@@ -123,10 +123,7 @@ impl LeakDetector {
                     "GitHub PAT",
                 ),
                 // Generic
-                (
-                    Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
-                    "Generic API key",
-                ),
+                (Regex::new(r"api[_-]?key[=:]\s*['\x22]*[a-zA-Z0-9_-]{20,}").unwrap(), "Generic API key"),
             ]
         });
 
@@ -150,17 +147,8 @@ impl LeakDetector {
         static AWS_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = AWS_PATTERNS.get_or_init(|| {
             vec![
-                (
-                    Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-                    "AWS Access Key ID",
-                ),
-                (
-                    Regex::new(
-                        r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
-                    )
-                    .unwrap(),
-                    "AWS Secret Access Key",
-                ),
+                (Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(), "AWS Access Key ID"),
+                (Regex::new(r"aws[_-]?secret[_-]?access[_-]?key[=:]\s*[a-zA-Z0-9/+=]{40}").unwrap(), "AWS Secret Access Key"),
             ]
         });
 
@@ -184,18 +172,9 @@ impl LeakDetector {
         static SECRET_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = SECRET_PATTERNS.get_or_init(|| {
             vec![
-                (
-                    Regex::new(r#"(?i)password[=:]\s*['"]*[^\s'"]{8,}"#).unwrap(),
-                    "Password in config",
-                ),
-                (
-                    Regex::new(r#"(?i)secret[=:]\s*['"]*[a-zA-Z0-9_-]{16,}"#).unwrap(),
-                    "Secret value",
-                ),
-                (
-                    Regex::new(r#"(?i)token[=:]\s*['"]*[a-zA-Z0-9_.-]{20,}"#).unwrap(),
-                    "Token value",
-                ),
+                (Regex::new(r"(?i)password[=:]\s*['\x22]*[^\s'\x22]{8,}").unwrap(), "Password in config"),
+                (Regex::new(r"(?i)secret[=:]\s*['\x22]*[a-zA-Z0-9_-]{16,}").unwrap(), "Secret value"),
+                (Regex::new(r"(?i)token[=:]\s*['\x22]*[a-zA-Z0-9_.-]{20,}").unwrap(), "Token value"),
             ]
         });
 
