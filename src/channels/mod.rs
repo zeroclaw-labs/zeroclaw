@@ -74,7 +74,10 @@ use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{
+    extract_domain_approval_host, normalize_domain_pattern, runtime_domain_policy, DomainListKind,
+    SecurityPolicy,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -160,6 +163,8 @@ enum ChannelRuntimeCommand {
     ShowThink,
     SetThink(Option<bool>),
     SetThinkEffort(String),
+    ApproveDomain(String),
+    DenyDomain(String),
     RestartService,
 }
 
@@ -573,6 +578,12 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/restart" => Some(ChannelRuntimeCommand::RestartService),
+        "/approve-domain" => Some(ChannelRuntimeCommand::ApproveDomain(
+            parts.collect::<Vec<_>>().join(" ").trim().to_string(),
+        )),
+        "/deny-domain" => Some(ChannelRuntimeCommand::DenyDomain(
+            parts.collect::<Vec<_>>().join(" ").trim().to_string(),
+        )),
         _ => None,
     }
 }
@@ -940,6 +951,13 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
+fn domain_approval_prompt_from_error(err: &anyhow::Error) -> Option<String> {
+    let host = extract_domain_approval_host(&err.to_string())?;
+    Some(format!(
+        "🔐 Domain `{host}` is not approved.\nReply with `/approve-domain {host}` to allow, or `/deny-domain {host}` to block."
+    ))
+}
+
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -1258,6 +1276,28 @@ fn build_think_response(current: &ChannelRouteSelection) -> String {
     )
 }
 
+fn build_domain_policy_update_response(raw_domain: &str, kind: DomainListKind) -> String {
+    let Some(domain) = normalize_domain_pattern(raw_domain) else {
+        return "Provide a valid domain: `/approve-domain example.com` or `/deny-domain example.com`.".to_string();
+    };
+
+    let Some(policy) = runtime_domain_policy() else {
+        return "Runtime domain policy store is unavailable.".to_string();
+    };
+
+    match policy.insert(&domain, kind, "runtime_command") {
+        Ok(()) => match kind {
+            DomainListKind::Allow => format!(
+                "Approved domain `{domain}`. Future browser/http calls to this host are allowed."
+            ),
+            DomainListKind::Deny => format!(
+                "Blocked domain `{domain}`. Future browser/http calls to this host are denied."
+            ),
+        },
+        Err(err) => format!("Failed to update domain policy for `{domain}`: {err}"),
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -1413,6 +1453,12 @@ async fn handle_runtime_command_if_needed(
                     )
                 }
             }
+        }
+        ChannelRuntimeCommand::ApproveDomain(raw_domain) => {
+            build_domain_policy_update_response(&raw_domain, DomainListKind::Allow)
+        }
+        ChannelRuntimeCommand::DenyDomain(raw_domain) => {
+            build_domain_policy_update_response(&raw_domain, DomainListKind::Deny)
         }
         ChannelRuntimeCommand::RestartService => match maybe_restart_managed_daemon_service() {
             Ok(true) => "Restart requested. Managed daemon service is restarting now.".to_string(),
@@ -2395,6 +2441,39 @@ async fn process_channel_message(
                 {
                     if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                    }
+                }
+            } else if let Some(approval_prompt) = domain_approval_prompt_from_error(&e) {
+                runtime_trace::record_event(
+                    "channel_domain_approval_required",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("domain approval required"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant("[Domain approval required — awaiting user decision]"),
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &approval_prompt)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(approval_prompt, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
@@ -3519,6 +3598,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let mut seeded_allowed_domains = config.browser.allowed_domains.clone();
+    seeded_allowed_domains.extend(config.http_request.allowed_domains.iter().cloned());
+    if let Err(err) =
+        crate::security::init_runtime_domain_policy(&config.workspace_dir, &seeded_allowed_domains)
+    {
+        tracing::warn!("Failed to initialize runtime domain policy store: {err}");
+    }
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -6874,6 +6960,16 @@ This is an example JSON object for profile settings."#;
         assert_eq!(
             parse_runtime_command("telegram", "/restart"),
             Some(ChannelRuntimeCommand::RestartService)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/approve-domain example.com"),
+            Some(ChannelRuntimeCommand::ApproveDomain(
+                "example.com".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/deny-domain bad.example"),
+            Some(ChannelRuntimeCommand::DenyDomain("bad.example".to_string()))
         );
     }
 

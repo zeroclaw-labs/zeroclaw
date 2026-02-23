@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::SecurityPolicy;
+use crate::security::{
+    runtime_domain_policy, AutonomyLevel, SecurityPolicy, DOMAIN_APPROVAL_REQUIRED_PREFIX,
+};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -56,7 +58,19 @@ impl HttpRequestTool {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
+        if let Some(policy) = runtime_domain_policy() {
+            if policy.is_denied(&host) {
+                anyhow::bail!("Host '{host}' is blocked by runtime domain denylist");
+            }
+            if policy.is_allowed(&host) {
+                return Ok(url.to_string());
+            }
+        }
+
         if !host_matches_allowlist(&host, &self.allowed_domains) {
+            if self.security.autonomy == AutonomyLevel::Supervised {
+                anyhow::bail!("{DOMAIN_APPROVAL_REQUIRED_PREFIX}{host}");
+            }
             anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 

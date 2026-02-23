@@ -23,6 +23,7 @@ pub mod audit;
 pub mod bubblewrap;
 pub mod detect;
 pub mod docker;
+pub mod domain_policy;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
@@ -44,6 +45,10 @@ pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
+pub use domain_policy::{
+    extract_domain_approval_host, init_runtime_domain_policy, normalize_domain_pattern,
+    runtime_domain_policy, DomainListKind, DOMAIN_APPROVAL_REQUIRED_PREFIX,
+};
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 #[allow(unused_imports)]

@@ -8,6 +8,7 @@ use crate::providers::{
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::security::{extract_domain_approval_host, DOMAIN_APPROVAL_REQUIRED_PREFIX};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -2551,6 +2552,20 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+        }
+
+        for entry in &ordered_results {
+            let Some((_, _, outcome)) = entry else {
+                continue;
+            };
+            let Some(reason) = outcome.error_reason.as_deref() else {
+                continue;
+            };
+            if extract_domain_approval_host(reason).is_some()
+                || reason.contains(DOMAIN_APPROVAL_REQUIRED_PREFIX)
+            {
+                anyhow::bail!("{reason}");
+            }
         }
 
         for entry in ordered_results {
