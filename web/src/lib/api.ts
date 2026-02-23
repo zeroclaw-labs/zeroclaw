@@ -177,7 +177,10 @@ export function getIntegrations(): Promise<Integration[]> {
 // ---------------------------------------------------------------------------
 
 export function runDoctor(): Promise<DiagResult[]> {
-  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor').then(
+  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor', {
+    method: 'POST',
+    body: '{}',
+  }).then(
     (data) => (Array.isArray(data) ? data : data.results),
   );
 }
