@@ -464,6 +464,37 @@ fn is_xml_meta_tag(tag: &str) -> bool {
 static XML_OPEN_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
 
+/// HuggingFace/Llama tool call format: `<function=name><parameter=key>value</parameter></function>`
+static HF_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<function=([a-zA-Z_][a-zA-Z0-9_.-]*)>([\s\S]*?)</function>").unwrap()
+});
+static HF_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<parameter=([a-zA-Z_][a-zA-Z0-9_.-]*)>([\s\S]*?)</parameter>").unwrap()
+});
+
+/// Parse HuggingFace/Llama-style tool calls: `<function=tool_name><parameter=key>value</parameter></function>`
+fn parse_hf_tool_calls(content: &str) -> Option<Vec<ParsedToolCall>> {
+    let mut calls = Vec::new();
+    for func_cap in HF_FUNCTION_RE.captures_iter(content) {
+        let name = func_cap.get(1)?.as_str().to_string();
+        let body = func_cap.get(2)?.as_str();
+        let mut args = serde_json::Map::new();
+        for param_cap in HF_PARAMETER_RE.captures_iter(body) {
+            let key = param_cap.get(1).map(|m| m.as_str().to_string())?;
+            let value = param_cap.get(2).map(|m| m.as_str().trim().to_string())?;
+            args.insert(key, serde_json::Value::String(value));
+        }
+        if !args.is_empty() {
+            calls.push(ParsedToolCall {
+                name,
+                arguments: serde_json::Value::Object(args),
+                tool_call_id: None,
+            });
+        }
+    }
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
 /// MiniMax XML invoke format:
 /// `<invoke name="shell"><parameter name="command">pwd</parameter></invoke>`
 static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1358,6 +1389,14 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            // Try HuggingFace/Llama format: <function=name><parameter=key>value</parameter></function>
+            if !parsed_any {
+                if let Some(hf_calls) = parse_hf_tool_calls(inner) {
+                    calls.extend(hf_calls);
+                    parsed_any = true;
+                }
+            }
+
             if !parsed_any {
                 // GLM-style shortened body: `shell>uname -a` or `shell\ncommand: date`
                 if let Some(glm_call) = parse_glm_shortened_body(inner) {
@@ -1368,7 +1407,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
             if !parsed_any {
                 tracing::warn!(
-                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
+                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM/HF)"
                 );
             }
 
@@ -1396,6 +1435,14 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 if !parsed_any {
                     if let Some(xml_calls) = parse_xml_tool_calls(inner) {
                         calls.extend(xml_calls);
+                        parsed_any = true;
+                    }
+                }
+
+                // Try HuggingFace/Llama format
+                if !parsed_any {
+                    if let Some(hf_calls) = parse_hf_tool_calls(inner) {
+                        calls.extend(hf_calls);
                         parsed_any = true;
                     }
                 }
