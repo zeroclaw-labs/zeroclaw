@@ -8,14 +8,30 @@
 //!
 //! - [`handle_request`]: stateless dispatcher that maps a single JSON-RPC
 //!   request to a response value.
-//! - [`run_stdio_server`]: async loop that reads Content-Length framed
-//!   JSON-RPC messages from stdin and writes responses to stdout.
+//! - [`run_stdio_server`]: async loop that auto-detects transport format
+//!   (newline-delimited JSON or Content-Length framed) and serves accordingly.
 
 use crate::mcp::protocol::encode_frame;
 use crate::mcp::tool_bridge::McpToolBridge;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Supported MCP protocol versions (newest first).
+const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2024-11-05"];
+
+/// Negotiate protocol version: return the client's requested version if we
+/// support it, otherwise fall back to our newest supported version.
+fn negotiate_version(client_version: Option<&str>) -> &'static str {
+    if let Some(cv) = client_version {
+        for &v in SUPPORTED_VERSIONS {
+            if v == cv {
+                return v;
+            }
+        }
+    }
+    SUPPORTED_VERSIONS[0]
+}
 
 /// Dispatch a single MCP JSON-RPC request and return the response value.
 ///
@@ -29,20 +45,26 @@ pub async fn handle_request(req: &Value, bridge: &McpToolBridge) -> Value {
         .unwrap_or_default();
 
     match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "zeroclaw",
-                    "version": "0.1.0"
+        "initialize" => {
+            let client_version = req
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str);
+            let version = negotiate_version(client_version);
+            json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": version,
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "zeroclaw",
+                        "version": "0.1.0"
+                    }
                 }
-            }
-        }),
+            })
+        }
 
         "notifications/initialized" => Value::Null,
 
@@ -134,37 +156,146 @@ pub async fn handle_request(req: &Value, bridge: &McpToolBridge) -> Value {
     }
 }
 
+/// Transport mode detected from the first message on stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportMode {
+    /// Newline-delimited JSON (used by Codex CLI / rmcp).
+    Newline,
+    /// Content-Length framed (LSP-style, used by standard MCP clients).
+    ContentLength,
+}
+
 /// Run the MCP stdio server loop.
 ///
-/// Reads Content-Length framed JSON-RPC messages from stdin, dispatches each
-/// through [`handle_request`], and writes the framed response to stdout.
+/// Auto-detects the transport format from the first line of stdin:
+/// - If it starts with `{`, uses newline-delimited JSON mode.
+/// - If it starts with `Content-Length:`, uses Content-Length framed mode.
+///
+/// The detected mode is fixed for the lifetime of the connection.
 /// Returns `Ok(())` on EOF.
 pub async fn run_stdio_server(bridge: Arc<McpToolBridge>) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
 
+    // Detect transport mode from first line.
+    let mut first_line = String::new();
+    let n = reader.read_line(&mut first_line).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let mode = if first_line.trim_start().starts_with('{') {
+        TransportMode::Newline
+    } else {
+        TransportMode::ContentLength
+    };
+
+    // Process the first line according to detected mode, then loop.
+    match mode {
+        TransportMode::Newline => {
+            // First line is already a JSON message.
+            run_newline_mode(&mut reader, &mut stdout, &bridge, Some(first_line)).await
+        }
+        TransportMode::ContentLength => {
+            // First line is a header; continue reading headers + body.
+            run_content_length_mode(&mut reader, &mut stdout, &bridge, Some(first_line)).await
+        }
+    }
+}
+
+/// Newline-delimited JSON transport: each line is a complete JSON-RPC message.
+async fn run_newline_mode<R, W>(
+    reader: &mut BufReader<R>,
+    stdout: &mut W,
+    bridge: &McpToolBridge,
+    first_line: Option<String>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Process the first line if provided.
+    if let Some(line) = first_line {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(req) = serde_json::from_str::<Value>(trimmed) {
+                let resp = handle_request(&req, bridge).await;
+                if !resp.is_null() {
+                    let mut bytes = serde_json::to_vec(&resp)?;
+                    bytes.push(b'\n');
+                    stdout.write_all(&bytes).await?;
+                    stdout.flush().await?;
+                }
+            }
+        }
+    }
+
+    // Read remaining lines.
     loop {
-        // Read headers until we find an empty line (the \r\n\r\n separator).
-        let mut header_buf = String::new();
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let req: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let resp = handle_request(&req, bridge).await;
+        if resp.is_null() {
+            continue;
+        }
+        let mut bytes = serde_json::to_vec(&resp)?;
+        bytes.push(b'\n');
+        stdout.write_all(&bytes).await?;
+        stdout.flush().await?;
+    }
+}
+
+/// Content-Length framed transport (LSP-style).
+async fn run_content_length_mode<R, W>(
+    reader: &mut BufReader<R>,
+    stdout: &mut W,
+    bridge: &McpToolBridge,
+    first_header_line: Option<String>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // We may already have the first header line.
+    let mut pending_header = first_header_line;
+
+    loop {
         let mut content_length: Option<usize> = None;
 
+        // Parse the pending header line if we have one.
+        if let Some(ref line) = pending_header {
+            let trimmed = line.trim();
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    content_length = Some(value.trim().parse::<usize>()?);
+                }
+            }
+        }
+        pending_header = None;
+
+        // Read remaining headers until empty line.
         loop {
             let mut line = String::new();
             let n = reader.read_line(&mut line).await?;
             if n == 0 {
-                // EOF on stdin — clean shutdown.
                 return Ok(());
             }
-
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                // End of headers.
                 break;
             }
-
-            header_buf.push_str(&line);
-
             if let Some((name, value)) = trimmed.split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
                     content_length = Some(value.trim().parse::<usize>()?);
@@ -174,25 +305,15 @@ pub async fn run_stdio_server(bridge: Arc<McpToolBridge>) -> anyhow::Result<()> 
 
         let length = match content_length {
             Some(len) => len,
-            None => {
-                // No Content-Length found and we hit an empty line. If
-                // header_buf is also empty we just read a stray newline;
-                // continue to the next frame.
-                if header_buf.is_empty() {
-                    continue;
-                }
-                anyhow::bail!("missing Content-Length header in frame");
-            }
+            None => continue,
         };
 
-        // Read exactly `length` bytes for the JSON body.
         let mut body = vec![0u8; length];
-        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await?;
+        tokio::io::AsyncReadExt::read_exact(reader, &mut body).await?;
 
         let req: Value = serde_json::from_slice(&body)?;
-        let resp = handle_request(&req, &bridge).await;
+        let resp = handle_request(&req, bridge).await;
 
-        // Notifications produce a Null response — do not send a frame.
         if resp.is_null() {
             continue;
         }
@@ -262,10 +383,42 @@ mod tests {
         assert_eq!(resp["id"], 1);
 
         let result = &resp["result"];
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert!(
+            SUPPORTED_VERSIONS.contains(&result["protocolVersion"].as_str().unwrap()),
+            "protocolVersion should be a supported version"
+        );
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["serverInfo"]["name"], "zeroclaw");
         assert_eq!(result["serverInfo"]["version"], "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn initialize_negotiates_client_version() {
+        let bridge = test_bridge();
+
+        // Client requests 2025-06-18 -> server returns 2025-06-18
+        let req = make_request(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        );
+        let resp = handle_request(&req, &bridge).await;
+        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
+
+        // Client requests 2024-11-05 -> server returns 2024-11-05
+        let req = make_request(
+            "initialize",
+            json!({"protocolVersion": "2024-11-05"}),
+        );
+        let resp = handle_request(&req, &bridge).await;
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+
+        // Client requests unknown version -> server returns newest supported
+        let req = make_request(
+            "initialize",
+            json!({"protocolVersion": "9999-01-01"}),
+        );
+        let resp = handle_request(&req, &bridge).await;
+        assert_eq!(resp["result"]["protocolVersion"], SUPPORTED_VERSIONS[0]);
     }
 
     #[tokio::test]
@@ -375,7 +528,6 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_tool_name_handled() {
-        // Two tools with the same name — last-wins semantics from McpToolBridge.
         struct ToolV1;
         struct ToolV2;
 
@@ -424,7 +576,6 @@ mod tests {
             Box::new(ToolV2) as Box<dyn Tool>,
         ]);
 
-        // tools/list should show exactly one entry (last wins).
         let list_req = make_request("tools/list", json!({}));
         let list_resp = handle_request(&list_req, &bridge).await;
         let tools = list_resp["result"]["tools"]
@@ -436,7 +587,6 @@ mod tests {
             "duplicate names should collapse to one entry"
         );
 
-        // tools/call should execute the last-registered implementation.
         let call_req = make_request("tools/call", json!({"name": "dup", "arguments": {}}));
         let call_resp = handle_request(&call_req, &bridge).await;
         assert_eq!(call_resp["result"]["content"][0]["text"], "v2");
@@ -478,5 +628,79 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": "abc-123", "method": "ping", "params": {}});
         let resp = handle_request(&req, &bridge).await;
         assert_eq!(resp["id"], "abc-123");
+    }
+
+    // --- Transport mode tests ---
+
+    #[tokio::test]
+    async fn newline_mode_roundtrip() {
+        let bridge = test_bridge();
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}});
+        let ping = json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}});
+
+        let input = format!("{}\n{}\n", init, ping);
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        run_newline_mode(&mut reader, &mut output, &bridge, None).await.unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2, "should get 2 response lines");
+
+        let resp1: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(resp1["result"]["protocolVersion"], "2025-06-18");
+
+        let resp2: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(resp2["id"], 2);
+        assert_eq!(resp2["result"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn content_length_mode_roundtrip() {
+        let bridge = test_bridge();
+        let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}});
+        let body = serde_json::to_vec(&ping).unwrap();
+        let input = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut input_bytes = input.into_bytes();
+        input_bytes.extend_from_slice(&body);
+
+        let mut reader = BufReader::new(input_bytes.as_slice());
+        let mut output = Vec::new();
+
+        run_content_length_mode(&mut reader, &mut output, &bridge, None).await.unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.starts_with("Content-Length:"));
+        assert!(output_str.contains("\"id\":1"));
+    }
+
+    #[tokio::test]
+    async fn newline_mode_skips_notifications() {
+        let bridge = test_bridge();
+        let notif = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}});
+
+        let input = format!("{}\n{}\n", notif, ping);
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        run_newline_mode(&mut reader, &mut output, &bridge, None).await.unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        assert_eq!(lines.len(), 1, "notification should not produce output");
+    }
+
+    #[test]
+    fn negotiate_version_returns_matching() {
+        assert_eq!(negotiate_version(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate_version(Some("2024-11-05")), "2024-11-05");
+    }
+
+    #[test]
+    fn negotiate_version_falls_back_to_newest() {
+        assert_eq!(negotiate_version(Some("9999-01-01")), SUPPORTED_VERSIONS[0]);
+        assert_eq!(negotiate_version(None), SUPPORTED_VERSIONS[0]);
     }
 }

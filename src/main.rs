@@ -670,14 +670,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .finish();
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // MCP server mode sends logs to stderr so stdout stays clean for
+    // Content-Length framed JSON-RPC.
+    let is_mcp_server = matches!(cli.command, Commands::McpServer);
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    if is_mcp_server {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    } else {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
@@ -752,8 +765,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Onboard { .. } => unreachable!(),
-        Commands::Completions { .. } => unreachable!(),
+        Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
 
         Commands::Agent {
             message,
@@ -1038,7 +1050,10 @@ async fn main() -> Result<()> {
             let peripheral_tools =
                 peripherals::create_peripheral_tools(&config.peripherals).await?;
             if !peripheral_tools.is_empty() {
-                info!(count = peripheral_tools.len(), "Peripheral tools added to MCP server");
+                info!(
+                    count = peripheral_tools.len(),
+                    "Peripheral tools added to MCP server"
+                );
                 tools_registry.extend(peripheral_tools);
             }
 
