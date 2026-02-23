@@ -11,6 +11,7 @@ pub mod postgres;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
+pub mod tiered;
 pub mod traits;
 pub mod vector;
 
@@ -29,6 +30,18 @@ pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
+
+// Tiered-memory public API
+#[allow(unused_imports)]
+pub use tiered::TieredMemory;
+#[allow(unused_imports)]
+pub use tiered::{ExtractionRequest, SharedMemory, TierCommand, TierConfig};
+#[allow(unused_imports)]
+pub use tiered::{
+    FactConfidence, FactEntry, FactEntryDraft, FactExtractor, FactStatus, MemoryAgentConfig,
+    MemoryAgentsConfig, MockFactExtractor, OpenRouterFactExtractor, SourceRole, SourceTurnRef,
+    VolatilityClass,
+};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 #[cfg(feature = "memory-postgres")]
@@ -358,6 +371,40 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
     }
 }
 
+/// Build a [`TieredMemory`] from three pre-constructed [`Memory`] backends.
+///
+/// This is the recommended entry-point when the caller already owns the STM,
+/// MTM, and LTM backends (e.g. three separate `SqliteMemory` instances or
+/// test doubles).
+///
+/// Returns a tuple of:
+/// 1. The `TieredMemory` (implements [`Memory`] as a drop-in replacement).
+/// 2. A command sender for issuing [`TierCommand`]s (force compression, etc.).
+/// 3. A command receiver — pass this to a [`tiered::manager::TierManager`]
+///    event loop so that commands are actually processed.
+pub fn create_tiered_memory_from_backends(
+    stm: Box<dyn Memory + Send>,
+    mtm: Box<dyn Memory + Send>,
+    ltm: Box<dyn Memory + Send>,
+    cfg: tiered::TierConfig,
+    extraction_tx: Option<tokio::sync::mpsc::Sender<tiered::ExtractionRequest>>,
+) -> (
+    tiered::TieredMemory,
+    tokio::sync::mpsc::Sender<tiered::TierCommand>,
+    tokio::sync::mpsc::Receiver<tiered::TierCommand>,
+) {
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+    let tiered_mem = tiered::TieredMemory {
+        stm: Arc::new(tokio::sync::Mutex::new(stm)),
+        mtm: Arc::new(tokio::sync::Mutex::new(mtm)),
+        ltm: Arc::new(tokio::sync::Mutex::new(ltm)),
+        cfg: Arc::new(cfg),
+        cmd_tx: cmd_tx.clone(),
+        extraction_tx,
+    };
+    (tiered_mem, cmd_tx, cmd_rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +624,21 @@ mod tests {
                 api_key: Some("base-key".into()),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn factory_creates_tiered_memory_from_backends() {
+        let stm: Box<dyn Memory + Send> = Box::new(NoneMemory::new());
+        let mtm: Box<dyn Memory + Send> = Box::new(NoneMemory::new());
+        let ltm: Box<dyn Memory + Send> = Box::new(NoneMemory::new());
+        let cfg = TierConfig::default();
+
+        let (tiered, cmd_tx, _cmd_rx) =
+            create_tiered_memory_from_backends(stm, mtm, ltm, cfg, None);
+
+        assert_eq!(tiered.name(), "tiered");
+        assert_eq!(tiered.count().await.unwrap(), 0);
+        // Verify the command channel is functional (receiver kept alive via _cmd_rx)
+        assert!(!cmd_tx.is_closed());
     }
 }

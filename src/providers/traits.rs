@@ -89,6 +89,11 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Optional conversation identity for session-aware providers.
+    /// Providers that maintain per-conversation state (e.g., Codex CLI session
+    /// resume) use this to key their session maps. When `None`, providers may
+    /// derive a session key from message content as a fallback.
+    pub session_id: Option<&'a str>,
 }
 
 /// A tool result to feed back to the LLM.
@@ -411,6 +416,33 @@ pub trait Provider: Send + Sync {
             usage: None,
             reasoning_content: None,
         })
+    }
+
+    /// Whether provider emits intermediate progress events during `chat()`.
+    ///
+    /// Providers that run subprocess-based inference (e.g., Codex CLI) can
+    /// stream commentary and tool-call events in real-time. When `true`, the
+    /// agent loop will call `chat_with_progress()` instead of `chat()`.
+    fn supports_progress_streaming(&self) -> bool {
+        false
+    }
+
+    /// Structured chat with real-time progress events.
+    ///
+    /// Providers that support progress streaming override this to emit
+    /// intermediate events (commentary, tool names) through `on_progress`
+    /// while the inference runs. The default falls back to `chat()`.
+    ///
+    /// Progress sends are fire-and-forget: a dropped receiver must not
+    /// fail the inference call.
+    async fn chat_with_progress(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        _on_progress: &tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat(request, model, temperature).await
     }
 
     /// Whether provider supports streaming responses.
@@ -780,6 +812,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -797,6 +830,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -897,6 +931,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -919,6 +954,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -941,6 +977,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let err = provider.chat(request, "model", 0.7).await.unwrap_err();

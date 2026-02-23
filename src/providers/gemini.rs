@@ -1652,7 +1652,7 @@ mod tests {
         let creds: GeminiCliOAuthCreds = serde_json::from_str(json).unwrap();
         assert_eq!(creds.access_token.as_deref(), Some("ya29.test-token"));
         assert_eq!(creds.refresh_token.as_deref(), Some("1//test-refresh"));
-        assert_eq!(creds.expiry_date, Some(4102444800000));
+        assert_eq!(creds.expiry_date, Some(4_102_444_800_000));
         assert!(creds.expiry.is_none());
     }
 

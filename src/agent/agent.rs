@@ -405,7 +405,16 @@ impl Agent {
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };
-        self.prompt_builder.build(&ctx)
+        let mut prompt = String::new();
+        if let Some(ref custom) = self.config.system_prompt {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() {
+                prompt.push_str(trimmed);
+                prompt.push_str("\n\n");
+            }
+        }
+        prompt.push_str(&self.prompt_builder.build(&ctx)?);
+        Ok(prompt)
     }
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
@@ -555,6 +564,7 @@ impl Agent {
                         } else {
                             None
                         },
+                        session_id: None,
                     },
                     &effective_model,
                     self.temperature,

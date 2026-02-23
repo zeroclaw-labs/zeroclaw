@@ -41,6 +41,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+#[allow(unused_imports)]
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -398,7 +399,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.\n\n\
+             Telegram tool routing:\n\
+             - Each message includes a [Telegram context] block with chat_id, user_message_id, and bot_last_message_id.\n\
+             - To edit a previous bot message: use telegram_edit with the message_id from context (bot_last_message_id or a known message_id). Only bot-owned messages can be edited.\n\
+             - To send a new message or reply: use telegram_send. The tool returns the new message_id.\n\
+             - To forward a message: use telegram_forward with from_chat_id, to_chat_id, message_id.\n\
+             - To pin/unpin: use telegram_pin with chat_id and message_id.\n\
+             - To react with emoji: use telegram_react with chat_id, message_id, emoji.\n\
+             - To delete a message: use telegram_delete with chat_id and message_id.\n\
+             - PREFER Telegram tools over file operations when the user asks to update, edit, or manage Telegram messages. Do NOT write to local files when the intent is to update a Telegram message.",
         ),
         _ => None,
     }
@@ -1262,9 +1272,7 @@ fn sanitize_tool_json_value(
         return None;
     }
 
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
         if !tool_calls.is_empty()
@@ -1304,7 +1312,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -1594,6 +1602,39 @@ async fn process_channel_message(
         }
     }
 
+    // Inject Telegram context (chat_id, message IDs) for Telegram channel messages
+    if msg.channel == "telegram" {
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" {
+                let chat_id = &msg.reply_target;
+                // Parse user_message_id from msg.id format "telegram_{chat_id}_{message_id}"
+                let user_message_id = msg
+                    .id
+                    .strip_prefix("telegram_")
+                    .and_then(|rest| rest.rsplit_once('_'))
+                    .and_then(|(_, mid)| mid.parse::<i64>().ok());
+
+                let bot_last_message_id = target_channel
+                    .as_ref()
+                    .and_then(|ch| ch.last_bot_message_id(chat_id));
+
+                let mut ctx_parts = vec![format!("chat_id={chat_id}")];
+                if let Some(uid) = user_message_id {
+                    ctx_parts.push(format!("user_message_id={uid}"));
+                }
+                if let Some(bid) = bot_last_message_id {
+                    ctx_parts.push(format!("bot_last_message_id={bid}"));
+                }
+
+                last_turn.content = format!(
+                    "{}\n\n[Telegram context: {}]",
+                    last_turn.content,
+                    ctx_parts.join(", ")
+                );
+            }
+        }
+    }
+
     let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
@@ -1720,6 +1761,7 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                Some(msg.sender.as_str()),
                 None,
             ),
         ) => LlmExecutionResult::Completed(result),
@@ -2647,6 +2689,7 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[allow(clippy::used_underscore_binding)]
 fn collect_configured_channels(
     config: &Config,
     _matrix_skip_context: &str,
@@ -3118,6 +3161,42 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
+    // Telegram tools (only when Telegram channel is configured)
+    if config.channels_config.telegram.is_some() {
+        tool_descs.push((
+            "telegram_send",
+            "Send a text message or upload a file to a Telegram chat. Returns message_id of the sent message.",
+        ));
+        tool_descs.push((
+            "telegram_edit",
+            "Edit a previously sent bot message in Telegram. Requires chat_id and the message_id of the bot's own message.",
+        ));
+        tool_descs.push((
+            "telegram_delete",
+            "Delete a message in a Telegram chat. Requires chat_id and message_id.",
+        ));
+        tool_descs.push((
+            "telegram_forward",
+            "Forward a message from one Telegram chat to another. Requires from_chat_id, to_chat_id, message_id.",
+        ));
+        tool_descs.push((
+            "telegram_pin",
+            "Pin or unpin a message in a Telegram chat. Requires chat_id and message_id.",
+        ));
+        tool_descs.push((
+            "telegram_react",
+            "Set an emoji reaction on a Telegram message. Requires chat_id, message_id, emoji.",
+        ));
+        tool_descs.push((
+            "telegram_get_chat",
+            "Get information about a Telegram chat (title, type, member count, etc.).",
+        ));
+        tool_descs.push((
+            "telegram_get_file",
+            "Download a file from Telegram by file_id and save it to the workspace.",
+        ));
+    }
+
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
     let excluded = &config.autonomy.non_cli_excluded_tools;
@@ -3131,7 +3210,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = build_system_prompt_with_mode(
+    let mut system_prompt = String::new();
+
+    // Prepend user-configured system prompt if set.
+    if let Some(ref custom) = config.agent.system_prompt {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            system_prompt.push_str(trimmed);
+            system_prompt.push_str("\n\n");
+        }
+    }
+
+    system_prompt.push_str(&build_system_prompt_with_mode(
         &workspace,
         &model,
         &tool_descs,
@@ -3140,7 +3230,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-    );
+    ));
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
@@ -6540,5 +6630,82 @@ This is an example JSON object for profile settings."#;
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
         );
+    }
+
+    // ── Telegram Tool Routing Instructions Tests ─────────────────
+
+    #[test]
+    fn telegram_delivery_instructions_include_tool_routing() {
+        let instructions = channel_delivery_instructions("telegram").unwrap();
+        assert!(instructions.contains("telegram_edit"));
+        assert!(instructions.contains("telegram_send"));
+        assert!(instructions.contains("telegram_forward"));
+        assert!(instructions.contains("telegram_pin"));
+        assert!(instructions.contains("telegram_react"));
+        assert!(instructions.contains("telegram_delete"));
+    }
+
+    #[test]
+    fn telegram_delivery_instructions_mention_context_block() {
+        let instructions = channel_delivery_instructions("telegram").unwrap();
+        assert!(instructions.contains("[Telegram context]"));
+        assert!(instructions.contains("chat_id"));
+        assert!(instructions.contains("bot_last_message_id"));
+    }
+
+    #[test]
+    fn telegram_delivery_instructions_prefer_telegram_tools_over_files() {
+        let instructions = channel_delivery_instructions("telegram").unwrap();
+        assert!(instructions.contains("PREFER Telegram tools over file operations"));
+    }
+
+    #[test]
+    fn non_telegram_channel_has_no_delivery_instructions() {
+        assert!(channel_delivery_instructions("discord").is_none());
+        assert!(channel_delivery_instructions("slack").is_none());
+        assert!(channel_delivery_instructions("unknown").is_none());
+    }
+
+    #[test]
+    fn build_channel_system_prompt_appends_telegram_instructions() {
+        let base = "You are a helpful bot.";
+        let result = build_channel_system_prompt(base, "telegram");
+        assert!(result.starts_with(base));
+        assert!(result.contains("telegram_edit"));
+        assert!(result.contains("PREFER Telegram tools"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_non_telegram_returns_base() {
+        let base = "You are a helpful bot.";
+        let result = build_channel_system_prompt(base, "discord");
+        assert_eq!(result, base);
+    }
+
+    // ── Agent Config system_prompt Tests ─────────────────────────
+
+    #[test]
+    fn agent_config_system_prompt_defaults_to_none() {
+        let config = crate::config::AgentConfig::default();
+        assert!(config.system_prompt.is_none());
+    }
+
+    #[test]
+    fn agent_config_system_prompt_deserializes() {
+        let toml = r#"
+            system_prompt = "You are a pirate. Respond in pirate speak."
+        "#;
+        let config: crate::config::AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some("You are a pirate. Respond in pirate speak.")
+        );
+    }
+
+    #[test]
+    fn agent_config_without_system_prompt_deserializes() {
+        let toml = "";
+        let config: crate::config::AgentConfig = toml::from_str(toml).unwrap();
+        assert!(config.system_prompt.is_none());
     }
 }

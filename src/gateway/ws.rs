@@ -53,8 +53,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => break,
-            Err(_) => break,
+            Ok(Message::Close(_)) | Err(_) => break,
             _ => continue,
         };
 
@@ -96,14 +95,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
         let system_prompt = {
             let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
+            let mut prompt = String::new();
+            if let Some(ref custom) = config_guard.agent.system_prompt {
+                let trimmed = custom.trim();
+                if !trimmed.is_empty() {
+                    prompt.push_str(trimmed);
+                    prompt.push_str("\n\n");
+                }
+            }
+            prompt.push_str(&crate::channels::build_system_prompt(
                 &config_guard.workspace_dir,
                 &state.model,
                 &[],
                 &[],
                 Some(&config_guard.identity),
                 None,
-            )
+            ));
+            prompt
         };
 
         let messages = vec![

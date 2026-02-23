@@ -469,4 +469,207 @@ mod tests {
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
     }
+
+    #[test]
+    fn schema_has_expected_properties_and_required_fields() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let sec = test_security(&cfg);
+        let tool = CronAddTool::new(Arc::new(cfg), sec);
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        let props = &schema["properties"];
+        assert!(props["name"].is_object());
+        assert!(props["schedule"].is_object());
+        assert!(props["job_type"].is_object());
+        assert!(props["command"].is_object());
+        assert!(props["prompt"].is_object());
+        assert!(props["session_target"].is_object());
+        assert!(props["delivery"].is_object());
+        assert!(props["delete_after_run"].is_object());
+        assert!(props["approved"].is_object());
+        let required = schema["required"].as_array().expect("required array");
+        assert!(required.contains(&json!("schedule")));
+    }
+
+    #[test]
+    fn name_and_description() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let sec = test_security(&cfg);
+        let tool = CronAddTool::new(Arc::new(cfg), sec);
+        assert_eq!(tool.name(), "cron_add");
+        assert!(!tool.description().is_empty());
+        assert!(tool.description().contains("cron"));
+    }
+
+    #[tokio::test]
+    async fn missing_schedule_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'schedule'"));
+    }
+
+    #[tokio::test]
+    async fn cron_disabled_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cron.enabled = false;
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let sec = test_security(&config);
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg, sec);
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("cron is disabled"));
+    }
+
+    #[tokio::test]
+    async fn invalid_job_type_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "unknown_type",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Invalid job_type"));
+    }
+
+    #[tokio::test]
+    async fn shell_job_empty_command_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "   "
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'command'"));
+    }
+
+    #[tokio::test]
+    async fn adds_agent_job_with_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "every", "every_ms": 60000 },
+                "job_type": "agent",
+                "prompt": "Summarize the daily log"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn agent_job_empty_prompt_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "0 * * * *" },
+                "job_type": "agent",
+                "prompt": "  "
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn infers_agent_job_type_when_prompt_present() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        // No job_type specified, but prompt is present => should infer agent
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "every", "every_ms": 30000 },
+                "prompt": "Check system status"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn invalid_schedule_kind_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "bogus" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Invalid schedule"));
+    }
 }

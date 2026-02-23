@@ -62,6 +62,12 @@ pub trait Channel: Send + Sync {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
+    /// Get the last bot message ID for a given chat, if tracked.
+    /// Only Telegram channels implement this; others return `None`.
+    fn last_bot_message_id(&self, _chat_id: &str) -> Option<i64> {
+        None
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 

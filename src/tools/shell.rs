@@ -162,13 +162,23 @@ impl Tool for ShellTool {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-                // Truncate output to prevent OOM
+                // Truncate output to prevent OOM.
+                // Find the largest char boundary <= MAX_OUTPUT_BYTES.
+                fn truncate_at_char_boundary(s: &mut String, max: usize) {
+                    if s.len() > max {
+                        let mut end = max;
+                        while end > 0 && !s.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        s.truncate(end);
+                    }
+                }
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    truncate_at_char_boundary(&mut stdout, MAX_OUTPUT_BYTES);
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    truncate_at_char_boundary(&mut stderr, MAX_OUTPUT_BYTES);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 

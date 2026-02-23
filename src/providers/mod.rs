@@ -18,6 +18,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod codex_cli;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
@@ -914,6 +915,7 @@ pub fn create_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
+        "codex-cli" | "codex_cli" => Ok(Box::new(codex_cli::CodexCliProvider::new())),
         "openai-codex" | "openai_codex" | "codex" => {
             Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
         }
@@ -1271,7 +1273,7 @@ pub fn create_resilient_provider_with_options(
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
     let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
+        "codex-cli" | "codex_cli" | "openai-codex" | "openai_codex" | "codex" => {
             create_provider_with_options(primary_name, api_key, options)?
         }
         _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
@@ -1467,6 +1469,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "OpenAI Codex (OAuth)",
             aliases: &["openai_codex", "codex"],
             local: false,
+        },
+        ProviderInfo {
+            name: "codex-cli",
+            display_name: "Codex CLI (local)",
+            aliases: &["codex_cli"],
+            local: true,
         },
         ProviderInfo {
             name: "ollama",
@@ -1970,6 +1978,14 @@ mod tests {
     fn factory_openai_codex() {
         let options = ProviderRuntimeOptions::default();
         assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
+    }
+
+    #[test]
+    fn factory_codex_cli() {
+        assert!(create_provider("codex-cli", None).is_ok());
+        assert!(create_provider("codex_cli", None).is_ok());
+        // Also works when an api_key is passed (ignored by the provider).
+        assert!(create_provider("codex-cli", Some("ignored")).is_ok());
     }
 
     #[test]

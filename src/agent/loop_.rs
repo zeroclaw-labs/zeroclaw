@@ -387,7 +387,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name,
                 arguments,
-                tool_call_id: tool_call_id,
+                tool_call_id,
             });
         }
     }
@@ -409,7 +409,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall {
         name,
         arguments,
-        tool_call_id: tool_call_id,
+        tool_call_id,
     })
 }
 
@@ -1820,6 +1820,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         None,
+        None,
     )
     .await
 }
@@ -2018,6 +2019,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    sender_key: Option<&str>,
     dynamic_registry: Option<&crate::tools::dynamic_registry::DynamicRegistry>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
@@ -2118,22 +2120,39 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let chat_future = provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            model,
-            temperature,
-        );
+        let derived_session_id = sender_key.map(|s| format!("{channel_name}/{s}"));
+        let chat_request = ChatRequest {
+            messages: &prepared_messages.messages,
+            tools: request_tools,
+            session_id: derived_session_id.as_deref(),
+        };
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        // Use chat_with_progress when the provider supports it and we have
+        // a draft-update channel, so intermediate events (tool names,
+        // commentary) are relayed to the user in real time.
+        let chat_result = if let (Some(tx), true) =
+            (on_delta.as_ref(), provider.supports_progress_streaming())
+        {
+            let progress_future =
+                provider.chat_with_progress(chat_request, model, temperature, tx);
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = progress_future => result,
+                }
+            } else {
+                progress_future.await
             }
         } else {
-            chat_future.await
+            let chat_future = provider.chat(chat_request, model, temperature);
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = chat_future => result,
+                }
+            } else {
+                chat_future.await
+            }
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
@@ -2581,15 +2600,13 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for entry in ordered_results {
-            if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
-                let _ = writeln!(
-                    tool_results,
-                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
-                );
-            }
+        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            individual_results.push((tool_call_id, outcome.output.clone()));
+            let _ = writeln!(
+                tool_results,
+                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                tool_name, outcome.output
+            );
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -2915,7 +2932,18 @@ pub async fn run(
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = String::new();
+
+    // Prepend user-configured system prompt if set.
+    if let Some(ref custom) = config.agent.system_prompt {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            system_prompt.push_str(trimmed);
+            system_prompt.push_str("\n\n");
+        }
+    }
+
+    system_prompt.push_str(&crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
         &tool_descs,
@@ -2924,7 +2952,7 @@ pub async fn run(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-    );
+    ));
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
@@ -2991,9 +3019,19 @@ pub async fn run(
             None,
             &[],
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
+
+        // Auto-save agent response to memory
+        if config.memory.auto_save {
+            let agent_key = autosave_memory_key("msg:agent");
+            let _ = mem
+                .store(&agent_key, &response, MemoryCategory::Conversation, None)
+                .await;
+        }
+
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
@@ -3113,6 +3151,7 @@ pub async fn run(
                 None,
                 &[],
                 None,
+                None,
             )
             .await
             {
@@ -3123,6 +3162,15 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+
+            // Auto-save agent response to memory
+            if config.memory.auto_save {
+                let agent_key = autosave_memory_key("msg:agent");
+                let _ = mem
+                    .store(&agent_key, &response, MemoryCategory::Conversation, None)
+                    .await;
+            }
+
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
@@ -3298,7 +3346,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = String::new();
+
+    if let Some(ref custom) = config.agent.system_prompt {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            system_prompt.push_str(trimmed);
+            system_prompt.push_str("\n\n");
+        }
+    }
+
+    system_prompt.push_str(&crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
@@ -3307,7 +3365,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-    );
+    ));
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
@@ -3655,6 +3713,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3702,6 +3761,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3742,6 +3802,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -3870,6 +3931,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3940,6 +4002,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -3996,6 +4059,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
