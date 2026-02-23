@@ -26,9 +26,7 @@ impl EvmProvider {
         self.chain_id
     }
 
-    fn read_provider(
-        &self,
-    ) -> impl Provider {
+    fn read_provider(&self) -> impl Provider {
         ProviderBuilder::new().connect_http(self.rpc_url.clone())
     }
 
@@ -61,10 +59,7 @@ impl EvmProvider {
         Ok(*pending.tx_hash())
     }
 
-    pub async fn get_tx_receipt(
-        &self,
-        hash: TxHash,
-    ) -> anyhow::Result<Option<TransactionReceipt>> {
+    pub async fn get_tx_receipt(&self, hash: TxHash) -> anyhow::Result<Option<TransactionReceipt>> {
         let provider = self.read_provider();
         let receipt = provider
             .get_transaction_receipt(hash)

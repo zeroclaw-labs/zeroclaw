@@ -1930,6 +1930,10 @@ pub struct RuntimeConfig {
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
+
+    /// Wasm runtime settings (used when `kind = "wasm"`).
+    #[serde(default)]
+    pub wasm: WasmRuntimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2002,6 +2006,53 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            wasm: WasmRuntimeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmRuntimeConfig {
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+
+    #[serde(default = "default_wasm_tools_dir")]
+    pub tools_dir: String,
+
+    #[serde(default)]
+    pub allow_workspace_read: bool,
+
+    #[serde(default)]
+    pub allow_workspace_write: bool,
+
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+fn default_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000
+}
+
+fn default_wasm_tools_dir() -> String {
+    "tools/wasm".into()
+}
+
+impl Default for WasmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_wasm_fuel_limit(),
+            tools_dir: default_wasm_tools_dir(),
+            allow_workspace_read: false,
+            allow_workspace_write: false,
+            allowed_hosts: Vec::new(),
         }
     }
 }

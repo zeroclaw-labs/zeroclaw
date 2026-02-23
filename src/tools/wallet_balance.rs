@@ -108,8 +108,7 @@ mod tests {
     fn tool_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = test_store_with_wallet(&tmp);
-        let provider =
-            Arc::new(EvmProvider::connect("https://rpc.sepolia.org", 11155111).unwrap());
+        let provider = Arc::new(EvmProvider::connect("https://rpc.sepolia.org", 11155111).unwrap());
         let tool = WalletBalanceTool::new(store, provider);
         assert_eq!(tool.name(), "wallet_balance");
         assert!(!tool.description().is_empty());

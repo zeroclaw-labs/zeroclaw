@@ -136,6 +136,9 @@ probe-rs = { version = "0.30", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# Wasm runtime (optional, enable with --features runtime-wasm)
+wasmi = { version = "0.40", optional = true }
+
 # EVM wallet (optional, enable with --features wallet)
 alloy-primitives = { version = "1.5", optional = true, default-features = false }
 alloy-signer = { version = "1.7", optional = true, default-features = false }
@@ -165,6 +168,8 @@ sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
 # Backward-compatible alias for older invocations
 landlock = ["sandbox-landlock"]
+# runtime-wasm = Wasm sandbox runtime (adds wasmi for in-process WASM tool execution)
+runtime-wasm = ["dep:wasmi"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG

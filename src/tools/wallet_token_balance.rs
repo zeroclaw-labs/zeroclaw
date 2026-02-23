@@ -57,21 +57,21 @@ impl Tool for WalletTokenBalanceTool {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
 
-        let account: Address =
-            if let Some(addr_str) = args.get("address").and_then(|v| v.as_str()) {
-                addr_str
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("Invalid address: {e}"))?
-            } else {
-                let addr_str = self
-                    .store
-                    .address()
-                    .map_err(|e| anyhow::anyhow!("No wallet available: {e}"))?;
-                addr_str
-                    .as_str()
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("Invalid wallet address: {e}"))?
-            };
+        let account: Address = if let Some(addr_str) = args.get("address").and_then(|v| v.as_str())
+        {
+            addr_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid address: {e}"))?
+        } else {
+            let addr_str = self
+                .store
+                .address()
+                .map_err(|e| anyhow::anyhow!("No wallet available: {e}"))?;
+            addr_str
+                .as_str()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid wallet address: {e}"))?
+        };
 
         let balance_data = self
             .provider
@@ -143,8 +143,7 @@ mod tests {
     fn tool_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = test_store_with_wallet(&tmp);
-        let provider =
-            Arc::new(EvmProvider::connect("https://rpc.sepolia.org", 11155111).unwrap());
+        let provider = Arc::new(EvmProvider::connect("https://rpc.sepolia.org", 11155111).unwrap());
         let tool = WalletTokenBalanceTool::new(store, provider);
         assert_eq!(tool.name(), "wallet_token_balance");
         assert!(!tool.description().is_empty());
@@ -156,8 +155,7 @@ mod tests {
     async fn missing_token_address_rejection() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = test_store_with_wallet(&tmp);
-        let provider =
-            Arc::new(EvmProvider::connect("https://rpc.sepolia.org", 11155111).unwrap());
+        let provider = Arc::new(EvmProvider::connect("https://rpc.sepolia.org", 11155111).unwrap());
         let tool = WalletTokenBalanceTool::new(store, provider);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());

@@ -12,17 +12,17 @@ pub mod policy;
 pub mod secrets;
 pub mod traits;
 
+pub use audit::AuditLogger;
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType};
-pub use audit::AuditLogger;
 pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use secrets::SecretStore;
-pub use traits::Sandbox;
 #[allow(unused_imports)]
 pub use traits::NoopSandbox;
+pub use traits::Sandbox;
 
 #[cfg(test)]
 mod tests {

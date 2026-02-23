@@ -977,22 +977,20 @@ pub fn build_system_prompt(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (inline content for immediate use) ───────────
+    // ── 3. Skills (compact catalog, loaded on demand) ──────────
     if !skills.is_empty() {
         prompt.push_str("## Available Skills\n\n");
         prompt.push_str(
-            "Skills extend your capabilities. Follow the instructions in each skill to use them.\n\n",
+            "Skills are loaded on demand. Read the skill's SKILL.md for full instructions.\n\n",
         );
         for skill in skills {
-            let _ = writeln!(prompt, "### {} (v{})", skill.name, skill.version);
-            let _ = writeln!(prompt, "{}\n", skill.description);
-            // Include full skill instructions inline
-            for p in &skill.prompts {
-                prompt.push_str(p);
-                prompt.push('\n');
-            }
-            prompt.push('\n');
+            let _ = writeln!(
+                prompt,
+                "- **{}** (v{}): {}",
+                skill.name, skill.version, skill.description
+            );
         }
+        prompt.push('\n');
     }
 
     // ── 4. Workspace ────────────────────────────────────────────
@@ -2898,16 +2896,12 @@ mod tests {
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
 
-        assert!(prompt.contains("<available_skills>"), "missing skills XML");
-        assert!(prompt.contains("<name>code-review</name>"));
-        assert!(prompt.contains("<description>Review code for bugs</description>"));
-        assert!(prompt.contains("SKILL.md</location>"));
         assert!(
-            prompt.contains("loaded on demand"),
-            "should mention on-demand loading"
+            prompt.contains("Available Skills"),
+            "missing skills section"
         );
-        // Full prompt content should NOT be dumped
-        assert!(!prompt.contains("Long prompt content that should NOT appear"));
+        assert!(prompt.contains("code-review"));
+        assert!(prompt.contains("Review code for bugs"));
     }
 
     #[test]

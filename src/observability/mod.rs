@@ -1,3 +1,4 @@
+pub mod health;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -6,6 +7,8 @@ pub mod prometheus;
 pub mod traits;
 pub mod verbose;
 
+#[allow(unused_imports)]
+pub use self::health::SelfHealthObserver;
 pub use self::log::LogObserver;
 pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;

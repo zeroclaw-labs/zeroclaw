@@ -30,11 +30,11 @@ pub mod soul_replicate;
 pub mod soul_status;
 pub mod traits;
 #[cfg(feature = "wallet")]
+pub mod wallet_balance;
+#[cfg(feature = "wallet")]
 pub mod wallet_info;
 #[cfg(feature = "wallet")]
 pub mod wallet_pay;
-#[cfg(feature = "wallet")]
-pub mod wallet_balance;
 #[cfg(feature = "wallet")]
 pub mod wallet_send;
 #[cfg(feature = "wallet")]
@@ -76,15 +76,15 @@ pub use soul_reflect::SoulReflectTool;
 pub use soul_replicate::SoulReplicateTool;
 pub use soul_status::SoulStatusTool;
 pub use traits::Tool;
-pub use traits::ToolSpec;
 #[allow(unused_imports)]
 pub use traits::ToolResult;
+pub use traits::ToolSpec;
+#[cfg(feature = "wallet")]
+pub use wallet_balance::WalletBalanceTool;
 #[cfg(feature = "wallet")]
 pub use wallet_info::WalletInfoTool;
 #[cfg(feature = "wallet")]
 pub use wallet_pay::WalletPayTool;
-#[cfg(feature = "wallet")]
-pub use wallet_balance::WalletBalanceTool;
 #[cfg(feature = "wallet")]
 pub use wallet_send::WalletSendTool;
 #[cfg(feature = "wallet")]
@@ -168,9 +168,12 @@ pub fn all_tools_with_runtime(
 ) -> Vec<Box<dyn Tool>> {
     let sandbox = Some(crate::security::create_sandbox(&root_config.security));
     let audit = if root_config.security.audit.enabled {
-        AuditLogger::new(root_config.security.audit.clone(), workspace_dir.to_path_buf())
-            .ok()
-            .map(Arc::new)
+        AuditLogger::new(
+            root_config.security.audit.clone(),
+            workspace_dir.to_path_buf(),
+        )
+        .ok()
+        .map(Arc::new)
     } else {
         None
     };

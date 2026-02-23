@@ -930,12 +930,20 @@ pub(crate) async fn run_tool_call_loop(
 
         if let Some(tracker) = cost_tracker {
             match (**tracker).lock().check_budget(0.0) {
-                Ok(cost::BudgetCheck::Exceeded { current_usd, limit_usd, period }) => {
+                Ok(cost::BudgetCheck::Exceeded {
+                    current_usd,
+                    limit_usd,
+                    period,
+                }) => {
                     anyhow::bail!(
                         "Budget exceeded: ${current_usd:.4} / ${limit_usd:.4} ({period:?})"
                     );
                 }
-                Ok(cost::BudgetCheck::Warning { current_usd, limit_usd, period }) => {
+                Ok(cost::BudgetCheck::Warning {
+                    current_usd,
+                    limit_usd,
+                    period,
+                }) => {
                     tracing::warn!(
                         current = current_usd,
                         limit = limit_usd,
@@ -1004,13 +1012,15 @@ pub(crate) async fn run_tool_call_loop(
                         let (input_tokens, output_tokens) = if let Some(ref u) = resp.usage {
                             (u.input_tokens, u.output_tokens)
                         } else {
-                            let input_est = history.iter().map(|m| m.content.len() as u64).sum::<u64>() / 4;
+                            let input_est =
+                                history.iter().map(|m| m.content.len() as u64).sum::<u64>() / 4;
                             let output_est = resp.text_or_empty().len() as u64 / 4;
                             (input_est, output_est)
                         };
                         let empty_prices = std::collections::HashMap::new();
                         let prices = model_prices.unwrap_or(&empty_prices);
-                        let (input_price, output_price) = lookup_model_prices(&effective_model, prices);
+                        let (input_price, output_price) =
+                            lookup_model_prices(&effective_model, prices);
                         let usage = TokenUsage::new(
                             &effective_model,
                             input_tokens,
@@ -1345,8 +1355,7 @@ pub async fn run(
                     );
                     manager.set_constitution(crate::soul::Constitution::default());
                     let manager = Arc::new(Mutex::new(manager));
-                    tools_registry
-                        .push(Box::new(crate::tools::SoulReplicateTool::new(manager)));
+                    tools_registry.push(Box::new(crate::tools::SoulReplicateTool::new(manager)));
                     tracing::info!("Soul reflect + replicate tools initialized");
                 }
                 Err(e) => {
@@ -1855,8 +1864,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
                     );
                     manager.set_constitution(crate::soul::Constitution::default());
                     let manager = Arc::new(Mutex::new(manager));
-                    tools_registry
-                        .push(Box::new(crate::tools::SoulReplicateTool::new(manager)));
+                    tools_registry.push(Box::new(crate::tools::SoulReplicateTool::new(manager)));
                     tracing::info!("Soul reflect + replicate tools initialized");
                 }
                 Err(e) => {

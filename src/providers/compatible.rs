@@ -1027,7 +1027,11 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls, usage: None })
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            usage: None,
+        })
     }
 
     async fn chat(

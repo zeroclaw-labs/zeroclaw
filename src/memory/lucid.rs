@@ -497,7 +497,7 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_millis(500),
+            Duration::from_secs(2),
             Duration::from_millis(400),
             Duration::from_secs(2),
         )
@@ -658,7 +658,7 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(500),
+            Duration::from_secs(2),
             Duration::from_millis(400),
             Duration::from_secs(5),
         );

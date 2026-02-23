@@ -14,7 +14,8 @@ pub use schema::{
     ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
     SecretsConfig, SecurityConfig, SlackConfig, SoulConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, SurvivalThresholdsConfig, TelegramConfig, TierModelConfig,
-    TreasuryConfig, TunnelConfig, VoiceConfig, WalletConfig, WebSearchConfig, WebhookConfig,
+    TreasuryConfig, TunnelConfig, VoiceConfig, WalletConfig, WasmRuntimeConfig, WebSearchConfig,
+    WebhookConfig,
 };
 
 #[cfg(test)]

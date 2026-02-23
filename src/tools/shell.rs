@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::{AuditLogger, SecurityPolicy, Sandbox};
+use crate::security::{AuditLogger, Sandbox, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -31,7 +31,12 @@ impl ShellTool {
         audit: Option<Arc<AuditLogger>>,
         sandbox: Option<Arc<dyn Sandbox>>,
     ) -> Self {
-        Self { security, runtime, audit, sandbox }
+        Self {
+            security,
+            runtime,
+            audit,
+            sandbox,
+        }
     }
 }
 
@@ -175,7 +180,15 @@ impl Tool for ShellTool {
 
         if let Some(ref logger) = self.audit {
             let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let _ = logger.log_command("tool", command, "medium", approved, true, tool_result.success, elapsed_ms);
+            let _ = logger.log_command(
+                "tool",
+                command,
+                "medium",
+                approved,
+                true,
+                tool_result.success,
+                elapsed_ms,
+            );
         }
 
         Ok(tool_result)
@@ -202,19 +215,34 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]
@@ -226,7 +254,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -238,7 +271,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
@@ -247,7 +285,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::ReadOnly),
+            test_runtime(),
+            None,
+            None,
+        );
         let result = tool.execute(json!({"command": "ls"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
@@ -255,7 +298,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
@@ -263,14 +311,24 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         let result = tool.execute(json!({"command": 123})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            None,
+            None,
+        );
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
