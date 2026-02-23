@@ -2909,8 +2909,12 @@ pub struct WatiConfig {
     /// Allowed phone numbers (E.164 format) or "*" for all.
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
-    /// Shared secret for webhook authentication.
-    /// When set, incoming webhooks must include a valid `X-Webhook-Secret` header.
+    /// Shared secret for webhook authentication (`X-Webhook-Secret` header).
+    /// Default: unset (`None`) — no verification, preserving backward compatibility.
+    /// When set, incoming WATI webhooks must include a matching `X-Webhook-Secret`
+    /// header; requests without a valid header are rejected with 401.
+    /// Rollback: remove the key or set to `None` to revert to unauthenticated mode.
+    /// Env override: `ZEROCLAW_WATI_WEBHOOK_SECRET` (takes priority over this field).
     #[serde(default)]
     pub webhook_secret: Option<String>,
 }
