@@ -818,7 +818,6 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "xai" | "grok" => vec!["XAI_API_KEY"],
         "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
-        "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
@@ -878,6 +877,30 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     }
 
     None
+}
+
+/// Returns true if the provider can resolve any credential from the given override and/or
+/// its supported environment/cached sources.
+///
+/// This is intended for UX/status surfaces (e.g. dashboard) to reflect runtime-configured
+/// credentials without leaking secret values.
+pub(crate) fn provider_credential_available(name: &str, credential_override: Option<&str>) -> bool {
+    if is_qwen_oauth_alias(name) {
+        return resolve_qwen_oauth_context(credential_override)
+            .credential
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+
+    if matches!(name, "gemini" | "google" | "google-gemini") {
+        if resolve_provider_credential(name, credential_override).is_some() {
+            return true;
+        }
+
+        return gemini::GeminiProvider::has_any_auth();
+    }
+
+    resolve_provider_credential(name, credential_override).is_some()
 }
 
 fn parse_custom_provider_url(
@@ -1095,9 +1118,6 @@ fn create_provider_with_url_and_options(
         ))),
         "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
-        ))),
-        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
         ))),
         "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
@@ -1622,12 +1642,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "fireworks",
             display_name: "Fireworks AI",
             aliases: &["fireworks-ai"],
-            local: false,
-        },
-        ProviderInfo {
-            name: "novita",
-            display_name: "Novita AI",
-            aliases: &[],
             local: false,
         },
         ProviderInfo {
@@ -2250,11 +2264,6 @@ mod tests {
     }
 
     #[test]
-    fn factory_novita() {
-        assert!(create_provider("novita", Some("key")).is_ok());
-    }
-
-    #[test]
     fn factory_perplexity() {
         assert!(create_provider("perplexity", Some("key")).is_ok());
     }
@@ -2598,7 +2607,6 @@ mod tests {
             "deepseek",
             "together",
             "fireworks",
-            "novita",
             "perplexity",
             "cohere",
             "copilot",
