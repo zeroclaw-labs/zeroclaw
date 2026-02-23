@@ -12,7 +12,7 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
-use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
+use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel};
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -62,6 +62,10 @@ fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String 
 
 fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("wati_{}_{}", msg.sender, msg.id)
 }
 
 fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
@@ -295,6 +299,7 @@ pub struct AppState {
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    pub wati: Option<Arc<WatiChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
@@ -474,6 +479,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // WATI channel (if configured)
+    let wati_channel: Option<Arc<WatiChannel>> =
+        config.channels_config.wati.as_ref().map(|wati_cfg| {
+            Arc::new(WatiChannel::new(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
+            ))
+        });
+
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
         config.channels_config.nextcloud_talk.as_ref().map(|nc| {
@@ -563,6 +579,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if linq_channel.is_some() {
         println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if wati_channel.is_some() {
+        println!("  GET  /wati      — WATI webhook verification");
+        println!("  POST /wati      — WATI message webhook");
+    }
     if nextcloud_talk_channel.is_some() {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
     }
@@ -616,6 +636,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
+        wati: wati_channel,
         observer: broadcast_observer,
         tools_registry,
         cost_tracker,
@@ -637,6 +658,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/wati", get(handle_wati_verify))
+        .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
@@ -1293,6 +1316,101 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// GET /wati — WATI webhook verification (echoes hub.challenge)
+async fn handle_wati_verify(
+    State(state): State<AppState>,
+    Query(params): Query<WatiVerifyQuery>,
+) -> impl IntoResponse {
+    if state.wati.is_none() {
+        return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
+    }
+
+    // WATI may use Meta-style webhook verification; echo the challenge
+    if let Some(challenge) = params.challenge {
+        tracing::info!("WATI webhook verified successfully");
+        return (StatusCode::OK, challenge);
+    }
+
+    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WatiVerifyQuery {
+    #[serde(rename = "hub.challenge")]
+    pub challenge: Option<String>,
+}
+
+/// POST /wati — incoming WATI WhatsApp message webhook
+async fn handle_wati_webhook(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref wati) = state.wati else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "WATI not configured"})),
+        );
+    };
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = wati.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "WATI message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = wati_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Call the LLM
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
+            Ok(response) => {
+                // Send reply via WATI
+                if let Err(e) = wati
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send WATI reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for WATI message: {e:#}");
+                let _ = wati
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
 async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
@@ -1472,6 +1590,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -1885,6 +2004,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -1948,6 +2068,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2023,6 +2144,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2070,6 +2192,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2122,6 +2245,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2179,6 +2303,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,

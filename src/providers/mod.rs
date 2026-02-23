@@ -818,6 +818,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "xai" | "grok" => vec!["XAI_API_KEY"],
         "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
+        "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
@@ -1094,6 +1095,9 @@ fn create_provider_with_url_and_options(
         ))),
         "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
+        ))),
+        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
         ))),
         "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
@@ -1618,6 +1622,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "fireworks",
             display_name: "Fireworks AI",
             aliases: &["fireworks-ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "novita",
+            display_name: "Novita AI",
+            aliases: &[],
             local: false,
         },
         ProviderInfo {
@@ -2240,6 +2250,11 @@ mod tests {
     }
 
     #[test]
+    fn factory_novita() {
+        assert!(create_provider("novita", Some("key")).is_ok());
+    }
+
+    #[test]
     fn factory_perplexity() {
         assert!(create_provider("perplexity", Some("key")).is_ok());
     }
@@ -2583,6 +2598,7 @@ mod tests {
             "deepseek",
             "together",
             "fireworks",
+            "novita",
             "perplexity",
             "cohere",
             "copilot",

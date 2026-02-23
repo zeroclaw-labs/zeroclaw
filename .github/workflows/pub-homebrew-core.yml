@@ -85,8 +85,8 @@ jobs:
               id: patch_formula
               shell: bash
               env:
-                  HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
-                  GH_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
+                  HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
+                  GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
               run: |
                   set -euo pipefail
 
@@ -131,10 +131,19 @@ jobs:
                   fi
 
                   if [[ "$DRY_RUN" == "false" ]]; then
-                    git -C "$repo_dir" remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-                    git -C "$repo_dir" fetch --depth=1 upstream master
+                    if git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; then
+                      git -C "$repo_dir" remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+                    else
+                      git -C "$repo_dir" remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+                    fi
+                    if git -C "$repo_dir" ls-remote --exit-code --heads upstream main >/dev/null 2>&1; then
+                      upstream_ref="main"
+                    else
+                      upstream_ref="master"
+                    fi
+                    git -C "$repo_dir" fetch --depth=1 upstream "$upstream_ref"
                     branch_name="zeroclaw-${RELEASE_TAG}-${GITHUB_RUN_ID}"
-                    git -C "$repo_dir" checkout -B "$branch_name" upstream/master
+                    git -C "$repo_dir" checkout -B "$branch_name" "upstream/$upstream_ref"
                     echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
                   fi
 
@@ -163,7 +172,7 @@ jobs:
               if: ${{ inputs.dry_run == false }}
               shell: bash
               env:
-                  GH_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
+                  GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
               run: |
                   set -euo pipefail
 
@@ -196,7 +205,7 @@ jobs:
 
                   gh pr create \
                     --repo "$UPSTREAM_REPO" \
-                    --base master \
+                    --base main \
                     --head "${fork_owner}:${branch_name}" \
                     --title "$pr_title" \
                     --body "$pr_body"

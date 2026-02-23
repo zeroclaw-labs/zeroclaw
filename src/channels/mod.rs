@@ -35,6 +35,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -61,6 +62,7 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -2809,6 +2811,18 @@ fn collect_configured_channels(
                 lq.api_token.clone(),
                 lq.from_phone.clone(),
                 lq.allowed_senders.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref wati_cfg) = config.channels_config.wati {
+        channels.push(ConfiguredChannel {
+            display_name: "WATI",
+            channel: Arc::new(WatiChannel::new(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
             )),
         });
     }
