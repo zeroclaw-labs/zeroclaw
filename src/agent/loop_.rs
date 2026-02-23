@@ -1010,6 +1010,8 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         // Shell variations (including GLM aliases that map to shell)
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
         | "web_search" => "shell",
+        // Messaging variations
+        "send_message" | "sendmessage" => "message_send",
         // File tool variations
         "fileread" | "file_read" | "readfile" | "read_file" | "file" => "file_read",
         "filewrite" | "file_write" | "writefile" | "write_file" => "file_write",
@@ -1147,10 +1149,20 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
         return None;
     }
 
+    let function_style = body.find('(').and_then(|open| {
+        if body.ends_with(')') && open > 0 {
+            Some((body[..open].trim(), body[open + 1..body.len() - 1].trim()))
+        } else {
+            None
+        }
+    });
+
     // Check attribute-style FIRST: `tool_name key="value" />`
     // Must come before `>` check because `/>` contains `>` and would
     // misparse the tool name in the first branch.
-    let (tool_raw, value_part) = if body.contains("=\"") {
+    let (tool_raw, value_part) = if let Some((tool, args)) = function_style {
+        (tool, args)
+    } else if body.contains("=\"") {
         // Attribute-style: split at first whitespace to get tool name
         let split_pos = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
         let tool = body[..split_pos].trim();
@@ -1190,7 +1202,9 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
                 .rfind(|c: char| c.is_whitespace())
                 .map(|p| p + 1)
                 .unwrap_or(0);
-            let key = rest[key_start..eq_pos].trim();
+            let key = rest[key_start..eq_pos]
+                .trim()
+                .trim_matches(|c: char| c == ',' || c == ';');
             let after_quote = &rest[eq_pos + 2..];
             if let Some(end_quote) = after_quote.find('"') {
                 let value = &after_quote[..end_quote];
@@ -4188,6 +4202,42 @@ I will now call the tool with this payload:
         assert_eq!(
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "pwd"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_call_inline_attributes_with_send_message_alias() {
+        let response = r#"<tool_call>send_message channel="user_channel" message="Hello! How can I assist you today?"</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "message_send");
+        assert_eq!(
+            calls[0].arguments.get("channel").unwrap().as_str().unwrap(),
+            "user_channel"
+        );
+        assert_eq!(
+            calls[0].arguments.get("message").unwrap().as_str().unwrap(),
+            "Hello! How can I assist you today?"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_call_function_style_arguments() {
+        let response = r#"<tool_call>message_send(channel="general", message="test")</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "message_send");
+        assert_eq!(
+            calls[0].arguments.get("channel").unwrap().as_str().unwrap(),
+            "general"
+        );
+        assert_eq!(
+            calls[0].arguments.get("message").unwrap().as_str().unwrap(),
+            "test"
         );
     }
 

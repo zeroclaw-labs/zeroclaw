@@ -1094,10 +1094,7 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            // Providers that require system-prompt merging (e.g. MiniMax) also
-            // reject OpenAI-style `tools` in the request body.  Fall back to
-            // prompt-guided tool calling for those providers.
-            native_tool_calling: !self.merge_system_into_user,
+            native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
         }
     }
