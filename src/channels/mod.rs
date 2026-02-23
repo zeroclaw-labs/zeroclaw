@@ -47,9 +47,10 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+<<<<<<< HEAD
+pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use acp::AcpChannel;
 pub use bluebubbles::BlueBubblesChannel;
-pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -3358,7 +3359,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
+        let Some(rel_start) = message[cursor..].find(&['{', '['][..]) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };

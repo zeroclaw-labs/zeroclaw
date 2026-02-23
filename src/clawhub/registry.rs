@@ -16,8 +16,19 @@ impl Registry {
     pub fn new(config_dir: &Path) -> Self {
         let registry_path = config_dir.join("clawhub_skills.json");
         let registry = if registry_path.exists() {
-            let content = std::fs::read_to_string(&registry_path).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or_default()
+            match std::fs::read_to_string(&registry_path) {
+                Ok(content) => match serde_json::from_str::<ClawHubRegistry>(&content) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse registry at {:?}: {}. Starting fresh.", registry_path, e);
+                        ClawHubRegistry::default()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read registry at {:?}: {}. Starting fresh.", registry_path, e);
+                    ClawHubRegistry::default()
+                }
+            }
         } else {
             ClawHubRegistry::default()
         };
@@ -42,7 +53,9 @@ impl Registry {
         source_url: &str,
     ) -> Result<()> {
         if let Some(existing) = self.registry.skills.iter_mut().find(|s| s.slug == slug) {
+            existing.name = name.to_string();
             existing.version = version.to_string();
+            existing.source_url = source_url.to_string();
             existing.updated_at = Some(chrono::Utc::now().to_rfc3339());
         } else {
             let skill = InstalledSkill {
