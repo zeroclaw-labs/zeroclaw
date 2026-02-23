@@ -3309,6 +3309,29 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
 
+    // Dynamic tool/hook registry for process_message path.
+    let pm_persistence_path = config
+        .workspace_dir
+        .join(".zeroclaw")
+        .join("state")
+        .join("dynamic-registry.json");
+    let pm_build_ctx = crate::tools::dynamic_factories::ToolBuildContext {
+        security: security.clone(),
+        workspace_dir: config.workspace_dir.clone(),
+    };
+    let pm_dynamic_registry = Arc::new(crate::tools::dynamic_registry::DynamicRegistry::new(
+        Vec::new(),
+        config.dynamic_registry.clone(),
+        pm_persistence_path,
+        pm_build_ctx,
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_tools::ManageToolsTool::new(pm_dynamic_registry.clone()),
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_hooks::ManageHooksTool::new(pm_dynamic_registry.clone()),
+    ));
+
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
@@ -3393,6 +3416,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    tool_descs.push((
+        "manage_tools",
+        "Create, remove, enable, or disable dynamic tools at runtime.",
+    ));
+    tool_descs.push((
+        "manage_hooks",
+        "Create, remove, enable, or disable dynamic hooks at runtime.",
+    ));
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
