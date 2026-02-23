@@ -1054,6 +1054,12 @@ pub struct ClawHubConfig {
     /// Auto-update installed clawhub skills on agent start
     #[serde(default)]
     pub auto_update: bool,
+
+    /// Fallback download URL pattern for skills not on GitHub.
+    /// Use `{slug}` placeholder for skill name.
+    /// Example: https://wry-manatee-359.convex.site/api/v1/download?slug={slug}
+    #[serde(default)]
+    pub download_fallback: Option<String>,
 }
 
 fn default_clawhub_url() -> String {

@@ -136,14 +136,24 @@ async fn handle_install(
 
     // Download SKILL.md (try main branch first, then fallback to master)
     let readme_url_master = skill.readme_url_master.as_deref();
-    downloader
+    let download_result = downloader
         .download_skill_with_fallback(
             skill.readme_url.as_deref(),
             readme_url_master,
             &temp_dir,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to download SKILL.md: {}", e))?;
+        .await;
+
+    if let Err(e) = download_result {
+        // If GitHub download fails, provide helpful guidance
+        anyhow::bail!(
+            "Failed to download SKILL.md from GitHub: {}\n\n\
+             This skill may be hosted on ClawHub's backend instead of GitHub.\n\
+             Try installing directly from the website or configure a fallback in [clawhub] config:\n\
+             download_fallback = \"https://your-convex-url.convex.site/api/v1/download?slug={{slug}}\"",
+            e
+        );
+    }
     let skill_md = temp_dir.join("SKILL.md");
     println!("  Downloaded from: main or master branch");
 

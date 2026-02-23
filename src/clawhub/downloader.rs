@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -86,6 +87,65 @@ impl SkillDownloader {
         }
 
         anyhow::bail!("No readme_url provided and master branch fallback also failed");
+    }
+
+    /// Download SKILL.md from a zip URL (e.g., ClawHub Convex backend)
+    pub async fn download_skill_from_zip(&self, zip_url: &str, target_dir: &Path) -> Result<()> {
+        let response = self
+            .http_client
+            .get(zip_url)
+            .send()
+            .await
+            .context("Failed to download zip")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            anyhow::bail!("Failed to download zip: HTTP {}", status);
+        }
+
+        let bytes = response.bytes().await.context("Failed to read zip bytes")?;
+
+        // Extract SKILL.md from zip
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor).context("Failed to read zip archive")?;
+
+        std::fs::create_dir_all(target_dir)?;
+
+        if let Ok(mut file) = archive.by_name("SKILL.md") {
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            let skill_md = target_dir.join("SKILL.md");
+            std::fs::write(&skill_md, &content)?;
+            return Ok(());
+        }
+
+        anyhow::bail!("SKILL.md not found in zip");
+    }
+
+    /// Download with zip fallback - tries GitHub first, then falls back to zip URL
+    pub async fn download_skill_with_zip_fallback(
+        &self,
+        readme_url: Option<&str>,
+        readme_url_master: Option<&str>,
+        zip_fallback_url: Option<&str>,
+        target_dir: &Path,
+    ) -> Result<()> {
+        // Try GitHub first
+        let github_result = self
+            .download_skill_with_fallback(readme_url, readme_url_master, target_dir)
+            .await;
+
+        if github_result.is_ok() {
+            return Ok(());
+        }
+
+        // Fall back to zip URL if provided
+        if let Some(url) = zip_fallback_url {
+            return self.download_skill_from_zip(url, target_dir).await;
+        }
+
+        // No fallback available
+        github_result
     }
 }
 
