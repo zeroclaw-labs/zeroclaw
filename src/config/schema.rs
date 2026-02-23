@@ -13293,6 +13293,7 @@ provider_api = "not-a-real-mode"
         let default_workspace_dir = default_config_dir.join("workspace");
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         fs::create_dir_all(&default_config_dir).await.unwrap();
@@ -13435,6 +13436,7 @@ provider_api = "not-a-real-mode"
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         let (config_dir, resolved_workspace_dir, source) =
@@ -13458,6 +13460,7 @@ provider_api = "not-a-real-mode"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -13485,6 +13488,7 @@ provider_api = "not-a-real-mode"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -13523,6 +13527,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -13557,6 +13562,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
         std::env::remove_var("ZEROCLAW_WORKSPACE");
 
         persist_active_workspace_config_dir(&custom_config_dir)
@@ -13595,6 +13601,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
@@ -13715,7 +13722,7 @@ default_model = "legacy-model"
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
-    #[test]
+    #[tokio::test]
     async fn env_override_empty_values_ignored() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
