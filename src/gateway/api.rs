@@ -10,6 +10,8 @@ use axum::{
 };
 use serde::Deserialize;
 
+const MASKED_SECRET: &str = "***MASKED***";
+
 // ── Bearer token auth extractor ─────────────────────────────────
 
 /// Extract and validate bearer token from Authorization header.
@@ -111,8 +113,9 @@ pub async fn handle_api_config_get(
 
     let config = state.config.lock().clone();
 
-    // Serialize to TOML, then mask sensitive fields
-    let toml_str = match toml::to_string_pretty(&config) {
+    // Serialize to TOML after masking sensitive fields.
+    let masked_config = mask_sensitive_fields(&config);
+    let toml_str = match toml::to_string_pretty(&masked_config) {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -123,12 +126,9 @@ pub async fn handle_api_config_get(
         }
     };
 
-    // Mask api_key in the TOML output
-    let masked = mask_sensitive_fields(&toml_str);
-
     Json(serde_json::json!({
         "format": "toml",
-        "content": masked,
+        "content": toml_str,
     }))
     .into_response()
 }
@@ -144,7 +144,7 @@ pub async fn handle_api_config_put(
     }
 
     // Parse the incoming TOML
-    let new_config: crate::config::Config = match toml::from_str(&body) {
+    let incoming: crate::config::Config = match toml::from_str(&body) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -154,6 +154,17 @@ pub async fn handle_api_config_put(
                 .into_response();
         }
     };
+
+    let current_config = state.config.lock().clone();
+    let new_config = hydrate_config_for_save(incoming, &current_config);
+
+    if let Err(e) = new_config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid config: {e}")})),
+        )
+            .into_response();
+    }
 
     // Save to disk
     if let Err(e) = new_config.save().await {
@@ -509,27 +520,310 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn mask_sensitive_fields(toml_str: &str) -> String {
-    let mut output = String::with_capacity(toml_str.len());
-    for line in toml_str.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("api_key")
-            || trimmed.starts_with("bot_token")
-            || trimmed.starts_with("access_token")
-            || trimmed.starts_with("secret")
-            || trimmed.starts_with("app_secret")
-            || trimmed.starts_with("signing_secret")
-        {
-            if let Some(eq_pos) = line.find('=') {
-                output.push_str(&line[..eq_pos + 1]);
-                output.push_str(" \"***MASKED***\"");
-            } else {
-                output.push_str(line);
-            }
-        } else {
-            output.push_str(line);
-        }
-        output.push('\n');
+fn is_masked_secret(value: &str) -> bool {
+    value == MASKED_SECRET
+}
+
+fn mask_optional_secret(value: &mut Option<String>) {
+    if value.is_some() {
+        *value = Some(MASKED_SECRET.to_string());
     }
-    output
+}
+
+fn mask_required_secret(value: &mut String) {
+    if !value.is_empty() {
+        *value = MASKED_SECRET.to_string();
+    }
+}
+
+fn mask_vec_secrets(values: &mut [String]) {
+    for value in values.iter_mut() {
+        if !value.is_empty() {
+            *value = MASKED_SECRET.to_string();
+        }
+    }
+}
+
+fn restore_optional_secret(value: &mut Option<String>, current: &Option<String>) {
+    if value.as_deref().is_some_and(is_masked_secret) {
+        *value = current.clone();
+    }
+}
+
+fn restore_required_secret(value: &mut String, current: &str) {
+    if is_masked_secret(value) {
+        *value = current.to_string();
+    }
+}
+
+fn restore_vec_secrets(values: &mut [String], current: &[String]) {
+    for (idx, value) in values.iter_mut().enumerate() {
+        if is_masked_secret(value) {
+            if let Some(existing) = current.get(idx) {
+                *value = existing.clone();
+            }
+        }
+    }
+}
+
+fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Config {
+    let mut masked = config.clone();
+
+    mask_optional_secret(&mut masked.api_key);
+    mask_vec_secrets(&mut masked.reliability.api_keys);
+    mask_optional_secret(&mut masked.composio.api_key);
+    mask_optional_secret(&mut masked.browser.computer_use.api_key);
+    mask_optional_secret(&mut masked.web_search.brave_api_key);
+    mask_optional_secret(&mut masked.storage.provider.config.db_url);
+
+    for agent in masked.agents.values_mut() {
+        mask_optional_secret(&mut agent.api_key);
+    }
+
+    if let Some(telegram) = masked.channels_config.telegram.as_mut() {
+        mask_required_secret(&mut telegram.bot_token);
+    }
+    if let Some(discord) = masked.channels_config.discord.as_mut() {
+        mask_required_secret(&mut discord.bot_token);
+    }
+    if let Some(slack) = masked.channels_config.slack.as_mut() {
+        mask_required_secret(&mut slack.bot_token);
+        mask_optional_secret(&mut slack.app_token);
+    }
+    if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
+        mask_required_secret(&mut mattermost.bot_token);
+    }
+    if let Some(webhook) = masked.channels_config.webhook.as_mut() {
+        mask_optional_secret(&mut webhook.secret);
+    }
+    if let Some(matrix) = masked.channels_config.matrix.as_mut() {
+        mask_required_secret(&mut matrix.access_token);
+    }
+    if let Some(whatsapp) = masked.channels_config.whatsapp.as_mut() {
+        mask_optional_secret(&mut whatsapp.access_token);
+        mask_optional_secret(&mut whatsapp.app_secret);
+        mask_optional_secret(&mut whatsapp.verify_token);
+    }
+    if let Some(linq) = masked.channels_config.linq.as_mut() {
+        mask_required_secret(&mut linq.api_token);
+        mask_optional_secret(&mut linq.signing_secret);
+    }
+    if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
+        mask_required_secret(&mut nextcloud.app_token);
+        mask_optional_secret(&mut nextcloud.webhook_secret);
+    }
+    if let Some(irc) = masked.channels_config.irc.as_mut() {
+        mask_optional_secret(&mut irc.server_password);
+        mask_optional_secret(&mut irc.nickserv_password);
+        mask_optional_secret(&mut irc.sasl_password);
+    }
+    if let Some(lark) = masked.channels_config.lark.as_mut() {
+        mask_required_secret(&mut lark.app_secret);
+        mask_optional_secret(&mut lark.encrypt_key);
+        mask_optional_secret(&mut lark.verification_token);
+    }
+    if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
+        mask_required_secret(&mut dingtalk.client_secret);
+    }
+    if let Some(qq) = masked.channels_config.qq.as_mut() {
+        mask_required_secret(&mut qq.app_secret);
+    }
+    if let Some(nostr) = masked.channels_config.nostr.as_mut() {
+        mask_required_secret(&mut nostr.private_key);
+    }
+    if let Some(clawdtalk) = masked.channels_config.clawdtalk.as_mut() {
+        mask_required_secret(&mut clawdtalk.api_key);
+        mask_optional_secret(&mut clawdtalk.webhook_secret);
+    }
+    masked
+}
+
+fn restore_masked_sensitive_fields(
+    incoming: &mut crate::config::Config,
+    current: &crate::config::Config,
+) {
+    restore_optional_secret(&mut incoming.api_key, &current.api_key);
+    restore_vec_secrets(&mut incoming.reliability.api_keys, &current.reliability.api_keys);
+    restore_optional_secret(&mut incoming.composio.api_key, &current.composio.api_key);
+    restore_optional_secret(
+        &mut incoming.browser.computer_use.api_key,
+        &current.browser.computer_use.api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.brave_api_key,
+        &current.web_search.brave_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.storage.provider.config.db_url,
+        &current.storage.provider.config.db_url,
+    );
+
+    for (name, agent) in incoming.agents.iter_mut() {
+        if let Some(current_agent) = current.agents.get(name) {
+            restore_optional_secret(&mut agent.api_key, &current_agent.api_key);
+        }
+    }
+
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.telegram.as_mut(),
+        current.channels_config.telegram.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.discord.as_mut(),
+        current.channels_config.discord.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.slack.as_mut(),
+        current.channels_config.slack.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.app_token, &current_ch.app_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.mattermost.as_mut(),
+        current.channels_config.mattermost.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.webhook.as_mut(),
+        current.channels_config.webhook.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_ch.secret, &current_ch.secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.matrix.as_mut(),
+        current.channels_config.matrix.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.whatsapp.as_mut(),
+        current.channels_config.whatsapp.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+        restore_optional_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
+        restore_optional_secret(&mut incoming_ch.verify_token, &current_ch.verify_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.linq.as_mut(),
+        current.channels_config.linq.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
+        restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.nextcloud_talk.as_mut(),
+        current.channels_config.nextcloud_talk.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.app_token, &current_ch.app_token);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.irc.as_mut(),
+        current.channels_config.irc.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_ch.server_password, &current_ch.server_password);
+        restore_optional_secret(&mut incoming_ch.nickserv_password, &current_ch.nickserv_password);
+        restore_optional_secret(&mut incoming_ch.sasl_password, &current_ch.sasl_password);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.lark.as_mut(),
+        current.channels_config.lark.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
+        restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
+        restore_optional_secret(
+            &mut incoming_ch.verification_token,
+            &current_ch.verification_token,
+        );
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.dingtalk.as_mut(),
+        current.channels_config.dingtalk.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.qq.as_mut(),
+        current.channels_config.qq.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.nostr.as_mut(),
+        current.channels_config.nostr.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.private_key, &current_ch.private_key);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.clawdtalk.as_mut(),
+        current.channels_config.clawdtalk.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.api_key, &current_ch.api_key);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
+    }
+}
+
+fn hydrate_config_for_save(
+    mut incoming: crate::config::Config,
+    current: &crate::config::Config,
+) -> crate::config::Config {
+    restore_masked_sensitive_fields(&mut incoming, current);
+    // These are runtime-computed fields skipped from TOML serialization.
+    incoming.config_path = current.config_path.clone();
+    incoming.workspace_dir = current.workspace_dir.clone();
+    incoming
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
+        let mut cfg = crate::config::Config::default();
+        cfg.api_key = Some("sk-live-123".to_string());
+        cfg.reliability.api_keys = vec!["rk-1".to_string(), "rk-2".to_string()];
+
+        let masked = mask_sensitive_fields(&cfg);
+        let toml = toml::to_string_pretty(&masked).expect("masked config should serialize");
+        let parsed: crate::config::Config =
+            toml::from_str(&toml).expect("masked config should remain valid TOML for Config");
+
+        assert_eq!(parsed.api_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(
+            parsed.reliability.api_keys,
+            vec![MASKED_SECRET.to_string(), MASKED_SECRET.to_string()]
+        );
+    }
+
+    #[test]
+    fn hydrate_config_for_save_restores_masked_secrets_and_paths() {
+        let mut current = crate::config::Config::default();
+        current.config_path = std::path::PathBuf::from("/tmp/current/config.toml");
+        current.workspace_dir = std::path::PathBuf::from("/tmp/current/workspace");
+        current.api_key = Some("real-key".to_string());
+        current.reliability.api_keys = vec!["r1".to_string(), "r2".to_string()];
+
+        let mut incoming = mask_sensitive_fields(&current);
+        incoming.default_model = Some("gpt-4.1-mini".to_string());
+        // Simulate UI changing only one key and keeping the first masked.
+        incoming.reliability.api_keys = vec![MASKED_SECRET.to_string(), "r2-new".to_string()];
+
+        let hydrated = hydrate_config_for_save(incoming, &current);
+
+        assert_eq!(hydrated.config_path, current.config_path);
+        assert_eq!(hydrated.workspace_dir, current.workspace_dir);
+        assert_eq!(hydrated.api_key, current.api_key);
+        assert_eq!(hydrated.default_model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(
+            hydrated.reliability.api_keys,
+            vec!["r1".to_string(), "r2-new".to_string()]
+        );
+    }
 }

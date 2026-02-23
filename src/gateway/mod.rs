@@ -674,7 +674,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/integrations", get(api::handle_api_integrations))
-        .route("/api/doctor", post(api::handle_api_doctor))
+        .route(
+            "/api/doctor",
+            get(api::handle_api_doctor).post(api::handle_api_doctor),
+        )
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
