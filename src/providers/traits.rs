@@ -407,6 +407,33 @@ pub trait Provider: Send + Sync {
         })
     }
 
+    /// Whether provider emits intermediate progress events during `chat()`.
+    ///
+    /// Providers that run subprocess-based inference (e.g., Codex CLI) can
+    /// stream commentary and tool-call events in real-time. When `true`, the
+    /// agent loop will call `chat_with_progress()` instead of `chat()`.
+    fn supports_progress_streaming(&self) -> bool {
+        false
+    }
+
+    /// Structured chat with real-time progress events.
+    ///
+    /// Providers that support progress streaming override this to emit
+    /// intermediate events (commentary, tool names) through `on_progress`
+    /// while the inference runs. The default falls back to `chat()`.
+    ///
+    /// Progress sends are fire-and-forget: a dropped receiver must not
+    /// fail the inference call.
+    async fn chat_with_progress(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        _on_progress: &tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat(request, model, temperature).await
+    }
+
     /// Whether provider supports streaming responses.
     /// Default implementation returns false.
     fn supports_streaming(&self) -> bool {

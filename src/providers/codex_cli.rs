@@ -22,11 +22,13 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
@@ -36,8 +38,10 @@ const MAX_SESSIONS: usize = 256;
 
 /// Provider that delegates inference to the Codex CLI binary via subprocess.
 ///
-/// Maintains an in-memory map of session keys to Codex thread IDs for
-/// session resume across conversation turns.
+/// Maintains a map of session keys to Codex thread IDs for session resume
+/// across conversation turns. Sessions are persisted to disk so they survive
+/// service restarts (the Codex server retains full conversation context
+/// for resumed threads, avoiding misinterpretation from stale memory recall).
 pub struct CodexCliProvider {
     codex_bin: String,
     sandbox_mode: String,
@@ -46,32 +50,75 @@ pub struct CodexCliProvider {
     /// passed via `ChatRequest.session_id` from the channel layer.
     /// Model is stored to invalidate sessions on model change.
     sessions: Mutex<HashMap<String, SessionEntry>>,
+    /// Path to the sessions persistence file. `None` disables persistence.
+    sessions_path: Option<PathBuf>,
 }
 
 /// A stored Codex CLI session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionEntry {
     thread_id: String,
     model: String,
 }
 
 impl CodexCliProvider {
+    /// Resolve the default sessions persistence path.
+    ///
+    /// Uses `ZEROCLAW_CODEX_SESSIONS` env var if set, otherwise falls back to
+    /// `~/.zeroclaw/state/codex-sessions.json`.
+    fn default_sessions_path() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("ZEROCLAW_CODEX_SESSIONS") {
+            if path.is_empty() {
+                return None; // Explicitly disabled.
+            }
+            return Some(PathBuf::from(path));
+        }
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".zeroclaw").join("state").join("codex-sessions.json"))
+    }
+
+    /// Load sessions from a JSON file on disk. Returns empty map on any error.
+    fn load_sessions_from_disk(path: &PathBuf) -> HashMap<String, SessionEntry> {
+        match std::fs::read_to_string(path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
     /// Create a new provider, reading configuration from environment variables.
+    ///
+    /// Loads persisted sessions from disk if available, enabling session resume
+    /// across service restarts.
     pub fn new() -> Self {
+        let sessions_path = Self::default_sessions_path();
+        let sessions = sessions_path
+            .as_ref()
+            .map(Self::load_sessions_from_disk)
+            .unwrap_or_default();
+
+        if !sessions.is_empty() {
+            tracing::info!(
+                count = sessions.len(),
+                "Codex CLI: loaded persisted sessions from disk"
+            );
+        }
+
         Self {
             codex_bin: std::env::var("ZEROCLAW_CODEX_BIN").unwrap_or_else(|_| "codex".into()),
             sandbox_mode: std::env::var("ZEROCLAW_CODEX_SANDBOX")
                 .unwrap_or_else(|_| "read-only".into()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(sessions),
+            sessions_path,
         }
     }
 
-    /// Create a provider with a custom binary path (for testing).
+    /// Create a provider with a custom binary path (for testing, no persistence).
     pub fn new_for_test(codex_bin: impl Into<String>) -> Self {
         Self {
             codex_bin: codex_bin.into(),
             sandbox_mode: "read-only".into(),
             sessions: Mutex::new(HashMap::new()),
+            sessions_path: None,
         }
     }
 
@@ -122,16 +169,127 @@ impl CodexCliProvider {
         Ok((stdout, true))
     }
 
-    /// Store a session entry, evicting oldest if at capacity.
-    fn store_session(&self, key: &str, entry: SessionEntry) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(key) {
-            // Evict an arbitrary entry to stay bounded.
-            if let Some(oldest_key) = sessions.keys().next().cloned() {
-                sessions.remove(&oldest_key);
+    /// Run a Codex CLI subprocess with streaming stdout, emitting progress
+    /// events through the sender as they arrive.
+    ///
+    /// Returns (stdout_collected, exit_success) just like `run_codex`, but
+    /// also sends formatted intermediate events to `on_progress`.
+    async fn run_codex_streaming(
+        &self,
+        args: &[String],
+        prompt: &str,
+        on_progress: &tokio::sync::mpsc::Sender<String>,
+    ) -> Result<(String, bool)> {
+        let mut child = Command::new(&self.codex_bin)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Failed to spawn Codex CLI binary '{}'. Is it installed and in PATH?",
+                    self.codex_bin
+                )
+            })?;
+
+        // Write prompt to stdin.
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("Failed to write prompt to Codex CLI stdin")?;
+        }
+
+        // Drain stderr concurrently to prevent pipe blocking.
+        let stderr = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let Some(stderr) = stderr else {
+                return String::new();
+            };
+            let mut buf = String::new();
+            let _ =
+                tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(stderr), &mut buf)
+                    .await;
+            buf
+        });
+
+        // Read stdout line by line, emit progress for intermediate events.
+        let mut collected = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                // Collect for final parsing.
+                collected.push_str(&line);
+                collected.push('\n');
+
+                // Try to parse and emit progress.
+                if let Some(progress) = format_codex_event(&line) {
+                    let _ = on_progress.send(progress).await;
+                }
             }
         }
-        sessions.insert(key.to_string(), entry);
+
+        // Wait for stderr drain.
+        let stderr_output = stderr_task.await.unwrap_or_default();
+
+        // Wait for process exit and check status.
+        let status = child.wait().await.context("Failed to wait for Codex CLI")?;
+
+        if !status.success() {
+            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                code,
+                stderr = %stderr_output.chars().take(200).collect::<String>(),
+                "Codex CLI exited with non-zero status"
+            );
+            return Ok((collected, false));
+        }
+
+        Ok((collected, true))
+    }
+
+    /// Persist current session map to disk atomically (write-then-rename).
+    /// No-op if persistence is disabled.
+    fn persist_sessions(&self) {
+        let Some(path) = &self.sessions_path else {
+            return;
+        };
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(data) = serde_json::to_string(&*sessions) else {
+            return;
+        };
+        drop(sessions);
+
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Atomic write: tmp file then rename.
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, data.as_bytes()) {
+            tracing::warn!(error = %e, "Failed to write codex sessions file");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::warn!(error = %e, "Failed to rename codex sessions file");
+        }
+    }
+
+    /// Store a session entry, evicting oldest if at capacity.
+    fn store_session(&self, key: &str, entry: SessionEntry) {
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(key) {
+                // Evict an arbitrary entry to stay bounded.
+                if let Some(oldest_key) = sessions.keys().next().cloned() {
+                    sessions.remove(&oldest_key);
+                }
+            }
+            sessions.insert(key.to_string(), entry);
+        }
+        self.persist_sessions();
     }
 
     /// Look up a session entry for the given key and model.
@@ -149,8 +307,11 @@ impl CodexCliProvider {
 
     /// Clear a session entry (e.g., on resume failure).
     fn clear_session(&self, key: &str) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.remove(key);
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.remove(key);
+        }
+        self.persist_sessions();
     }
 
     /// Run a fresh codex exec with the given prompt. Returns (response_text, thread_id).
@@ -177,6 +338,43 @@ impl CodexCliProvider {
     ) -> Result<String> {
         let args = build_codex_resume_args(thread_id, model, &self.sandbox_mode);
         let (stdout, success) = self.run_codex(&args, prompt).await?;
+
+        if !success {
+            bail!("Codex CLI resume exited with non-zero status");
+        }
+
+        extract_last_agent_message(&stdout)
+    }
+
+    /// Run a fresh codex exec with streaming progress. Returns (response_text, thread_id).
+    async fn exec_fresh_streaming(
+        &self,
+        prompt: &str,
+        model: &str,
+        on_progress: &tokio::sync::mpsc::Sender<String>,
+    ) -> Result<(String, Option<String>)> {
+        let args = build_codex_exec_args(model, &self.sandbox_mode);
+        let (stdout, success) = self.run_codex_streaming(&args, prompt, on_progress).await?;
+
+        if !success {
+            bail!("Codex CLI exited with non-zero status");
+        }
+
+        let thread_id = extract_thread_id(&stdout);
+        let text = extract_last_agent_message(&stdout)?;
+        Ok((text, thread_id))
+    }
+
+    /// Resume an existing codex session with streaming progress.
+    async fn exec_resume_streaming(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        model: &str,
+        on_progress: &tokio::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let args = build_codex_resume_args(thread_id, model, &self.sandbox_mode);
+        let (stdout, success) = self.run_codex_streaming(&args, prompt, on_progress).await?;
 
         if !success {
             bail!("Codex CLI resume exited with non-zero status");
@@ -369,6 +567,74 @@ fn serialize_history(messages: &[ChatMessage]) -> String {
     parts.join("\n\n")
 }
 
+/// Sanitize text for safe display in Telegram draft messages.
+///
+/// Strips HTML entities to prevent formatting issues in draft updates.
+fn sanitize_for_draft(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .chars()
+        .take(200) // Limit per-event progress length.
+        .collect()
+}
+
+/// Format a Codex CLI JSONL event as a human-readable progress string.
+///
+/// Returns `Some(formatted_message)` for events worth showing to the user,
+/// `None` for internal/ignored events. Safe gating: only whitelisted event
+/// shapes produce output.
+pub(crate) fn format_codex_event(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let event: Value = serde_json::from_str(line).ok()?;
+    let event_type = event.get("type")?.as_str()?;
+
+    match event_type {
+        "event_msg" => {
+            let payload = event.get("payload")?;
+
+            // Skip internal metrics and prompt echoes.
+            if let Some(
+                "token_count" | "user_message" | "task_started" | "task_complete",
+            ) = payload.get("type").and_then(Value::as_str)
+            {
+                return None;
+            }
+
+            // Extract human-readable commentary from the msg/message field.
+            let msg = payload
+                .get("msg")
+                .or_else(|| payload.get("message"))
+                .and_then(Value::as_str)?;
+
+            // Skip messages that look like structured JSON (not commentary).
+            if msg.starts_with('{') {
+                return None;
+            }
+
+            Some(format!("💬 {}\n", sanitize_for_draft(msg)))
+        }
+
+        "response_item" => {
+            let item = event.get("payload")?.get("item")?;
+            let item_type = item.get("type")?.as_str()?;
+
+            if item_type == "function_call" {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                Some(format!("🔧 {}\n", sanitize_for_draft(name)))
+            } else {
+                None
+            }
+        }
+
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl Provider for CodexCliProvider {
     async fn chat_with_system(
@@ -467,6 +733,90 @@ impl Provider for CodexCliProvider {
         let (text, thread_id) = self.exec_fresh(&prompt, model).await?;
 
         // Store thread_id for next turn.
+        if let Some(tid) = thread_id {
+            self.store_session(
+                &key,
+                SessionEntry {
+                    thread_id: tid,
+                    model: model.to_string(),
+                },
+            );
+        }
+
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn supports_progress_streaming(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_progress(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+        on_progress: &tokio::sync::mpsc::Sender<String>,
+    ) -> Result<ChatResponse> {
+        let messages = request.messages;
+
+        // If no session_id, fall back to stateless streaming.
+        let Some(sid) = request.session_id else {
+            let prompt = serialize_history(messages);
+            let (text, _thread_id) =
+                self.exec_fresh_streaming(&prompt, model, on_progress).await?;
+            return Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: None,
+            });
+        };
+
+        let key = session_key(sid, model);
+
+        let last_user = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+
+        // Try session resume with streaming.
+        if let Some(thread_id) = self.get_session(&key, model) {
+            tracing::info!(
+                thread_id = %thread_id,
+                "Codex CLI: resuming session (streaming)"
+            );
+
+            match self
+                .exec_resume_streaming(&thread_id, last_user, model, on_progress)
+                .await
+            {
+                Ok(text) => {
+                    return Ok(ChatResponse {
+                        text: Some(text),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        error = %err,
+                        "Codex CLI: streaming resume failed, falling back to fresh exec"
+                    );
+                    self.clear_session(&key);
+                }
+            }
+        }
+
+        // Fresh exec with streaming.
+        let prompt = serialize_history(messages);
+        let (text, thread_id) =
+            self.exec_fresh_streaming(&prompt, model, on_progress).await?;
+
         if let Some(tid) = thread_id {
             self.store_session(
                 &key,
@@ -750,5 +1100,233 @@ mod tests {
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"gpt-5.3-codex-spark".to_string()));
         assert!(args.contains(&"-".to_string()));
+    }
+
+    // --- Session persistence tests ---
+
+    /// Helper: create a provider with persistence to a temp file.
+    fn provider_with_persistence(path: PathBuf) -> CodexCliProvider {
+        CodexCliProvider {
+            codex_bin: "fake".into(),
+            sandbox_mode: "read-only".into(),
+            sessions: Mutex::new(HashMap::new()),
+            sessions_path: Some(path),
+        }
+    }
+
+    #[test]
+    fn persist_and_reload_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        // Store a session and persist.
+        let p1 = provider_with_persistence(path.clone());
+        p1.store_session(
+            "telegram/user1\0model-a",
+            SessionEntry {
+                thread_id: "tid-abc".into(),
+                model: "model-a".into(),
+            },
+        );
+
+        // Verify file exists.
+        assert!(path.exists());
+
+        // Reload from disk.
+        let loaded = CodexCliProvider::load_sessions_from_disk(&path);
+        assert_eq!(loaded.len(), 1);
+        let entry = loaded.get("telegram/user1\0model-a").unwrap();
+        assert_eq!(entry.thread_id, "tid-abc");
+        assert_eq!(entry.model, "model-a");
+    }
+
+    #[test]
+    fn clear_session_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        let provider = provider_with_persistence(path.clone());
+        provider.store_session(
+            "key1",
+            SessionEntry {
+                thread_id: "tid-1".into(),
+                model: "m".into(),
+            },
+        );
+        provider.store_session(
+            "key2",
+            SessionEntry {
+                thread_id: "tid-2".into(),
+                model: "m".into(),
+            },
+        );
+        provider.clear_session("key1");
+
+        let loaded = CodexCliProvider::load_sessions_from_disk(&path);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("key2"));
+        assert!(!loaded.contains_key("key1"));
+    }
+
+    #[test]
+    fn load_missing_file_returns_empty() {
+        let path = PathBuf::from("/nonexistent/path/sessions.json");
+        let loaded = CodexCliProvider::load_sessions_from_disk(&path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_corrupt_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+
+        let loaded = CodexCliProvider::load_sessions_from_disk(&path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn no_persistence_without_path() {
+        let provider = CodexCliProvider::new_for_test("fake");
+        assert!(provider.sessions_path.is_none());
+
+        // store_session should work in-memory without panicking.
+        provider.store_session(
+            "key",
+            SessionEntry {
+                thread_id: "tid".into(),
+                model: "m".into(),
+            },
+        );
+        assert_eq!(provider.get_session("key", "m"), Some("tid".into()));
+    }
+
+    #[test]
+    fn session_entry_serialization_roundtrip() {
+        let entry = SessionEntry {
+            thread_id: "019c88e9-462f-7620".into(),
+            model: "gpt-5.3-codex-spark".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let restored: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.thread_id, entry.thread_id);
+        assert_eq!(restored.model, entry.model);
+    }
+
+    // --- format_codex_event tests ---
+
+    #[test]
+    fn format_event_commentary() {
+        let line = r#"{"type":"event_msg","payload":{"type":"status","msg":"Thinking about the problem..."}}"#;
+        let result = format_codex_event(line).unwrap();
+        assert!(result.starts_with("💬 "));
+        assert!(result.contains("Thinking about the problem"));
+    }
+
+    #[test]
+    fn format_event_tool_call() {
+        let line = r#"{"type":"response_item","payload":{"item":{"type":"function_call","name":"file_read"}}}"#;
+        let result = format_codex_event(line).unwrap();
+        assert!(result.starts_with("🔧 "));
+        assert!(result.contains("file_read"));
+    }
+
+    #[test]
+    fn format_event_skips_token_count() {
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","msg":"tokens: 500"}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_skips_user_message() {
+        let line = r#"{"type":"event_msg","payload":{"type":"user_message","msg":"hello"}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_skips_task_started() {
+        let line = r#"{"type":"event_msg","payload":{"type":"task_started","msg":"starting"}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_skips_task_complete() {
+        let line = r#"{"type":"event_msg","payload":{"type":"task_complete","msg":"done"}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_skips_json_msg() {
+        let line = r#"{"type":"event_msg","payload":{"msg":"{\"key\":\"value\"}"}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_skips_unknown_type() {
+        let line = r#"{"type":"some_future_event","payload":{}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_skips_empty_line() {
+        assert!(format_codex_event("").is_none());
+        assert!(format_codex_event("   ").is_none());
+    }
+
+    #[test]
+    fn format_event_skips_non_json() {
+        assert!(format_codex_event("not json at all").is_none());
+    }
+
+    #[test]
+    fn format_event_skips_non_function_response_item() {
+        let line = r#"{"type":"response_item","payload":{"item":{"type":"message","text":"hello"}}}"#;
+        assert!(format_codex_event(line).is_none());
+    }
+
+    #[test]
+    fn format_event_uses_message_field_fallback() {
+        let line = r#"{"type":"event_msg","payload":{"message":"Using alternate field"}}"#;
+        let result = format_codex_event(line).unwrap();
+        assert!(result.contains("Using alternate field"));
+    }
+
+    #[test]
+    fn format_event_tool_without_name() {
+        let line = r#"{"type":"response_item","payload":{"item":{"type":"function_call"}}}"#;
+        let result = format_codex_event(line).unwrap();
+        assert!(result.contains("tool"));
+    }
+
+    // --- sanitize_for_draft tests ---
+
+    #[test]
+    fn sanitize_escapes_html() {
+        assert_eq!(sanitize_for_draft("<b>bold</b>"), "&lt;b&gt;bold&lt;/b&gt;");
+    }
+
+    #[test]
+    fn sanitize_escapes_ampersand() {
+        assert_eq!(sanitize_for_draft("a & b"), "a &amp; b");
+    }
+
+    #[test]
+    fn sanitize_truncates_long_text() {
+        let long = "x".repeat(300);
+        let result = sanitize_for_draft(&long);
+        assert_eq!(result.len(), 200);
+    }
+
+    #[test]
+    fn sanitize_preserves_short_text() {
+        assert_eq!(sanitize_for_draft("hello"), "hello");
+    }
+
+    // --- supports_progress_streaming test ---
+
+    #[test]
+    fn codex_cli_supports_progress_streaming() {
+        let provider = CodexCliProvider::new_for_test("fake");
+        assert!(provider.supports_progress_streaming());
     }
 }

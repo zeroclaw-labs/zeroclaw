@@ -132,11 +132,21 @@ impl Tool for TelegramSendTool {
                 .post_json("tool.telegram_send", "sendMessage", &body)
                 .await
             {
-                Ok(_) => Ok(ToolResult {
-                    success: true,
-                    output: format!("Message sent to chat {chat_id}."),
-                    error: None,
-                }),
+                Ok(resp) => {
+                    let mid = resp
+                        .get("result")
+                        .and_then(|r| r.get("message_id"))
+                        .and_then(|v| v.as_i64());
+                    let output = match mid {
+                        Some(id) => format!("Message sent to chat {chat_id}. message_id={id}"),
+                        None => format!("Message sent to chat {chat_id}."),
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    })
+                }
                 Err(result) => Ok(result),
             }
         } else {
@@ -189,11 +199,21 @@ impl Tool for TelegramSendTool {
                 .post_multipart("tool.telegram_send", method, form)
                 .await
             {
-                Ok(_) => Ok(ToolResult {
-                    success: true,
-                    output: format!("File sent to chat {chat_id}."),
-                    error: None,
-                }),
+                Ok(resp) => {
+                    let mid = resp
+                        .get("result")
+                        .and_then(|r| r.get("message_id"))
+                        .and_then(|v| v.as_i64());
+                    let output = match mid {
+                        Some(id) => format!("File sent to chat {chat_id}. message_id={id}"),
+                        None => format!("File sent to chat {chat_id}."),
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    })
+                }
                 Err(result) => Ok(result),
             }
         }

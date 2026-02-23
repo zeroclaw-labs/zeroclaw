@@ -94,13 +94,25 @@ impl Tool for TelegramForwardTool {
             .post_json("tool.telegram_forward", "forwardMessage", &body)
             .await
         {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
-                ),
-                error: None,
-            }),
+            Ok(resp) => {
+                let mid = resp
+                    .get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|v| v.as_i64());
+                let output = match mid {
+                    Some(id) => format!(
+                        "Message {message_id} forwarded from {from_chat_id} to {to_chat_id}. new_message_id={id}"
+                    ),
+                    None => format!(
+                        "Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
+                    ),
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Err(result) => Ok(result),
         }
     }

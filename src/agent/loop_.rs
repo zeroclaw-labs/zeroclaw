@@ -2076,23 +2076,38 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         let derived_session_id = sender_key.map(|s| format!("{channel_name}/{s}"));
-        let chat_future = provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-                session_id: derived_session_id.as_deref(),
-            },
-            model,
-            temperature,
-        );
+        let chat_request = ChatRequest {
+            messages: &prepared_messages.messages,
+            tools: request_tools,
+            session_id: derived_session_id.as_deref(),
+        };
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        // Use chat_with_progress when the provider supports it and we have
+        // a draft-update channel, so intermediate events (tool names,
+        // commentary) are relayed to the user in real time.
+        let chat_result = if let (Some(tx), true) =
+            (on_delta.as_ref(), provider.supports_progress_streaming())
+        {
+            let progress_future =
+                provider.chat_with_progress(chat_request, model, temperature, tx);
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = progress_future => result,
+                }
+            } else {
+                progress_future.await
             }
         } else {
-            chat_future.await
+            let chat_future = provider.chat(chat_request, model, temperature);
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = chat_future => result,
+                }
+            } else {
+                chat_future.await
+            }
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
