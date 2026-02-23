@@ -479,6 +479,7 @@ impl Agent {
                         } else {
                             None
                         },
+                        session_id: None,
                     },
                     &effective_model,
                     self.temperature,

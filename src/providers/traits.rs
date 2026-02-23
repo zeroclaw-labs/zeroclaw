@@ -84,6 +84,11 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Optional conversation identity for session-aware providers.
+    /// Providers that maintain per-conversation state (e.g., Codex CLI session
+    /// resume) use this to key their session maps. When `None`, providers may
+    /// derive a session key from message content as a fallback.
+    pub session_id: Option<&'a str>,
 }
 
 /// A tool result to feed back to the LLM.
@@ -766,6 +771,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -783,6 +789,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -883,6 +890,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -905,6 +913,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -927,6 +936,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            session_id: None,
         };
 
         let err = provider.chat(request, "model", 0.7).await.unwrap_err();

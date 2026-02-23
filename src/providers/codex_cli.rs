@@ -24,13 +24,12 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
 
 /// Maximum number of tracked sessions to prevent unbounded memory growth.
 const MAX_SESSIONS: usize = 256;
@@ -43,9 +42,10 @@ pub struct CodexCliProvider {
     codex_bin: String,
     sandbox_mode: String,
     /// Map of session key -> (thread_id, model).
-    /// Session key is derived from the system prompt hash.
+    /// Session key is a stable conversation identity (e.g. "telegram/user123")
+    /// passed via `ChatRequest.session_id` from the channel layer.
     /// Model is stored to invalidate sessions on model change.
-    sessions: Mutex<HashMap<u64, SessionEntry>>,
+    sessions: Mutex<HashMap<String, SessionEntry>>,
 }
 
 /// A stored Codex CLI session.
@@ -123,22 +123,22 @@ impl CodexCliProvider {
     }
 
     /// Store a session entry, evicting oldest if at capacity.
-    fn store_session(&self, key: u64, entry: SessionEntry) {
+    fn store_session(&self, key: &str, entry: SessionEntry) {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&key) {
+        if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(key) {
             // Evict an arbitrary entry to stay bounded.
-            if let Some(&oldest_key) = sessions.keys().next() {
+            if let Some(oldest_key) = sessions.keys().next().cloned() {
                 sessions.remove(&oldest_key);
             }
         }
-        sessions.insert(key, entry);
+        sessions.insert(key.to_string(), entry);
     }
 
     /// Look up a session entry for the given key and model.
     /// Returns None if no session exists or if the model has changed.
-    fn get_session(&self, key: u64, model: &str) -> Option<String> {
+    fn get_session(&self, key: &str, model: &str) -> Option<String> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(&key).and_then(|entry| {
+        sessions.get(key).and_then(|entry| {
             if entry.model == model {
                 Some(entry.thread_id.clone())
             } else {
@@ -148,9 +148,9 @@ impl CodexCliProvider {
     }
 
     /// Clear a session entry (e.g., on resume failure).
-    fn clear_session(&self, key: u64) {
+    fn clear_session(&self, key: &str) {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.remove(&key);
+        sessions.remove(key);
     }
 
     /// Run a fresh codex exec with the given prompt. Returns (response_text, thread_id).
@@ -338,15 +338,14 @@ fn extract_assistant_text(message: &Value) -> Option<String> {
     None
 }
 
-/// Derive a session key from the system prompt and model.
+/// Derive a session key from a session_id and model.
 ///
-/// Uses a hash so the key is compact and deterministic. The system prompt
-/// is unique per conversation in ZeroClaw (it contains user/channel context).
-fn session_key(system_prompt: Option<&str>, model: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    system_prompt.unwrap_or("").hash(&mut hasher);
-    model.hash(&mut hasher);
-    hasher.finish()
+/// Combines the stable conversation identity (e.g. "telegram/user123") with
+/// the model name to ensure session isolation per model.
+/// Uses `\0` as delimiter to prevent collisions (neither session_id nor model
+/// can contain null bytes in practice).
+fn session_key(session_id: &str, model: &str) -> String {
+    format!("{session_id}\0{model}")
 }
 
 /// Serialize a multi-turn conversation as formatted text for a fresh codex exec.
@@ -387,20 +386,7 @@ impl Provider for CodexCliProvider {
             _ => message.to_string(),
         };
 
-        let (text, thread_id) = self.exec_fresh(&prompt, model).await?;
-
-        // Store thread_id for potential future resume.
-        if let Some(tid) = thread_id {
-            let key = session_key(system_prompt, model);
-            self.store_session(
-                key,
-                SessionEntry {
-                    thread_id: tid,
-                    model: model.to_string(),
-                },
-            );
-        }
-
+        let (text, _thread_id) = self.exec_fresh(&prompt, model).await?;
         Ok(text)
     }
 
@@ -410,13 +396,37 @@ impl Provider for CodexCliProvider {
         model: &str,
         _temperature: f64,
     ) -> Result<String> {
-        // Extract system prompt for session key derivation.
-        let system_prompt = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str());
+        // Stateless fallback: serialize full history as a single prompt.
+        // Session resume is handled in chat() which has access to session_id.
+        let prompt = serialize_history(messages);
+        let (text, _thread_id) = self.exec_fresh(&prompt, model).await?;
+        Ok(text)
+    }
 
-        let key = session_key(system_prompt, model);
+    /// Structured chat with session resume support.
+    ///
+    /// When `session_id` is provided (from channel layer), uses it to track
+    /// Codex CLI thread IDs for server-side session resume. This gives Codex
+    /// richer context without re-serializing the full conversation each turn.
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> Result<ChatResponse> {
+        let messages = request.messages;
+
+        // If no session_id, fall back to stateless behavior.
+        let Some(sid) = request.session_id else {
+            let text = self.chat_with_history(messages, model, temperature).await?;
+            return Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: None,
+            });
+        };
+
+        let key = session_key(sid, model);
 
         // Extract the last user message for resume mode.
         let last_user = messages
@@ -426,21 +436,27 @@ impl Provider for CodexCliProvider {
             .unwrap_or("");
 
         // Try session resume if we have a stored thread_id.
-        if let Some(thread_id) = self.get_session(key, model) {
+        if let Some(thread_id) = self.get_session(&key, model) {
             tracing::info!(
                 thread_id = %thread_id,
                 "Codex CLI: resuming session"
             );
 
             match self.exec_resume(&thread_id, last_user, model).await {
-                Ok(text) => return Ok(text),
+                Ok(text) => {
+                    return Ok(ChatResponse {
+                        text: Some(text),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    });
+                }
                 Err(err) => {
                     tracing::warn!(
                         thread_id = %thread_id,
                         error = %err,
                         "Codex CLI: resume failed, falling back to fresh exec"
                     );
-                    self.clear_session(key);
+                    self.clear_session(&key);
                     // Fall through to fresh exec below.
                 }
             }
@@ -453,7 +469,7 @@ impl Provider for CodexCliProvider {
         // Store thread_id for next turn.
         if let Some(tid) = thread_id {
             self.store_session(
-                key,
+                &key,
                 SessionEntry {
                     thread_id: tid,
                     model: model.to_string(),
@@ -461,7 +477,11 @@ impl Provider for CodexCliProvider {
             );
         }
 
-        Ok(text)
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage: None,
+        })
     }
 }
 
@@ -596,74 +616,74 @@ mod tests {
 
     #[test]
     fn session_key_deterministic() {
-        let k1 = session_key(Some("Be helpful"), "gpt-5.3-codex-spark");
-        let k2 = session_key(Some("Be helpful"), "gpt-5.3-codex-spark");
+        let k1 = session_key("telegram/user1", "gpt-5.3-codex-spark");
+        let k2 = session_key("telegram/user1", "gpt-5.3-codex-spark");
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn session_key_differs_by_model() {
-        let k1 = session_key(Some("Be helpful"), "gpt-5.3-codex-spark");
-        let k2 = session_key(Some("Be helpful"), "gpt-5.3-codex");
+        let k1 = session_key("telegram/user1", "gpt-5.3-codex-spark");
+        let k2 = session_key("telegram/user1", "gpt-5.3-codex");
         assert_ne!(k1, k2);
     }
 
     #[test]
-    fn session_key_differs_by_prompt() {
-        let k1 = session_key(Some("You are agent A"), "model");
-        let k2 = session_key(Some("You are agent B"), "model");
+    fn session_key_differs_by_sender() {
+        let k1 = session_key("telegram/user_a", "model");
+        let k2 = session_key("telegram/user_b", "model");
         assert_ne!(k1, k2);
     }
 
     #[test]
-    fn session_key_none_prompt() {
-        let k1 = session_key(None, "model");
-        let k2 = session_key(Some(""), "model");
-        assert_eq!(k1, k2);
+    fn session_key_differs_by_channel() {
+        let k1 = session_key("telegram/user1", "model");
+        let k2 = session_key("discord/user1", "model");
+        assert_ne!(k1, k2);
     }
 
     #[test]
     fn session_store_and_retrieve() {
         let provider = CodexCliProvider::new_for_test("fake");
-        let key = session_key(Some("sys"), "model-a");
+        let key = session_key("telegram/user1", "model-a");
         provider.store_session(
-            key,
+            &key,
             SessionEntry {
                 thread_id: "tid-1".into(),
                 model: "model-a".into(),
             },
         );
-        assert_eq!(provider.get_session(key, "model-a"), Some("tid-1".into()));
+        assert_eq!(provider.get_session(&key, "model-a"), Some("tid-1".into()));
     }
 
     #[test]
     fn session_invalidated_on_model_change() {
         let provider = CodexCliProvider::new_for_test("fake");
-        let key = session_key(Some("sys"), "model-a");
+        let key = session_key("telegram/user1", "model-a");
         provider.store_session(
-            key,
+            &key,
             SessionEntry {
                 thread_id: "tid-1".into(),
                 model: "model-a".into(),
             },
         );
         // Same key but different model — should return None.
-        assert_eq!(provider.get_session(key, "model-b"), None);
+        assert_eq!(provider.get_session(&key, "model-b"), None);
     }
 
     #[test]
     fn session_clear() {
         let provider = CodexCliProvider::new_for_test("fake");
-        let key = session_key(Some("sys"), "model-a");
+        let key = session_key("telegram/user1", "model-a");
         provider.store_session(
-            key,
+            &key,
             SessionEntry {
                 thread_id: "tid-1".into(),
                 model: "model-a".into(),
             },
         );
-        provider.clear_session(key);
-        assert_eq!(provider.get_session(key, "model-a"), None);
+        provider.clear_session(&key);
+        assert_eq!(provider.get_session(&key, "model-a"), None);
     }
 
     #[test]
@@ -672,7 +692,7 @@ mod tests {
         // Fill to MAX_SESSIONS.
         for i in 0..MAX_SESSIONS {
             provider.store_session(
-                i as u64,
+                &format!("ch/user-{i}"),
                 SessionEntry {
                     thread_id: format!("tid-{i}"),
                     model: "m".into(),
@@ -681,7 +701,7 @@ mod tests {
         }
         // Adding one more should evict one.
         provider.store_session(
-            9999,
+            "ch/user-new",
             SessionEntry {
                 thread_id: "tid-new".into(),
                 model: "m".into(),
@@ -689,7 +709,15 @@ mod tests {
         );
         let sessions = provider.sessions.lock().unwrap();
         assert_eq!(sessions.len(), MAX_SESSIONS);
-        assert!(sessions.contains_key(&9999));
+        assert!(sessions.contains_key("ch/user-new"));
+    }
+
+    #[test]
+    fn session_key_no_collision_with_colon_in_parts() {
+        // "a:b" + "c" must differ from "a" + "b:c" — null delimiter prevents ambiguity.
+        let k1 = session_key("telegram/a:b", "c");
+        let k2 = session_key("telegram/a", "b:c");
+        assert_ne!(k1, k2);
     }
 
     #[test]
