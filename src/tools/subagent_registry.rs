@@ -1,3 +1,8 @@
+//! Thread-safe sub-agent session registry.
+//!
+//! Provides [`SubAgentRegistry`] for tracking background sub-agent sessions
+//! with status lifecycle management, concurrent access, and automatic cleanup.
+
 use crate::tools::traits::ToolResult;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -18,6 +23,7 @@ pub enum SubAgentStatus {
 }
 
 impl SubAgentStatus {
+    /// pub fn as_str.
     pub fn as_str(&self) -> &'static str {
         match self {
             SubAgentStatus::Running => "running",
@@ -35,6 +41,7 @@ impl std::fmt::Display for SubAgentStatus {
 }
 
 /// A single sub-agent session tracked by the registry.
+/// pub struct SubAgentSession.
 pub struct SubAgentSession {
     pub id: String,
     pub agent_name: String,
@@ -49,11 +56,13 @@ pub struct SubAgentSession {
 
 /// Thread-safe registry for tracking background sub-agent sessions.
 #[derive(Clone)]
+/// pub struct SubAgentRegistry.
 pub struct SubAgentRegistry {
     sessions: Arc<RwLock<HashMap<String, SubAgentSession>>>,
 }
 
 impl SubAgentRegistry {
+    /// pub fn new.
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -61,12 +70,14 @@ impl SubAgentRegistry {
     }
 
     /// Insert a new session into the registry.
+    /// pub fn insert.
     pub fn insert(&self, session: SubAgentSession) {
         let mut sessions = self.sessions.write();
         sessions.insert(session.id.clone(), session);
     }
 
     /// Set the tokio task handle for a session (used to enable cancellation).
+    /// pub fn set_handle.
     pub fn set_handle(&self, session_id: &str, handle: JoinHandle<()>) {
         let mut sessions = self.sessions.write();
         if let Some(session) = sessions.get_mut(session_id) {
@@ -75,6 +86,7 @@ impl SubAgentRegistry {
     }
 
     /// Mark a session as completed with a result.
+    /// pub fn complete.
     pub fn complete(&self, session_id: &str, result: ToolResult) {
         let mut sessions = self.sessions.write();
         if let Some(session) = sessions.get_mut(session_id) {
@@ -86,6 +98,7 @@ impl SubAgentRegistry {
     }
 
     /// Mark a session as failed with an error result.
+    /// pub fn fail.
     pub fn fail(&self, session_id: &str, error: String) {
         let mut sessions = self.sessions.write();
         if let Some(session) = sessions.get_mut(session_id) {
@@ -102,6 +115,7 @@ impl SubAgentRegistry {
 
     /// Kill a running session by aborting its tokio task.
     /// Returns `true` if the session was found and killed, `false` otherwise.
+    /// pub fn kill.
     pub fn kill(&self, session_id: &str) -> bool {
         let mut sessions = self.sessions.write();
         if let Some(session) = sessions.get_mut(session_id) {
@@ -125,6 +139,7 @@ impl SubAgentRegistry {
     }
 
     /// Get the status and optional result for a session.
+    /// pub fn get_status.
     pub fn get_status(&self, session_id: &str) -> Option<SubAgentStatusSnapshot> {
         let sessions = self.sessions.read();
         sessions.get(session_id).map(|s| SubAgentStatusSnapshot {
@@ -139,6 +154,7 @@ impl SubAgentRegistry {
 
     /// List sessions, optionally filtered by status.
     /// Also performs lazy cleanup of old completed sessions.
+    /// pub fn list.
     pub fn list(&self, status_filter: Option<&str>) -> Vec<SubAgentSessionInfo> {
         self.cleanup_old_sessions();
 
@@ -188,11 +204,13 @@ impl SubAgentRegistry {
     }
 
     /// Check if a session exists.
+    /// pub fn exists.
     pub fn exists(&self, session_id: &str) -> bool {
         self.sessions.read().contains_key(session_id)
     }
 
     /// Get the number of currently running sessions.
+    /// pub fn running_count.
     pub fn running_count(&self) -> usize {
         self.sessions
             .read()
@@ -210,6 +228,7 @@ impl Default for SubAgentRegistry {
 
 /// Snapshot of a session's status returned by `get_status`.
 #[derive(Debug, Clone)]
+/// pub struct SubAgentStatusSnapshot.
 pub struct SubAgentStatusSnapshot {
     pub status: SubAgentStatus,
     pub agent_name: String,
@@ -221,6 +240,7 @@ pub struct SubAgentStatusSnapshot {
 
 /// Serializable session info for list output.
 #[derive(Debug, Clone, serde::Serialize)]
+/// pub struct SubAgentSessionInfo.
 pub struct SubAgentSessionInfo {
     pub session_id: String,
     pub agent: String,

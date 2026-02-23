@@ -1,3 +1,8 @@
+//! Sub-agent management tool (status and kill).
+//!
+//! Implements the `subagent_manage` tool for querying individual session
+//! status and killing running sub-agents via cancellation tokens.
+
 use super::subagent_registry::SubAgentRegistry;
 use super::traits::{Tool, ToolResult};
 use crate::security::policy::ToolOperation;
@@ -13,6 +18,7 @@ pub struct SubAgentManageTool {
 }
 
 impl SubAgentManageTool {
+    /// pub fn new.
     pub fn new(registry: Arc<SubAgentRegistry>, security: Arc<SecurityPolicy>) -> Self {
         Self { registry, security }
     }

@@ -1,3 +1,9 @@
+//! Sub-agent spawn tool for background execution.
+//!
+//! Implements the `subagent_spawn` tool that launches delegate agents
+//! asynchronously via `tokio::spawn`, returning a session ID immediately.
+//! See `AGENTS.md` §7.3 for the tool change playbook.
+
 use super::subagent_registry::{SubAgentRegistry, SubAgentSession, SubAgentStatus};
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
