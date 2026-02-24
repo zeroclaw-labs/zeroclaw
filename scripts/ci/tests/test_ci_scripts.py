@@ -1214,6 +1214,101 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["summary"]["new_write_permissions"], 0)
         self.assertEqual(report["summary"]["new_pull_request_target_triggers"], 0)
 
+    def test_unsafe_debt_audit_emits_reproducible_machine_readable_output(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        src_dir = repo / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / "unsafe_a.rs").write_text(
+            textwrap.dedent(
+                """
+                pub unsafe fn dangerous() {
+                    unsafe { libc::getuid(); }
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (src_dir / "unsafe_b.rs").write_text(
+            textwrap.dedent(
+                """
+                pub fn convert(v: u32) -> u8 {
+                    unsafe { core::mem::transmute::<u32, u8>(v) }
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json_a = self.tmp / "unsafe-audit-a.json"
+        out_json_b = self.tmp / "unsafe-audit-b.json"
+        proc_a = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json_a),
+            ]
+        )
+        proc_b = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json_b),
+            ]
+        )
+        self.assertEqual(proc_a.returncode, 0, msg=proc_a.stderr)
+        self.assertEqual(proc_b.returncode, 0, msg=proc_b.stderr)
+
+        report_a = json.loads(out_json_a.read_text(encoding="utf-8"))
+        report_b = json.loads(out_json_b.read_text(encoding="utf-8"))
+        self.assertEqual(report_a, report_b)
+        self.assertEqual(report_a["event_type"], "unsafe_debt_audit")
+        self.assertEqual(report_a["summary"]["total_findings"], 5)
+        self.assertEqual(report_a["summary"]["by_pattern"]["unsafe_block"], 2)
+        self.assertEqual(report_a["summary"]["by_pattern"]["unsafe_fn"], 1)
+        self.assertEqual(report_a["summary"]["by_pattern"]["ffi_libc_call"], 1)
+        self.assertEqual(report_a["summary"]["by_pattern"]["mem_transmute"], 1)
+        self.assertEqual(report_a["source"]["mode"], "git_ls_files")
+
+    def test_unsafe_debt_audit_fail_on_findings(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "unsafe_one.rs").write_text(
+            "pub fn whoami() -> bool { unsafe { libc::getuid() == 0 } }\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-fail.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+                "--fail-on-findings",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(report["summary"]["total_findings"], 1)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
