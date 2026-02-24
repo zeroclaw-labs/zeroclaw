@@ -71,6 +71,7 @@ pub(crate) mod service;
 pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
+pub mod update;
 pub(crate) mod util;
 
 pub use config::Config;

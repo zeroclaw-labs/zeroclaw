@@ -84,6 +84,7 @@ mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
+mod update;
 mod util;
 
 use config::Config;
@@ -292,6 +293,28 @@ Examples:
 
     /// Show system status (full details)
     Status,
+
+    /// Self-update ZeroClaw to the latest version
+    #[command(long_about = "\
+Self-update ZeroClaw to the latest release from GitHub.
+
+Downloads the appropriate pre-built binary for your platform and
+replaces the current executable. Requires write permissions to
+the binary location.
+
+Examples:
+  zeroclaw update              # Update to latest version
+  zeroclaw update --check      # Check for updates without installing
+  zeroclaw update --force      # Reinstall even if already up to date")]
+    Update {
+        /// Check for updates without installing
+        #[arg(long)]
+        check: bool,
+
+        /// Force update even if already at latest version
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Engage, inspect, and resume emergency-stop states.
     ///
@@ -955,6 +978,11 @@ async fn main() -> Result<()> {
             );
             println!("  Boards:    {}", config.peripherals.boards.len());
 
+            Ok(())
+        }
+
+        Commands::Update { check, force } => {
+            update::self_update(force, check).await?;
             Ok(())
         }
 
