@@ -155,6 +155,7 @@ enum ChannelRuntimeCommand {
     ShowStatus,
     ShowChannels,
     ShowUsage,
+    ShowSessions,
     CompactConversation,
     ShowProviders,
     SetProvider(String),
@@ -309,7 +310,7 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}", msg.channel, msg.sender)
+    format!("{}_{}", msg.channel, msg.reply_target)
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
@@ -523,6 +524,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/status" => Some(ChannelRuntimeCommand::ShowStatus),
         "/channels" => Some(ChannelRuntimeCommand::ShowChannels),
         "/usage" => Some(ChannelRuntimeCommand::ShowUsage),
+        "/sessions" => Some(ChannelRuntimeCommand::ShowSessions),
         "/compact" => Some(ChannelRuntimeCommand::CompactConversation),
         "/providers" => {
             if let Some(provider) = parts.next() {
@@ -1215,6 +1217,29 @@ fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> St
     )
 }
 
+fn build_sessions_response(ctx: &ChannelRuntimeContext, channel_name: &str) -> String {
+    let prefix = format!("{channel_name}_");
+    let mut session_keys: Vec<String> = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
+        .collect();
+    session_keys.sort();
+    session_keys.dedup();
+
+    if session_keys.is_empty() {
+        return "No active sessions for this channel.".to_string();
+    }
+
+    let mut response = format!("Active sessions ({}):\n", session_keys.len());
+    for key in session_keys {
+        let _ = writeln!(response, "- `{}`", key);
+    }
+    response
+}
+
 fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
     let id = model
         .rsplit('/')
@@ -1318,6 +1343,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowStatus => build_status_response(ctx, &current),
         ChannelRuntimeCommand::ShowChannels => build_channels_help_response(ctx),
         ChannelRuntimeCommand::ShowUsage => build_usage_response(&sender_key, &current),
+        ChannelRuntimeCommand::ShowSessions => build_sessions_response(ctx, &msg.channel),
         ChannelRuntimeCommand::CompactConversation => {
             let compacted = compact_sender_history(ctx, &sender_key);
             if compacted {
@@ -6936,6 +6962,10 @@ This is an example JSON object for profile settings."#;
         assert_eq!(
             parse_runtime_command("telegram", "/usage"),
             Some(ChannelRuntimeCommand::ShowUsage)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/sessions"),
+            Some(ChannelRuntimeCommand::ShowSessions)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/compact"),

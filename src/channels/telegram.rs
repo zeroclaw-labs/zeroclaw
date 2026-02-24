@@ -40,6 +40,7 @@ const TELEGRAM_RUNTIME_COMMANDS: &[(&str, &str)] = &[
     ("status", "Show ZeroClaw runtime status"),
     ("channels", "Show active channels"),
     ("usage", "Show current session usage snapshot"),
+    ("sessions", "Show active chat sessions"),
     ("compact", "Compact conversation context"),
     ("providers", "List providers or switch provider"),
     ("models", "List models or switch model"),
