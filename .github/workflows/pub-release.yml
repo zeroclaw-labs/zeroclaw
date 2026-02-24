@@ -343,8 +343,12 @@ jobs:
                   path: artifacts
 
             - name: Install syft
+              shell: bash
               run: |
-                  curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+                  set -euo pipefail
+                  mkdir -p "${RUNNER_TEMP}/bin"
+                  ./scripts/ci/install_syft.sh "${RUNNER_TEMP}/bin"
+                  echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
             - name: Generate SBOM (CycloneDX)
               run: |

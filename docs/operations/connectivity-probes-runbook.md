@@ -1,131 +1,108 @@
 # Connectivity Probes Runbook
 
-This runbook defines how maintainers operate the provider/model connectivity matrix probes.
+This runbook defines how maintainers operate provider endpoint connectivity probes in CI.
 
 Last verified: **February 24, 2026**.
 
 ## Scope
 
-Covers the scheduled/manual workflow:
+Primary workflow:
+
+- `.github/workflows/ci-provider-connectivity.yml`
+
+Legacy compatibility wrapper (manual only):
 
 - `.github/workflows/ci-connectivity-probes.yml`
+
+Probe engine and config:
+
 - `scripts/ci/provider_connectivity_matrix.py`
-- `.github/connectivity/probe-contract.json`
+- `.github/connectivity/providers.json`
 
-Probe purpose:
+## Probe Model
 
-- verify provider catalog discovery (`doctor models --provider ...`)
-- classify failures into actionable buckets
-- keep CI noise low with transient-failure policy
-- publish machine-readable artifacts for triage
-
-## Contract Model
-
-Contract file: `.github/connectivity/probe-contract.json`
+Configuration file: `.github/connectivity/providers.json`
 
 Each provider entry defines:
 
-- `name`: display label in report
-- `provider`: provider ID passed to `zeroclaw doctor models --provider`
-- `required`: whether this provider can gate the run
-- `secret_env`: required credential env var name for live probe
-- `timeout_sec`: per-attempt timeout
-- `retries`: retry count for transient failures
-- `notes`: operator-facing context
+- `id`: provider identifier
+- `url`: endpoint URL to probe
+- `method`: HTTP method (`HEAD` or `GET`)
+- `critical`: whether failure should gate in enforce mode
 
 Global field:
 
-- `consecutive_transient_failures_to_escalate`: threshold for promoting `network` / `rate_limit` from warning to gate failure on required providers
+- `global_timeout_seconds`: probe timeout for DNS + HTTP checks
 
-## Failure Taxonomy
+## Trigger and Enforcement
 
-Categories in `connectivity-report.json`:
+`CI Provider Connectivity` behavior:
 
-- `auth`: missing/invalid credential, permission denied, quota/access issues
-- `network`: timeout, DNS/connectivity/TLS transport failures
-- `unavailable`: unsupported endpoint, 404, empty model list, service unavailable
-- `rate_limit`: HTTP 429 / explicit rate-limit errors
-- `other`: uncategorized provider failures
+- Schedule: every 6 hours
+- Manual dispatch: `fail_on_critical=true|false`
+- PR/push: runs when probe config/script/workflow changes
 
-## Gate Policy
+Enforcement policy:
 
-Default policy implemented by `provider_connectivity_matrix.py`:
+- critical endpoint unreachable + `fail_on_critical=true` -> workflow fails
+- non-critical endpoint unreachable -> reported but non-blocking
 
-- Required provider + `auth` / `unavailable` / `other` => immediate gate failure
-- Required provider + `network` / `rate_limit` => gate only after reaching transient threshold
-- Optional provider failures => never gate
-- Missing secret on required provider => immediate gate failure
+`Connectivity Probes (Legacy Wrapper)` behavior:
 
-For ad-hoc diagnostics, use workflow input `enforcement_mode=report-only`.
+- manual dispatch only
+- accepts `enforcement_mode=enforce|report-only`
+- delegates to the same `providers.json` probe engine
 
 ## CI Artifacts
 
-Each run uploads:
+Per run artifacts include:
 
-- `connectivity-report.json` (full machine-readable matrix)
-- `connectivity-summary.md` (human summary table)
-- `.ci/connectivity-state.json` (transient tracking state)
-- `.ci/connectivity-raw.log` (per-probe raw line log)
+- `provider-connectivity-matrix.json` or `connectivity-report.json`
+- `provider-connectivity-matrix.md` or `connectivity-summary.md`
+- normalized audit event JSON when emitted by workflow
 
-The markdown summary is also appended to `GITHUB_STEP_SUMMARY`.
+Markdown summary is appended to `GITHUB_STEP_SUMMARY`.
 
 ## Local Reproduction
 
-Build binary first:
-
-```bash
-cargo build --profile release-fast --locked --bin zeroclaw
-```
-
-Run probes in enforce mode:
+Enforced mode:
 
 ```bash
 python3 scripts/ci/provider_connectivity_matrix.py \
-  --binary target/release-fast/zeroclaw \
-  --contract .github/connectivity/probe-contract.json \
-  --state-file .ci/connectivity-state.json \
-  --output-json connectivity-report.json \
-  --output-markdown connectivity-summary.md
+  --config .github/connectivity/providers.json \
+  --output-json provider-connectivity-matrix.json \
+  --output-md provider-connectivity-matrix.md \
+  --fail-on-critical
 ```
 
-Run report-only mode:
+Report-only mode:
 
 ```bash
 python3 scripts/ci/provider_connectivity_matrix.py \
-  --binary target/release-fast/zeroclaw \
-  --contract .github/connectivity/probe-contract.json \
-  --report-only
+  --config .github/connectivity/providers.json \
+  --output-json provider-connectivity-matrix.json \
+  --output-md provider-connectivity-matrix.md
 ```
 
 ## Triage Playbook
 
-1. Open `connectivity-summary.md` for quick provider matrix.
-2. For gate failures, inspect `category` and `message` in `connectivity-report.json`.
-3. Follow category-specific actions:
-
-- `auth`:
-  - verify secret exists and is non-empty
-  - rotate secret if revoked/expired
-  - confirm plan/permission supports `/models`
-- `network`:
-  - retry once manually (`workflow_dispatch`)
-  - check provider status page / GitHub Actions network incidents
-  - escalate only after threshold is exceeded
-- `unavailable`:
-  - validate endpoint path contract
-  - confirm provider still supports live model discovery
-- `rate_limit`:
-  - re-run later or reduce probe frequency for that provider
-  - ensure provider plan allows current request rate
-- `other`:
-  - inspect raw log and provider response body
-  - adjust classifier hints if recurring and actionable
+1. Read matrix markdown for quick status.
+2. For failures, inspect row-level fields in JSON:
+   - `dns_ok`
+   - `http_status`
+   - `reachable`
+   - `notes`
+3. Resolve by class:
+   - DNS/transport errors: check network, provider status, retry manually
+   - HTTP 401/403: rotate credentials or verify auth configuration
+   - HTTP 404/5xx: verify endpoint contract and upstream service health
+4. Re-run manually before escalating sustained incidents.
 
 ## Change Control
 
-When editing `.github/connectivity/probe-contract.json`:
+When editing `.github/connectivity/providers.json`:
 
-1. Explain why provider requirement or threshold changed.
-2. Keep required set small and stable to avoid alert fatigue.
+1. Keep critical endpoint list minimal and stable.
+2. Document why endpoint criticality changed.
 3. Run local probe once before merging.
-4. Update this runbook if policy behavior changed.
+4. Update this runbook when contract fields or gating behavior changes.

@@ -231,16 +231,42 @@ All contributors (human or agent) must follow the same collaboration flow:
 - `main` is reserved for release promotion PRs from `dev`.
 - Wait for required checks and review outcomes before merging.
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
-- Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
+- After merge/close, clean up task branches/worktrees that are no longer needed.
+- Keep long-lived branches only when intentionally maintained with clear owner and purpose.
 
-### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
+### 6.1A PR Disposition and Workflow Authority (Required)
 
-Use Git worktrees to isolate concurrent agent/human tracks safely and predictably:
+- Decide merge/close outcomes from repository-local authority in this order: `.github/workflows/**`, GitHub branch protection/rulesets, `docs/pr-workflow.md`, then this `AGENTS.md`.
+- External agent skills/templates are execution aids only; they must not override repository-local policy.
+- A normal contributor PR targeting `main` is a routing defect, not by itself a closure reason; if intent and content are legitimate, retarget to `dev`.
+- Direct-close the PR (do not supersede/replay) when high-confidence integrity-risk signals exist:
+  - unapproved or unrelated repository rebranding attempts (for example replacing project logo/identity assets)
+  - unauthorized platform-surface expansion (for example introducing `web` apps, dashboards, frontend stacks, or UI surfaces not requested by maintainers)
+  - title/scope deception that hides high-risk code changes (for example `docs:` title with broad `src/**` changes)
+  - spam-like or intentionally harmful payload patterns
+  - multi-domain dirty-bundle changes with no safe, auditable isolation path
+- If unauthorized platform-surface expansion is detected during review/implementation, report to maintainers immediately and pause further execution until explicit direction is given.
+- Use supersede flow only when maintainers explicitly want to preserve valid work and attribution.
+- In public PR close/block comments, state only direct actionable reasons; do not include internal decision-process narration or "non-reason" qualifiers.
 
-- Use one worktree per active branch/PR stream to avoid cross-task contamination.
-- Keep each worktree on a single branch; do not mix unrelated edits in one worktree.
+### 6.1B Assignee-First Gate (Required)
+
+- For any GitHub issue or PR selected for active handling, the first action is to ensure `@chumyin` is an assignee.
+- This is additive ownership: keep existing assignees and add `@chumyin` if missing.
+- Do not start triage/review/implementation/merge work before assignee assignment is confirmed.
+- Queue safety rule: assign only the currently active target; do not pre-assign future queued targets.
+
+### 6.2 Worktree Workflow (Required for All Task Streams)
+
+Use Git worktrees to isolate every active task stream safely and predictably:
+
+- Use one dedicated worktree per active branch/PR stream; do not implement directly in a shared default workspace.
+- Keep each worktree on a single branch and a single concern; do not mix unrelated edits in one worktree.
+- Before each commit/push, verify commit hygiene in that worktree (`git status --short` and `git diff --cached`) so only scoped files are included.
 - Run validation commands inside the corresponding worktree before commit/PR.
-- Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`) and remove stale worktrees when no longer needed.
+- Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`).
+- After PR merge/close (or task abandonment), remove stale worktrees/branches and prune refs (`git worktree prune`, `git fetch --prune`).
+- Local Codex automation may use one-command cleanup helper: `~/.codex/skills/zeroclaw-pr-issue-automation/scripts/cleanup_track.sh --repo-dir <repo_dir> --worktree <worktree_path> --branch <branch_name>`.
 - PR checkpoint rules from section 6.1 still apply to worktree-based development.
 
 ### 6.3 Code Naming Contract (Required)
@@ -346,6 +372,12 @@ If full checks are impractical, run the most relevant subset and document what w
 
 - Follow `.github/pull_request_template.md` fully (including side effects / blast radius).
 - Keep PR descriptions concrete: problem, change, non-goals, risk, rollback.
+- For issue-driven work, add explicit issue-closing keywords in the **PR body** for every resolved issue (for example `Closes #1502`).
+- Do not rely on issue comments alone for linkage visibility; comments are supplemental, not a substitute for PR-body closing references.
+- Default to one issue per clean commit/PR track. For multiple issues, split into separate clean commits/PRs unless there is clear technical coupling.
+- If multiple issues are intentionally bundled in one PR, document the coupling rationale explicitly in the PR summary.
+- Commit hygiene is mandatory: stage only task-scoped files and split unrelated changes into separate commits/worktrees.
+- Completion hygiene is mandatory: after merge/close, clean stale local branches/worktrees before starting the next track.
 - Use conventional commit titles.
 - Prefer small PRs (`size: XS/S/M`) when possible.
 - Agent-assisted PRs are welcome, **but contributors remain accountable for understanding what their code will do**.
@@ -462,6 +494,8 @@ Reference docs:
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
+- Do not attempt repository rebranding/identity replacement unless maintainers explicitly requested it in the current scope.
+- Do not introduce new platform surfaces (for example `web` apps, dashboards, frontend stacks, or UI portals) unless maintainers explicitly requested them in the current scope.
 
 ## 11) Handoff Template (Agent -> Agent / Maintainer)
 
