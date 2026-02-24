@@ -220,6 +220,32 @@ To require binary-only install with no source fallback:
 brew install zeroclaw
 ```
 
+### Linux pre-built installer (beginner-friendly)
+
+For Linux hosts that prefer a pre-built binary (no local Rust build), use the
+repository-maintained release installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash
+```
+
+What it does:
+
+- Detects your Linux CPU architecture (`x86_64`, `aarch64`, `armv7`)
+- Downloads the matching asset from the latest official GitHub release
+- Installs `zeroclaw` into a local bin directory (or `/usr/local/bin` if needed)
+- Starts `zeroclaw onboard` (skip with `--no-onboard`)
+
+Examples:
+
+```bash
+# Install and start onboarding (default)
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash
+
+# Install only (no onboarding)
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash -s -- --no-onboard
+```
+
 ### One-click bootstrap
 
 ```bash
