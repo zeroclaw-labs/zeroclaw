@@ -38,7 +38,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
+pub(super) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for key in SAFE_ENV_VARS
