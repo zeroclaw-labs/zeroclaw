@@ -20,7 +20,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{
         client::IntoClientRequest,
-        http::header::{AUTHORIZATION, HeaderName},
+        http::header::{HeaderName, AUTHORIZATION},
         http::HeaderValue as WsHeaderValue,
         Message as WsMessage,
     },
@@ -832,10 +832,7 @@ fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToo
         .filter(|item| item.kind.as_deref() == Some("function_call"))
         .filter_map(|item| {
             let name = item.name.clone()?;
-            let arguments = item
-                .arguments
-                .clone()
-                .unwrap_or_else(|| "{}".to_string());
+            let arguments = item.arguments.clone().unwrap_or_else(|| "{}".to_string());
             Some(ProviderToolCall {
                 id: item
                     .call_id
@@ -1044,7 +1041,10 @@ impl OpenAiCompatibleProvider {
 
         reqwest::Url::parse(&self.responses_url())
             .ok()
-            .and_then(|url| url.host_str().map(|host| host.eq_ignore_ascii_case("api.openai.com")))
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            })
             .unwrap_or(false)
     }
 
@@ -2400,7 +2400,10 @@ mod tests {
             .expect("completed event should finalize response");
 
         assert_eq!(response.id.as_deref(), Some("resp_123"));
-        assert_eq!(extract_responses_text(&response).as_deref(), Some("Hello world"));
+        assert_eq!(
+            extract_responses_text(&response).as_deref(),
+            Some("Hello world")
+        );
     }
 
     #[test]
