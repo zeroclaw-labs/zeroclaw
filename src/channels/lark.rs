@@ -247,7 +247,12 @@ fn should_refresh_lark_tenant_token(status: reqwest::StatusCode, body: &serde_js
 fn parse_image_key(content: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(content)
         .ok()
-        .and_then(|value| value.get("image_key").and_then(|key| key.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("image_key")
+                .and_then(|key| key.as_str())
+                .map(str::to_string)
+        })
 }
 
 fn extract_lark_token_ttl_seconds(body: &serde_json::Value) -> u64 {

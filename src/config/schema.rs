@@ -76,7 +76,9 @@ impl ProviderApiMode {
             Self::OpenAiChatCompletions => {
                 crate::providers::compatible::CompatibleApiMode::OpenAiChatCompletions
             }
-            Self::OpenAiResponses => crate::providers::compatible::CompatibleApiMode::OpenAiResponses,
+            Self::OpenAiResponses => {
+                crate::providers::compatible::CompatibleApiMode::OpenAiResponses
+            }
         }
     }
 }
@@ -6491,10 +6493,9 @@ requires_openai_auth = true
         let err = config
             .validate()
             .expect_err("provider_api should be rejected for non-custom provider");
-        assert!(
-            err.to_string()
-                .contains("provider_api is only valid when default_provider uses the custom:<url> format")
-        );
+        assert!(err.to_string().contains(
+            "provider_api is only valid when default_provider uses the custom:<url> format"
+        ));
     }
 
     #[test]
@@ -6506,7 +6507,10 @@ default_temperature = 0.7
 provider_api = "not-a-real-mode"
 "#;
         let parsed = toml::from_str::<Config>(toml);
-        assert!(parsed.is_err(), "invalid provider_api should fail to deserialize");
+        assert!(
+            parsed.is_err(),
+            "invalid provider_api should fail to deserialize"
+        );
     }
 
     #[test]
@@ -6523,10 +6527,9 @@ provider_api = "not-a-real-mode"
         let err = config
             .validate()
             .expect_err("model route max_tokens=0 should be rejected");
-        assert!(
-            err.to_string()
-                .contains("model_routes[0].max_tokens must be greater than 0")
-        );
+        assert!(err
+            .to_string()
+            .contains("model_routes[0].max_tokens must be greater than 0"));
     }
 
     #[test]

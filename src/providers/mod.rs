@@ -1423,7 +1423,9 @@ pub fn create_routed_provider_with_options(
         });
         let key = routed_credential.or(api_key);
         // Only use api_url for routes targeting the same provider namespace.
-        let url = (route.provider == primary_name).then_some(api_url).flatten();
+        let url = (route.provider == primary_name)
+            .then_some(api_url)
+            .flatten();
 
         let mut route_options = options.clone();
         route_options.max_tokens_override = route.max_tokens;

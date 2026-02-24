@@ -155,10 +155,7 @@ impl OpenRouterProvider {
         Self::new_with_max_tokens(credential, None)
     }
 
-    pub fn new_with_max_tokens(
-        credential: Option<&str>,
-        max_tokens_override: Option<u32>,
-    ) -> Self {
+    pub fn new_with_max_tokens(credential: Option<&str>, max_tokens_override: Option<u32>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
