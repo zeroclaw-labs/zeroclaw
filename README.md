@@ -657,6 +657,7 @@ keyword_weight = 0.3
 # schema = "public"
 # table = "memories"
 # connect_timeout_secs = 15
+# tls = true                  # true = TLS (cert not verified), false = plain TCP (default)
 
 [gateway]
 port = 42617                    # default
