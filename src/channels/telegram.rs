@@ -557,6 +557,31 @@ impl TelegramChannel {
         }
     }
 
+    /// Register bot commands with Telegram's `setMyCommands` API so they
+    /// appear in the command menu for users. Called once on startup.
+    async fn register_commands(&self) -> anyhow::Result<()> {
+        let url = self.api_url("setMyCommands");
+        let body = serde_json::json!({
+            "commands": [
+                { "command": "new", "description": "Start a new conversation" },
+                { "command": "model", "description": "Show or switch the current model" },
+                { "command": "models", "description": "Show or switch the current provider" },
+            ]
+        });
+
+        let resp = self.http_client().post(&url).json(&body).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("setMyCommands failed: status={status}, body={text}");
+        } else {
+            tracing::info!("Telegram bot commands registered successfully");
+        }
+
+        Ok(())
+    }
+
     fn is_telegram_username_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || ch == '_'
     }
@@ -2455,6 +2480,10 @@ impl Channel for TelegramChannel {
 
         if self.mention_only {
             let _ = self.get_bot_username().await;
+        }
+
+        if let Err(e) = self.register_commands().await {
+            tracing::warn!("Failed to register Telegram bot commands: {e}");
         }
 
         tracing::info!("Telegram channel listening for messages...");
