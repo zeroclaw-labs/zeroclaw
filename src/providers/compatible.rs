@@ -1051,10 +1051,8 @@ impl OpenAiCompatibleProvider {
     fn responses_websocket_url(&self, model: &str) -> anyhow::Result<String> {
         let mut url = reqwest::Url::parse(&self.responses_url())?;
         let next_scheme: &'static str = match url.scheme() {
-            "https" => "wss",
-            "http" => "ws",
-            "wss" => "wss",
-            "ws" => "ws",
+            "https" | "wss" => "wss",
+            "http" | "ws" => "ws",
             other => {
                 anyhow::bail!(
                     "{} Responses API websocket transport does not support URL scheme: {}",
@@ -1065,7 +1063,7 @@ impl OpenAiCompatibleProvider {
         };
 
         url.set_scheme(next_scheme)
-            .map_err(|_| anyhow::anyhow!("failed to set websocket URL scheme"))?;
+            .map_err(|()| anyhow::anyhow!("failed to set websocket URL scheme"))?;
 
         if !url.query_pairs().any(|(k, _)| k == "model") {
             url.query_pairs_mut().append_pair("model", model);
