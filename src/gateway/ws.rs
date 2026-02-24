@@ -10,6 +10,8 @@
 //! ```
 
 use super::AppState;
+use crate::agent::loop_::run_tool_call_loop;
+use crate::providers::ChatMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -17,7 +19,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -47,10 +49,27 @@ pub async fn handle_ws_chat(
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
+async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    // Maintain conversation history for this WebSocket session
+    let mut history: Vec<ChatMessage> = Vec::new();
 
-    while let Some(msg) = receiver.next().await {
+    // Build system prompt once for the session
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[],
+            &[],
+            Some(&config_guard.identity),
+            None,
+        )
+    };
+
+    // Add system message to history
+    history.push(ChatMessage::system(&system_prompt));
+
+    while let Some(msg) = socket.recv().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) => break,
@@ -63,7 +82,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Ok(v) => v,
             Err(_) => {
                 let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = socket.send(Message::Text(err.to_string().into())).await;
                 continue;
             }
         };
@@ -78,7 +97,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             continue;
         }
 
-        // Process message with the LLM provider
+        // Add user message to history
+        history.push(ChatMessage::user(&content));
+
+        // Get provider info
         let provider_label = state
             .config
             .lock()
@@ -93,52 +115,38 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             "model": state.model,
         }));
 
-        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[],
-                &[],
-                Some(&config_guard.identity),
-                None,
-            )
-        };
+        // Run the agent loop with tool execution
+        let result = run_tool_call_loop(
+            state.provider.as_ref(),
+            &mut history,
+            state.tools_registry_exec.as_ref(),
+            state.observer.as_ref(),
+            &provider_label,
+            &state.model,
+            state.temperature,
+            true, // silent - no console output
+            None, // approval manager
+            "webchat",
+            &state.multimodal,
+            state.max_tool_iterations,
+            None, // cancellation token
+            None, // delta streaming
+            None, // hooks
+            &[],  // excluded tools
+        )
+        .await;
 
-        let messages = vec![
-            crate::providers::ChatMessage::system(system_prompt),
-            crate::providers::ChatMessage::user(&content),
-        ];
-
-        let multimodal_config = state.config.lock().multimodal.clone();
-        let prepared =
-            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Multimodal prep failed: {e}")
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
-            };
-
-        match state
-            .provider
-            .chat_with_history(&prepared.messages, &state.model, state.temperature)
-            .await
-        {
+        match result {
             Ok(response) => {
+                // Add assistant response to history
+                history.push(ChatMessage::assistant(&response));
+
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
                 });
-                let _ = sender.send(Message::Text(done.to_string().into())).await;
+                let _ = socket.send(Message::Text(done.to_string().into())).await;
 
                 // Broadcast agent_end event
                 let _ = state.event_tx.send(serde_json::json!({
@@ -153,7 +161,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     "type": "error",
                     "message": sanitized,
                 });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = socket.send(Message::Text(err.to_string().into())).await;
 
                 // Broadcast error event
                 let _ = state.event_tx.send(serde_json::json!({
