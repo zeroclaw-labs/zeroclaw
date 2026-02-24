@@ -1279,6 +1279,126 @@ fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+fn normalize_model_provider_wire_api(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "responses" => Some("responses"),
+        "chat_completions" | "chat-completions" | "chat" | "chatcompletions" => {
+            Some("chat_completions")
+        }
+        _ => None,
+    }
+}
+
+fn lookup_model_provider_profile<'a, S>(
+    model_providers: &'a std::collections::HashMap<
+        String,
+        crate::config::schema::ModelProviderConfig,
+        S,
+    >,
+    provider_name: &str,
+) -> Option<(&'a str, &'a crate::config::schema::ModelProviderConfig)>
+where
+    S: std::hash::BuildHasher,
+{
+    let needle = provider_name.trim();
+    if needle.is_empty() {
+        return None;
+    }
+
+    model_providers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(needle))
+        .map(|(name, profile)| (name.as_str(), profile))
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedProviderTarget {
+    provider_name: String,
+    api_key: Option<String>,
+    api_url: Option<String>,
+}
+
+fn resolve_provider_target_from_profiles<S>(
+    provider_name: &str,
+    explicit_api_key: Option<&str>,
+    fallback_api_key: Option<&str>,
+    inherited_api_url: Option<&str>,
+    model_providers: &std::collections::HashMap<
+        String,
+        crate::config::schema::ModelProviderConfig,
+        S,
+    >,
+) -> ResolvedProviderTarget
+where
+    S: std::hash::BuildHasher,
+{
+    let mut resolved_provider_name = provider_name.trim().to_string();
+    let mut resolved_api_url = inherited_api_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    let explicit_api_key = explicit_api_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let fallback_api_key = fallback_api_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let mut profile_api_key: Option<String> = None;
+
+    if let Some((profile_key, profile)) =
+        lookup_model_provider_profile(model_providers, provider_name)
+    {
+        let base_url = profile
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let profile_name = profile
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let wire_api = profile
+            .wire_api
+            .as_deref()
+            .and_then(normalize_model_provider_wire_api);
+
+        profile_api_key = profile
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        if let Some(base_url) = base_url.as_ref() {
+            resolved_api_url = Some(base_url.clone());
+        }
+
+        if wire_api == Some("responses") {
+            resolved_provider_name = "openai-codex".to_string();
+        } else if let Some(profile_name) = profile_name {
+            if !profile_name.eq_ignore_ascii_case(profile_key) {
+                resolved_provider_name = profile_name;
+            } else if let Some(base_url) = base_url {
+                resolved_provider_name = format!("custom:{base_url}");
+            }
+        } else if let Some(base_url) = base_url {
+            resolved_provider_name = format!("custom:{base_url}");
+        }
+    }
+
+    ResolvedProviderTarget {
+        provider_name: resolved_provider_name,
+        api_key: explicit_api_key.or(profile_api_key).or(fallback_api_key),
+        api_url: resolved_api_url,
+    }
+}
+
 /// Create provider chain with retry and fallback behavior.
 pub fn create_resilient_provider(
     primary_name: &str,
@@ -1371,12 +1491,41 @@ pub fn create_routed_provider(
     model_routes: &[crate::config::ModelRouteConfig],
     default_model: &str,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    create_routed_provider_with_options(
+    create_routed_provider_with_model_providers(
         primary_name,
         api_key,
         api_url,
         reliability,
         model_routes,
+        &std::collections::HashMap::new(),
+        default_model,
+    )
+}
+
+/// Create a RouterProvider with optional named provider profiles.
+pub fn create_routed_provider_with_model_providers<S>(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    model_providers: &std::collections::HashMap<
+        String,
+        crate::config::schema::ModelProviderConfig,
+        S,
+    >,
+    default_model: &str,
+) -> anyhow::Result<Box<dyn Provider>>
+where
+    S: std::hash::BuildHasher,
+{
+    create_routed_provider_with_options_and_model_providers(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        model_providers,
         default_model,
         &ProviderRuntimeOptions::default(),
     )
@@ -1392,11 +1541,49 @@ pub fn create_routed_provider_with_options(
     default_model: &str,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    create_routed_provider_with_options_and_model_providers(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        &std::collections::HashMap::new(),
+        default_model,
+        options,
+    )
+}
+
+/// Create a routed provider using explicit runtime options and named provider profiles.
+pub fn create_routed_provider_with_options_and_model_providers<S>(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    model_providers: &std::collections::HashMap<
+        String,
+        crate::config::schema::ModelProviderConfig,
+        S,
+    >,
+    default_model: &str,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>>
+where
+    S: std::hash::BuildHasher,
+{
+    let resolved_primary = resolve_provider_target_from_profiles(
+        primary_name,
+        api_key,
+        None,
+        api_url,
+        model_providers,
+    );
+
     if model_routes.is_empty() {
         return create_resilient_provider_with_options(
-            primary_name,
-            api_key,
-            api_url,
+            &resolved_primary.provider_name,
+            resolved_primary.api_key.as_deref(),
+            resolved_primary.api_url.as_deref(),
             reliability,
             options,
         );
@@ -1404,36 +1591,45 @@ pub fn create_routed_provider_with_options(
 
     // Keep a default provider for non-routed model hints.
     let default_provider = create_resilient_provider_with_options(
-        primary_name,
-        api_key,
-        api_url,
+        &resolved_primary.provider_name,
+        resolved_primary.api_key.as_deref(),
+        resolved_primary.api_url.as_deref(),
         reliability,
         options,
     )?;
     let mut providers: Vec<(String, Box<dyn Provider>)> =
-        vec![(primary_name.to_string(), default_provider)];
+        vec![(resolved_primary.provider_name.clone(), default_provider)];
 
     // Build hint routes with dedicated provider instances so per-route API keys
     // and max_tokens overrides do not bleed across routes.
     let mut routes: Vec<(String, router::Route)> = Vec::new();
     for route in model_routes {
-        let routed_credential = route.api_key.as_ref().and_then(|raw_key| {
-            let trimmed_key = raw_key.trim();
-            (!trimmed_key.is_empty()).then_some(trimmed_key)
-        });
-        let key = routed_credential.or(api_key);
-        // Only use api_url for routes targeting the same provider namespace.
-        let url = (route.provider == primary_name)
-            .then_some(api_url)
+        let inherits_primary_provider = route.provider.trim().eq_ignore_ascii_case(primary_name);
+        let fallback_api_key = if inherits_primary_provider {
+            resolved_primary.api_key.as_deref().or(api_key)
+        } else {
+            api_key
+        };
+        // Only inherit api_url for routes targeting the same provider namespace.
+        let inherited_api_url = inherits_primary_provider
+            .then(|| resolved_primary.api_url.as_deref().or(api_url))
             .flatten();
+        let resolved_route = resolve_provider_target_from_profiles(
+            &route.provider,
+            route.api_key.as_deref(),
+            fallback_api_key,
+            inherited_api_url,
+            model_providers,
+        );
+        let resolved_route_provider_name = resolved_route.provider_name.clone();
 
         let mut route_options = options.clone();
         route_options.max_tokens_override = route.max_tokens;
 
         match create_resilient_provider_with_options(
-            &route.provider,
-            key,
-            url,
+            &resolved_route_provider_name,
+            resolved_route.api_key.as_deref(),
+            resolved_route.api_url.as_deref(),
             reliability,
             &route_options,
         ) {
@@ -1451,6 +1647,7 @@ pub fn create_routed_provider_with_options(
             Err(error) => {
                 tracing::warn!(
                     provider = route.provider.as_str(),
+                    resolved_provider = resolved_route_provider_name.as_str(),
                     hint = route.hint.as_str(),
                     "Ignoring routed provider that failed to initialize: {error}"
                 );
@@ -2846,6 +3043,125 @@ mod tests {
             &ProviderRuntimeOptions::default(),
         );
         assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn routed_provider_profile_resolves_route_provider_key() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "code".to_string(),
+            provider: "sub2api".to_string(),
+            model: "gpt-4.1-mini".to_string(),
+            max_tokens: None,
+            api_key: None,
+        }];
+        let model_providers = std::collections::HashMap::from([(
+            "sub2api".to_string(),
+            crate::config::schema::ModelProviderConfig {
+                name: Some("sub2api".to_string()),
+                base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                api_key: Some("profile-key".to_string()),
+                wire_api: Some("chat_completions".to_string()),
+                requires_openai_auth: false,
+            },
+        )]);
+
+        let provider = create_routed_provider_with_options_and_model_providers(
+            "openrouter",
+            Some("root-key"),
+            None,
+            &reliability,
+            &routes,
+            &model_providers,
+            "anthropic/claude-sonnet-4.6",
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn resolve_route_provider_profile_prefers_profile_key_over_root_key() {
+        let model_providers = std::collections::HashMap::from([(
+            "sub2api".to_string(),
+            crate::config::schema::ModelProviderConfig {
+                name: Some("sub2api".to_string()),
+                base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                api_key: Some("profile-key".to_string()),
+                wire_api: Some("chat_completions".to_string()),
+                requires_openai_auth: false,
+            },
+        )]);
+
+        let resolved = resolve_provider_target_from_profiles(
+            "sub2api",
+            None,
+            Some("root-key"),
+            None,
+            &model_providers,
+        );
+
+        assert_eq!(
+            resolved.provider_name,
+            "custom:https://api.tonsof.blue/v1".to_string()
+        );
+        assert_eq!(
+            resolved.api_url.as_deref(),
+            Some("https://api.tonsof.blue/v1")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+    }
+
+    #[test]
+    fn resolve_route_provider_profile_prefers_route_key_over_profile_key() {
+        let model_providers = std::collections::HashMap::from([(
+            "sub2api".to_string(),
+            crate::config::schema::ModelProviderConfig {
+                name: Some("sub2api".to_string()),
+                base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                api_key: Some("profile-key".to_string()),
+                wire_api: Some("chat_completions".to_string()),
+                requires_openai_auth: false,
+            },
+        )]);
+
+        let resolved = resolve_provider_target_from_profiles(
+            "sub2api",
+            Some("route-key"),
+            Some("root-key"),
+            None,
+            &model_providers,
+        );
+
+        assert_eq!(resolved.api_key.as_deref(), Some("route-key"));
+    }
+
+    #[test]
+    fn resolve_route_provider_profile_responses_wire_api_maps_to_openai_codex() {
+        let model_providers = std::collections::HashMap::from([(
+            "sub2api".to_string(),
+            crate::config::schema::ModelProviderConfig {
+                name: Some("sub2api".to_string()),
+                base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                api_key: Some("profile-key".to_string()),
+                wire_api: Some("responses".to_string()),
+                requires_openai_auth: false,
+            },
+        )]);
+
+        let resolved = resolve_provider_target_from_profiles(
+            "sub2api",
+            None,
+            Some("root-key"),
+            None,
+            &model_providers,
+        );
+
+        assert_eq!(resolved.provider_name, "openai-codex");
+        assert_eq!(
+            resolved.api_url.as_deref(),
+            Some("https://api.tonsof.blue/v1")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
     }
 
     // --- parse_provider_profile ---

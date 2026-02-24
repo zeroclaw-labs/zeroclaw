@@ -293,12 +293,13 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
+        let provider: Box<dyn Provider> = providers::create_routed_provider_with_model_providers(
             provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
+            &config.model_providers,
             &model_name,
         )?;
 

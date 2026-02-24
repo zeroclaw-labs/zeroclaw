@@ -2812,15 +2812,17 @@ pub async fn run(
         max_tokens_override: None,
     };
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        model_name,
-        &provider_runtime_options,
-    )?;
+    let provider: Box<dyn Provider> =
+        providers::create_routed_provider_with_options_and_model_providers(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &config.model_providers,
+            model_name,
+            &provider_runtime_options,
+        )?;
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -3271,15 +3273,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
     };
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
-        &provider_runtime_options,
-    )?;
+    let provider: Box<dyn Provider> =
+        providers::create_routed_provider_with_options_and_model_providers(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &config.model_providers,
+            &model_name,
+            &provider_runtime_options,
+        )?;
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
