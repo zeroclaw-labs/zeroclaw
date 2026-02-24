@@ -272,18 +272,22 @@ jobs:
                     ln -sf "$ARMV7_CC" "${TOOLCHAIN}/arm-linux-androideabi-clang"
                     ln -sf "$ARMV7_CXX" "${TOOLCHAIN}/arm-linux-androideabi-clang++"
 
-                    echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${ARMV7_CC}" >> "$GITHUB_ENV"
-                    echo "CC_armv7_linux_androideabi=${ARMV7_CC}" >> "$GITHUB_ENV"
-                    echo "CXX_armv7_linux_androideabi=${ARMV7_CXX}" >> "$GITHUB_ENV"
-                    echo "AR_armv7_linux_androideabi=${TOOLCHAIN}/llvm-ar" >> "$GITHUB_ENV"
+                    {
+                      echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${ARMV7_CC}"
+                      echo "CC_armv7_linux_androideabi=${ARMV7_CC}"
+                      echo "CXX_armv7_linux_androideabi=${ARMV7_CXX}"
+                      echo "AR_armv7_linux_androideabi=${TOOLCHAIN}/llvm-ar"
+                    } >> "$GITHUB_ENV"
                   elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
                     AARCH64_CC="${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang"
                     AARCH64_CXX="${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang++"
 
-                    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${AARCH64_CC}" >> "$GITHUB_ENV"
-                    echo "CC_aarch64_linux_android=${AARCH64_CC}" >> "$GITHUB_ENV"
-                    echo "CXX_aarch64_linux_android=${AARCH64_CXX}" >> "$GITHUB_ENV"
-                    echo "AR_aarch64_linux_android=${TOOLCHAIN}/llvm-ar" >> "$GITHUB_ENV"
+                    {
+                      echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${AARCH64_CC}"
+                      echo "CC_aarch64_linux_android=${AARCH64_CC}"
+                      echo "CXX_aarch64_linux_android=${AARCH64_CXX}"
+                      echo "AR_aarch64_linux_android=${TOOLCHAIN}/llvm-ar"
+                    } >> "$GITHUB_ENV"
                   fi
 
             - name: Build release
