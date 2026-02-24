@@ -2424,11 +2424,16 @@ impl Channel for TelegramChannel {
                 self.send_text_chunks(text, &chat_id, thread_id.as_deref())
                     .await
             }
-            _ => {
-                // Delete failed — draft still visible with content from update_draft.
-                // Sending a new message now would create a duplicate, so skip it.
+            Ok(r) => {
+                let status = r.status();
                 tracing::warn!(
-                    "Telegram deleteMessage failed; draft still shows response, skipping sendMessage to avoid duplicate"
+                    "Telegram deleteMessage failed ({status}); draft still shows response, skipping sendMessage to avoid duplicate"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Telegram deleteMessage network error: {e}; draft still shows response, skipping sendMessage to avoid duplicate"
                 );
                 Ok(())
             }
