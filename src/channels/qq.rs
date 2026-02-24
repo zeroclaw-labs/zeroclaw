@@ -204,7 +204,13 @@ impl QQChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
-    async fn post_json(&self, token: &str, url: &str, body: &Value, op: &str) -> anyhow::Result<()> {
+    async fn post_json(
+        &self,
+        token: &str,
+        url: &str,
+        body: &Value,
+        op: &str,
+    ) -> anyhow::Result<()> {
         ensure_https(url)?;
 
         let resp = self
