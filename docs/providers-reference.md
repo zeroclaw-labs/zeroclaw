@@ -201,6 +201,21 @@ Behavior:
 
 Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
 
+### OpenAI Codex Reasoning Level
+
+You can control OpenAI Codex reasoning effort from `config.toml`:
+
+```toml
+[provider]
+reasoning_level = "high"
+```
+
+Behavior:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT`.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+
 ### Kimi Code Notes
 
 - Provider ID: `kimi-code`

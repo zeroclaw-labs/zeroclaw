@@ -16,3 +16,7 @@ Source anglaise:
 
 - Les noms de clés de configuration restent en anglais.
 - Le comportement runtime exact est défini en anglais.
+
+## Notes de mise à jour
+
+- Ajout de `provider.reasoning_level` (OpenAI Codex `/responses`). Voir la source anglaise pour les détails.

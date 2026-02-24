@@ -136,6 +136,18 @@ Lưu ý:
 - `reasoning_enabled = true` yêu cầu reasoning tường minh (`think: true` trên `ollama`).
 - Để trống giữ mặc định của provider.
 
+## `[provider]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `reasoning_level` | chưa đặt (`None`) | Ghi đè mức reasoning cho provider hỗ trợ mức (hiện tại OpenAI Codex `/responses`) |
+
+Lưu ý:
+
+- Giá trị hỗ trợ: `minimal`, `low`, `medium`, `high`, `xhigh` (không phân biệt hoa/thường).
+- Khi đặt, ghi đè `ZEROCLAW_CODEX_REASONING_EFFORT` cho OpenAI Codex.
+- Để trống sẽ dùng `ZEROCLAW_CODEX_REASONING_EFFORT` nếu có, nếu không mặc định `xhigh`.
+
 ## `[skills]`
 
 | Khóa | Mặc định | Mục đích |

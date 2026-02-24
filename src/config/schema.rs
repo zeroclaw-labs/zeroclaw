@@ -5568,6 +5568,19 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn provider_reasoning_level_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[provider]
+reasoning_level = "high"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.provider.reasoning_level.as_deref(), Some("high"));
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);

@@ -151,6 +151,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         zeroclaw_dir: None,
         secrets_encrypt: false,
         reasoning_enabled: None,
+        reasoning_level: None,
         custom_provider_api_mode: None,
         max_tokens_override: None,
         model_support_vision: None,

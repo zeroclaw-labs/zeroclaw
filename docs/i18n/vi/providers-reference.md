@@ -113,6 +113,21 @@ Hành vi:
 
 Biến môi trường: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
 
+### Mức reasoning của OpenAI Codex
+
+Bạn có thể điều chỉnh mức reasoning của OpenAI Codex từ `config.toml`:
+
+```toml
+[provider]
+reasoning_level = "high"
+```
+
+Hành vi:
+
+- Giá trị hỗ trợ: `minimal`, `low`, `medium`, `high`, `xhigh` (không phân biệt hoa/thường).
+- Khi đặt, ghi đè `ZEROCLAW_CODEX_REASONING_EFFORT`.
+- Không đặt sẽ dùng `ZEROCLAW_CODEX_REASONING_EFFORT` nếu có, nếu không mặc định `xhigh`.
+
 ### Ghi chú về Kimi Code
 
 - Provider ID: `kimi-code`

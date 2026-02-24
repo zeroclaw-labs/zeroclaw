@@ -239,6 +239,18 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[provider]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `reasoning_level` | unset (`None`) | Reasoning effort/level override for providers that support explicit levels (currently OpenAI Codex `/responses`) |
+
+Notes:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT` for OpenAI Codex requests.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+
 ## `[skills]`
 
 | Key | Default | Purpose |
