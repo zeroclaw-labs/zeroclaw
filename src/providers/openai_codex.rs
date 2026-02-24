@@ -1017,8 +1017,10 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            provider_api_url: None,
         };
-        let provider = OpenAiCodexProvider::new(&options);
+        let provider =
+            OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
         let caps = provider.capabilities();
 
         assert!(!caps.native_tool_calling);

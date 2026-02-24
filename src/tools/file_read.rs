@@ -987,7 +987,8 @@ mod tests {
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
         // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
+        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
+            .expect("provider should initialize");
 
         let mut agent = Agent::builder()
             .provider(Box::new(provider) as Box<dyn Provider>)
