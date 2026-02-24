@@ -5502,7 +5502,10 @@ Let me check the result."#;
         assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
         assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
         assert_eq!(map_tool_name_alias("http"), "http_request");
-        assert_eq!(map_tool_name_alias("totally_unknown_tool"), "totally_unknown_tool");
+        assert_eq!(
+            map_tool_name_alias("totally_unknown_tool"),
+            "totally_unknown_tool"
+        );
     }
 
     #[test]
