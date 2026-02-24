@@ -470,7 +470,6 @@ Reference docs:
 - `docs/operations-runbook.md`
 - `docs/troubleshooting.md`
 - `docs/one-click-bootstrap.md`
-- `docs/operations/linear-sync-playbook.md`
 - `docs/pr-workflow.md`
 - `docs/reviewer-playbook.md`
 - `docs/ci-map.md`
