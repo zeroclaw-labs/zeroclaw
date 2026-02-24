@@ -955,6 +955,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        // Check mention_only for group messages (apply to caption for attachments)
+        let is_group = Self::is_group_message(message);
+        if self.mention_only && is_group {
+            let bot_username = self.bot_username.lock();
+            if let Some(ref bot_username) = *bot_username {
+                let text_to_check = attachment.caption.as_deref().unwrap_or("");
+                if !Self::contains_bot_mention(text_to_check, bot_username) {
+                    return None;
+                }
+            } else {
+                // Bot username unknown, can't verify mention
+                return None;
+            }
+        }
+
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -1079,6 +1094,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        // Voice messages have no text to mention the bot, so ignore in mention_only mode when in groups.
+        // Private chats are always processed.
+        let is_group = Self::is_group_message(message);
+        if self.mention_only && is_group {
             return None;
         }
 
