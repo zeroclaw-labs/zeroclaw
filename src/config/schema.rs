@@ -827,6 +827,28 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Node-control protocol scaffold (`[gateway.node_control]`).
+    #[serde(default)]
+    pub node_control: NodeControlConfig,
+}
+
+/// Node-control scaffold settings under `[gateway.node_control]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct NodeControlConfig {
+    /// Enable experimental node-control API endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional extra shared token for node-control API calls.
+    /// When set, clients must send this value in `X-Node-Control-Token`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+
+    /// Allowlist of remote node IDs for `node.describe`/`node.invoke`.
+    /// Empty means "no explicit allowlist" (accept all IDs).
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -875,6 +897,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            node_control: NodeControlConfig::default(),
         }
     }
 }
@@ -6042,6 +6065,9 @@ channel_id = "C123"
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(!g.node_control.enabled);
+        assert!(g.node_control.auth_token.is_none());
+        assert!(g.node_control.allowed_node_ids.is_empty());
     }
 
     #[test]
@@ -6073,6 +6099,11 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            node_control: NodeControlConfig {
+                enabled: true,
+                auth_token: Some("node-token".into()),
+                allowed_node_ids: vec!["node-1".into(), "node-2".into()],
+            },
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -6085,6 +6116,15 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert!(parsed.node_control.enabled);
+        assert_eq!(
+            parsed.node_control.auth_token.as_deref(),
+            Some("node-token")
+        );
+        assert_eq!(
+            parsed.node_control.allowed_node_ids,
+            vec!["node-1", "node-2"]
+        );
     }
 
     #[test]
@@ -7385,6 +7425,9 @@ default_model = "legacy-model"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(!g.node_control.enabled);
+        assert!(g.node_control.auth_token.is_none());
+        assert!(g.node_control.allowed_node_ids.is_empty());
     }
 
     // ── Peripherals config ───────────────────────────────────────
