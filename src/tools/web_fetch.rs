@@ -268,6 +268,7 @@ impl WebFetchTool {
     }
 
     #[cfg(not(feature = "firecrawl"))]
+    #[allow(clippy::unused_async)]
     async fn fetch_with_firecrawl(&self, _url: &str) -> anyhow::Result<String> {
         anyhow::bail!("web_fetch provider 'firecrawl' requires Cargo feature 'firecrawl'")
     }

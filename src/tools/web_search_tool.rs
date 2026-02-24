@@ -104,8 +104,7 @@ impl WebSearchTool {
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
         let api_key = self
             .api_key
-            .as_ref()
-            .map(String::as_str)
+            .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
@@ -265,6 +264,7 @@ impl WebSearchTool {
     }
 
     #[cfg(not(feature = "firecrawl"))]
+    #[allow(clippy::unused_async)]
     async fn search_firecrawl(&self, _query: &str) -> anyhow::Result<String> {
         anyhow::bail!("web_search provider 'firecrawl' requires Cargo feature 'firecrawl'")
     }
