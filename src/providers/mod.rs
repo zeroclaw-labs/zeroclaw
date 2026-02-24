@@ -676,6 +676,8 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub custom_provider_api_mode: Option<CompatibleApiMode>,
+    pub max_tokens_override: Option<u32>,
     pub model_support_vision: Option<bool>,
 }
 
@@ -687,6 +689,8 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            custom_provider_api_mode: None,
+            max_tokens_override: None,
             model_support_vision: None,
         }
     }
@@ -1426,8 +1430,7 @@ pub fn create_routed_provider_with_options(
             .then_some(api_url)
             .flatten();
 
-        let mut route_options = options.clone();
-        route_options.max_tokens_override = route.max_tokens;
+        let route_options = options.clone();
 
         match create_resilient_provider_with_options(
             &route.provider,
