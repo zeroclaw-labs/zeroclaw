@@ -158,6 +158,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
@@ -506,6 +507,7 @@ async fn run_quick_setup_with_home(
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
@@ -1749,6 +1751,93 @@ pub async fn run_models_refresh(
                 .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
         }
     }
+}
+
+pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter");
+
+    let cached = load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?;
+
+    let Some(cached) = cached else {
+        println!();
+        println!(
+            "  No cached models for '{provider_name}'. Run: zeroclaw models refresh --provider {provider_name}"
+        );
+        println!();
+        return Ok(());
+    };
+
+    println!();
+    println!(
+        "  {} models for '{}' (cached {} ago):",
+        cached.models.len(),
+        provider_name,
+        humanize_age(cached.age_secs)
+    );
+    println!();
+    for model in &cached.models {
+        let marker = if config.default_model.as_deref() == Some(model.as_str()) {
+            "* "
+        } else {
+            "  "
+        };
+        println!("  {marker}{model}");
+    }
+    println!();
+    Ok(())
+}
+
+pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("Model name cannot be empty");
+    }
+
+    let mut updated = config.clone();
+    updated.default_model = Some(model.to_string());
+    updated.save().await?;
+
+    println!();
+    println!("  Default model set to '{}'.", style(model).green().bold());
+    println!();
+    Ok(())
+}
+
+pub async fn run_models_status(config: &Config) -> Result<()> {
+    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model = config.default_model.as_deref().unwrap_or("(not set)");
+
+    println!();
+    println!("  Provider:  {}", style(provider).cyan());
+    println!("  Model:     {}", style(model).cyan());
+    println!(
+        "  Temp:      {}",
+        style(format!("{:.1}", config.default_temperature)).cyan()
+    );
+
+    match load_any_cached_models_for_provider(&config.workspace_dir, provider).await? {
+        Some(cached) => {
+            println!(
+                "  Cache:     {} models (updated {} ago)",
+                cached.models.len(),
+                humanize_age(cached.age_secs)
+            );
+            let fresh = cached.age_secs < MODEL_CACHE_TTL_SECS;
+            if fresh {
+                println!("  Freshness: {}", style("fresh").green());
+            } else {
+                println!("  Freshness: {}", style("stale").yellow());
+            }
+        }
+        None => {
+            println!("  Cache:     {}", style("none").yellow());
+        }
+    }
+
+    println!();
+    Ok(())
 }
 
 // ── Step helpers ─────────────────────────────────────────────────
@@ -4722,28 +4811,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     );
                 }
 
-                if is_feishu {
-                    config.feishu = Some(FeishuConfig {
-                        app_id,
-                        app_secret,
-                        verification_token,
-                        encrypt_key: None,
-                        allowed_users,
-                        receive_mode,
-                        port,
-                    });
-                } else {
-                    config.lark = Some(LarkConfig {
-                        app_id,
-                        app_secret,
-                        verification_token,
-                        encrypt_key: None,
-                        allowed_users,
-                        use_feishu: false,
-                        receive_mode,
-                        port,
-                    });
-                }
+                config.lark = Some(LarkConfig {
+                    app_id,
+                    app_secret,
+                    verification_token,
+                    encrypt_key: None,
+                    allowed_users,
+                    mention_only: false,
+                    use_feishu: is_feishu,
+                    receive_mode,
+                    port,
+                });
             }
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──

@@ -13,7 +13,7 @@ import {
   clearToken as removeToken,
   isAuthenticated as checkAuth,
 } from '../lib/auth';
-import { pair as apiPair } from '../lib/api';
+import { pair as apiPair, getPublicHealth } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // Context shape
@@ -24,6 +24,8 @@ export interface AuthState {
   token: string | null;
   /** Whether the user is currently authenticated. */
   isAuthenticated: boolean;
+  /** True while the initial auth check is in progress. */
+  loading: boolean;
   /** Pair with the agent using a pairing code. Stores the token on success. */
   pair: (code: string) => Promise<void>;
   /** Clear the stored token and sign out. */
@@ -43,6 +45,29 @@ export interface AuthProviderProps {
 export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setTokenState] = useState<string | null>(readToken);
   const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
+  const [loading, setLoading] = useState<boolean>(!checkAuth());
+
+  // On mount: check if server requires pairing at all
+  useEffect(() => {
+    if (checkAuth()) return; // already have a token, no need to check
+    let cancelled = false;
+    getPublicHealth()
+      .then((health) => {
+        if (cancelled) return;
+        if (!health.require_pairing) {
+          setAuthenticated(true);
+        }
+      })
+      .catch(() => {
+        // health endpoint unreachable — fall back to showing pairing dialog
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Keep state in sync if localStorage is changed in another tab
   useEffect(() => {
@@ -73,6 +98,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const value: AuthState = {
     token,
     isAuthenticated: authenticated,
+    loading,
     pair,
     logout,
   };

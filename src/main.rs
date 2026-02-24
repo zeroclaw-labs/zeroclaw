@@ -579,6 +579,19 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
+    /// List cached models for a provider
+    List {
+        /// Provider name (defaults to configured default provider)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Set the default model in config
+    Set {
+        /// Model name to set as default
+        model: String,
+    },
+    /// Show current model configuration and cache status
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -899,6 +912,11 @@ async fn main() -> Result<()> {
             ModelCommands::Refresh { provider, force } => {
                 onboard::run_models_refresh(&config, provider.as_deref(), force).await
             }
+            ModelCommands::List { provider } => {
+                onboard::run_models_list(&config, provider.as_deref()).await
+            }
+            ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
+            ModelCommands::Status => onboard::run_models_status(&config).await,
         },
 
         Commands::Providers => {

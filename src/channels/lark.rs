@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
@@ -14,37 +14,37 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "加油", "鼓掌", "碰拳", "看", "奋斗", "强"];
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
+    "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
+];
 const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "我看行",
     "OK",
-    "加油",
-    "鼓掌",
-    "碰拳",
-    "看",
-    "奮鬥",
-    "強",
-    "很 OK",
+    "JIAYI",
+    "APPLAUSE",
+    "THUMBSUP",
+    "FINGERHEART",
+    "SMILE",
+    "DONE",
 ];
 const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "LooksGoodToMe",
     "OK",
-    "Praise",
-    "Determined",
-    "Glance",
-    "FistBump",
-    "Applaud",
-    "FightOn",
+    "THUMBSUP",
+    "THANKS",
+    "MUSCLE",
+    "FINGERHEART",
+    "APPLAUSE",
+    "SMILE",
+    "DONE",
 ];
 const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "いいと思う",
     "OK",
-    "よくできた",
-    "頑張る",
-    "見る",
-    "グータッチ",
-    "拍手",
-    "頑張れ",
+    "THUMBSUP",
+    "THANKS",
+    "MUSCLE",
+    "FINGERHEART",
+    "APPLAUSE",
+    "SMILE",
+    "DONE",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,8 +293,11 @@ pub struct LarkChannel {
     verification_token: String,
     port: Option<u16>,
     allowed_users: Vec<String>,
-    /// Runtime endpoint/platform selection.
-    platform: LarkPlatform,
+    /// Bot open_id resolved at runtime via `/bot/v3/info`.
+    resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
+    mention_only: bool,
+    /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
+    use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
     /// Cached tenant access token
@@ -310,6 +313,7 @@ impl LarkChannel {
         verification_token: String,
         port: Option<u16>,
         allowed_users: Vec<String>,
+        mention_only: bool,
     ) -> Self {
         Self::new_with_platform(
             app_id,
@@ -335,7 +339,9 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
-            platform,
+            resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
+            mention_only,
+            use_feishu: true,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -356,35 +362,7 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            platform,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch
-    }
-
-    /// Build from explicit Lark config entry.
-    pub fn from_lark_config(config: &crate::config::schema::LarkConfig) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            LarkPlatform::Lark,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch
-    }
-
-    /// Build from explicit Feishu config entry.
-    pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            LarkPlatform::Feishu,
+            config.mention_only,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
@@ -410,12 +388,29 @@ impl LarkChannel {
         format!("{}/auth/v3/tenant_access_token/internal", self.api_base())
     }
 
+    fn bot_info_url(&self) -> String {
+        format!("{}/bot/v3/info", self.api_base())
+    }
+
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
+    }
+
+    fn resolved_bot_open_id(&self) -> Option<String> {
+        self.resolved_bot_open_id
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn set_resolved_bot_open_id(&self, open_id: Option<String>) {
+        if let Ok(mut guard) = self.resolved_bot_open_id.write() {
+            *guard = open_id;
+        }
     }
 
     async fn post_message_reaction_with_token(
@@ -546,6 +541,7 @@ impl LarkChannel {
     /// (the caller reconnects).
     #[allow(clippy::too_many_lines)]
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        self.ensure_bot_open_id().await;
         let (wss_url, client_config) = self.get_ws_endpoint().await?;
         let service_id = wss_url
             .split('?')
@@ -735,19 +731,19 @@ impl LarkChannel {
                     }
 
                     // Decode content by type (mirrors clawdbot-feishu parsing)
-                    let text = match lark_msg.message_type.as_str() {
+                    let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
                         "text" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
                             match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
-                                Some(t) => t.to_string(),
+                                Some(t) => (t.to_string(), Vec::new()),
                                 None => continue,
                             }
                         }
-                        "post" => match parse_post_content(&lark_msg.content) {
-                            Some(t) => t,
+                        "post" => match parse_post_content_details(&lark_msg.content) {
+                            Some(details) => (details.text, details.mentioned_open_ids),
                             None => continue,
                         },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
@@ -759,7 +755,15 @@ impl LarkChannel {
                     if text.is_empty() { continue; }
 
                     // Group-chat: only respond when explicitly @-mentioned
-                    if lark_msg.chat_type == "group" && !should_respond_in_group(&lark_msg.mentions) {
+                    let bot_open_id = self.resolved_bot_open_id();
+                    if lark_msg.chat_type == "group"
+                        && !should_respond_in_group(
+                            self.mention_only,
+                            bot_open_id.as_deref(),
+                            &lark_msg.mentions,
+                            &post_mentioned_open_ids,
+                        )
+                    {
                         continue;
                     }
 
@@ -861,6 +865,84 @@ impl LarkChannel {
         *cached = None;
     }
 
+    async fn fetch_bot_open_id_with_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let resp = self
+            .http_client()
+            .get(self.bot_info_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        Ok((status, body))
+    }
+
+    async fn refresh_bot_open_id(&self) -> anyhow::Result<Option<String>> {
+        let token = self.get_tenant_access_token().await?;
+        let (status, body) = self.fetch_bot_open_id_with_token(&token).await?;
+
+        let body = if should_refresh_lark_tenant_token(status, &body) {
+            self.invalidate_token().await;
+            let refreshed = self.get_tenant_access_token().await?;
+            let (retry_status, retry_body) = self.fetch_bot_open_id_with_token(&refreshed).await?;
+            if !retry_status.is_success() {
+                anyhow::bail!(
+                    "Lark bot info request failed after token refresh: status={retry_status}, body={retry_body}"
+                );
+            }
+            retry_body
+        } else {
+            if !status.is_success() {
+                anyhow::bail!("Lark bot info request failed: status={status}, body={body}");
+            }
+            body
+        };
+
+        let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            anyhow::bail!("Lark bot info failed: code={code}, body={body}");
+        }
+
+        let bot_open_id = body
+            .pointer("/bot/open_id")
+            .or_else(|| body.pointer("/data/bot/open_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+
+        self.set_resolved_bot_open_id(bot_open_id.clone());
+        Ok(bot_open_id)
+    }
+
+    async fn ensure_bot_open_id(&self) {
+        if !self.mention_only || self.resolved_bot_open_id().is_some() {
+            return;
+        }
+
+        match self.refresh_bot_open_id().await {
+            Ok(Some(open_id)) => {
+                tracing::info!("Lark: resolved bot open_id: {open_id}");
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Lark: bot open_id missing from /bot/v3/info response; mention_only group messages will be ignored"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Lark: failed to resolve bot open_id: {err}; mention_only group messages will be ignored"
+                );
+            }
+        }
+    }
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -924,12 +1006,23 @@ impl LarkChannel {
             .and_then(|t| t.as_str())
             .unwrap_or("");
 
+        let chat_type = event
+            .pointer("/message/chat_type")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        let mentions = event
+            .pointer("/message/mentions")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
+
         let content_str = event
             .pointer("/message/content")
             .and_then(|c| c.as_str())
             .unwrap_or("");
 
-        let text: String = match msg_type {
+        let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
             "text" => {
                 let extracted = serde_json::from_str::<serde_json::Value>(content_str)
                     .ok()
@@ -940,12 +1033,12 @@ impl LarkChannel {
                             .map(String::from)
                     });
                 match extracted {
-                    Some(t) => t,
+                    Some(t) => (t, Vec::new()),
                     None => return messages,
                 }
             }
-            "post" => match parse_post_content(content_str) {
-                Some(t) => t,
+            "post" => match parse_post_content_details(content_str) {
+                Some(details) => (details.text, details.mentioned_open_ids),
                 None => return messages,
             },
             _ => {
@@ -953,6 +1046,18 @@ impl LarkChannel {
                 return messages;
             }
         };
+
+        let bot_open_id = self.resolved_bot_open_id();
+        if chat_type == "group"
+            && !should_respond_in_group(
+                self.mention_only,
+                bot_open_id.as_deref(),
+                &mentions,
+                &post_mentioned_open_ids,
+            )
+        {
+            return messages;
+        }
 
         let timestamp = event
             .pointer("/message/create_time")
@@ -1046,6 +1151,7 @@ impl LarkChannel {
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        self.ensure_bot_open_id().await;
         use axum::{extract::State, routing::post, Json, Router};
 
         #[derive(Clone)]
@@ -1343,7 +1449,12 @@ fn random_lark_ack_reaction(
 /// Returns `None` when the content cannot be parsed or yields no usable text,
 /// so callers can simply `continue` rather than forwarding a meaningless
 /// placeholder string to the agent.
-fn parse_post_content(content: &str) -> Option<String> {
+struct ParsedPostContent {
+    text: String,
+    mentioned_open_ids: Vec<String>,
+}
+
+fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let locale = parsed
         .get("zh_cn")
@@ -1355,6 +1466,7 @@ fn parse_post_content(content: &str) -> Option<String> {
         })?;
 
     let mut text = String::new();
+    let mut mentioned_open_ids = Vec::new();
 
     if let Some(title) = locale
         .get("title")
@@ -1392,6 +1504,14 @@ fn parse_post_content(content: &str) -> Option<String> {
                                 .unwrap_or("user");
                             text.push('@');
                             text.push_str(n);
+                            if let Some(open_id) = el
+                                .get("user_id")
+                                .and_then(|i| i.as_str())
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty())
+                            {
+                                mentioned_open_ids.push(open_id.to_string());
+                            }
                         }
                         _ => {}
                     }
@@ -1405,8 +1525,15 @@ fn parse_post_content(content: &str) -> Option<String> {
     if result.is_empty() {
         None
     } else {
-        Some(result)
+        Some(ParsedPostContent {
+            text: result,
+            mentioned_open_ids,
+        })
     }
+}
+
+fn parse_post_content(content: &str) -> Option<String> {
+    parse_post_content_details(content).map(|details| details.text)
 }
 
 /// Remove `@_user_N` placeholder tokens injected by Feishu in group chats.
@@ -1433,22 +1560,58 @@ fn strip_at_placeholders(text: &str) -> String {
     result
 }
 
+fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -> bool {
+    mention
+        .pointer("/id/open_id")
+        .or_else(|| mention.pointer("/open_id"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|value| value == bot_open_id)
+}
+
 /// In group chats, only respond when the bot is explicitly @-mentioned.
-fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
-    !mentions.is_empty()
+fn should_respond_in_group(
+    mention_only: bool,
+    bot_open_id: Option<&str>,
+    mentions: &[serde_json::Value],
+    post_mentioned_open_ids: &[String],
+) -> bool {
+    if !mention_only {
+        return true;
+    }
+    let Some(bot_open_id) = bot_open_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if mentions.is_empty() && post_mentioned_open_ids.is_empty() {
+        return false;
+    }
+    mentions
+        .iter()
+        .any(|mention| mention_matches_bot_open_id(mention, bot_open_id))
+        || post_mentioned_open_ids
+            .iter()
+            .any(|id| id.as_str() == bot_open_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
+        ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
+        ch
+    }
+
     fn make_channel() -> LarkChannel {
-        LarkChannel::new(
-            "cli_test_app_id".into(),
-            "test_app_secret".into(),
-            "test_verification_token".into(),
-            None,
-            vec!["ou_testuser123".into()],
+        with_bot_open_id(
+            LarkChannel::new(
+                "cli_test_app_id".into(),
+                "test_app_secret".into(),
+                "test_verification_token".into(),
+                None,
+                vec!["ou_testuser123".into()],
+                true,
+            ),
+            "ou_bot",
         )
     }
 
@@ -1471,6 +1634,47 @@ mod tests {
     fn lark_ws_non_activity_frames_do_not_refresh_heartbeat_watchdog() {
         assert!(!should_refresh_last_recv(&WsMsg::Text("hello".into())));
         assert!(!should_refresh_last_recv(&WsMsg::Close(None)));
+    }
+
+    #[test]
+    fn lark_group_response_requires_matching_bot_mention_when_ids_available() {
+        let mentions = vec![serde_json::json!({
+            "id": { "open_id": "ou_other" }
+        })];
+        assert!(!should_respond_in_group(
+            true,
+            Some("ou_bot"),
+            &mentions,
+            &[]
+        ));
+
+        let mentions = vec![serde_json::json!({
+            "id": { "open_id": "ou_bot" }
+        })];
+        assert!(should_respond_in_group(
+            true,
+            Some("ou_bot"),
+            &mentions,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn lark_group_response_requires_resolved_open_id_when_mention_only_enabled() {
+        let mentions = vec![serde_json::json!({
+            "id": { "open_id": "ou_any" }
+        })];
+        assert!(!should_respond_in_group(true, None, &mentions, &[]));
+    }
+
+    #[test]
+    fn lark_group_response_allows_post_mentions_for_bot_open_id() {
+        assert!(should_respond_in_group(
+            true,
+            Some("ou_bot"),
+            &[],
+            &[String::from("ou_bot")]
+        ));
     }
 
     #[test]
@@ -1550,13 +1754,21 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         assert!(ch.is_user_allowed("ou_anyone"));
     }
 
     #[test]
     fn lark_user_denied_empty() {
-        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec![]);
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec![],
+            true,
+        );
         assert!(!ch.is_user_allowed("ou_anyone"));
     }
 
@@ -1631,6 +1843,7 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1656,6 +1869,7 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1693,6 +1907,7 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1717,6 +1932,7 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1755,6 +1971,7 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1781,6 +1998,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
+            mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
@@ -1802,6 +2020,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("tok".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -1820,6 +2039,7 @@ mod tests {
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
     }
@@ -1834,6 +2054,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -1899,6 +2120,7 @@ mod tests {
             "token".into(),
             None,
             vec!["*".into()],
+            true,
         );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1915,6 +2137,125 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
+    }
+
+    #[test]
+    fn lark_parse_group_message_requires_bot_mention_when_enabled() {
+        let ch = with_bot_open_id(
+            LarkChannel::new(
+                "cli_app123".into(),
+                "secret".into(),
+                "token".into(),
+                None,
+                vec!["*".into()],
+                true,
+            ),
+            "ou_bot_123",
+        );
+
+        let no_mention_payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_chat",
+                    "mentions": []
+                }
+            }
+        });
+        assert!(ch.parse_event_payload(&no_mention_payload).is_empty());
+
+        let wrong_mention_payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_chat",
+                    "mentions": [{ "id": { "open_id": "ou_other" } }]
+                }
+            }
+        });
+        assert!(ch.parse_event_payload(&wrong_mention_payload).is_empty());
+
+        let bot_mention_payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_chat",
+                    "mentions": [{ "id": { "open_id": "ou_bot_123" } }]
+                }
+            }
+        });
+        assert_eq!(ch.parse_event_payload(&bot_mention_payload).len(), 1);
+    }
+
+    #[test]
+    fn lark_parse_group_post_message_accepts_at_when_top_level_mentions_empty() {
+        let ch = with_bot_open_id(
+            LarkChannel::new(
+                "cli_app123".into(),
+                "secret".into(),
+                "token".into(),
+                None,
+                vec!["*".into()],
+                true,
+            ),
+            "ou_bot_123",
+        );
+
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "post",
+                    "chat_type": "group",
+                    "chat_id": "oc_chat",
+                    "mentions": [],
+                    "content": "{\"zh_cn\":{\"title\":\"\",\"content\":[[{\"tag\":\"at\",\"user_id\":\"ou_bot_123\",\"user_name\":\"Bot\"},{\"tag\":\"text\",\"text\":\" hi\"}]]}}"
+                }
+            }
+        });
+
+        assert_eq!(ch.parse_event_payload(&payload).len(), 1);
+    }
+
+    #[test]
+    fn lark_parse_group_message_allows_without_mention_when_disabled() {
+        let ch = LarkChannel::new(
+            "cli_app123".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        );
+
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_chat",
+                    "mentions": []
+                }
+            }
+        });
+
+        assert_eq!(ch.parse_event_payload(&payload).len(), 1);
     }
 
     #[test]
