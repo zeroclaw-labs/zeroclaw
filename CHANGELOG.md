@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-24
+
+### Added
+- **15 messaging channels**: Telegram, Discord, Slack, WhatsApp, Matrix, Signal, Email, IRC,
+  CLI, DingTalk, Lark/Feishu, QQ, Mattermost, iMessage, and generic Webhook — all with
+  deny-by-default allowlists, per-channel health checks, and automatic supervisor restart.
+- **9 LLM providers + 19 aliases**: Anthropic, OpenAI, Gemini, Ollama, OpenRouter, Copilot,
+  OpenAI Codex, GLM/Zhipu, and generic OpenAI-compatible (`custom:`) / Anthropic-compatible
+  (`anthropic-custom:`) endpoints. Plus Groq, Mistral, xAI, DeepSeek, Together, Fireworks,
+  Perplexity, Cohere, NVIDIA NIM, Venice, Vercel, Cloudflare AI, Moonshot/Kimi, MiniMax,
+  Bedrock, Qianfan, Qwen/DashScope, and LM Studio.
+- **ResilientProvider wrapper**: Automatic retry with exponential backoff, provider fallback
+  chains, circuit breaker pattern, and per-provider rate limiting.
+- **Subscription auth profiles**: Multi-account encrypted-at-rest auth for OpenAI Codex OAuth
+  and Anthropic setup-token flows (`zeroclaw auth login/paste-token/refresh/use`).
+- **Model routing**: `hint:<name>` routing via `[[model_routes]]` config for multi-provider
+  model selection (e.g., `hint:reasoning` → Claude Opus, `hint:fast` → Groq Llama).
+- **Telegram voice pipeline**: Full STT/TTS support via OpenAI-compatible Whisper/TTS APIs
+  with configurable model, voice, language, and max duration.
+- **Telegram mention_only mode**: Bot only responds to @-mentions in groups; DMs always work.
+- **Discord mention_only mode**: Same behavior as Telegram mention_only for Discord guilds.
+- **WhatsApp Business Cloud API**: Webhook-based integration with HMAC signature verification,
+  E.164 phone number allowlists, and Meta Business Suite OAuth tokens.
+- **Matrix E2EE support**: End-to-end encrypted room decryption via matrix-sdk, with automatic
+  device/session restoration and key sharing.
+- **Signal channel**: SSE-based listener with signal-cli HTTP daemon, group filtering, and
+  attachment/story ignore options.
+- **Lark/Feishu channel**: Dual-mode (WebSocket persistent + webhook callback), with Feishu
+  (China) and Lark (International) endpoint toggle.
+- **DingTalk channel**: Stream-mode integration with DingTalk Open Platform.
+- **QQ channel**: Official QQ Bot SDK integration with C2C and group message support.
+- **iMessage channel**: macOS-native AppleScript bridge for local iMessage integration.
+- **Email channel**: IMAP polling + SMTP send with TLS, configurable poll interval and folder.
+- **IRC channel**: TLS socket with NickServ, SASL, and bouncer password support.
+- **Memory system**: SQLite hybrid search (FTS5 BM25 + vector cosine similarity), PostgreSQL
+  backend, Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, and
+  optional response cache. Custom embedding provider trait.
+- **Browser tools**: Multi-backend (agent_browser, rust_native, computer_use) with domain
+  allowlists and coordinate guardrails.
+- **Composio integration**: Opt-in access to 1000+ OAuth apps via composio.dev.
+- **AIEOS identity support**: AI Entity Object Specification v1.1 JSON identity format alongside
+  default OpenClaw markdown identity files.
+- **Tunnel system**: Cloudflare, Tailscale, ngrok, and custom tunnel support with automatic
+  gateway bind safety.
+- **Heartbeat engine**: Periodic task execution from HEARTBEAT.md with configurable interval.
+- **Skills system**: TOML manifest + SKILL.md instruction loading for community skill packs.
+- **Integrations registry**: 70+ integrations across 9 categories with plugin system.
+- **Hardware peripherals**: STM32 and Raspberry Pi GPIO support via `Peripheral` trait.
+- **Docker sandboxed runtime**: Optional Docker container execution with memory limits, CPU
+  limits, read-only rootfs, and network isolation.
+- **Service management**: `zeroclaw service install/status` for user-level background daemon.
+- **Diagnostics**: `zeroclaw doctor` and `zeroclaw channel doctor` for system and channel health.
+- **OpenClaw migration**: `zeroclaw migrate openclaw` with dry-run preview.
+- **Python companion**: `zeroclaw-tools` pip package with LangGraph-based tool calling for
+  providers with inconsistent native tool support.
+
+### Changed
+- **Project logo**: New SVG logo at `assets/logo.svg` replacing placeholder PNG.
+- **Version bump**: 0.1.1 → 0.2.0 reflecting scope of channel/provider/docs additions.
+- **Documentation overhaul**: Comprehensive setup guide, channels reference (all 15 channels
+  with full config field documentation), providers reference (28+ providers with env vars),
+  and interactive architecture overview HTML visualization.
+
+### Security
+- **Legacy XOR cipher migration**: `enc:` prefix deprecated; auto-migrates to `enc2:`
+  (ChaCha20-Poly1305 AEAD) on decryption. Warning logged for legacy values.
+- **Gateway bind safety**: Refuses `0.0.0.0` without active tunnel or explicit opt-in.
+- **Channel allowlists**: Deny-by-default across all channels. Empty allowlist = deny all.
+- **WhatsApp HMAC verification**: Optional `app_secret` for webhook signature validation.
+- **Symlink escape detection**: Canonicalization + resolved-path workspace checks in file tools.
+
+### Deprecated
+- `enc:` prefix for encrypted secrets — use `enc2:` (ChaCha20-Poly1305) instead.
+
 ## [0.1.1] - 2026-02-18
 
 ### Added
@@ -59,5 +133,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace escape prevention
 - Forbidden system path protection (`/etc`, `/root`, `~/.ssh`)
 
+[0.2.0]: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/v0.2.0
 [0.1.1]: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/v0.1.1
 [0.1.0]: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/v0.1.0

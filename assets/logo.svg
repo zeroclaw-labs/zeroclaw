@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="claw" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="50%" stop-color="#ef4444"/>
+      <stop offset="100%" stop-color="#dc2626"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="250" fill="url(#bg)" stroke="url(#ring)" stroke-width="4"/>
+
+  <!-- Outer orbit ring -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="url(#ring)" stroke-width="2" opacity="0.3"/>
+  <circle cx="256" cy="256" r="160" fill="none" stroke="url(#ring)" stroke-width="1" opacity="0.15"/>
+
+  <!-- Central claw mark - three slashes -->
+  <g filter="url(#glow)" transform="translate(256,240)">
+    <!-- Left claw -->
+    <path d="M-70,-90 Q-55,-45 -50,10 Q-48,40 -55,80"
+          stroke="url(#claw)" stroke-width="18" stroke-linecap="round" fill="none"/>
+    <!-- Center claw -->
+    <path d="M0,-100 Q5,-50 0,10 Q-2,45 0,90"
+          stroke="url(#claw)" stroke-width="20" stroke-linecap="round" fill="none"/>
+    <!-- Right claw -->
+    <path d="M70,-90 Q55,-45 50,10 Q48,40 55,80"
+          stroke="url(#claw)" stroke-width="18" stroke-linecap="round" fill="none"/>
+  </g>
+
+  <!-- Zero symbol - integrated as orbit dots -->
+  <circle cx="256" cy="56" r="8" fill="#3b82f6" opacity="0.9"/>
+  <circle cx="456" cy="256" r="6" fill="#6366f1" opacity="0.7"/>
+  <circle cx="256" cy="456" r="8" fill="#3b82f6" opacity="0.9"/>
+  <circle cx="56" cy="256" r="6" fill="#6366f1" opacity="0.7"/>
+
+  <!-- Rust crab accent - small pincers at top -->
+  <g transform="translate(256, 68)" opacity="0.8">
+    <path d="M-25,0 Q-35,-15 -20,-20 Q-10,-22 -8,-12" stroke="#f97316" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M25,0 Q35,-15 20,-20 Q10,-22 8,-12" stroke="#f97316" stroke-width="3" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <!-- Text: ZEROCLAW -->
+  <text x="256" y="410" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="800" font-size="36" fill="#e2e8f0" letter-spacing="6">ZEROCLAW</text>
+
+  <!-- Tagline -->
+  <text x="256" y="440" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="400" font-size="12" fill="#94a3b8" letter-spacing="3">ZERO OVERHEAD  ZERO COMPROMISE</text>
+</svg>

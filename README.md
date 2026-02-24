@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="assets/logo.svg" alt="ZeroClaw" width="200" />
 </p>
 
 <h1 align="center">ZeroClaw 🦀</h1>
@@ -31,6 +31,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center">
   <strong>Quick Routes:</strong>
+  <a href="docs/setup-guide.md">Setup Guide</a> ·
   <a href="docs/reference/README.md">Reference</a> ·
   <a href="docs/operations/README.md">Operations</a> ·
   <a href="docs/troubleshooting.md">Troubleshoot</a> ·
