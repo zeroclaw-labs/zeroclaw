@@ -2704,7 +2704,9 @@ impl ChannelsConfig {
             ),
             (
                 Box::new(ConfigWrapper::new(&self.qq)),
-                self.qq.is_some()
+                self.qq
+                    .as_ref()
+                    .is_some_and(|qq| qq.receive_mode == QQReceiveMode::Websocket)
             ),
             (
                 Box::new(ConfigWrapper::new(&self.nostr)),
@@ -3563,6 +3565,15 @@ impl ChannelConfig for DingTalkConfig {
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QQReceiveMode {
+    Websocket,
+    #[default]
+    Webhook,
+}
+
+/// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
     /// App ID from QQ Bot developer console
@@ -3572,6 +3583,9 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Event receive mode: "webhook" (default) or "websocket".
+    #[serde(default)]
+    pub receive_mode: QQReceiveMode,
 }
 
 impl ChannelConfig for QQConfig {
@@ -7685,6 +7699,28 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+    }
+
+    #[test]
+    async fn qq_config_defaults_to_webhook_receive_mode() {
+        let json = r#"{"app_id":"123","app_secret":"secret"}"#;
+        let parsed: QQConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
+        assert!(parsed.allowed_users.is_empty());
+    }
+
+    #[test]
+    async fn qq_config_toml_roundtrip_receive_mode() {
+        let qc = QQConfig {
+            app_id: "123".into(),
+            app_secret: "secret".into(),
+            allowed_users: vec!["*".into()],
+            receive_mode: QQReceiveMode::Websocket,
+        };
+        let toml_str = toml::to_string(&qc).unwrap();
+        let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
+        assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
     #[test]

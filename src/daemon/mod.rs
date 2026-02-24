@@ -440,6 +440,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
         });
         assert!(has_supervised_channels(&config));
     }

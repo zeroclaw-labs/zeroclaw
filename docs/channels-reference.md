@@ -76,23 +76,23 @@ Operational notes:
 
 Matrix and Lark support are controlled at compile time.
 
-- Default builds are lean (`default = []`) and do not include Matrix/Lark.
-- Typical local check with only hardware support:
+- Default builds include Lark/Feishu (`default = ["channel-lark"]`), while Matrix remains opt-in.
+- For a lean local build without Matrix/Lark:
 
 ```bash
-cargo check --features hardware
+cargo check --no-default-features --features hardware
 ```
 
-- Enable Matrix explicitly when needed:
+- Enable Matrix explicitly in a custom feature set:
 
 ```bash
-cargo check --features hardware,channel-matrix
+cargo check --no-default-features --features hardware,channel-matrix
 ```
 
-- Enable Lark explicitly when needed:
+- Enable Lark explicitly in a custom feature set:
 
 ```bash
-cargo check --features hardware,channel-lark
+cargo check --no-default-features --features hardware,channel-lark
 ```
 
 If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
@@ -387,7 +387,15 @@ allowed_users = ["*"]
 app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
+receive_mode = "webhook" # webhook (default) or websocket (legacy fallback)
 ```
+
+Notes:
+
+- `webhook` mode is now the default and serves inbound callbacks at `POST /qq`.
+- QQ validation challenge payloads (`op = 13`) are auto-signed using `app_secret`.
+- `X-Bot-Appid` is checked when present and must match `app_id`.
+- Set `receive_mode = "websocket"` to keep the legacy gateway WS receive path.
 
 ### 4.16 Nextcloud Talk
 

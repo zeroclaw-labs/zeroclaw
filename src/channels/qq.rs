@@ -1,9 +1,11 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -121,6 +123,56 @@ fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
     Some(format!("{text}\n\n{}", image_markers.join("\n")))
 }
 
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn build_channel_message(
+    sender: &str,
+    reply_target: String,
+    content: String,
+    msg_id: &str,
+) -> ChannelMessage {
+    ChannelMessage {
+        id: Uuid::new_v4().to_string(),
+        sender: sender.to_string(),
+        reply_target,
+        content,
+        channel: "qq".to_string(),
+        timestamp: current_unix_timestamp_secs(),
+        thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
+    }
+}
+
+fn qq_seed_from_secret(secret: &str) -> Option<[u8; 32]> {
+    let bytes = secret.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut seed = [0_u8; 32];
+    for (idx, slot) in seed.iter_mut().enumerate() {
+        *slot = bytes[idx % bytes.len()];
+    }
+    Some(seed)
+}
+
+fn qq_webhook_validation_signature(
+    app_secret: &str,
+    event_ts: &str,
+    plain_token: &str,
+) -> Option<String> {
+    let seed = qq_seed_from_secret(app_secret)?;
+    let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed).ok()?;
+    let mut payload = String::with_capacity(event_ts.len() + plain_token.len());
+    payload.push_str(event_ts);
+    payload.push_str(plain_token);
+    Some(hex::encode(key_pair.sign(payload.as_bytes()).as_ref()))
+}
+
 fn apply_passive_reply_fields(body: &mut Map<String, Value>, msg_id: Option<&str>, msg_seq: u64) {
     if let Some(msg_id) = msg_id {
         body.insert("msg_id".to_string(), Value::String(msg_id.to_string()));
@@ -200,8 +252,135 @@ impl QQChannel {
         crate::config::build_runtime_proxy_client("channel.qq")
     }
 
+    pub fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    async fn parse_dispatch_message_event(
+        &self,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
+        match event_type {
+            "C2C_MESSAGE_CREATE" => {
+                let msg_id = payload.get("id").and_then(Value::as_str).unwrap_or("");
+                if self.is_duplicate(msg_id).await {
+                    return None;
+                }
+
+                let content = compose_message_content(payload)?;
+                let author_id = payload
+                    .get("author")
+                    .and_then(|a| a.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let user_openid = payload
+                    .get("author")
+                    .and_then(|a| a.get("user_openid"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(author_id);
+
+                if !self.is_user_allowed(user_openid) {
+                    tracing::warn!(
+                        "QQ: ignoring C2C message from unauthorized user: {user_openid}"
+                    );
+                    return None;
+                }
+
+                let chat_id = format!("user:{user_openid}");
+                Some(build_channel_message(user_openid, chat_id, content, msg_id))
+            }
+            "GROUP_AT_MESSAGE_CREATE" => {
+                let msg_id = payload.get("id").and_then(Value::as_str).unwrap_or("");
+                if self.is_duplicate(msg_id).await {
+                    return None;
+                }
+
+                let content = compose_message_content(payload)?;
+                let author_id = payload
+                    .get("author")
+                    .and_then(|a| a.get("member_openid"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if !self.is_user_allowed(author_id) {
+                    tracing::warn!(
+                        "QQ: ignoring group message from unauthorized user: {author_id}"
+                    );
+                    return None;
+                }
+
+                let group_openid = payload
+                    .get("group_openid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let chat_id = format!("group:{group_openid}");
+                Some(build_channel_message(author_id, chat_id, content, msg_id))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn build_webhook_validation_response(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let op = payload
+            .get("op")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if op != 13 {
+            return None;
+        }
+
+        let validation = payload.get("d")?;
+        let plain_token = validation
+            .get("plain_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?;
+        let event_ts = validation
+            .get("event_ts")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?;
+
+        let signature = qq_webhook_validation_signature(&self.app_secret, event_ts, plain_token)?;
+        Some(json!({
+            "plain_token": plain_token,
+            "signature": signature
+        }))
+    }
+
+    pub async fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        let op = payload
+            .get("op")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if op != 0 {
+            return Vec::new();
+        }
+
+        let event_type = payload
+            .get("t")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if event_type.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(dispatch_payload) = payload.get("d") else {
+            return Vec::new();
+        };
+
+        self.parse_dispatch_message_event(event_type, dispatch_payload)
+            .await
+            .into_iter()
+            .collect()
     }
 
     async fn post_json(
@@ -560,85 +739,13 @@ impl Channel for QQChannel {
                         None => continue,
                     };
 
-                    match event_type {
-                        "C2C_MESSAGE_CREATE" => {
-                            let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if self.is_duplicate(msg_id).await {
-                                continue;
-                            }
-
-                            let Some(content) = compose_message_content(d) else {
-                                continue;
-                            };
-
-                            let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
-                            // For QQ, user_openid is the identifier
-                            let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
-
-                            if !self.is_user_allowed(user_openid) {
-                                tracing::warn!("QQ: ignoring C2C message from unauthorized user: {user_openid}");
-                                continue;
-                            }
-
-                            let chat_id = format!("user:{user_openid}");
-
-                            let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
-                                sender: user_openid.to_string(),
-                                reply_target: chat_id,
-                                content,
-                                channel: "qq".to_string(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
-                            };
-
-                            if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("QQ: message channel closed");
-                                break;
-                            }
+                    if let Some(channel_msg) =
+                        self.parse_dispatch_message_event(event_type, d).await
+                    {
+                        if tx.send(channel_msg).await.is_err() {
+                            tracing::warn!("QQ: message channel closed");
+                            break;
                         }
-                        "GROUP_AT_MESSAGE_CREATE" => {
-                            let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if self.is_duplicate(msg_id).await {
-                                continue;
-                            }
-
-                            let Some(content) = compose_message_content(d) else {
-                                continue;
-                            };
-
-                            let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
-
-                            if !self.is_user_allowed(author_id) {
-                                tracing::warn!("QQ: ignoring group message from unauthorized user: {author_id}");
-                                continue;
-                            }
-
-                            let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
-                            let chat_id = format!("group:{group_openid}");
-
-                            let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
-                                sender: author_id.to_string(),
-                                reply_target: chat_id,
-                                content,
-                                channel: "qq".to_string(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
-                            };
-
-                            if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("QQ: message channel closed");
-                                break;
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -709,6 +816,81 @@ allowed_users = ["user1"]
         assert_eq!(config.app_id, "12345");
         assert_eq!(config.app_secret, "secret_abc");
         assert_eq!(config.allowed_users, vec!["user1"]);
+        assert_eq!(
+            config.receive_mode,
+            crate::config::schema::QQReceiveMode::Webhook
+        );
+    }
+
+    #[test]
+    fn test_build_webhook_validation_response() {
+        let ch = QQChannel::new(
+            "11111111".into(),
+            "DG5g3B4j9X2KOErG".into(),
+            vec!["*".into()],
+        );
+        let payload = json!({
+            "op": 13,
+            "d": {
+                "plain_token": "Arq0D5A61EgUu4OxUvOp",
+                "event_ts": "1725442341"
+            }
+        });
+
+        let response = ch
+            .build_webhook_validation_response(&payload)
+            .expect("validation response expected");
+
+        assert_eq!(response["plain_token"], "Arq0D5A61EgUu4OxUvOp");
+        assert_eq!(
+            response["signature"],
+            "87befc99c42c651b3aac0278e71ada338433ae26fcb24307bdc5ad38c1adc2d01bcfcadc0842edac85e85205028a1132afe09280305f13aa6909ffc2d652c706"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_webhook_payload_c2c_event() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["user_open_1".into()]);
+        let payload = json!({
+            "op": 0,
+            "t": "C2C_MESSAGE_CREATE",
+            "d": {
+                "id": "msg-1",
+                "content": "hello webhook",
+                "author": {
+                    "id": "author-1",
+                    "user_openid": "user_open_1"
+                }
+            }
+        });
+
+        let messages = ch.parse_webhook_payload(&payload).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, "user_open_1");
+        assert_eq!(messages[0].reply_target, "user:user_open_1");
+        assert_eq!(messages[0].thread_ts.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_webhook_payload_deduplicates_by_message_id() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["user_open_1".into()]);
+        let payload = json!({
+            "op": 0,
+            "t": "C2C_MESSAGE_CREATE",
+            "d": {
+                "id": "msg-dup",
+                "content": "hello webhook",
+                "author": {
+                    "id": "author-1",
+                    "user_openid": "user_open_1"
+                }
+            }
+        });
+
+        let first = ch.parse_webhook_payload(&payload).await;
+        let second = ch.parse_webhook_payload(&payload).await;
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
     }
 
     #[test]

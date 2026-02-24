@@ -180,7 +180,7 @@ rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = []
+default = ["channel-lark"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
