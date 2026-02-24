@@ -86,6 +86,7 @@
 // #![warn(missing_docs)]
 #![allow(missing_docs)]
 #![warn(clippy::all)]
+#![forbid(unsafe_code)]
 
 pub mod config;
 pub mod traits;

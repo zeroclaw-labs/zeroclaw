@@ -1283,6 +1283,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report_a["summary"]["by_pattern"]["ffi_libc_call"], 1)
         self.assertEqual(report_a["summary"]["by_pattern"]["mem_transmute"], 1)
         self.assertEqual(report_a["source"]["mode"], "git_ls_files")
+        self.assertEqual(report_a["source"]["crate_roots_scanned"], 0)
 
     def test_unsafe_debt_audit_fail_on_findings(self) -> None:
         repo = self.tmp / "repo"
@@ -1308,6 +1309,107 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         report = json.loads(out_json.read_text(encoding="utf-8"))
         self.assertGreaterEqual(report["summary"]["total_findings"], 1)
+
+    def test_unsafe_debt_audit_detects_missing_crate_unsafe_guard(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        (repo / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "fixture-missing-guard"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "lib.rs").write_text(
+            "pub fn version() -> &'static str { \"v1\" }\n",
+            encoding="utf-8",
+        )
+
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json = self.tmp / "unsafe-missing-guard.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["crate_roots_scanned"], 1)
+        self.assertEqual(report["summary"]["total_findings"], 1)
+        self.assertEqual(report["summary"]["by_pattern"]["missing_crate_unsafe_guard"], 1)
+        finding = report["findings"][0]
+        self.assertEqual(finding["pattern_id"], "missing_crate_unsafe_guard")
+        self.assertEqual(finding["path"], "src/lib.rs")
+
+    def test_unsafe_debt_audit_accepts_crate_with_unsafe_guard(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        (repo / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "fixture-with-guard"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "lib.rs").write_text(
+            textwrap.dedent(
+                """
+                #![forbid(unsafe_code)]
+                pub fn version() -> &'static str { "v2" }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json = self.tmp / "unsafe-with-guard.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+                "--fail-on-findings",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["crate_roots_scanned"], 1)
+        self.assertEqual(report["summary"]["total_findings"], 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
