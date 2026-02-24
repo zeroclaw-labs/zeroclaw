@@ -10,6 +10,18 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+let fallbackMessageIdCounter = 0;
+
+function makeMessageId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return uuid;
+
+  fallbackMessageIdCounter += 1;
+  return `msg_${Date.now().toString(36)}_${fallbackMessageIdCounter.toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
 export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -52,7 +64,7 @@ export default function AgentChat() {
             setMessages((prev) => [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: makeMessageId(),
                 role: 'agent',
                 content,
                 timestamp: new Date(),
@@ -68,7 +80,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: makeMessageId(),
               role: 'agent',
               content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
               timestamp: new Date(),
@@ -80,7 +92,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: makeMessageId(),
               role: 'agent',
               content: `[Tool Result] ${msg.output ?? ''}`,
               timestamp: new Date(),
@@ -92,7 +104,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: makeMessageId(),
               role: 'agent',
               content: `[Error] ${msg.message ?? 'Unknown error'}`,
               timestamp: new Date(),
@@ -123,7 +135,7 @@ export default function AgentChat() {
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: makeMessageId(),
         role: 'user',
         content: trimmed,
         timestamp: new Date(),
