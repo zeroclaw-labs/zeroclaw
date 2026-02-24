@@ -248,6 +248,7 @@ mod tests {
             HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 30,
+                ..HeartbeatConfig::default()
             },
             dir.clone(),
             observer,
@@ -273,6 +274,7 @@ mod tests {
             HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 30,
+                ..HeartbeatConfig::default()
             },
             dir.clone(),
             observer,
@@ -290,6 +292,7 @@ mod tests {
             HeartbeatConfig {
                 enabled: false,
                 interval_minutes: 30,
+                ..HeartbeatConfig::default()
             },
             std::env::temp_dir(),
             observer,

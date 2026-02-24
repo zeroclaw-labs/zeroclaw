@@ -12,7 +12,10 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
-use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
+use crate::channels::{
+    Channel, LinqChannel, NextcloudTalkChannel, QQChannel, SendMessage, WatiChannel,
+    WhatsAppChannel,
+};
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -20,8 +23,8 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools;
 use crate::tools::traits::ToolSpec;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -64,8 +67,16 @@ fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
 }
 
+fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("wati_{}_{}", msg.sender, msg.id)
+}
+
 fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
+}
+
+fn qq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("qq_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -295,10 +306,19 @@ pub struct AppState {
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    pub wati: Option<Arc<WatiChannel>>,
+    pub qq: Option<Arc<QQChannel>>,
+    pub qq_webhook_enabled: bool,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Executable tools for agent loop (web chat)
+    pub tools_registry_exec: Arc<Vec<Box<dyn Tool>>>,
+    /// Multimodal config for image handling in web chat
+    pub multimodal: crate::config::MultimodalConfig,
+    /// Max tool iterations for agent loop
+    pub max_tool_iterations: usize,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -338,9 +358,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.reliability,
         &providers::ProviderRuntimeOptions {
             auth_profile_override: None,
+            provider_api_url: config.api_url.clone(),
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+            max_tokens_override: None,
         },
     )?);
     let model = config
@@ -370,7 +393,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry_raw = tools::all_tools_with_runtime(
+    let tools_registry_exec: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -379,13 +402,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    );
+    ));
     let tools_registry: Arc<Vec<ToolSpec>> =
-        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+        Arc::new(tools_registry_exec.iter().map(|t| t.spec()).collect());
+    let max_tool_iterations = config.agent.max_tool_iterations;
+    let multimodal_config = config.multimodal.clone();
 
     // Cost tracker (optional)
     let cost_tracker = if config.cost.enabled {
@@ -473,6 +499,31 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         })
         .map(Arc::from);
+
+    // WATI channel (if configured)
+    let wati_channel: Option<Arc<WatiChannel>> =
+        config.channels_config.wati.as_ref().map(|wati_cfg| {
+            Arc::new(WatiChannel::new(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
+            ))
+        });
+
+    // QQ channel (if configured)
+    let qq_channel: Option<Arc<QQChannel>> = config.channels_config.qq.as_ref().map(|qq_cfg| {
+        Arc::new(QQChannel::new(
+            qq_cfg.app_id.clone(),
+            qq_cfg.app_secret.clone(),
+            qq_cfg.allowed_users.clone(),
+        ))
+    });
+    let qq_webhook_enabled = config
+        .channels_config
+        .qq
+        .as_ref()
+        .is_some_and(|qq| qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook);
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
@@ -563,8 +614,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if linq_channel.is_some() {
         println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if wati_channel.is_some() {
+        println!("  GET  /wati      — WATI webhook verification");
+        println!("  POST /wati      — WATI message webhook");
+    }
     if nextcloud_talk_channel.is_some() {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
+    if qq_webhook_enabled {
+        println!("  POST /qq        — QQ Bot webhook (validation + events)");
     }
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
@@ -616,8 +674,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
+        wati: wati_channel,
+        qq: qq_channel,
+        qq_webhook_enabled,
         observer: broadcast_observer,
         tools_registry,
+        tools_registry_exec,
+        multimodal: multimodal_config,
+        max_tool_iterations,
         cost_tracker,
         event_tx,
     };
@@ -637,7 +701,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/wati", get(handle_wati_verify))
+        .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route("/qq", post(handle_qq_webhook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
@@ -646,7 +713,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/integrations", get(api::handle_api_integrations))
-        .route("/api/doctor", post(api::handle_api_doctor))
+        .route(
+            "/api/doctor",
+            get(api::handle_api_doctor).post(api::handle_api_doctor),
+        )
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
@@ -689,6 +759,7 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
+        "require_pairing": state.pairing.require_pairing(),
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
@@ -1293,6 +1364,98 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// GET /wati — WATI webhook verification (echoes hub.challenge)
+async fn handle_wati_verify(
+    State(state): State<AppState>,
+    Query(params): Query<WatiVerifyQuery>,
+) -> impl IntoResponse {
+    if state.wati.is_none() {
+        return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
+    }
+
+    // WATI may use Meta-style webhook verification; echo the challenge
+    if let Some(challenge) = params.challenge {
+        tracing::info!("WATI webhook verified successfully");
+        return (StatusCode::OK, challenge);
+    }
+
+    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct WatiVerifyQuery {
+    #[serde(rename = "hub.challenge")]
+    pub challenge: Option<String>,
+}
+
+/// POST /wati — incoming WATI WhatsApp message webhook
+async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+    let Some(ref wati) = state.wati else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "WATI not configured"})),
+        );
+    };
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = wati.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "WATI message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = wati_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Call the LLM
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
+            Ok(response) => {
+                // Send reply via WATI
+                if let Err(e) = wati
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send WATI reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for WATI message: {e:#}");
+                let _ = wati
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
 async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
@@ -1395,6 +1558,101 @@ async fn handle_nextcloud_talk_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /qq — incoming QQ Bot webhook (validation + events)
+async fn handle_qq_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref qq) = state.qq else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "QQ not configured"})),
+        );
+    };
+
+    if !state.qq_webhook_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "QQ webhook mode not enabled"})),
+        );
+    }
+
+    let app_id_header = headers
+        .get("X-Bot-Appid")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if !app_id_header.is_empty() && !constant_time_eq(app_id_header, qq.app_id()) {
+        tracing::warn!("QQ webhook rejected due to mismatched X-Bot-Appid");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid X-Bot-Appid"})),
+        );
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    if let Some(validation_response) = qq.build_webhook_validation_response(&payload) {
+        tracing::info!("QQ webhook validation challenge accepted");
+        return (StatusCode::OK, Json(validation_response));
+    }
+
+    let messages = qq.parse_webhook_payload(&payload).await;
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "QQ webhook message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        if state.auto_save {
+            let key = qq_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
+            Ok(response) => {
+                if let Err(e) = qq
+                    .send(
+                        &SendMessage::new(response, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await
+                {
+                    tracing::error!("Failed to send QQ reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for QQ webhook message: {e:#}");
+                let _ = qq
+                    .send(
+                        &SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,8 +1730,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1520,8 +1784,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1728,6 +1998,22 @@ mod tests {
         assert_eq!(key, "whatsapp_+1234567890_wamid-123");
     }
 
+    #[test]
+    fn qq_memory_key_includes_sender_and_message_id() {
+        let msg = ChannelMessage {
+            id: "msg-123".into(),
+            sender: "user_openid".into(),
+            reply_target: "user:user_openid".into(),
+            content: "hello".into(),
+            channel: "qq".into(),
+            timestamp: 1,
+            thread_ts: Some("msg-123".into()),
+        };
+
+        let key = qq_memory_key(&msg);
+        assert_eq!(key, "qq_user_openid_msg-123");
+    }
+
     #[derive(Default)]
     struct MockMemory;
 
@@ -1885,8 +2171,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1948,8 +2240,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2023,8 +2321,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2070,8 +2374,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2122,8 +2432,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2179,8 +2495,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2232,8 +2554,14 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2252,6 +2580,116 @@ mod tests {
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn qq_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_qq_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"op":13,"d":{"plain_token":"p","event_ts":"1"}}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn qq_webhook_validation_returns_signed_challenge() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let qq = Arc::new(QQChannel::new(
+            "11111111".into(),
+            "DG5g3B4j9X2KOErG".into(),
+            vec!["*".into()],
+        ));
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: Some(qq),
+            qq_webhook_enabled: true,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Bot-Appid", HeaderValue::from_static("11111111"));
+
+        let response = handle_qq_webhook(
+            State(state),
+            headers,
+            Bytes::from_static(
+                br#"{"op":13,"d":{"plain_token":"Arq0D5A61EgUu4OxUvOp","event_ts":"1725442341"}}"#,
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["plain_token"], "Arq0D5A61EgUu4OxUvOp");
+        assert_eq!(
+            parsed["signature"],
+            "87befc99c42c651b3aac0278e71ada338433ae26fcb24307bdc5ad38c1adc2d01bcfcadc0842edac85e85205028a1132afe09280305f13aa6909ffc2d652c706"
+        );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 

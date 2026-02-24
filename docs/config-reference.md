@@ -23,6 +23,7 @@ Schema export command:
 | Key | Default | Notes |
 |---|---|---|
 | `default_provider` | `openrouter` | provider ID or alias |
+| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
@@ -71,6 +72,10 @@ Operational note for container users:
 
 - If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
 - Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
+- For OpenAI-compatible Responses fallback transport:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode (`wss://.../responses`) for compatible providers.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` forces HTTP-only mode.
+  - Unset = auto (websocket-first only when endpoint host is `api.openai.com`, then HTTP fallback if websocket fails).
 
 ## `[agent]`
 
@@ -271,7 +276,7 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
+| `enabled` | `false` | Enable `browser_open` tool (opens URLs in the system browser without scraping) |
 | `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
@@ -327,7 +332,7 @@ Notes:
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
-| `allowed_commands` | _required for shell execution_ | allowlist of executable names |
+| `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -342,6 +347,7 @@ Notes:
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
+- `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
 
@@ -379,6 +385,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
+| `max_tokens` | unset | Optional per-route output token cap forwarded to provider APIs |
 | `api_key` | unset | Optional API key override for this route's provider |
 
 ### `[[embedding_routes]]`
@@ -399,6 +406,7 @@ embedding_model = "hint:semantic"
 hint = "reasoning"
 provider = "openrouter"
 model = "provider/model-id"
+max_tokens = 8192
 
 [[embedding_routes]]
 hint = "semantic"

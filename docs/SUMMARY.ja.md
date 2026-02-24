@@ -8,6 +8,7 @@
 
 ## 言語別入口
 
+- ドキュメント構造マップ（言語/カテゴリ/機能）: [structure/README.md](structure/README.md)
 - 英語 README：[../README.md](../README.md)
 - 中国語 README：[../README.zh-CN.md](../README.zh-CN.md)
 - 日本語 README：[../README.ja.md](../README.ja.md)

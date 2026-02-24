@@ -9,8 +9,8 @@ unmaintained = "all"
 yanked = "deny"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
-    # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
-    "RUSTSEC-2025-0141",
+    # bincode v2.0.1 via probe-rs — upstream project ceased; accepted transitive risk for current hardware stack.
+    { id = "RUSTSEC-2025-0141", reason = "Transitive via probe-rs in current release path; tracked for replacement when probe-rs updates." },
     { id = "RUSTSEC-2024-0384", reason = "Reported to `rust-nostr/nostr` and it's WIP" },
 ]
 

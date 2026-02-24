@@ -8,15 +8,15 @@ pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
     CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig,
-    EstopConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, OtpConfig,
-    OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
-    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
-    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    EstopConfig, FeishuConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
+    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
+    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
+    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
+    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
+    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
+    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
-    WebSearchConfig, WebhookConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: &Option<T>) -> (&'static str, bool) {
@@ -61,7 +61,17 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec![],
+            mention_only: false,
             use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+        };
+        let feishu = FeishuConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         };
@@ -76,6 +86,7 @@ mod tests {
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
         assert_eq!(lark.app_id, "app-id");
+        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }

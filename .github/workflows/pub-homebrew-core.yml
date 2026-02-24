@@ -85,7 +85,8 @@ jobs:
               id: patch_formula
               shell: bash
               env:
-                  HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
+                  HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
+                  GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
               run: |
                   set -euo pipefail
 
@@ -107,9 +108,19 @@ jobs:
                       echo "::error::HOMEBREW_CORE_BOT_FORK_REPO must be in owner/repo format."
                       exit 1
                     fi
-                    auth_header="$(printf 'x-access-token:%s' "${HOMEBREW_CORE_BOT_TOKEN}" | base64 | tr -d '\n')"
-                    git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
-                      clone --depth=1 "https://github.com/${BOT_FORK_REPO}.git" "$tmp_repo/homebrew-core"
+                    if ! command -v gh >/dev/null 2>&1; then
+                      echo "::error::gh CLI is required on the runner."
+                      exit 1
+                    fi
+                    if [[ -z "${GH_TOKEN:-}" ]]; then
+                      echo "::error::Repository secret HOMEBREW_CORE_BOT_TOKEN is missing."
+                      exit 1
+                    fi
+                    if ! gh api "repos/${BOT_FORK_REPO}" >/dev/null 2>&1; then
+                      echo "::error::HOMEBREW_CORE_BOT_TOKEN cannot access ${BOT_FORK_REPO}."
+                      exit 1
+                    fi
+                    gh repo clone "${BOT_FORK_REPO}" "$tmp_repo/homebrew-core" -- --depth=1
                   fi
 
                   repo_dir="$tmp_repo/homebrew-core"
@@ -120,10 +131,19 @@ jobs:
                   fi
 
                   if [[ "$DRY_RUN" == "false" ]]; then
-                    git -C "$repo_dir" remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-                    git -C "$repo_dir" fetch --depth=1 upstream master
+                    if git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; then
+                      git -C "$repo_dir" remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+                    else
+                      git -C "$repo_dir" remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+                    fi
+                    if git -C "$repo_dir" ls-remote --exit-code --heads upstream main >/dev/null 2>&1; then
+                      upstream_ref="main"
+                    else
+                      upstream_ref="master"
+                    fi
+                    git -C "$repo_dir" fetch --depth=1 upstream "$upstream_ref"
                     branch_name="zeroclaw-${RELEASE_TAG}-${GITHUB_RUN_ID}"
-                    git -C "$repo_dir" checkout -B "$branch_name" upstream/master
+                    git -C "$repo_dir" checkout -B "$branch_name" "upstream/$upstream_ref"
                     echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
                   fi
 
@@ -152,7 +172,7 @@ jobs:
               if: ${{ inputs.dry_run == false }}
               shell: bash
               env:
-                  GH_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
+                  GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
               run: |
                   set -euo pipefail
 
@@ -166,9 +186,12 @@ jobs:
                   git -C "$repo_dir" config user.email "$bot_email"
                   git -C "$repo_dir" add "$FORMULA_PATH"
                   git -C "$repo_dir" commit -m "zeroclaw ${tag_version}"
-                  auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
-                  git -C "$repo_dir" -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
-                    push --set-upstream origin "$branch_name"
+                  if [[ -z "${GH_TOKEN:-}" ]]; then
+                    echo "::error::Repository secret HOMEBREW_CORE_BOT_TOKEN is missing."
+                    exit 1
+                  fi
+                  gh auth setup-git
+                  git -C "$repo_dir" push --set-upstream origin "$branch_name"
 
                   pr_title="zeroclaw ${tag_version}"
                   pr_body=$(cat <<EOF
@@ -182,7 +205,7 @@ jobs:
 
                   gh pr create \
                     --repo "$UPSTREAM_REPO" \
-                    --base master \
+                    --base main \
                     --head "${fork_owner}:${branch_name}" \
                     --title "$pr_title" \
                     --body "$pr_body"

@@ -26,6 +26,7 @@ Last reviewed: **February 18, 2026**.
 | `docs/README.ru.md` | Current Guide (localized hub) | Russian readers |
 | `docs/README.vi.md` | Current Guide (localized hub) | Vietnamese readers |
 | `docs/SUMMARY.md` | Current Guide (unified TOC) | all readers |
+| `docs/structure/README.md` | Current Guide (structure map) | all readers |
 
 ## Collection Index Docs
 

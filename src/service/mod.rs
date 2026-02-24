@@ -457,12 +457,25 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 /// Check if the current process is running as root (Unix only)
 #[cfg(unix)]
 fn is_root() -> bool {
-    unsafe { libc::getuid() == 0 }
+    current_uid() == Some(0)
 }
 
 #[cfg(not(unix))]
 fn is_root() -> bool {
     false
+}
+
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 /// Check if the zeroclaw user exists and has expected properties.
@@ -1168,7 +1181,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn is_root_matches_system_uid() {
-        assert_eq!(is_root(), unsafe { libc::getuid() == 0 });
+        assert_eq!(is_root(), current_uid() == Some(0));
     }
 
     #[test]

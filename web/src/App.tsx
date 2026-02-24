@@ -80,7 +80,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 }
 
 function AppContent() {
-  const { isAuthenticated, pair, logout } = useAuth();
+  const { isAuthenticated, loading, pair, logout } = useAuth();
   const [locale, setLocaleState] = useState('tr');
 
   const setAppLocale = (newLocale: string) => {
@@ -96,6 +96,14 @@ function AppContent() {
     window.addEventListener('zeroclaw-unauthorized', handler);
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
   }, [logout]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <p className="text-gray-400">Connecting...</p>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return <PairingDialog onPair={pair} />;
