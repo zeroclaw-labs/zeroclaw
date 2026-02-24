@@ -2361,7 +2361,21 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // Markdown failed — retry without parse_mode
+        // Telegram returns "message is not modified" when update_draft already
+        // set identical content. Common for short plain-text responses where
+        // HTML and plain text are equivalent.
+        {
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            if body_str.contains("message is not modified") {
+                tracing::debug!(
+                    "Telegram editMessageText (HTML): message is not modified, treating as success"
+                );
+                return Ok(());
+            }
+        }
+
+        // HTML edit failed — retry without parse_mode
         let plain_body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": id,
@@ -2379,10 +2393,46 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // Edit failed entirely — fall back to new message
-        tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
-        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-            .await
+        {
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            if body_str.contains("message is not modified") {
+                tracing::debug!(
+                    "Telegram editMessageText (plain): message is not modified, treating as success"
+                );
+                return Ok(());
+            }
+        }
+
+        // Both edits truly failed — try to delete draft before sending new message
+        // to prevent duplicates (draft from update_draft still shows response text).
+        tracing::warn!("Telegram finalize_draft edit failed; attempting delete+send fallback");
+
+        let del_resp = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": id,
+            }))
+            .send()
+            .await;
+
+        match del_resp {
+            Ok(r) if r.status().is_success() => {
+                // Draft deleted — safe to send fresh message without duplication
+                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+                    .await
+            }
+            _ => {
+                // Delete failed — draft still visible with content from update_draft.
+                // Sending a new message now would create a duplicate, so skip it.
+                tracing::warn!(
+                    "Telegram deleteMessage failed; draft still shows response, skipping sendMessage to avoid duplicate"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
