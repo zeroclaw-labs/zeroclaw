@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_outside_workspace_guides_allowed_roots() {
+    async fn file_read_outside_workspace_allowed_when_workspace_only_disabled() {
         let root = std::env::temp_dir().join("zeroclaw_test_file_read_allowed_roots_hint");
         let workspace = root.join("workspace");
         let outside = root.join("outside");
@@ -487,10 +487,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
-        let error = result.error.unwrap_or_default();
-        assert!(error.contains("escapes workspace"));
-        assert!(error.contains("allowed_roots"));
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("outside"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
