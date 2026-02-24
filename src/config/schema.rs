@@ -173,6 +173,10 @@ pub struct Config {
     #[serde(default)]
     pub multimodal: MultimodalConfig,
 
+    /// Web fetch tool configuration (`[web_fetch]`).
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+
     /// Web search tool configuration (`[web_search]`).
     #[serde(default)]
     pub web_search: WebSearchConfig,
@@ -931,7 +935,7 @@ impl Default for BrowserComputerUseConfig {
 /// Controls the `browser_open` tool and browser automation backends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserConfig {
-    /// Enable `browser_open` tool (opens URLs in Brave without scraping)
+    /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default)]
     pub enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
@@ -993,7 +997,7 @@ pub struct HttpRequestConfig {
     /// Allowed domains for HTTP requests (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
-    /// Maximum response size in bytes (default: 1MB)
+    /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
     /// Request timeout in seconds (default: 30)
@@ -1018,6 +1022,53 @@ fn default_http_max_response_size() -> usize {
 
 fn default_http_timeout_secs() -> u64 {
     30
+}
+
+// ── Web fetch ────────────────────────────────────────────────────
+
+/// Web fetch tool configuration (`[web_fetch]` section).
+///
+/// Fetches web pages and converts HTML to plain text for LLM consumption.
+/// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
+/// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
+/// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebFetchConfig {
+    /// Enable `web_fetch` tool for fetching web page content
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
+    #[serde(default = "default_web_fetch_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_web_fetch_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_web_fetch_max_response_size() -> usize {
+    500_000 // 500KB
+}
+
+fn default_web_fetch_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: vec!["*".into()],
+            blocked_domains: vec![],
+            max_response_size: default_web_fetch_max_response_size(),
+            timeout_secs: default_web_fetch_timeout_secs(),
+        }
+    }
 }
 
 // ── Web search ───────────────────────────────────────────────────
@@ -2288,6 +2339,15 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Optional delivery channel for heartbeat output (for example: `telegram`).
+    #[serde(default, alias = "channel")]
+    pub target: Option<String>,
+    /// Optional delivery recipient/chat identifier (required when `target` is set).
+    #[serde(default, alias = "recipient")]
+    pub to: Option<String>,
 }
 
 impl Default for HeartbeatConfig {
@@ -2295,6 +2355,9 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            message: None,
+            target: None,
+            to: None,
         }
     }
 }
@@ -3052,9 +3115,11 @@ pub struct LarkConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// Legacy compatibility flag: route this Lark config to Feishu endpoint.
-    ///
-    /// Prefer `[channels_config.feishu]` for new setups.
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
@@ -3490,6 +3555,7 @@ impl Default for Config {
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
@@ -3868,8 +3934,25 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
+
+            // Track ignored/unknown config keys to warn users about silent misconfigurations
+            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
+            let mut ignored_paths: Vec<String> = Vec::new();
+            let mut config: Config = serde_ignored::deserialize(
+                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
+                |path| {
+                    ignored_paths.push(path.to_string());
+                },
+            )
+            .context("Failed to deserialize config file")?;
+
+            // Warn about each unknown config key
+            for path in ignored_paths {
+                tracing::warn!(
+                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
+                    path
+                );
+            }
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -4462,6 +4545,13 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
+        // Ensure config file is not world-readable (may contain API keys).
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            let _ = fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await;
+        }
+
         sync_directory(parent_dir).await?;
 
         if had_existing_config {
@@ -4494,13 +4584,14 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     #[cfg(unix)]
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
+    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -4570,6 +4661,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    async fn save_sets_config_permissions_on_new_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace_dir;
+
+        config.save().await.expect("save config");
+
+        let mode = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
@@ -4611,6 +4723,26 @@ mod tests {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
+        assert!(h.message.is_none());
+        assert!(h.target.is_none());
+        assert!(h.to.is_none());
+    }
+
+    #[test]
+    async fn heartbeat_config_parses_delivery_aliases() {
+        let raw = r#"
+enabled = true
+interval_minutes = 10
+message = "Ping"
+channel = "telegram"
+recipient = "42"
+"#;
+        let parsed: HeartbeatConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.interval_minutes, 10);
+        assert_eq!(parsed.message.as_deref(), Some("Ping"));
+        assert_eq!(parsed.target.as_deref(), Some("telegram"));
+        assert_eq!(parsed.to.as_deref(), Some("42"));
     }
 
     #[test]
@@ -4720,6 +4852,9 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                message: Some("Check London time".into()),
+                target: Some("telegram".into()),
+                to: Some("123456".into()),
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
@@ -4762,6 +4897,7 @@ default_temperature = 0.7
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
@@ -4788,6 +4924,12 @@ default_temperature = 0.7
         assert_eq!(parsed.runtime.kind, "docker");
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
+        assert_eq!(
+            parsed.heartbeat.message.as_deref(),
+            Some("Check London time")
+        );
+        assert_eq!(parsed.heartbeat.target.as_deref(), Some("telegram"));
+        assert_eq!(parsed.heartbeat.to.as_deref(), Some("123456"));
         assert!(parsed.channels_config.telegram.is_some());
         assert_eq!(
             parsed.channels_config.telegram.unwrap().bot_token,
@@ -4936,6 +5078,7 @@ tool_dispatcher = "xml"
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
@@ -6801,6 +6944,7 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
@@ -6823,6 +6967,7 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -6841,6 +6986,7 @@ default_model = "legacy-model"
         assert!(parsed.encrypt_key.is_none());
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
         assert!(!parsed.use_feishu);
     }
 
@@ -6949,16 +7095,47 @@ default_model = "legacy-model"
         config.config_path = config_path.clone();
         config.save().await.unwrap();
 
-        // Apply the same permission logic as load_or_init
-        fs::set_permissions(&config_path, Permissions::from_mode(0o600))
-            .await
-            .expect("Failed to set permissions");
-
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
             "New config file should be owner-only (0600), got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn save_restricts_existing_world_readable_config_to_owner_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.save().await.unwrap();
+
+        // Simulate the regression state observed in issue #1345.
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let loose_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            loose_mode, 0o644,
+            "test setup requires world-readable config"
+        );
+
+        config.default_temperature = 0.6;
+        config.save().await.unwrap();
+
+        let hardened_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            hardened_mode, 0o600,
+            "Saving config should restore owner-only permissions (0600)"
         );
     }
 

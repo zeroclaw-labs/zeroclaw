@@ -93,6 +93,18 @@ export async function pair(code: string): Promise<{ token: string }> {
 }
 
 // ---------------------------------------------------------------------------
+// Public health (no auth required)
+// ---------------------------------------------------------------------------
+
+export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
+  const response = await fetch('/health');
+  if (!response.ok) {
+    throw new Error(`Health check failed (${response.status})`);
+  }
+  return response.json() as Promise<{ require_pairing: boolean; paired: boolean }>;
+}
+
+// ---------------------------------------------------------------------------
 // Status / Health
 // ---------------------------------------------------------------------------
 
@@ -177,9 +189,10 @@ export function getIntegrations(): Promise<Integration[]> {
 // ---------------------------------------------------------------------------
 
 export function runDoctor(): Promise<DiagResult[]> {
-  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor').then(
-    (data) => (Array.isArray(data) ? data : data.results),
-  );
+  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }).then((data) => (Array.isArray(data) ? data : data.results));
 }
 
 // ---------------------------------------------------------------------------

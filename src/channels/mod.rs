@@ -151,6 +151,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    NewSession,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -491,6 +492,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
 }
@@ -1027,6 +1029,10 @@ async fn handle_runtime_command_if_needed(
                     current.provider
                 )
             }
+        }
+        ChannelRuntimeCommand::NewSession => {
+            clear_sender_history(ctx, &sender_key);
+            "Conversation history cleared. Starting fresh.".to_string()
         }
     };
 
@@ -3068,6 +3074,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.web_fetch,
         &workspace,
         &config.agents,
         config.api_key.as_deref(),
@@ -3107,7 +3114,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if config.browser.enabled {
         tool_descs.push((
             "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
+            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
     }
     if config.composio.enabled {

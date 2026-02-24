@@ -45,10 +45,12 @@ When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
+- `/new` — clear conversation history and start a fresh session
 
 Notes:
 
-- Switching clears only that sender's in-memory conversation history to avoid cross-model context contamination.
+- Switching provider or model clears only that sender's in-memory conversation history to avoid cross-model context contamination.
+- `/new` clears the sender's conversation history without changing provider or model selection.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
@@ -311,6 +313,8 @@ app_secret = "xxx"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
+mention_only = false              # optional: require @mention in groups (DMs always allowed)
+use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```

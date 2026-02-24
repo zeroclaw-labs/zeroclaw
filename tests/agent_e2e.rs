@@ -632,7 +632,8 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert_eq!(agent.history().len(), 5);
 }
 
-/// Validates that empty memory context passes user message through unmodified.
+/// Validates that empty memory context does not prepend memory text.
+/// A per-turn datetime prefix may still be present.
 #[tokio::test]
 async fn e2e_empty_memory_context_passthrough() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("plain response")]);
@@ -646,9 +647,15 @@ async fn e2e_empty_memory_context_passthrough() {
 
     let requests = recorded.lock().unwrap();
     let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
-    assert_eq!(
-        user_msg.content, "hello",
-        "Empty context should not prepend anything to user message",
+    assert!(
+        user_msg.content.ends_with("hello"),
+        "User payload should preserve original text suffix, got: {}",
+        user_msg.content
+    );
+    assert!(
+        !user_msg.content.contains("[Memory context]"),
+        "Empty context should not prepend memory context text, got: {}",
+        user_msg.content
     );
 }
 

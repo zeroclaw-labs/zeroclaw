@@ -1079,7 +1079,7 @@ fn create_provider_with_url_and_options(
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Groq", "https://api.groq.com/openai", key, AuthStyle::Bearer,
+            "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
         ))),
         "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
@@ -1175,7 +1175,7 @@ fn create_provider_with_url_and_options(
             )))
         }
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
-            OpenAiCompatibleProvider::new(
+            OpenAiCompatibleProvider::new_no_responses_fallback(
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1",
                 key,
@@ -2092,6 +2092,16 @@ mod tests {
         assert!(create_provider("minimax-oauth-cn", Some("key")).is_ok());
         assert!(create_provider("minimax-portal", Some("key")).is_ok());
         assert!(create_provider("minimax-portal-cn", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_minimax_disables_native_tool_calling() {
+        let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
+        assert!(!minimax.supports_native_tools());
+
+        let minimax_cn =
+            create_provider("minimax-cn", Some("key")).expect("provider should resolve");
+        assert!(!minimax_cn.supports_native_tools());
     }
 
     #[test]
