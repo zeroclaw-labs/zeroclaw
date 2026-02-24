@@ -75,9 +75,14 @@ pub struct Config {
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
+    #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
+    #[serde(alias = "model")]
     pub default_model: Option<String>,
+    /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
+    #[serde(default)]
+    pub model_providers: HashMap<String, ModelProviderConfig>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
@@ -212,6 +217,23 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+}
+
+/// Named provider profile definition compatible with Codex app-server style config.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ModelProviderConfig {
+    /// Optional provider type/name override (e.g. "openai", "openai-codex", or custom profile id).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional base URL for OpenAI-compatible endpoints.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Provider protocol variant ("responses" or "chat_completions").
+    #[serde(default)]
+    pub wire_api: Option<String>,
+    /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
+    #[serde(default)]
+    pub requires_openai_auth: bool,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -3572,6 +3594,7 @@ impl Default for Config {
             api_url: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            model_providers: HashMap::new(),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -3937,6 +3960,30 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         })
 }
 
+fn normalize_wire_api(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "responses" => Some("responses"),
+        "chat_completions" | "chat-completions" | "chat" | "chatcompletions" => {
+            Some("chat_completions")
+        }
+        _ => None,
+    }
+}
+
+fn read_codex_openai_api_key() -> Option<String> {
+    let home = UserDirs::new()?.home_dir().to_path_buf();
+    let auth_path = home.join(".codex").join("auth.json");
+    let raw = std::fs::read_to_string(auth_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    parsed
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -4070,6 +4117,90 @@ impl Config {
         }
     }
 
+    fn lookup_model_provider_profile(
+        &self,
+        provider_name: &str,
+    ) -> Option<(String, ModelProviderConfig)> {
+        let needle = provider_name.trim();
+        if needle.is_empty() {
+            return None;
+        }
+
+        self.model_providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(needle))
+            .map(|(name, profile)| (name.clone(), profile.clone()))
+    }
+
+    fn apply_named_model_provider_profile(&mut self) {
+        let Some(current_provider) = self.default_provider.clone() else {
+            return;
+        };
+
+        let Some((profile_key, profile)) = self.lookup_model_provider_profile(&current_provider)
+        else {
+            return;
+        };
+
+        let base_url = profile
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        if self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty())
+        {
+            if let Some(base_url) = base_url.as_ref() {
+                self.api_url = Some(base_url.clone());
+            }
+        }
+
+        if profile.requires_openai_auth
+            && self
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+        {
+            let codex_key = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(read_codex_openai_api_key);
+            if let Some(codex_key) = codex_key {
+                self.api_key = Some(codex_key);
+            }
+        }
+
+        let normalized_wire_api = profile.wire_api.as_deref().and_then(normalize_wire_api);
+        let profile_name = profile
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if normalized_wire_api == Some("responses") {
+            self.default_provider = Some("openai-codex".to_string());
+            return;
+        }
+
+        if let Some(profile_name) = profile_name {
+            if !profile_name.eq_ignore_ascii_case(&profile_key) {
+                self.default_provider = Some(profile_name.to_string());
+                return;
+            }
+        }
+
+        if let Some(base_url) = base_url {
+            self.default_provider = Some(format!("custom:{base_url}"));
+        }
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -4163,6 +4294,51 @@ impl Config {
             }
         }
 
+        for (profile_key, profile) in &self.model_providers {
+            let profile_name = profile_key.trim();
+            if profile_name.is_empty() {
+                anyhow::bail!("model_providers contains an empty profile name");
+            }
+
+            let has_name = profile
+                .name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let has_base_url = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+
+            if !has_name && !has_base_url {
+                anyhow::bail!(
+                    "model_providers.{profile_name} must define at least one of `name` or `base_url`"
+                );
+            }
+
+            if let Some(base_url) = profile.base_url.as_deref().map(str::trim) {
+                if !base_url.is_empty() {
+                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
+                        format!("model_providers.{profile_name}.base_url is not a valid URL")
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        anyhow::bail!(
+                            "model_providers.{profile_name}.base_url must use http/https"
+                        );
+                    }
+                }
+            }
+
+            if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim) {
+                if !wire_api.is_empty() && normalize_wire_api(wire_api).is_none() {
+                    anyhow::bail!(
+                        "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                    );
+                }
+            }
+        }
+
         // Ollama cloud-routing safety checks
         if self
             .default_provider
@@ -4220,10 +4396,15 @@ impl Config {
 
         // Provider override precedence:
         // 1) ZEROCLAW_PROVIDER always wins when set.
-        // 2) Legacy PROVIDER is only honored when config still uses the
-        //    default provider (openrouter) or provider is unset. This prevents
-        //    container defaults from overriding explicit custom providers.
+        // 2) ZEROCLAW_MODEL_PROVIDER/MODEL_PROVIDER (Codex app-server style).
+        // 3) Legacy PROVIDER is honored only when config still uses default provider.
         if let Ok(provider) = std::env::var("ZEROCLAW_PROVIDER") {
+            if !provider.is_empty() {
+                self.default_provider = Some(provider);
+            }
+        } else if let Ok(provider) =
+            std::env::var("ZEROCLAW_MODEL_PROVIDER").or_else(|_| std::env::var("MODEL_PROVIDER"))
+        {
             if !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
@@ -4243,6 +4424,9 @@ impl Config {
                 self.default_model = Some(model);
             }
         }
+
+        // Apply named provider profile remapping (Codex app-server compatibility).
+        self.apply_named_model_provider_profile();
 
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
@@ -4858,6 +5042,7 @@ default_temperature = 0.7
             api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
+            model_providers: HashMap::new(),
             default_temperature: 0.5,
             observability: ObservabilityConfig {
                 backend: "log".into(),
@@ -5095,6 +5280,7 @@ tool_dispatcher = "xml"
             api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
+            model_providers: HashMap::new(),
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -6085,6 +6271,44 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn env_override_model_provider_alias() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::set_var("ZEROCLAW_MODEL_PROVIDER", "openai-codex");
+        config.apply_env_overrides();
+        assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
+
+        std::env::remove_var("ZEROCLAW_MODEL_PROVIDER");
+    }
+
+    #[test]
+    async fn toml_supports_model_provider_and_model_alias_fields() {
+        let raw = r#"
+default_temperature = 0.7
+model_provider = "sub2api"
+model = "gpt-5.3-codex"
+
+[model_providers.sub2api]
+name = "sub2api"
+base_url = "https://api.tonsof.blue/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+
+        let parsed: Config = toml::from_str(raw).expect("config should parse");
+        assert_eq!(parsed.default_provider.as_deref(), Some("sub2api"));
+        assert_eq!(parsed.default_model.as_deref(), Some("gpt-5.3-codex"));
+        let profile = parsed
+            .model_providers
+            .get("sub2api")
+            .expect("profile should exist");
+        assert_eq!(profile.wire_api.as_deref(), Some("responses"));
+        assert!(profile.requires_openai_auth);
+    }
+
+    #[test]
     async fn env_override_open_skills_enabled_and_dir() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -6227,6 +6451,61 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn model_provider_profile_maps_to_custom_endpoint() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("custom:https://api.tonsof.blue/v1")
+        );
+        assert_eq!(
+            config.api_url.as_deref(),
+            Some("https://api.tonsof.blue/v1")
+        );
+    }
+
+    #[test]
+    async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue".to_string()),
+                    wire_api: Some("responses".to_string()),
+                    requires_openai_auth: true,
+                },
+            )]),
+            api_key: None,
+            ..Config::default()
+        };
+
+        std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key");
+        config.apply_env_overrides();
+        std::env::remove_var("OPENAI_API_KEY");
+
+        assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
+        assert_eq!(config.api_url.as_deref(), Some("https://api.tonsof.blue"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-test-codex-key"));
+    }
+
+    #[test]
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
         let config = Config {
@@ -6259,6 +6538,29 @@ default_temperature = 0.7
         std::env::remove_var("OLLAMA_API_KEY");
 
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn validate_rejects_unknown_model_provider_wire_api() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    wire_api: Some("ws".to_string()),
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error
+            .to_string()
+            .contains("wire_api must be one of: responses, chat_completions"));
     }
 
     #[test]

@@ -575,6 +575,10 @@ enum ModelCommands {
         #[arg(long)]
         provider: Option<String>,
 
+        /// Refresh all providers that support live model discovery
+        #[arg(long)]
+        all: bool,
+
         /// Force live refresh and ignore fresh cache
         #[arg(long)]
         force: bool,
@@ -909,8 +913,19 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => match model_command {
-            ModelCommands::Refresh { provider, force } => {
-                onboard::run_models_refresh(&config, provider.as_deref(), force).await
+            ModelCommands::Refresh {
+                provider,
+                all,
+                force,
+            } => {
+                if all {
+                    if provider.is_some() {
+                        bail!("`models refresh --all` cannot be combined with --provider");
+                    }
+                    onboard::run_models_refresh_all(&config, force).await
+                } else {
+                    onboard::run_models_refresh(&config, provider.as_deref(), force).await
+                }
             }
             ModelCommands::List { provider } => {
                 onboard::run_models_list(&config, provider.as_deref()).await
