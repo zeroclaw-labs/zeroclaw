@@ -235,6 +235,10 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
+
 [[bench]]
 name = "agent_benchmarks"
 harness = false
