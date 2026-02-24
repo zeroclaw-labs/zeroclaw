@@ -243,13 +243,13 @@ jobs:
                   TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
                   
                   # Add to path for linker resolution
-                  echo "$TOOLCHAIN" >> $GITHUB_PATH
+                  echo "$TOOLCHAIN" >> "$GITHUB_PATH"
                   
                   # Set linker environment variables
                   if [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
-                    echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang" >> $GITHUB_ENV
+                    echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
                   elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
-                    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang" >> $GITHUB_ENV
+                    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
                   fi
 
             - name: Build release
