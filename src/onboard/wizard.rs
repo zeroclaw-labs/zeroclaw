@@ -1,6 +1,7 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, QQReceiveMode, SignalConfig, StreamMode,
+    WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -136,7 +137,9 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         },
         api_url: provider_api_url,
         default_provider: Some(provider),
+        provider_api: None,
         default_model: Some(model),
+        model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
@@ -160,6 +163,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         browser: browser_config,
         http_request: http_request_config,
         multimodal: crate::config::MultimodalConfig::default(),
+        web_fetch: crate::config::WebFetchConfig::default(),
         web_search: web_search_config,
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
@@ -389,6 +393,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        qdrant: crate::config::QdrantConfig::default(),
     }
 }
 
@@ -484,7 +489,9 @@ async fn run_quick_setup_with_home(
         }),
         api_url: None,
         default_provider: Some(provider_name.clone()),
+        provider_api: None,
         default_model: Some(model.clone()),
+        model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
@@ -508,6 +515,7 @@ async fn run_quick_setup_with_home(
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
@@ -1742,6 +1750,151 @@ pub async fn run_models_refresh(
                 .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
         }
     }
+}
+
+pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter");
+
+    let cached = load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?;
+
+    let Some(cached) = cached else {
+        println!();
+        println!(
+            "  No cached models for '{provider_name}'. Run: zeroclaw models refresh --provider {provider_name}"
+        );
+        println!();
+        return Ok(());
+    };
+
+    println!();
+    println!(
+        "  {} models for '{}' (cached {} ago):",
+        cached.models.len(),
+        provider_name,
+        humanize_age(cached.age_secs)
+    );
+    println!();
+    for model in &cached.models {
+        let marker = if config.default_model.as_deref() == Some(model.as_str()) {
+            "* "
+        } else {
+            "  "
+        };
+        println!("  {marker}{model}");
+    }
+    println!();
+    Ok(())
+}
+
+pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("Model name cannot be empty");
+    }
+
+    let mut updated = config.clone();
+    updated.default_model = Some(model.to_string());
+    updated.save().await?;
+
+    println!();
+    println!("  Default model set to '{}'.", style(model).green().bold());
+    println!();
+    Ok(())
+}
+
+pub async fn run_models_status(config: &Config) -> Result<()> {
+    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model = config.default_model.as_deref().unwrap_or("(not set)");
+
+    println!();
+    println!("  Provider:  {}", style(provider).cyan());
+    println!("  Model:     {}", style(model).cyan());
+    println!(
+        "  Temp:      {}",
+        style(format!("{:.1}", config.default_temperature)).cyan()
+    );
+
+    match load_any_cached_models_for_provider(&config.workspace_dir, provider).await? {
+        Some(cached) => {
+            println!(
+                "  Cache:     {} models (updated {} ago)",
+                cached.models.len(),
+                humanize_age(cached.age_secs)
+            );
+            let fresh = cached.age_secs < MODEL_CACHE_TTL_SECS;
+            if fresh {
+                println!("  Freshness: {}", style("fresh").green());
+            } else {
+                println!("  Freshness: {}", style("stale").yellow());
+            }
+        }
+        None => {
+            println!("  Cache:     {}", style("none").yellow());
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+pub async fn cached_model_catalog_stats(
+    config: &Config,
+    provider_name: &str,
+) -> Result<Option<(usize, u64)>> {
+    let Some(cached) =
+        load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((cached.models.len(), cached.age_secs)))
+}
+
+pub async fn run_models_refresh_all(config: &Config, force: bool) -> Result<()> {
+    let mut targets: Vec<String> = crate::providers::list_providers()
+        .into_iter()
+        .map(|provider| provider.name.to_string())
+        .filter(|name| supports_live_model_fetch(name))
+        .collect();
+
+    targets.sort();
+    targets.dedup();
+
+    if targets.is_empty() {
+        anyhow::bail!("No providers support live model discovery");
+    }
+
+    println!(
+        "Refreshing model catalogs for {} providers (force: {})",
+        targets.len(),
+        if force { "yes" } else { "no" }
+    );
+    println!();
+
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+
+    for provider_name in &targets {
+        println!("== {} ==", provider_name);
+        match run_models_refresh(config, Some(provider_name), force).await {
+            Ok(()) => {
+                ok_count += 1;
+            }
+            Err(error) => {
+                fail_count += 1;
+                println!("  failed: {error}");
+            }
+        }
+        println!();
+    }
+
+    println!("Summary: {} succeeded, {} failed", ok_count, fail_count);
+
+    if ok_count == 0 {
+        anyhow::bail!("Model refresh failed for all providers")
+    }
+    Ok(())
 }
 
 // ── Step helpers ─────────────────────────────────────────────────
@@ -5048,6 +5201,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     app_id,
                     app_secret,
                     allowed_users,
+                    receive_mode: QQReceiveMode::Webhook,
                 });
             }
             ChannelMenuChoice::Lark | ChannelMenuChoice::Feishu => {
@@ -5244,6 +5398,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         verification_token,
                         encrypt_key: None,
                         allowed_users,
+                        mention_only: false,
                         use_feishu: false,
                         receive_mode,
                         port,
@@ -7498,6 +7653,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
         });
         assert!(has_launchable_channels(&channels));
 
