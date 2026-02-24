@@ -1,22 +1,10 @@
-# Danh mục tham chiếu
+# Vietnamese Reference Compatibility Index
 
-Tra cứu lệnh, provider, channel, config và tích hợp.
+This compatibility path redirects to the canonical Vietnamese reference index:
 
-## Tham chiếu cốt lõi
+- [../../i18n/vi/reference/README.md](../../i18n/vi/reference/README.md)
 
-- Lệnh theo workflow: [../commands-reference.md](../commands-reference.md)
-- ID provider / alias / biến môi trường: [../providers-reference.md](../providers-reference.md)
-- Thiết lập channel + allowlist: [../channels-reference.md](../channels-reference.md)
-- Giá trị mặc định và khóa config: [../config-reference.md](../config-reference.md)
+Related canonical Vietnamese indexes:
 
-## Mở rộng provider và tích hợp
-
-- Endpoint provider tùy chỉnh: [../custom-providers.md](../custom-providers.md)
-- Tích hợp provider Z.AI / GLM: [../zai-glm-setup.md](../zai-glm-setup.md)
-- Các mẫu tích hợp dựa trên LangGraph: [../langgraph-integration.md](../langgraph-integration.md)
-
-## Cách dùng
-
-Sử dụng bộ sưu tập này khi bạn cần chi tiết CLI/config chính xác hoặc các mẫu tích hợp provider thay vì hướng dẫn từng bước.
-
-Khi thêm tài liệu tham chiếu/tích hợp mới, hãy đảm bảo nó được liên kết trong cả [../SUMMARY.md](../SUMMARY.md) và [../../docs-inventory.md](../../docs-inventory.md).
+- Hub: [../../i18n/vi/README.md](../../i18n/vi/README.md)
+- TOC: [../../i18n/vi/SUMMARY.md](../../i18n/vi/SUMMARY.md)

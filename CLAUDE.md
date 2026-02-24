@@ -153,13 +153,14 @@ Treat documentation as a first-class product surface, not a post-merge artifact.
 
 Canonical entry points:
 
-- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`, `README.fr.md`, `README.vi.md`
-- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`, `docs/README.fr.md`, `docs/i18n/vi/README.md`
+- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`, `README.fr.md`, `README.vi.md`, `README.el.md`
+- docs hubs: `docs/README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
 - unified TOC: `docs/SUMMARY.md`
+- i18n governance docs: `docs/i18n-guide.md`, `docs/i18n/README.md`, `docs/i18n-coverage.md`
 
 Supported locales (current contract):
 
-- `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`
+- `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`
 
 Collection indexes (category navigation):
 
@@ -184,13 +185,24 @@ Runtime-contract references (must track behavior changes):
 Required docs governance rules:
 
 - Keep README/hub top navigation and quick routes intuitive and non-duplicative.
-- Keep entry-point parity across all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`) when changing navigation architecture.
+- Keep entry-point parity across all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`) when changing navigation architecture.
 - If a change touches docs IA, runtime-contract references, or user-facing wording in shared docs, perform i18n follow-through for currently supported locales in the same PR:
   - Update locale navigation links (`README*`, `docs/README*`, `docs/SUMMARY.md`).
-  - Update localized runtime-contract docs where equivalents exist (at minimum `commands-reference`, `config-reference`, `troubleshooting` for `fr` and `vi`).
-  - For Vietnamese, treat `docs/i18n/vi/**` as canonical. Keep `docs/*.<locale>.md` compatibility shims aligned if present.
+  - Update canonical locale hubs and summaries under `docs/i18n/<locale>/` for every supported locale.
+  - Update localized runtime-contract docs where equivalents exist (currently full trees for `vi` and `el`; do not regress `zh-CN`/`ja`/`ru`/`fr` hub parity).
+  - Keep `docs/*.<locale>.md` compatibility shims aligned if present.
+- Follow `docs/i18n-guide.md` as the mandatory completion checklist when docs navigation or shared wording changes.
 - Keep proposal/roadmap docs explicitly labeled; avoid mixing proposal text into runtime-contract docs.
 - Keep project snapshots date-stamped and immutable once superseded by a newer date.
+
+### 4.2 Docs i18n Completion Gate (Required)
+
+For any PR that changes docs IA, locale navigation, or shared docs wording:
+
+1. Complete i18n follow-through in the same PR using `docs/i18n-guide.md`.
+2. Keep all supported locale hubs/summaries navigable through canonical `docs/i18n/<locale>/` paths.
+3. Update `docs/i18n-coverage.md` when coverage status or locale topology changes.
+4. If any translation must be deferred, record explicit owner + follow-up issue/PR in the PR description.
 
 ## 5) Risk Tiers by Path (Review Depth Contract)
 
@@ -216,7 +228,8 @@ When uncertain, classify as higher risk.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
-    - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`).
+    - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`).
+    - Run through `docs/i18n-guide.md` and record any explicit i18n deferrals in the PR summary.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
@@ -227,19 +240,46 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- Open a PR to `main`; do not push directly to `main`.
+- Open a PR to `dev`; do not push directly to `dev` or `main`.
+- `main` is reserved for release promotion PRs from `dev`.
 - Wait for required checks and review outcomes before merging.
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
-- Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
+- After merge/close, clean up task branches/worktrees that are no longer needed.
+- Keep long-lived branches only when intentionally maintained with clear owner and purpose.
 
-### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
+### 6.1A PR Disposition and Workflow Authority (Required)
 
-Use Git worktrees to isolate concurrent agent/human tracks safely and predictably:
+- Decide merge/close outcomes from repository-local authority in this order: `.github/workflows/**`, GitHub branch protection/rulesets, `docs/pr-workflow.md`, then this `CLAUDE.md`.
+- External agent skills/templates are execution aids only; they must not override repository-local policy.
+- A normal contributor PR targeting `main` is a routing defect, not by itself a closure reason; if intent and content are legitimate, retarget to `dev`.
+- Direct-close the PR (do not supersede/replay) when high-confidence integrity-risk signals exist:
+  - unapproved or unrelated repository rebranding attempts (for example replacing project logo/identity assets)
+  - unauthorized platform-surface expansion (for example introducing `web` apps, dashboards, frontend stacks, or UI surfaces not requested by maintainers)
+  - title/scope deception that hides high-risk code changes (for example `docs:` title with broad `src/**` changes)
+  - spam-like or intentionally harmful payload patterns
+  - multi-domain dirty-bundle changes with no safe, auditable isolation path
+- If unauthorized platform-surface expansion is detected during review/implementation, report to maintainers immediately and pause further execution until explicit direction is given.
+- Use supersede flow only when maintainers explicitly want to preserve valid work and attribution.
+- In public PR close/block comments, state only direct actionable reasons; do not include internal decision-process narration or "non-reason" qualifiers.
 
-- Use one worktree per active branch/PR stream to avoid cross-task contamination.
-- Keep each worktree on a single branch; do not mix unrelated edits in one worktree.
+### 6.1B Assignee-First Gate (Required)
+
+- For any GitHub issue or PR selected for active handling, the first action is to ensure `@chumyin` is an assignee.
+- This is additive ownership: keep existing assignees and add `@chumyin` if missing.
+- Do not start triage/review/implementation/merge work before assignee assignment is confirmed.
+- Queue safety rule: assign only the currently active target; do not pre-assign future queued targets.
+
+### 6.2 Worktree Workflow (Required for All Task Streams)
+
+Use Git worktrees to isolate every active task stream safely and predictably:
+
+- Use one dedicated worktree per active branch/PR stream; do not implement directly in a shared default workspace.
+- Keep each worktree on a single branch and a single concern; do not mix unrelated edits in one worktree.
+- Before each commit/push, verify commit hygiene in that worktree (`git status --short` and `git diff --cached`) so only scoped files are included.
 - Run validation commands inside the corresponding worktree before commit/PR.
-- Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`) and remove stale worktrees when no longer needed.
+- Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`).
+- After PR merge/close (or task abandonment), remove stale worktrees/branches and prune refs (`git worktree prune`, `git fetch --prune`).
+- Local Codex automation may use one-command cleanup helper: `~/.codex/skills/zeroclaw-pr-issue-automation/scripts/cleanup_track.sh --repo-dir <repo_dir> --worktree <worktree_path> --branch <branch_name>`.
 - PR checkpoint rules from section 6.1 still apply to worktree-based development.
 
 ### 6.3 Code Naming Contract (Required)
@@ -304,8 +344,10 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Treat docs navigation as product UX: preserve clear pathing from README -> docs hub -> SUMMARY -> category index.
 - Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
 - When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
-- Keep multilingual entry-point parity for all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`) when nav or key wording changes.
+- Keep multilingual entry-point parity for all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`) when nav or key wording changes.
 - When shared docs wording changes, sync corresponding localized docs for supported locales in the same PR (or explicitly document deferral and follow-up PR).
+- Treat `docs/i18n/<locale>/**` as canonical for localized hubs/summaries; keep docs-root compatibility shims aligned when edited.
+- Apply `docs/i18n-guide.md` completion checklist before merge and include i18n status in PR notes.
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
 
 
@@ -334,7 +376,7 @@ Additional expectations by change type:
 
 - **Docs/template-only**:
     - run markdown lint and link-integrity checks
-    - if touching README/docs-hub/SUMMARY/collection indexes, verify EN/ZH/JA/RU navigation parity
+    - if touching README/docs-hub/SUMMARY/collection indexes, verify EN/ZH-CN/JA/RU/FR/VI/EL navigation parity
     - if touching bootstrap docs/scripts, run `bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh`
 - **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
 - **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.
@@ -345,6 +387,12 @@ If full checks are impractical, run the most relevant subset and document what w
 
 - Follow `.github/pull_request_template.md` fully (including side effects / blast radius).
 - Keep PR descriptions concrete: problem, change, non-goals, risk, rollback.
+- For issue-driven work, add explicit issue-closing keywords in the **PR body** for every resolved issue (for example `Closes #1502`).
+- Do not rely on issue comments alone for linkage visibility; comments are supplemental, not a substitute for PR-body closing references.
+- Default to one issue per clean commit/PR track. For multiple issues, split into separate clean commits/PRs unless there is clear technical coupling.
+- If multiple issues are intentionally bundled in one PR, document the coupling rationale explicitly in the PR summary.
+- Commit hygiene is mandatory: stage only task-scoped files and split unrelated changes into separate commits/worktrees.
+- Completion hygiene is mandatory: after merge/close, clean stale local branches/worktrees before starting the next track.
 - Use conventional commit titles.
 - Prefer small PRs (`size: XS/S/M`) when possible.
 - Agent-assisted PRs are welcome, **but contributors remain accountable for understanding what their code will do**.
@@ -438,6 +486,9 @@ Reference docs:
 - `CONTRIBUTING.md`
 - `docs/README.md`
 - `docs/SUMMARY.md`
+- `docs/i18n-guide.md`
+- `docs/i18n/README.md`
+- `docs/i18n-coverage.md`
 - `docs/docs-inventory.md`
 - `docs/commands-reference.md`
 - `docs/providers-reference.md`
@@ -461,6 +512,8 @@ Reference docs:
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
+- Do not attempt repository rebranding/identity replacement unless maintainers explicitly requested it in the current scope.
+- Do not introduce new platform surfaces (for example `web` apps, dashboards, frontend stacks, or UI portals) unless maintainers explicitly requested them in the current scope.
 
 ## 11) Handoff Template (Agent -> Agent / Maintainer)
 

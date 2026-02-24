@@ -209,6 +209,7 @@ user_id = "@zeroclaw:matrix.example.com"   # optional, recommended for E2EE
 device_id = "DEVICEID123"                  # optional, recommended for E2EE
 room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.com)
 allowed_users = ["*"]
+mention_only = false                       # optional: when true, only DM / @mention / reply-to-bot
 ```
 
 See [Matrix E2EE Guide](./matrix-e2ee-guide.md) for encrypted-room troubleshooting.

@@ -34,6 +34,15 @@ enum IncomingAttachmentKind {
     Document,
     Photo,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceMetadata {
+    file_id: String,
+    duration_secs: u64,
+    file_name_hint: Option<String>,
+    mime_type_hint: Option<String>,
+    voice_note: bool,
+}
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -863,15 +872,109 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(resp.bytes().await?.to_vec())
     }
 
-    /// Extract (file_id, duration) from a voice or audio message.
-    fn parse_voice_metadata(message: &serde_json::Value) -> Option<(String, u64)> {
-        let voice = message.get("voice").or_else(|| message.get("audio"))?;
+    /// Extract transcription metadata from a voice or audio payload.
+    fn parse_voice_metadata(message: &serde_json::Value) -> Option<VoiceMetadata> {
+        let (voice, voice_note) = if let Some(voice) = message.get("voice") {
+            (voice, true)
+        } else {
+            (message.get("audio")?, false)
+        };
+
         let file_id = voice.get("file_id")?.as_str()?.to_string();
-        let duration = voice
+        let duration_secs = voice
             .get("duration")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        Some((file_id, duration))
+        let file_name_hint = voice
+            .get("file_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|name| !name.trim().is_empty());
+        let mime_type_hint = voice
+            .get("mime_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|mime| !mime.trim().is_empty());
+
+        Some(VoiceMetadata {
+            file_id,
+            duration_secs,
+            file_name_hint,
+            mime_type_hint,
+            voice_note,
+        })
+    }
+
+    fn extension_from_audio_mime_type(mime_type: &str) -> Option<&'static str> {
+        match mime_type.trim().to_ascii_lowercase().as_str() {
+            "audio/flac" | "audio/x-flac" => Some("flac"),
+            "audio/mpeg" => Some("mp3"),
+            "audio/mp4" => Some("mp4"),
+            "audio/x-m4a" => Some("m4a"),
+            "audio/ogg" | "application/ogg" => Some("ogg"),
+            "audio/opus" => Some("opus"),
+            "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+            "audio/webm" => Some("webm"),
+            _ => None,
+        }
+    }
+
+    fn has_file_extension(name: &str) -> bool {
+        std::path::Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| !ext.trim().is_empty())
+    }
+
+    fn infer_voice_filename(file_path: &str, metadata: &VoiceMetadata) -> String {
+        let basename = file_path.rsplit('/').next().unwrap_or("").trim();
+        if !basename.is_empty() && Self::has_file_extension(basename) {
+            return basename.to_string();
+        }
+
+        if let Some(hint) = metadata
+            .file_name_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if Self::has_file_extension(hint) {
+                return hint.to_string();
+            }
+        }
+
+        let default_stem = if metadata.voice_note {
+            "voice"
+        } else {
+            "audio"
+        };
+        let stem = if basename.is_empty() {
+            metadata
+                .file_name_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(default_stem)
+        } else {
+            basename
+        }
+        .trim_end_matches('.');
+
+        if let Some(extension) = metadata
+            .mime_type_hint
+            .as_deref()
+            .and_then(Self::extension_from_audio_mime_type)
+        {
+            return format!("{stem}.{extension}");
+        }
+
+        // Last-resort fallback keeps extension present so transcription backends
+        // do not reject otherwise valid payloads from extension-less file paths.
+        if metadata.voice_note {
+            format!("{stem}.ogg")
+        } else {
+            format!("{stem}.mp3")
+        }
     }
 
     /// Extract attachment metadata from an incoming Telegram message (document or photo).
@@ -1058,14 +1161,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Returns `None` if the message is not a voice message, transcription is disabled,
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let config = self.transcription.as_ref()?;
+        // Check if transcription is enabled before doing anything else
+        let config = match self.transcription.as_ref() {
+            Some(c) => c,
+            None => {
+                // Log at debug level when a voice message is received but transcription is disabled
+                if let Some(message) = update.get("message") {
+                    if message.get("voice").is_some() || message.get("audio").is_some() {
+                        tracing::debug!(
+                            "Received voice/audio message but transcription is disabled. \
+                             Set [transcription].enabled = true to enable voice transcription."
+                        );
+                    }
+                }
+                return None;
+            }
+        };
         let message = update.get("message")?;
 
-        let (file_id, duration) = Self::parse_voice_metadata(message)?;
+        let metadata = Self::parse_voice_metadata(message)?;
 
-        if duration > config.max_duration_secs {
+        if metadata.duration_secs > config.max_duration_secs {
             tracing::info!(
-                "Skipping voice message: duration {duration}s exceeds limit {}s",
+                "Skipping voice message: duration {}s exceeds limit {}s",
+                metadata.duration_secs,
                 config.max_duration_secs
             );
             return None;
@@ -1079,6 +1198,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            tracing::debug!(
+                "Skipping voice message from unauthorized user: {} (allowed_users: {:?})",
+                sender_identity,
+                self.allowed_users
+                    .read()
+                    .map(|u| u.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            );
             return None;
         }
 
@@ -1105,7 +1232,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         };
 
         // Download and transcribe
-        let file_path = match self.get_file_path(&file_id).await {
+        let file_path = match self.get_file_path(&metadata.file_id).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to get voice file path: {e}");
@@ -1113,11 +1240,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let file_name = file_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("voice.ogg")
-            .to_string();
+        let file_name = Self::infer_voice_filename(&file_path, &metadata);
 
         let audio_data = match self.download_file(&file_path).await {
             Ok(d) => d,
@@ -1149,6 +1272,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
             cache.insert(format!("{chat_id}:{message_id}"), text.clone());
         }
+
+        tracing::info!(
+            "Voice message transcribed successfully ({} chars) for user {} in chat {}",
+            text.len(),
+            sender_identity,
+            chat_id
+        );
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n[Voice] {text}")
@@ -3914,9 +4044,10 @@ mod tests {
                 "duration": 5
             }
         });
-        let (file_id, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
-        assert_eq!(file_id, "abc123");
-        assert_eq!(dur, 5);
+        let meta = TelegramChannel::parse_voice_metadata(&msg).unwrap();
+        assert_eq!(meta.file_id, "abc123");
+        assert_eq!(meta.duration_secs, 5);
+        assert!(meta.voice_note);
     }
 
     #[test]
@@ -3927,9 +4058,10 @@ mod tests {
                 "duration": 30
             }
         });
-        let (file_id, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
-        assert_eq!(file_id, "audio456");
-        assert_eq!(dur, 30);
+        let meta = TelegramChannel::parse_voice_metadata(&msg).unwrap();
+        assert_eq!(meta.file_id, "audio456");
+        assert_eq!(meta.duration_secs, 30);
+        assert!(!meta.voice_note);
     }
 
     #[test]
@@ -3947,8 +4079,53 @@ mod tests {
                 "file_id": "no_dur"
             }
         });
-        let (_, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
-        assert_eq!(dur, 0);
+        let meta = TelegramChannel::parse_voice_metadata(&msg).unwrap();
+        assert_eq!(meta.duration_secs, 0);
+    }
+
+    #[test]
+    fn infer_voice_filename_prefers_hint_with_extension() {
+        let meta = VoiceMetadata {
+            file_id: "f".into(),
+            duration_secs: 0,
+            file_name_hint: Some("telegram_voice.m4a".into()),
+            mime_type_hint: Some("audio/mp4".into()),
+            voice_note: false,
+        };
+        assert_eq!(
+            TelegramChannel::infer_voice_filename("voice/file_without_ext", &meta),
+            "telegram_voice.m4a"
+        );
+    }
+
+    #[test]
+    fn infer_voice_filename_uses_mime_extension_when_path_has_none() {
+        let meta = VoiceMetadata {
+            file_id: "f".into(),
+            duration_secs: 0,
+            file_name_hint: None,
+            mime_type_hint: Some("audio/ogg".into()),
+            voice_note: true,
+        };
+        assert_eq!(
+            TelegramChannel::infer_voice_filename("voice/file_without_ext", &meta),
+            "file_without_ext.ogg"
+        );
+    }
+
+    #[test]
+    fn infer_voice_filename_falls_back_for_audio_without_hints() {
+        let meta = VoiceMetadata {
+            file_id: "f".into(),
+            duration_secs: 0,
+            file_name_hint: None,
+            mime_type_hint: None,
+            voice_note: false,
+        };
+        assert_eq!(
+            TelegramChannel::infer_voice_filename("voice/file_without_ext", &meta),
+            "file_without_ext.mp3"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

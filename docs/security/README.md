@@ -9,6 +9,7 @@ For current runtime behavior, start here:
 - Config reference: [../config-reference.md](../config-reference.md)
 - Operations runbook: [../operations-runbook.md](../operations-runbook.md)
 - Troubleshooting: [../troubleshooting.md](../troubleshooting.md)
+- CI/Security audit event schema: [../audit-event-schema.md](../audit-event-schema.md)
 
 ## Proposal / Roadmap Docs
 

@@ -5,6 +5,7 @@ Dành cho operator vận hành ZeroClaw liên tục hoặc trên production.
 ## Vận hành cốt lõi
 
 - Sổ tay Day-2: [../operations-runbook.md](../operations-runbook.md)
+- Runbook probe kết nối provider trong CI: [connectivity-probes-runbook.md](connectivity-probes-runbook.md)
 - Sổ tay Release: [../release-process.md](../release-process.md)
 - Ma trận xử lý sự cố: [../troubleshooting.md](../troubleshooting.md)
 - Triển khai mạng/gateway an toàn: [../network-deployment.md](../network-deployment.md)

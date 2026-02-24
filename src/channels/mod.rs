@@ -67,7 +67,9 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::{
+    build_shell_policy_instructions, build_tool_instructions, run_tool_call_loop, scrub_credentials,
+};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -2751,15 +2753,18 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_mention_only(mx.mention_only),
+            ),
         });
     }
 
@@ -3199,6 +3204,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
+    system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
     if !skills.is_empty() {
         println!(

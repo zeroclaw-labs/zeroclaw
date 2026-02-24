@@ -5,8 +5,9 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
+        events::Mentions,
         OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
@@ -25,6 +26,7 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
+    mention_only: bool,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     zeroclaw_dir: Option<PathBuf>,
@@ -157,6 +159,7 @@ impl MatrixChannel {
             access_token,
             room_id,
             allowed_users,
+            mention_only: false,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             zeroclaw_dir,
@@ -164,6 +167,11 @@ impl MatrixChannel {
             sdk_client: Arc::new(OnceCell::new()),
             http_client: Client::new(),
         }
+    }
+
+    pub fn with_mention_only(mut self, mention_only: bool) -> Self {
+        self.mention_only = mention_only;
+        self
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -215,6 +223,137 @@ impl MatrixChannel {
 
     fn has_non_empty_body(body: &str) -> bool {
         !body.trim().is_empty()
+    }
+
+    fn is_matrix_identifier_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
+    }
+
+    fn contains_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
+        if text.is_empty() || user_id.is_empty() {
+            return false;
+        }
+
+        let text_lower = text.to_ascii_lowercase();
+        let user_id_lower = user_id.to_ascii_lowercase();
+        let mut search_from = 0;
+
+        while let Some(found) = text_lower[search_from..].find(&user_id_lower) {
+            let start = search_from + found;
+            let end = start + user_id_lower.len();
+
+            let before = text[..start].chars().next_back();
+            let after = text[end..].chars().next();
+
+            let left_ok = before.is_none_or(|c| !Self::is_matrix_identifier_char(c));
+            let right_ok = after.is_none_or(|c| !Self::is_matrix_identifier_char(c));
+
+            if left_ok && right_ok {
+                return true;
+            }
+
+            search_from = end;
+        }
+
+        false
+    }
+
+    fn percent_encode(input: &str) -> String {
+        let mut encoded = String::with_capacity(input.len());
+        for byte in input.bytes() {
+            if matches!(
+                byte,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+            ) {
+                encoded.push(char::from(byte));
+            } else {
+                use std::fmt::Write;
+                let _ = write!(&mut encoded, "%{byte:02X}");
+            }
+        }
+        encoded
+    }
+
+    fn has_structured_mention(mentions: Option<&Mentions>, bot_user_id: &str) -> bool {
+        mentions.is_some_and(|m| {
+            m.user_ids
+                .iter()
+                .any(|user_id| user_id.as_str().eq_ignore_ascii_case(bot_user_id))
+        })
+    }
+
+    fn extract_formatted_body(msgtype: &MessageType) -> Option<&str> {
+        match msgtype {
+            MessageType::Text(content) => content.formatted.as_ref().map(|f| f.body.as_str()),
+            MessageType::Notice(content) => content.formatted.as_ref().map(|f| f.body.as_str()),
+            MessageType::Emote(content) => content.formatted.as_ref().map(|f| f.body.as_str()),
+            _ => None,
+        }
+    }
+
+    fn event_mentions_user(
+        event: &OriginalSyncRoomMessageEvent,
+        plain_body: &str,
+        bot_user_id: &str,
+    ) -> bool {
+        if Self::has_structured_mention(event.content.mentions.as_ref(), bot_user_id) {
+            return true;
+        }
+
+        if Self::contains_matrix_user_id_mention(plain_body, bot_user_id) {
+            return true;
+        }
+
+        let Some(formatted_body) = Self::extract_formatted_body(&event.content.msgtype) else {
+            return false;
+        };
+
+        if Self::contains_matrix_user_id_mention(formatted_body, bot_user_id) {
+            return true;
+        }
+
+        let encoded_user_id = Self::percent_encode(bot_user_id).to_ascii_lowercase();
+        formatted_body
+            .to_ascii_lowercase()
+            .contains(&encoded_user_id)
+    }
+
+    fn reply_target_event_id(event: &OriginalSyncRoomMessageEvent) -> Option<String> {
+        match event.content.relates_to.as_ref()? {
+            Relation::Reply { in_reply_to } => Some(in_reply_to.event_id.to_string()),
+            Relation::Thread(thread) => thread.in_reply_to.as_ref().map(|r| r.event_id.to_string()),
+            Relation::Replacement(_) | Relation::_Custom(_) => None,
+            _ => None, // Handle any future relation types added by the Matrix SDK
+        }
+    }
+
+    async fn is_reply_to_cached_bot_event(
+        event: &OriginalSyncRoomMessageEvent,
+        bot_event_cache: &tokio::sync::Mutex<(
+            std::collections::VecDeque<String>,
+            std::collections::HashSet<String>,
+        )>,
+    ) -> bool {
+        let Some(target_event_id) = Self::reply_target_event_id(event) else {
+            return false;
+        };
+
+        let guard = bot_event_cache.lock().await;
+        let (_, known_bot_events) = &*guard;
+        known_bot_events.contains(&target_event_id)
+    }
+
+    fn should_process_message(
+        mention_only: bool,
+        is_direct_room: bool,
+        is_mentioned: bool,
+        is_reply_to_bot: bool,
+    ) -> bool {
+        if !mention_only {
+            return true;
+        }
+
+        is_direct_room || is_mentioned || is_reply_to_bot
     }
 
     fn cache_event_id(
@@ -300,9 +439,7 @@ impl MatrixChannel {
                     if let Some(hinted) = self.session_owner_hint.as_ref() {
                         if hinted != &whoami.user_id {
                             tracing::warn!(
-                                "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
-                                crate::security::redact(hinted),
-                                crate::security::redact(&whoami.user_id)
+                                "Matrix configured user_id does not match whoami user_id; using whoami."
                             );
                         }
                     }
@@ -320,9 +457,7 @@ impl MatrixChannel {
                         if let Some(whoami_device_id) = whoami.device_id.as_ref() {
                             if whoami_device_id != hinted {
                                 tracing::warn!(
-                                    "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
-                                    crate::security::redact(hinted),
-                                    crate::security::redact(whoami_device_id)
+                                    "Matrix configured device_id does not match whoami device_id; using whoami."
                                 );
                             }
                             whoami_device_id.clone()
@@ -491,14 +626,10 @@ impl MatrixChannel {
         match client.encryption().get_own_device().await {
             Ok(Some(device)) => {
                 if device.is_verified() {
-                    tracing::info!(
-                        "Matrix device '{}' is verified for E2EE.",
-                        device.device_id()
-                    );
+                    tracing::info!("Matrix device is verified for E2EE.");
                 } else {
                     tracing::warn!(
-                        "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
-                        device.device_id()
+                        "Matrix device is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session."
                     );
                 }
             }
@@ -587,12 +718,18 @@ impl Channel for MatrixChannel {
             std::collections::VecDeque::new(),
             std::collections::HashSet::new(),
         )));
+        let recent_bot_event_cache = Arc::new(Mutex::new((
+            std::collections::VecDeque::new(),
+            std::collections::HashSet::new(),
+        )));
 
         let tx_handler = tx.clone();
         let target_room_for_handler = target_room.clone();
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
+        let bot_dedupe_for_handler = Arc::clone(&recent_bot_event_cache);
+        let mention_only_for_handler = self.mention_only;
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -600,13 +737,19 @@ impl Channel for MatrixChannel {
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
+            let bot_dedupe = Arc::clone(&bot_dedupe_for_handler);
 
             async move {
                 if room.room_id().as_str() != target_room.as_str() {
                     return;
                 }
 
+                let event_id = event.event_id.to_string();
+
                 if event.sender == my_user_id {
+                    let mut guard = bot_dedupe.lock().await;
+                    let (recent_order, recent_lookup) = &mut *guard;
+                    MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup);
                     return;
                 }
 
@@ -625,7 +768,34 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                let event_id = event.event_id.to_string();
+                let mut is_direct_room = false;
+                let mut is_mentioned = false;
+                let mut is_reply_to_bot = false;
+
+                if mention_only_for_handler {
+                    is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
+                        tracing::warn!(
+                            "Matrix is_direct() failed while evaluating mention_only gate: {error}"
+                        );
+                        false
+                    });
+                    if !is_direct_room {
+                        is_mentioned =
+                            MatrixChannel::event_mentions_user(&event, &body, my_user_id.as_str());
+                        is_reply_to_bot =
+                            MatrixChannel::is_reply_to_cached_bot_event(&event, &bot_dedupe).await;
+                    }
+
+                    if !MatrixChannel::should_process_message(
+                        mention_only_for_handler,
+                        is_direct_room,
+                        is_mentioned,
+                        is_reply_to_bot,
+                    ) {
+                        return;
+                    }
+                }
+
                 {
                     let mut guard = dedupe.lock().await;
                     let (recent_order, recent_lookup) = &mut *guard;
@@ -689,6 +859,7 @@ impl Channel for MatrixChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_sdk::ruma::{OwnedEventId, OwnedUserId};
 
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
@@ -840,6 +1011,124 @@ mod tests {
         assert!(MatrixChannel::has_non_empty_body("  hello  "));
         assert!(!MatrixChannel::has_non_empty_body(""));
         assert!(!MatrixChannel::has_non_empty_body("   \n\t  "));
+    }
+
+    fn parse_sync_message_event(value: serde_json::Value) -> OriginalSyncRoomMessageEvent {
+        serde_json::from_value(value).expect("valid m.room.message event")
+    }
+
+    #[test]
+    fn mention_only_builder_sets_flag() {
+        let ch = make_channel().with_mention_only(true);
+        assert!(ch.mention_only);
+    }
+
+    #[test]
+    fn event_mentions_user_detects_plain_text_user_id() {
+        let event = parse_sync_message_event(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$event:matrix.org",
+            "sender": "@user:matrix.org",
+            "origin_server_ts": 1u64,
+            "content": {
+                "msgtype": "m.text",
+                "body": "hello @bot:matrix.org"
+            }
+        }));
+
+        assert!(MatrixChannel::event_mentions_user(
+            &event,
+            "hello @bot:matrix.org",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn event_mentions_user_detects_html_matrix_to_link() {
+        let event = parse_sync_message_event(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$event:matrix.org",
+            "sender": "@user:matrix.org",
+            "origin_server_ts": 1u64,
+            "content": {
+                "msgtype": "m.text",
+                "body": "hello bot",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<a href=\"https://matrix.to/#/%40bot%3Amatrix.org\">bot</a>"
+            }
+        }));
+
+        assert!(MatrixChannel::event_mentions_user(
+            &event,
+            "hello bot",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn event_mentions_user_detects_structured_mentions() {
+        let event = parse_sync_message_event(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$event:matrix.org",
+            "sender": "@user:matrix.org",
+            "origin_server_ts": 1u64,
+            "content": {
+                "msgtype": "m.text",
+                "body": "hello there",
+                "m.mentions": {
+                    "user_ids": ["@bot:matrix.org"]
+                }
+            }
+        }));
+
+        assert!(MatrixChannel::event_mentions_user(
+            &event,
+            "hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn reply_target_event_id_extracts_reply_relation() {
+        let event = parse_sync_message_event(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$event:matrix.org",
+            "sender": "@user:matrix.org",
+            "origin_server_ts": 1u64,
+            "content": {
+                "msgtype": "m.text",
+                "body": "reply",
+                "m.relates_to": {
+                    "m.in_reply_to": {
+                        "event_id": "$botmsg:matrix.org"
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(
+            MatrixChannel::reply_target_event_id(&event).as_deref(),
+            Some("$botmsg:matrix.org")
+        );
+    }
+
+    #[test]
+    fn mention_only_gate_behaves_as_expected() {
+        assert!(MatrixChannel::should_process_message(
+            false, false, false, false
+        ));
+        assert!(MatrixChannel::should_process_message(
+            true, true, false, false
+        ));
+        assert!(MatrixChannel::should_process_message(
+            true, false, true, false
+        ));
+        assert!(MatrixChannel::should_process_message(
+            true, false, false, true
+        ));
+        assert!(!MatrixChannel::should_process_message(
+            true, false, false, false
+        ));
     }
 
     #[test]

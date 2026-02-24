@@ -604,6 +604,8 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     mask_vec_secrets(&mut masked.reliability.api_keys);
     mask_optional_secret(&mut masked.composio.api_key);
     mask_optional_secret(&mut masked.browser.computer_use.api_key);
+    mask_optional_secret(&mut masked.web_fetch.api_key);
+    mask_optional_secret(&mut masked.web_search.api_key);
     mask_optional_secret(&mut masked.web_search.brave_api_key);
     mask_optional_secret(&mut masked.storage.provider.config.db_url);
 
@@ -682,6 +684,11 @@ fn restore_masked_sensitive_fields(
     restore_optional_secret(
         &mut incoming.browser.computer_use.api_key,
         &current.browser.computer_use.api_key,
+    );
+    restore_optional_secret(&mut incoming.web_fetch.api_key, &current.web_fetch.api_key);
+    restore_optional_secret(
+        &mut incoming.web_search.api_key,
+        &current.web_search.api_key,
     );
     restore_optional_secret(
         &mut incoming.web_search.brave_api_key,

@@ -1,10 +1,13 @@
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{
+    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Open approved HTTPS URLs in the system default browser (no scraping, no DOM automation).
+/// Open approved HTTPS URLs in Brave Browser (no scraping, no DOM automation).
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -19,37 +22,18 @@ impl BrowserOpenTool {
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        let url = raw_url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("https://") {
-            anyhow::bail!("Only https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
-        }
-
-        Ok(url.to_string())
+        validate_url(
+            raw_url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &[],
+                allowed_field_name: "browser.allowed_domains",
+                blocked_field_name: None,
+                empty_allowed_message: "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpsOnly,
+                ipv6_error_context: "browser_open",
+            },
+        )
     }
 }
 
@@ -60,7 +44,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open an approved HTTPS URL in Brave Browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +53,7 @@ impl Tool for BrowserOpenTool {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "HTTPS URL to open in the system browser"
+                    "description": "HTTPS URL to open in Brave Browser"
                 }
             },
             "required": ["url"]
@@ -109,113 +93,72 @@ impl Tool for BrowserOpenTool {
             }
         };
 
-        match open_in_system_browser(&url).await {
+        match open_in_brave(&url).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Opened in system browser: {url}"),
+                output: format!("Opened in Brave: {url}"),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to open system browser: {e}")),
+                error: Some(format!("Failed to open Brave Browser: {e}")),
             }),
         }
     }
 }
 
-async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
+async fn open_in_brave(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let primary_error = match tokio::process::Command::new("open").arg(url).status().await {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("open exited with status {status}"),
-            Err(error) => format!("open not runnable: {error}"),
-        };
-
-        // TODO(compat): remove Brave fallback after default-browser launch has been stable across macOS environments.
-        let mut brave_error = String::new();
         for app in ["Brave Browser", "Brave"] {
-            match tokio::process::Command::new("open")
+            let status = tokio::process::Command::new("open")
                 .arg("-a")
                 .arg(app)
                 .arg(url)
                 .status()
-                .await
-            {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    brave_error = format!("open -a '{app}' exited with status {status}");
-                }
-                Err(error) => {
-                    brave_error = format!("open -a '{app}' not runnable: {error}");
+                .await;
+
+            if let Ok(s) = status {
+                if s.success() {
+                    return Ok(());
                 }
             }
         }
-
         anyhow::bail!(
-            "Failed to open URL with default browser launcher: {primary_error}. Brave compatibility fallback also failed: {brave_error}"
+            "Brave Browser was not found (tried macOS app names 'Brave Browser' and 'Brave')"
         );
     }
 
     #[cfg(target_os = "linux")]
     {
         let mut last_error = String::new();
-        for cmd in [
-            "xdg-open",
-            "gio",
-            "sensible-browser",
-            "brave-browser",
-            "brave",
-        ] {
-            let mut command = tokio::process::Command::new(cmd);
-            if cmd == "gio" {
-                command.arg("open");
-            }
-            command.arg(url);
-            match command.status().await {
+        for cmd in ["brave-browser", "brave"] {
+            match tokio::process::Command::new(cmd).arg(url).status().await {
                 Ok(status) if status.success() => return Ok(()),
                 Ok(status) => {
                     last_error = format!("{cmd} exited with status {status}");
                 }
-                Err(error) => {
-                    last_error = format!("{cmd} not runnable: {error}");
+                Err(e) => {
+                    last_error = format!("{cmd} not runnable: {e}");
                 }
             }
         }
-
-        // TODO(compat): remove Brave fallback commands (brave-browser/brave) once default launcher coverage is validated.
-        anyhow::bail!(
-            "Failed to open URL with default browser launchers; Brave compatibility fallback also failed. Last error: {last_error}"
-        );
+        anyhow::bail!("{last_error}");
     }
 
     #[cfg(target_os = "windows")]
     {
-        let primary_error = match tokio::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("cmd start default-browser exited with status {status}"),
-            Err(error) => format!("cmd start default-browser not runnable: {error}"),
-        };
-
-        // TODO(compat): remove Brave fallback after default-browser launch has been stable across Windows environments.
-        let brave_error = match tokio::process::Command::new("cmd")
+        let status = tokio::process::Command::new("cmd")
             .args(["/C", "start", "", "brave", url])
             .status()
-            .await
-        {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("cmd start brave exited with status {status}"),
-            Err(error) => format!("cmd start brave not runnable: {error}"),
-        };
+            .await?;
 
-        anyhow::bail!(
-            "Failed to open URL with default browser launcher: {primary_error}. Brave compatibility fallback also failed: {brave_error}"
-        );
+        if status.success() {
+            return Ok(());
+        }
+
+        anyhow::bail!("cmd start brave exited with status {status}");
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -225,135 +168,11 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in browser_open");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
-}
-
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
-        return true;
-    }
-
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
-    }
-
-    false
-}
-
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::url_validation::normalize_domain;
 
     fn test_tool(allowed_domains: Vec<&str>) -> BrowserOpenTool {
         let security = Arc::new(SecurityPolicy {
@@ -409,6 +228,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_subdomain_pattern() {
+        let tool = test_tool(vec!["*.example.com"]);
+        assert!(tool.validate_url("https://example.com").is_ok());
+        assert!(tool.validate_url("https://sub.example.com").is_ok());
+        assert!(tool.validate_url("https://other.com").is_err());
     }
 
     #[test]
@@ -480,18 +307,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
     }
 
     #[tokio::test]

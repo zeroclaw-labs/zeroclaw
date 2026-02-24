@@ -4,7 +4,7 @@ Ce fichier constitue la table des matières canonique du système de documentati
 
 > 📖 [English version](SUMMARY.md)
 
-Dernière mise à jour : **18 février 2026**.
+Dernière mise à jour : **24 février 2026**.
 
 ## Points d'entrée par langue
 
@@ -15,75 +15,81 @@ Dernière mise à jour : **18 février 2026**.
 - README en russe : [../README.ru.md](../README.ru.md)
 - README en français : [../README.fr.md](../README.fr.md)
 - README en vietnamien : [../README.vi.md](../README.vi.md)
+- README en grec : [../README.el.md](../README.el.md)
 - Documentation en anglais : [README.md](README.md)
-- Documentation en chinois : [README.zh-CN.md](README.zh-CN.md)
-- Documentation en japonais : [README.ja.md](README.ja.md)
-- Documentation en russe : [README.ru.md](README.ru.md)
-- Documentation en français : [README.fr.md](README.fr.md)
+- Documentation en chinois : [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- Documentation en japonais : [i18n/ja/README.md](i18n/ja/README.md)
+- Documentation en russe : [i18n/ru/README.md](i18n/ru/README.md)
+- Documentation en français : [i18n/fr/README.md](i18n/fr/README.md)
 - Documentation en vietnamien : [i18n/vi/README.md](i18n/vi/README.md)
-- Index de localisation : [i18n/README.md](i18n/README.md)
-- Carte de couverture i18n : [i18n-coverage.md](i18n-coverage.md)
+- Documentation en grec : [i18n/el/README.md](i18n/el/README.md)
+- Index i18n : [i18n/README.md](i18n/README.md)
+- Couverture i18n : [i18n-coverage.md](i18n-coverage.md)
+- Guide i18n : [i18n-guide.md](i18n-guide.md)
+- Suivi des écarts : [i18n-gap-backlog.md](i18n-gap-backlog.md)
 
 ## Catégories
 
 ### 1) Démarrage rapide
 
-- [getting-started/README.md](getting-started/README.md)
-- [one-click-bootstrap.md](one-click-bootstrap.md)
+- [getting-started/README.fr.md](getting-started/README.fr.md)
+- [i18n/fr/one-click-bootstrap.md](i18n/fr/one-click-bootstrap.md)
+- [i18n/fr/android-setup.md](i18n/fr/android-setup.md)
 
 ### 2) Référence des commandes, configuration et intégrations
 
-- [reference/README.md](reference/README.md)
-- [commands-reference.md](commands-reference.md)
-- [providers-reference.md](providers-reference.md)
-- [channels-reference.md](channels-reference.md)
-- [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
-- [config-reference.md](config-reference.md)
-- [custom-providers.md](custom-providers.md)
-- [zai-glm-setup.md](zai-glm-setup.md)
-- [langgraph-integration.md](langgraph-integration.md)
+- [reference/README.fr.md](reference/README.fr.md)
+- [i18n/fr/commands-reference.md](i18n/fr/commands-reference.md)
+- [i18n/fr/providers-reference.md](i18n/fr/providers-reference.md)
+- [i18n/fr/channels-reference.md](i18n/fr/channels-reference.md)
+- [i18n/fr/config-reference.md](i18n/fr/config-reference.md)
+- [i18n/fr/custom-providers.md](i18n/fr/custom-providers.md)
+- [i18n/fr/zai-glm-setup.md](i18n/fr/zai-glm-setup.md)
+- [i18n/fr/langgraph-integration.md](i18n/fr/langgraph-integration.md)
+- [i18n/fr/proxy-agent-playbook.md](i18n/fr/proxy-agent-playbook.md)
 
 ### 3) Exploitation et déploiement
 
-- [operations/README.md](operations/README.md)
-- [operations-runbook.md](operations-runbook.md)
-- [release-process.md](release-process.md)
-- [troubleshooting.md](troubleshooting.md)
-- [network-deployment.md](network-deployment.md)
-- [mattermost-setup.md](mattermost-setup.md)
+- [operations/README.fr.md](operations/README.fr.md)
+- [i18n/fr/operations-runbook.md](i18n/fr/operations-runbook.md)
+- [i18n/fr/release-process.md](i18n/fr/release-process.md)
+- [i18n/fr/troubleshooting.md](i18n/fr/troubleshooting.md)
+- [i18n/fr/network-deployment.md](i18n/fr/network-deployment.md)
+- [i18n/fr/mattermost-setup.md](i18n/fr/mattermost-setup.md)
+- [i18n/fr/nextcloud-talk-setup.md](i18n/fr/nextcloud-talk-setup.md)
 
-### 4) Conception de la sécurité et propositions
+### 4) Sécurité et gouvernance
 
-- [security/README.md](security/README.md)
-- [agnostic-security.md](agnostic-security.md)
-- [frictionless-security.md](frictionless-security.md)
-- [sandboxing.md](sandboxing.md)
-- [resource-limits.md](resource-limits.md)
-- [audit-logging.md](audit-logging.md)
-- [security-roadmap.md](security-roadmap.md)
+- [security/README.fr.md](security/README.fr.md)
+- [i18n/fr/agnostic-security.md](i18n/fr/agnostic-security.md)
+- [i18n/fr/frictionless-security.md](i18n/fr/frictionless-security.md)
+- [i18n/fr/sandboxing.md](i18n/fr/sandboxing.md)
+- [i18n/fr/resource-limits.md](i18n/fr/resource-limits.md)
+- [i18n/fr/audit-logging.md](i18n/fr/audit-logging.md)
+- [i18n/fr/audit-event-schema.md](i18n/fr/audit-event-schema.md)
+- [i18n/fr/security-roadmap.md](i18n/fr/security-roadmap.md)
 
 ### 5) Matériel et périphériques
 
-- [hardware/README.md](hardware/README.md)
-- [hardware-peripherals-design.md](hardware-peripherals-design.md)
-- [adding-boards-and-tools.md](adding-boards-and-tools.md)
-- [nucleo-setup.md](nucleo-setup.md)
-- [arduino-uno-q-setup.md](arduino-uno-q-setup.md)
-- [datasheets/nucleo-f401re.md](datasheets/nucleo-f401re.md)
-- [datasheets/arduino-uno.md](datasheets/arduino-uno.md)
-- [datasheets/esp32.md](datasheets/esp32.md)
+- [hardware/README.fr.md](hardware/README.fr.md)
+- [i18n/fr/hardware-peripherals-design.md](i18n/fr/hardware-peripherals-design.md)
+- [i18n/fr/adding-boards-and-tools.md](i18n/fr/adding-boards-and-tools.md)
+- [i18n/fr/nucleo-setup.md](i18n/fr/nucleo-setup.md)
+- [i18n/fr/arduino-uno-q-setup.md](i18n/fr/arduino-uno-q-setup.md)
+- [datasheets/README.md](datasheets/README.md)
 
 ### 6) Contribution et CI
 
-- [contributing/README.md](contributing/README.md)
+- [contributing/README.fr.md](contributing/README.fr.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
-- [pr-workflow.md](pr-workflow.md)
-- [reviewer-playbook.md](reviewer-playbook.md)
-- [ci-map.md](ci-map.md)
-- [actions-source-policy.md](actions-source-policy.md)
+- [i18n/fr/pr-workflow.md](i18n/fr/pr-workflow.md)
+- [i18n/fr/reviewer-playbook.md](i18n/fr/reviewer-playbook.md)
+- [i18n/fr/ci-map.md](i18n/fr/ci-map.md)
+- [i18n/fr/actions-source-policy.md](i18n/fr/actions-source-policy.md)
 
 ### 7) État du projet et instantanés
 
-- [project/README.md](project/README.md)
-- [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
-- [docs-inventory.md](docs-inventory.md)
+- [project/README.fr.md](project/README.fr.md)
+- [i18n/fr/project-triage-snapshot-2026-02-18.md](i18n/fr/project-triage-snapshot-2026-02-18.md)
+- [i18n/fr/docs-audit-2026-02-24.md](i18n/fr/docs-audit-2026-02-24.md)
+- [i18n/fr/docs-inventory.md](i18n/fr/docs-inventory.md)

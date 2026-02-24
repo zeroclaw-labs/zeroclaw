@@ -252,6 +252,69 @@ jobs:
                     echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
                   fi
 
+            - name: Setup Android NDK
+              if: matrix.android_ndk
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  NDK_VERSION="r26d"
+                  NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+                  NDK_URL="https://dl.google.com/android/repository/${NDK_ZIP}"
+                  NDK_ROOT="${RUNNER_TEMP}/android-ndk"
+                  NDK_HOME="${NDK_ROOT}/android-ndk-${NDK_VERSION}"
+
+                  sudo apt-get update -qq
+                  sudo apt-get install -y unzip
+
+                  mkdir -p "${NDK_ROOT}"
+                  curl -fsSL "${NDK_URL}" -o "${RUNNER_TEMP}/${NDK_ZIP}"
+                  unzip -q "${RUNNER_TEMP}/${NDK_ZIP}" -d "${NDK_ROOT}"
+
+                  echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "$GITHUB_ENV"
+                  echo "${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+            - name: Configure Android toolchain
+              if: matrix.android_ndk
+              shell: bash
+              run: |
+                  echo "Setting up Android NDK toolchain for ${{ matrix.target }}"
+                  NDK_HOME="${ANDROID_NDK_HOME:-}"
+                  if [[ -z "$NDK_HOME" ]]; then
+                    echo "::error::ANDROID_NDK_HOME was not configured."
+                    exit 1
+                  fi
+                  TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+                  
+                  # Add to path for linker resolution
+                  echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+                  
+                  # Set linker environment variables
+                  if [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
+                    ARMV7_CC="${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang"
+                    ARMV7_CXX="${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang++"
+
+                    # Some crates still probe legacy compiler names (arm-linux-androideabi-clang).
+                    ln -sf "$ARMV7_CC" "${TOOLCHAIN}/arm-linux-androideabi-clang"
+                    ln -sf "$ARMV7_CXX" "${TOOLCHAIN}/arm-linux-androideabi-clang++"
+
+                    {
+                      echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${ARMV7_CC}"
+                      echo "CC_armv7_linux_androideabi=${ARMV7_CC}"
+                      echo "CXX_armv7_linux_androideabi=${ARMV7_CXX}"
+                      echo "AR_armv7_linux_androideabi=${TOOLCHAIN}/llvm-ar"
+                    } >> "$GITHUB_ENV"
+                  elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+                    AARCH64_CC="${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang"
+                    AARCH64_CXX="${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang++"
+
+                    {
+                      echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${AARCH64_CC}"
+                      echo "CC_aarch64_linux_android=${AARCH64_CC}"
+                      echo "CXX_aarch64_linux_android=${AARCH64_CXX}"
+                      echo "AR_aarch64_linux_android=${TOOLCHAIN}/llvm-ar"
+                    } >> "$GITHUB_ENV"
+                  fi
+
             - name: Build release
               shell: bash
               env:

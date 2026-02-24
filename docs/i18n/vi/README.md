@@ -12,12 +12,16 @@
 |---|---|
 | Cài đặt và chạy nhanh | [../../../README.vi.md](../../../README.vi.md) / [../../../README.md](../../../README.md) |
 | Cài đặt bằng một lệnh | [one-click-bootstrap.md](one-click-bootstrap.md) |
+| Cài đặt trên Android (Termux/ADB) | [android-setup.md](android-setup.md) |
 | Tìm lệnh theo tác vụ | [commands-reference.md](commands-reference.md) |
 | Kiểm tra giá trị mặc định và khóa cấu hình | [config-reference.md](config-reference.md) |
 | Kết nối provider / endpoint tùy chỉnh | [custom-providers.md](custom-providers.md) |
 | Cấu hình Z.AI / GLM provider | [zai-glm-setup.md](zai-glm-setup.md) |
 | Sử dụng tích hợp LangGraph | [langgraph-integration.md](langgraph-integration.md) |
+| Thiết lập Nextcloud Talk | [nextcloud-talk-setup.md](nextcloud-talk-setup.md) |
+| Cấu hình proxy theo phạm vi an toàn | [proxy-agent-playbook.md](proxy-agent-playbook.md) |
 | Vận hành hàng ngày (runbook) | [operations-runbook.md](operations-runbook.md) |
+| Vận hành probe kết nối provider trong CI | [operations/connectivity-probes-runbook.md](operations/connectivity-probes-runbook.md) |
 | Khắc phục sự cố cài đặt/chạy/kênh | [troubleshooting.md](troubleshooting.md) |
 | Cấu hình Matrix phòng mã hóa (E2EE) | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
 | Xem theo danh mục | [SUMMARY.md](SUMMARY.md) |
@@ -83,12 +87,17 @@
 
 - Mục lục thống nhất (TOC): [SUMMARY.md](SUMMARY.md)
 - Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [../../structure/README.md](../../structure/README.md)
-- Danh mục và phân loại tài liệu: [docs-inventory.md](../../docs-inventory.md)
+- Danh mục và phân loại tài liệu: [docs-inventory.md](docs-inventory.md)
+- Checklist hoàn thiện i18n: [i18n-guide.md](i18n-guide.md)
+- Bản đồ độ phủ i18n: [i18n-coverage.md](i18n-coverage.md)
+- Backlog thiếu hụt i18n: [i18n-gap-backlog.md](i18n-gap-backlog.md)
+- Snapshot kiểm toán tài liệu (2026-02-24): [docs-audit-2026-02-24.md](docs-audit-2026-02-24.md)
 
 ## Ngôn ngữ khác
 
 - English: [README.md](../../README.md)
-- 简体中文: [README.zh-CN.md](../../README.zh-CN.md)
-- 日本語: [README.ja.md](../../README.ja.md)
-- Русский: [README.ru.md](../../README.ru.md)
-- Français: [README.fr.md](../../README.fr.md)
+- 简体中文: [../zh-CN/README.md](../zh-CN/README.md)
+- 日本語: [../ja/README.md](../ja/README.md)
+- Русский: [../ru/README.md](../ru/README.md)
+- Français: [../fr/README.md](../fr/README.md)
+- Ελληνικά: [../el/README.md](../el/README.md)
