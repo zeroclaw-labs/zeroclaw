@@ -326,6 +326,14 @@ Notes:
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
 
+## `[gateway.node_control]` (experimental)
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | enable node-control scaffold endpoint (`POST /api/node-control`) |
+| `auth_token` | `null` | optional extra shared token checked via `X-Node-Control-Token` |
+| `allowed_node_ids` | `[]` | allowlist for `node.describe`/`node.invoke` (`[]` accepts any) |
+
 ## `[autonomy]`
 
 | Key | Default | Purpose |

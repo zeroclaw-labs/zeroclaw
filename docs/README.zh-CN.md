@@ -6,6 +6,8 @@
 
 > 说明：命令、配置键、API 路径保持英文；实现细节以英文文档为准。
 
+本地化入口： [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/README.md) · [Русский](i18n/ru/README.md) · [Français](i18n/fr/README.md) · [Tiếng Việt](i18n/vi/README.md) · [Ελληνικά](i18n/el/README.md).
+
 ## 快速入口
 
 | 我想要… | 建议阅读 |
@@ -24,24 +26,24 @@
 
 ## 10 秒决策树（先看这个）
 
-- 首次安装或快速启动 → [getting-started/README.md](getting-started/README.md)
-- 需要精确命令或配置键 → [reference/README.md](reference/README.md)
-- 需要部署与服务化运维 → [operations/README.md](operations/README.md)
+- 首次安装或快速启动 → [getting-started/README.zh-CN.md](getting-started/README.zh-CN.md)
+- 需要精确命令或配置键 → [reference/README.zh-CN.md](reference/README.zh-CN.md)
+- 需要部署与服务化运维 → [operations/README.zh-CN.md](operations/README.zh-CN.md)
 - 遇到报错、异常或回归 → [troubleshooting.md](troubleshooting.md)
-- 查看安全现状与路线图 → [security/README.md](security/README.md)
-- 接入板卡与外设 → [hardware/README.md](hardware/README.md)
-- 参与贡献、评审与 CI → [contributing/README.md](contributing/README.md)
+- 查看安全现状与路线图 → [security/README.zh-CN.md](security/README.zh-CN.md)
+- 接入板卡与外设 → [hardware/README.zh-CN.md](hardware/README.zh-CN.md)
+- 参与贡献、评审与 CI → [contributing/README.zh-CN.md](contributing/README.zh-CN.md)
 - 查看完整文档地图 → [SUMMARY.md](SUMMARY.md)
 
 ## 按目录浏览（推荐）
 
-- 入门文档： [getting-started/README.md](getting-started/README.md)
-- 参考手册： [reference/README.md](reference/README.md)
-- 运维与部署： [operations/README.md](operations/README.md)
-- 安全文档： [security/README.md](security/README.md)
-- 硬件与外设： [hardware/README.md](hardware/README.md)
-- 贡献与 CI： [contributing/README.md](contributing/README.md)
-- 项目快照： [project/README.md](project/README.md)
+- 入门文档： [getting-started/README.zh-CN.md](getting-started/README.zh-CN.md)
+- 参考手册： [reference/README.zh-CN.md](reference/README.zh-CN.md)
+- 运维与部署： [operations/README.zh-CN.md](operations/README.zh-CN.md)
+- 安全文档： [security/README.zh-CN.md](security/README.zh-CN.md)
+- 硬件与外设： [hardware/README.zh-CN.md](hardware/README.zh-CN.md)
+- 贡献与 CI： [contributing/README.zh-CN.md](contributing/README.zh-CN.md)
+- 项目快照： [project/README.zh-CN.md](project/README.zh-CN.md)
 
 ## 按角色
 
@@ -69,7 +71,7 @@
 
 > 说明：本分组内有 proposal/roadmap 文档，可能包含设想中的命令或配置。当前可执行行为请优先阅读 [config-reference.md](config-reference.md)、[operations-runbook.md](operations-runbook.md)、[troubleshooting.md](troubleshooting.md)。
 
-- [security/README.md](security/README.md)
+- [security/README.zh-CN.md](security/README.zh-CN.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)
@@ -86,7 +88,8 @@
 ## 其他语言
 
 - English: [README.md](README.md)
-- 日本語: [README.ja.md](README.ja.md)
-- Русский: [README.ru.md](README.ru.md)
-- Français: [README.fr.md](README.fr.md)
+- 日本語: [i18n/ja/README.md](i18n/ja/README.md)
+- Русский: [i18n/ru/README.md](i18n/ru/README.md)
+- Français: [i18n/fr/README.md](i18n/fr/README.md)
 - Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)
+- Ελληνικά: [i18n/el/README.md](i18n/el/README.md)

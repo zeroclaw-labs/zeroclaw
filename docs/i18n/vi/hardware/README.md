@@ -13,7 +13,7 @@ Hệ thống phần cứng của ZeroClaw cho phép điều khiển trực tiế
 
 ## Datasheet
 
-- Chỉ mục datasheet: [../datasheets](../datasheets)
+- Chỉ mục datasheet: [../datasheets/README.md](../datasheets/README.md)
 - STM32 Nucleo-F401RE: [../datasheets/nucleo-f401re.md](../datasheets/nucleo-f401re.md)
 - Arduino Uno: [../datasheets/arduino-uno.md](../datasheets/arduino-uno.md)
 - ESP32: [../datasheets/esp32.md](../datasheets/esp32.md)

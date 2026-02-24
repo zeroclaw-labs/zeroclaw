@@ -6,6 +6,8 @@
 
 > 注: コマンド名・設定キー・API パスは英語のまま記載します。実装の一次情報は英語版ドキュメントを優先してください。
 
+ローカライズハブ: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/README.md) · [Русский](i18n/ru/README.md) · [Français](i18n/fr/README.md) · [Tiếng Việt](i18n/vi/README.md) · [Ελληνικά](i18n/el/README.md).
+
 ## すぐに参照したい項目
 
 | やりたいこと | 参照先 |
@@ -24,24 +26,24 @@
 
 ## 10秒ルーティング（まずここ）
 
-- 初回セットアップや導入をしたい → [getting-started/README.md](getting-started/README.md)
-- CLI/設定キーを正確に確認したい → [reference/README.md](reference/README.md)
-- 本番運用やサービス管理をしたい → [operations/README.md](operations/README.md)
+- 初回セットアップや導入をしたい → [getting-started/README.ja.md](getting-started/README.ja.md)
+- CLI/設定キーを正確に確認したい → [reference/README.ja.md](reference/README.ja.md)
+- 本番運用やサービス管理をしたい → [operations/README.ja.md](operations/README.ja.md)
 - エラーや不具合を解消したい → [troubleshooting.md](troubleshooting.md)
-- セキュリティ方針やロードマップを見たい → [security/README.md](security/README.md)
-- ボード/周辺機器を扱いたい → [hardware/README.md](hardware/README.md)
-- 貢献・レビュー・CIを確認したい → [contributing/README.md](contributing/README.md)
+- セキュリティ方針やロードマップを見たい → [security/README.ja.md](security/README.ja.md)
+- ボード/周辺機器を扱いたい → [hardware/README.ja.md](hardware/README.ja.md)
+- 貢献・レビュー・CIを確認したい → [contributing/README.ja.md](contributing/README.ja.md)
 - 全体マップを見たい → [SUMMARY.md](SUMMARY.md)
 
 ## カテゴリ別ナビゲーション（推奨）
 
-- 入門: [getting-started/README.md](getting-started/README.md)
-- リファレンス: [reference/README.md](reference/README.md)
-- 運用 / デプロイ: [operations/README.md](operations/README.md)
-- セキュリティ: [security/README.md](security/README.md)
-- ハードウェア: [hardware/README.md](hardware/README.md)
-- コントリビュート / CI: [contributing/README.md](contributing/README.md)
-- プロジェクトスナップショット: [project/README.md](project/README.md)
+- 入門: [getting-started/README.ja.md](getting-started/README.ja.md)
+- リファレンス: [reference/README.ja.md](reference/README.ja.md)
+- 運用 / デプロイ: [operations/README.ja.md](operations/README.ja.md)
+- セキュリティ: [security/README.ja.md](security/README.ja.md)
+- ハードウェア: [hardware/README.ja.md](hardware/README.ja.md)
+- コントリビュート / CI: [contributing/README.ja.md](contributing/README.ja.md)
+- プロジェクトスナップショット: [project/README.ja.md](project/README.ja.md)
 
 ## ロール別
 
@@ -69,7 +71,7 @@
 
 > 注: このセクションには proposal/roadmap 文書が含まれ、想定段階のコマンドや設定が記載される場合があります。現行動作は [config-reference.md](config-reference.md)、[operations-runbook.md](operations-runbook.md)、[troubleshooting.md](troubleshooting.md) を優先してください。
 
-- [security/README.md](security/README.md)
+- [security/README.ja.md](security/README.ja.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)
@@ -86,7 +88,8 @@
 ## 他言語
 
 - English: [README.md](README.md)
-- 简体中文: [README.zh-CN.md](README.zh-CN.md)
-- Русский: [README.ru.md](README.ru.md)
-- Français: [README.fr.md](README.fr.md)
+- 简体中文: [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- Русский: [i18n/ru/README.md](i18n/ru/README.md)
+- Français: [i18n/fr/README.md](i18n/fr/README.md)
 - Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)
+- Ελληνικά: [i18n/el/README.md](i18n/el/README.md)
