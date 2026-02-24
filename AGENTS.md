@@ -265,29 +265,6 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Introduce new shared abstractions only after repeated use (rule-of-three), with at least one real caller in current scope.
 - For config/schema changes, treat keys as public contract: document defaults, compatibility impact, and migration/rollback path.
 
-### 6.5 Linear Synchronization Contract (Required)
-
-Use Linear as the canonical execution tracker for ZeroClaw delivery flow, not just as optional notes.
-
-- Default team for repository task synchronization is `RMN` (`Repo Maintainers`).
-- For every actionable GitHub issue/PR track, create or link one Linear issue during intake unless the user explicitly opts out.
-- Cross-linking is mandatory:
-  - Linear issue must include GitHub issue/PR URL.
-  - GitHub issue/PR must include the Linear issue key (for example `RMN-123`).
-- State transitions must be updated promptly when milestones change:
-  - Intake complete -> set Linear issue to active execution state (`started` / team equivalent).
-  - PR opened as draft -> keep active execution state and add PR link.
-  - PR ready for review -> set review state (`in review` / team equivalent).
-  - Merged with green CI -> set done state (`completed` / team equivalent).
-  - Blocked -> set blocked state, include blocker owner and next checkpoint time.
-- Synchronization latency target: update Linear within 15 minutes of each stage-gate transition.
-- Required update payload at each transition:
-  - current stage
-  - latest commit SHA or PR number
-  - CI status summary
-  - explicit next action owner
-- If Linear API/CLI is unavailable, record a fallback event in run artifacts and retry before final handoff.
-
 ## 7) Change Playbooks
 
 ### 7.1 Adding a Provider
