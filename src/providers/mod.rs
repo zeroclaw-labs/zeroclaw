@@ -672,6 +672,7 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
+    pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
@@ -681,6 +682,7 @@ impl Default for ProviderRuntimeOptions {
     fn default() -> Self {
         Self {
             auth_profile_override: None,
+            provider_api_url: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
@@ -915,9 +917,9 @@ pub fn create_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
-        }
+        "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(
+            openai_codex::OpenAiCodexProvider::new(options, api_key)?,
+        )),
         _ => create_provider_with_url_and_options(name, api_key, None, options),
     }
 }
@@ -953,6 +955,18 @@ fn create_provider_with_url_and_options(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {
+        "openai-codex" | "openai_codex" | "codex" => {
+            let mut codex_options = options.clone();
+            codex_options.provider_api_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| options.provider_api_url.clone());
+            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
+                &codex_options,
+                key,
+            )?))
+        }
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
