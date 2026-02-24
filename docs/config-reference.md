@@ -644,6 +644,31 @@ Notes:
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
 
+## `[agents_ipc]`
+
+Inter-process communication for independent ZeroClaw agents on the same host.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable IPC tools (`agents_list`, `agents_send`, `agents_inbox`, `state_get`, `state_set`) |
+| `db_path` | `~/.zeroclaw/agents.db` | Shared SQLite database path (all agents on this host share one file) |
+| `staleness_secs` | `300` | Agents not seen within this window are considered offline (seconds) |
+
+Notes:
+
+- When `enabled = false` (default), no IPC tools are registered and no database is created.
+- All agents that share a `db_path` can discover each other and exchange messages.
+- Agent identity is derived from `workspace_dir` (SHA-256 hash), not user-supplied.
+
+Example:
+
+```toml
+[agents_ipc]
+enabled = true
+db_path = "~/.zeroclaw/agents.db"
+staleness_secs = 300
+```
+
 ## Security-Relevant Defaults
 
 - deny-by-default channel allowlists (`[]` means deny all)
