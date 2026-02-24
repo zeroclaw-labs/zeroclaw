@@ -29,27 +29,30 @@ jobs:
                   pr_author_lc="$(echo "${PR_AUTHOR}" | tr '[:upper:]' '[:lower:]')"
                   allowed_authors=("willsarg" "theonlyhennygod")
 
-                  is_allowed_author=false
-                  for allowed in "${allowed_authors[@]}"; do
-                    if [[ "$pr_author_lc" == "$allowed" ]]; then
-                      is_allowed_author=true
-                      break
-                    fi
-                  done
-
-                  if [[ "$is_allowed_author" != "true" ]]; then
-                    echo "::error::PRs into main are restricted to: willsarg, theonlyhennygod. PR author: ${PR_AUTHOR}. Open this PR against dev instead."
-                    exit 1
-                  fi
-
                   if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
-                    echo "::error::PRs into main must originate from ${BASE_REPO}:dev. Current head repo: ${HEAD_REPO}."
+                    echo "::error::PRs into main must originate from ${BASE_REPO}:dev or ${BASE_REPO}:release/*. Current head repo: ${HEAD_REPO}."
                     exit 1
                   fi
 
-                  if [[ "$HEAD_REF" != "dev" ]]; then
-                    echo "::error::PRs into main must use head branch 'dev'. Current head branch: ${HEAD_REF}."
+                  if [[ "$HEAD_REF" != "dev" && ! "$HEAD_REF" =~ ^release/ ]]; then
+                    echo "::error::PRs into main must use head branch 'dev' or 'release/*'. Current head branch: ${HEAD_REF}."
                     exit 1
+                  fi
+
+                  # Keep strict author allowlist for dev -> main, but allow release/* promotion from same repo.
+                  if [[ "$HEAD_REF" == "dev" ]]; then
+                    is_allowed_author=false
+                    for allowed in "${allowed_authors[@]}"; do
+                      if [[ "$pr_author_lc" == "$allowed" ]]; then
+                        is_allowed_author=true
+                        break
+                      fi
+                    done
+
+                    if [[ "$is_allowed_author" != "true" ]]; then
+                      echo "::error::dev -> main PRs are restricted to: willsarg, theonlyhennygod. PR author: ${PR_AUTHOR}."
+                      exit 1
+                    fi
                   fi
 
                   echo "Promotion policy satisfied: author=${PR_AUTHOR}, source=${HEAD_REPO}:${HEAD_REF} -> main"
