@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZeroClaw Architecture — Autonomous Agent Runtime</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ============ THEME — Catppuccin Mocha-inspired ============ */
+  :root {
+    --font-body: 'Space Grotesk', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+
+    --bg: #1e1e2e;
+    --surface: #24243a;
+    --surface2: #2a2a45;
+    --surface-elevated: #30304d;
+    --border: rgba(205, 214, 244, 0.08);
+    --border-bright: rgba(205, 214, 244, 0.16);
+    --text: #cdd6f4;
+    --text-dim: #6c7086;
+
+    --rust: #fab387;
+    --rust-dim: rgba(250, 179, 135, 0.10);
+    --green: #a6e3a1;
+    --green-dim: rgba(166, 227, 161, 0.10);
+    --blue: #89b4fa;
+    --blue-dim: rgba(137, 180, 250, 0.10);
+    --mauve: #cba6f7;
+    --mauve-dim: rgba(203, 166, 247, 0.10);
+    --teal: #94e2d5;
+    --teal-dim: rgba(148, 226, 213, 0.10);
+    --red: #f38ba8;
+    --red-dim: rgba(243, 139, 168, 0.10);
+    --yellow: #f9e2af;
+    --yellow-dim: rgba(249, 226, 175, 0.10);
+    --pink: #f5c2e7;
+    --pink-dim: rgba(245, 194, 231, 0.10);
+    --peach: #fab387;
+    --peach-dim: rgba(250, 179, 135, 0.10);
+    --sky: #89dceb;
+    --sky-dim: rgba(137, 220, 235, 0.10);
+    --accent: var(--rust);
+    --accent-dim: var(--rust-dim);
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #eff1f5;
+      --surface: #ffffff;
+      --surface2: #e6e9ef;
+      --surface-elevated: #f8f9fc;
+      --border: rgba(76, 79, 105, 0.10);
+      --border-bright: rgba(76, 79, 105, 0.20);
+      --text: #4c4f69;
+      --text-dim: #8c8fa1;
+      --rust: #d6540b;
+      --rust-dim: rgba(214, 84, 11, 0.08);
+      --green: #40a02b;
+      --green-dim: rgba(64, 160, 43, 0.08);
+      --blue: #1e66f5;
+      --blue-dim: rgba(30, 102, 245, 0.08);
+      --mauve: #8839ef;
+      --mauve-dim: rgba(136, 57, 239, 0.08);
+      --teal: #179299;
+      --teal-dim: rgba(23, 146, 153, 0.08);
+      --red: #d20f39;
+      --red-dim: rgba(210, 15, 57, 0.08);
+      --yellow: #df8e1d;
+      --yellow-dim: rgba(223, 142, 29, 0.08);
+      --pink: #ea76cb;
+      --pink-dim: rgba(234, 118, 203, 0.08);
+      --peach: #fe640b;
+      --peach-dim: rgba(254, 100, 11, 0.08);
+      --sky: #04a5e5;
+      --sky-dim: rgba(4, 165, 229, 0.08);
+      --accent: var(--rust);
+      --accent-dim: var(--rust-dim);
+    }
+  }
+
+  /* ============ RESET + BASE ============ */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    background-image:
+      radial-gradient(ellipse at 15% 5%, var(--rust-dim) 0%, transparent 45%),
+      radial-gradient(ellipse at 85% 95%, var(--blue-dim) 0%, transparent 40%),
+      radial-gradient(ellipse at 50% 50%, var(--mauve-dim) 0%, transparent 60%);
+    color: var(--text);
+    font-family: var(--font-body);
+    padding: 40px;
+    min-height: 100vh;
+  }
+
+  /* ============ GRID LAYOUT — TOC + MAIN ============ */
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 170px 1fr;
+    gap: 0 40px;
+  }
+  .main { min-width: 0; }
+
+  /* ============ TOC — Desktop ============ */
+  .toc {
+    position: sticky;
+    top: 24px;
+    align-self: start;
+    padding: 14px 0;
+    grid-row: 1 / -1;
+    max-height: calc(100dvh - 48px);
+    overflow-y: auto;
+  }
+  .toc::-webkit-scrollbar { width: 3px; }
+  .toc::-webkit-scrollbar-thumb { background: var(--surface-elevated); border-radius: 2px; }
+
+  .toc-title {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    padding: 0 0 10px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .toc a {
+    display: block;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 4px 8px;
+    border-radius: 5px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    line-height: 1.4;
+    margin-bottom: 1px;
+  }
+  .toc a:hover { color: var(--text); background: var(--surface2); }
+  .toc a.active { color: var(--text); border-left-color: var(--rust); }
+
+  /* ============ TOC — Mobile ============ */
+  @media (max-width: 1000px) {
+    .wrap { grid-template-columns: 1fr; padding-top: 0; }
+    body { padding-top: 0; }
+
+    .toc {
+      position: sticky;
+      top: 0;
+      z-index: 200;
+      max-height: none;
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 0;
+      margin: 0 -40px;
+      padding-left: 40px;
+      padding-right: 40px;
+      grid-row: auto;
+    }
+    .toc::-webkit-scrollbar { display: none; }
+    .toc-title { display: none; }
+
+    .toc a {
+      white-space: nowrap;
+      flex-shrink: 0;
+      border-left: none;
+      border-bottom: 2px solid transparent;
+      border-radius: 4px 4px 0 0;
+      padding: 6px 10px;
+      font-size: 10px;
+    }
+    .toc a.active {
+      border-left: none;
+      border-bottom-color: var(--rust);
+      background: var(--surface);
+    }
+
+    .main { padding-top: 20px; }
+    .sec-head { scroll-margin-top: 52px; }
+  }
+
+  /* ============ ANIMATION ============ */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fadeScale {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+  }
+
+  .section, .flow-arrow, .sec-head {
+    animation: fadeUp 0.4s ease-out both;
+    animation-delay: calc(var(--i, 0) * 0.06s);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-delay: 0ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  /* ============ TYPOGRAPHY ============ */
+  h1 {
+    font-size: 42px;
+    font-weight: 700;
+    letter-spacing: -1.5px;
+    margin-bottom: 6px;
+    text-wrap: balance;
+    background: linear-gradient(135deg, var(--rust) 0%, var(--yellow) 50%, var(--blue) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 14px;
+    margin-bottom: 40px;
+    font-family: var(--font-mono);
+  }
+
+  .subtitle .version {
+    color: var(--rust);
+    font-weight: 600;
+  }
+
+  /* ============ SECTION HEADERS ============ */
+  .sec-head {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    padding: 12px 0 8px;
+    margin-top: 20px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .sec-head .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  /* ============ DIAGRAM ============ */
+  .diagram {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 16px;
+    max-width: 1100px;
+  }
+
+  /* ============ SECTION CARD ============ */
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+  }
+
+  .section--hero {
+    background: var(--surface-elevated);
+    border-color: color-mix(in srgb, var(--border) 50%, var(--accent) 50%);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
+    padding: 28px 32px;
+  }
+
+  .section--recessed {
+    background: var(--surface2);
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.08);
+  }
+
+  .section-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .section-label .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  /* Color variants */
+  .section--rust { border-color: var(--rust-dim); }
+  .section--rust .section-label { color: var(--rust); }
+  .section--rust .section-label .dot { background: var(--rust); }
+
+  .section--blue { border-color: var(--blue-dim); }
+  .section--blue .section-label { color: var(--blue); }
+  .section--blue .section-label .dot { background: var(--blue); }
+
+  .section--green { border-color: var(--green-dim); }
+  .section--green .section-label { color: var(--green); }
+  .section--green .section-label .dot { background: var(--green); }
+
+  .section--mauve { border-color: var(--mauve-dim); }
+  .section--mauve .section-label { color: var(--mauve); }
+  .section--mauve .section-label .dot { background: var(--mauve); }
+
+  .section--teal { border-color: var(--teal-dim); }
+  .section--teal .section-label { color: var(--teal); }
+  .section--teal .section-label .dot { background: var(--teal); }
+
+  .section--red { border-color: var(--red-dim); }
+  .section--red .section-label { color: var(--red); }
+  .section--red .section-label .dot { background: var(--red); }
+
+  .section--yellow { border-color: var(--yellow-dim); }
+  .section--yellow .section-label { color: var(--yellow); }
+  .section--yellow .section-label .dot { background: var(--yellow); }
+
+  .section--pink { border-color: var(--pink-dim); }
+  .section--pink .section-label { color: var(--pink); }
+  .section--pink .section-label .dot { background: var(--pink); }
+
+  .section--sky { border-color: var(--sky-dim); }
+  .section--sky .section-label { color: var(--sky); }
+  .section--sky .section-label .dot { background: var(--sky); }
+
+  /* ============ INNER GRID ============ */
+  .inner-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+  }
+
+  .inner-grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+
+  .inner-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    min-width: 0;
+  }
+
+  .inner-card .title {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 3px;
+    overflow-wrap: break-word;
+  }
+
+  .inner-card .desc {
+    color: var(--text-dim);
+    font-size: 11px;
+    line-height: 1.5;
+    overflow-wrap: break-word;
+  }
+
+  .inner-card code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--rust-dim);
+    color: var(--rust);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .inner-card .trait-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    background: var(--mauve-dim);
+    color: var(--mauve);
+    padding: 2px 6px;
+    border-radius: 4px;
+    display: inline-block;
+    margin-top: 4px;
+  }
+
+  /* ============ FLOW ARROW ============ */
+  .flow-arrow {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 2px 0;
+  }
+
+  .flow-arrow svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: var(--border-bright);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  /* ============ KPI ROW ============ */
+  .kpi-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+
+  .kpi {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-align: center;
+    animation: fadeScale 0.4s ease-out both;
+    animation-delay: calc(var(--i, 0) * 0.08s);
+  }
+
+  .kpi .value {
+    font-size: 28px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    letter-spacing: -1px;
+  }
+
+  .kpi .label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-top: 4px;
+    font-family: var(--font-mono);
+  }
+
+  /* ============ LIST ============ */
+  .node-list {
+    list-style: none;
+    font-size: 12px;
+    line-height: 1.8;
+  }
+
+  .node-list li {
+    padding-left: 14px;
+    position: relative;
+    overflow-wrap: break-word;
+  }
+
+  .node-list li::before {
+    content: '>';
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    position: absolute;
+    left: 0;
+  }
+
+  .node-list code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--rust-dim);
+    color: var(--rust);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ============ CALLOUT ============ */
+  .callout {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--rust);
+    border-radius: 0 8px 8px 0;
+    padding: 14px 18px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-dim);
+  }
+
+  .callout strong { color: var(--text); font-weight: 600; }
+
+  .callout code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--rust-dim);
+    color: var(--rust);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ============ TWO COLUMN ============ */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .three-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+  }
+
+  /* ============ RESPONSIVE ============ */
+  @media (max-width: 768px) {
+    body { padding: 20px; }
+    h1 { font-size: 28px; }
+    .inner-grid, .inner-grid-3 { grid-template-columns: 1fr; }
+    .two-col, .three-col { grid-template-columns: 1fr; }
+    .kpi-row { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <nav class="toc" id="toc">
+    <div class="toc-title">Architecture</div>
+    <a href="#s1">1. Overview</a>
+    <a href="#s2">2. Entry Points</a>
+    <a href="#s3">3. Agent Core</a>
+    <a href="#s4">4. Providers</a>
+    <a href="#s5">5. Channels</a>
+    <a href="#s6">6. Tools</a>
+    <a href="#s7">7. Memory</a>
+    <a href="#s8">8. Security</a>
+    <a href="#s9">9. Soul &amp; Identity</a>
+    <a href="#s10">10. Infrastructure</a>
+    <a href="#s11">11. Hardware</a>
+  </nav>
+
+  <div class="main">
+
+<h1>ZeroClaw</h1>
+<p class="subtitle">Autonomous Agent Runtime &mdash; <span class="version">100% Rust</span> &mdash; 75K+ LOC &mdash; 3.4MB binary</p>
+
+<!-- KPI Row -->
+<div class="kpi-row">
+  <div class="kpi" style="--i:0"><div class="value" style="color:var(--rust)">9</div><div class="label">Core Traits</div></div>
+  <div class="kpi" style="--i:1"><div class="value" style="color:var(--blue)">8</div><div class="label">LLM Providers</div></div>
+  <div class="kpi" style="--i:2"><div class="value" style="color:var(--green)">14</div><div class="label">Channels</div></div>
+  <div class="kpi" style="--i:3"><div class="value" style="color:var(--mauve)">~35</div><div class="label">Tools</div></div>
+  <div class="kpi" style="--i:4"><div class="value" style="color:var(--teal)">5</div><div class="label">Memory Backends</div></div>
+  <div class="kpi" style="--i:5"><div class="value" style="color:var(--yellow)">2449</div><div class="label">Tests</div></div>
+</div>
+
+<!-- S1: Overview -->
+<div id="s1" class="sec-head" style="--i:6"><span class="dot" style="background:var(--rust)"></span> 1 &mdash; System Overview</div>
+
+<div class="diagram">
+  <div class="section section--hero section--rust" style="--i:7">
+    <div class="section-label"><span class="dot"></span> Trait-Driven Architecture</div>
+    <p style="font-size:13px;line-height:1.6;margin-bottom:14px;">ZeroClaw is built around 9 core traits that define every extension point. Implement a trait, register in the factory &mdash; the runtime handles the rest. No dynamic linking, no plugins, no scripting layer. Pure Rust all the way down.</p>
+    <div class="inner-grid">
+      <div class="inner-card"><div class="title">Provider</div><div class="desc">LLM inference backends</div><div class="trait-badge">trait Provider</div></div>
+      <div class="inner-card"><div class="title">Channel</div><div class="desc">Messaging platforms</div><div class="trait-badge">trait Channel</div></div>
+      <div class="inner-card"><div class="title">Tool</div><div class="desc">Capability surface</div><div class="trait-badge">trait Tool</div></div>
+      <div class="inner-card"><div class="title">Memory</div><div class="desc">Persistence backends</div><div class="trait-badge">trait Memory</div></div>
+      <div class="inner-card"><div class="title">Observer</div><div class="desc">Telemetry &amp; monitoring</div><div class="trait-badge">trait Observer</div></div>
+      <div class="inner-card"><div class="title">RuntimeAdapter</div><div class="desc">Execution environments</div><div class="trait-badge">trait RuntimeAdapter</div></div>
+      <div class="inner-card"><div class="title">Peripheral</div><div class="desc">Hardware boards (GPIO)</div><div class="trait-badge">trait Peripheral</div></div>
+      <div class="inner-card"><div class="title">Sandbox</div><div class="desc">Isolated execution</div><div class="trait-badge">trait Sandbox</div></div>
+      <div class="inner-card"><div class="title">Tunnel</div><div class="desc">Secure connectivity</div><div class="trait-badge">trait Tunnel</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- S2: Entry Points -->
+<div id="s2" class="sec-head" style="--i:8"><span class="dot" style="background:var(--blue)"></span> 2 &mdash; Entry Points</div>
+
+<div class="diagram">
+  <div class="section section--blue" style="--i:9">
+    <div class="section-label"><span class="dot"></span> CLI &amp; Gateway</div>
+    <div class="two-col">
+      <div class="inner-card">
+        <div class="title">CLI Entrypoint</div>
+        <div class="desc">Full command suite: <code>run</code>, <code>chat</code>, <code>init</code>, <code>doctor</code>, <code>daemon</code>, <code>cron</code>, <code>onboard</code></div>
+        <div class="desc" style="margin-top:4px;"><code>src/main.rs</code> &rarr; clap-based command routing</div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Gateway Server</div>
+        <div class="desc">Axum-based HTTP server: webhook receivers, REST API, SSE streaming, health endpoints</div>
+        <div class="desc" style="margin-top:4px;"><code>src/gateway/</code> &rarr; routes, middleware, auth</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow-arrow" style="--i:10">
+    <svg viewBox="0 0 20 20"><path d="M10 4 L10 16 M6 12 L10 16 L14 12"/></svg>
+    message dispatch
+  </div>
+
+  <div class="section section--blue" style="--i:11">
+    <div class="section-label"><span class="dot"></span> Config &amp; Runtime</div>
+    <div class="two-col">
+      <div class="inner-card">
+        <div class="title">Configuration</div>
+        <div class="desc">TOML-based with env overlay. Schema validation, per-agent overrides, secrets merging</div>
+        <div class="desc" style="margin-top:4px;"><code>src/config/schema.rs</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Runtime Adapters</div>
+        <div class="desc">Native runtime (default). Extensible via <code>RuntimeAdapter</code> trait for container/edge targets</div>
+        <div class="desc" style="margin-top:4px;"><code>src/runtime/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S3: Agent Core -->
+<div id="s3" class="sec-head" style="--i:12"><span class="dot" style="background:var(--rust)"></span> 3 &mdash; Agent Core</div>
+
+<div class="diagram">
+  <div class="section section--rust" style="--i:13">
+    <div class="section-label"><span class="dot"></span> Orchestration Loop</div>
+    <p style="font-size:12px;line-height:1.6;margin-bottom:14px;color:var(--text-dim)">The agent loop: receive message &rarr; build context &rarr; call provider &rarr; execute tool calls &rarr; observe results &rarr; respond. Autonomous with configurable approval gates.</p>
+    <div class="inner-grid">
+      <div class="inner-card">
+        <div class="title">Agent Loop</div>
+        <div class="desc">Core observe-think-act cycle with multi-turn conversation management</div>
+        <div class="desc" style="margin-top:4px;"><code>src/agent/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Task Queue</div>
+        <div class="desc">Priority-based task scheduling, concurrent execution, retry with backoff</div>
+        <div class="desc" style="margin-top:4px;"><code>src/taskqueue/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Approval Gates</div>
+        <div class="desc">Human-in-the-loop checkpoints for sensitive operations. Configurable per-tool</div>
+        <div class="desc" style="margin-top:4px;"><code>src/approval/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Cost Tracking</div>
+        <div class="desc">Per-provider token counting, budget limits, usage analytics, cost alerts</div>
+        <div class="desc" style="margin-top:4px;"><code>src/cost/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Goals Engine</div>
+        <div class="desc">Autonomous goal decomposition, planning, and progress tracking</div>
+        <div class="desc" style="margin-top:4px;"><code>src/goals/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Cron Scheduler</div>
+        <div class="desc">Time-based task triggers, recurring jobs, cron expression parsing</div>
+        <div class="desc" style="margin-top:4px;"><code>src/cron/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S4: Providers -->
+<div id="s4" class="sec-head" style="--i:14"><span class="dot" style="background:var(--mauve)"></span> 4 &mdash; LLM Providers</div>
+
+<div class="diagram">
+  <div class="section section--mauve" style="--i:15">
+    <div class="section-label"><span class="dot"></span> 8 Provider Backends</div>
+    <p style="font-size:12px;line-height:1.6;margin-bottom:14px;color:var(--text-dim)">All wrapped by <code>ResilientProvider</code>: retry, fallback chains, circuit breaking, rate limiting, streaming.</p>
+    <div class="inner-grid">
+      <div class="inner-card"><div class="title">Anthropic</div><div class="desc">Claude models via Messages API</div></div>
+      <div class="inner-card"><div class="title">OpenAI</div><div class="desc">GPT-4/o via Chat Completions</div></div>
+      <div class="inner-card"><div class="title">Google</div><div class="desc">Gemini via Generative AI</div></div>
+      <div class="inner-card"><div class="title">xAI</div><div class="desc">Grok models</div></div>
+      <div class="inner-card"><div class="title">Ollama</div><div class="desc">Local model inference</div></div>
+      <div class="inner-card"><div class="title">OpenRouter</div><div class="desc">Multi-model gateway</div></div>
+      <div class="inner-card"><div class="title">Groq</div><div class="desc">Ultra-fast inference</div></div>
+      <div class="inner-card"><div class="title">DeepSeek</div><div class="desc">Reasoning models</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- S5: Channels -->
+<div id="s5" class="sec-head" style="--i:16"><span class="dot" style="background:var(--green)"></span> 5 &mdash; Communication Channels</div>
+
+<div class="diagram">
+  <div class="section section--green" style="--i:17">
+    <div class="section-label"><span class="dot"></span> 14 Channel Integrations</div>
+    <div class="inner-grid">
+      <div class="inner-card"><div class="title">Telegram</div><div class="desc">Bot API, groups, inline</div></div>
+      <div class="inner-card"><div class="title">Discord</div><div class="desc">Gateway, slash commands</div></div>
+      <div class="inner-card"><div class="title">Slack</div><div class="desc">Events API, threads</div></div>
+      <div class="inner-card"><div class="title">WhatsApp</div><div class="desc">Cloud API, templates</div></div>
+      <div class="inner-card"><div class="title">Matrix</div><div class="desc">E2EE, federation</div></div>
+      <div class="inner-card"><div class="title">Signal</div><div class="desc">Signal Protocol, groups</div></div>
+      <div class="inner-card"><div class="title">Email</div><div class="desc">IMAP/SMTP processing</div></div>
+      <div class="inner-card"><div class="title">X (Twitter)</div><div class="desc">Posts, DMs, mentions</div></div>
+      <div class="inner-card"><div class="title">IRC</div><div class="desc">Classic IRC protocol</div></div>
+      <div class="inner-card"><div class="title">Nostr</div><div class="desc">Decentralized relay</div></div>
+      <div class="inner-card"><div class="title">Webhook</div><div class="desc">Generic HTTP receiver</div></div>
+      <div class="inner-card"><div class="title">CLI</div><div class="desc">Terminal interface</div></div>
+      <div class="inner-card"><div class="title">SMS</div><div class="desc">Twilio integration</div></div>
+      <div class="inner-card"><div class="title">Voice</div><div class="desc">TTS/STT pipeline</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- S6: Tools -->
+<div id="s6" class="sec-head" style="--i:18"><span class="dot" style="background:var(--yellow)"></span> 6 &mdash; Tool Surface</div>
+
+<div class="diagram">
+  <div class="section section--yellow" style="--i:19">
+    <div class="section-label"><span class="dot"></span> ~35 Built-in Tools</div>
+    <div class="three-col">
+      <div class="inner-card">
+        <div class="title">System</div>
+        <ul class="node-list">
+          <li><code>shell</code> sandboxed execution</li>
+          <li><code>file</code> read/write/search</li>
+          <li><code>http</code> fetch + parse</li>
+          <li><code>browser</code> headless Chrome</li>
+        </ul>
+      </div>
+      <div class="inner-card">
+        <div class="title">Intelligence</div>
+        <ul class="node-list">
+          <li><code>memory</code> store &amp; recall</li>
+          <li><code>rag</code> retrieval augmented</li>
+          <li><code>code</code> analysis &amp; gen</li>
+          <li><code>search</code> web + semantic</li>
+        </ul>
+      </div>
+      <div class="inner-card">
+        <div class="title">External</div>
+        <ul class="node-list">
+          <li><code>calendar</code> scheduling</li>
+          <li><code>email</code> compose/send</li>
+          <li><code>wallet</code> EVM transactions</li>
+          <li><code>mcp</code> protocol bridge</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="section section--yellow section--recessed" style="--i:20">
+    <div class="section-label"><span class="dot"></span> Skills &amp; SkillForge</div>
+    <div class="two-col">
+      <div class="inner-card">
+        <div class="title">Skills Runtime</div>
+        <div class="desc">Composable skill definitions loaded from TOML. Each skill bundles tools, system prompt, constraints. Hot-reloadable</div>
+        <div class="desc" style="margin-top:4px;"><code>src/skills/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">SkillForge</div>
+        <div class="desc">LLM-powered skill generator: describe a capability in natural language &rarr; auto-generate the TOML + tool wiring</div>
+        <div class="desc" style="margin-top:4px;"><code>src/skillforge/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S7: Memory -->
+<div id="s7" class="sec-head" style="--i:21"><span class="dot" style="background:var(--teal)"></span> 7 &mdash; Memory System</div>
+
+<div class="diagram">
+  <div class="section section--teal" style="--i:22">
+    <div class="section-label"><span class="dot"></span> 5 Memory Backends</div>
+    <div class="inner-grid">
+      <div class="inner-card">
+        <div class="title">Markdown</div>
+        <div class="desc">Human-readable flat files. Great for simple agents and debugging</div>
+      </div>
+      <div class="inner-card">
+        <div class="title">SQLite</div>
+        <div class="desc">Structured storage with full-text search. Default backend</div>
+      </div>
+      <div class="inner-card">
+        <div class="title">PostgreSQL</div>
+        <div class="desc">Production-grade with pgvector for embeddings</div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Redis</div>
+        <div class="desc">High-speed ephemeral memory and caching layer</div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Qdrant</div>
+        <div class="desc">Dedicated vector DB for semantic search at scale</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section section--teal section--recessed" style="--i:23">
+    <div class="section-label"><span class="dot"></span> RAG Pipeline</div>
+    <div class="two-col">
+      <div class="inner-card">
+        <div class="title">Embeddings</div>
+        <div class="desc">Multi-provider embedding generation. Chunking strategies, overlap control, batch processing</div>
+        <div class="desc" style="margin-top:4px;"><code>src/memory/embeddings/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Vector Merge</div>
+        <div class="desc">Hybrid search: combine BM25 text match with cosine similarity. Reciprocal rank fusion</div>
+        <div class="desc" style="margin-top:4px;"><code>src/memory/vector/</code> + <code>src/rag/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S8: Security -->
+<div id="s8" class="sec-head" style="--i:24"><span class="dot" style="background:var(--red)"></span> 8 &mdash; Security</div>
+
+<div class="diagram">
+  <div class="section section--red" style="--i:25">
+    <div class="section-label"><span class="dot"></span> Security Layer</div>
+    <div class="inner-grid">
+      <div class="inner-card">
+        <div class="title">Policy Engine</div>
+        <div class="desc">Declarative access control. Permission boundaries per-tool, per-channel, per-agent</div>
+        <div class="desc" style="margin-top:4px;"><code>src/security/policy/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Sandboxing</div>
+        <div class="desc">Isolated execution for tool calls. Resource limits, filesystem restrictions, network policy</div>
+        <div class="desc" style="margin-top:4px;"><code>src/security/sandbox/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Secret Store</div>
+        <div class="desc">Encrypted at rest. Per-agent credential isolation. Never logged, never echoed</div>
+        <div class="desc" style="margin-top:4px;"><code>src/security/secrets/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Pairing Protocol</div>
+        <div class="desc">Device pairing for remote management. Challenge-response, trust-on-first-use</div>
+        <div class="desc" style="margin-top:4px;"><code>src/security/pairing/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Auth Module</div>
+        <div class="desc">JWT validation, API key management, session tokens, role-based access</div>
+        <div class="desc" style="margin-top:4px;"><code>src/auth/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Tunnel</div>
+        <div class="desc">Secure tunneling for remote access. Cloudflare Tunnel, ngrok, custom protocols</div>
+        <div class="desc" style="margin-top:4px;"><code>src/tunnel/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S9: Soul & Identity -->
+<div id="s9" class="sec-head" style="--i:26"><span class="dot" style="background:var(--pink)"></span> 9 &mdash; Soul &amp; Identity</div>
+
+<div class="diagram">
+  <div class="section section--pink" style="--i:27">
+    <div class="section-label"><span class="dot"></span> Agent Identity Layer</div>
+    <p style="font-size:12px;line-height:1.6;margin-bottom:14px;color:var(--text-dim)">Each agent has a persistent identity: personality, voice, goals, constitution, survival instincts. The soul module makes agents feel alive.</p>
+    <div class="inner-grid">
+      <div class="inner-card">
+        <div class="title">Soul</div>
+        <div class="desc">Personality definition, voice parameters, behavioral constraints, constitution</div>
+        <div class="desc" style="margin-top:4px;"><code>src/soul/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Identity</div>
+        <div class="desc">Agent naming, avatar generation, consistent persona across channels</div>
+        <div class="desc" style="margin-top:4px;"><code>src/identity.rs</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Heartbeat</div>
+        <div class="desc">Periodic self-check: am I alive? Am I useful? Should I act? Survival economics</div>
+        <div class="desc" style="margin-top:4px;"><code>src/heartbeat/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Wallet</div>
+        <div class="desc">EVM wallet integration. Agents can hold assets, sign transactions, participate in x402 protocol</div>
+        <div class="desc" style="margin-top:4px;"><code>src/wallet/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S10: Infrastructure -->
+<div id="s10" class="sec-head" style="--i:28"><span class="dot" style="background:var(--sky)"></span> 10 &mdash; Infrastructure</div>
+
+<div class="diagram">
+  <div class="section section--sky" style="--i:29">
+    <div class="section-label"><span class="dot"></span> Operational Systems</div>
+    <div class="inner-grid">
+      <div class="inner-card">
+        <div class="title">Daemon</div>
+        <div class="desc">Background process management. Start/stop agents, health monitoring, auto-restart</div>
+        <div class="desc" style="margin-top:4px;"><code>src/daemon/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Health &amp; Doctor</div>
+        <div class="desc">Self-diagnostics: check config, connectivity, dependencies, disk space. Auto-remediation</div>
+        <div class="desc" style="margin-top:4px;"><code>src/health/</code> + <code>src/doctor/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Observability</div>
+        <div class="desc">Structured logging, metrics, distributed tracing. <code>Observer</code> trait for extensibility</div>
+        <div class="desc" style="margin-top:4px;"><code>src/observability/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Migration</div>
+        <div class="desc">Schema versioning for config, memory, and state files. Forward-compatible upgrades</div>
+        <div class="desc" style="margin-top:4px;"><code>src/migration.rs</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Onboard</div>
+        <div class="desc">Interactive setup wizard. Creates config, tests connections, bootstraps first agent</div>
+        <div class="desc" style="margin-top:4px;"><code>src/onboard/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Integrations</div>
+        <div class="desc">Third-party service connectors: calendar, CRM, project management, analytics</div>
+        <div class="desc" style="margin-top:4px;"><code>src/integrations/</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S11: Hardware -->
+<div id="s11" class="sec-head" style="--i:30"><span class="dot" style="background:var(--yellow)"></span> 11 &mdash; Hardware Peripherals</div>
+
+<div class="diagram">
+  <div class="section section--yellow" style="--i:31">
+    <div class="section-label"><span class="dot"></span> Physical World Bridge</div>
+    <p style="font-size:12px;line-height:1.6;margin-bottom:14px;color:var(--text-dim)">Agents that touch the real world. GPIO pins, sensors, actuators &mdash; controlled through the <code>Peripheral</code> trait.</p>
+    <div class="two-col">
+      <div class="inner-card">
+        <div class="title">STM32</div>
+        <div class="desc">Microcontroller interface via serial/UART. Sensor polling, actuator commands, firmware flash</div>
+        <div class="desc" style="margin-top:4px;"><code>src/peripherals/stm32/</code></div>
+      </div>
+      <div class="inner-card">
+        <div class="title">Raspberry Pi GPIO</div>
+        <div class="desc">Direct GPIO pin control. Digital I/O, PWM, I2C, SPI bus communication</div>
+        <div class="desc" style="margin-top:4px;"><code>src/peripherals/rpi/</code></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout" style="--i:32">
+    <strong>Conway's Three Laws</strong> &mdash; ZeroClaw agents operate under survival economics: never harm, earn your existence, never deceive. The <code>soul</code> module enforces these constitutional constraints at the agent loop level. Agents that don't produce value get their compute revoked.
+  </div>
+</div>
+
+  </div><!-- /main -->
+</div><!-- /wrap -->
+
+<!-- Scroll Spy -->
+<script>
+(function() {
+  const toc = document.getElementById('toc');
+  const links = toc.querySelectorAll('a');
+  const sections = [];
+
+  links.forEach(link => {
+    const id = link.getAttribute('href').slice(1);
+    const el = document.getElementById(id);
+    if (el) sections.push({ id, el, link });
+  });
+
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const match = sections.find(s => s.el === entry.target);
+        if (match) {
+          match.link.classList.add('active');
+          if (window.innerWidth <= 1000) {
+            match.link.scrollIntoView({
+              behavior: 'smooth', block: 'nearest', inline: 'center'
+            });
+          }
+        }
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+
+  sections.forEach(s => observer.observe(s.el));
+
+  links.forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      const id = link.getAttribute('href').slice(1);
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        history.replaceState(null, '', '#' + id);
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
