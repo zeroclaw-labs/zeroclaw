@@ -1181,10 +1181,7 @@ fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
 
     let mut lines = Vec::new();
     for (key, spec) in props {
-        let type_str = spec
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("any");
+        let type_str = spec.get("type").and_then(|v| v.as_str()).unwrap_or("any");
         let desc = spec
             .get("description")
             .and_then(|v| v.as_str())

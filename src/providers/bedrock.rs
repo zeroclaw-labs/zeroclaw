@@ -654,9 +654,7 @@ impl BedrockProvider {
             .take_while(|m| m.role == "user")
             .flat_map(|m| m.content.iter())
             .filter_map(|b| match b {
-                ContentBlock::ToolResult(wrapper) => {
-                    Some(wrapper.tool_result.tool_use_id.as_str())
-                }
+                ContentBlock::ToolResult(wrapper) => Some(wrapper.tool_result.tool_use_id.as_str()),
                 _ => None,
             })
             .collect();
@@ -1673,9 +1671,8 @@ mod tests {
 
     #[test]
     fn parse_tool_result_accepts_alternate_id_fields() {
-        let msg = BedrockProvider::parse_tool_result_message(
-            r#"{"tool_use_id":"x","content":"ok"}"#,
-        );
+        let msg =
+            BedrockProvider::parse_tool_result_message(r#"{"tool_use_id":"x","content":"ok"}"#);
         assert!(msg.is_some());
         if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "x");

@@ -25,15 +25,15 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
-pub use response_cache::ResponseCache;
 pub use qdrant::QdrantMemory;
+pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use anyhow::Context;
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -55,7 +55,9 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(

@@ -4627,11 +4627,11 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
-    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
