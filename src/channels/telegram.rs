@@ -245,6 +245,23 @@ fn strip_tool_call_tags(message: &str) -> String {
     super::strip_tool_call_tags(message)
 }
 
+fn find_matching_close(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -259,12 +276,12 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
         let open = cursor + open_rel;
         cleaned.push_str(&message[cursor..open]);
 
-        let Some(close_rel) = message[open..].find(']') else {
+        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
             cleaned.push_str(&message[open..]);
             break;
         };
 
-        let close = open + close_rel;
+        let close = open + 1 + close_rel;
         let marker = &message[open + 1..close];
 
         let parsed = marker.split_once(':').and_then(|(kind, target)| {
@@ -3003,6 +3020,28 @@ mod tests {
         let (cleaned, attachments) = parse_attachment_markers(message);
 
         assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn parse_attachment_markers_handles_brackets_in_filename() {
+        let message = "Here it is [VIDEO:/mnt/clips/Butters - What What [G4PvTrTp7Tc].mp4]";
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(cleaned, "Here it is");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Video);
+        assert_eq!(
+            attachments[0].target,
+            "/mnt/clips/Butters - What What [G4PvTrTp7Tc].mp4"
+        );
+    }
+
+    #[test]
+    fn parse_attachment_markers_unclosed_bracket_falls_back_to_text() {
+        let message = "send [VIDEO:/path/file[broken.mp4";
+        let (cleaned, attachments) = parse_attachment_markers(message);
+        assert_eq!(cleaned, "send [VIDEO:/path/file[broken.mp4");
         assert!(attachments.is_empty());
     }
 
