@@ -33,7 +33,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
                 "offset": {
                     "type": "integer",
@@ -100,10 +100,10 @@ impl Tool for FileReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_path.display()
-                )),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_path),
+                ),
             });
         }
 
@@ -462,6 +462,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_read_outside_workspace_allowed_when_workspace_only_disabled() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_allowed_roots_hint");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let outside_file = outside.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(&outside_file, "outside").await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": outside_file.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("outside"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
     async fn file_read_nonexistent_consumes_rate_limit_budget() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -710,6 +743,7 @@ mod tests {
                         text: Some("done".into()),
                         tool_calls: vec![],
                         usage: None,
+                        reasoning_content: None,
                     });
                 }
                 Ok(guard.remove(0))
@@ -769,12 +803,14 @@ mod tests {
                     arguments: r#"{"path": "report.pdf"}"#.into(),
                 }],
                 usage: None,
+                reasoning_content: None,
             },
             // Turn 1 continued: provider sees tool result and answers
             ChatResponse {
                 text: Some("The PDF contains a greeting: Hello PDF".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
             },
         ]);
 
@@ -860,11 +896,13 @@ mod tests {
                     arguments: r#"{"path": "data.bin"}"#.into(),
                 }],
                 usage: None,
+                reasoning_content: None,
             },
             ChatResponse {
                 text: Some("The file appears to be binary data.".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning_content: None,
             },
         ]);
 
@@ -948,7 +986,8 @@ mod tests {
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
         // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
+        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
+            .expect("provider should initialize");
 
         let mut agent = Agent::builder()
             .provider(Box::new(provider) as Box<dyn Provider>)

@@ -141,6 +141,10 @@ impl HttpRequestTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
+        // 0 means unlimited — no truncation.
+        if self.max_response_size == 0 {
+            return text.to_string();
+        }
         if text.len() > self.max_response_size {
             let mut truncated = text
                 .chars()
@@ -377,6 +381,10 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.iter().any(|domain| domain == "*") {
+        return true;
+    }
+
     allowed_domains.iter().any(|domain| {
         host == domain
             || host
@@ -491,6 +499,22 @@ mod tests {
     fn validate_accepts_subdomain() {
         let tool = test_tool(vec!["example.com"]);
         assert!(tool.validate_url("https://api.example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_allowlist_for_public_host() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool.validate_url("https://news.ycombinator.com").is_ok());
+    }
+
+    #[test]
+    fn validate_wildcard_allowlist_still_rejects_private_host() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
     }
 
     #[test]
@@ -704,6 +728,32 @@ mod tests {
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
         assert!(truncated.len() <= 10 + 60); // limit + message
+        assert!(truncated.contains("[Response truncated"));
+    }
+
+    #[test]
+    fn truncate_response_zero_means_unlimited() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            0, // max_response_size = 0 means no limit
+            30,
+        );
+        let text = "a".repeat(10_000_000);
+        assert_eq!(tool.truncate_response(&text), text);
+    }
+
+    #[test]
+    fn truncate_response_nonzero_still_truncates() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            5,
+            30,
+        );
+        let text = "hello world";
+        let truncated = tool.truncate_response(text);
+        assert!(truncated.starts_with("hello"));
         assert!(truncated.contains("[Response truncated"));
     }
 

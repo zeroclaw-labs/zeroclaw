@@ -1,0 +1,55 @@
+name: Main Promotion Gate
+
+on:
+    pull_request:
+        branches: [main]
+
+concurrency:
+    group: main-promotion-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    enforce-dev-promotion:
+        name: Enforce Dev -> Main Promotion
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - name: Validate PR source branch
+              shell: bash
+              env:
+                  HEAD_REF: ${{ github.head_ref }}
+                  HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+                  BASE_REPO: ${{ github.repository }}
+                  PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+              run: |
+                  set -euo pipefail
+
+                  pr_author_lc="$(echo "${PR_AUTHOR}" | tr '[:upper:]' '[:lower:]')"
+                  allowed_authors=("willsarg" "theonlyhennygod")
+
+                  is_allowed_author=false
+                  for allowed in "${allowed_authors[@]}"; do
+                    if [[ "$pr_author_lc" == "$allowed" ]]; then
+                      is_allowed_author=true
+                      break
+                    fi
+                  done
+
+                  if [[ "$is_allowed_author" != "true" ]]; then
+                    echo "::error::PRs into main are restricted to: willsarg, theonlyhennygod. PR author: ${PR_AUTHOR}. Open this PR against dev instead."
+                    exit 1
+                  fi
+
+                  if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
+                    echo "::error::PRs into main must originate from ${BASE_REPO}:dev. Current head repo: ${HEAD_REPO}."
+                    exit 1
+                  fi
+
+                  if [[ "$HEAD_REF" != "dev" ]]; then
+                    echo "::error::PRs into main must use head branch 'dev'. Current head branch: ${HEAD_REF}."
+                    exit 1
+                  fi
+
+                  echo "Promotion policy satisfied: author=${PR_AUTHOR}, source=${HEAD_REPO}:${HEAD_REF} -> main"

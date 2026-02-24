@@ -1,0 +1,61 @@
+name: CI Build (Fast)
+
+# Optional fast release build that runs alongside the normal Build (Smoke) job.
+# This workflow is informational and does not gate merges.
+
+on:
+    push:
+        branches: [dev, main]
+    pull_request:
+        branches: [dev, main]
+
+concurrency:
+    group: ci-fast-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    changes:
+        name: Detect Change Scope
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        outputs:
+            rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            docs_only: ${{ steps.scope.outputs.docs_only }}
+            workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - name: Detect docs-only changes
+              id: scope
+              shell: bash
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+              run: ./scripts/ci/detect_change_scope.sh
+
+    build-fast:
+        name: Build (Fast)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true' || needs.changes.outputs.workflow_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  prefix-key: fast-build
+                  cache-targets: true
+
+            - name: Build release binary
+              run: cargo build --release --locked --verbose

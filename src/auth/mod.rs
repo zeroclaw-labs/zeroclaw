@@ -1,10 +1,12 @@
 pub mod anthropic_token;
+pub mod gemini_oauth;
+pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore,
+    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet,
 };
 use crate::config::Config;
 use anyhow::Result;
@@ -15,9 +17,12 @@ use std::time::{Duration, Instant};
 
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
+const GEMINI_PROVIDER: &str = "gemini";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
+const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
+const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -51,6 +56,21 @@ impl AuthService {
         set_active: bool,
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, profile_name, token_set);
+        profile.account_id = account_id;
+        self.store
+            .upsert_profile(profile.clone(), set_active)
+            .await?;
+        Ok(profile)
+    }
+
+    pub async fn store_gemini_tokens(
+        &self,
+        profile_name: &str,
+        token_set: crate::auth::profiles::TokenSet,
+        account_id: Option<String>,
+        set_active: bool,
+    ) -> Result<AuthProfile> {
+        let mut profile = AuthProfile::new_oauth(GEMINI_PROVIDER, profile_name, token_set);
         profile.account_id = account_id;
         self.store
             .upsert_profile(profile.clone(), set_active)
@@ -190,19 +210,20 @@ impl AuthService {
             );
         }
 
-        let mut refreshed = match refresh_access_token(&self.client, &refresh_token).await {
-            Ok(tokens) => {
-                clear_refresh_backoff(&profile_id);
-                tokens
-            }
-            Err(err) => {
-                set_refresh_backoff(
-                    &profile_id,
-                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                );
-                return Err(err);
-            }
-        };
+        let mut refreshed =
+            match refresh_openai_access_token_with_retries(&self.client, &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                    return Err(err);
+                }
+            };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -224,6 +245,106 @@ impl AuthService {
 
         Ok(updated.token_set.map(|t| t.access_token))
     }
+
+    /// Get a valid Gemini OAuth access token, refreshing if necessary.
+    ///
+    /// Returns `None` if no Gemini profile exists.
+    pub async fn get_valid_gemini_access_token(
+        &self,
+        profile_override: Option<&str>,
+    ) -> Result<Option<String>> {
+        let data = self.store.load().await?;
+        let Some(profile_id) = select_profile_id(&data, GEMINI_PROVIDER, profile_override) else {
+            return Ok(None);
+        };
+
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(token_set) = profile.token_set.as_ref() else {
+            anyhow::bail!("Gemini auth profile is not OAuth-based: {profile_id}");
+        };
+
+        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(token_set.access_token.clone()));
+        }
+
+        let Some(refresh_token) = token_set.refresh_token.clone() else {
+            return Ok(Some(token_set.access_token.clone()));
+        };
+
+        let refresh_lock = refresh_lock_for_profile(&profile_id);
+        let _guard = refresh_lock.lock().await;
+
+        // Re-load after waiting for lock to avoid duplicate refreshes.
+        let data = self.store.load().await?;
+        let Some(latest_profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
+            anyhow::bail!("Gemini auth profile is missing token set: {profile_id}");
+        };
+
+        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(latest_tokens.access_token.clone()));
+        }
+
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+
+        if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
+            anyhow::bail!(
+                "Gemini token refresh is in backoff for {remaining}s due to previous failures"
+            );
+        }
+
+        let mut refreshed =
+            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                    return Err(err);
+                }
+            };
+        if refreshed.refresh_token.is_none() {
+            refreshed
+                .refresh_token
+                .clone_from(&latest_tokens.refresh_token);
+        }
+
+        let account_id = refreshed
+            .id_token
+            .as_deref()
+            .and_then(gemini_oauth::extract_account_email_from_id_token)
+            .or_else(|| latest_profile.account_id.clone());
+
+        let updated = self
+            .store
+            .update_profile(&profile_id, |profile| {
+                profile.kind = AuthProfileKind::OAuth;
+                profile.token_set = Some(refreshed.clone());
+                profile.account_id.clone_from(&account_id);
+                Ok(())
+            })
+            .await?;
+
+        Ok(updated.token_set.map(|t| t.access_token))
+    }
+
+    /// Get Gemini profile info (for provider initialization).
+    pub async fn get_gemini_profile(
+        &self,
+        profile_override: Option<&str>,
+    ) -> Result<Option<AuthProfile>> {
+        self.get_profile(GEMINI_PROVIDER, profile_override).await
+    }
 }
 
 pub fn normalize_provider(provider: &str) -> Result<String> {
@@ -231,6 +352,7 @@ pub fn normalize_provider(provider: &str) -> Result<String> {
     match normalized.as_str() {
         "openai-codex" | "openai_codex" | "codex" => Ok(OPENAI_CODEX_PROVIDER.to_string()),
         "anthropic" | "claude" | "claude-code" => Ok(ANTHROPIC_PROVIDER.to_string()),
+        "gemini" | "google" | "vertex" => Ok(GEMINI_PROVIDER.to_string()),
         other if !other.is_empty() => Ok(other.to_string()),
         _ => anyhow::bail!("Provider name cannot be empty"),
     }
@@ -282,6 +404,70 @@ pub fn select_profile_id(
     data.profiles
         .iter()
         .find_map(|(id, profile)| (profile.provider == provider).then(|| id.clone()))
+}
+
+async fn refresh_openai_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
+        match refresh_access_token(client, refresh_token).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
+                    retry = should_retry,
+                    error = %err,
+                    "OpenAI token refresh failed"
+                );
+                last_error = Some(err);
+                if should_retry {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("OpenAI token refresh failed")))
+}
+
+async fn refresh_gemini_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
+        match gemini_oauth::refresh_access_token(client, refresh_token).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
+                    retry = should_retry,
+                    error = %err,
+                    "Gemini token refresh failed"
+                );
+                last_error = Some(err);
+                if should_retry {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini token refresh failed")))
 }
 
 fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {

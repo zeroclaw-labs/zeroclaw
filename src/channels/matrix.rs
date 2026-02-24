@@ -13,6 +13,7 @@ use matrix_sdk::{
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
@@ -26,6 +27,7 @@ pub struct MatrixChannel {
     allowed_users: Vec<String>,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
+    zeroclaw_dir: Option<PathBuf>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
     http_client: Client,
@@ -121,6 +123,26 @@ impl MatrixChannel {
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
     ) -> Self {
+        Self::new_with_session_hint_and_zeroclaw_dir(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            owner_hint,
+            device_id_hint,
+            None,
+        )
+    }
+
+    pub fn new_with_session_hint_and_zeroclaw_dir(
+        homeserver: String,
+        access_token: String,
+        room_id: String,
+        allowed_users: Vec<String>,
+        owner_hint: Option<String>,
+        device_id_hint: Option<String>,
+        zeroclaw_dir: Option<PathBuf>,
+    ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
         let room_id = room_id.trim().to_string();
@@ -137,6 +159,7 @@ impl MatrixChannel {
             allowed_users,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
+            zeroclaw_dir,
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
             http_client: Client::new(),
@@ -166,6 +189,12 @@ impl MatrixChannel {
 
     fn auth_header_value(&self) -> String {
         format!("Bearer {}", self.access_token)
+    }
+
+    fn matrix_store_dir(&self) -> Option<PathBuf> {
+        self.zeroclaw_dir
+            .as_ref()
+            .map(|dir| dir.join("state").join("matrix"))
     }
 
     fn is_user_allowed(&self, sender: &str) -> bool {
@@ -314,10 +343,19 @@ impl MatrixChannel {
                     }
                 };
 
-                let client = MatrixSdkClient::builder()
-                    .homeserver_url(&self.homeserver)
-                    .build()
-                    .await?;
+                let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
+
+                if let Some(store_dir) = self.matrix_store_dir() {
+                    tokio::fs::create_dir_all(&store_dir).await.map_err(|error| {
+                        anyhow::anyhow!(
+                            "Matrix failed to initialize persistent store directory at '{}': {error}",
+                            store_dir.display()
+                        )
+                    })?;
+                    client_builder = client_builder.sqlite_store(&store_dir, None);
+                }
+
+                let client = client_builder.build().await?;
 
                 let user_id: OwnedUserId = resolved_user_id.parse()?;
                 let session = MatrixSession {
@@ -742,6 +780,38 @@ mod tests {
 
         assert!(ch.session_owner_hint.is_none());
         assert!(ch.session_device_id_hint.is_none());
+    }
+
+    #[test]
+    fn matrix_store_dir_is_derived_from_zeroclaw_dir() {
+        let ch = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+            Some(PathBuf::from("/tmp/zeroclaw")),
+        );
+
+        assert_eq!(
+            ch.matrix_store_dir(),
+            Some(PathBuf::from("/tmp/zeroclaw/state/matrix"))
+        );
+    }
+
+    #[test]
+    fn matrix_store_dir_absent_without_zeroclaw_dir() {
+        let ch = MatrixChannel::new_with_session_hint(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+        );
+
+        assert!(ch.matrix_store_dir().is_none());
     }
 
     #[test]

@@ -1,0 +1,15 @@
+title = "ZeroClaw gitleaks configuration"
+
+[allowlist]
+description = "Known false positives in detector fixtures and documentation examples"
+paths = [
+  '''src/security/leak_detector\.rs''',
+  '''src/agent/loop_\.rs''',
+  '''src/security/secrets\.rs''',
+  '''docs/(i18n/vi/|vi/)?zai-glm-setup\.md''',
+  '''\.github/workflows/pub-release\.yml'''
+]
+regexes = [
+  '''Authorization: Bearer \$\{[^}]+\}''',
+  '''curl -sS -o /tmp/ghcr-release-manifest\.json -w "%\{http_code\}"'''
+]

@@ -141,6 +141,15 @@ enum ModelProbeOutcome {
     Error,
 }
 
+fn model_probe_status_label(outcome: ModelProbeOutcome) -> &'static str {
+    match outcome {
+        ModelProbeOutcome::Ok => "ok",
+        ModelProbeOutcome::Skipped => "skipped",
+        ModelProbeOutcome::AuthOrAccess => "auth/access",
+        ModelProbeOutcome::Error => "error",
+    }
+}
+
 fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     let lower = err_message.to_lowercase();
 
@@ -208,6 +217,7 @@ pub async fn run_models(
     let mut skipped_count = 0usize;
     let mut auth_count = 0usize;
     let mut error_count = 0usize;
+    let mut matrix_rows: Vec<(String, ModelProbeOutcome, Option<usize>, String)> = Vec::new();
 
     for provider_name in &targets {
         println!("  [{}]", provider_name);
@@ -216,6 +226,16 @@ pub async fn run_models(
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");
+                let models_count =
+                    crate::onboard::wizard::cached_model_catalog_stats(config, provider_name)
+                        .await?
+                        .map(|(count, _)| count);
+                matrix_rows.push((
+                    provider_name.clone(),
+                    ModelProbeOutcome::Ok,
+                    models_count,
+                    "catalog refreshed".to_string(),
+                ));
             }
             Err(error) => {
                 let error_text = format_error_chain(&error);
@@ -223,6 +243,12 @@ pub async fn run_models(
                     ModelProbeOutcome::Skipped => {
                         skipped_count += 1;
                         println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Skipped,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
                     }
                     ModelProbeOutcome::AuthOrAccess => {
                         auth_count += 1;
@@ -230,13 +256,31 @@ pub async fn run_models(
                             "    ⚠️  auth/access: {}",
                             truncate_for_display(&error_text, 160)
                         );
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::AuthOrAccess,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
                     }
                     ModelProbeOutcome::Error => {
                         error_count += 1;
                         println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Error,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
                     }
                     ModelProbeOutcome::Ok => {
                         ok_count += 1;
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Ok,
+                            None,
+                            "catalog refreshed".to_string(),
+                        ));
                     }
                 }
             }
@@ -250,6 +294,31 @@ pub async fn run_models(
         ok_count, skipped_count, auth_count, error_count
     );
 
+    if !matrix_rows.is_empty() {
+        println!();
+        println!("  Connectivity matrix:");
+        println!(
+            "  {:<18} {:<12} {:<8} detail",
+            "provider", "status", "models"
+        );
+        println!(
+            "  {:<18} {:<12} {:<8} ------",
+            "------------------", "------------", "--------"
+        );
+        for (provider, outcome, models_count, detail) in matrix_rows {
+            let models_text = models_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<18} {:<12} {:<8} {}",
+                provider,
+                model_probe_status_label(outcome),
+                models_text,
+                detail
+            );
+        }
+    }
+
     if auth_count > 0 {
         println!(
             "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
@@ -260,6 +329,88 @@ pub async fn run_models(
         anyhow::bail!("Model probe failed for target provider")
     }
 
+    Ok(())
+}
+
+pub fn run_traces(
+    config: &Config,
+    id: Option<&str>,
+    event_filter: Option<&str>,
+    contains: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let path = crate::observability::runtime_trace::resolve_trace_path(
+        &config.observability,
+        &config.workspace_dir,
+    );
+
+    if let Some(target_id) = id.map(str::trim).filter(|value| !value.is_empty()) {
+        match crate::observability::runtime_trace::find_event_by_id(&path, target_id)? {
+            Some(event) => {
+                println!("{}", serde_json::to_string_pretty(&event)?);
+            }
+            None => {
+                println!(
+                    "No runtime trace event found for id '{}' (path: {}).",
+                    target_id,
+                    path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if !path.exists() {
+        println!(
+            "Runtime trace file not found: {}.\n\
+             Enable [observability] runtime_trace_mode = \"rolling\" or \"full\", then reproduce the issue.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let safe_limit = limit.max(1);
+    let events = crate::observability::runtime_trace::load_events(
+        &path,
+        safe_limit,
+        event_filter,
+        contains,
+    )?;
+
+    if events.is_empty() {
+        println!(
+            "No runtime trace events matched query (path: {}).",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    println!("Runtime traces (newest first)");
+    println!("Path: {}", path.display());
+    println!(
+        "Filters: event={} contains={} limit={}",
+        event_filter.unwrap_or("*"),
+        contains.unwrap_or("*"),
+        safe_limit
+    );
+    println!();
+
+    for event in events {
+        let success = match event.success {
+            Some(true) => "ok",
+            Some(false) => "fail",
+            None => "-",
+        };
+        let message = event.message.unwrap_or_default();
+        let preview = truncate_for_display(&message, 80);
+        println!(
+            "- {} | {} | {} | {} | {}",
+            event.timestamp, event.id, event.event_type, success, preview
+        );
+    }
+
+    println!();
+    println!("Use `zeroclaw doctor traces --id <trace-id>` to inspect a full event payload.");
     Ok(())
 }
 
@@ -436,17 +587,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Channel: at least one configured
     let cc = &config.channels_config;
-    let has_channel = cc.telegram.is_some()
-        || cc.discord.is_some()
-        || cc.slack.is_some()
-        || cc.imessage.is_some()
-        || cc.matrix.is_some()
-        || cc.whatsapp.is_some()
-        || cc.nextcloud_talk.is_some()
-        || cc.email.is_some()
-        || cc.irc.is_some()
-        || cc.lark.is_some()
-        || cc.webhook.is_some();
+    let has_channel = cc.channels().iter().any(|(_, ok)| *ok);
 
     if has_channel {
         items.push(DiagItem::ok(cat, "at least one channel configured"));
@@ -1024,6 +1165,7 @@ mod tests {
             hint: "fast".into(),
             provider: "groq".into(),
             model: String::new(),
+            max_tokens: None,
             api_key: None,
         }];
         let mut items = Vec::new();

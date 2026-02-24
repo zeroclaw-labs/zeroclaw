@@ -36,7 +36,7 @@ impl Tool for FileEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
                 "old_string": {
                     "type": "string",
@@ -130,10 +130,10 @@ impl Tool for FileEditTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_parent.display()
-                )),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_parent),
+                ),
             });
         }
 

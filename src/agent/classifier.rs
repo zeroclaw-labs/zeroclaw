@@ -1,11 +1,26 @@
 use crate::config::schema::QueryClassificationConfig;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationDecision {
+    pub hint: String,
+    pub priority: i32,
+}
+
 /// Classify a user message against the configured rules and return the
 /// matching hint string, if any.
 ///
 /// Returns `None` when classification is disabled, no rules are configured,
 /// or no rule matches the message.
 pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<String> {
+    classify_with_decision(config, message).map(|decision| decision.hint)
+}
+
+/// Classify a user message and return the matched hint together with
+/// match metadata for observability.
+pub fn classify_with_decision(
+    config: &QueryClassificationConfig,
+    message: &str,
+) -> Option<ClassificationDecision> {
     if !config.enabled || config.rules.is_empty() {
         return None;
     }
@@ -40,7 +55,10 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
             .any(|pat: &String| message.contains(pat.as_str()));
 
         if keyword_hit || pattern_hit {
-            return Some(rule.hint.clone());
+            return Some(ClassificationDecision {
+                hint: rule.hint.clone(),
+                priority: rule.priority,
+            });
         }
     }
 
@@ -168,5 +186,31 @@ mod tests {
             }],
         );
         assert_eq!(classify(&config, "something completely different"), None);
+    }
+
+    #[test]
+    fn classify_with_decision_exposes_priority_of_matched_rule() {
+        let config = make_config(
+            true,
+            vec![
+                ClassificationRule {
+                    hint: "fast".into(),
+                    keywords: vec!["code".into()],
+                    priority: 3,
+                    ..Default::default()
+                },
+                ClassificationRule {
+                    hint: "code".into(),
+                    keywords: vec!["code".into()],
+                    priority: 10,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let decision = classify_with_decision(&config, "write code now")
+            .expect("classification decision expected");
+        assert_eq!(decision.hint, "code");
+        assert_eq!(decision.priority, 10);
     }
 }

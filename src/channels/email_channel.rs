@@ -69,6 +69,15 @@ pub struct EmailConfig {
     pub allowed_senders: Vec<String>,
 }
 
+impl crate::config::traits::ChannelConfig for EmailConfig {
+    fn name() -> &'static str {
+        "Email"
+    }
+    fn desc() -> &'static str {
+        "Email over IMAP/SMTP"
+    }
+}
+
 fn default_imap_port() -> u16 {
     993
 }

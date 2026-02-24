@@ -2,6 +2,7 @@ name: PR Labeler
 
 on:
     pull_request_target:
+        branches: [dev, main]
         types: [opened, reopened, synchronize, edited, labeled, unlabeled]
     workflow_dispatch:
         inputs:

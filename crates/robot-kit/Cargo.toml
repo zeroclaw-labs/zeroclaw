@@ -3,7 +3,7 @@ name = "zeroclaw-robot-kit"
 version = "0.1.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Robot control toolkit for ZeroClaw - drive, vision, speech, sensors, safety"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 readme = "README.md"
@@ -57,7 +57,7 @@ directories = "6.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # GPIO (Raspberry Pi only, optional)
-rppal = { version = "0.19", optional = true }
+rppal = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

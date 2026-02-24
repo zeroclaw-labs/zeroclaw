@@ -9,16 +9,27 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, SinkExt, StreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::header::{HeaderName, AUTHORIZATION},
+        http::HeaderValue as WsHeaderValue,
+        Message as WsMessage,
+    },
+};
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
+#[allow(clippy::struct_excessive_bools)]
 pub struct OpenAiCompatibleProvider {
     pub(crate) name: String,
     pub(crate) base_url: String,
@@ -33,6 +44,13 @@ pub struct OpenAiCompatibleProvider {
     /// to the first `user` message, then drop the system messages.
     /// Required for providers that reject `role: system` (e.g. MiniMax).
     merge_system_into_user: bool,
+    /// Whether this provider supports OpenAI-style native tool calling.
+    /// When false, tools are injected into the system prompt as text.
+    native_tool_calling: bool,
+    /// Selects the primary protocol for this compatible endpoint.
+    api_mode: CompatibleApiMode,
+    /// Optional max token cap propagated to outbound requests.
+    max_tokens_override: Option<u32>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -46,6 +64,15 @@ pub enum AuthStyle {
     Custom(String),
 }
 
+/// API mode for OpenAI-compatible endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibleApiMode {
+    /// Default mode: call chat-completions first and optionally fallback.
+    OpenAiChatCompletions,
+    /// Responses-first mode: call `/responses` directly.
+    OpenAiResponses,
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(
         name: &str,
@@ -54,7 +81,16 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, true, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            true,
+            None,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -74,6 +110,8 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -86,7 +124,16 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            false,
+            None,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -110,6 +157,8 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -130,6 +179,8 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -142,7 +193,40 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, true,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            false,
+            None,
+            true,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
+        )
+    }
+
+    /// Constructor used by `custom:` providers to choose explicit protocol mode.
+    pub fn new_custom_with_mode(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+        api_mode: CompatibleApiMode,
+        max_tokens_override: Option<u32>,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            true,
+            None,
+            false,
+            api_mode,
+            max_tokens_override,
         )
     }
 
@@ -155,6 +239,8 @@ impl OpenAiCompatibleProvider {
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
+        api_mode: CompatibleApiMode,
+        max_tokens_override: Option<u32>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -165,6 +251,9 @@ impl OpenAiCompatibleProvider {
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
+            native_tool_calling: !merge_system_into_user,
+            api_mode,
+            max_tokens_override: max_tokens_override.filter(|value| *value > 0),
         }
     }
 
@@ -306,6 +395,8 @@ struct ApiChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,6 +590,8 @@ struct NativeChatRequest {
     messages: Vec<NativeMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -515,6 +608,10 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Raw reasoning content from thinking models; pass-through for providers
+    /// that require it in assistant tool-call history messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -524,7 +621,13 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -533,25 +636,56 @@ struct ResponsesInput {
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponsesResponse {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     output: Vec<ResponsesOutput>,
     #[serde(default)]
     output_text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponsesOutput {
+    #[serde(rename = "type")]
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponsesContent {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesWebSocketCreateEvent {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    input: Vec<ResponsesInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -748,7 +882,7 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
     (instructions, input)
 }
 
-fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
+fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
     }
@@ -772,6 +906,180 @@ fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     }
 
     None
+}
+
+fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
+    response
+        .output
+        .iter()
+        .filter(|item| item.kind.as_deref() == Some("function_call"))
+        .filter_map(|item| {
+            let name = item.name.clone()?;
+            let arguments = item.arguments.clone().unwrap_or_else(|| "{}".to_string());
+            Some(ProviderToolCall {
+                id: item
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name,
+                arguments,
+            })
+        })
+        .collect()
+}
+
+fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatResponse {
+    let text = extract_responses_text(&response);
+    let tool_calls = extract_responses_tool_calls(&response);
+    ProviderChatResponse {
+        text,
+        tool_calls,
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+fn extract_responses_stream_error_message(event: &Value) -> Option<String> {
+    let event_type = event.get("type").and_then(Value::as_str);
+
+    if event_type == Some("error") {
+        return first_nonempty(
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("code").and_then(Value::as_str))
+                .or_else(|| {
+                    event
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                }),
+        );
+    }
+
+    if event_type == Some("response.failed") {
+        return first_nonempty(
+            event
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str),
+        );
+    }
+
+    None
+}
+
+fn extract_responses_stream_text_event(event: &Value, saw_delta: bool) -> Option<String> {
+    let event_type = event.get("type").and_then(Value::as_str);
+    match event_type {
+        Some("response.output_text.delta") => {
+            first_nonempty(event.get("delta").and_then(Value::as_str))
+        }
+        Some("response.output_text.done") if !saw_delta => {
+            first_nonempty(event.get("text").and_then(Value::as_str))
+        }
+        Some("response.completed" | "response.done") => event
+            .get("response")
+            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
+            .and_then(|response| extract_responses_text(&response)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResponsesWebSocketAccumulator {
+    saw_delta: bool,
+    delta_accumulator: String,
+    fallback_text: Option<String>,
+    latest_response_id: Option<String>,
+    output_items: Vec<ResponsesOutput>,
+}
+
+impl ResponsesWebSocketAccumulator {
+    fn final_text(&self) -> Option<String> {
+        if self.saw_delta {
+            first_nonempty(Some(&self.delta_accumulator))
+        } else {
+            self.fallback_text.clone()
+        }
+    }
+
+    fn fallback_response(&self) -> Option<ResponsesResponse> {
+        let output_text = self.final_text();
+        if output_text.is_none() && self.output_items.is_empty() {
+            return None;
+        }
+
+        Some(ResponsesResponse {
+            id: self.latest_response_id.clone(),
+            output: self.output_items.clone(),
+            output_text,
+        })
+    }
+
+    fn record_output_item(&mut self, event: &Value) {
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return;
+        };
+
+        if event_type != "response.output_item.done" {
+            return;
+        }
+
+        let item = event
+            .get("item")
+            .or_else(|| event.get("output_item"))
+            .cloned();
+        if let Some(item) = item {
+            if let Ok(parsed) = serde_json::from_value::<ResponsesOutput>(item) {
+                self.output_items.push(parsed);
+            }
+        }
+    }
+
+    fn apply_event(&mut self, event: &Value) -> anyhow::Result<Option<ResponsesResponse>> {
+        if let Some(message) = extract_responses_stream_error_message(event) {
+            anyhow::bail!("{}", message.trim());
+        }
+
+        self.record_output_item(event);
+
+        let event_type = event.get("type").and_then(Value::as_str);
+        if let Some(id) = event
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(Value::as_str)
+        {
+            self.latest_response_id = Some(id.to_string());
+        }
+
+        if let Some(text) = extract_responses_stream_text_event(event, self.saw_delta) {
+            if event_type == Some("response.output_text.delta") {
+                self.saw_delta = true;
+                self.delta_accumulator.push_str(&text);
+            } else if self.fallback_text.is_none() {
+                self.fallback_text = Some(text);
+            }
+        }
+
+        if event_type == Some("response.completed") || event_type == Some("response.done") {
+            if let Some(value) = event.get("response").cloned() {
+                if let Ok(mut parsed) = serde_json::from_value::<ResponsesResponse>(value) {
+                    if parsed.output_text.is_none() {
+                        parsed.output_text = self.final_text();
+                    }
+                    if parsed.output.is_empty() && !self.output_items.is_empty() {
+                        parsed.output = self.output_items.clone();
+                    }
+                    return Ok(Some(parsed));
+                }
+            }
+            return Ok(self.fallback_response());
+        }
+
+        Ok(None)
+    }
 }
 
 fn compact_sanitized_body_snippet(body: &str) -> String {
@@ -803,6 +1111,229 @@ fn parse_responses_response_body(
 }
 
 impl OpenAiCompatibleProvider {
+    fn should_use_responses_mode(&self) -> bool {
+        self.api_mode == CompatibleApiMode::OpenAiResponses
+    }
+
+    fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens_override.filter(|value| *value > 0)
+    }
+
+    fn should_try_responses_websocket(&self) -> bool {
+        if let Ok(raw) = std::env::var("ZEROCLAW_RESPONSES_WEBSOCKET") {
+            let normalized = raw.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "0" | "false" | "off" | "no") {
+                return false;
+            }
+            if matches!(normalized.as_str(), "1" | "true" | "on" | "yes") {
+                return true;
+            }
+        }
+
+        reqwest::Url::parse(&self.responses_url())
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            })
+            .unwrap_or(false)
+    }
+
+    fn responses_websocket_url(&self, model: &str) -> anyhow::Result<String> {
+        let mut url = reqwest::Url::parse(&self.responses_url())?;
+        let next_scheme: &'static str = match url.scheme() {
+            "https" | "wss" => "wss",
+            "http" | "ws" => "ws",
+            other => {
+                anyhow::bail!(
+                    "{} Responses API websocket transport does not support URL scheme: {}",
+                    self.name,
+                    other
+                );
+            }
+        };
+
+        url.set_scheme(next_scheme)
+            .map_err(|()| anyhow::anyhow!("failed to set websocket URL scheme"))?;
+
+        if !url.query_pairs().any(|(k, _)| k == "model") {
+            url.query_pairs_mut().append_pair("model", model);
+        }
+
+        Ok(url.into())
+    }
+
+    fn apply_auth_header_ws(
+        &self,
+        request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+        credential: &str,
+    ) -> anyhow::Result<()> {
+        let headers = request.headers_mut();
+        match &self.auth_header {
+            AuthStyle::Bearer => {
+                let value = WsHeaderValue::from_str(&format!("Bearer {credential}"))?;
+                headers.insert(AUTHORIZATION, value);
+            }
+            AuthStyle::XApiKey => {
+                headers.insert("x-api-key", WsHeaderValue::from_str(credential)?);
+            }
+            AuthStyle::Custom(header) => {
+                let name = HeaderName::from_bytes(header.as_bytes())?;
+                headers.insert(name, WsHeaderValue::from_str(credential)?);
+            }
+        }
+
+        if let Some(ua) = self.user_agent.as_deref() {
+            headers.insert(USER_AGENT, WsHeaderValue::from_str(ua)?);
+        }
+
+        Ok(())
+    }
+
+    async fn send_responses_websocket_request(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API websocket mode requires at least one non-system message",
+                self.name
+            );
+        }
+
+        let tools = tools.filter(|items| !items.is_empty());
+        let payload = ResponsesWebSocketCreateEvent {
+            kind: "response.create",
+            model: model.to_string(),
+            previous_response_id: None,
+            input,
+            instructions,
+            store: Some(false),
+            max_output_tokens: self.effective_max_tokens(),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let ws_url = self.responses_websocket_url(model)?;
+        let mut request = ws_url
+            .into_client_request()
+            .map_err(|error| anyhow::anyhow!("invalid websocket request URL: {error}"))?;
+        self.apply_auth_header_ws(&mut request, credential)?;
+
+        let (mut ws_stream, _) = connect_async(request).await?;
+        ws_stream
+            .send(WsMessage::Text(serde_json::to_string(&payload)?.into()))
+            .await?;
+
+        let mut accumulator = ResponsesWebSocketAccumulator::default();
+        while let Some(frame) = ws_stream.next().await {
+            let frame = frame?;
+            match frame {
+                WsMessage::Text(text) => {
+                    let event: Value = serde_json::from_str(text.as_ref())?;
+                    if let Some(response) = accumulator.apply_event(&event)? {
+                        let _ = ws_stream.close(None).await;
+                        return Ok(response);
+                    }
+                }
+                WsMessage::Binary(binary) => {
+                    let text = String::from_utf8(binary.to_vec()).map_err(|error| {
+                        anyhow::anyhow!("invalid UTF-8 websocket frame from Responses API: {error}")
+                    })?;
+                    let event: Value = serde_json::from_str(&text)?;
+                    if let Some(response) = accumulator.apply_event(&event)? {
+                        let _ = ws_stream.close(None).await;
+                        return Ok(response);
+                    }
+                }
+                WsMessage::Ping(payload) => {
+                    ws_stream.send(WsMessage::Pong(payload)).await?;
+                }
+                WsMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        if let Some(response) = accumulator.fallback_response() {
+            return Ok(response);
+        }
+
+        anyhow::bail!("No response from {} Responses websocket stream", self.name)
+    }
+
+    async fn send_responses_http_request(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API fallback requires at least one non-system message",
+                self.name
+            );
+        }
+
+        let tools = tools.filter(|items| !items.is_empty());
+        let request = ResponsesRequest {
+            model: model.to_string(),
+            input,
+            instructions,
+            max_output_tokens: self.effective_max_tokens(),
+            stream: Some(false),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let url = self.responses_url();
+
+        let response = self
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            anyhow::bail!("{} Responses API error: {error}", self.name);
+        }
+
+        let body = response.text().await?;
+        parse_responses_response_body(&self.name, &body)
+    }
+
+    async fn send_responses_request(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
+        if self.should_try_responses_websocket() {
+            match self
+                .send_responses_websocket_request(credential, messages, model, tools.clone())
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %self.name,
+                        error = %error,
+                        "Responses websocket request failed; falling back to HTTP"
+                    );
+                }
+            }
+        }
+
+        self.send_responses_http_request(credential, messages, model, tools)
+            .await
+    }
+
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
@@ -821,38 +1352,28 @@ impl OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
-        let (instructions, input) = build_responses_prompt(messages);
-        if input.is_empty() {
-            anyhow::bail!(
-                "{} Responses API fallback requires at least one non-system message",
-                self.name
-            );
-        }
-
-        let request = ResponsesRequest {
-            model: model.to_string(),
-            input,
-            instructions,
-            stream: Some(false),
-        };
-
-        let url = self.responses_url();
-
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
+        let responses = self
+            .send_responses_request(credential, messages, model, None)
             .await?;
-
-        if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("{} Responses API error: {error}", self.name);
-        }
-
-        let body = response.text().await?;
-        let responses = parse_responses_response_body(&self.name, &body)?;
-
-        extract_responses_text(responses)
+        extract_responses_text(&responses)
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
+    }
+
+    async fn chat_via_responses_chat(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let responses = self
+            .send_responses_request(credential, messages, model, tools)
+            .await?;
+        let parsed = parse_responses_chat_response(responses);
+        if parsed.text.is_none() && parsed.tool_calls.is_empty() {
+            anyhow::bail!("No response from {} Responses API", self.name);
+        }
+        Ok(parsed)
     }
 
     fn convert_tool_specs(
@@ -875,8 +1396,12 @@ impl OpenAiCompatibleProvider {
         })
     }
 
-    fn to_message_content(role: &str, content: &str) -> MessageContent {
-        if role != "user" {
+    fn to_message_content(
+        role: &str,
+        content: &str,
+        allow_user_image_parts: bool,
+    ) -> MessageContent {
+        if role != "user" || !allow_user_image_parts {
             return MessageContent::Text(content.to_string());
         }
 
@@ -902,7 +1427,10 @@ impl OpenAiCompatibleProvider {
         MessageContent::Parts(parts)
     }
 
-    fn convert_messages_for_native(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+    fn convert_messages_for_native(
+        messages: &[ChatMessage],
+        allow_user_image_parts: bool,
+    ) -> Vec<NativeMessage> {
         messages
             .iter()
             .map(|message| {
@@ -935,11 +1463,17 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(|value| MessageContent::Text(value.to_string()));
 
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
+                                    reasoning_content,
                                 };
                             }
                         }
@@ -963,15 +1497,21 @@ impl OpenAiCompatibleProvider {
                             content,
                             tool_call_id,
                             tool_calls: None,
+                            reasoning_content: None,
                         };
                     }
                 }
 
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(Self::to_message_content(&message.role, &message.content)),
+                    content: Some(Self::to_message_content(
+                        &message.role,
+                        &message.content,
+                        allow_user_image_parts,
+                    )),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }
             })
             .collect()
@@ -1006,6 +1546,7 @@ impl OpenAiCompatibleProvider {
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
+        let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -1036,6 +1577,7 @@ impl OpenAiCompatibleProvider {
             text,
             tool_calls,
             usage: None,
+            reasoning_content,
         }
     }
 
@@ -1065,7 +1607,10 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
+            // Providers that require system-prompt merging (e.g. MiniMax) also
+            // reject OpenAI-style `tools` in the request body. Fall back to
+            // prompt-guided tool calling for those providers.
+            native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
         }
     }
@@ -1093,7 +1638,7 @@ impl Provider for OpenAiCompatibleProvider {
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content),
+                content: Self::to_message_content("user", &content, !self.merge_system_into_user),
             });
         } else {
             if let Some(sys) = system_prompt {
@@ -1104,7 +1649,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", message),
+                content: Self::to_message_content("user", message, true),
             });
         }
 
@@ -1112,6 +1657,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1129,6 +1675,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             fallback_messages
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses(credential, &fallback_messages, model)
+                .await;
+        }
 
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -1222,7 +1774,11 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content),
+                content: Self::to_message_content(
+                    &m.role,
+                    &m.content,
+                    !self.merge_system_into_user,
+                ),
             })
             .collect();
 
@@ -1230,10 +1786,17 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses(credential, &effective_messages, model)
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1328,7 +1891,11 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content),
+                content: Self::to_message_content(
+                    &m.role,
+                    &m.content,
+                    !self.merge_system_into_user,
+                ),
             })
             .collect();
 
@@ -1336,6 +1903,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: if tools.is_empty() {
                 None
@@ -1348,6 +1916,17 @@ impl Provider for OpenAiCompatibleProvider {
                 Some("auto".to_string())
             },
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses_chat(
+                    credential,
+                    &effective_messages,
+                    model,
+                    (!tools.is_empty()).then(|| tools.to_vec()),
+                )
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1366,11 +1945,23 @@ impl Provider for OpenAiCompatibleProvider {
                     text: Some(text),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning_content: None,
                 });
             }
         };
 
         if !response.status().is_success() {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
+                return self
+                    .chat_via_responses_chat(
+                        credential,
+                        &effective_messages,
+                        model,
+                        (!tools.is_empty()).then(|| tools.to_vec()),
+                    )
+                    .await;
+            }
             return Err(super::api_error(&self.name, response).await);
         }
 
@@ -1387,6 +1978,7 @@ impl Provider for OpenAiCompatibleProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
         let text = choice.message.effective_content_optional();
+        let reasoning_content = choice.message.reasoning_content;
         let tool_calls = choice
             .message
             .tool_calls
@@ -1408,6 +2000,7 @@ impl Provider for OpenAiCompatibleProvider {
             text,
             tool_calls,
             usage,
+            reasoning_content,
         })
     }
 
@@ -1425,6 +2018,7 @@ impl Provider for OpenAiCompatibleProvider {
         })?;
 
         let tools = Self::convert_tool_specs(request.tools);
+        let response_tools = tools.clone();
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
@@ -1432,12 +2026,27 @@ impl Provider for OpenAiCompatibleProvider {
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(&effective_messages),
+            messages: Self::convert_messages_for_native(
+                &effective_messages,
+                !self.merge_system_into_user,
+            ),
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses_chat(
+                    credential,
+                    &effective_messages,
+                    model,
+                    response_tools.clone(),
+                )
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1453,13 +2062,13 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses_chat(
+                            credential,
+                            &effective_messages,
+                            model,
+                            response_tools.clone(),
+                        )
                         .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                        })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -1487,18 +2096,19 @@ impl Provider for OpenAiCompatibleProvider {
                     text: Some(text),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning_content: None,
                 });
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses_chat(
+                        credential,
+                        &effective_messages,
+                        model,
+                        response_tools.clone(),
+                    )
                     .await
-                    .map(|text| ProviderChatResponse {
-                        text: Some(text),
-                        tool_calls: vec![],
-                        usage: None,
-                    })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -1528,7 +2138,7 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        true
+        self.native_tool_calling
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1566,13 +2176,14 @@ impl Provider for OpenAiCompatibleProvider {
         }
         messages.push(Message {
             role: "user".to_string(),
-            content: Self::to_message_content("user", message),
+            content: Self::to_message_content("user", message, !self.merge_system_into_user),
         });
 
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
@@ -1714,6 +2325,7 @@ mod tests {
                 },
             ],
             temperature: 0.4,
+            max_tokens: None,
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1790,6 +2402,22 @@ mod tests {
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
     }
 
+    #[test]
+    fn custom_constructor_applies_responses_mode_and_max_tokens_override() {
+        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            "https://api.example.com",
+            Some("key"),
+            AuthStyle::Bearer,
+            true,
+            CompatibleApiMode::OpenAiResponses,
+            Some(2048),
+        );
+
+        assert!(provider.should_use_responses_mode());
+        assert_eq!(provider.effective_max_tokens(), Some(2048));
+    }
+
     #[tokio::test]
     async fn all_compatible_providers_fail_without_key() {
         let providers = vec![
@@ -1819,7 +2447,7 @@ mod tests {
         let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from top-level")
         );
     }
@@ -1830,7 +2458,7 @@ mod tests {
             r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from nested")
         );
     }
@@ -1840,9 +2468,127 @@ mod tests {
         let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Fallback text")
         );
+    }
+
+    #[test]
+    fn responses_extracts_function_call_as_tool_call() {
+        let json = r#"{
+            "output":[
+                {
+                    "type":"function_call",
+                    "call_id":"call_abc",
+                    "name":"shell",
+                    "arguments":"{\"command\":\"date\"}"
+                }
+            ]
+        }"#;
+        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
+        let parsed = parse_responses_chat_response(response);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_abc");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments, "{\"command\":\"date\"}");
+    }
+
+    #[test]
+    fn websocket_url_converts_scheme_and_adds_model_query() {
+        let provider = make_provider("custom", "https://api.openai.com/v1", Some("key"));
+        let ws_url = provider
+            .responses_websocket_url("gpt-5.2")
+            .expect("websocket URL should be derived");
+        assert_eq!(ws_url, "wss://api.openai.com/v1/responses?model=gpt-5.2");
+    }
+
+    #[test]
+    fn websocket_url_preserves_existing_model_query() {
+        let provider = make_provider(
+            "custom",
+            "https://api.openai.com/v1/responses?model=gpt-4.1-mini",
+            Some("key"),
+        );
+        let ws_url = provider
+            .responses_websocket_url("gpt-5.2")
+            .expect("existing query should be preserved");
+        assert_eq!(
+            ws_url,
+            "wss://api.openai.com/v1/responses?model=gpt-4.1-mini"
+        );
+    }
+
+    #[test]
+    fn websocket_accumulator_parses_delta_and_completed_event() {
+        let mut acc = ResponsesWebSocketAccumulator::default();
+
+        assert!(acc
+            .apply_event(&serde_json::json!({
+                "type":"response.created",
+                "response":{"id":"resp_123"}
+            }))
+            .unwrap()
+            .is_none());
+
+        assert!(acc
+            .apply_event(&serde_json::json!({
+                "type":"response.output_text.delta",
+                "delta":"Hello"
+            }))
+            .unwrap()
+            .is_none());
+
+        let response = acc
+            .apply_event(&serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_123","output_text":"Hello world","output":[]}
+            }))
+            .unwrap()
+            .expect("completed event should finalize response");
+
+        assert_eq!(response.id.as_deref(), Some("resp_123"));
+        assert_eq!(
+            extract_responses_text(&response).as_deref(),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn websocket_accumulator_falls_back_to_output_items() {
+        let mut acc = ResponsesWebSocketAccumulator::default();
+        assert!(acc
+            .apply_event(&serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "name":"shell",
+                    "call_id":"call_xyz",
+                    "arguments":"{\"command\":\"pwd\"}"
+                }
+            }))
+            .unwrap()
+            .is_none());
+
+        let fallback = acc
+            .fallback_response()
+            .expect("function-call output item should be retained");
+        let parsed = parse_responses_chat_response(fallback);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_xyz");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn websocket_accumulator_reports_stream_error() {
+        let mut acc = ResponsesWebSocketAccumulator::default();
+        let err = acc
+            .apply_event(&serde_json::json!({
+                "type":"error",
+                "error":{"code":"previous_response_not_found","message":"missing response id"}
+            }))
+            .expect_err("error event should fail");
+
+        assert!(err.to_string().contains("missing response id"));
     }
 
     #[test]
@@ -2147,13 +2893,29 @@ mod tests {
             r#"{"tool_call_id":"call_abc","content":"done"}"#,
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
+        let input = vec![ChatMessage::user(
+            "System primer [IMAGE:data:image/png;base64,abcd] user turn",
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value))
+                if value == "System primer [IMAGE:data:image/png;base64,abcd] user turn"
         ));
     }
 
@@ -2270,10 +3032,71 @@ mod tests {
     }
 
     #[test]
+    fn minimax_provider_disables_native_tool_calling() {
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(
+            !caps.native_tool_calling,
+            "MiniMax should use prompt-guided tool calling, not native"
+        );
+        assert!(!caps.vision);
+    }
+
+    #[test]
+    fn user_agent_constructor_keeps_native_tool_calling_enabled() {
+        let p = OpenAiCompatibleProvider::new_with_user_agent(
+            "TestProvider",
+            "https://example.com",
+            Some("k"),
+            AuthStyle::Bearer,
+            "zeroclaw-test/1.0",
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(!caps.vision);
+        assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/1.0"));
+    }
+
+    #[test]
+    fn user_agent_and_vision_constructor_preserves_capability_flags() {
+        let p = OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+            "VisionProvider",
+            "https://example.com",
+            Some("k"),
+            AuthStyle::Bearer,
+            "zeroclaw-test/vision",
+            true,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
+        assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/vision"));
+    }
+
+    #[test]
+    fn no_responses_fallback_constructor_keeps_native_tool_calling_enabled() {
+        let p = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "FallbackProvider",
+            "https://example.com",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(!caps.vision);
+        assert!(p.user_agent.is_none());
+    }
+
+    #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
         let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
-            "user", content,
+            "user", content, true,
         ))
         .unwrap();
         let parts = value
@@ -2287,10 +3110,21 @@ mod tests {
     }
 
     #[test]
+    fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
+        let content = "Policy [IMAGE:data:image/png;base64,abcd]";
+        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+            "user", content, false,
+        ))
+        .unwrap();
+        assert_eq!(value, serde_json::json!(content));
+    }
+
+    #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
         let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
             "system",
             "You are a helpful assistant.",
+            true,
         ))
         .unwrap();
         assert_eq!(value, serde_json::json!("You are a helpful assistant."));
@@ -2339,6 +3173,7 @@ mod tests {
                 content: MessageContent::Text("What is the weather?".to_string()),
             }],
             temperature: 0.7,
+            max_tokens: None,
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
@@ -2639,5 +3474,119 @@ mod tests {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_native_response_captures_reasoning_content() {
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: Some("thinking step".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_1".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+            }]),
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_none_reasoning_content_for_normal_model() {
+        let message = ResponseMessage {
+            content: Some("hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_round_trips_reasoning_content() {
+        // Simulate stored assistant history JSON that includes reasoning_content
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "Let me think about this..."
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Let me think about this...")
+        );
+        assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_no_reasoning_content_when_absent() {
+        // Normal model history without reasoning_content key
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
+        // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
+        let msg_without = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg_without).unwrap();
+        assert!(
+            !json.contains("reasoning_content"),
+            "reasoning_content should be omitted when None"
+        );
+
+        let msg_with = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: Some("thinking...".to_string()),
+        };
+        let json = serde_json::to_string(&msg_with).unwrap();
+        assert!(
+            json.contains("reasoning_content"),
+            "reasoning_content should be present when Some"
+        );
+        assert!(json.contains("thinking..."));
     }
 }

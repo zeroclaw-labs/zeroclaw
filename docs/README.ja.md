@@ -80,6 +80,7 @@
 ## ドキュメント運用 / 分類
 
 - 統合 TOC: [SUMMARY.md](SUMMARY.md)
+- ドキュメント構造マップ（言語/カテゴリ/機能）: [structure/README.md](structure/README.md)
 - ドキュメント一覧 / 分類: [docs-inventory.md](docs-inventory.md)
 
 ## 他言語

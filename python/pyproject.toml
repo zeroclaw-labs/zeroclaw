@@ -7,7 +7,7 @@ name = "zeroclaw-tools"
 version = "0.1.0"
 description = "Python companion package for ZeroClaw - LangGraph-based tool calling for consistent LLM agent execution"
 readme = "README.md"
-license = "MIT"
+license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
     { name = "ZeroClaw Community" }
@@ -24,6 +24,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

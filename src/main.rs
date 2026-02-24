@@ -1,4 +1,5 @@
 #![warn(clippy::all, clippy::pedantic)]
+#![forbid(unsafe_code)]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
@@ -32,7 +33,7 @@
     dead_code
 )]
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
@@ -105,11 +106,23 @@ enum CompletionShell {
     Elvish,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum EstopLevelArg {
+    #[value(name = "kill-all")]
+    KillAll,
+    #[value(name = "network-kill")]
+    NetworkKill,
+    #[value(name = "domain-block")]
+    DomainBlock,
+    #[value(name = "tool-freeze")]
+    ToolFreeze,
+}
+
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -161,7 +174,9 @@ Examples:
   zeroclaw agent                              # interactive session
   zeroclaw agent -m \"Summarize today's logs\"  # single message
   zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
+  zeroclaw agent --autonomy-level full --max-actions-per-hour 100
+  zeroclaw agent -m \"quick task\" --memory-backend none --compact-context")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -182,6 +197,30 @@ Examples:
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
         peripheral: Vec<String>,
+
+        /// Autonomy level (read_only, supervised, full)
+        #[arg(long, value_parser = clap::value_parser!(security::AutonomyLevel))]
+        autonomy_level: Option<security::AutonomyLevel>,
+
+        /// Maximum shell/tool actions per hour
+        #[arg(long)]
+        max_actions_per_hour: Option<u32>,
+
+        /// Maximum tool-call iterations per message
+        #[arg(long)]
+        max_tool_iterations: Option<usize>,
+
+        /// Maximum conversation history messages
+        #[arg(long)]
+        max_history_messages: Option<usize>,
+
+        /// Enable compact context mode (smaller prompts for limited models)
+        #[arg(long)]
+        compact_context: bool,
+
+        /// Memory backend (sqlite, markdown, none)
+        #[arg(long)]
+        memory_backend: Option<String>,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -251,6 +290,34 @@ Examples:
 
     /// Show system status (full details)
     Status,
+
+    /// Engage, inspect, and resume emergency-stop states.
+    ///
+    /// Examples:
+    /// - `zeroclaw estop`
+    /// - `zeroclaw estop --level network-kill`
+    /// - `zeroclaw estop --level domain-block --domain "*.chase.com"`
+    /// - `zeroclaw estop --level tool-freeze --tool shell --tool browser`
+    /// - `zeroclaw estop status`
+    /// - `zeroclaw estop resume --network`
+    /// - `zeroclaw estop resume --domain "*.chase.com"`
+    /// - `zeroclaw estop resume --tool shell`
+    Estop {
+        #[command(subcommand)]
+        estop_command: Option<EstopSubcommands>,
+
+        /// Level used when engaging estop from `zeroclaw estop`.
+        #[arg(long, value_enum)]
+        level: Option<EstopLevelArg>,
+
+        /// Domain pattern(s) for `domain-block` (repeatable).
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+
+        /// Tool name(s) for `tool-freeze` (repeatable).
+        #[arg(long = "tool")]
+        tools: Vec<String>,
+    },
 
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
@@ -424,10 +491,31 @@ enum ConfigCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum EstopSubcommands {
+    /// Print current estop status.
+    Status,
+    /// Resume from an engaged estop level.
+    Resume {
+        /// Resume only network kill.
+        #[arg(long)]
+        network: bool,
+        /// Resume one or more blocked domain patterns.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+        /// Resume one or more frozen tools.
+        #[arg(long = "tool")]
+        tools: Vec<String>,
+        /// OTP code. If omitted and OTP is required, a prompt is shown.
+        #[arg(long)]
+        otp: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OpenAI Codex OAuth
+    /// Login with OAuth (OpenAI Codex or Gemini)
     Login {
-        /// Provider (`openai-codex`)
+        /// Provider (`openai-codex` or `gemini`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -514,10 +602,27 @@ enum ModelCommands {
         #[arg(long)]
         provider: Option<String>,
 
+        /// Refresh all providers that support live model discovery
+        #[arg(long)]
+        all: bool,
+
         /// Force live refresh and ignore fresh cache
         #[arg(long)]
         force: bool,
     },
+    /// List cached models for a provider
+    List {
+        /// Provider name (defaults to configured default provider)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Set the default model in config
+    Set {
+        /// Model name to set as default
+        model: String,
+    },
+    /// Show current model configuration and cache status
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -531,6 +636,21 @@ enum DoctorCommands {
         /// Prefer cached catalogs when available (skip forced live refresh)
         #[arg(long)]
         use_cache: bool,
+    },
+    /// Query runtime trace events (tool diagnostics and model replies)
+    Traces {
+        /// Show a specific trace event by id
+        #[arg(long)]
+        id: Option<String>,
+        /// Filter list output by event type
+        #[arg(long)]
+        event: Option<String>,
+        /// Case-insensitive text match across message/payload
+        #[arg(long)]
+        contains: Option<String>,
+        /// Maximum number of events to display
+        #[arg(long, default_value = "20")]
+        limit: usize,
     },
 }
 
@@ -657,6 +777,20 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
+    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    if config.security.otp.enabled {
+        let config_dir = config
+            .config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
+        let (_validator, enrollment_uri) =
+            security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
+        if let Some(uri) = enrollment_uri {
+            println!("Initialized OTP secret for ZeroClaw.");
+            println!("Enrollment URI: {uri}");
+        }
+    }
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
@@ -668,17 +802,43 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+            autonomy_level,
+            max_actions_per_hour,
+            max_tool_iterations,
+            max_history_messages,
+            compact_context,
+            memory_backend,
+        } => {
+            if let Some(level) = autonomy_level {
+                config.autonomy.level = level;
+            }
+            if let Some(n) = max_actions_per_hour {
+                config.autonomy.max_actions_per_hour = n;
+            }
+            if let Some(n) = max_tool_iterations {
+                config.agent.max_tool_iterations = n;
+            }
+            if let Some(n) = max_history_messages {
+                config.agent.max_history_messages = n;
+            }
+            if compact_context {
+                config.agent.compact_context = true;
+            }
+            if let Some(ref backend) = memory_backend {
+                config.memory.backend = backend.clone();
+            }
+            agent::run(
+                config,
+                message,
+                provider,
+                model,
+                temperature,
+                peripheral,
+                true,
+            )
+            .await
+            .map(|_| ())
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -718,6 +878,10 @@ async fn main() -> Result<()> {
                 config.default_model.as_deref().unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
+            println!(
+                "🧾 Trace storage:  {} ({})",
+                config.observability.runtime_trace_mode, config.observability.runtime_trace_path
+            );
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             let effective_memory_backend = memory::effective_memory_backend_name(
@@ -742,6 +906,14 @@ async fn main() -> Result<()> {
             println!("Security:");
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
             println!(
+                "  Allowed roots:     {}",
+                if config.autonomy.allowed_roots.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    config.autonomy.allowed_roots.join(", ")
+                }
+            );
+            println!(
                 "  Allowed commands:  {}",
                 config.autonomy.allowed_commands.join(", ")
             );
@@ -753,18 +925,15 @@ async fn main() -> Result<()> {
                 "  Max cost/day:      ${:.2}",
                 f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
             );
+            println!("  OTP enabled:       {}", config.security.otp.enabled);
+            println!("  E-stop enabled:    {}", config.security.estop.enabled);
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("Nextcloud", config.channels_config.nextcloud_talk.is_some()),
-            ] {
+            for (channel, configured) in config.channels_config.channels() {
                 println!(
-                    "  {name:9} {}",
+                    "  {:9} {}",
+                    channel.name(),
                     if configured {
                         "✅ configured"
                     } else {
@@ -787,12 +956,35 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Estop {
+            estop_command,
+            level,
+            domains,
+            tools,
+        } => handle_estop_command(&config, estop_command, level, domains, tools),
+
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => match model_command {
-            ModelCommands::Refresh { provider, force } => {
-                onboard::run_models_refresh(&config, provider.as_deref(), force).await
+            ModelCommands::Refresh {
+                provider,
+                all,
+                force,
+            } => {
+                if all {
+                    if provider.is_some() {
+                        bail!("`models refresh --all` cannot be combined with --provider");
+                    }
+                    onboard::run_models_refresh_all(&config, force).await
+                } else {
+                    onboard::run_models_refresh(&config, provider.as_deref(), force).await
+                }
             }
+            ModelCommands::List { provider } => {
+                onboard::run_models_list(&config, provider.as_deref()).await
+            }
+            ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
+            ModelCommands::Status => onboard::run_models_status(&config).await,
         },
 
         Commands::Providers => {
@@ -841,6 +1033,18 @@ async fn main() -> Result<()> {
                 provider,
                 use_cache,
             }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
+            Some(DoctorCommands::Traces {
+                id,
+                event,
+                contains,
+                limit,
+            }) => doctor::run_traces(
+                &config,
+                id.as_deref(),
+                event.as_deref(),
+                contains.as_deref(),
+                limit,
+            ),
             None => doctor::run(&config),
         },
 
@@ -887,6 +1091,172 @@ async fn main() -> Result<()> {
     }
 }
 
+fn handle_estop_command(
+    config: &Config,
+    estop_command: Option<EstopSubcommands>,
+    level: Option<EstopLevelArg>,
+    domains: Vec<String>,
+    tools: Vec<String>,
+) -> Result<()> {
+    if !config.security.estop.enabled {
+        bail!("Emergency stop is disabled. Enable [security.estop].enabled = true in config.toml");
+    }
+
+    let config_dir = config
+        .config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    let mut manager = security::EstopManager::load(&config.security.estop, config_dir)?;
+
+    match estop_command {
+        Some(EstopSubcommands::Status) => {
+            print_estop_status(&manager.status());
+            Ok(())
+        }
+        Some(EstopSubcommands::Resume {
+            network,
+            domains,
+            tools,
+            otp,
+        }) => {
+            let selector = build_resume_selector(network, domains, tools)?;
+            let mut otp_code = otp;
+            let otp_validator = if config.security.estop.require_otp_to_resume {
+                if !config.security.otp.enabled {
+                    bail!(
+                        "security.estop.require_otp_to_resume=true but security.otp.enabled=false"
+                    );
+                }
+                if otp_code.is_none() {
+                    let entered = Password::new()
+                        .with_prompt("Enter OTP code")
+                        .allow_empty_password(false)
+                        .interact()?;
+                    otp_code = Some(entered);
+                }
+
+                let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
+                let (validator, enrollment_uri) =
+                    security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
+                if let Some(uri) = enrollment_uri {
+                    println!("Initialized OTP secret for ZeroClaw.");
+                    println!("Enrollment URI: {uri}");
+                }
+                Some(validator)
+            } else {
+                None
+            };
+
+            manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
+            println!("Estop resume completed.");
+            print_estop_status(&manager.status());
+            Ok(())
+        }
+        None => {
+            let engage_level = build_engage_level(level, domains, tools)?;
+            manager.engage(engage_level)?;
+            println!("Estop engaged.");
+            print_estop_status(&manager.status());
+            Ok(())
+        }
+    }
+}
+
+fn build_engage_level(
+    level: Option<EstopLevelArg>,
+    domains: Vec<String>,
+    tools: Vec<String>,
+) -> Result<security::EstopLevel> {
+    let requested = level.unwrap_or(EstopLevelArg::KillAll);
+    match requested {
+        EstopLevelArg::KillAll => {
+            if !domains.is_empty() || !tools.is_empty() {
+                bail!("--domain/--tool are only valid with --level domain-block/tool-freeze");
+            }
+            Ok(security::EstopLevel::KillAll)
+        }
+        EstopLevelArg::NetworkKill => {
+            if !domains.is_empty() || !tools.is_empty() {
+                bail!("--domain/--tool are not valid with --level network-kill");
+            }
+            Ok(security::EstopLevel::NetworkKill)
+        }
+        EstopLevelArg::DomainBlock => {
+            if domains.is_empty() {
+                bail!("--level domain-block requires at least one --domain");
+            }
+            if !tools.is_empty() {
+                bail!("--tool is not valid with --level domain-block");
+            }
+            Ok(security::EstopLevel::DomainBlock(domains))
+        }
+        EstopLevelArg::ToolFreeze => {
+            if tools.is_empty() {
+                bail!("--level tool-freeze requires at least one --tool");
+            }
+            if !domains.is_empty() {
+                bail!("--domain is not valid with --level tool-freeze");
+            }
+            Ok(security::EstopLevel::ToolFreeze(tools))
+        }
+    }
+}
+
+fn build_resume_selector(
+    network: bool,
+    domains: Vec<String>,
+    tools: Vec<String>,
+) -> Result<security::ResumeSelector> {
+    let selected =
+        usize::from(network) + usize::from(!domains.is_empty()) + usize::from(!tools.is_empty());
+    if selected > 1 {
+        bail!("Use only one of --network, --domain, or --tool for estop resume");
+    }
+    if network {
+        return Ok(security::ResumeSelector::Network);
+    }
+    if !domains.is_empty() {
+        return Ok(security::ResumeSelector::Domains(domains));
+    }
+    if !tools.is_empty() {
+        return Ok(security::ResumeSelector::Tools(tools));
+    }
+    Ok(security::ResumeSelector::KillAll)
+}
+
+fn print_estop_status(state: &security::EstopState) {
+    println!("Estop status:");
+    println!(
+        "  engaged:        {}",
+        if state.is_engaged() { "yes" } else { "no" }
+    );
+    println!(
+        "  kill_all:       {}",
+        if state.kill_all { "active" } else { "inactive" }
+    );
+    println!(
+        "  network_kill:   {}",
+        if state.network_kill {
+            "active"
+        } else {
+            "inactive"
+        }
+    );
+    if state.blocked_domains.is_empty() {
+        println!("  domain_blocks:  (none)");
+    } else {
+        println!("  domain_blocks:  {}", state.blocked_domains.join(", "));
+    }
+    if state.frozen_tools.is_empty() {
+        println!("  tool_freeze:    (none)");
+    } else {
+        println!("  tool_freeze:    {}", state.frozen_tools.join(", "));
+    }
+    if let Some(updated_at) = &state.updated_at {
+        println!("  updated_at:     {updated_at}");
+    }
+}
+
 fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
     use clap_complete::generate;
     use clap_complete::shells;
@@ -908,8 +1278,12 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     Ok(())
 }
 
+// ─── Generic Pending OAuth Login ────────────────────────────────────────────
+
+/// Generic pending OAuth login state, shared across providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingOpenAiLogin {
+struct PendingOAuthLogin {
+    provider: String,
     profile: String,
     code_verifier: String,
     state: String,
@@ -917,7 +1291,9 @@ struct PendingOpenAiLogin {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingOpenAiLoginFile {
+struct PendingOAuthLoginFile {
+    #[serde(default)]
+    provider: Option<String>,
     profile: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     code_verifier: Option<String>,
@@ -927,11 +1303,12 @@ struct PendingOpenAiLoginFile {
     created_at: String,
 }
 
-fn pending_openai_login_path(config: &Config) -> std::path::PathBuf {
-    auth::state_dir_from_config(config).join("auth-openai-pending.json")
+fn pending_oauth_login_path(config: &Config, provider: &str) -> std::path::PathBuf {
+    let filename = format!("auth-{}-pending.json", provider);
+    auth::state_dir_from_config(config).join(filename)
 }
 
-fn pending_openai_secret_store(config: &Config) -> security::secrets::SecretStore {
+fn pending_oauth_secret_store(config: &Config) -> security::secrets::SecretStore {
     security::secrets::SecretStore::new(
         &auth::state_dir_from_config(config),
         config.secrets.encrypt,
@@ -950,14 +1327,15 @@ fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn save_pending_openai_login(config: &Config, pending: &PendingOpenAiLogin) -> Result<()> {
-    let path = pending_openai_login_path(config);
+fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
+    let path = pending_oauth_login_path(config, &pending.provider);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let secret_store = pending_openai_secret_store(config);
+    let secret_store = pending_oauth_secret_store(config);
     let encrypted_code_verifier = secret_store.encrypt(&pending.code_verifier)?;
-    let persisted = PendingOpenAiLoginFile {
+    let persisted = PendingOAuthLoginFile {
+        provider: Some(pending.provider.clone()),
         profile: pending.profile.clone(),
         code_verifier: None,
         encrypted_code_verifier: Some(encrypted_code_verifier),
@@ -977,25 +1355,26 @@ fn save_pending_openai_login(config: &Config, pending: &PendingOpenAiLogin) -> R
     Ok(())
 }
 
-fn load_pending_openai_login(config: &Config) -> Result<Option<PendingOpenAiLogin>> {
-    let path = pending_openai_login_path(config);
+fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<PendingOAuthLogin>> {
+    let path = pending_oauth_login_path(config, provider);
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(&path)?;
     if bytes.is_empty() {
         return Ok(None);
     }
-    let persisted: PendingOpenAiLoginFile = serde_json::from_slice(&bytes)?;
-    let secret_store = pending_openai_secret_store(config);
+    let persisted: PendingOAuthLoginFile = serde_json::from_slice(&bytes)?;
+    let secret_store = pending_oauth_secret_store(config);
     let code_verifier = if let Some(encrypted) = persisted.encrypted_code_verifier {
         secret_store.decrypt(&encrypted)?
     } else if let Some(plaintext) = persisted.code_verifier {
         plaintext
     } else {
-        bail!("Pending OpenAI login is missing code verifier");
+        bail!("Pending {} login is missing code verifier", provider);
     };
-    Ok(Some(PendingOpenAiLogin {
+    Ok(Some(PendingOAuthLogin {
+        provider: persisted.provider.unwrap_or_else(|| provider.to_string()),
         profile: persisted.profile,
         code_verifier,
         state: persisted.state,
@@ -1003,8 +1382,8 @@ fn load_pending_openai_login(config: &Config) -> Result<Option<PendingOpenAiLogi
     }))
 }
 
-fn clear_pending_openai_login(config: &Config) {
-    let path = pending_openai_login_path(config);
+fn clear_pending_oauth_login(config: &Config, provider: &str) {
+    let path = pending_oauth_login_path(config, provider);
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
         let _ = file.set_len(0);
         let _ = file.sync_all();
@@ -1066,90 +1445,184 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             device_code,
         } => {
             let provider = auth::normalize_provider(&provider)?;
-            if provider != "openai-codex" {
-                bail!("`auth login` currently supports only --provider openai-codex");
-            }
-
             let client = reqwest::Client::new();
 
-            if device_code {
-                match auth::openai_oauth::start_device_code_flow(&client).await {
-                    Ok(device) => {
-                        println!("OpenAI device-code login started.");
-                        println!("Visit: {}", device.verification_uri);
-                        println!("Code:  {}", device.user_code);
-                        if let Some(uri_complete) = &device.verification_uri_complete {
-                            println!("Fast link: {uri_complete}");
+            match provider.as_str() {
+                "gemini" => {
+                    // Gemini OAuth flow
+                    if device_code {
+                        match auth::gemini_oauth::start_device_code_flow(&client).await {
+                            Ok(device) => {
+                                println!("Google/Gemini device-code login started.");
+                                println!("Visit: {}", device.verification_uri);
+                                println!("Code:  {}", device.user_code);
+                                if let Some(uri_complete) = &device.verification_uri_complete {
+                                    println!("Fast link: {uri_complete}");
+                                }
+
+                                let token_set =
+                                    auth::gemini_oauth::poll_device_code_tokens(&client, &device)
+                                        .await?;
+                                let account_id = token_set.id_token.as_deref().and_then(
+                                    auth::gemini_oauth::extract_account_email_from_id_token,
+                                );
+
+                                auth_service
+                                    .store_gemini_tokens(&profile, token_set, account_id, true)
+                                    .await?;
+
+                                println!("Saved profile {profile}");
+                                println!("Active profile for gemini: {profile}");
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Device-code flow unavailable: {e}. Falling back to browser flow."
+                                );
+                            }
                         }
-                        if let Some(message) = &device.message {
-                            println!("{message}");
+                    }
+
+                    let pkce = auth::gemini_oauth::generate_pkce_state();
+                    let authorize_url = auth::gemini_oauth::build_authorize_url(&pkce)?;
+
+                    // Save pending login for paste-redirect fallback
+                    let pending = PendingOAuthLogin {
+                        provider: "gemini".to_string(),
+                        profile: profile.clone(),
+                        code_verifier: pkce.code_verifier.clone(),
+                        state: pkce.state.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    save_pending_oauth_login(config, &pending)?;
+
+                    println!("Open this URL in your browser and authorize access:");
+                    println!("{authorize_url}");
+                    println!();
+
+                    let code = match auth::gemini_oauth::receive_loopback_code(
+                        &pkce.state,
+                        std::time::Duration::from_secs(180),
+                    )
+                    .await
+                    {
+                        Ok(code) => {
+                            clear_pending_oauth_login(config, "gemini");
+                            code
                         }
+                        Err(e) => {
+                            println!("Callback capture failed: {e}");
+                            println!(
+                                "Run `zeroclaw auth paste-redirect --provider gemini --profile {profile}`"
+                            );
+                            return Ok(());
+                        }
+                    };
 
-                        let token_set =
-                            auth::openai_oauth::poll_device_code_tokens(&client, &device).await?;
-                        let account_id =
-                            extract_openai_account_id_for_profile(&token_set.access_token);
+                    let token_set =
+                        auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = token_set
+                        .id_token
+                        .as_deref()
+                        .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
 
-                        auth_service
-                            .store_openai_tokens(&profile, token_set, account_id, true)
-                            .await?;
-                        clear_pending_openai_login(config);
+                    auth_service
+                        .store_gemini_tokens(&profile, token_set, account_id, true)
+                        .await?;
 
-                        println!("Saved profile {profile}");
-                        println!("Active profile for openai-codex: {profile}");
-                        return Ok(());
+                    println!("Saved profile {profile}");
+                    println!("Active profile for gemini: {profile}");
+                    Ok(())
+                }
+                "openai-codex" => {
+                    // OpenAI Codex OAuth flow
+                    if device_code {
+                        match auth::openai_oauth::start_device_code_flow(&client).await {
+                            Ok(device) => {
+                                println!("OpenAI device-code login started.");
+                                println!("Visit: {}", device.verification_uri);
+                                println!("Code:  {}", device.user_code);
+                                if let Some(uri_complete) = &device.verification_uri_complete {
+                                    println!("Fast link: {uri_complete}");
+                                }
+                                if let Some(message) = &device.message {
+                                    println!("{message}");
+                                }
+
+                                let token_set =
+                                    auth::openai_oauth::poll_device_code_tokens(&client, &device)
+                                        .await?;
+                                let account_id =
+                                    extract_openai_account_id_for_profile(&token_set.access_token);
+
+                                auth_service
+                                    .store_openai_tokens(&profile, token_set, account_id, true)
+                                    .await?;
+                                clear_pending_oauth_login(config, "openai");
+
+                                println!("Saved profile {profile}");
+                                println!("Active profile for openai-codex: {profile}");
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Device-code flow unavailable: {e}. Falling back to browser/paste flow."
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        println!(
-                            "Device-code flow unavailable: {e}. Falling back to browser/paste flow."
-                        );
-                    }
+
+                    let pkce = auth::openai_oauth::generate_pkce_state();
+                    let pending = PendingOAuthLogin {
+                        provider: "openai".to_string(),
+                        profile: profile.clone(),
+                        code_verifier: pkce.code_verifier.clone(),
+                        state: pkce.state.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    save_pending_oauth_login(config, &pending)?;
+
+                    let authorize_url = auth::openai_oauth::build_authorize_url(&pkce);
+                    println!("Open this URL in your browser and authorize access:");
+                    println!("{authorize_url}");
+                    println!();
+                    println!("Waiting for callback at http://localhost:1455/auth/callback ...");
+
+                    let code = match auth::openai_oauth::receive_loopback_code(
+                        &pkce.state,
+                        std::time::Duration::from_secs(180),
+                    )
+                    .await
+                    {
+                        Ok(code) => code,
+                        Err(e) => {
+                            println!("Callback capture failed: {e}");
+                            println!(
+                                "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                    let token_set =
+                        auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+
+                    auth_service
+                        .store_openai_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "openai");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for openai-codex: {profile}");
+                    Ok(())
+                }
+                _ => {
+                    bail!(
+                        "`auth login` supports --provider openai-codex or gemini, got: {provider}"
+                    );
                 }
             }
-
-            let pkce = auth::openai_oauth::generate_pkce_state();
-            let pending = PendingOpenAiLogin {
-                profile: profile.clone(),
-                code_verifier: pkce.code_verifier.clone(),
-                state: pkce.state.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-            };
-            save_pending_openai_login(config, &pending)?;
-
-            let authorize_url = auth::openai_oauth::build_authorize_url(&pkce);
-            println!("Open this URL in your browser and authorize access:");
-            println!("{authorize_url}");
-            println!();
-            println!("Waiting for callback at http://localhost:1455/auth/callback ...");
-
-            let code = match auth::openai_oauth::receive_loopback_code(
-                &pkce.state,
-                std::time::Duration::from_secs(180),
-            )
-            .await
-            {
-                Ok(code) => code,
-                Err(e) => {
-                    println!("Callback capture failed: {e}");
-                    println!(
-                            "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
-                        );
-                    return Ok(());
-                }
-            };
-
-            let token_set =
-                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-            let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
-
-            auth_service
-                .store_openai_tokens(&profile, token_set, account_id, true)
-                .await?;
-            clear_pending_openai_login(config);
-
-            println!("Saved profile {profile}");
-            println!("Active profile for openai-codex: {profile}");
-            Ok(())
         }
 
         AuthCommands::PasteRedirect {
@@ -1158,52 +1631,103 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             input,
         } => {
             let provider = auth::normalize_provider(&provider)?;
-            if provider != "openai-codex" {
-                bail!("`auth paste-redirect` currently supports only --provider openai-codex");
+
+            match provider.as_str() {
+                "openai-codex" => {
+                    let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                        )
+                    })?;
+
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
+                    }
+
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::openai_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::openai_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+
+                    auth_service
+                        .store_openai_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "openai");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for openai-codex: {profile}");
+                }
+                "gemini" => {
+                    let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
+                        )
+                    })?;
+
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
+                    }
+
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::gemini_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::gemini_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = token_set
+                        .id_token
+                        .as_deref()
+                        .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
+
+                    auth_service
+                        .store_gemini_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "gemini");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for gemini: {profile}");
+                }
+                _ => {
+                    bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
+                }
             }
-
-            let pending = load_pending_openai_login(config)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
-                )
-            })?;
-
-            if pending.profile != profile {
-                bail!(
-                    "Pending login profile mismatch: pending={}, requested={}",
-                    pending.profile,
-                    profile
-                );
-            }
-
-            let redirect_input = match input {
-                Some(value) => value,
-                None => read_plain_input("Paste redirect URL or OAuth code")?,
-            };
-
-            let code = auth::openai_oauth::parse_code_from_redirect(
-                &redirect_input,
-                Some(&pending.state),
-            )?;
-
-            let pkce = auth::openai_oauth::PkceState {
-                code_verifier: pending.code_verifier.clone(),
-                code_challenge: String::new(),
-                state: pending.state.clone(),
-            };
-
-            let client = reqwest::Client::new();
-            let token_set =
-                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-            let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
-
-            auth_service
-                .store_openai_tokens(&profile, token_set, account_id, true)
-                .await?;
-            clear_pending_openai_login(config);
-
-            println!("Saved profile {profile}");
-            println!("Active profile for openai-codex: {profile}");
             Ok(())
         }
 
@@ -1261,23 +1785,43 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Refresh { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
-            if provider != "openai-codex" {
-                bail!("`auth refresh` currently supports only --provider openai-codex");
-            }
 
-            match auth_service
-                .get_valid_openai_access_token(profile.as_deref())
-                .await?
-            {
-                Some(_) => {
-                    println!("OpenAI Codex token is valid (refresh completed if needed).");
-                    Ok(())
+            match provider.as_str() {
+                "openai-codex" => {
+                    match auth_service
+                        .get_valid_openai_access_token(profile.as_deref())
+                        .await?
+                    {
+                        Some(_) => {
+                            println!("OpenAI Codex token is valid (refresh completed if needed).");
+                            Ok(())
+                        }
+                        None => {
+                            bail!(
+                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                            )
+                        }
+                    }
                 }
-                None => {
-                    bail!(
-                        "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
-                    )
+                "gemini" => {
+                    match auth_service
+                        .get_valid_gemini_access_token(profile.as_deref())
+                        .await?
+                    {
+                        Some(_) => {
+                            let profile_name = profile.as_deref().unwrap_or("default");
+                            println!("✓ Gemini token refreshed successfully");
+                            println!("  Profile: gemini:{}", profile_name);
+                            Ok(())
+                        }
+                        None => {
+                            bail!(
+                                "No Gemini auth profile found. Run `zeroclaw auth login --provider gemini`."
+                            )
+                        }
+                    }
                 }
+                _ => bail!("`auth refresh` supports --provider openai-codex or gemini"),
             }
         }
 
@@ -1447,6 +1991,40 @@ mod tests {
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
             other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_estop_default_engage() {
+        let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
+
+        match cli.command {
+            Commands::Estop {
+                estop_command,
+                level,
+                domains,
+                tools,
+            } => {
+                assert!(estop_command.is_none());
+                assert!(level.is_none());
+                assert!(domains.is_empty());
+                assert!(tools.is_empty());
+            }
+            other => panic!("expected estop command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_estop_resume_domain() {
+        let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
+            .expect("estop resume command should parse");
+
+        match cli.command {
+            Commands::Estop {
+                estop_command: Some(EstopSubcommands::Resume { domains, .. }),
+                ..
+            } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
+            other => panic!("expected estop resume command, got {other:?}"),
         }
     }
 }
