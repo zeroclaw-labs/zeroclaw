@@ -22,7 +22,7 @@ Schema export command:
 
 | Key | Default | Notes |
 |---|---|---|
-| `default_provider` | `openrouter` | provider ID or alias |
+| `default_provider` | `openrouter` | provider ID, alias, or `[model_providers.<name>]` key |
 | `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
@@ -76,6 +76,26 @@ Operational note for container users:
   - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode (`wss://.../responses`) for compatible providers.
   - `ZEROCLAW_RESPONSES_WEBSOCKET=0` forces HTTP-only mode.
   - Unset = auto (websocket-first only when endpoint host is `api.openai.com`, then HTTP fallback if websocket fails).
+
+## `[model_providers.<name>]`
+
+Named provider profiles compatible with Codex-style config layouts.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `name` | unset | Optional provider remap target (for example `openai`, `openai-codex`) |
+| `base_url` | unset | Optional OpenAI-compatible base URL; maps selected profile to `custom:<base_url>` when used |
+| `api_key` | unset | Optional profile-specific API key override |
+| `wire_api` | unset | Optional wire mode: `responses` or `chat_completions` |
+| `requires_openai_auth` | `false` | When true and no profile `api_key`, load OpenAI auth material (`OPENAI_API_KEY` or `~/.codex/auth.json`) |
+
+Notes:
+
+- Profile `api_key` applies when that profile is active and takes precedence over root-level `api_key`.
+- Profile API keys are encrypted at rest when `secrets.encrypt = true`.
+- For built-in provider IDs/aliases, `name` and `base_url` can both be omitted (for example `[model_providers.openrouter]` with only `api_key`).
+- `wire_api = "responses"` remaps to provider `openai-codex` for compatibility.
+- You can reference profile keys directly in `default_provider` and `[[model_routes]].provider`.
 
 ## `[agent]`
 
@@ -383,7 +403,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | Key | Default | Purpose |
 |---|---|---|
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
-| `provider` | _required_ | Provider to route to (must match a known provider name) |
+| `provider` | _required_ | Provider to route to (known provider name or `[model_providers.<name>]` key) |
 | `model` | _required_ | Model to use with that provider |
 | `max_tokens` | unset | Optional per-route output token cap forwarded to provider APIs |
 | `api_key` | unset | Optional API key override for this route's provider |

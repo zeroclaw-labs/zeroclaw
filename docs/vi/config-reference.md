@@ -22,7 +22,7 @@ Lệnh xuất schema:
 
 | Khóa | Mặc định | Ghi chú |
 |---|---|---|
-| `default_provider` | `openrouter` | ID hoặc bí danh provider |
+| `default_provider` | `openrouter` | ID, bí danh provider hoặc key `[model_providers.<name>]` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | Model định tuyến qua provider đã chọn |
 | `default_temperature` | `0.7` | Nhiệt độ model |
 
@@ -60,6 +60,26 @@ Lưu ý cho người dùng container:
 
 - Nếu `config.toml` đặt provider tùy chỉnh như `custom:https://.../v1`, biến `PROVIDER=openrouter` mặc định từ Docker/container sẽ không thay thế nó.
 - Dùng `ZEROCLAW_PROVIDER` khi cố ý muốn biến môi trường ghi đè provider đã cấu hình.
+
+## `[model_providers.<name>]`
+
+Profile provider đặt tên, tương thích bố cục cấu hình kiểu Codex.
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `name` | chưa đặt | Đích remap provider (ví dụ `openai`, `openai-codex`) |
+| `base_url` | chưa đặt | Base URL OpenAI-compatible; khi profile được chọn sẽ ánh xạ thành `custom:<base_url>` |
+| `api_key` | chưa đặt | API key riêng cho profile |
+| `wire_api` | chưa đặt | Chế độ wire: `responses` hoặc `chat_completions` |
+| `requires_openai_auth` | `false` | Khi bật và profile không có `api_key`, nạp OpenAI auth (`OPENAI_API_KEY` hoặc `~/.codex/auth.json`) |
+
+Lưu ý:
+
+- `api_key` trong profile được áp dụng khi profile đó đang hoạt động và ưu tiên hơn `api_key` ở cấp root.
+- API key của profile được mã hóa khi `secrets.encrypt = true`.
+- Với provider tích hợp sẵn (ID/bí danh), có thể bỏ trống cả `name` và `base_url` (ví dụ `[model_providers.openrouter]` chỉ khai báo `api_key`).
+- `wire_api = "responses"` sẽ remap sang provider `openai-codex` để tương thích.
+- Có thể dùng trực tiếp key profile trong `default_provider` và `[[model_routes]].provider`.
 
 ## `[agent]`
 
@@ -305,7 +325,7 @@ Route hint giúp tên tích hợp ổn định khi model ID thay đổi.
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
 | `hint` | _bắt buộc_ | Tên hint tác vụ (ví dụ `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
-| `provider` | _bắt buộc_ | Provider đích (phải khớp tên provider đã biết) |
+| `provider` | _bắt buộc_ | Provider đích (tên provider đã biết hoặc key `[model_providers.<name>]`) |
 | `model` | _bắt buộc_ | Model sử dụng với provider đó |
 | `api_key` | chưa đặt | API key tùy chỉnh cho provider của route này (tùy chọn) |
 

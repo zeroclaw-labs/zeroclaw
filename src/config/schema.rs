@@ -1,5 +1,5 @@
 use crate::config::traits::ChannelConfig;
-use crate::providers::{is_glm_alias, is_zai_alias};
+use crate::providers::{is_glm_alias, is_zai_alias, list_providers};
 use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -255,6 +255,10 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional API key override for this profile.
+    /// When present, this key is applied when the profile is selected.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
@@ -2344,7 +2348,7 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Provider to route to (must match a known provider name)
+    /// Provider to route to (known provider name or `[model_providers.<name>]` key)
     pub provider: String,
     /// Model to use with that provider
     pub model: String,
@@ -4023,6 +4027,21 @@ fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     }
 }
 
+fn is_known_provider_alias(name: &str) -> bool {
+    let needle = name.trim();
+    if needle.is_empty() {
+        return false;
+    }
+
+    list_providers().into_iter().any(|provider| {
+        provider.name.eq_ignore_ascii_case(needle)
+            || provider
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(needle))
+    })
+}
+
 fn read_codex_openai_api_key() -> Option<String> {
     let home = UserDirs::new()?.home_dir().to_path_buf();
     let auth_path = home.join(".codex").join("auth.json");
@@ -4122,6 +4141,14 @@ impl Config {
                 "config.storage.provider.config.db_url",
             )?;
 
+            for profile in config.model_providers.values_mut() {
+                decrypt_optional_secret(
+                    &store,
+                    &mut profile.api_key,
+                    "config.model_providers.*.api_key",
+                )?;
+            }
+
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
@@ -4201,6 +4228,12 @@ impl Config {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
+        let profile_api_key = profile
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
 
         if self
             .api_url
@@ -4213,7 +4246,9 @@ impl Config {
             }
         }
 
-        if profile.requires_openai_auth
+        if let Some(profile_api_key) = profile_api_key {
+            self.api_key = Some(profile_api_key);
+        } else if profile.requires_openai_auth
             && self
                 .api_key
                 .as_deref()
@@ -4378,7 +4413,7 @@ impl Config {
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
 
-            if !has_name && !has_base_url {
+            if !has_name && !has_base_url && !is_known_provider_alias(profile_name) {
                 anyhow::bail!(
                     "model_providers.{profile_name} must define at least one of `name` or `base_url`"
                 );
@@ -4757,6 +4792,14 @@ impl Config {
             &mut config_to_save.storage.provider.config.db_url,
             "config.storage.provider.config.db_url",
         )?;
+
+        for profile in config_to_save.model_providers.values_mut() {
+            encrypt_optional_secret(
+                &store,
+                &mut profile.api_key,
+                "config.model_providers.*.api_key",
+            )?;
+        }
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
@@ -5427,6 +5470,16 @@ tool_dispatcher = "xml"
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.model_providers.insert(
+            "sub2api".into(),
+            ModelProviderConfig {
+                name: Some("sub2api".into()),
+                base_url: Some("https://api.tonsof.blue/v1".into()),
+                api_key: Some("provider-credential".into()),
+                wire_api: None,
+                requires_openai_auth: false,
+            },
+        );
 
         config.agents.insert(
             "worker".into(),
@@ -5480,6 +5533,16 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(web_search_encrypted).unwrap(),
             "brave-credential"
+        );
+
+        let model_provider = stored.model_providers.get("sub2api").unwrap();
+        let provider_encrypted = model_provider.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            provider_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(provider_encrypted).unwrap(),
+            "provider-credential"
         );
 
         let worker = stored.agents.get("worker").unwrap();
@@ -6369,6 +6432,7 @@ model = "gpt-5.3-codex"
 [model_providers.sub2api]
 name = "sub2api"
 base_url = "https://api.tonsof.blue/v1"
+api_key = "profile-key"
 wire_api = "responses"
 requires_openai_auth = true
 "#;
@@ -6380,6 +6444,7 @@ requires_openai_auth = true
             .model_providers
             .get("sub2api")
             .expect("profile should exist");
+        assert_eq!(profile.api_key.as_deref(), Some("profile-key"));
         assert_eq!(profile.wire_api.as_deref(), Some("responses"));
         assert!(profile.requires_openai_auth);
     }
@@ -6584,6 +6649,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_key: None,
                     wire_api: None,
                     requires_openai_auth: false,
                 },
@@ -6603,6 +6669,29 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn model_provider_profile_api_key_overrides_root_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("sub2api".to_string()),
+            api_key: Some("root-key".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_key: Some("profile-key".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("profile-key"));
+    }
+
+    #[test]
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -6612,6 +6701,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue".to_string()),
+                    api_key: None,
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
                 },
@@ -6627,6 +6717,33 @@ provider_api = "not-a-real-mode"
         assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
         assert_eq!(config.api_url.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(config.api_key.as_deref(), Some("sk-test-codex-key"));
+    }
+
+    #[test]
+    async fn model_provider_profile_api_key_wins_over_openai_auth_fallback() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue".to_string()),
+                    api_key: Some("profile-key".to_string()),
+                    wire_api: Some("responses".to_string()),
+                    requires_openai_auth: true,
+                },
+            )]),
+            api_key: None,
+            ..Config::default()
+        };
+
+        std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key");
+        config.apply_env_overrides();
+        std::env::remove_var("OPENAI_API_KEY");
+
+        assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
+        assert_eq!(config.api_key.as_deref(), Some("profile-key"));
     }
 
     #[test]
@@ -6674,6 +6791,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_key: None,
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
                 },
@@ -6685,6 +6803,52 @@ provider_api = "not-a-real-mode"
         assert!(error
             .to_string()
             .contains("wire_api must be one of: responses, chat_completions"));
+    }
+
+    #[test]
+    async fn validate_accepts_builtin_model_provider_profile_without_base_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("openrouter".to_string()),
+            model_providers: HashMap::from([(
+                "openrouter".to_string(),
+                ModelProviderConfig {
+                    name: None,
+                    base_url: None,
+                    api_key: Some("profile-key".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn validate_rejects_unknown_model_provider_without_name_or_base_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: None,
+                    base_url: None,
+                    api_key: Some("profile-key".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error
+            .to_string()
+            .contains("must define at least one of `name` or `base_url`"));
     }
 
     #[test]
