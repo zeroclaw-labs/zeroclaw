@@ -8041,7 +8041,6 @@ dependencies = [
  "image",
  "landlock",
  "lettre",
- "libc",
  "mail-parser",
  "matrix-sdk",
  "mime_guess",

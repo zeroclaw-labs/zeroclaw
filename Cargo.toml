@@ -179,10 +179,6 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
-# Unix-specific dependencies (for root check, etc.)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [features]
 default = []
 hardware = ["nusb", "tokio-serial"]
