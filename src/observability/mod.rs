@@ -4,6 +4,7 @@ pub mod noop;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
 pub mod prometheus;
+pub mod runtime_events;
 pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
@@ -16,6 +17,7 @@ pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
+pub use runtime_events::set_runtime_event_sender;
 pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
@@ -24,7 +26,7 @@ use crate::config::ObservabilityConfig;
 
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    match config.backend.as_str() {
+    let base: Box<dyn Observer> = match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
         "prometheus" => Box::new(PrometheusObserver::new()),
         "otel" | "opentelemetry" | "otlp" => {
@@ -64,7 +66,9 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             );
             Box::new(NoopObserver)
         }
-    }
+    };
+
+    Box::new(runtime_events::RuntimeEventForwardingObserver::new(base))
 }
 
 #[cfg(test)]
