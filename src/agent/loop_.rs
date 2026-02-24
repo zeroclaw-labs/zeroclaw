@@ -1494,6 +1494,59 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Try ```tool <name> format used by some providers (e.g., xAI grok)
+    // Example: ```tool file_write\n{"path": "...", "content": "..."}\n```
+    if calls.is_empty() {
+        static MD_TOOL_NAME_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)").unwrap());
+        let mut md_text_parts: Vec<String> = Vec::new();
+        let mut last_end = 0;
+
+        for cap in MD_TOOL_NAME_RE.captures_iter(response) {
+            let full_match = cap.get(0).unwrap();
+            let before = &response[last_end..full_match.start()];
+            if !before.trim().is_empty() {
+                md_text_parts.push(before.trim().to_string());
+            }
+            let tool_name = &cap[1];
+            let inner = &cap[2];
+
+            // Try to parse the inner content as JSON arguments
+            let json_values = extract_json_values(inner);
+            if !json_values.is_empty() {
+                for value in json_values {
+                    let arguments = if value.is_object() {
+                        value
+                    } else {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    };
+                    calls.push(ParsedToolCall {
+                        name: tool_name.to_string(),
+                        arguments,
+                        tool_call_id: None,
+                    });
+                }
+            } else {
+                // Log a warning if we found a tool block but couldn't parse arguments
+                tracing::warn!(
+                    tool_name = %tool_name,
+                    inner = %inner.chars().take(100).collect::<String>(),
+                    "Found ```tool <name> block but could not parse JSON arguments"
+                );
+            }
+            last_end = full_match.end();
+        }
+
+        if !calls.is_empty() {
+            let after = &response[last_end..];
+            if !after.trim().is_empty() {
+                md_text_parts.push(after.trim().to_string());
+            }
+            text_parts = md_text_parts;
+            remaining = "";
+        }
+    }
+
     // XML attribute-style tool calls:
     // <minimax:toolcall>
     // <invoke name="shell">
@@ -1643,6 +1696,11 @@ fn detect_tool_call_parse_issue(response: &str, parsed_calls: &[ParsedToolCall])
         || trimmed.contains("```tool_call")
         || trimmed.contains("```toolcall")
         || trimmed.contains("```tool-call")
+        || trimmed.contains("```tool file_")
+        || trimmed.contains("```tool shell")
+        || trimmed.contains("```tool web_")
+        || trimmed.contains("```tool memory_")
+        || trimmed.contains("```tool ") // Generic ```tool <name> pattern
         || trimmed.contains("\"tool_calls\"")
         || trimmed.contains("TOOL_CALL")
         || trimmed.contains("<FunctionCall>");
@@ -2705,6 +2763,7 @@ pub async fn run(
         composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
@@ -2828,7 +2887,7 @@ pub async fn run(
     if config.browser.enabled {
         tool_descs.push((
             "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
+            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
     }
     if config.composio.enabled {
@@ -2934,10 +2993,11 @@ pub async fn run(
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
-            msg.clone()
+            format!("[{now}] {msg}")
         } else {
-            format!("{context}{msg}")
+            format!("{context}[{now}] {msg}")
         };
 
         let mut history = vec![
@@ -3058,10 +3118,11 @@ pub async fn run(
                 .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
             let enriched = if context.is_empty() {
-                user_input.clone()
+                format!("[{now}] {user_input}")
             } else {
-                format!("{context}{user_input}")
+                format!("{context}[{now}] {user_input}")
             };
 
             history.push(ChatMessage::user(&enriched));
@@ -3169,6 +3230,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
@@ -3289,10 +3351,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
     let context = format!("{mem_context}{hw_context}");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let enriched = if context.is_empty() {
-        message.to_string()
+        format!("[{now}] {message}")
     } else {
-        format!("{context}{message}")
+        format!("{context}[{now}] {message}")
     };
 
     let mut history = vec![
@@ -4235,6 +4298,64 @@ Done."#;
             "date"
         );
         assert!(text.contains("Checking."));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_name_fence_format() {
+        // Issue #1420: xAI grok models use ```tool <name> format
+        let response = r#"I'll write a test file.
+```tool file_write
+{"path": "/home/user/test.txt", "content": "Hello world"}
+```
+Done."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "/home/user/test.txt"
+        );
+        assert!(text.contains("I'll write a test file."));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_name_fence_shell() {
+        // Issue #1420: Test shell command in ```tool shell format
+        let response = r#"```tool shell
+{"command": "ls -la"}
+```"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_multiple_tool_name_fences() {
+        // Multiple tool calls in ```tool <name> format
+        let response = r#"First, I'll write a file.
+```tool file_write
+{"path": "/tmp/a.txt", "content": "A"}
+```
+Then read it.
+```tool file_read
+{"path": "/tmp/a.txt"}
+```
+Done."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(calls[1].name, "file_read");
+        assert!(text.contains("First, I'll write a file."));
+        assert!(text.contains("Then read it."));
         assert!(text.contains("Done."));
     }
 

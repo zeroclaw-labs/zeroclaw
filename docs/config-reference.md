@@ -271,7 +271,7 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
+| `enabled` | `false` | Enable `browser_open` tool (opens URLs in the system browser without scraping) |
 | `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
@@ -327,7 +327,7 @@ Notes:
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
-| `allowed_commands` | _required for shell execution_ | allowlist of executable names |
+| `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -342,6 +342,7 @@ Notes:
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
+- `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
 

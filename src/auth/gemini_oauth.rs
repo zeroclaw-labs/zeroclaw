@@ -524,6 +524,29 @@ pub fn extract_account_email_from_id_token(id_token: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    struct EnvVarRestore {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            if let Some(ref original) = self.original {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn pkce_generates_valid_state() {
         let pkce = generate_pkce_state();
@@ -534,9 +557,10 @@ mod tests {
 
     #[test]
     fn authorize_url_contains_required_params() {
-        // Set test credentials
-        std::env::set_var("GEMINI_OAUTH_CLIENT_ID", "test-client-id");
-        std::env::set_var("GEMINI_OAUTH_CLIENT_SECRET", "test-client-secret");
+        // Isolate environment changes so this test cannot leak into other test modules.
+        let _client_id_guard = EnvVarRestore::set("GEMINI_OAUTH_CLIENT_ID", "test-client-id");
+        let _client_secret_guard =
+            EnvVarRestore::set("GEMINI_OAUTH_CLIENT_SECRET", "test-client-secret");
 
         let pkce = generate_pkce_state();
         let url = build_authorize_url(&pkce).expect("Failed to build authorize URL");

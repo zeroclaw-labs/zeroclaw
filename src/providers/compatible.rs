@@ -33,6 +33,9 @@ pub struct OpenAiCompatibleProvider {
     /// to the first `user` message, then drop the system messages.
     /// Required for providers that reject `role: system` (e.g. MiniMax).
     merge_system_into_user: bool,
+    /// Whether this provider supports OpenAI-style native tool calling.
+    /// When false, tools are injected into the system prompt as text.
+    native_tool_calling: bool,
 }
 
 /// How the provider expects the API key to be sent.
@@ -1079,7 +1082,10 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
+            // Providers that require system-prompt merging (e.g. MiniMax) also
+            // reject OpenAI-style `tools` in the request body.  Fall back to
+            // prompt-guided tool calling for those providers.
+            native_tool_calling: !self.merge_system_into_user,
             vision: self.supports_vision,
         }
     }
@@ -2287,6 +2293,22 @@ mod tests {
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn minimax_provider_disables_native_tool_calling() {
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(
+            !caps.native_tool_calling,
+            "MiniMax should use prompt-guided tool calling, not native"
+        );
+        assert!(!caps.vision);
     }
 
     #[test]
