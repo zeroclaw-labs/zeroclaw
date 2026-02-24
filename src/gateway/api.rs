@@ -643,7 +643,10 @@ fn restore_masked_sensitive_fields(
     current: &crate::config::Config,
 ) {
     restore_optional_secret(&mut incoming.api_key, &current.api_key);
-    restore_vec_secrets(&mut incoming.reliability.api_keys, &current.reliability.api_keys);
+    restore_vec_secrets(
+        &mut incoming.reliability.api_keys,
+        &current.reliability.api_keys,
+    );
     restore_optional_secret(&mut incoming.composio.api_key, &current.composio.api_key);
     restore_optional_secret(
         &mut incoming.browser.computer_use.api_key,
@@ -727,8 +730,14 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.irc.as_mut(),
         current.channels_config.irc.as_ref(),
     ) {
-        restore_optional_secret(&mut incoming_ch.server_password, &current_ch.server_password);
-        restore_optional_secret(&mut incoming_ch.nickserv_password, &current_ch.nickserv_password);
+        restore_optional_secret(
+            &mut incoming_ch.server_password,
+            &current_ch.server_password,
+        );
+        restore_optional_secret(
+            &mut incoming_ch.nickserv_password,
+            &current_ch.nickserv_password,
+        );
         restore_optional_secret(&mut incoming_ch.sasl_password, &current_ch.sasl_password);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
