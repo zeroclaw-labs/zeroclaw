@@ -51,6 +51,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod task_plan;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
@@ -91,6 +92,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -226,6 +228,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
