@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,6 +18,11 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_remote_media_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("https://") || trimmed.starts_with("http://")
 }
 
 fn is_image_filename(filename: &str) -> bool {
@@ -57,6 +62,32 @@ fn extract_image_marker_from_attachment(attachment: &serde_json::Value) -> Optio
     Some(format!("[IMAGE:{url}]"))
 }
 
+fn parse_image_marker_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let marker = trimmed.strip_prefix("[IMAGE:")?.strip_suffix(']')?.trim();
+    if marker.is_empty() {
+        return None;
+    }
+    Some(marker)
+}
+
+fn parse_outgoing_content(content: &str) -> (String, Vec<String>) {
+    let mut passthrough_lines = Vec::new();
+    let mut image_urls = Vec::new();
+
+    for line in content.lines() {
+        if let Some(marker_target) = parse_image_marker_line(line) {
+            if is_remote_media_url(marker_target) {
+                image_urls.push(marker_target.to_string());
+                continue;
+            }
+        }
+        passthrough_lines.push(line);
+    }
+
+    (passthrough_lines.join("\n").trim().to_string(), image_urls)
+}
+
 fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
     let text = payload
         .get("content")
@@ -88,6 +119,55 @@ fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
     }
 
     Some(format!("{text}\n\n{}", image_markers.join("\n")))
+}
+
+fn apply_passive_reply_fields(body: &mut Map<String, Value>, msg_id: Option<&str>, msg_seq: u64) {
+    if let Some(msg_id) = msg_id {
+        body.insert("msg_id".to_string(), Value::String(msg_id.to_string()));
+        body.insert("msg_seq".to_string(), Value::from(msg_seq));
+    }
+}
+
+fn build_text_message_body(content: &str, msg_id: Option<&str>, msg_seq: u64) -> Option<Value> {
+    let text = content.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut body = Map::new();
+    body.insert("content".to_string(), Value::String(text.to_string()));
+    body.insert("msg_type".to_string(), Value::from(0));
+    apply_passive_reply_fields(&mut body, msg_id, msg_seq);
+
+    Some(Value::Object(body))
+}
+
+fn build_media_message_body(file_info: &str, msg_id: Option<&str>, msg_seq: u64) -> Value {
+    let mut body = Map::new();
+    body.insert("content".to_string(), Value::String(" ".to_string()));
+    body.insert("msg_type".to_string(), Value::from(7));
+    body.insert("media".to_string(), json!({ "file_info": file_info }));
+    apply_passive_reply_fields(&mut body, msg_id, msg_seq);
+    Value::Object(body)
+}
+
+fn resolve_send_endpoints(recipient: &str) -> (String, String) {
+    if let Some(group_id) = recipient.strip_prefix("group:") {
+        (
+            format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
+            format!("{QQ_API_BASE}/v2/groups/{group_id}/files"),
+        )
+    } else {
+        let raw_uid = recipient.strip_prefix("user:").unwrap_or(recipient);
+        let user_id: String = raw_uid
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (
+            format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
+            format!("{QQ_API_BASE}/v2/users/{user_id}/files"),
+        )
+    }
 }
 
 /// Deduplication set capacity — evict half of entries when full.
@@ -122,6 +202,66 @@ impl QQChannel {
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    async fn post_json(&self, token: &str, url: &str, body: &Value, op: &str) -> anyhow::Result<()> {
+        ensure_https(url)?;
+
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("QQ {op} failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn upload_media_file_info(
+        &self,
+        token: &str,
+        files_url: &str,
+        media_url: &str,
+    ) -> anyhow::Result<String> {
+        ensure_https(files_url)?;
+        ensure_https(media_url)?;
+
+        let upload_body = json!({
+            "file_type": 1,
+            "url": media_url,
+            "srv_send_msg": false
+        });
+
+        let resp = self
+            .http_client()
+            .post(files_url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&upload_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("QQ upload media failed ({status}): {err}");
+        }
+
+        let payload: Value = resp.json().await?;
+        let file_info = payload
+            .get("file_info")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("QQ upload media response missing file_info"))?;
+
+        Ok(file_info.to_string())
     }
 
     /// Fetch an access token from QQ's OAuth2 endpoint.
@@ -250,49 +390,35 @@ impl Channel for QQChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
+        let (message_url, files_url) = resolve_send_endpoints(&message.recipient);
 
-        // Determine if this is a group or private message based on recipient format
-        // Format: "user:{openid}" or "group:{group_openid}"
-        let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
-            (
-                format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
-            )
-        } else {
-            let raw_uid = message
-                .recipient
-                .strip_prefix("user:")
-                .unwrap_or(&message.recipient);
-            let user_id: String = raw_uid
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            (
-                format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
-            )
-        };
+        let passive_msg_id = message
+            .thread_ts
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut msg_seq: u64 = 1;
 
-        ensure_https(&url)?;
+        let (text_content, image_urls) = parse_outgoing_content(&message.content);
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await?;
+        if let Some(body) = build_text_message_body(&text_content, passive_msg_id, msg_seq) {
+            self.post_json(&token, &message_url, &body, "send message")
+                .await?;
+            if passive_msg_id.is_some() {
+                msg_seq += 1;
+            }
+        }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send message failed ({status}): {err}");
+        for image_url in image_urls {
+            let file_info = self
+                .upload_media_file_info(&token, &files_url, &image_url)
+                .await?;
+            let media_body = build_media_message_body(&file_info, passive_msg_id, msg_seq);
+            self.post_json(&token, &message_url, &media_body, "send message")
+                .await?;
+            if passive_msg_id.is_some() {
+                msg_seq += 1;
+            }
         }
 
         Ok(())
@@ -460,7 +586,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                                thread_ts: None,
+                                thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -498,7 +624,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                                thread_ts: None,
+                                thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -666,5 +792,60 @@ allowed_users = ["user1"]
         });
 
         assert_eq!(compose_message_content(&payload), None);
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_extracts_remote_image_markers() {
+        let input = "hello\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:http://cdn.example.com/b.jpg]\nbye";
+        let (text, images) = parse_outgoing_content(input);
+
+        assert_eq!(text, "hello\nbye");
+        assert_eq!(
+            images,
+            vec![
+                "https://cdn.example.com/a.png".to_string(),
+                "http://cdn.example.com/b.jpg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_keeps_non_remote_image_marker_as_text() {
+        let input = "[IMAGE:/tmp/a.png]\nhello";
+        let (text, images) = parse_outgoing_content(input);
+
+        assert_eq!(text, "[IMAGE:/tmp/a.png]\nhello");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn test_build_text_message_body_with_passive_fields() {
+        let body = build_text_message_body("hello", Some("msg-123"), 2).expect("text body");
+        assert_eq!(
+            body,
+            json!({
+                "content": "hello",
+                "msg_type": 0,
+                "msg_id": "msg-123",
+                "msg_seq": 2
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_media_message_body_with_passive_fields() {
+        let body = build_media_message_body("file-info-abc", Some("msg-123"), 3);
+        assert_eq!(
+            body,
+            json!({
+                "content": " ",
+                "msg_type": 7,
+                "media": {
+                    "file_info": "file-info-abc"
+                },
+                "msg_id": "msg-123",
+                "msg_seq": 3
+            })
+        );
     }
 }
