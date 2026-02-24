@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! Config Schema Boundary Tests
 //!
 //! Validates: config defaults, backward compatibility, invalid input rejection,

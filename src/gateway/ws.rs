@@ -71,8 +71,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     while let Some(msg) = socket.recv().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => break,
-            Err(_) => break,
+            Ok(Message::Close(_)) | Err(_) => break,
             _ => continue,
         };
 

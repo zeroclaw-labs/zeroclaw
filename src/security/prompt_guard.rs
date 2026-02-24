@@ -114,7 +114,9 @@ impl PromptGuard {
         // Normalize score to 0.0-1.0 range (max possible is 6.0, one per category)
         let normalized_score = (total_score / 6.0).min(1.0);
 
-        if !detected_patterns.is_empty() {
+        if detected_patterns.is_empty() {
+            GuardResult::Safe
+        } else {
             match self.action {
                 GuardAction::Block if max_score > self.sensitivity => {
                     GuardResult::Blocked(format!(
@@ -125,8 +127,6 @@ impl PromptGuard {
                 }
                 _ => GuardResult::Suspicious(detected_patterns, normalized_score),
             }
-        } else {
-            GuardResult::Safe
         }
     }
 

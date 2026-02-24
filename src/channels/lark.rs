@@ -1503,6 +1503,7 @@ impl LarkChannel {
 // WS helper functions
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::cast_possible_truncation)]
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;

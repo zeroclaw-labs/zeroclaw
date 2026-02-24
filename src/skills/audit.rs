@@ -200,12 +200,12 @@ fn audit_manifest_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
                     .push(format!("{rel}: tools[{idx}] is missing a command field."));
             }
 
-            if kind.eq_ignore_ascii_case("script") || kind.eq_ignore_ascii_case("shell") {
-                if command.is_some_and(|value| value.trim().is_empty()) {
-                    report
-                        .findings
-                        .push(format!("{rel}: tools[{idx}] has an empty {kind} command."));
-                }
+            if (kind.eq_ignore_ascii_case("script") || kind.eq_ignore_ascii_case("shell"))
+                && command.is_some_and(|value| value.trim().is_empty())
+            {
+                report
+                    .findings
+                    .push(format!("{rel}: tools[{idx}] has an empty {kind} command."));
             }
         }
     }

@@ -85,6 +85,7 @@ impl Tool for ShellTool {
         })
     }
 
+    #[allow(clippy::incompatible_msrv)]
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = args
             .get("command")
