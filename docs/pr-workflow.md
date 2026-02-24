@@ -125,6 +125,7 @@ Maintain these branch protection rules on `dev` and `main`:
 - `CI Required Gate` is the merge gate.
 - Docs-only PRs use fast-path and skip heavy Rust jobs.
 - Non-doc PRs must pass lint, tests, and release build smoke check.
+- Rust-impacting PRs use the same required gate set as `dev`/`main` pushes (no PR build-only shortcut).
 
 ### 4.3 Step C: Review
 
