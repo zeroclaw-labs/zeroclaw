@@ -82,6 +82,7 @@ Hubs localisés : [简体中文](README.zh-CN.md) · [日本語](README.ja.md) �
 ## Navigation Système & Gouvernance
 
 - Table des matières unifiée : [SUMMARY.md](SUMMARY.md)
+- Carte de structure docs (langue/partie/fonction) : [structure/README.md](structure/README.md)
 - Inventaire/classification de la documentation : [docs-inventory.md](docs-inventory.md)
 - Instantané de triage du projet : [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
 

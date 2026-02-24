@@ -84,6 +84,7 @@ Hub bản địa hóa: [简体中文](README.zh-CN.md) · [日本語](README.ja.
 ## Quản lý tài liệu
 
 - Mục lục thống nhất (TOC): [SUMMARY.md](i18n/vi/SUMMARY.md)
+- Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [structure/README.md](structure/README.md)
 - Danh mục và phân loại tài liệu: [docs-inventory.md](docs-inventory.md)
 
 ## Ngôn ngữ khác

@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 21, 2026**.
 
 Config path resolution at startup:
 
@@ -23,6 +23,7 @@ Schema export command:
 | Key | Default | Notes |
 |---|---|---|
 | `default_provider` | `openrouter` | provider ID or alias |
+| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
@@ -33,11 +34,19 @@ Schema export command:
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
 | `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+| `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
+| `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
+| `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
 
 Notes:
 
 - `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
 - Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+- Runtime traces are intended for debugging tool-call failures and malformed model tool payloads. They can contain model output text, so keep this disabled by default on shared hosts.
+- Query runtime traces with:
+  - `zeroclaw doctor traces --limit 20`
+  - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
+  - `zeroclaw doctor traces --id <trace-id>`
 
 Example:
 
@@ -46,6 +55,9 @@ Example:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
 ```
 
 ## Environment Provider Overrides
@@ -60,6 +72,10 @@ Operational note for container users:
 
 - If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
 - Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
+- For OpenAI-compatible Responses fallback transport:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode (`wss://.../responses`) for compatible providers.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` forces HTTP-only mode.
+  - Unset = auto (websocket-first only when endpoint host is `api.openai.com`, then HTTP fallback if websocket fails).
 
 ## `[agent]`
 
@@ -77,6 +93,52 @@ Notes:
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+
+## `[security.otp]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable OTP gating for sensitive actions/domains |
+| `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
+| `token_ttl_secs` | `30` | TOTP time-step window in seconds |
+| `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
+| `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
+| `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
+| `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
+
+Notes:
+
+- Domain patterns support wildcard `*`.
+- Category presets expand to curated domain sets during validation.
+- Invalid domain globs or unknown categories fail fast at startup.
+- When `enabled = true` and no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
+
+Example:
+
+```toml
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 300
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+```
+
+## `[security.estop]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable emergency-stop state machine and CLI |
+| `state_file` | `~/.zeroclaw/estop-state.json` | Persistent estop state path |
+| `require_otp_to_resume` | `true` | Require OTP validation before resume operations |
+
+Notes:
+
+- Estop state is persisted atomically and reloaded on startup.
+- Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
+- Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
 ## `[agents.<name>]`
 
@@ -145,6 +207,7 @@ Notes:
   - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
+- Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
 
 ## `[composio]`
 
@@ -213,8 +276,8 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `enabled` | `false` | Enable `browser_open` tool (opens URLs in the system browser without scraping) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -244,14 +307,15 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
+- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
@@ -267,11 +331,12 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
-| `workspace_only` | `true` | restrict writes/command paths to workspace scope |
-| `allowed_commands` | _required for shell execution_ | allowlist of executable names |
-| `forbidden_paths` | `[]` | explicit path denylist |
-| `max_actions_per_hour` | `100` | per-policy action budget |
-| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
+| `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
+| `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
+| `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
+| `max_actions_per_hour` | `20` | per-policy action budget |
+| `max_cost_per_day_cents` | `500` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
@@ -280,8 +345,18 @@ Notes:
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
+- `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
+- `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+
+```toml
+[autonomy]
+workspace_only = false
+forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+```
 
 ## `[memory]`
 
@@ -310,6 +385,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
+| `max_tokens` | unset | Optional per-route output token cap forwarded to provider APIs |
 | `api_key` | unset | Optional API key override for this route's provider |
 
 ### `[[embedding_routes]]`
@@ -330,6 +406,7 @@ embedding_model = "hint:semantic"
 hint = "reasoning"
 provider = "openrouter"
 model = "provider/model-id"
+max_tokens = 8192
 
 [[embedding_routes]]
 hint = "semantic"
@@ -343,6 +420,17 @@ Upgrade strategy:
 1. Keep hints stable (`hint:reasoning`, `hint:semantic`).
 2. Update only `model = "...new-version..."` in the route entries.
 3. Validate with `zeroclaw doctor` before restart/rollout.
+
+Natural-language config path:
+
+- During normal agent chat, ask the assistant to rewire routes in plain language.
+- The runtime can persist these updates via tool `model_routing_config` (defaults, scenarios, and delegate sub-agents) without manual TOML editing.
+
+Example requests:
+
+- `Set conversation to provider kimi, model moonshot-v1-8k.`
+- `Set coding to provider openai, model gpt-5.3-codex, and auto-route when message contains code blocks.`
+- `Create a coder sub-agent using openai/gpt-5.3-codex with tools file_read,file_write,shell.`
 
 ## `[query_classification]`
 

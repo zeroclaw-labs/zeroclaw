@@ -46,7 +46,7 @@ impl Tool for PdfReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the PDF file within the workspace"
+                    "description": "Path to the PDF file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
                 "max_chars": {
                     "type": "integer",
@@ -117,10 +117,10 @@ impl Tool for PdfReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_path.display()
-                )),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_path),
+                ),
             });
         }
 

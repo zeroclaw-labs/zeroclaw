@@ -1,0 +1,185 @@
+name: Sec Vorpal Reviewdog
+
+on:
+    workflow_dispatch:
+        inputs:
+            scan_scope:
+                description: "File selection mode when source_path is empty"
+                required: true
+                type: choice
+                default: changed
+                options:
+                    - changed
+                    - all
+            base_ref:
+                description: "Base branch/ref for changed diff mode"
+                required: true
+                type: string
+                default: main
+            source_path:
+                description: "Optional comma-separated file paths to scan (overrides scan_scope)"
+                required: false
+                type: string
+            include_tests:
+                description: "Include test/fixture files in scan selection"
+                required: true
+                type: choice
+                default: "false"
+                options:
+                    - "false"
+                    - "true"
+            folders_to_ignore:
+                description: "Optional comma-separated path prefixes to ignore"
+                required: false
+                type: string
+                default: target,node_modules,web/dist,.venv,venv
+            reporter:
+                description: "Reviewdog reporter mode"
+                required: true
+                type: choice
+                default: github-pr-check
+                options:
+                    - github-pr-check
+                    - github-pr-review
+            filter_mode:
+                description: "Reviewdog filter mode"
+                required: true
+                type: choice
+                default: file
+                options:
+                    - added
+                    - diff_context
+                    - file
+                    - nofilter
+            level:
+                description: "Reviewdog severity level"
+                required: true
+                type: choice
+                default: error
+                options:
+                    - info
+                    - warning
+                    - error
+            fail_on_error:
+                description: "Fail workflow when Vorpal reports findings"
+                required: true
+                type: choice
+                default: "false"
+                options:
+                    - "false"
+                    - "true"
+            reviewdog_flags:
+                description: "Optional extra reviewdog flags"
+                required: false
+                type: string
+
+concurrency:
+    group: sec-vorpal-reviewdog-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    checks: write
+    pull-requests: write
+
+jobs:
+    vorpal:
+        name: Vorpal Reviewdog Scan
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Resolve source paths
+              id: sources
+              shell: bash
+              env:
+                  INPUT_SOURCE_PATH: ${{ inputs.source_path }}
+                  INPUT_SCAN_SCOPE: ${{ inputs.scan_scope }}
+                  INPUT_BASE_REF: ${{ inputs.base_ref }}
+                  INPUT_INCLUDE_TESTS: ${{ inputs.include_tests }}
+              run: |
+                  set -euo pipefail
+
+                  strip_space() {
+                      local value="$1"
+                      value="${value//$'\n'/}"
+                      value="${value//$'\r'/}"
+                      value="${value// /}"
+                      echo "$value"
+                  }
+
+                  source_override="$(strip_space "${INPUT_SOURCE_PATH}")"
+                  if [ -n "${source_override}" ]; then
+                      normalized="$(echo "${INPUT_SOURCE_PATH}" | tr '\n' ',' | sed -E 's/[[:space:]]+//g; s/,+/,/g; s/^,|,$//g')"
+                      if [ -n "${normalized}" ]; then
+                          {
+                              echo "scan=true"
+                              echo "source_path=${normalized}"
+                              echo "selection=manual"
+                          } >> "${GITHUB_OUTPUT}"
+                          exit 0
+                      fi
+                  fi
+
+                  include_ext='\.(py|js|jsx|ts|tsx)$'
+                  exclude_paths='^(target/|node_modules/|web/node_modules/|dist/|web/dist/|\.venv/|venv/)'
+                  exclude_tests='(^|/)(test|tests|__tests__|fixtures|mocks|examples)/|(^|/)test_helpers/|(_test\.py$)|(^|/)test_.*\.py$|(\.spec\.(ts|tsx|js|jsx)$)|(\.test\.(ts|tsx|js|jsx)$)'
+
+                  if [ "${INPUT_SCAN_SCOPE}" = "all" ]; then
+                      candidate_files="$(git ls-files)"
+                  else
+                      base_ref="${INPUT_BASE_REF#refs/heads/}"
+                      base_ref="${base_ref#origin/}"
+                      if git fetch --no-tags --depth=1 origin "${base_ref}" >/dev/null 2>&1; then
+                          if merge_base="$(git merge-base HEAD "origin/${base_ref}" 2>/dev/null)"; then
+                              candidate_files="$(git diff --name-only --diff-filter=ACMR "${merge_base}"...HEAD)"
+                          else
+                              echo "Unable to resolve merge-base for origin/${base_ref}; falling back to tracked files."
+                              candidate_files="$(git ls-files)"
+                          fi
+                      else
+                          echo "Unable to fetch origin/${base_ref}; falling back to tracked files."
+                          candidate_files="$(git ls-files)"
+                      fi
+                  fi
+
+                  source_files="$(printf '%s\n' "${candidate_files}" | sed '/^$/d' | grep -E "${include_ext}" | grep -Ev "${exclude_paths}" || true)"
+                  if [ "${INPUT_INCLUDE_TESTS}" != "true" ] && [ -n "${source_files}" ]; then
+                      source_files="$(printf '%s\n' "${source_files}" | grep -Ev "${exclude_tests}" || true)"
+                  fi
+                  if [ -z "${source_files}" ]; then
+                      {
+                          echo "scan=false"
+                          echo "source_path="
+                          echo "selection=none"
+                      } >> "${GITHUB_OUTPUT}"
+                      exit 0
+                  fi
+
+                  source_path="$(printf '%s\n' "${source_files}" | paste -sd, -)"
+                  {
+                      echo "scan=true"
+                      echo "source_path=${source_path}"
+                      echo "selection=auto-${INPUT_SCAN_SCOPE}"
+                  } >> "${GITHUB_OUTPUT}"
+
+            - name: No supported files to scan
+              if: steps.sources.outputs.scan != 'true'
+              shell: bash
+              run: |
+                  echo "No supported files selected for Vorpal scan (extensions: .py .js .jsx .ts .tsx)."
+
+            - name: Run Vorpal with reviewdog
+              if: steps.sources.outputs.scan == 'true'
+              uses: Checkmarx/vorpal-reviewdog-github-action@8cc292f337a2f1dea581b4f4bd73852e7becb50d # v1.2.0
+              with:
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
+                  source_path: ${{ steps.sources.outputs.source_path }}
+                  folders_to_ignore: ${{ inputs.folders_to_ignore }}
+                  reporter: ${{ inputs.reporter }}
+                  filter_mode: ${{ inputs.filter_mode }}
+                  level: ${{ inputs.level }}
+                  fail_on_error: ${{ inputs.fail_on_error }}
+                  reviewdog_flags: ${{ inputs.reviewdog_flags }}

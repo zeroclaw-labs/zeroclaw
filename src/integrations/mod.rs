@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::Result;
 
 /// Integration status
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationStatus {
     /// Fully implemented and ready to use
     Available,
@@ -15,7 +15,7 @@ pub enum IntegrationStatus {
 }
 
 /// Integration category
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationCategory {
     Chat,
     AiModel,

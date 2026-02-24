@@ -4,6 +4,7 @@ pub mod noop;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
 pub mod prometheus;
+pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
@@ -112,6 +113,7 @@ mod tests {
             backend: "otel".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
+            ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-otel") {
             "otel"
@@ -127,6 +129,7 @@ mod tests {
             backend: "opentelemetry".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
+            ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-otel") {
             "otel"
@@ -142,6 +145,7 @@ mod tests {
             backend: "otlp".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
+            ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-otel") {
             "otel"

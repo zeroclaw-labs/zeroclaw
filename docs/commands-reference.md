@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 20, 2026**.
+Last verified: **February 21, 2026**.
 
 ## Top-Level Commands
 
@@ -15,6 +15,7 @@ Last verified: **February 20, 2026**.
 | `service` | Manage user-level OS service lifecycle |
 | `doctor` | Run diagnostics and freshness checks |
 | `status` | Print current configuration and system summary |
+| `estop` | Engage/resume emergency stop levels and inspect estop state |
 | `cron` | Manage scheduled tasks |
 | `models` | Refresh provider model catalogs |
 | `providers` | List provider IDs, aliases, and active provider |
@@ -41,7 +42,9 @@ Last verified: **February 20, 2026**.
 
 `onboard` safety behavior:
 
-- If `config.toml` already exists, `onboard` asks for explicit confirmation before overwrite.
+- If `config.toml` already exists and you run `--interactive`, onboarding now offers two modes:
+  - Full onboarding (overwrite `config.toml`)
+  - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
 - Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
 
@@ -52,10 +55,33 @@ Last verified: **February 20, 2026**.
 - `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
 - `zeroclaw agent --peripheral <board:path>`
 
+Tip:
+
+- In interactive chat, you can ask for route changes in natural language (for example “conversation uses kimi, coding uses gpt-5.3-codex”); the assistant can persist this via tool `model_routing_config`.
+
 ### `gateway` / `daemon`
 
 - `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
 - `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+
+### `estop`
+
+- `zeroclaw estop` (engage `kill-all`)
+- `zeroclaw estop --level network-kill`
+- `zeroclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
+- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `zeroclaw estop status`
+- `zeroclaw estop resume`
+- `zeroclaw estop resume --network`
+- `zeroclaw estop resume --domain "*.chase.com"`
+- `zeroclaw estop resume --tool shell`
+- `zeroclaw estop resume --otp <123456>`
+
+Notes:
+
+- `estop` commands require `[security.estop].enabled = true`.
+- When `[security.estop].require_otp_to_resume = true`, `resume` requires OTP validation.
+- OTP prompt appears automatically if `--otp` is omitted.
 
 ### `service`
 
@@ -88,7 +114,20 @@ Notes:
 - `zeroclaw models refresh --provider <ID>`
 - `zeroclaw models refresh --force`
 
-`models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
+`models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
+
+### `doctor`
+
+- `zeroclaw doctor`
+- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
+- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `zeroclaw doctor traces --id <TRACE_ID>`
+
+Provider connectivity matrix CI/local helper:
+
+- `python3 scripts/ci/provider_connectivity_matrix.py --binary target/release-fast/zeroclaw --contract .github/connectivity/probe-contract.json`
+
+`doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
 
@@ -105,6 +144,7 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+- `/new`
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`
@@ -122,10 +162,19 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 ### `skills`
 
 - `zeroclaw skills list`
+- `zeroclaw skills audit <source_or_name>`
 - `zeroclaw skills install <source>`
 - `zeroclaw skills remove <name>`
 
 `<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
+
+`skills install` always runs a built-in static security audit before the skill is accepted. The audit blocks:
+- symlinks inside the skill package
+- script-like files (`.sh`, `.bash`, `.zsh`, `.ps1`, `.bat`, `.cmd`)
+- high-risk command snippets (for example pipe-to-shell payloads)
+- markdown links that escape the skill root, point to remote markdown, or target script files
+
+Use `skills audit` to manually validate a candidate skill directory (or an installed skill by name) before sharing it.
 
 Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injected into the agent system prompt at runtime, so the model can follow skill instructions without manually reading skill files.
 

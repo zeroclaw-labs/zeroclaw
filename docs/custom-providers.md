@@ -14,6 +14,25 @@ api_key = "your-api-key"
 default_model = "your-model-name"
 ```
 
+Optional API mode:
+
+```toml
+# Default (chat-completions first, responses fallback when available)
+provider_api = "openai-chat-completions"
+
+# Responses-first mode (calls /responses directly)
+provider_api = "openai-responses"
+```
+
+`provider_api` is only valid when `default_provider` uses `custom:<url>`.
+
+Responses API WebSocket mode is supported for OpenAI-compatible endpoints:
+
+- Auto mode: when your `custom:` endpoint resolves to `api.openai.com`, ZeroClaw will try WebSocket mode first (`wss://.../responses`) and automatically fall back to HTTP if the websocket handshake or stream fails.
+- Manual override:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode for any `custom:` endpoint.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` disables websocket mode and uses HTTP only.
+
 ### Anthropic-Compatible Endpoints (`anthropic-custom:`)
 
 For services that implement the Anthropic API format:
@@ -73,6 +92,37 @@ Quick validation:
 
 ```bash
 zeroclaw models refresh --provider llamacpp
+zeroclaw agent -m "hello"
+```
+
+You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
+
+## SGLang Server
+
+ZeroClaw includes a first-class local provider for [SGLang](https://github.com/sgl-project/sglang):
+
+- Provider ID: `sglang`
+- Default endpoint: `http://localhost:30000/v1`
+- API key is optional unless the server requires authentication
+
+Start a local server (example):
+
+```bash
+python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
+```
+
+Then configure ZeroClaw:
+
+```toml
+default_provider = "sglang"
+default_model = "meta-llama/Llama-3.1-8B-Instruct"
+default_temperature = 0.7
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider sglang
 zeroclaw agent -m "hello"
 ```
 

@@ -1,10 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+
+mod audit;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -122,6 +124,25 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
             continue;
         }
 
+        match audit::audit_skill_directory(&path) {
+            Ok(report) if report.is_clean() => {}
+            Ok(report) => {
+                tracing::warn!(
+                    "skipping insecure skill directory {}: {}",
+                    path.display(),
+                    report.summary()
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "skipping unauditable skill directory {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        }
+
         // Try SKILL.toml first, then SKILL.md
         let manifest_path = path.join("SKILL.toml");
         let md_path = path.join("SKILL.md");
@@ -141,6 +162,14 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
 }
 
 fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
+    // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
+    // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
+    // as executable skills.
+    let nested_skills_dir = repo_dir.join("skills");
+    if nested_skills_dir.is_dir() {
+        return load_skills_from_directory(&nested_skills_dir);
+    }
+
     let mut skills = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(repo_dir) else {
@@ -167,6 +196,25 @@ fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
             .is_some_and(|name| name.eq_ignore_ascii_case("README.md"));
         if is_readme {
             continue;
+        }
+
+        match audit::audit_open_skill_markdown(&path, repo_dir) {
+            Ok(report) if report.is_clean() => {}
+            Ok(report) => {
+                tracing::warn!(
+                    "skipping insecure open-skill file {}: {}",
+                    path.display(),
+                    report.summary()
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "skipping unauditable open-skill file {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
         }
 
         if let Ok(skill) = load_open_skill_md(&path) {
@@ -628,21 +676,155 @@ fn is_git_scp_source(source: &str) -> bool {
         && !host.contains('\\')
 }
 
-/// Recursively copy a directory (used as fallback when symlinks aren't available)
-#[cfg(any(windows, not(unix)))]
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
+fn snapshot_skill_children(skills_path: &Path) -> Result<HashSet<PathBuf>> {
+    let mut paths = HashSet::new();
+    for entry in std::fs::read_dir(skills_path)? {
+        let entry = entry?;
+        paths.insert(entry.path());
+    }
+    Ok(paths)
+}
+
+fn detect_newly_installed_directory(
+    skills_path: &Path,
+    before: &HashSet<PathBuf>,
+) -> Result<PathBuf> {
+    let mut created = Vec::new();
+    for entry in std::fs::read_dir(skills_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !before.contains(&path) && path.is_dir() {
+            created.push(path);
+        }
+    }
+
+    match created.len() {
+        1 => Ok(created.remove(0)),
+        0 => anyhow::bail!(
+            "Unable to determine installed skill directory after clone (no new directory found)"
+        ),
+        _ => anyhow::bail!(
+            "Unable to determine installed skill directory after clone (multiple new directories found)"
+        ),
+    }
+}
+
+fn enforce_skill_security_audit(skill_path: &Path) -> Result<audit::SkillAuditReport> {
+    let report = audit::audit_skill_directory(skill_path)?;
+    if report.is_clean() {
+        return Ok(report);
+    }
+
+    anyhow::bail!("Skill security audit failed: {}", report.summary());
+}
+
+fn remove_git_metadata(skill_path: &Path) -> Result<()> {
+    let git_dir = skill_path.join(".git");
+    if git_dir.exists() {
+        std::fs::remove_dir_all(&git_dir)
+            .with_context(|| format!("failed to remove {}", git_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
+    let src_meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("failed to read metadata for {}", src.display()))?;
+    if src_meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "Refusing to copy symlinked skill source path: {}",
+            src.display()
+        );
+    }
+    if !src_meta.is_dir() {
+        anyhow::bail!("Skill source must be a directory: {}", src.display());
+    }
+
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create destination {}", dest.display()))?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
-        } else {
-            std::fs::copy(&src_path, &dest_path)?;
+        let metadata = std::fs::symlink_metadata(&src_path)
+            .with_context(|| format!("failed to read metadata for {}", src_path.display()))?;
+
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to copy symlink within skill source: {}",
+                src_path.display()
+            );
+        }
+
+        if metadata.is_dir() {
+            copy_dir_recursive_secure(&src_path, &dest_path)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&src_path, &dest_path).with_context(|| {
+                format!(
+                    "failed to copy skill file from {} to {}",
+                    src_path.display(),
+                    dest_path.display()
+                )
+            })?;
         }
     }
+
     Ok(())
+}
+
+fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let source_path = PathBuf::from(source);
+    if !source_path.exists() {
+        anyhow::bail!("Source path does not exist: {source}");
+    }
+
+    let source_path = source_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize source path {source}"))?;
+    let _ = enforce_skill_security_audit(&source_path)?;
+
+    let name = source_path
+        .file_name()
+        .context("Source path must include a directory name")?;
+    let dest = skills_path.join(name);
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+
+    if let Err(err) = copy_dir_recursive_secure(&source_path, &dest) {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(err);
+    }
+
+    match enforce_skill_security_audit(&dest) {
+        Ok(report) => Ok((dest, report.files_scanned)),
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            Err(err)
+        }
+    }
+}
+
+fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let before = snapshot_skill_children(skills_path)?;
+    let output = std::process::Command::new("git")
+        .args(["clone", "--depth", "1", source])
+        .current_dir(skills_path)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Git clone failed: {stderr}");
+    }
+
+    let installed_dir = detect_newly_installed_directory(skills_path, &before)?;
+    remove_git_metadata(&installed_dir)?;
+    match enforce_skill_security_audit(&installed_dir) {
+        Ok(report) => Ok((installed_dir, report.files_scanned)),
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&installed_dir);
+            Err(err)
+        }
+    }
 }
 
 /// Handle the `skills` CLI command
@@ -688,6 +870,39 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             println!();
             Ok(())
         }
+        crate::SkillCommands::Audit { source } => {
+            let source_path = PathBuf::from(&source);
+            let target = if source_path.exists() {
+                source_path
+            } else {
+                skills_dir(workspace_dir).join(&source)
+            };
+
+            if !target.exists() {
+                anyhow::bail!("Skill source or installed skill not found: {source}");
+            }
+
+            let report = audit::audit_skill_directory(&target)?;
+            if report.is_clean() {
+                println!(
+                    "  {} Skill audit passed for {} ({} files scanned).",
+                    console::style("✓").green().bold(),
+                    target.display(),
+                    report.files_scanned
+                );
+                return Ok(());
+            }
+
+            println!(
+                "  {} Skill audit failed for {}",
+                console::style("✗").red().bold(),
+                target.display()
+            );
+            for finding in report.findings {
+                println!("    - {finding}");
+            }
+            anyhow::bail!("Skill audit failed.");
+        }
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
 
@@ -695,88 +910,27 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             std::fs::create_dir_all(&skills_path)?;
 
             if is_git_source(&source) {
-                // Git clone
-                let output = std::process::Command::new("git")
-                    .args(["clone", "--depth", "1", &source])
-                    .current_dir(&skills_path)
-                    .output()?;
-
-                if output.status.success() {
-                    println!(
-                        "  {} Skill installed successfully!",
-                        console::style("✓").green().bold()
-                    );
-                    println!("  Restart `zeroclaw channel start` to activate.");
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    anyhow::bail!("Git clone failed: {stderr}");
-                }
+                let (installed_dir, files_scanned) =
+                    install_git_skill_source(&source, &skills_path)
+                        .with_context(|| format!("failed to install git skill source: {source}"))?;
+                println!(
+                    "  {} Skill installed and audited: {} ({} files scanned)",
+                    console::style("✓").green().bold(),
+                    installed_dir.display(),
+                    files_scanned
+                );
             } else {
-                // Local path — symlink or copy
-                let src = PathBuf::from(&source);
-                if !src.exists() {
-                    anyhow::bail!("Source path does not exist: {source}");
-                }
-                let name = src.file_name().unwrap_or_default();
-                let dest = skills_path.join(name);
-
-                #[cfg(unix)]
-                {
-                    std::os::unix::fs::symlink(&src, &dest)?;
-                    println!(
-                        "  {} Skill linked: {}",
-                        console::style("✓").green().bold(),
-                        dest.display()
-                    );
-                }
-                #[cfg(windows)]
-                {
-                    // On Windows, try symlink first (requires admin or developer mode),
-                    // fall back to directory junction, then copy
-                    use std::os::windows::fs::symlink_dir;
-                    if symlink_dir(&src, &dest).is_ok() {
-                        println!(
-                            "  {} Skill linked: {}",
-                            console::style("✓").green().bold(),
-                            dest.display()
-                        );
-                    } else {
-                        // Try junction as fallback (works without admin)
-                        let junction_result = std::process::Command::new("cmd")
-                            .args(["/C", "mklink", "/J"])
-                            .arg(&dest)
-                            .arg(&src)
-                            .output();
-
-                        if junction_result.is_ok() && junction_result.unwrap().status.success() {
-                            println!(
-                                "  {} Skill linked (junction): {}",
-                                console::style("✓").green().bold(),
-                                dest.display()
-                            );
-                        } else {
-                            // Final fallback: copy the directory
-                            copy_dir_recursive(&src, &dest)?;
-                            println!(
-                                "  {} Skill copied: {}",
-                                console::style("✓").green().bold(),
-                                dest.display()
-                            );
-                        }
-                    }
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    // On other platforms, copy the directory
-                    copy_dir_recursive(&src, &dest)?;
-                    println!(
-                        "  {} Skill copied: {}",
-                        console::style("✓").green().bold(),
-                        dest.display()
-                    );
-                }
+                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
+                    .with_context(|| format!("failed to install local skill source: {source}"))?;
+                println!(
+                    "  {} Skill installed and audited: {} ({} files scanned)",
+                    console::style("✓").green().bold(),
+                    dest.display(),
+                    files_scanned
+                );
             }
 
+            println!("  Security audit completed successfully.");
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
@@ -1294,10 +1448,15 @@ description = "Bare minimum"
         fs::create_dir_all(workspace_dir.join("skills")).unwrap();
 
         let open_skills_dir = dir.path().join("open-skills-local");
-        fs::create_dir_all(&open_skills_dir).unwrap();
+        fs::create_dir_all(open_skills_dir.join("skills/http_request")).unwrap();
         fs::write(open_skills_dir.join("README.md"), "# open skills\n").unwrap();
         fs::write(
-            open_skills_dir.join("http_request.md"),
+            open_skills_dir.join("CONTRIBUTING.md"),
+            "# contribution guide\n",
+        )
+        .unwrap();
+        fs::write(
+            open_skills_dir.join("skills/http_request/SKILL.md"),
             "# HTTP request\nFetch API responses.\n",
         )
         .unwrap();
@@ -1310,6 +1469,7 @@ description = "Bare minimum"
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
+        assert_ne!(skills[0].name, "CONTRIBUTING");
     }
 }
 

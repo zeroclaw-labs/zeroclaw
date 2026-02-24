@@ -17,7 +17,7 @@ Welcome — contributions of all sizes are valued. If this is your first contrib
    - Fork the repository and clone your fork
    - Create a feature branch (`git checkout -b fix/my-change`)
    - Make your changes and run `cargo fmt && cargo clippy && cargo test`
-   - Open a PR against `main` using the PR template
+   - Open a PR against `dev` using the PR template
 
 4. **Start with Track A.** ZeroClaw uses three [collaboration tracks](#collaboration-tracks-risk-based) (A/B/C) based on risk. First-time contributors should target **Track A** (docs, tests, chore) — these require lighter review and are the fastest path to a merged PR.
 

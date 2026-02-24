@@ -31,6 +31,24 @@ COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
+COPY web/ web/
+# Keep release builds resilient when frontend dist assets are not prebuilt in Git.
+RUN mkdir -p web/dist && \
+    if [ ! -f web/dist/index.html ]; then \
+      printf '%s\n' \
+        '<!doctype html>' \
+        '<html lang="en">' \
+        '  <head>' \
+        '    <meta charset="utf-8" />' \
+        '    <meta name="viewport" content="width=device-width,initial-scale=1" />' \
+        '    <title>ZeroClaw Dashboard</title>' \
+        '  </head>' \
+        '  <body>' \
+        '    <h1>ZeroClaw Dashboard Unavailable</h1>' \
+        '    <p>Frontend assets are not bundled in this build. Build the web UI to populate <code>web/dist</code>.</p>' \
+        '  </body>' \
+        '</html>' > web/dist/index.html; \
+    fi
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \

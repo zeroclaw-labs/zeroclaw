@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "description": "Provider/model connectivity probe contract for scheduled CI checks.",
+  "consecutive_transient_failures_to_escalate": 2,
+  "providers": [
+    {
+      "name": "OpenAI",
+      "provider": "openai",
+      "required": true,
+      "secret_env": "OPENAI_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Primary reference provider; validates baseline OpenAI-compatible path."
+    },
+    {
+      "name": "Anthropic",
+      "provider": "anthropic",
+      "required": true,
+      "secret_env": "ANTHROPIC_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Checks non-OpenAI provider fetch path and account health."
+    },
+    {
+      "name": "Gemini",
+      "provider": "gemini",
+      "required": true,
+      "secret_env": "GEMINI_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Validates Google model discovery endpoint availability."
+    },
+    {
+      "name": "OpenRouter",
+      "provider": "openrouter",
+      "required": true,
+      "secret_env": "OPENROUTER_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Routes across many providers; signal for aggregator-side health."
+    },
+    {
+      "name": "Qwen",
+      "provider": "qwen",
+      "required": false,
+      "secret_env": "DASHSCOPE_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Regional provider check; optional for global deployments."
+    },
+    {
+      "name": "NVIDIA NIM",
+      "provider": "nvidia",
+      "required": false,
+      "secret_env": "NVIDIA_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Optional ecosystem endpoint check."
+    },
+    {
+      "name": "OpenAI Codex",
+      "provider": "openai-codex",
+      "required": false,
+      "secret_env": "OPENAI_API_KEY",
+      "timeout_sec": 90,
+      "retries": 2,
+      "notes": "Uses OpenAI-compatible models endpoint to verify Codex-profile discovery path."
+    }
+  ]
+}
