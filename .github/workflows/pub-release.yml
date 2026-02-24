@@ -225,7 +225,7 @@ jobs:
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
               run: |
                   sudo apt-get update -qq
-                  sudo apt-get install -y ${{ matrix.cross_compiler }}
+                  sudo apt-get install -y "${{ matrix.cross_compiler }}"
 
             - name: Setup Android NDK
               if: matrix.android_ndk
