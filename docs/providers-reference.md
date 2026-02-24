@@ -51,6 +51,7 @@ credential is not reused for fallback providers.
 | `deepseek` | — | No | `DEEPSEEK_API_KEY` |
 | `together` | `together-ai` | No | `TOGETHER_API_KEY` |
 | `fireworks` | `fireworks-ai` | No | `FIREWORKS_API_KEY` |
+| `novita` | — | No | `NOVITA_API_KEY` |
 | `perplexity` | — | No | `PERPLEXITY_API_KEY` |
 | `cohere` | — | No | `COHERE_API_KEY` |
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |

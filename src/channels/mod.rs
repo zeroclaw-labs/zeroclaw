@@ -35,6 +35,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -61,6 +62,7 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -149,6 +151,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    NewSession,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -257,11 +260,19 @@ impl InFlightTaskCompletion {
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+    // Include thread_ts for per-topic memory isolation in forum groups
+    match &msg.thread_ts {
+        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
+        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
+    }
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}", msg.channel, msg.sender)
+    // Include thread_ts for per-topic session isolation in forum groups
+    match &msg.thread_ts {
+        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
+        None => format!("{}_{}", msg.channel, msg.sender),
+    }
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
@@ -404,16 +415,33 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
+fn build_channel_system_prompt(
+    base_prompt: &str,
+    channel_name: &str,
+    reply_target: &str,
+) -> String {
+    let mut prompt = base_prompt.to_string();
+
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
-        if base_prompt.is_empty() {
-            instructions.to_string()
+        if prompt.is_empty() {
+            prompt = instructions.to_string();
         } else {
-            format!("{base_prompt}\n\n{instructions}")
+            prompt = format!("{prompt}\n\n{instructions}");
         }
-    } else {
-        base_prompt.to_string()
     }
+
+    if !reply_target.is_empty() {
+        let context = format!(
+            "\n\nChannel context: You are currently responding on channel={channel_name}, \
+             reply_target={reply_target}. When scheduling delayed messages or reminders \
+             via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
+             \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
+             reaches the user."
+        );
+        prompt.push_str(&context);
+    }
+
+    prompt
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -489,6 +517,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
 }
@@ -1025,6 +1054,10 @@ async fn handle_runtime_command_if_needed(
                     current.provider
                 )
             }
+        }
+        ChannelRuntimeCommand::NewSession => {
+            clear_sender_history(ctx, &sender_key);
+            "Conversation history cleared. Starting fresh.".to_string()
         }
     };
 
@@ -1594,7 +1627,8 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+    let system_prompt =
+        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -2813,6 +2847,18 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref wati_cfg) = config.channels_config.wati {
+        channels.push(ConfiguredChannel {
+            display_name: "WATI",
+            channel: Arc::new(WatiChannel::new(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
+            )),
+        });
+    }
+
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
         channels.push(ConfiguredChannel {
             display_name: "Nextcloud Talk",
@@ -2984,6 +3030,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
@@ -3054,6 +3101,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.web_fetch,
         &workspace,
         &config.agents,
         config.api_key.as_deref(),
@@ -3093,7 +3141,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if config.browser.enabled {
         tool_descs.push((
             "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
+            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
     }
     if config.composio.enabled {

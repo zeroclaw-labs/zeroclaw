@@ -141,6 +141,15 @@ enum ModelProbeOutcome {
     Error,
 }
 
+fn model_probe_status_label(outcome: ModelProbeOutcome) -> &'static str {
+    match outcome {
+        ModelProbeOutcome::Ok => "ok",
+        ModelProbeOutcome::Skipped => "skipped",
+        ModelProbeOutcome::AuthOrAccess => "auth/access",
+        ModelProbeOutcome::Error => "error",
+    }
+}
+
 fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     let lower = err_message.to_lowercase();
 
@@ -208,6 +217,7 @@ pub async fn run_models(
     let mut skipped_count = 0usize;
     let mut auth_count = 0usize;
     let mut error_count = 0usize;
+    let mut matrix_rows: Vec<(String, ModelProbeOutcome, Option<usize>, String)> = Vec::new();
 
     for provider_name in &targets {
         println!("  [{}]", provider_name);
@@ -216,6 +226,16 @@ pub async fn run_models(
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");
+                let models_count =
+                    crate::onboard::wizard::cached_model_catalog_stats(config, provider_name)
+                        .await?
+                        .map(|(count, _)| count);
+                matrix_rows.push((
+                    provider_name.clone(),
+                    ModelProbeOutcome::Ok,
+                    models_count,
+                    "catalog refreshed".to_string(),
+                ));
             }
             Err(error) => {
                 let error_text = format_error_chain(&error);
@@ -223,6 +243,12 @@ pub async fn run_models(
                     ModelProbeOutcome::Skipped => {
                         skipped_count += 1;
                         println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Skipped,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
                     }
                     ModelProbeOutcome::AuthOrAccess => {
                         auth_count += 1;
@@ -230,13 +256,31 @@ pub async fn run_models(
                             "    ⚠️  auth/access: {}",
                             truncate_for_display(&error_text, 160)
                         );
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::AuthOrAccess,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
                     }
                     ModelProbeOutcome::Error => {
                         error_count += 1;
                         println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Error,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
                     }
                     ModelProbeOutcome::Ok => {
                         ok_count += 1;
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Ok,
+                            None,
+                            "catalog refreshed".to_string(),
+                        ));
                     }
                 }
             }
@@ -249,6 +293,31 @@ pub async fn run_models(
         "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
         ok_count, skipped_count, auth_count, error_count
     );
+
+    if !matrix_rows.is_empty() {
+        println!();
+        println!("  Connectivity matrix:");
+        println!(
+            "  {:<18} {:<12} {:<8} detail",
+            "provider", "status", "models"
+        );
+        println!(
+            "  {:<18} {:<12} {:<8} ------",
+            "------------------", "------------", "--------"
+        );
+        for (provider, outcome, models_count, detail) in matrix_rows {
+            let models_text = models_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<18} {:<12} {:<8} {}",
+                provider,
+                model_probe_status_label(outcome),
+                models_text,
+                detail
+            );
+        }
+    }
 
     if auth_count > 0 {
         println!(

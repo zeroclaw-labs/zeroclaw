@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
@@ -158,6 +158,24 @@ impl SlackChannel {
         channels.dedup();
         Ok(channels)
     }
+
+    fn slack_now_ts() -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}.{:06}", now.as_secs(), now.subsec_micros())
+    }
+
+    fn ensure_poll_cursor(
+        cursors: &mut HashMap<String, String>,
+        channel_id: &str,
+        now_ts: &str,
+    ) -> String {
+        cursors
+            .entry(channel_id.to_string())
+            .or_insert_with(|| now_ts.to_string())
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -257,12 +275,22 @@ impl Channel for SlackChannel {
             }
 
             for channel_id in target_channels {
-                let mut params = vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
-                if let Some(last_ts) = last_ts_by_channel.get(&channel_id).cloned() {
-                    if !last_ts.is_empty() {
-                        params.push(("oldest", last_ts));
-                    }
+                let had_cursor = last_ts_by_channel.contains_key(&channel_id);
+                let bootstrap_ts = Self::slack_now_ts();
+                let cursor_ts =
+                    Self::ensure_poll_cursor(&mut last_ts_by_channel, &channel_id, &bootstrap_ts);
+                if !had_cursor {
+                    tracing::debug!(
+                        "Slack: initialized cursor for channel {} at {} to prevent historical replay",
+                        channel_id,
+                        cursor_ts
+                    );
                 }
+                let params = vec![
+                    ("channel", channel_id.clone()),
+                    ("limit", "10".to_string()),
+                    ("oldest", cursor_ts),
+                ];
 
                 let resp = match self
                     .http_client()
@@ -531,5 +559,27 @@ mod tests {
 
         let thread_ts = SlackChannel::inbound_thread_ts(&msg, "");
         assert_eq!(thread_ts, None);
+    }
+
+    #[test]
+    fn ensure_poll_cursor_bootstraps_new_channel() {
+        let mut cursors = HashMap::new();
+        let now_ts = "1700000000.123456";
+
+        let cursor = SlackChannel::ensure_poll_cursor(&mut cursors, "C123", now_ts);
+        assert_eq!(cursor, now_ts);
+        assert_eq!(cursors.get("C123").map(String::as_str), Some(now_ts));
+    }
+
+    #[test]
+    fn ensure_poll_cursor_keeps_existing_cursor() {
+        let mut cursors = HashMap::from([("C123".to_string(), "1700000000.000001".to_string())]);
+        let cursor = SlackChannel::ensure_poll_cursor(&mut cursors, "C123", "9999999999.999999");
+
+        assert_eq!(cursor, "1700000000.000001");
+        assert_eq!(
+            cursors.get("C123").map(String::as_str),
+            Some("1700000000.000001")
+        );
     }
 }

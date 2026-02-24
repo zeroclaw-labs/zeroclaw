@@ -3712,6 +3712,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "nanohtml2text"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ec1bc47d34ae756616f387c11fd0595f86f2cc7e6473bde9e3ded30cb902a1"
+
+[[package]]
 name = "negentropy"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4761,6 +4767,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5669,6 +5684,16 @@ dependencies = [
  "indexmap",
  "itoa",
  "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
  "serde_core",
 ]
 
@@ -7989,7 +8014,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -8020,6 +8045,7 @@ dependencies = [
  "mail-parser",
  "matrix-sdk",
  "mime_guess",
+ "nanohtml2text",
  "nostr-sdk",
  "nusb",
  "opentelemetry",
@@ -8031,6 +8057,7 @@ dependencies = [
  "probe-rs",
  "prometheus",
  "prost 0.14.3",
+ "qrcode",
  "rand 0.10.0",
  "regex",
  "reqwest",
@@ -8041,8 +8068,10 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "schemars",
+ "scopeguard",
  "serde",
  "serde-big-array",
+ "serde_ignored",
  "serde_json",
  "sha2",
  "shellexpand",

@@ -8,6 +8,7 @@
 
 ## 语言入口
 
+- 文档结构图（按语言/分区/功能）：[structure/README.md](structure/README.md)
 - 英文 README：[../README.md](../README.md)
 - 中文 README：[../README.zh-CN.md](../README.zh-CN.md)
 - 日文 README：[../README.ja.md](../README.ja.md)
