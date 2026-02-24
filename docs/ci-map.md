@@ -33,6 +33,10 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
     - Purpose: scheduled/manual static analysis for security findings
+- `.github/workflows/ci-connectivity-probes.yml` (`Connectivity Probes`)
+    - Purpose: scheduled/manual provider-model connectivity matrix with categorized failures (`auth`, `network`, `unavailable`, `rate_limit`, `other`)
+    - Output: uploads `connectivity-report.json`, `connectivity-summary.md`, transient state, and raw probe log artifacts
+    - Noise control: optional providers never gate; required providers gate immediately for `auth/unavailable/other`, and gate for `network/rate_limit` only after transient threshold
 - `.github/workflows/sec-vorpal-reviewdog.yml` (`Sec Vorpal Reviewdog`)
     - Purpose: manual secure-coding feedback scan for supported non-Rust files (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`) using reviewdog annotations
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
@@ -78,6 +82,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `CI`: push to `dev` and `main`, PRs to `dev` and `main`
 - `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
+- `Connectivity Probes`: every 6 hours schedule, manual dispatch (`enforce` or `report-only`)
 - `Pub Homebrew Core`: manual dispatch only
 - `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
@@ -98,11 +103,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
 4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
 5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-6. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-7. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-8. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-9. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-10. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+6. Connectivity probe failures: inspect `connectivity-summary.md` and `connectivity-report.json` artifacts from `.github/workflows/ci-connectivity-probes.yml`; apply runbook in `docs/operations/connectivity-probes-runbook.md`.
+7. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+8. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
+9. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+10. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+11. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 

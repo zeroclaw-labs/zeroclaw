@@ -1,0 +1,84 @@
+name: Connectivity Probes
+
+on:
+    schedule:
+        - cron: "15 */6 * * *"
+    workflow_dispatch:
+        inputs:
+            enforcement_mode:
+                description: "enforce = apply gate policy; report-only = never fail run"
+                type: choice
+                required: false
+                default: enforce
+                options:
+                    - enforce
+                    - report-only
+
+concurrency:
+    group: connectivity-probes-${{ github.ref_name }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    probes:
+        name: Provider Connectivity Probes
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 35
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+
+            - name: Restore probe state cache
+              uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+              with:
+                  path: .ci/connectivity-state.json
+                  key: connectivity-state-${{ github.ref_name }}-${{ github.run_id }}
+                  restore-keys: |
+                      connectivity-state-${{ github.ref_name }}-
+
+            - name: Build zeroclaw binary for probes
+              run: cargo build --profile release-fast --locked --bin zeroclaw
+
+            - name: Run provider connectivity matrix
+              shell: bash
+              env:
+                  ENFORCEMENT_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enforcement_mode || 'enforce' }}
+              run: |
+                  set -euo pipefail
+
+                  args=(
+                    --binary target/release-fast/zeroclaw
+                    --contract .github/connectivity/probe-contract.json
+                    --state-file .ci/connectivity-state.json
+                    --output-json connectivity-report.json
+                    --output-markdown connectivity-summary.md
+                    --raw-log .ci/connectivity-raw.log
+                  )
+
+                  if [ "${ENFORCEMENT_MODE}" = "report-only" ]; then
+                    args+=(--report-only)
+                  fi
+
+                  python3 scripts/ci/provider_connectivity_matrix.py "${args[@]}"
+
+            - name: Upload connectivity artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: connectivity-probes-${{ github.run_id }}
+                  if-no-files-found: error
+                  path: |
+                      connectivity-report.json
+                      connectivity-summary.md
+                      .ci/connectivity-state.json
+                      .ci/connectivity-raw.log
