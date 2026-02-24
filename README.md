@@ -241,6 +241,7 @@ cd zeroclaw
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 
 # Optional: run bootstrap + onboarding fully in Docker-compatible mode
+# See docs/docker-setup.md for full Docker guide
 ./bootstrap.sh --docker
 
 # Optional: force Podman as container CLI
