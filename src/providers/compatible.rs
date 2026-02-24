@@ -46,6 +46,10 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    /// Selects the primary protocol for this compatible endpoint.
+    api_mode: CompatibleApiMode,
+    /// Optional max token cap propagated to outbound requests.
+    max_tokens_override: Option<u32>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -59,6 +63,15 @@ pub enum AuthStyle {
     Custom(String),
 }
 
+/// API mode for OpenAI-compatible endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibleApiMode {
+    /// Default mode: call chat-completions first and optionally fallback.
+    OpenAiChatCompletions,
+    /// Responses-first mode: call `/responses` directly.
+    OpenAiResponses,
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(
         name: &str,
@@ -67,7 +80,16 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, true, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            true,
+            None,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -87,6 +109,8 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -99,7 +123,16 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            false,
+            None,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -123,6 +156,8 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -143,6 +178,8 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -155,7 +192,40 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, true,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            false,
+            None,
+            true,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
+        )
+    }
+
+    /// Constructor used by `custom:` providers to choose explicit protocol mode.
+    pub fn new_custom_with_mode(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+        api_mode: CompatibleApiMode,
+        max_tokens_override: Option<u32>,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            true,
+            None,
+            false,
+            api_mode,
+            max_tokens_override,
         )
     }
 
@@ -168,6 +238,8 @@ impl OpenAiCompatibleProvider {
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
+        api_mode: CompatibleApiMode,
+        max_tokens_override: Option<u32>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -179,6 +251,8 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            api_mode,
+            max_tokens_override: max_tokens_override.filter(|value| *value > 0),
         }
     }
 
@@ -320,6 +394,8 @@ struct ApiChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -513,6 +589,8 @@ struct NativeChatRequest {
     messages: Vec<NativeMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -541,6 +619,8 @@ struct ResponsesRequest {
     input: Vec<ResponsesInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,6 +679,8 @@ struct ResponsesWebSocketCreateEvent {
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1028,6 +1110,14 @@ fn parse_responses_response_body(
 }
 
 impl OpenAiCompatibleProvider {
+    fn should_use_responses_mode(&self) -> bool {
+        self.api_mode == CompatibleApiMode::OpenAiResponses
+    }
+
+    fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens_override.filter(|value| *value > 0)
+    }
+
     fn should_try_responses_websocket(&self) -> bool {
         if let Ok(raw) = std::env::var("ZEROCLAW_RESPONSES_WEBSOCKET") {
             let normalized = raw.trim().to_ascii_lowercase();
@@ -1122,6 +1212,7 @@ impl OpenAiCompatibleProvider {
             input,
             instructions,
             store: Some(false),
+            max_output_tokens: self.effective_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -1193,6 +1284,7 @@ impl OpenAiCompatibleProvider {
             model: model.to_string(),
             input,
             instructions,
+            max_output_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
@@ -1564,6 +1656,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1581,6 +1674,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             fallback_messages
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses(credential, &fallback_messages, model)
+                .await;
+        }
 
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -1686,10 +1785,17 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses(credential, &effective_messages, model)
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1796,6 +1902,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: if tools.is_empty() {
                 None
@@ -1808,6 +1915,17 @@ impl Provider for OpenAiCompatibleProvider {
                 Some("auto".to_string())
             },
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses_chat(
+                    credential,
+                    &effective_messages,
+                    model,
+                    (!tools.is_empty()).then(|| tools.to_vec()),
+                )
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1912,10 +2030,22 @@ impl Provider for OpenAiCompatibleProvider {
                 !self.merge_system_into_user,
             ),
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses_chat(
+                    credential,
+                    &effective_messages,
+                    model,
+                    response_tools.clone(),
+                )
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2052,6 +2182,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
@@ -2193,6 +2324,7 @@ mod tests {
                 },
             ],
             temperature: 0.4,
+            max_tokens: None,
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -2267,6 +2399,22 @@ mod tests {
             AuthStyle::Custom("X-Custom-Key".into()),
         );
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
+    }
+
+    #[test]
+    fn custom_constructor_applies_responses_mode_and_max_tokens_override() {
+        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            "https://api.example.com",
+            Some("key"),
+            AuthStyle::Bearer,
+            true,
+            CompatibleApiMode::OpenAiResponses,
+            Some(2048),
+        );
+
+        assert!(provider.should_use_responses_mode());
+        assert_eq!(provider.effective_max_tokens(), Some(2048));
     }
 
     #[tokio::test]
@@ -3024,6 +3172,7 @@ mod tests {
                 content: MessageContent::Text("What is the weather?".to_string()),
             }],
             temperature: 0.7,
+            max_tokens: None,
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),

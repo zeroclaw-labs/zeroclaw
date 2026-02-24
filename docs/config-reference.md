@@ -23,6 +23,7 @@ Schema export command:
 | Key | Default | Notes |
 |---|---|---|
 | `default_provider` | `openrouter` | provider ID or alias |
+| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
@@ -384,6 +385,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
+| `max_tokens` | unset | Optional per-route output token cap forwarded to provider APIs |
 | `api_key` | unset | Optional API key override for this route's provider |
 
 ### `[[embedding_routes]]`
@@ -404,6 +406,7 @@ embedding_model = "hint:semantic"
 hint = "reasoning"
 provider = "openrouter"
 model = "provider/model-id"
+max_tokens = 8192
 
 [[embedding_routes]]
 hint = "semantic"

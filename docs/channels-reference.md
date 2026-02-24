@@ -336,6 +336,8 @@ Migration note:
 
 - Legacy config `[channels_config.lark] use_feishu = true` is still supported for backward compatibility.
 - Prefer `[channels_config.feishu]` for new setups.
+- Inbound `image` messages are converted to multimodal markers (`[IMAGE:data:image/...;base64,...]`).
+- If image download fails, ZeroClaw forwards fallback text instead of silently dropping the message.
 
 ### 4.13 Nostr
 
