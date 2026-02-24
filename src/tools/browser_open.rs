@@ -1,4 +1,7 @@
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{
+    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -19,37 +22,18 @@ impl BrowserOpenTool {
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        let url = raw_url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("https://") {
-            anyhow::bail!("Only https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
-        }
-
-        Ok(url.to_string())
+        validate_url(
+            raw_url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &[],
+                allowed_field_name: "browser.allowed_domains",
+                blocked_field_name: None,
+                empty_allowed_message: "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpsOnly,
+                ipv6_error_context: "browser_open",
+            },
+        )
     }
 }
 
@@ -184,136 +168,11 @@ async fn open_in_brave(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in browser_open");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
-}
-
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains.iter().any(|pattern| {
-        if pattern == "*" {
-            return true;
-        }
-        if pattern.starts_with("*.") {
-            let suffix = &pattern[1..]; // ".example.com"
-            host.ends_with(suffix) || host == &pattern[2..]
-        } else {
-            host == pattern || host.ends_with(&format!(".{pattern}"))
-        }
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
-        return true;
-    }
-
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
-    }
-
-    false
-}
-
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::url_validation::normalize_domain;
 
     fn test_tool(allowed_domains: Vec<&str>) -> BrowserOpenTool {
         let security = Arc::new(SecurityPolicy {
@@ -448,18 +307,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
     }
 
     #[tokio::test]
