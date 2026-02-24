@@ -229,17 +229,35 @@ jobs:
 
             - name: Setup Android NDK
               if: matrix.android_ndk
-              uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
-              id: setup-ndk
-              with:
-                  ndk-version: r26d
-                  add-to-path: true
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  NDK_VERSION="r26d"
+                  NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+                  NDK_URL="https://dl.google.com/android/repository/${NDK_ZIP}"
+                  NDK_ROOT="${RUNNER_TEMP}/android-ndk"
+                  NDK_HOME="${NDK_ROOT}/android-ndk-${NDK_VERSION}"
+
+                  sudo apt-get update -qq
+                  sudo apt-get install -y unzip
+
+                  mkdir -p "${NDK_ROOT}"
+                  curl -fsSL "${NDK_URL}" -o "${RUNNER_TEMP}/${NDK_ZIP}"
+                  unzip -q "${RUNNER_TEMP}/${NDK_ZIP}" -d "${NDK_ROOT}"
+
+                  echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "$GITHUB_ENV"
+                  echo "${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
             - name: Configure Android toolchain
               if: matrix.android_ndk
+              shell: bash
               run: |
                   echo "Setting up Android NDK toolchain for ${{ matrix.target }}"
-                  NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+                  NDK_HOME="${ANDROID_NDK_HOME:-}"
+                  if [[ -z "$NDK_HOME" ]]; then
+                    echo "::error::ANDROID_NDK_HOME was not configured."
+                    exit 1
+                  fi
                   TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
                   
                   # Add to path for linker resolution
