@@ -14,37 +14,48 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "加油", "鼓掌", "碰拳", "看", "奋斗", "强"];
+/// Feishu/Lark reaction API requires standardized `emoji_type` identifiers
+/// (e.g. `"JIAYI"`, `"APPLAUSE"`), not locale-specific display names
+/// (e.g. `"加油"`, `"鼓掌"`).  Using display names causes HTTP 400 with
+/// error code 231001 "reaction type is invalid".
+///
+/// Per-locale pools let us vary the culturally appropriate set of reactions
+/// while always sending valid API identifiers.
+///
+/// Ref: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create
+/// Ref: https://open.larksuite.com/document/server-docs/im-v1/message-reaction/create
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] =
+    &["OK", "JIAYI", "APPLAUSE", "FISTBUMP", "GLANCE", "STRIVE", "MUSCLE"];
 const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "我看行",
+    "LGTM",
     "OK",
-    "加油",
-    "鼓掌",
-    "碰拳",
-    "看",
-    "奮鬥",
-    "強",
-    "很 OK",
+    "JIAYI",
+    "APPLAUSE",
+    "FISTBUMP",
+    "GLANCE",
+    "STRIVE",
+    "MUSCLE",
+    "THUMBSUP",
 ];
 const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "LooksGoodToMe",
+    "LGTM",
     "OK",
-    "Praise",
-    "Determined",
-    "Glance",
-    "FistBump",
-    "Applaud",
-    "FightOn",
+    "THUMBSUP",
+    "STRIVE",
+    "GLANCE",
+    "FISTBUMP",
+    "APPLAUSE",
+    "JIAYI",
 ];
 const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "いいと思う",
+    "LGTM",
     "OK",
-    "よくできた",
-    "頑張る",
-    "見る",
-    "グータッチ",
-    "拍手",
-    "頑張れ",
+    "THUMBSUP",
+    "STRIVE",
+    "GLANCE",
+    "FISTBUMP",
+    "APPLAUSE",
+    "JIAYI",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
