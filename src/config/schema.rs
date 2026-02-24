@@ -1676,6 +1676,14 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Enable TLS for the PostgreSQL connection.
+    ///
+    /// `true` — require TLS (skips certificate verification; suitable for
+    /// self-signed certs and most managed databases).
+    /// `false` (default) — plain TCP, backward-compatible.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 fn default_storage_schema() -> String {
@@ -1694,6 +1702,7 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            tls: false,
         }
     }
 }
