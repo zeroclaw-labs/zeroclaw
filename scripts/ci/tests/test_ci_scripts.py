@@ -1283,6 +1283,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report_a["summary"]["by_pattern"]["ffi_libc_call"], 1)
         self.assertEqual(report_a["summary"]["by_pattern"]["mem_transmute"], 1)
         self.assertEqual(report_a["source"]["mode"], "git_ls_files")
+        self.assertEqual(report_a["source"]["crate_roots_scanned"], 0)
 
     def test_unsafe_debt_audit_fail_on_findings(self) -> None:
         repo = self.tmp / "repo"
@@ -1308,6 +1309,360 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         report = json.loads(out_json.read_text(encoding="utf-8"))
         self.assertGreaterEqual(report["summary"]["total_findings"], 1)
+
+    def test_unsafe_debt_audit_detects_missing_crate_unsafe_guard(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        (repo / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "fixture-missing-guard"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "lib.rs").write_text(
+            "pub fn version() -> &'static str { \"v1\" }\n",
+            encoding="utf-8",
+        )
+
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json = self.tmp / "unsafe-missing-guard.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["crate_roots_scanned"], 1)
+        self.assertEqual(report["summary"]["total_findings"], 1)
+        self.assertEqual(report["summary"]["by_pattern"]["missing_crate_unsafe_guard"], 1)
+        finding = report["findings"][0]
+        self.assertEqual(finding["pattern_id"], "missing_crate_unsafe_guard")
+        self.assertEqual(finding["path"], "src/lib.rs")
+
+    def test_unsafe_debt_audit_accepts_crate_with_unsafe_guard(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        (repo / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "fixture-with-guard"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "lib.rs").write_text(
+            textwrap.dedent(
+                """
+                #![forbid(unsafe_code)]
+                pub fn version() -> &'static str { "v2" }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json = self.tmp / "unsafe-with-guard.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+                "--fail-on-findings",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["crate_roots_scanned"], 1)
+        self.assertEqual(report["summary"]["total_findings"], 0)
+
+    def test_unsafe_debt_audit_policy_file_ignores_pattern_findings(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "unsafe_one.rs").write_text(
+            "pub fn whoami() -> bool { unsafe { libc::getuid() == 0 } }\n",
+            encoding="utf-8",
+        )
+
+        policy_path = repo / "scripts" / "ci" / "config"
+        policy_path.mkdir(parents=True, exist_ok=True)
+        (policy_path / "unsafe_debt_policy.toml").write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                include_paths = ["src"]
+                ignore_pattern_ids = ["unsafe_block", "ffi_libc_call"]
+                enforce_crate_unsafe_guard = false
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-policy-ignore.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+                "--fail-on-findings",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["policy_file"], "scripts/ci/config/unsafe_debt_policy.toml")
+        self.assertEqual(report["summary"]["total_findings"], 0)
+
+    def test_unsafe_debt_audit_fails_on_excluded_crate_roots_policy(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        (repo / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "top-crate"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "lib.rs").write_text(
+            "#![forbid(unsafe_code)]\npub fn top() {}\n",
+            encoding="utf-8",
+        )
+
+        (repo / "firmware" / "sensor").mkdir(parents=True, exist_ok=True)
+        (repo / "firmware" / "sensor" / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sensor-crate"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "firmware" / "sensor" / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "firmware" / "sensor" / "src" / "lib.rs").write_text(
+            "#![forbid(unsafe_code)]\npub fn sensor() {}\n",
+            encoding="utf-8",
+        )
+
+        policy_dir = repo / "scripts" / "ci" / "config"
+        policy_dir.mkdir(parents=True, exist_ok=True)
+        (policy_dir / "unsafe_debt_policy.toml").write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                include_paths = ["src", "crates", "tests", "benches", "fuzz"]
+                fail_on_excluded_crate_roots = true
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json = self.tmp / "unsafe-excluded-roots.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 4)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["crate_roots_total"], 2)
+        self.assertEqual(report["source"]["crate_roots_scanned"], 1)
+        self.assertEqual(report["source"]["crate_roots_excluded"], 1)
+        self.assertIn("firmware/sensor/src/lib.rs", report["source"]["excluded_crate_roots"])
+
+    def test_unsafe_policy_guard_passes_for_valid_governance(self) -> None:
+        policy_path = self.tmp / "unsafe_debt_policy.toml"
+        policy_path.write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                ignore_paths = ["legacy/vendor"]
+                ignore_pattern_ids = ["ffi_libc_call"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        governance_path = self.tmp / "unsafe-governance.json"
+        governance_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.unsafe-audit-governance.v1",
+                    "ignore_paths": [
+                        {
+                            "path": "legacy/vendor",
+                            "owner": "repo-maintainers",
+                            "reason": "Temporary vendor mirror while upstream replaces unsafe bindings.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2027-01-01",
+                        }
+                    ],
+                    "ignore_pattern_ids": [
+                        {
+                            "pattern_id": "ffi_libc_call",
+                            "owner": "repo-maintainers",
+                            "reason": "Allowlisted for libc shim crate pending migration to safer wrappers.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2027-01-01",
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-policy-guard.json"
+        out_md = self.tmp / "unsafe-policy-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_policy_guard.py"),
+                "--policy-file",
+                str(policy_path),
+                "--governance-file",
+                str(governance_path),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["unmanaged_paths"], [])
+        self.assertEqual(report["unmanaged_pattern_ids"], [])
+
+    def test_unsafe_policy_guard_detects_expired_or_unmanaged_entries(self) -> None:
+        policy_path = self.tmp / "unsafe_debt_policy.toml"
+        policy_path.write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                ignore_paths = ["legacy/vendor", "legacy/temp"]
+                ignore_pattern_ids = ["ffi_libc_call", "unknown_pattern"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        governance_path = self.tmp / "unsafe-governance.json"
+        governance_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.unsafe-audit-governance.v1",
+                    "ignore_paths": [
+                        {
+                            "path": "legacy/vendor",
+                            "owner": "repo-maintainers",
+                            "reason": "Temporary vendor mirror while upstream replaces unsafe bindings.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2020-01-01",
+                        }
+                    ],
+                    "ignore_pattern_ids": [
+                        {
+                            "pattern_id": "ffi_libc_call",
+                            "owner": "repo-maintainers",
+                            "reason": "Allowlisted for libc shim crate pending migration to safer wrappers.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2027-01-01",
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-policy-guard-invalid.json"
+        out_md = self.tmp / "unsafe-policy-guard-invalid.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_policy_guard.py"),
+                "--policy-file",
+                str(policy_path),
+                "--governance-file",
+                str(governance_path),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        violation_text = "\n".join(report["violations"])
+        self.assertIn("expired", violation_text)
+        self.assertIn("unknown", violation_text)
+        self.assertIn("no governance metadata", violation_text)
 
 
 if __name__ == "__main__":  # pragma: no cover

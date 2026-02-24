@@ -2946,14 +2946,20 @@ fn collect_configured_channels(
     }
 
     if let Some(ref qq) = config.channels_config.qq {
-        channels.push(ConfiguredChannel {
-            display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
-        });
+        if qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook {
+            tracing::info!(
+                "QQ channel configured with receive_mode=webhook; websocket listener startup skipped."
+            );
+        } else {
+            channels.push(ConfiguredChannel {
+                display_name: "QQ",
+                channel: Arc::new(QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )),
+            });
+        }
     }
 
     if let Some(ref ct) = config.channels_config.clawdtalk {

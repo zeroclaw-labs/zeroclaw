@@ -1,0 +1,17 @@
+[audit]
+# Paths that the audit must cover (repo-root relative prefixes).
+include_paths = ["src", "crates", "tests", "benches", "fuzz", "firmware"]
+
+# Optional prefixes to exclude from the audit.
+ignore_paths = []
+
+# Optional pattern IDs to ignore.
+ignore_pattern_ids = []
+
+# When true, crate roots in scope must include `#![forbid(unsafe_code)]`
+# or `#![deny(unsafe_code)]`.
+enforce_crate_unsafe_guard = true
+
+# When true, the audit exits non-zero if any discovered crate roots are
+# outside the scoped include_paths/ignore_paths.
+fail_on_excluded_crate_roots = true

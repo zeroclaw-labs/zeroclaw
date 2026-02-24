@@ -259,6 +259,14 @@ Lưu ý:
 | `require_pairing` | `true` | Yêu cầu ghép nối trước khi xác thực bearer |
 | `allow_public_bind` | `false` | Chặn lộ public do vô ý |
 
+## `[gateway.node_control]` (thử nghiệm)
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật endpoint scaffold node-control (`POST /api/node-control`) |
+| `auth_token` | `null` | Shared token bổ sung, kiểm qua header `X-Node-Control-Token` |
+| `allowed_node_ids` | `[]` | Allowlist cho `node.describe`/`node.invoke` (`[]` = chấp nhận mọi node) |
+
 ## `[autonomy]`
 
 | Khóa | Mặc định | Mục đích |

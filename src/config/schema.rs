@@ -827,6 +827,28 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Node-control protocol scaffold (`[gateway.node_control]`).
+    #[serde(default)]
+    pub node_control: NodeControlConfig,
+}
+
+/// Node-control scaffold settings under `[gateway.node_control]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct NodeControlConfig {
+    /// Enable experimental node-control API endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional extra shared token for node-control API calls.
+    /// When set, clients must send this value in `X-Node-Control-Token`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+
+    /// Allowlist of remote node IDs for `node.describe`/`node.invoke`.
+    /// Empty means "no explicit allowlist" (accept all IDs).
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -875,6 +897,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            node_control: NodeControlConfig::default(),
         }
     }
 }
@@ -1676,6 +1699,14 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Enable TLS for the PostgreSQL connection.
+    ///
+    /// `true` — require TLS (skips certificate verification; suitable for
+    /// self-signed certs and most managed databases).
+    /// `false` (default) — plain TCP, backward-compatible.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 fn default_storage_schema() -> String {
@@ -1694,6 +1725,7 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            tls: false,
         }
     }
 }
@@ -2700,7 +2732,9 @@ impl ChannelsConfig {
             ),
             (
                 Box::new(ConfigWrapper::new(&self.qq)),
-                self.qq.is_some()
+                self.qq
+                    .as_ref()
+                    .is_some_and(|qq| qq.receive_mode == QQReceiveMode::Websocket)
             ),
             (
                 Box::new(ConfigWrapper::new(&self.nostr)),
@@ -3559,6 +3593,15 @@ impl ChannelConfig for DingTalkConfig {
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QQReceiveMode {
+    Websocket,
+    #[default]
+    Webhook,
+}
+
+/// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
     /// App ID from QQ Bot developer console
@@ -3568,6 +3611,9 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Event receive mode: "webhook" (default) or "websocket".
+    #[serde(default)]
+    pub receive_mode: QQReceiveMode,
 }
 
 impl ChannelConfig for QQConfig {
@@ -6019,6 +6065,9 @@ channel_id = "C123"
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(!g.node_control.enabled);
+        assert!(g.node_control.auth_token.is_none());
+        assert!(g.node_control.allowed_node_ids.is_empty());
     }
 
     #[test]
@@ -6050,6 +6099,11 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            node_control: NodeControlConfig {
+                enabled: true,
+                auth_token: Some("node-token".into()),
+                allowed_node_ids: vec!["node-1".into(), "node-2".into()],
+            },
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -6062,6 +6116,15 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert!(parsed.node_control.enabled);
+        assert_eq!(
+            parsed.node_control.auth_token.as_deref(),
+            Some("node-token")
+        );
+        assert_eq!(
+            parsed.node_control.allowed_node_ids,
+            vec!["node-1", "node-2"]
+        );
     }
 
     #[test]
@@ -7362,6 +7425,9 @@ default_model = "legacy-model"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(!g.node_control.enabled);
+        assert!(g.node_control.auth_token.is_none());
+        assert!(g.node_control.allowed_node_ids.is_empty());
     }
 
     // ── Peripherals config ───────────────────────────────────────
@@ -7521,6 +7587,28 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+    }
+
+    #[test]
+    async fn qq_config_defaults_to_webhook_receive_mode() {
+        let json = r#"{"app_id":"123","app_secret":"secret"}"#;
+        let parsed: QQConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
+        assert!(parsed.allowed_users.is_empty());
+    }
+
+    #[test]
+    async fn qq_config_toml_roundtrip_receive_mode() {
+        let qc = QQConfig {
+            app_id: "123".into(),
+            app_secret: "secret".into(),
+            allowed_users: vec!["*".into()],
+            receive_mode: QQReceiveMode::Websocket,
+        };
+        let toml_str = toml::to_string(&qc).unwrap();
+        let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
+        assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
     #[test]

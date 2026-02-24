@@ -12,10 +12,14 @@ on:
             - ".gitleaks.toml"
             - ".github/security/gitleaks-allowlist-governance.json"
             - ".github/security/deny-ignore-governance.json"
+            - ".github/security/unsafe-audit-governance.json"
             - "scripts/ci/install_gitleaks.sh"
             - "scripts/ci/install_syft.sh"
             - "scripts/ci/deny_policy_guard.py"
             - "scripts/ci/secrets_governance_guard.py"
+            - "scripts/ci/unsafe_debt_audit.py"
+            - "scripts/ci/unsafe_policy_guard.py"
+            - "scripts/ci/config/unsafe_debt_policy.toml"
             - "scripts/ci/emit_audit_event.py"
             - ".github/workflows/sec-audit.yml"
     pull_request:
@@ -29,10 +33,14 @@ on:
             - ".gitleaks.toml"
             - ".github/security/gitleaks-allowlist-governance.json"
             - ".github/security/deny-ignore-governance.json"
+            - ".github/security/unsafe-audit-governance.json"
             - "scripts/ci/install_gitleaks.sh"
             - "scripts/ci/install_syft.sh"
             - "scripts/ci/deny_policy_guard.py"
             - "scripts/ci/secrets_governance_guard.py"
+            - "scripts/ci/unsafe_debt_audit.py"
+            - "scripts/ci/unsafe_policy_guard.py"
+            - "scripts/ci/config/unsafe_debt_policy.toml"
             - "scripts/ci/emit_audit_event.py"
             - ".github/workflows/sec-audit.yml"
     merge_group:
@@ -121,7 +129,7 @@ jobs:
 
             - name: Upload deny policy artifacts
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: deny-policy-guard
                   path: artifacts/deny-policy-guard.*
@@ -130,7 +138,7 @@ jobs:
 
             - name: Upload deny policy audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: deny-policy-audit-event
                   path: artifacts/audit-event-deny-policy-guard.json
@@ -194,7 +202,7 @@ jobs:
 
             - name: Upload secrets governance artifacts
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: secrets-governance-guard
                   path: artifacts/secrets-governance-guard.*
@@ -203,7 +211,7 @@ jobs:
 
             - name: Upload secrets governance audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: secrets-governance-audit-event
                   path: artifacts/audit-event-secrets-governance-guard.json
@@ -302,7 +310,7 @@ jobs:
 
             - name: Upload gitleaks artifact
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: gitleaks-report
                   path: artifacts/gitleaks.sarif
@@ -325,7 +333,7 @@ jobs:
 
             - name: Upload gitleaks audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: gitleaks-audit-event
                   path: artifacts/audit-event-gitleaks-scan.json
@@ -362,7 +370,7 @@ jobs:
                   } >> "$GITHUB_STEP_SUMMARY"
 
             - name: Upload SBOM artifacts
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: sbom-snapshot
                   path: artifacts/zeroclaw.*.json
@@ -390,17 +398,154 @@ jobs:
 
             - name: Upload SBOM audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: sbom-audit-event
                   path: artifacts/audit-event-sbom-snapshot.json
                   if-no-files-found: ignore
                   retention-days: 14
 
+    unsafe-debt:
+        name: Unsafe Debt Audit
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Enforce unsafe policy governance
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/unsafe_policy_guard.py \
+                    --policy-file scripts/ci/config/unsafe_debt_policy.toml \
+                    --governance-file .github/security/unsafe-audit-governance.json \
+                    --output-json artifacts/unsafe-policy-guard.json \
+                    --output-md artifacts/unsafe-policy-guard.md \
+                    --fail-on-violation
+
+            - name: Publish unsafe governance summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/unsafe-policy-guard.md ]; then
+                    cat artifacts/unsafe-policy-guard.md >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Unsafe policy governance report missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+            - name: Run unsafe debt audit
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/unsafe_debt_audit.py \
+                    --repo-root . \
+                    --policy-file scripts/ci/config/unsafe_debt_policy.toml \
+                    --output-json artifacts/unsafe-debt-audit.json \
+                    --fail-on-findings \
+                    --fail-on-excluded-crate-roots
+
+            - name: Publish unsafe debt summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/unsafe-debt-audit.json ]; then
+                  python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+                  import json
+                  from pathlib import Path
+
+                  report = json.loads(Path("artifacts/unsafe-debt-audit.json").read_text(encoding="utf-8"))
+                  summary = report.get("summary", {})
+                  source = report.get("source", {})
+                  by_pattern = summary.get("by_pattern", {})
+
+                  print("### Unsafe debt audit")
+                  print(f"- Total findings: `{summary.get('total_findings', 0)}`")
+                  print(f"- Files scanned: `{source.get('files_scanned', 0)}`")
+                  print(f"- Crate roots scanned: `{source.get('crate_roots_scanned', 0)}`")
+                  print(f"- Crate roots excluded: `{source.get('crate_roots_excluded', 0)}`")
+                  if by_pattern:
+                      print("- Findings by pattern:")
+                      for pattern_id, count in sorted(by_pattern.items()):
+                          print(f"  - `{pattern_id}`: `{count}`")
+                  else:
+                      print("- Findings by pattern: none")
+                  PY
+                  else
+                    echo "Unsafe debt audit JSON report missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+            - name: Emit unsafe policy governance audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/unsafe-policy-guard.json ]; then
+                    python3 scripts/ci/emit_audit_event.py \
+                      --event-type unsafe_policy_guard \
+                      --input-json artifacts/unsafe-policy-guard.json \
+                      --output-json artifacts/audit-event-unsafe-policy-guard.json \
+                      --artifact-name unsafe-policy-audit-event \
+                      --retention-days 14
+                  fi
+
+            - name: Emit unsafe debt audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/unsafe-debt-audit.json ]; then
+                    python3 scripts/ci/emit_audit_event.py \
+                      --event-type unsafe_debt_audit \
+                      --input-json artifacts/unsafe-debt-audit.json \
+                      --output-json artifacts/audit-event-unsafe-debt-audit.json \
+                      --artifact-name unsafe-debt-audit-event \
+                      --retention-days 14
+                  fi
+
+            - name: Upload unsafe policy guard artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: unsafe-policy-guard
+                  path: artifacts/unsafe-policy-guard.*
+                  if-no-files-found: ignore
+                  retention-days: 14
+
+            - name: Upload unsafe debt audit artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: unsafe-debt-audit
+                  path: artifacts/unsafe-debt-audit.json
+                  if-no-files-found: ignore
+                  retention-days: 14
+
+            - name: Upload unsafe policy audit event
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: unsafe-policy-audit-event
+                  path: artifacts/audit-event-unsafe-policy-guard.json
+                  if-no-files-found: ignore
+                  retention-days: 14
+
+            - name: Upload unsafe debt audit event
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: unsafe-debt-audit-event
+                  path: artifacts/audit-event-unsafe-debt-audit.json
+                  if-no-files-found: ignore
+                  retention-days: 14
+
     security-required:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
-        needs: [audit, deny, secrets, sbom]
+        needs: [audit, deny, secrets, sbom, unsafe-debt]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce security gate
@@ -412,6 +557,7 @@ jobs:
                     "deny=${{ needs.deny.result }}"
                     "secrets=${{ needs.secrets.result }}"
                     "sbom=${{ needs.sbom.result }}"
+                    "unsafe-debt=${{ needs['unsafe-debt'].result }}"
                   )
                   for item in "${results[@]}"; do
                     echo "$item"
