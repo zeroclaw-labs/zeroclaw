@@ -134,11 +134,13 @@ jobs:
                   PY
                   )"
 
-                  echo "branch=$branch_input" >> "$GITHUB_OUTPUT"
-                  echo "mode=$mode_input" >> "$GITHUB_OUTPUT"
-                  echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
-                  echo "target_ref=$target_ref" >> "$GITHUB_OUTPUT"
-                  echo "ready_to_execute=$ready_to_execute" >> "$GITHUB_OUTPUT"
+                  {
+                    echo "branch=$branch_input"
+                    echo "mode=$mode_input"
+                    echo "target_sha=$target_sha"
+                    echo "target_ref=$target_ref"
+                    echo "ready_to_execute=$ready_to_execute"
+                  } >> "$GITHUB_OUTPUT"
 
             - name: Emit rollback audit event
               if: always()
@@ -238,10 +240,12 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  echo "### Rollback Execute Actions" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- Branch: \`${{ needs.rollback-plan.outputs.branch }}\`" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- Target ref: \`${{ needs.rollback-plan.outputs.target_ref }}\`" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- Target sha: \`${{ needs.rollback-plan.outputs.target_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
-                  if [ -n "${{ steps.marker.outputs.marker_tag || '' }}" ]; then
-                    echo "- Marker tag: \`${{ steps.marker.outputs.marker_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
-                  fi
+                  {
+                    echo "### Rollback Execute Actions"
+                    echo "- Branch: \`${{ needs.rollback-plan.outputs.branch }}\`"
+                    echo "- Target ref: \`${{ needs.rollback-plan.outputs.target_ref }}\`"
+                    echo "- Target sha: \`${{ needs.rollback-plan.outputs.target_sha }}\`"
+                    if [ -n "${{ steps.marker.outputs.marker_tag || '' }}" ]; then
+                      echo "- Marker tag: \`${{ steps.marker.outputs.marker_tag }}\`"
+                    fi
+                  } >> "$GITHUB_STEP_SUMMARY"

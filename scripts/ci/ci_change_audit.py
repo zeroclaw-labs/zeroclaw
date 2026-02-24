@@ -37,6 +37,13 @@ AUDIT_FILES = {
     "deny.toml",
     ".gitleaks.toml",
 }
+WORKFLOW_PATH_PREFIXES = (
+    ".github/workflows/",
+    ".github/actions/",
+    ".github/codeql/",
+)
+WORKFLOW_EXTENSIONS = (".yml", ".yaml")
+SHELL_EXTENSIONS = (".sh", ".bash")
 USES_RE = re.compile(r"^\+\s*(?:-\s*)?uses:\s*([^\s#]+)")
 SECRETS_RE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*}}")
 SHA_PIN_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -71,6 +78,14 @@ def run(cmd: list[str]) -> str:
 
 def is_ci_path(path: str) -> bool:
     return path in AUDIT_FILES or path.startswith(AUDIT_PREFIXES)
+
+
+def is_workflow_yaml_path(path: str) -> bool:
+    return path.startswith(WORKFLOW_PATH_PREFIXES) and path.endswith(WORKFLOW_EXTENSIONS)
+
+
+def is_shell_path(path: str) -> bool:
+    return path.endswith(SHELL_EXTENSIONS) or path.startswith(".githooks/")
 
 
 @dataclass
@@ -253,12 +268,14 @@ def main() -> int:
 
         added, deleted = parse_numstat(args.base_sha, args.head_sha, path)
         audit = FileAudit(path=path, status=status, added=added, deleted=deleted)
+        workflow_yaml = is_workflow_yaml_path(path)
+        shell_script = is_shell_path(path)
 
         for line in parse_patch_added_lines(args.base_sha, args.head_sha, path):
             added_text = line[1:].strip()
 
             uses_match = USES_RE.search(line)
-            if uses_match:
+            if uses_match and workflow_yaml:
                 action_ref = uses_match.group(1).strip()
                 audit.added_actions.append(action_ref)
                 if not action_is_pinned(action_ref):
@@ -270,7 +287,7 @@ def main() -> int:
             for secret_name in SECRETS_RE.findall(line):
                 audit.added_secret_refs.append(secret_name)
 
-            if PIPE_TO_SHELL_RE.search(added_text):
+            if PIPE_TO_SHELL_RE.search(added_text) and (workflow_yaml or shell_script):
                 command = added_text[:220]
                 audit.added_pipe_to_shell.append(command)
                 violations.append(
@@ -278,15 +295,15 @@ def main() -> int:
                 )
 
             permission_match = PERMISSION_WRITE_RE.match(line)
-            if permission_match:
+            if permission_match and workflow_yaml:
                 audit.added_write_permissions.append(permission_match.group(1))
-            if PERMISSIONS_WRITE_ALL_RE.match(line):
+            if PERMISSIONS_WRITE_ALL_RE.match(line) and workflow_yaml:
                 audit.added_write_permissions.append("write-all")
                 violations.append(
                     f"{path}: `permissions: write-all` introduced; scope permissions minimally."
                 )
 
-            if line_adds_pull_request_target(added_text):
+            if line_adds_pull_request_target(added_text) and workflow_yaml:
                 audit.added_pull_request_target += 1
                 violations.append(
                     f"{path}: `pull_request_target` trigger introduced -> `{added_text[:180]}`; "

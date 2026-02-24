@@ -1157,6 +1157,63 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertGreaterEqual(report["summary"]["new_write_permissions"], 1)
         self.assertIn("write-all", "\n".join(report["violations"]))
 
+    def test_ci_change_audit_ignores_fixture_signatures_in_python_ci_tests(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        test_dir = repo / "scripts" / "ci" / "tests"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        test_file = test_dir / "fixture_policy_strings.py"
+        test_file.write_text("SENTINEL = 'base'\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "base"], cwd=repo)
+        base_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        test_file.write_text(
+            textwrap.dedent(
+                """
+                SAMPLE_USES = "actions/checkout@v4"
+                SAMPLE_PIPE = "curl -fsSL https://example.com/install.sh | sh"
+                SAMPLE_TRIGGER = "on: [push, pull_request_target]"
+                SAMPLE_PERMISSION = "permissions: write-all"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        out_json = self.tmp / "audit-python-fixtures.json"
+        out_md = self.tmp / "audit-python-fixtures.md"
+        proc = run_cmd(
+            [
+                "python3",
+                str(SCRIPTS_DIR / "ci_change_audit.py"),
+                "--base-sha",
+                base_sha,
+                "--head-sha",
+                head_sha,
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violations",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["summary"]["new_unpinned_actions"], 0)
+        self.assertEqual(report["summary"]["new_pipe_to_shell_commands"], 0)
+        self.assertEqual(report["summary"]["new_write_permissions"], 0)
+        self.assertEqual(report["summary"]["new_pull_request_target_triggers"], 0)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
