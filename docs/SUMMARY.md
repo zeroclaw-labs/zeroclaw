@@ -33,6 +33,7 @@ Last refreshed: **February 18, 2026**.
 - [getting-started/README.md](getting-started/README.md)
 - [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md)
 - [one-click-bootstrap.md](one-click-bootstrap.md)
+- [docker-setup.md](docker-setup.md)
 - [android-setup.md](android-setup.md)
 
 ### 2) Command/Config References & Integrations
