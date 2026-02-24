@@ -1411,6 +1411,126 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["source"]["crate_roots_scanned"], 1)
         self.assertEqual(report["summary"]["total_findings"], 0)
 
+    def test_unsafe_debt_audit_policy_file_ignores_pattern_findings(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "unsafe_one.rs").write_text(
+            "pub fn whoami() -> bool { unsafe { libc::getuid() == 0 } }\n",
+            encoding="utf-8",
+        )
+
+        policy_path = repo / "scripts" / "ci" / "config"
+        policy_path.mkdir(parents=True, exist_ok=True)
+        (policy_path / "unsafe_debt_policy.toml").write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                include_paths = ["src"]
+                ignore_pattern_ids = ["unsafe_block", "ffi_libc_call"]
+                enforce_crate_unsafe_guard = false
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-policy-ignore.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+                "--fail-on-findings",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["policy_file"], "scripts/ci/config/unsafe_debt_policy.toml")
+        self.assertEqual(report["summary"]["total_findings"], 0)
+
+    def test_unsafe_debt_audit_fails_on_excluded_crate_roots_policy(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        (repo / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "top-crate"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "lib.rs").write_text(
+            "#![forbid(unsafe_code)]\npub fn top() {}\n",
+            encoding="utf-8",
+        )
+
+        (repo / "firmware" / "sensor").mkdir(parents=True, exist_ok=True)
+        (repo / "firmware" / "sensor" / "Cargo.toml").write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sensor-crate"
+                version = "0.1.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (repo / "firmware" / "sensor" / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "firmware" / "sensor" / "src" / "lib.rs").write_text(
+            "#![forbid(unsafe_code)]\npub fn sensor() {}\n",
+            encoding="utf-8",
+        )
+
+        policy_dir = repo / "scripts" / "ci" / "config"
+        policy_dir.mkdir(parents=True, exist_ok=True)
+        (policy_dir / "unsafe_debt_policy.toml").write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                include_paths = ["src", "crates", "tests", "benches", "fuzz"]
+                fail_on_excluded_crate_roots = true
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "fixture"], cwd=repo)
+
+        out_json = self.tmp / "unsafe-excluded-roots.json"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_debt_audit.py"),
+                "--repo-root",
+                str(repo),
+                "--output-json",
+                str(out_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 4)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["crate_roots_total"], 2)
+        self.assertEqual(report["source"]["crate_roots_scanned"], 1)
+        self.assertEqual(report["source"]["crate_roots_excluded"], 1)
+        self.assertIn("firmware/sensor/src/lib.rs", report["source"]["excluded_crate_roots"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
