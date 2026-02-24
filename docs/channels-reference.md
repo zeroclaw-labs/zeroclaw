@@ -387,7 +387,15 @@ allowed_users = ["*"]
 app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
+receive_mode = "webhook" # webhook (default) or websocket (legacy fallback)
 ```
+
+Notes:
+
+- `webhook` mode is now the default and serves inbound callbacks at `POST /qq`.
+- QQ validation challenge payloads (`op = 13`) are auto-signed using `app_secret`.
+- `X-Bot-Appid` is checked when present and must match `app_id`.
+- Set `receive_mode = "websocket"` to keep the legacy gateway WS receive path.
 
 ### 4.16 Nextcloud Talk
 

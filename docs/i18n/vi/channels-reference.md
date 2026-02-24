@@ -340,7 +340,15 @@ allowed_users = ["*"]
 app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
+receive_mode = "webhook" # webhook (mặc định) hoặc websocket (legacy fallback)
 ```
+
+Ghi chú:
+
+- `webhook` hiện là chế độ mặc định, nhận callback tại `POST /qq`.
+- Gói xác thực QQ (`op = 13`) được ký tự động bằng `app_secret`.
+- Nếu có header `X-Bot-Appid`, giá trị phải khớp `app_id`.
+- Đặt `receive_mode = "websocket"` nếu cần giữ đường nhận sự kiện WS cũ.
 
 ### 4.14 iMessage
 
