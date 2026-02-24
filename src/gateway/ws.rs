@@ -19,7 +19,6 @@ use axum::{
     },
     response::IntoResponse,
 };
-use futures_util::SinkExt;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
