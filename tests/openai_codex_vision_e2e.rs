@@ -147,6 +147,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     // Create provider with profile override
     let opts = ProviderRuntimeOptions {
         auth_profile_override: Some("second".to_string()),
+        provider_api_url: None,
         zeroclaw_dir: None,
         secrets_encrypt: false,
         reasoning_enabled: None,

@@ -1013,11 +1013,11 @@ data: [DONE]
     #[test]
     fn capabilities_includes_vision() {
         let options = ProviderRuntimeOptions {
+            provider_api_url: None,
             zeroclaw_dir: None,
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
-            provider_api_url: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
