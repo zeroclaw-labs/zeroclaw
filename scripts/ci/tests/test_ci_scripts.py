@@ -1531,6 +1531,139 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["source"]["crate_roots_excluded"], 1)
         self.assertIn("firmware/sensor/src/lib.rs", report["source"]["excluded_crate_roots"])
 
+    def test_unsafe_policy_guard_passes_for_valid_governance(self) -> None:
+        policy_path = self.tmp / "unsafe_debt_policy.toml"
+        policy_path.write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                ignore_paths = ["legacy/vendor"]
+                ignore_pattern_ids = ["ffi_libc_call"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        governance_path = self.tmp / "unsafe-governance.json"
+        governance_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.unsafe-audit-governance.v1",
+                    "ignore_paths": [
+                        {
+                            "path": "legacy/vendor",
+                            "owner": "repo-maintainers",
+                            "reason": "Temporary vendor mirror while upstream replaces unsafe bindings.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2027-01-01",
+                        }
+                    ],
+                    "ignore_pattern_ids": [
+                        {
+                            "pattern_id": "ffi_libc_call",
+                            "owner": "repo-maintainers",
+                            "reason": "Allowlisted for libc shim crate pending migration to safer wrappers.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2027-01-01",
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-policy-guard.json"
+        out_md = self.tmp / "unsafe-policy-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_policy_guard.py"),
+                "--policy-file",
+                str(policy_path),
+                "--governance-file",
+                str(governance_path),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["unmanaged_paths"], [])
+        self.assertEqual(report["unmanaged_pattern_ids"], [])
+
+    def test_unsafe_policy_guard_detects_expired_or_unmanaged_entries(self) -> None:
+        policy_path = self.tmp / "unsafe_debt_policy.toml"
+        policy_path.write_text(
+            textwrap.dedent(
+                """
+                [audit]
+                ignore_paths = ["legacy/vendor", "legacy/temp"]
+                ignore_pattern_ids = ["ffi_libc_call", "unknown_pattern"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        governance_path = self.tmp / "unsafe-governance.json"
+        governance_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.unsafe-audit-governance.v1",
+                    "ignore_paths": [
+                        {
+                            "path": "legacy/vendor",
+                            "owner": "repo-maintainers",
+                            "reason": "Temporary vendor mirror while upstream replaces unsafe bindings.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2020-01-01",
+                        }
+                    ],
+                    "ignore_pattern_ids": [
+                        {
+                            "pattern_id": "ffi_libc_call",
+                            "owner": "repo-maintainers",
+                            "reason": "Allowlisted for libc shim crate pending migration to safer wrappers.",
+                            "ticket": "RMN-32",
+                            "expires_on": "2027-01-01",
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "unsafe-policy-guard-invalid.json"
+        out_md = self.tmp / "unsafe-policy-guard-invalid.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("unsafe_policy_guard.py"),
+                "--policy-file",
+                str(policy_path),
+                "--governance-file",
+                str(governance_path),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        violation_text = "\n".join(report["violations"])
+        self.assertIn("expired", violation_text)
+        self.assertIn("unknown", violation_text)
+        self.assertIn("no governance metadata", violation_text)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
