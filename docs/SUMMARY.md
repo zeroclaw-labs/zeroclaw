@@ -6,6 +6,7 @@ Last refreshed: **February 18, 2026**.
 
 ## Language Entry
 
+- Docs Structure Map (language/part/function): [structure/README.md](structure/README.md)
 - English README: [../README.md](../README.md)
 - Chinese README: [../README.zh-CN.md](../README.zh-CN.md)
 - Japanese README: [../README.ja.md](../README.ja.md)
@@ -26,6 +27,7 @@ Last refreshed: **February 18, 2026**.
 ### 1) Getting Started
 
 - [getting-started/README.md](getting-started/README.md)
+- [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md)
 - [one-click-bootstrap.md](one-click-bootstrap.md)
 
 ### 2) Command/Config References & Integrations

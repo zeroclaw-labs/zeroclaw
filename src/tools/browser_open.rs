@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Open approved HTTPS URLs in Brave Browser (no scraping, no DOM automation).
+/// Open approved HTTPS URLs in the system default browser (no scraping, no DOM automation).
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -60,7 +60,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in Brave Browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +69,7 @@ impl Tool for BrowserOpenTool {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "HTTPS URL to open in Brave Browser"
+                    "description": "HTTPS URL to open in the system browser"
                 }
             },
             "required": ["url"]
@@ -109,72 +109,119 @@ impl Tool for BrowserOpenTool {
             }
         };
 
-        match open_in_brave(&url).await {
+        match open_in_system_browser(&url).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Opened in Brave: {url}"),
+                output: format!("Opened in system browser: {url}"),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to open Brave Browser: {e}")),
+                error: Some(format!("Failed to open system browser: {e}")),
             }),
         }
     }
 }
 
-async fn open_in_brave(url: &str) -> anyhow::Result<()> {
+async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
+        let primary_error = match tokio::process::Command::new("open").arg(url).status().await {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => format!("open exited with status {status}"),
+            Err(error) => format!("open not runnable: {error}"),
+        };
+
+        // TODO(compat): remove Brave fallback after default-browser launch has been stable across macOS environments.
+        let mut brave_error = String::new();
         for app in ["Brave Browser", "Brave"] {
-            let status = tokio::process::Command::new("open")
+            match tokio::process::Command::new("open")
                 .arg("-a")
                 .arg(app)
                 .arg(url)
                 .status()
-                .await;
-
-            if let Ok(s) = status {
-                if s.success() {
-                    return Ok(());
+                .await
+            {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => {
+                    brave_error = format!("open -a '{app}' exited with status {status}");
+                }
+                Err(error) => {
+                    brave_error = format!("open -a '{app}' not runnable: {error}");
                 }
             }
         }
+
         anyhow::bail!(
-            "Brave Browser was not found (tried macOS app names 'Brave Browser' and 'Brave')"
+            "Failed to open URL with default browser launcher: {primary_error}. Brave compatibility fallback also failed: {brave_error}"
         );
     }
 
     #[cfg(target_os = "linux")]
     {
         let mut last_error = String::new();
-        for cmd in ["brave-browser", "brave"] {
-            match tokio::process::Command::new(cmd).arg(url).status().await {
+        for cmd in [
+            "xdg-open",
+            "gio",
+            "sensible-browser",
+            "brave-browser",
+            "brave",
+        ] {
+            let mut command = tokio::process::Command::new(cmd);
+            if cmd == "gio" {
+                command.arg("open");
+            }
+            command.arg(url);
+            match command.status().await {
                 Ok(status) if status.success() => return Ok(()),
                 Ok(status) => {
                     last_error = format!("{cmd} exited with status {status}");
                 }
-                Err(e) => {
-                    last_error = format!("{cmd} not runnable: {e}");
+                Err(error) => {
+                    last_error = format!("{cmd} not runnable: {error}");
                 }
             }
         }
-        anyhow::bail!("{last_error}");
+
+        // TODO(compat): remove Brave fallback commands (brave-browser/brave) once default launcher coverage is validated.
+        anyhow::bail!(
+            "Failed to open URL with default browser launchers; Brave compatibility fallback also failed. Last error: {last_error}"
+        );
     }
 
     #[cfg(target_os = "windows")]
     {
-        let status = tokio::process::Command::new("cmd")
-            .args(["/C", "start", "", "brave", url])
+        // Use direct process invocation (not `cmd /C start`) to avoid shell
+        // metacharacter interpretation in URLs (e.g. `&` in query strings).
+        let primary_error = match tokio::process::Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
             .status()
-            .await?;
+            .await
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => format!("rundll32 default-browser launcher exited with status {status}"),
+            Err(error) => format!("rundll32 default-browser launcher not runnable: {error}"),
+        };
 
-        if status.success() {
-            return Ok(());
+        // TODO(compat): remove Brave fallback after default-browser launch has been stable across Windows environments.
+        let mut brave_error = String::new();
+        for cmd in ["brave", "brave.exe"] {
+            match tokio::process::Command::new(cmd).arg(url).status().await {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => {
+                    brave_error = format!("{cmd} exited with status {status}");
+                }
+                Err(error) => {
+                    brave_error = format!("{cmd} not runnable: {error}");
+                }
+            }
         }
 
-        anyhow::bail!("cmd start brave exited with status {status}");
+        anyhow::bail!(
+            "Failed to open URL with default browser launcher: {primary_error}. Brave compatibility fallback also failed: {brave_error}"
+        );
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

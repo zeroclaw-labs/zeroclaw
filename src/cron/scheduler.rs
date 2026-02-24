@@ -111,9 +111,9 @@ async fn process_due_jobs(
         )
         .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success)) = in_flight.next().await {
+    while let Some((job_id, success, output)) = in_flight.next().await {
         if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed");
+            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
         }
     }
 }
@@ -123,7 +123,7 @@ async fn execute_and_persist_job(
     security: &SecurityPolicy,
     job: &CronJob,
     component: &str,
-) -> (String, bool) {
+) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
@@ -132,7 +132,7 @@ async fn execute_and_persist_job(
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
-    (job.id.clone(), success)
+    (job.id.clone(), success, output)
 }
 
 async fn run_agent_job(
@@ -296,6 +296,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
+    deliver_announcement(config, channel, target, output).await
+}
+
+pub(crate) async fn deliver_announcement(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config
@@ -846,6 +855,143 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_success_deletes_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(lookup.is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_failure_disables_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        assert!(!success);
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_non_best_effort_marks_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("announce-job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "deliver this",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("123456".into()),
+                best_effort: false,
+            }),
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(!success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "error");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_best_effort_keeps_success() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("announce-job-best-effort".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "deliver this",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("123456".into()),
+                best_effort: true,
+            }),
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_at_schedule_without_delete_after_run_is_not_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_agent_job(
+            &config,
+            Some("at-no-autodelete".into()),
+            crate::cron::Schedule::At { at },
+            "Hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!job.delete_after_run);
+
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
     }
 
     #[tokio::test]

@@ -43,7 +43,7 @@ jobs:
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         steps:
@@ -65,7 +65,7 @@ jobs:
     test:
         name: Test
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
         steps:
@@ -116,7 +116,7 @@ jobs:
     docs-quality:
         name: Docs Quality
         needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        if: needs.changes.outputs.docs_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 15
         steps:
@@ -263,8 +263,8 @@ jobs:
                       echo "License file owner guard did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only push changed docs, but docs-quality did not pass."
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs-only change detected, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Docs-only fast path passed."
@@ -283,8 +283,8 @@ jobs:
                       echo "License file owner guard did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Non-rust push changed docs, but docs-quality did not pass."
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Non-rust change touched docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Non-rust fast path passed."
@@ -315,8 +315,12 @@ jobs:
                   fi
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$build_result" != "success" ]; then
-                      echo "Required PR build job did not pass."
+                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                      echo "Required PR CI jobs did not pass."
+                      exit 1
+                    fi
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "PR changed docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "PR required checks passed."

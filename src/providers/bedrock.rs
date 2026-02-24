@@ -554,16 +554,50 @@ impl BedrockProvider {
                     }
                 }
                 "tool" => {
-                    if let Some(tool_result_msg) = Self::parse_tool_result_message(&msg.content) {
-                        converse_messages.push(tool_result_msg);
-                    } else {
-                        converse_messages.push(ConverseMessage {
-                            role: "user".to_string(),
-                            content: vec![ContentBlock::Text(TextBlock {
-                                text: msg.content.clone(),
-                            })],
+                    let tool_result_msg = Self::parse_tool_result_message(&msg.content)
+                        .unwrap_or_else(|| {
+                            // Fallback: always emit a toolResult block so the
+                            // Bedrock API contract (every toolUse needs a matching
+                            // toolResult) is never violated.
+                            let tool_use_id = Self::extract_tool_call_id(&msg.content)
+                                .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
+                                .unwrap_or_else(|| "unknown".to_string());
+
+                            tracing::warn!(
+                                "Failed to parse tool result message, creating error \
+                                 toolResult for tool_use_id={}",
+                                tool_use_id
+                            );
+
+                            ConverseMessage {
+                                role: "user".to_string(),
+                                content: vec![ContentBlock::ToolResult(ToolResultWrapper {
+                                    tool_result: ToolResultBlock {
+                                        tool_use_id,
+                                        content: vec![ToolResultContent {
+                                            text: msg.content.clone(),
+                                        }],
+                                        status: "error".to_string(),
+                                    },
+                                })],
+                            }
                         });
+
+                    // Merge consecutive tool results into a single user message.
+                    // Bedrock requires all toolResult blocks for a multi-tool-call
+                    // turn to appear in one user message.
+                    if let Some(last) = converse_messages.last_mut() {
+                        if last.role == "user"
+                            && last
+                                .content
+                                .iter()
+                                .all(|b| matches!(b, ContentBlock::ToolResult(_)))
+                        {
+                            last.content.extend(tool_result_msg.content);
+                            continue;
+                        }
                     }
+                    converse_messages.push(tool_result_msg);
                 }
                 _ => {
                     let content_blocks = Self::parse_user_content_blocks(&msg.content);
@@ -581,6 +615,54 @@ impl BedrockProvider {
             Some(system_blocks)
         };
         (system, converse_messages)
+    }
+
+    /// Try to extract a tool_call_id from partially-valid JSON content.
+    fn extract_tool_call_id(content: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        value
+            .get("tool_call_id")
+            .or_else(|| value.get("tool_use_id"))
+            .or_else(|| value.get("toolUseId"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    }
+
+    /// Find the first unmatched tool_use_id from the last assistant message.
+    ///
+    /// When a tool result can't be parsed at all (not even the ID), we fall
+    /// back to matching it against the preceding assistant turn's toolUse
+    /// blocks that don't yet have a corresponding toolResult.
+    fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
+        let last_assistant = converse_messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")?;
+
+        let tool_use_ids: Vec<&str> = last_assistant
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse(wrapper) => Some(wrapper.tool_use.tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let answered_ids: Vec<&str> = converse_messages
+            .iter()
+            .rev()
+            .take_while(|m| m.role == "user")
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(wrapper) => Some(wrapper.tool_result.tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        tool_use_ids
+            .into_iter()
+            .find(|id| !answered_ids.contains(id))
+            .map(String::from)
     }
 
     /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
@@ -699,6 +781,8 @@ impl BedrockProvider {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_use_id = value
             .get("tool_call_id")
+            .or_else(|| value.get("tool_use_id"))
+            .or_else(|| value.get("toolUseId"))
             .and_then(serde_json::Value::as_str)?
             .to_string();
         let result = value
@@ -1493,5 +1577,107 @@ mod tests {
         let json = r#"{"output": {"message": {"role": "assistant", "content": []}}}"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    // ── Tool result fallback & merge tests ───────────────────────
+
+    #[test]
+    fn fallback_tool_result_emits_tool_result_block_not_text() {
+        // When tool message content is not valid JSON, we should still get
+        // a toolResult block (not a plain text user message).
+        let messages = vec![
+            ChatMessage::user("do something"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"tool_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "not valid json".to_string(),
+            },
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let tool_msg = &msgs[2];
+        assert_eq!(tool_msg.role, "user");
+        assert!(
+            matches!(&tool_msg.content[0], ContentBlock::ToolResult(_)),
+            "Expected ToolResult block, got {:?}",
+            tool_msg.content[0]
+        );
+    }
+
+    #[test]
+    fn fallback_recovers_tool_use_id_from_assistant() {
+        let messages = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"tool_abc","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "raw output with no json".to_string(),
+            },
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
+            assert_eq!(wrapper.tool_result.status, "error");
+        } else {
+            panic!("Expected ToolResult block");
+        }
+    }
+
+    #[test]
+    fn consecutive_tool_results_merged_into_single_message() {
+        let messages = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"a","arguments":"{}"},{"id":"t2","name":"b","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        // Should be: user, assistant, user (merged tool results)
+        assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(
+            msgs[2].content.len(),
+            2,
+            "Expected 2 tool results in one message"
+        );
+        assert!(matches!(&msgs[2].content[0], ContentBlock::ToolResult(_)));
+        assert!(matches!(&msgs[2].content[1], ContentBlock::ToolResult(_)));
+    }
+
+    #[test]
+    fn extract_tool_call_id_tries_multiple_field_names() {
+        assert_eq!(
+            BedrockProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            BedrockProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            BedrockProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
+            Some("c".to_string())
+        );
+        assert_eq!(
+            BedrockProvider::extract_tool_call_id("not json at all"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_tool_result_accepts_alternate_id_fields() {
+        let msg =
+            BedrockProvider::parse_tool_result_message(r#"{"tool_use_id":"x","content":"ok"}"#);
+        assert!(msg.is_some());
+        if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "x");
+        } else {
+            panic!("Expected ToolResult");
+        }
     }
 }
