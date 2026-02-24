@@ -3214,6 +3214,7 @@ fn setup_tool_mode() -> Result<(
     ))
 }
 
+#[allow(clippy::struct_excessive_bools)] // Capability probe flags are intentionally independent.
 #[derive(Debug, Clone)]
 struct BrowserRuntimeAvailability {
     brave_available: bool,
