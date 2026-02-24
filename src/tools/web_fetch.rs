@@ -193,16 +193,14 @@ impl WebFetchTool {
 
     #[cfg(feature = "firecrawl")]
     async fn fetch_with_firecrawl(&self, url: &str) -> anyhow::Result<String> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        let auth_token = match self.api_key.as_ref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim(),
+            _ => {
+                anyhow::bail!(
                     "web_fetch provider 'firecrawl' requires [web_fetch].api_key in config.toml"
-                )
-            })?;
+                );
+            }
+        };
 
         let api_url = self
             .api_url
@@ -215,7 +213,10 @@ impl WebFetchTool {
         let response = self
             .build_http_client()?
             .post(endpoint)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {auth_token}"),
+            )
             .json(&json!({
                 "url": url,
                 "formats": ["markdown"],
@@ -375,7 +376,7 @@ mod tests {
         allowed_domains: Vec<&str>,
         blocked_domains: Vec<&str>,
         provider: &str,
-        api_key: Option<&str>,
+        provider_key: Option<&str>,
         api_url: Option<&str>,
     ) -> WebFetchTool {
         let security = Arc::new(SecurityPolicy {
@@ -385,7 +386,7 @@ mod tests {
         WebFetchTool::new(
             security,
             provider.to_string(),
-            api_key.map(ToOwned::to_owned),
+            provider_key.map(ToOwned::to_owned),
             api_url.map(ToOwned::to_owned),
             allowed_domains.into_iter().map(String::from).collect(),
             blocked_domains.into_iter().map(String::from).collect(),

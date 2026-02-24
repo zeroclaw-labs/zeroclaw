@@ -102,12 +102,10 @@ impl WebSearchTool {
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
+        let auth_token = match self.api_key.as_ref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim(),
+            _ => anyhow::bail!("Brave API key not configured"),
+        };
 
         let encoded_query = urlencoding::encode(query);
         let search_url = format!(
@@ -122,7 +120,7 @@ impl WebSearchTool {
         let response = client
             .get(&search_url)
             .header("Accept", "application/json")
-            .header("X-Subscription-Token", api_key)
+            .header("X-Subscription-Token", auth_token)
             .send()
             .await?;
 
@@ -170,16 +168,14 @@ impl WebSearchTool {
 
     #[cfg(feature = "firecrawl")]
     async fn search_firecrawl(&self, query: &str) -> anyhow::Result<String> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        let auth_token = match self.api_key.as_ref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim(),
+            _ => {
+                anyhow::bail!(
                     "web_search provider 'firecrawl' requires [web_search].api_key in config.toml"
-                )
-            })?;
+                );
+            }
+        };
 
         let api_url = self
             .api_url
@@ -194,7 +190,10 @@ impl WebSearchTool {
 
         let response = client
             .post(endpoint)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {auth_token}"),
+            )
             .json(&json!({
                 "query": query,
                 "limit": self.max_results,
