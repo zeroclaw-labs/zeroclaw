@@ -423,6 +423,13 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            vision: true,
+            native_tool_calling: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1352,5 +1359,13 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn capabilities_reports_vision_and_native_tool_calling() {
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let caps = provider.capabilities();
+        assert!(caps.vision);
+        assert!(caps.native_tool_calling);
     }
 }
