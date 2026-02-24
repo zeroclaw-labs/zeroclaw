@@ -42,7 +42,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -1308,9 +1308,7 @@ fn sanitize_tool_json_value(
         return None;
     }
 
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
         if !tool_calls.is_empty()
@@ -1350,7 +1348,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -2693,9 +2691,10 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[allow(unused_variables)]
 fn collect_configured_channels(
     config: &Config,
-    _matrix_skip_context: &str,
+    matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
@@ -2783,7 +2782,7 @@ fn collect_configured_channels(
     if config.channels_config.matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            _matrix_skip_context
+            matrix_skip_context
         );
     }
 

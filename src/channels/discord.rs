@@ -362,6 +362,7 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -389,9 +390,10 @@ fn encode_emoji_for_discord(emoji: &str) -> String {
         return emoji.to_string();
     }
 
+    use std::fmt::Write as _;
     let mut encoded = String::new();
     for byte in emoji.as_bytes() {
-        encoded.push_str(&format!("%{byte:02X}"));
+        write!(encoded, "%{byte:02X}").ok();
     }
     encoded
 }
@@ -1366,6 +1368,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn split_message_many_short_lines() {
         // Many short lines should be batched into chunks under the limit
         let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();

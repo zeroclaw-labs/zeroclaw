@@ -575,6 +575,7 @@ fn mask_vec_secrets(values: &mut [String]) {
     }
 }
 
+#[allow(clippy::ref_option)]
 fn restore_optional_secret(value: &mut Option<String>, current: &Option<String>) {
     if value.as_deref().is_some_and(is_masked_secret) {
         *value = current.clone();
@@ -699,7 +700,7 @@ fn restore_masked_sensitive_fields(
         &current.storage.provider.config.db_url,
     );
 
-    for (name, agent) in incoming.agents.iter_mut() {
+    for (name, agent) in &mut incoming.agents {
         if let Some(current_agent) = current.agents.get(name) {
             restore_optional_secret(&mut agent.api_key, &current_agent.api_key);
         }

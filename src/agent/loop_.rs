@@ -881,15 +881,13 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for entry in ordered_results {
-            if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
-                let _ = writeln!(
-                    tool_results,
-                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
-                );
-            }
+        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            individual_results.push((tool_call_id, outcome.output.clone()));
+            let _ = writeln!(
+                tool_results,
+                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                tool_name, outcome.output
+            );
         }
 
         // Add assistant message with tool calls + tool results to history.

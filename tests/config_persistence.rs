@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! TG2: Config Load/Save Round-Trip Tests
 //!
 //! Prevents: Pattern 2 — Config persistence & workspace discovery bugs (13% of user bugs).

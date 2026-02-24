@@ -120,6 +120,7 @@ impl Tool for ShellTool {
         })
     }
 
+    #[allow(clippy::incompatible_msrv)]
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = extract_command_argument(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
