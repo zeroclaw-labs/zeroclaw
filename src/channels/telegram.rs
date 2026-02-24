@@ -953,7 +953,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .map(|id| id.to_string());
 
-        let reply_target = if let Some(tid) = thread_id {
+        let reply_target = if let Some(ref tid) = thread_id {
             format!("{}:{}", chat_id, tid)
         } else {
             chat_id.clone()
@@ -1031,7 +1031,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: None,
+            thread_ts: thread_id,
         })
     }
 
@@ -1080,7 +1080,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .map(|id| id.to_string());
 
-        let reply_target = if let Some(tid) = thread_id {
+        let reply_target = if let Some(ref tid) = thread_id {
             format!("{}:{}", chat_id, tid)
         } else {
             chat_id.clone()
@@ -1148,7 +1148,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: None,
+            thread_ts: thread_id,
         })
     }
 
@@ -1274,7 +1274,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .map(|id| id.to_string());
 
         // reply_target: chat_id or chat_id:thread_id format
-        let reply_target = if let Some(tid) = thread_id {
+        let reply_target = if let Some(ref tid) = thread_id {
             format!("{}:{}", chat_id, tid)
         } else {
             chat_id.clone()
@@ -1304,7 +1304,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: None,
+            thread_ts: thread_id,
         })
     }
 

@@ -260,11 +260,19 @@ impl InFlightTaskCompletion {
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+    // Include thread_ts for per-topic memory isolation in forum groups
+    match &msg.thread_ts {
+        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
+        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
+    }
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}", msg.channel, msg.sender)
+    // Include thread_ts for per-topic session isolation in forum groups
+    match &msg.thread_ts {
+        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
+        None => format!("{}_{}", msg.channel, msg.sender),
+    }
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
