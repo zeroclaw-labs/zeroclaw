@@ -22,6 +22,7 @@ const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 /// Per-locale pools let us vary the culturally appropriate set of reactions
 /// while always sending valid API identifiers.
 ///
+/// Ref: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
 /// Ref: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create
 /// Ref: https://open.larksuite.com/document/server-docs/im-v1/message-reaction/create
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] =
