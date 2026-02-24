@@ -574,7 +574,20 @@ impl TelegramChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            tracing::warn!("setMyCommands failed: status={status}, body={text}");
+            // Only log Telegram's error_code and description, not the full body
+            let detail = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    let code = v.get("error_code");
+                    let desc = v.get("description").and_then(|d| d.as_str());
+                    match (code, desc) {
+                        (Some(c), Some(d)) => Some(format!("error_code={c}, description={d}")),
+                        (_, Some(d)) => Some(format!("description={d}")),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| "no parseable error detail".to_string());
+            tracing::warn!("setMyCommands failed: status={status}, {detail}");
         } else {
             tracing::info!("Telegram bot commands registered successfully");
         }
