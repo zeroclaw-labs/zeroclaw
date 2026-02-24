@@ -2690,10 +2690,11 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             channel: Arc::new(
-                TelegramChannel::new(
+                TelegramChannel::with_options(
                     tg.bot_token.clone(),
                     tg.allowed_users.clone(),
                     tg.mention_only,
+                    tg.disable_ack_reactions,
                 )
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())

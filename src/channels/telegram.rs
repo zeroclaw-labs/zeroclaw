@@ -304,6 +304,7 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    disable_ack_reactions: bool,
     bot_username: Mutex<Option<String>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
@@ -315,6 +316,15 @@ pub struct TelegramChannel {
 
 impl TelegramChannel {
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
+        Self::with_options(bot_token, allowed_users, mention_only, false)
+    }
+
+    pub fn with_options(
+        bot_token: String,
+        allowed_users: Vec<String>,
+        mention_only: bool,
+        disable_ack_reactions: bool,
+    ) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
             let guard = PairingGuard::new(true, &[]);
@@ -337,6 +347,7 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            disable_ack_reactions,
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
@@ -2617,10 +2628,12 @@ Ensure only one `zeroclaw` process is using this bot token."
                     if let Some((reaction_chat_id, reaction_message_id)) =
                         Self::extract_update_message_target(update)
                     {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
+                        if !self.disable_ack_reactions {
+                            self.try_add_ack_reaction_nonblocking(
+                                reaction_chat_id,
+                                reaction_message_id,
+                            );
+                        }
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -4602,5 +4615,25 @@ mod tests {
         // The combination of marker_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the provider, and the channel will send "⚠️ Error: ..." to the user.
+    }
+
+    #[test]
+    fn telegram_channel_disable_ack_reactions_flag() {
+        let enabled = TelegramChannel::new("token".into(), vec!["user".into()], false);
+        assert!(
+            !enabled.disable_ack_reactions,
+            "default constructor should enable ack reactions"
+        );
+
+        let disabled = TelegramChannel::with_options(
+            "token".into(),
+            vec!["user".into()],
+            false,
+            true,
+        );
+        assert!(
+            disabled.disable_ack_reactions,
+            "with_options(true) should disable ack reactions"
+        );
     }
 }

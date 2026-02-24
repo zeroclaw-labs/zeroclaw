@@ -2761,6 +2761,9 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, disable automatic emoji reactions on incoming messages.
+    #[serde(default)]
+    pub disable_ack_reactions: bool,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -5119,6 +5122,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    disable_ack_reactions: false,
                 }),
                 discord: None,
                 slack: None,
@@ -5490,6 +5494,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            disable_ack_reactions: true,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -5498,6 +5503,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
         assert!(parsed.interrupt_on_new_message);
+        assert!(parsed.disable_ack_reactions);
     }
 
     #[test]
@@ -5507,6 +5513,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert!(!parsed.disable_ack_reactions);
     }
 
     #[test]
