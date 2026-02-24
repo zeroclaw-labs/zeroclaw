@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agents_ipc;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -350,6 +351,29 @@ pub fn all_tools_with_runtime(
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
+    }
+
+    // Inter-process agent communication (opt-in)
+    if root_config.agents_ipc.enabled {
+        match agents_ipc::IpcDb::open(workspace_dir, &root_config.agents_ipc) {
+            Ok(ipc_db) => {
+                let ipc_db = Arc::new(ipc_db);
+                tool_arcs.push(Arc::new(agents_ipc::AgentsListTool::new(ipc_db.clone())));
+                tool_arcs.push(Arc::new(agents_ipc::AgentsSendTool::new(
+                    ipc_db.clone(),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(agents_ipc::AgentsInboxTool::new(ipc_db.clone())));
+                tool_arcs.push(Arc::new(agents_ipc::StateGetTool::new(ipc_db.clone())));
+                tool_arcs.push(Arc::new(agents_ipc::StateSetTool::new(
+                    ipc_db,
+                    security.clone(),
+                )));
+            }
+            Err(e) => {
+                tracing::warn!("agents_ipc: failed to open IPC database: {e}");
+            }
+        }
     }
 
     boxed_registry_from_arcs(tool_arcs)

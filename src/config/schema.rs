@@ -244,6 +244,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Inter-process agent communication (`[agents_ipc]`).
+    #[serde(default)]
+    pub agents_ipc: AgentsIpcConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -415,6 +419,44 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+// ── Agents IPC ──────────────────────────────────────────────────
+
+fn default_agents_ipc_db_path() -> String {
+    "~/.zeroclaw/agents.db".into()
+}
+
+fn default_agents_ipc_staleness_secs() -> u64 {
+    300
+}
+
+/// Inter-process agent communication configuration (`[agents_ipc]` section).
+///
+/// When enabled, registers 5 IPC tools that let independent ZeroClaw processes
+/// on the same host discover each other and exchange messages via a shared
+/// SQLite database. Disabled by default (zero overhead when off).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentsIpcConfig {
+    /// Enable inter-process agent communication tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to shared SQLite database (all agents on this host share one file).
+    #[serde(default = "default_agents_ipc_db_path")]
+    pub db_path: String,
+    /// Agents not seen within this window are considered offline (seconds).
+    #[serde(default = "default_agents_ipc_staleness_secs")]
+    pub staleness_secs: u64,
+}
+
+impl Default for AgentsIpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: default_agents_ipc_db_path(),
+            staleness_secs: default_agents_ipc_staleness_secs(),
         }
     }
 }
@@ -3684,6 +3726,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         }
     }
 }
@@ -5231,6 +5274,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5414,6 +5458,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         };
 
         config.save().await.unwrap();
