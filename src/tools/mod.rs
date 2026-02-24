@@ -55,6 +55,7 @@ pub mod screenshot;
 pub mod shell;
 pub mod task_plan;
 pub mod traits;
+pub mod url_validation;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -287,6 +288,9 @@ pub fn all_tools_with_runtime(
     if web_fetch_config.enabled {
         tool_arcs.push(Arc::new(WebFetchTool::new(
             security.clone(),
+            web_fetch_config.provider.clone(),
+            web_fetch_config.api_key.clone(),
+            web_fetch_config.api_url.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
@@ -296,9 +300,20 @@ pub fn all_tools_with_runtime(
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
+        let provider = root_config.web_search.provider.trim().to_lowercase();
+        let api_key = if provider == "brave" {
+            root_config
+                .web_search
+                .brave_api_key
+                .clone()
+                .or_else(|| root_config.web_search.api_key.clone())
+        } else {
+            root_config.web_search.api_key.clone()
+        };
         tool_arcs.push(Arc::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
-            root_config.web_search.brave_api_key.clone(),
+            api_key,
+            root_config.web_search.api_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
         )));
