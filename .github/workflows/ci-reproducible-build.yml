@@ -91,7 +91,7 @@ jobs:
 
             - name: Upload reproducibility artifacts
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: reproducible-build
                   path: artifacts/reproducible-build*
@@ -99,7 +99,7 @@ jobs:
 
             - name: Upload audit event artifact
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: reproducible-build-audit-event
                   path: artifacts/audit-event-reproducible-build.json
