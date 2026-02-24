@@ -45,10 +45,12 @@ When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
+- `/new` — clear conversation history and start a fresh session
 
 Notes:
 
-- Switching clears only that sender's in-memory conversation history to avoid cross-model context contamination.
+- Switching provider or model clears only that sender's in-memory conversation history to avoid cross-model context contamination.
+- `/new` clears the sender's conversation history without changing provider or model selection.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
@@ -74,23 +76,23 @@ Operational notes:
 
 Matrix and Lark support are controlled at compile time.
 
-- Default builds are lean (`default = []`) and do not include Matrix/Lark.
-- Typical local check with only hardware support:
+- Default builds include Lark/Feishu (`default = ["channel-lark"]`), while Matrix remains opt-in.
+- For a lean local build without Matrix/Lark:
 
 ```bash
-cargo check --features hardware
+cargo check --no-default-features --features hardware
 ```
 
-- Enable Matrix explicitly when needed:
+- Enable Matrix explicitly in a custom feature set:
 
 ```bash
-cargo check --features hardware,channel-matrix
+cargo check --no-default-features --features hardware,channel-matrix
 ```
 
-- Enable Lark explicitly when needed:
+- Enable Lark explicitly in a custom feature set:
 
 ```bash
-cargo check --features hardware,channel-lark
+cargo check --no-default-features --features hardware,channel-lark
 ```
 
 If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
@@ -311,6 +313,8 @@ app_secret = "xxx"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
+mention_only = false              # optional: require @mention in groups (DMs always allowed)
+use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
@@ -332,6 +336,8 @@ Migration note:
 
 - Legacy config `[channels_config.lark] use_feishu = true` is still supported for backward compatibility.
 - Prefer `[channels_config.feishu]` for new setups.
+- Inbound `image` messages are converted to multimodal markers (`[IMAGE:data:image/...;base64,...]`).
+- If image download fails, ZeroClaw forwards fallback text instead of silently dropping the message.
 
 ### 4.13 Nostr
 
@@ -381,7 +387,15 @@ allowed_users = ["*"]
 app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
+receive_mode = "webhook" # webhook (default) or websocket (legacy fallback)
 ```
+
+Notes:
+
+- `webhook` mode is now the default and serves inbound callbacks at `POST /qq`.
+- QQ validation challenge payloads (`op = 13`) are auto-signed using `app_secret`.
+- `X-Bot-Appid` is checked when present and must match `app_id`.
+- Set `receive_mode = "websocket"` to keep the legacy gateway WS receive path.
 
 ### 4.16 Nextcloud Talk
 

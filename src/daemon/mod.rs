@@ -181,6 +181,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         observer,
     );
+    let delivery = heartbeat_delivery_target(&config)?;
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -188,7 +189,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     loop {
         interval.tick().await;
 
-        let tasks = engine.collect_tasks().await?;
+        let file_tasks = engine.collect_tasks().await?;
+        let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
         if tasks.is_empty() {
             continue;
         }
@@ -196,7 +198,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(
+            match crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -207,13 +209,113 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-            } else {
-                crate::health::mark_component_ok("heartbeat");
+                Ok(output) => {
+                    crate::health::mark_component_ok("heartbeat");
+                    let announcement = if output.trim().is_empty() {
+                        "heartbeat task executed".to_string()
+                    } else {
+                        output
+                    };
+                    if let Some((channel, target)) = &delivery {
+                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
+                            &config,
+                            channel,
+                            target,
+                            &announcement,
+                        )
+                        .await
+                        {
+                            crate::health::mark_component_error(
+                                "heartbeat",
+                                format!("delivery failed: {e}"),
+                            );
+                            tracing::warn!("Heartbeat delivery failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::health::mark_component_error("heartbeat", e.to_string());
+                    tracing::warn!("Heartbeat task failed: {e}");
+                }
             }
         }
     }
+}
+
+fn heartbeat_tasks_for_tick(
+    file_tasks: Vec<String>,
+    fallback_message: Option<&str>,
+) -> Vec<String> {
+    if !file_tasks.is_empty() {
+        return file_tasks;
+    }
+
+    fallback_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(|message| vec![message.to_string()])
+        .unwrap_or_default()
+}
+
+fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>> {
+    let channel = config
+        .heartbeat
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target = config
+        .heartbeat
+        .to
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (channel, target) {
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!("heartbeat.to is required when heartbeat.target is set"),
+        (None, Some(_)) => anyhow::bail!("heartbeat.target is required when heartbeat.to is set"),
+        (Some(channel), Some(target)) => {
+            validate_heartbeat_channel_config(config, channel)?;
+            Ok(Some((channel.to_string(), target.to_string())))
+        }
+    }
+}
+
+fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
+    match channel.to_ascii_lowercase().as_str() {
+        "telegram" => {
+            if config.channels_config.telegram.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to telegram but channels_config.telegram is not configured"
+                );
+            }
+        }
+        "discord" => {
+            if config.channels_config.discord.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to discord but channels_config.discord is not configured"
+                );
+            }
+        }
+        "slack" => {
+            if config.channels_config.slack.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to slack but channels_config.slack is not configured"
+                );
+            }
+        }
+        "mattermost" => {
+            if config.channels_config.mattermost.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
+                );
+            }
+        }
+        other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
+    }
+
+    Ok(())
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
@@ -338,6 +440,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -352,5 +455,91 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn heartbeat_tasks_use_file_tasks_when_available() {
+        let tasks =
+            heartbeat_tasks_for_tick(vec!["From file".to_string()], Some("Fallback from config"));
+        assert_eq!(tasks, vec!["From file".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_tasks_fall_back_to_config_message() {
+        let tasks = heartbeat_tasks_for_tick(vec![], Some("  check london time  "));
+        assert_eq!(tasks, vec!["check london time".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_tasks_ignore_empty_fallback_message() {
+        let tasks = heartbeat_tasks_for_tick(vec![], Some("   "));
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_none_when_unset() {
+        let config = Config::default();
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_requires_to_field() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("heartbeat.to is required when heartbeat.target is set"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_requires_target_field() {
+        let mut config = Config::default();
+        config.heartbeat.to = Some("123456".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("heartbeat.target is required when heartbeat.to is set"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_unsupported_channel() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("email".into());
+        config.heartbeat.to = Some("ops@example.com".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported heartbeat.target channel"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_requires_channel_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        config.heartbeat.to = Some("123456".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("channels_config.telegram is not configured"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_telegram_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        config.heartbeat.to = Some("123456".into());
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "bot-token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
     }
 }

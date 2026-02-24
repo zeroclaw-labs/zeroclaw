@@ -17,6 +17,21 @@ pub enum AutonomyLevel {
     Full,
 }
 
+impl std::str::FromStr for AutonomyLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "read_only" | "readonly" => Ok(Self::ReadOnly),
+            "supervised" => Ok(Self::Supervised),
+            "full" => Ok(Self::Full),
+            _ => Err(format!(
+                "invalid autonomy level '{s}': expected read_only, supervised, or full"
+            )),
+        }
+    }
+}
+
 /// Risk score for shell command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRiskLevel {
@@ -725,10 +740,10 @@ impl SecurityPolicy {
 
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
-        // bypassing path checks through variable indirection.
+        // bypassing path checks through variable indirection. The helper below
+        // ignores escapes and literals inside single quotes, so `$(` or `${`
+        // literals are permitted there.
         if command.contains('`')
-            || command.contains("$(")
-            || command.contains("${")
             || contains_unquoted_shell_variable_expansion(command)
             || command.contains("<(")
             || command.contains(">(")
@@ -941,7 +956,6 @@ impl SecurityPolicy {
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
-        // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
@@ -952,12 +966,29 @@ impl SecurityPolicy {
             return true;
         }
 
-        // Check extra allowed roots (e.g. shared skills directories).
+        // Check extra allowed roots (e.g. shared skills directories) before
+        // forbidden checks so explicit allowlists can coexist with broad
+        // default forbidden roots such as `/home` and `/tmp`.
         for root in &self.allowed_roots {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
             if resolved.starts_with(&canonical) {
                 return true;
             }
+        }
+
+        // For paths outside workspace/allowlist, block forbidden roots to
+        // prevent symlink escapes and sensitive directory access.
+        for forbidden in &self.forbidden_paths {
+            let forbidden_path = expand_user_path(forbidden);
+            if resolved.starts_with(&forbidden_path) {
+                return false;
+            }
+        }
+
+        // When workspace_only is disabled the user explicitly opted out of
+        // workspace confinement after forbidden-path checks are applied.
+        if !self.workspace_only {
+            return true;
         }
 
         false
@@ -1599,6 +1630,24 @@ mod tests {
     }
 
     #[test]
+    fn command_injection_dollar_paren_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '$(cat /etc/passwd)'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '${HOME}'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_unquoted_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo ${HOME}"));
+    }
+
+    #[test]
     fn command_with_env_var_prefix() {
         let p = default_policy();
         // "FOO=bar" is the first word — not in allowlist
@@ -1929,6 +1978,78 @@ mod tests {
         };
         assert!(!p.is_path_allowed("/etc/shadow"));
         assert!(!p.is_path_allowed("/root/.bashrc"));
+    }
+
+    #[test]
+    fn workspace_only_false_allows_resolved_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec!["/etc".into(), "/var".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Path outside workspace should be allowed when workspace_only=false
+        let outside = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home"))
+            .join("zeroclaw_outside_ws");
+        assert!(
+            p.is_resolved_path_allowed(&outside),
+            "workspace_only=false must allow resolved paths outside workspace"
+        );
+
+        // Forbidden paths must still be blocked even with workspace_only=false
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "forbidden paths must be blocked even when workspace_only=false"
+        );
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
+            "forbidden /var must be blocked even when workspace_only=false"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn workspace_only_true_blocks_resolved_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_true");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Path inside workspace — allowed
+        let inside = canonical_workspace.join("subdir");
+        assert!(
+            p.is_resolved_path_allowed(&inside),
+            "path inside workspace must be allowed"
+        );
+
+        // Path outside workspace — blocked
+        let outside = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("zeroclaw_outside_ws_true");
+        assert!(
+            !p.is_resolved_path_allowed(&outside),
+            "workspace_only=true must block resolved paths outside workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     // ── Edge cases: from_config preserves tracker ────────────

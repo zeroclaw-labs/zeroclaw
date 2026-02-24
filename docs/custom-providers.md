@@ -14,6 +14,25 @@ api_key = "your-api-key"
 default_model = "your-model-name"
 ```
 
+Optional API mode:
+
+```toml
+# Default (chat-completions first, responses fallback when available)
+provider_api = "openai-chat-completions"
+
+# Responses-first mode (calls /responses directly)
+provider_api = "openai-responses"
+```
+
+`provider_api` is only valid when `default_provider` uses `custom:<url>`.
+
+Responses API WebSocket mode is supported for OpenAI-compatible endpoints:
+
+- Auto mode: when your `custom:` endpoint resolves to `api.openai.com`, ZeroClaw will try WebSocket mode first (`wss://.../responses`) and automatically fall back to HTTP if the websocket handshake or stream fails.
+- Manual override:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode for any `custom:` endpoint.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` disables websocket mode and uses HTTP only.
+
 ### Anthropic-Compatible Endpoints (`anthropic-custom:`)
 
 For services that implement the Anthropic API format:

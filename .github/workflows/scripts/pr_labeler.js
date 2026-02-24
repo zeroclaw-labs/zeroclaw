@@ -267,6 +267,7 @@ const providerKeywordHints = [
   "groq",
   "together",
   "fireworks",
+  "novita",
   "cohere",
   "openai",
   "openrouter",

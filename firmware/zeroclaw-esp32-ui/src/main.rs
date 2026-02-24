@@ -3,6 +3,7 @@
 //! This binary initializes ESP-IDF, boots a minimal Slint UI, and keeps
 //! architecture boundaries explicit so hardware integrations can be added
 //! incrementally.
+#![forbid(unsafe_code)]
 
 use anyhow::Context;
 use log::info;

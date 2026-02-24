@@ -168,6 +168,37 @@ impl OllamaProvider {
         serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    fn normalize_response_text(content: String) -> Option<String> {
+        if content.trim().is_empty() {
+            None
+        } else {
+            Some(content)
+        }
+    }
+
+    fn fallback_text_for_empty_content(model: &str, thinking: Option<&str>) -> String {
+        if let Some(thinking) = thinking.map(str::trim).filter(|value| !value.is_empty()) {
+            let thinking_log_excerpt: String = thinking.chars().take(100).collect();
+            let thinking_reply_excerpt: String = thinking.chars().take(200).collect();
+            tracing::warn!(
+                "Ollama returned empty content with only thinking for model '{}': '{}'. Model may have stopped prematurely.",
+                model,
+                thinking_log_excerpt
+            );
+            return format!(
+                "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
+                thinking_reply_excerpt
+            );
+        }
+
+        tracing::warn!(
+            "Ollama returned empty or whitespace content with no tool calls for model '{}'",
+            model
+        );
+        "I couldn't get a complete response from Ollama. Please try again or switch to a different model."
+            .to_string()
+    }
+
     fn build_chat_request(
         &self,
         messages: Vec<Message>,
@@ -508,23 +539,14 @@ impl Provider for OllamaProvider {
 
         // Plain text response
         let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
+        if let Some(content) = Self::normalize_response_text(content) {
+            return Ok(content);
         }
 
-        Ok(content)
+        Ok(Self::fallback_text_for_empty_content(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ))
     }
 
     async fn chat_with_history(
@@ -558,25 +580,14 @@ impl Provider for OllamaProvider {
 
         // Plain text response
         let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        // This is a model quirk - it stopped after reasoning without producing output
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                // Return a message indicating the model's thought process but no action
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
+        if let Some(content) = Self::normalize_response_text(content) {
+            return Ok(content);
         }
 
-        Ok(content)
+        Ok(Self::fallback_text_for_empty_content(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ))
     }
 
     async fn chat_with_tools(
@@ -632,11 +643,7 @@ impl Provider for OllamaProvider {
                     }
                 })
                 .collect();
-            let text = if response.message.content.is_empty() {
-                None
-            } else {
-                Some(response.message.content)
-            };
+            let text = Self::normalize_response_text(response.message.content);
             return Ok(ChatResponse {
                 text,
                 tool_calls,
@@ -647,26 +654,16 @@ impl Provider for OllamaProvider {
 
         // Plain text response.
         let content = response.message.content;
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                return Ok(ChatResponse {
-                    text: Some(format!(
-                        "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                        if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                    )),
-                    tool_calls: vec![],
-                    usage,
-                    reasoning_content: None,
-                });
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
-        }
+        let text = if let Some(content) = Self::normalize_response_text(content) {
+            content
+        } else {
+            Self::fallback_text_for_empty_content(
+                &normalized_model,
+                response.message.thinking.as_deref(),
+            )
+        };
         Ok(ChatResponse {
-            text: Some(content),
+            text: Some(text),
             tool_calls: vec![],
             usage,
             reasoning_content: None,
@@ -861,6 +858,24 @@ mod tests {
         let json = r#"{"message":{"role":"assistant","content":""}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.message.content.is_empty());
+    }
+
+    #[test]
+    fn normalize_response_text_rejects_whitespace_only_content() {
+        assert_eq!(
+            OllamaProvider::normalize_response_text("\n \t".to_string()),
+            None
+        );
+        assert_eq!(
+            OllamaProvider::normalize_response_text(" hello ".to_string()),
+            Some(" hello ".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_text_for_empty_content_without_thinking_is_generic() {
+        let text = OllamaProvider::fallback_text_for_empty_content("qwen3-coder", None);
+        assert!(text.contains("couldn't get a complete response from Ollama"));
     }
 
     #[test]

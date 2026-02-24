@@ -1,0 +1,77 @@
+{
+  "global_timeout_seconds": 8,
+  "providers": [
+    {
+      "id": "openrouter",
+      "url": "https://openrouter.ai/api/v1/models",
+      "method": "GET",
+      "critical": true
+    },
+    {
+      "id": "openai",
+      "url": "https://api.openai.com/v1/models",
+      "method": "GET",
+      "critical": true
+    },
+    {
+      "id": "anthropic",
+      "url": "https://api.anthropic.com/v1/messages",
+      "method": "POST",
+      "critical": true
+    },
+    {
+      "id": "groq",
+      "url": "https://api.groq.com/openai/v1/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "deepseek",
+      "url": "https://api.deepseek.com/v1/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "moonshot",
+      "url": "https://api.moonshot.ai/v1/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "qwen",
+      "url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "zai",
+      "url": "https://api.z.ai/api/paas/v4/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "glm",
+      "url": "https://open.bigmodel.cn/api/paas/v4/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "together",
+      "url": "https://api.together.xyz/v1/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "fireworks",
+      "url": "https://api.fireworks.ai/inference/v1/models",
+      "method": "GET",
+      "critical": false
+    },
+    {
+      "id": "cohere",
+      "url": "https://api.cohere.com/v1/models",
+      "method": "GET",
+      "critical": false
+    }
+  ]
+}

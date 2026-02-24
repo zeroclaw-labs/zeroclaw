@@ -4,6 +4,7 @@
 //! responds with JSON. Compatible with host ZeroClaw SerialPeripheral protocol.
 //!
 //! Protocol: same as STM32 — see docs/hardware-peripherals-design.md
+#![forbid(unsafe_code)]
 
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;

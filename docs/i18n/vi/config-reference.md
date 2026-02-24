@@ -210,7 +210,7 @@ Lưu ý:
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `enabled` | `false` | Bật tool `browser_open` (mở URL, không thu thập dữ liệu) |
+| `enabled` | `false` | Bật tool `browser_open` (mở URL trong trình duyệt mặc định hệ thống, không thu thập dữ liệu) |
 | `allowed_domains` | `[]` | Tên miền cho phép cho `browser_open` (khớp chính xác hoặc subdomain) |
 | `session_name` | chưa đặt | Tên phiên trình duyệt (cho tự động hóa agent-browser) |
 | `backend` | `agent_browser` | Backend tự động hóa: `"agent_browser"`, `"rust_native"`, `"computer_use"` hoặc `"auto"` |

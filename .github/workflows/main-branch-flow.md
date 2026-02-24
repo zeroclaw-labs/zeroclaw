@@ -13,10 +13,11 @@ Use this with:
 | Event | Main workflows |
 | --- | --- |
 | PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-auto-response.yml` |
-| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, `main-promotion-gate.yml` (for `main` PRs), plus path-scoped workflows |
-| Push to `dev`/`main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
+| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, `sec-codeql.yml` (when Rust/codeql paths change), `main-promotion-gate.yml` (for `main` PRs), plus path-scoped workflows |
+| Push to `dev`/`main` | `ci-run.yml`, `sec-audit.yml`, `sec-codeql.yml` (when Rust/codeql paths change), plus path-scoped workflows |
+| Merge queue (`merge_group`) | `ci-run.yml`, `sec-audit.yml`, `sec-codeql.yml` |
 | Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job |
-| Scheduled/manual | `pub-release.yml` verification mode, `pub-homebrew-core.yml` (manual), `sec-codeql.yml`, `feature-matrix.yml`, `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
+| Scheduled/manual | `pub-release.yml` verification mode, `pub-homebrew-core.yml` (manual), `sec-codeql.yml`, `ci-connectivity-probes.yml`, `ci-provider-connectivity.yml`, `ci-reproducible-build.yml`, `ci-supply-chain-provenance.yml`, `ci-change-audit.yml` (manual), `ci-rollback.yml` (weekly/manual), `feature-matrix.yml`, `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
 
 ## Runtime and Docker Matrix
 
@@ -55,10 +56,14 @@ Notes:
 3. `pull_request` CI workflows start:
    - `ci-run.yml`
    - `sec-audit.yml`
+   - `sec-codeql.yml` (if Rust/codeql paths changed)
    - path-scoped workflows if matching files changed:
      - `pub-docker-img.yml` (Docker build-input paths only)
      - `workflow-sanity.yml` (workflow files only)
      - `pr-label-policy-check.yml` (label-policy files only)
+     - `ci-change-audit.yml` (CI/security path changes)
+     - `ci-provider-connectivity.yml` (probe config/script/workflow changes)
+     - `ci-reproducible-build.yml` (Rust/build reproducibility paths)
 4. In `ci-run.yml`, `changes` computes:
    - `docs_only`
    - `docs_changed`
@@ -69,6 +74,7 @@ Notes:
    - `lint`
    - `lint-strict-delta`
    - `test`
+   - `flake-probe` (single-retry telemetry; optional block via `CI_BLOCK_ON_FLAKE_SUSPECTED`)
    - `docs-quality`
 7. If `.github/workflows/**` changed, `workflow-owner-approval` must pass.
 8. If root license files (`LICENSE-APACHE`, `LICENSE-MIT`) changed, `license-file-owner-guard` allows only PR author `willsarg`.
@@ -123,16 +129,18 @@ Notes:
 5. Maintainer merges PR once checks and review policy pass.
 6. Merge emits a `push` event on `main`.
 
-### 4) Push to `dev` or `main` (including after merge)
+### 4) Push/Merge Queue to `dev` or `main` (including after merge)
 
-1. Commit reaches `dev` or `main` (usually from a merged PR).
-2. `ci-run.yml` runs on `push`.
-3. `sec-audit.yml` runs on `push`.
-4. Path-filtered workflows run only if touched files match their filters.
-5. In `ci-run.yml`, push behavior differs from PR behavior:
+1. Commit reaches `dev` or `main` (usually from a merged PR), or merge queue creates a `merge_group` validation commit.
+2. `ci-run.yml` runs on `push` and `merge_group`.
+3. `sec-audit.yml` runs on `push` and `merge_group`.
+4. `sec-codeql.yml` runs on `push`/`merge_group` when Rust/codeql paths change (path-scoped on push).
+5. `ci-supply-chain-provenance.yml` runs on push when Rust/build provenance paths change.
+6. Path-filtered workflows run only if touched files match their filters.
+7. In `ci-run.yml`, push/merge-group behavior differs from PR behavior:
    - Rust path: `lint`, `lint-strict-delta`, `test`, `build` are expected.
    - Docs/non-rust paths: fast-path behavior applies.
-6. `CI Required Gate` computes overall push result.
+8. `CI Required Gate` computes overall push/merge-group result.
 
 ## Docker Publish Logic
 
@@ -184,9 +192,16 @@ Manual Homebrew formula flow:
 
 1. Workflow-file changes (`.github/workflows/**`) activate owner-approval gate in `ci-run.yml`.
 2. PR lint/test strictness is intentionally controlled by `ci:full` label.
-3. `sec-audit.yml` runs on both PR and push, plus scheduled weekly.
-4. Some workflows are operational and non-merge-path (`pr-check-stale`, `pr-check-status`, `sync-contributors`, etc.).
-5. Workflow-specific JavaScript helpers are organized under `.github/workflows/scripts/`.
+3. `pr-intake-checks.yml` now blocks PRs missing a Linear issue key (`RMN-*`, `CDV-*`, `COM-*`) to keep execution mapped to Linear.
+4. `sec-audit.yml` runs on PR/push/merge queue (`merge_group`), plus scheduled weekly.
+5. `ci-change-audit.yml` enforces pinned `uses:` references for CI/security workflow changes.
+6. `sec-audit.yml` includes deny policy hygiene checks (`deny_policy_guard.py`) before cargo-deny.
+7. `sec-audit.yml` includes gitleaks allowlist governance checks (`secrets_governance_guard.py`) against `.github/security/gitleaks-allowlist-governance.json`.
+8. `ci-reproducible-build.yml` and `ci-supply-chain-provenance.yml` provide scheduled supply-chain assurance signals outside release-only windows.
+9. Some workflows are operational and non-merge-path (`pr-check-stale`, `pr-check-status`, `sync-contributors`, etc.).
+10. Workflow-specific JavaScript helpers are organized under `.github/workflows/scripts/`.
+11. `ci-run.yml` includes cache partitioning (`prefix-key`) across lint/test/build/flake-probe lanes to reduce cache contention.
+12. `ci-rollback.yml` provides a guarded rollback planning lane (scheduled dry-run + manual execute controls) with audit artifacts.
 
 ## Mermaid Diagrams
 

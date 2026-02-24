@@ -633,14 +633,34 @@ impl BrowserTool {
         {
             let mut state = self.native_state.lock().await;
 
-            let output = state
+            let first_attempt = state
                 .execute_action(
-                    action,
+                    action.clone(),
                     self.native_headless,
                     &self.native_webdriver_url,
                     self.native_chrome_path.as_deref(),
                 )
-                .await?;
+                .await;
+
+            let output = match first_attempt {
+                Ok(output) => output,
+                Err(err) => {
+                    if !is_recoverable_rust_native_error(&err) {
+                        return Err(err);
+                    }
+
+                    state.reset_session().await;
+                    state
+                        .execute_action(
+                            action,
+                            self.native_headless,
+                            &self.native_webdriver_url,
+                            self.native_chrome_path.as_deref(),
+                        )
+                        .await
+                        .with_context(|| "rust_native backend retry after session reset failed")?
+                }
+            };
 
             Ok(ToolResult {
                 success: true,
@@ -1072,6 +1092,7 @@ mod native_backend {
     use anyhow::{Context, Result};
     use base64::Engine;
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
+    use fantoccini::error::CmdError;
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
     use serde_json::{json, Map, Value};
@@ -1142,7 +1163,7 @@ mod native_backend {
                 }
                 BrowserAction::Click { selector } => {
                     let client = self.active_client()?;
-                    find_element(client, &selector).await?.click().await?;
+                    click_with_recovery(client, &selector).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1152,9 +1173,7 @@ mod native_backend {
                 }
                 BrowserAction::Fill { selector, value } => {
                     let client = self.active_client()?;
-                    let element = find_element(client, &selector).await?;
-                    let _ = element.clear().await;
-                    element.send_keys(&value).await?;
+                    fill_with_recovery(client, &selector, &value).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1164,10 +1183,7 @@ mod native_backend {
                 }
                 BrowserAction::Type { selector, text } => {
                     let client = self.active_client()?;
-                    find_element(client, &selector)
-                        .await?
-                        .send_keys(&text)
-                        .await?;
+                    type_with_recovery(client, &selector, &text).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1348,9 +1364,7 @@ mod native_backend {
                     }))
                 }
                 BrowserAction::Close => {
-                    if let Some(client) = self.client.take() {
-                        let _ = client.close().await;
-                    }
+                    self.reset_session().await;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1366,35 +1380,37 @@ mod native_backend {
                 } => {
                     let client = self.active_client()?;
                     let selector = selector_for_find(&by, &value);
-                    let element = find_element(client, &selector).await?;
 
                     let payload = match action.as_str() {
                         "click" => {
-                            element.click().await?;
+                            click_with_recovery(client, &selector).await?;
                             json!({"result": "clicked"})
                         }
                         "fill" => {
                             let fill = fill_value.ok_or_else(|| {
                                 anyhow::anyhow!("find_action='fill' requires fill_value")
                             })?;
-                            let _ = element.clear().await;
-                            element.send_keys(&fill).await?;
+                            fill_with_recovery(client, &selector, &fill).await?;
                             json!({"result": "filled", "typed": fill.len()})
                         }
                         "text" => {
+                            let element = find_element(client, &selector).await?;
                             let text = element.text().await?;
                             json!({"result": "text", "text": text})
                         }
                         "hover" => {
+                            let element = prepare_interactable_element(client, &selector).await?;
                             hover_element(client, &element).await?;
                             json!({"result": "hovered"})
                         }
                         "check" => {
+                            let element = prepare_interactable_element(client, &selector).await?;
                             let checked_before = element_checked(&element).await?;
                             if !checked_before {
-                                element.click().await?;
+                                click_with_recovery(client, &selector).await?;
                             }
-                            let checked_after = element_checked(&element).await?;
+                            let refreshed = find_element(client, &selector).await?;
+                            let checked_after = element_checked(&refreshed).await?;
                             json!({
                                 "result": "checked",
                                 "checked_before": checked_before,
@@ -1415,6 +1431,12 @@ mod native_backend {
                         "data": payload,
                     }))
                 }
+            }
+        }
+
+        pub async fn reset_session(&mut self) {
+            if let Some(client) = self.client.take() {
+                let _ = client.close().await;
             }
         }
 
@@ -1521,6 +1543,10 @@ mod native_backend {
         }
     }
 
+    const INTERACTABLE_TIMEOUT_MS: u64 = 5_000;
+    const INTERACTABLE_POLL_MS: u64 = 120;
+    const INTERACTABLE_RETRY_DELAY_MS: u64 = 180;
+
     async fn wait_for_selector(client: &Client, selector: &str) -> Result<()> {
         match parse_selector(selector) {
             SelectorKind::Css(css) => {
@@ -1541,6 +1567,46 @@ mod native_backend {
         Ok(())
     }
 
+    async fn prepare_interactable_element(
+        client: &Client,
+        selector: &str,
+    ) -> Result<fantoccini::elements::Element> {
+        wait_for_selector(client, selector).await?;
+        wait_for_interactable_element(
+            client,
+            selector,
+            Duration::from_millis(INTERACTABLE_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    async fn wait_for_interactable_element(
+        client: &Client,
+        selector: &str,
+        timeout: Duration,
+    ) -> Result<fantoccini::elements::Element> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(element) = find_element(client, selector).await {
+                let _ = scroll_element_into_view(client, &element).await;
+                let visible = element.is_displayed().await.unwrap_or(false);
+                let disabled = element_disabled(&element).await.unwrap_or(false);
+                if visible && !disabled {
+                    return Ok(element);
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Element '{selector}' became visible in DOM but stayed non-interactable for {}ms",
+                    timeout.as_millis()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_POLL_MS)).await;
+        }
+    }
+
     async fn find_element(
         client: &Client,
         selector: &str,
@@ -1556,6 +1622,125 @@ mod native_backend {
                 .with_context(|| format!("Failed to find element by XPath '{xpath}'"))?,
         };
         Ok(element)
+    }
+
+    async fn scroll_element_into_view(
+        client: &Client,
+        element: &fantoccini::elements::Element,
+    ) -> Result<()> {
+        let element_arg = serde_json::to_value(element)
+            .context("Failed to serialize element for scrollIntoView")?;
+        client
+            .execute(
+                r#"const el = arguments[0];
+if (!el || typeof el.scrollIntoView !== "function") return false;
+try {
+  el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+} catch (_) {
+  el.scrollIntoView(true);
+}
+return true;"#,
+                vec![element_arg],
+            )
+            .await
+            .context("Failed to execute scrollIntoView for element")?;
+        Ok(())
+    }
+
+    async fn element_disabled(element: &fantoccini::elements::Element) -> Result<bool> {
+        let disabled = element
+            .prop("disabled")
+            .await
+            .context("Failed to read disabled property")?
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(disabled.as_str(), "true" | "disabled" | "1") {
+            return Ok(true);
+        }
+
+        let aria_disabled = element
+            .attr("aria-disabled")
+            .await
+            .context("Failed to read aria-disabled attribute")?
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Ok(matches!(aria_disabled.as_str(), "true" | "1"))
+    }
+
+    async fn javascript_click(
+        client: &Client,
+        element: &fantoccini::elements::Element,
+    ) -> Result<()> {
+        let element_arg =
+            serde_json::to_value(element).context("Failed to serialize element for JS click")?;
+        client
+            .execute(
+                r#"const el = arguments[0];
+if (!el) return false;
+el.click();
+return true;"#,
+                vec![element_arg],
+            )
+            .await
+            .context("Failed JavaScript click fallback")?;
+        Ok(())
+    }
+
+    fn is_non_interactable_cmd_error(err: &CmdError) -> bool {
+        let message = format!("{err:#}").to_ascii_lowercase();
+        message.contains("element not interactable")
+            || message.contains("element click intercepted")
+            || message.contains("not clickable")
+    }
+
+    async fn click_with_recovery(client: &Client, selector: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        if let Err(err) = element.click().await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            match retry_element.click().await {
+                Ok(()) => {}
+                Err(retry_err) if is_non_interactable_cmd_error(&retry_err) => {
+                    javascript_click(client, &retry_element).await?;
+                }
+                Err(retry_err) => return Err(retry_err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn fill_with_recovery(client: &Client, selector: &str, value: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        let _ = element.clear().await;
+        if let Err(err) = element.send_keys(value).await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            let _ = retry_element.clear().await;
+            retry_element.send_keys(value).await?;
+        }
+        Ok(())
+    }
+
+    async fn type_with_recovery(client: &Client, selector: &str, text: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        if let Err(err) = element.send_keys(text).await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            retry_element.send_keys(text).await?;
+        }
+        Ok(())
     }
 
     async fn hover_element(client: &Client, element: &fantoccini::elements::Element) -> Result<()> {
@@ -1945,6 +2130,21 @@ fn unavailable_action_for_backend_error(action: &str, backend: ResolvedBackend) 
         "Action '{action}' is unavailable for backend '{}'",
         backend_name(backend)
     )
+}
+
+fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+
+    if message.contains("invalid session id")
+        || message.contains("no such window")
+        || message.contains("session not created")
+        || message.contains("connection reset")
+        || message.contains("broken pipe")
+    {
+        return true;
+    }
+
+    message.contains("webdriver") && (message.contains("timed out") || message.contains("timeout"))
 }
 
 fn normalize_domains(domains: Vec<String>) -> Vec<String> {
@@ -2411,5 +2611,46 @@ mod tests {
             unavailable_action_for_backend_error("mouse_move", ResolvedBackend::RustNative),
             "Action 'mouse_move' is unavailable for backend 'rust_native'"
         );
+    }
+
+    #[test]
+    fn recoverable_error_detection_matches_session_patterns() {
+        for message in [
+            "invalid session id",
+            "No Such Window",
+            "session not created",
+            "connection reset by peer",
+            "broken pipe while writing webdriver command",
+            "WebDriver request timed out",
+        ] {
+            let err = anyhow::anyhow!(message);
+            assert!(is_recoverable_rust_native_error(&err), "{message}");
+        }
+
+        let allowlist_error =
+            anyhow::anyhow!("URL host 'localhost' is not in browser allowlist [example.com]");
+        assert!(!is_recoverable_rust_native_error(&allowlist_error));
+    }
+
+    #[test]
+    fn non_recoverable_error_detection_rejects_policy_errors() {
+        for message in [
+            "Blocked by security policy",
+            "URL host '127.0.0.1' is private and disallowed",
+            "Action 'mouse_move' is unavailable for backend 'rust_native'",
+        ] {
+            let err = anyhow::anyhow!(message);
+            assert!(!is_recoverable_rust_native_error(&err), "{message}");
+        }
+    }
+
+    #[cfg(feature = "browser-native")]
+    #[test]
+    fn reset_session_is_idempotent_without_client() {
+        tokio_test::block_on(async {
+            let mut state = native_backend::NativeBrowserState::default();
+            state.reset_session().await;
+            state.reset_session().await;
+        });
     }
 }

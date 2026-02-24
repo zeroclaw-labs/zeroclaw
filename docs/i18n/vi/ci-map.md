@@ -12,6 +12,8 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 
 - `.github/workflows/ci-run.yml` (`CI`)
     - Mục đích: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate trên các dòng Rust thay đổi, `test`, kiểm tra smoke release build) + kiểm tra chất lượng tài liệu khi tài liệu thay đổi (`markdownlint` chỉ chặn các vấn đề trên dòng thay đổi; link check chỉ quét các link mới được thêm trên dòng thay đổi)
+    - Hành vi bổ sung: rust-cache được phân vùng theo vai trò job qua `prefix-key` để giảm cache churn giữa các lane lint/test/build/flake-probe
+    - Hành vi bổ sung: sinh artifact `test-flake-probe` từ cơ chế retry một lần khi test fail; có thể bật chế độ chặn bằng biến repository `CI_BLOCK_ON_FLAKE_SUSPECTED=true`
     - Hành vi bổ sung: các PR thay đổi `.github/workflows/**` yêu cầu ít nhất một review phê duyệt từ login trong `WORKFLOW_OWNER_LOGINS` (fallback biến repository: `theonlyhennygod,willsarg`)
     - Hành vi bổ sung: lint gate chạy trước `test`/`build`; khi lint/docs gate thất bại trên PR, CI đăng comment phản hồi hành động được với tên gate thất bại và các lệnh sửa cục bộ
     - Merge gate: `CI Required Gate`
@@ -26,9 +28,19 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
     - Mục đích: kiểm tra Docker smoke trên PR và publish image khi push lên `main` (các đường dẫn build-input), push tag (`v*`) và khi dispatch thủ công
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
-    - Mục đích: advisory phụ thuộc (`rustsec/audit-check`, SHA được pin) và kiểm tra chính sách/giấy phép (`cargo deny`)
+    - Mục đích: advisory phụ thuộc (`rustsec/audit-check`, SHA được pin), kiểm tra chính sách/giấy phép (`cargo deny`), quản trị secrets bằng gitleaks (kèm kiểm tra metadata allowlist + hạn dùng), và sinh artifact SBOM (`CycloneDX` + `SPDX`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
-    - Mục đích: phân tích tĩnh theo lịch/thủ công để phát hiện vấn đề bảo mật
+    - Mục đích: phân tích tĩnh cho PR/push (khi đổi mã Rust/codeql) và chạy theo lịch/thủ công để phát hiện vấn đề bảo mật
+- `.github/workflows/ci-change-audit.yml` (`CI/CD Change Audit`)
+    - Mục đích: tạo báo cáo diff có thể kiểm toán cho thay đổi CI/security (line churn, `uses:` mới, vi phạm pin SHA, vi phạm policy pipe-to-shell, cấp quyền rộng `permissions: write-all`, bổ sung trigger `pull_request_target`, tham chiếu `secrets.*` mới)
+- `.github/workflows/ci-provider-connectivity.yml` (`CI Provider Connectivity`)
+    - Mục đích: probe matrix endpoint provider theo lịch/thủ công, xuất artifact JSON/Markdown để theo dõi độ sẵn sàng kết nối
+- `.github/workflows/ci-reproducible-build.yml` (`CI Reproducible Build`)
+    - Mục đích: kiểm tra drift tính quyết định của build (clean-build hai lần + so sánh hash) kèm artifact chuẩn hóa
+- `.github/workflows/ci-supply-chain-provenance.yml` (`CI Supply Chain Provenance`)
+    - Mục đích: tạo statement provenance cho artifact release-fast và bundle chữ ký keyless để truy vết chuỗi cung ứng
+- `.github/workflows/ci-rollback.yml` (`CI Rollback Guard`)
+    - Mục đích: tạo kế hoạch rollback có tính quyết định với chế độ `execute` được bảo vệ thủ công, tùy chọn marker tag và artifact kiểm toán rollback
 - `.github/workflows/pub-release.yml` (`Release`)
     - Mục đích: build release artifact ở chế độ xác minh (thủ công/theo lịch) và publish GitHub release khi push tag hoặc chế độ publish thủ công
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
@@ -65,10 +77,15 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 
 ## Bản đồ Trigger
 
-- `CI`: push lên `main`, PR lên `main`
-- `Docker`: push lên `main` khi Docker build input thay đổi, push tag (`v*`), PR tương ứng, dispatch thủ công
+- `CI`: push lên `dev` và `main`, PR lên `dev` và `main`, và `merge_group` cho merge queue vào `dev`/`main`
+- `Docker`: push tag (`v*`) để publish, PR lên `dev`/`main` cho smoke build (khi đổi build-input), dispatch thủ công
 - `Release`: push tag (`v*`), lịch hàng tuần (chỉ xác minh), dispatch thủ công (xác minh hoặc publish)
-- `Security Audit`: push lên `main`, PR lên `main`, lịch hàng tuần
+- `Security Audit`: push lên `dev` và `main`, PR lên `dev` và `main`, `merge_group` cho merge queue vào `dev`/`main`, lịch hàng tuần
+- `CI/CD Change Audit`: PR/push trên các đường dẫn CI/security, dispatch thủ công
+- `CI Provider Connectivity`: lịch mỗi 6 giờ, dispatch thủ công, và PR/push khi đổi workflow/script/config probe
+- `CI Reproducible Build`: PR/push trên đường dẫn Rust/build, lịch hàng tuần, dispatch thủ công
+- `CI Supply Chain Provenance`: push trên đường dẫn Rust/build, lịch hàng tuần, dispatch thủ công
+- `CI Rollback Guard`: lịch hàng tuần (chỉ lập kế hoạch) và dispatch thủ công (`dry-run` hoặc `execute` có bảo vệ)
 - `Workflow Sanity`: PR/push khi `.github/workflows/**`, `.github/*.yml` hoặc `.github/*.yaml` thay đổi
 - `PR Intake Checks`: `pull_request_target` khi opened/reopened/synchronize/edited/ready_for_review
 - `Label Policy Sanity`: PR/push khi `.github/label-policy.json`, `.github/workflows/pr-labeler.yml` hoặc `.github/workflows/pr-auto-response.yml` thay đổi
@@ -85,14 +102,27 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 3. Release thất bại (tag/thủ công/theo lịch): kiểm tra `.github/workflows/pub-release.yml` và kết quả job `prepare`.
 4. Security thất bại: kiểm tra `.github/workflows/sec-audit.yml` và `deny.toml`.
 5. Lỗi cú pháp/lint workflow: kiểm tra `.github/workflows/workflow-sanity.yml`.
-6. PR intake thất bại: kiểm tra comment sticky `.github/workflows/pr-intake-checks.yml` và run log.
-7. Lỗi parity chính sách nhãn: kiểm tra `.github/workflows/pr-label-policy-check.yml`.
-8. Lỗi tài liệu trong CI: kiểm tra log job `docs-quality` trong `.github/workflows/ci-run.yml`.
-9. Lỗi strict delta lint trong CI: kiểm tra log job `lint-strict-delta` và so sánh với phạm vi diff `BASE_SHA`.
+6. Lỗi policy CI (`unpinned action` / `pipe-to-shell` / `permissions: write-all` / `pull_request_target`): kiểm tra summary + artifact của `.github/workflows/ci-change-audit.yml`.
+7. Drift/sự cố kết nối provider: kiểm tra summary + artifact của `.github/workflows/ci-provider-connectivity.yml`.
+8. Cảnh báo drift tính tái lập build: kiểm tra artifact của `.github/workflows/ci-reproducible-build.yml`.
+9. Lỗi provenance/ký số: kiểm tra log và bundle artifact của `.github/workflows/ci-supply-chain-provenance.yml`.
+10. Sự cố lập kế hoạch/thực thi rollback: kiểm tra summary + artifact `ci-rollback-plan` của `.github/workflows/ci-rollback.yml`.
+11. PR intake thất bại: kiểm tra comment sticky `.github/workflows/pr-intake-checks.yml` và run log.
+12. Lỗi parity chính sách nhãn: kiểm tra `.github/workflows/pr-label-policy-check.yml`.
+13. Lỗi tài liệu trong CI: kiểm tra log job `docs-quality` trong `.github/workflows/ci-run.yml`.
+14. Lỗi strict delta lint trong CI: kiểm tra log job `lint-strict-delta` và so sánh với phạm vi diff `BASE_SHA`.
+15. Nghi ngờ flaky test: kiểm tra summary `Test Flake Retry Probe` và artifact `test-flake-probe` trong `.github/workflows/ci-run.yml`.
 
 ## Quy tắc bảo trì
 
 - Giữ các kiểm tra chặn merge mang tính quyết định và tái tạo được (`--locked` khi áp dụng được).
+- Đảm bảo tương thích merge queue bằng cách hỗ trợ `merge_group` cho các workflow bắt buộc (`ci-run`, `sec-audit`, `sec-codeql`).
+- Bắt buộc PR liên kết với Linear issue key (`RMN-*`/`CDV-*`/`COM-*`) qua PR intake checks.
+- Bắt buộc entry `advisories.ignore` trong `deny.toml` dùng object có `id` + `reason` (được kiểm tra bởi `deny_policy_guard.py`).
+- Giữ metadata governance cho deny ignore trong `.github/security/deny-ignore-governance.json` luôn cập nhật (owner/reason/expiry/ticket được kiểm tra bởi `deny_policy_guard.py`).
+- Giữ metadata quản trị allowlist gitleaks trong `.github/security/gitleaks-allowlist-governance.json` luôn cập nhật (owner/reason/expiry/ticket được kiểm tra bởi `secrets_governance_guard.py`).
+- Giữ schema audit event + metadata retention đồng bộ với `docs/audit-event-schema.md` (`emit_audit_event.py` + policy artifact workflow).
+- Giữ thao tác rollback ở chế độ bảo vệ và có thể đảo ngược (`ci-rollback.yml` mặc định `dry-run`; `execute` là thao tác thủ công có gate chính sách).
 - Tuân theo `docs/release-process.md` để kiểm tra trước khi publish và kỷ luật tag.
 - Giữ chính sách chất lượng Rust chặn merge nhất quán giữa `.github/workflows/ci-run.yml`, `dev/ci.sh` và `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
 - Dùng `./scripts/ci/rust_strict_delta_gate.sh` (hoặc `./dev/ci.sh lint-delta`) làm merge gate nghiêm ngặt gia tăng cho các dòng Rust thay đổi.
@@ -104,6 +134,7 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 - Sử dụng bộ lọc đường dẫn cho các workflow tốn kém khi thực tế.
 - Giữ kiểm tra chất lượng tài liệu ít nhiễu (markdown gia tăng + kiểm tra link mới thêm gia tăng).
 - Giữ khối lượng cập nhật phụ thuộc được kiểm soát (nhóm + giới hạn PR).
+- Cài tool CI bên thứ ba qua script cài đặt nội bộ đã pin phiên bản và có xác minh checksum (ví dụ `scripts/ci/install_gitleaks.sh`, `scripts/ci/install_syft.sh`); tránh mẫu từ xa `curl | sh`.
 - Tránh kết hợp tự động hóa giới thiệu/cộng đồng với logic gating merge.
 
 ## Kiểm soát tác dụng phụ tự động hóa

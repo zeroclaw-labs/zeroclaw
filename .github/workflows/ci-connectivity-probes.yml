@@ -1,0 +1,68 @@
+name: Connectivity Probes (Legacy Wrapper)
+
+on:
+    workflow_dispatch:
+        inputs:
+            enforcement_mode:
+                description: "enforce = fail when critical endpoints are unreachable; report-only = never fail run"
+                type: choice
+                required: false
+                default: enforce
+                options:
+                    - enforce
+                    - report-only
+
+concurrency:
+    group: connectivity-probes-${{ github.ref_name }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    probes:
+        name: Provider Connectivity Probes
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Legacy wrapper note
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  {
+                    echo "### Connectivity Probes (Legacy Wrapper)"
+                    echo "- Preferred workflow: \`CI Provider Connectivity\`"
+                    echo "- This run uses the shared endpoint-config probe engine."
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Run provider connectivity matrix
+              shell: bash
+              env:
+                  ENFORCEMENT_MODE: ${{ github.event.inputs.enforcement_mode || 'enforce' }}
+              run: |
+                  set -euo pipefail
+                  fail_on_critical="true"
+                  if [ "${ENFORCEMENT_MODE}" = "report-only" ]; then
+                    fail_on_critical="false"
+                  fi
+
+                  cmd=(python3 scripts/ci/provider_connectivity_matrix.py
+                    --config .github/connectivity/providers.json
+                    --output-json connectivity-report.json
+                    --output-md connectivity-summary.md)
+                  if [ "$fail_on_critical" = "true" ]; then
+                    cmd+=(--fail-on-critical)
+                  fi
+                  "${cmd[@]}"
+
+            - name: Upload connectivity artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: connectivity-probes-${{ github.run_id }}
+                  if-no-files-found: error
+                  path: |
+                      connectivity-report.json
+                      connectivity-summary.md

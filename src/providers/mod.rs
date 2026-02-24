@@ -37,7 +37,7 @@ pub use traits::{
 };
 
 use crate::auth::AuthService;
-use compatible::{AuthStyle, OpenAiCompatibleProvider};
+use compatible::{AuthStyle, CompatibleApiMode, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -672,18 +672,24 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
+    pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub custom_provider_api_mode: Option<CompatibleApiMode>,
+    pub max_tokens_override: Option<u32>,
 }
 
 impl Default for ProviderRuntimeOptions {
     fn default() -> Self {
         Self {
             auth_profile_override: None,
+            provider_api_url: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            custom_provider_api_mode: None,
+            max_tokens_override: None,
         }
     }
 }
@@ -818,6 +824,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "xai" | "grok" => vec!["XAI_API_KEY"],
         "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
+        "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
@@ -914,9 +921,9 @@ pub fn create_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
-        }
+        "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(
+            openai_codex::OpenAiCodexProvider::new(options, api_key)?,
+        )),
         _ => create_provider_with_url_and_options(name, api_key, None, options),
     }
 }
@@ -952,10 +959,29 @@ fn create_provider_with_url_and_options(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {
+        "openai-codex" | "openai_codex" | "codex" => {
+            let mut codex_options = options.clone();
+            codex_options.provider_api_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| options.provider_api_url.clone());
+            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
+                &codex_options,
+                key,
+            )?))
+        }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
+        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new_with_max_tokens(
+            key,
+            options.max_tokens_override,
+        ))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url_and_max_tokens(
+            api_url,
+            key,
+            options.max_tokens_override,
+        ))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
@@ -1078,7 +1104,7 @@ fn create_provider_with_url_and_options(
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Groq", "https://api.groq.com/openai", key, AuthStyle::Bearer,
+            "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
         ))),
         "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
@@ -1094,6 +1120,9 @@ fn create_provider_with_url_and_options(
         ))),
         "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
+        ))),
+        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
         ))),
         "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
@@ -1171,7 +1200,7 @@ fn create_provider_with_url_and_options(
             )))
         }
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
-            OpenAiCompatibleProvider::new(
+            OpenAiCompatibleProvider::new_no_responses_fallback(
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1",
                 key,
@@ -1198,11 +1227,17 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            let api_mode = options
+                .custom_provider_api_mode
+                .unwrap_or(CompatibleApiMode::OpenAiChatCompletions);
+            Ok(Box::new(OpenAiCompatibleProvider::new_custom_with_mode(
                 "Custom",
                 &base_url,
                 key,
                 AuthStyle::Bearer,
+                true,
+                api_mode,
+                options.max_tokens_override,
             )))
         }
 
@@ -1367,56 +1402,61 @@ pub fn create_routed_provider_with_options(
         );
     }
 
-    // Collect unique provider names needed
-    let mut needed: Vec<String> = vec![primary_name.to_string()];
-    for route in model_routes {
-        if !needed.iter().any(|n| n == &route.provider) {
-            needed.push(route.provider.clone());
-        }
-    }
+    // Keep a default provider for non-routed model hints.
+    let default_provider = create_resilient_provider_with_options(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        options,
+    )?;
+    let mut providers: Vec<(String, Box<dyn Provider>)> =
+        vec![(primary_name.to_string(), default_provider)];
 
-    // Create each provider (with its own resilience wrapper)
-    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-    for name in &needed {
-        let routed_credential = model_routes
-            .iter()
-            .find(|r| &r.provider == name)
-            .and_then(|r| {
-                r.api_key.as_ref().and_then(|raw_key| {
-                    let trimmed_key = raw_key.trim();
-                    (!trimmed_key.is_empty()).then_some(trimmed_key)
-                })
-            });
+    // Build hint routes with dedicated provider instances so per-route API keys
+    // and max_tokens overrides do not bleed across routes.
+    let mut routes: Vec<(String, router::Route)> = Vec::new();
+    for route in model_routes {
+        let routed_credential = route.api_key.as_ref().and_then(|raw_key| {
+            let trimmed_key = raw_key.trim();
+            (!trimmed_key.is_empty()).then_some(trimmed_key)
+        });
         let key = routed_credential.or(api_key);
-        // Only use api_url for the primary provider
-        let url = if name == primary_name { api_url } else { None };
-        match create_resilient_provider_with_options(name, key, url, reliability, options) {
-            Ok(provider) => providers.push((name.clone(), provider)),
-            Err(e) => {
-                if name == primary_name {
-                    return Err(e);
-                }
+        // Only use api_url for routes targeting the same provider namespace.
+        let url = (route.provider == primary_name)
+            .then_some(api_url)
+            .flatten();
+
+        let mut route_options = options.clone();
+        route_options.max_tokens_override = route.max_tokens;
+
+        match create_resilient_provider_with_options(
+            &route.provider,
+            key,
+            url,
+            reliability,
+            &route_options,
+        ) {
+            Ok(provider) => {
+                let provider_id = format!("{}#{}", route.provider, route.hint);
+                providers.push((provider_id.clone(), provider));
+                routes.push((
+                    route.hint.clone(),
+                    router::Route {
+                        provider_name: provider_id,
+                        model: route.model.clone(),
+                    },
+                ));
+            }
+            Err(error) => {
                 tracing::warn!(
-                    provider = name.as_str(),
-                    "Ignoring routed provider that failed to initialize"
+                    provider = route.provider.as_str(),
+                    hint = route.hint.as_str(),
+                    "Ignoring routed provider that failed to initialize: {error}"
                 );
             }
         }
     }
-
-    // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
-        .iter()
-        .map(|r| {
-            (
-                r.hint.clone(),
-                router::Route {
-                    provider_name: r.provider.clone(),
-                    model: r.model.clone(),
-                },
-            )
-        })
-        .collect();
 
     Ok(Box::new(router::RouterProvider::new(
         providers,
@@ -1618,6 +1658,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "fireworks",
             display_name: "Fireworks AI",
             aliases: &["fireworks-ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "novita",
+            display_name: "Novita AI",
+            aliases: &[],
             local: false,
         },
         ProviderInfo {
@@ -2085,6 +2131,16 @@ mod tests {
     }
 
     #[test]
+    fn factory_minimax_disables_native_tool_calling() {
+        let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
+        assert!(!minimax.supports_native_tools());
+
+        let minimax_cn =
+            create_provider("minimax-cn", Some("key")).expect("provider should resolve");
+        assert!(!minimax_cn.supports_native_tools());
+    }
+
+    #[test]
     fn factory_bedrock() {
         // Bedrock uses AWS env vars for credentials, not API key.
         assert!(create_provider("bedrock", None).is_ok());
@@ -2237,6 +2293,11 @@ mod tests {
     fn factory_fireworks() {
         assert!(create_provider("fireworks", Some("key")).is_ok());
         assert!(create_provider("fireworks-ai", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_novita() {
+        assert!(create_provider("novita", Some("key")).is_ok());
     }
 
     #[test]
@@ -2583,6 +2644,7 @@ mod tests {
             "deepseek",
             "together",
             "fireworks",
+            "novita",
             "perplexity",
             "cohere",
             "copilot",
@@ -2761,6 +2823,29 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
+    }
+
+    #[test]
+    fn routed_provider_accepts_per_route_max_tokens() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4.6".to_string(),
+            max_tokens: Some(4096),
+            api_key: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            "openrouter",
+            Some("openrouter-test-key"),
+            None,
+            &reliability,
+            &routes,
+            "anthropic/claude-sonnet-4.6",
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(provider.is_ok());
     }
 
     // --- parse_provider_profile ---

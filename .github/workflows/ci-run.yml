@@ -5,6 +5,8 @@ on:
         branches: [dev, main]
     pull_request:
         branches: [dev, main]
+    merge_group:
+        branches: [dev, main]
 
 concurrency:
     group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -37,13 +39,13 @@ jobs:
               shell: bash
               env:
                   EVENT_NAME: ${{ github.event_name }}
-                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
               run: ./scripts/ci/detect_change_scope.sh
 
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         steps:
@@ -55,6 +57,8 @@ jobs:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  prefix-key: ci-run-lint
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
             - name: Run strict lint delta gate
@@ -65,7 +69,7 @@ jobs:
     test:
         name: Test
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
         steps:
@@ -74,6 +78,8 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  prefix-key: ci-run-test
             - name: Run tests
               run: cargo test --locked --verbose
 
@@ -90,10 +96,60 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  prefix-key: ci-run-build
+                  cache-targets: true
             - name: Build binary (smoke check)
               run: cargo build --profile release-fast --locked --verbose
             - name: Check binary size
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
+
+    flake-probe:
+        name: Test Flake Retry Probe
+        needs: [changes, lint, test]
+        if: always() && needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  prefix-key: ci-run-flake-probe
+            - name: Probe flaky failure via single retry
+              shell: bash
+              env:
+                  INITIAL_TEST_RESULT: ${{ needs.test.result }}
+                  BLOCK_ON_FLAKE: ${{ vars.CI_BLOCK_ON_FLAKE_SUSPECTED || 'false' }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/flake_retry_probe.py \
+                    --initial-result "${INITIAL_TEST_RESULT}" \
+                    --retry-command "cargo test --locked --verbose" \
+                    --output-json artifacts/flake-probe.json \
+                    --output-md artifacts/flake-probe.md \
+                    --block-on-flake "${BLOCK_ON_FLAKE}"
+            - name: Publish flake probe summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/flake-probe.md ]; then
+                    cat artifacts/flake-probe.md >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Flake probe report missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+            - name: Upload flake probe artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: test-flake-probe
+                  path: artifacts/flake-probe.*
+                  if-no-files-found: ignore
+                  retention-days: 14
 
     docs-only:
         name: Docs-Only Fast Path
@@ -116,7 +172,7 @@ jobs:
     docs-quality:
         name: Docs Quality
         needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        if: needs.changes.outputs.docs_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 15
         steps:
@@ -236,7 +292,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, flake-probe, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -263,8 +319,8 @@ jobs:
                       echo "License file owner guard did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only push changed docs, but docs-quality did not pass."
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs-only change detected, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Docs-only fast path passed."
@@ -283,8 +339,8 @@ jobs:
                       echo "License file owner guard did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Non-rust push changed docs, but docs-quality did not pass."
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Non-rust change touched docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Non-rust fast path passed."
@@ -295,11 +351,13 @@ jobs:
                   lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
+                  flake_result="${{ needs.flake-probe.result }}"
 
                   echo "lint=${lint_result}"
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
+                  echo "flake_probe=${flake_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
@@ -315,8 +373,12 @@ jobs:
                   fi
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$build_result" != "success" ]; then
-                      echo "Required PR build job did not pass."
+                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                      echo "Required PR CI jobs did not pass."
+                      exit 1
+                    fi
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "PR changed docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "PR required checks passed."
@@ -325,6 +387,11 @@ jobs:
 
                   if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
                     echo "Required push CI jobs did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$flake_result" != "success" ]; then
+                    echo "Flake probe did not pass under current blocking policy."
                     exit 1
                   fi
 
