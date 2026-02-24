@@ -6,7 +6,7 @@ pub mod profiles;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore,
+    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet,
 };
 use crate::config::Config;
 use anyhow::Result;
@@ -21,6 +21,8 @@ const GEMINI_PROVIDER: &str = "gemini";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
+const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
+const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -208,19 +210,20 @@ impl AuthService {
             );
         }
 
-        let mut refreshed = match refresh_access_token(&self.client, &refresh_token).await {
-            Ok(tokens) => {
-                clear_refresh_backoff(&profile_id);
-                tokens
-            }
-            Err(err) => {
-                set_refresh_backoff(
-                    &profile_id,
-                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                );
-                return Err(err);
-            }
-        };
+        let mut refreshed =
+            match refresh_openai_access_token_with_retries(&self.client, &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                    return Err(err);
+                }
+            };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -297,7 +300,7 @@ impl AuthService {
         }
 
         let mut refreshed =
-            match gemini_oauth::refresh_access_token(&self.client, &refresh_token).await {
+            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
                 Ok(tokens) => {
                     clear_refresh_backoff(&profile_id);
                     tokens
@@ -401,6 +404,70 @@ pub fn select_profile_id(
     data.profiles
         .iter()
         .find_map(|(id, profile)| (profile.provider == provider).then(|| id.clone()))
+}
+
+async fn refresh_openai_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
+        match refresh_access_token(client, refresh_token).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
+                    retry = should_retry,
+                    error = %err,
+                    "OpenAI token refresh failed"
+                );
+                last_error = Some(err);
+                if should_retry {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("OpenAI token refresh failed")))
+}
+
+async fn refresh_gemini_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
+        match gemini_oauth::refresh_access_token(client, refresh_token).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
+                    retry = should_retry,
+                    error = %err,
+                    "Gemini token refresh failed"
+                );
+                last_error = Some(err);
+                if should_retry {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini token refresh failed")))
 }
 
 fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {

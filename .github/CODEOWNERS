@@ -1,28 +1,32 @@
 # Default owner for all files
-* @theonlyhennygod
+* @chumyin
 
-# High-risk surfaces
-/src/security/** @willsarg
+# Important functional modules
+/src/agent/** @theonlyhennygod
+/src/providers/** @theonlyhennygod
+/src/channels/** @theonlyhennygod
+/src/tools/** @theonlyhennygod
+/src/gateway/** @theonlyhennygod
 /src/runtime/** @theonlyhennygod
-/src/memory/** @theonlyhennygod @chumyin
-/.github/** @theonlyhennygod
+/src/memory/** @theonlyhennygod
 /Cargo.toml @theonlyhennygod
 /Cargo.lock @theonlyhennygod
 
-# CI
-/.github/workflows/**  @theonlyhennygod @willsarg
-/.github/codeql/**     @willsarg
-/.github/dependabot.yml @willsarg
+# Security / tests / CI-CD ownership
+/src/security/** @chumyin
+/tests/** @chumyin
+/.github/** @chumyin
+/.github/workflows/** @chumyin
+/.github/codeql/** @chumyin
+/.github/dependabot.yml @chumyin
+/SECURITY.md @chumyin
+/docs/actions-source-policy.md @chumyin
+/docs/ci-map.md @chumyin
 
 # Docs & governance
-/docs/**                @chumyin
-/AGENTS.md              @chumyin
-/CLAUDE.md              @chumyin
-/CONTRIBUTING.md        @chumyin
-/docs/pr-workflow.md    @chumyin
+/docs/** @chumyin
+/AGENTS.md @chumyin
+/CLAUDE.md @chumyin
+/CONTRIBUTING.md @chumyin
+/docs/pr-workflow.md @chumyin
 /docs/reviewer-playbook.md @chumyin
-
-# Security / CI-CD governance overrides (last-match wins)
-/SECURITY.md              @willsarg
-/docs/actions-source-policy.md @willsarg
-/docs/ci-map.md           @willsarg

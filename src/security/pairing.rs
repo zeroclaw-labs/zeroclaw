@@ -19,10 +19,19 @@ const MAX_PAIR_ATTEMPTS: u32 = 5;
 /// Lockout duration after too many failed pairing attempts.
 const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 /// Maximum number of tracked client entries to bound memory usage.
-const MAX_TRACKED_CLIENTS: usize = 1024;
+const MAX_TRACKED_CLIENTS: usize = 10_000;
+/// Retention period for failed-attempt entries with no activity.
+const FAILED_ATTEMPT_RETENTION_SECS: u64 = 900; // 15 min
+/// Minimum interval between full sweeps of the failed-attempt map.
+const FAILED_ATTEMPT_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
 
-/// Per-client failed attempt counter with optional lockout timestamp.
-type FailedAttempts = HashMap<String, (u32, Option<Instant>)>;
+/// Per-client failed attempt state with optional absolute lockout deadline.
+#[derive(Debug, Clone, Copy)]
+struct FailedAttemptState {
+    count: u32,
+    lockout_until: Option<Instant>,
+    last_attempt: Instant,
+}
 
 /// Manages pairing state for the gateway.
 ///
@@ -38,8 +47,8 @@ pub struct PairingGuard {
     pairing_code: Arc<Mutex<Option<String>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Arc<Mutex<HashSet<String>>>,
-    /// Brute-force protection: per-client failed attempt counter + lockout time.
-    failed_attempts: Arc<Mutex<FailedAttempts>>,
+    /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
+    failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
 }
 
 impl PairingGuard {
@@ -71,7 +80,7 @@ impl PairingGuard {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
-            failed_attempts: Arc::new(Mutex::new(HashMap::new())),
+            failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
         }
     }
 
@@ -86,15 +95,29 @@ impl PairingGuard {
     }
 
     fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
-        // Check brute force lockout for this specific client
+        let client_id = normalize_client_key(client_id);
+        let now = Instant::now();
+
+        // Periodic sweep + lockout check
         {
-            let attempts = self.failed_attempts.lock();
-            if let Some((count, Some(locked_at))) = attempts.get(client_id) {
-                if *count >= MAX_PAIR_ATTEMPTS {
-                    let elapsed = locked_at.elapsed().as_secs();
-                    if elapsed < PAIR_LOCKOUT_SECS {
-                        return Err(PAIR_LOCKOUT_SECS - elapsed);
+            let mut guard = self.failed_attempts.lock();
+            let (ref mut map, ref mut last_sweep) = *guard;
+
+            // Sweep stale entries on interval
+            if now.duration_since(*last_sweep).as_secs() >= FAILED_ATTEMPT_SWEEP_INTERVAL_SECS {
+                prune_failed_attempts(map, now);
+                *last_sweep = now;
+            }
+
+            // Check brute force lockout for this specific client
+            if let Some(state) = map.get(&client_id) {
+                if let Some(until) = state.lockout_until {
+                    if now < until {
+                        let remaining = (until - now).as_secs();
+                        return Err(remaining.max(1));
                     }
+                    // Lockout expired — reset inline
+                    map.remove(&client_id);
                 }
             }
         }
@@ -105,8 +128,8 @@ impl PairingGuard {
                 if constant_time_eq(code.trim(), expected.trim()) {
                     // Reset failed attempts for this client on success
                     {
-                        let mut attempts = self.failed_attempts.lock();
-                        attempts.remove(client_id);
+                        let mut guard = self.failed_attempts.lock();
+                        guard.0.remove(&client_id);
                     }
                     let token = generate_token();
                     let mut tokens = self.paired_tokens.lock();
@@ -122,27 +145,35 @@ impl PairingGuard {
 
         // Increment failed attempts for this client
         {
-            let mut attempts = self.failed_attempts.lock();
+            let mut guard = self.failed_attempts.lock();
+            let (ref mut map, _) = *guard;
 
-            // Evict expired entries when approaching the bound
-            if attempts.len() >= MAX_TRACKED_CLIENTS {
-                attempts.retain(|_, (_, locked_at)| {
-                    locked_at
-                        .map(|t| t.elapsed().as_secs() < PAIR_LOCKOUT_SECS)
-                        .unwrap_or(true)
-                });
+            // Enforce capacity bound: prune stale first, then LRU-evict if still full
+            if map.len() >= MAX_TRACKED_CLIENTS {
+                prune_failed_attempts(map, now);
             }
-
-            let entry = attempts.entry(client_id.to_string()).or_insert((0, None));
-            // Reset if previous lockout has expired
-            if let Some(locked_at) = entry.1 {
-                if locked_at.elapsed().as_secs() >= PAIR_LOCKOUT_SECS {
-                    *entry = (0, None);
+            if map.len() >= MAX_TRACKED_CLIENTS {
+                // Evict the least-recently-active entry
+                if let Some(lru_key) = map
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_attempt)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&lru_key);
                 }
             }
-            entry.0 += 1;
-            if entry.0 >= MAX_PAIR_ATTEMPTS {
-                entry.1 = Some(Instant::now());
+
+            let entry = map.entry(client_id).or_insert(FailedAttemptState {
+                count: 0,
+                lockout_until: None,
+                last_attempt: now,
+            });
+
+            entry.last_attempt = now;
+            entry.count += 1;
+
+            if entry.count >= MAX_PAIR_ATTEMPTS {
+                entry.lockout_until = Some(now + std::time::Duration::from_secs(PAIR_LOCKOUT_SECS));
             }
         }
 
@@ -185,6 +216,23 @@ impl PairingGuard {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()
     }
+}
+
+/// Normalize a client identifier: trim whitespace, map empty to `"unknown"`.
+fn normalize_client_key(key: &str) -> String {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Remove failed-attempt entries whose `last_attempt` is older than the retention window.
+fn prune_failed_attempts(map: &mut HashMap<String, FailedAttemptState>, now: Instant) {
+    map.retain(|_, state| {
+        now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
+    });
 }
 
 /// Generate a 6-digit numeric pairing code using cryptographically secure randomness.
@@ -518,6 +566,122 @@ mod tests {
         assert!(
             err >= PAIR_LOCKOUT_SECS - 1,
             "Remaining lockout should be ~{PAIR_LOCKOUT_SECS}s, got {err}s"
+        );
+    }
+
+    #[test]
+    async fn successful_pair_resets_only_requesting_client_state() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let client_a = "client_a";
+        let client_b = "client_b";
+
+        // Both clients fail a few times
+        for _ in 0..3 {
+            let _ = guard.try_pair("wrong", client_a).await;
+            let _ = guard.try_pair("wrong", client_b).await;
+        }
+
+        // client_a pairs successfully — only its state should reset
+        let result = guard.try_pair(&code, client_a).await.unwrap();
+        assert!(result.is_some(), "client_a should pair successfully");
+
+        // client_b's failed count should still be intact (3 failures recorded)
+        let state = guard.failed_attempts.lock();
+        let b_state = state.0.get(client_b);
+        assert!(b_state.is_some(), "client_b state should still exist");
+        assert_eq!(
+            b_state.unwrap().count,
+            3,
+            "client_b should still have 3 failures"
+        );
+
+        // client_a should have been removed
+        assert!(
+            !state.0.contains_key(client_a),
+            "client_a state should be cleared"
+        );
+    }
+
+    #[test]
+    async fn failed_attempt_state_is_bounded_by_max_clients() {
+        let guard = PairingGuard::new(true, &[]);
+
+        // Fill the map to MAX_TRACKED_CLIENTS with stale entries
+        {
+            let mut state = guard.failed_attempts.lock();
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_RETENTION_SECS + 60,
+                ))
+                .unwrap_or_else(Instant::now);
+            for i in 0..MAX_TRACKED_CLIENTS {
+                state.0.insert(
+                    format!("stale_client_{i}"),
+                    FailedAttemptState {
+                        count: 1,
+                        lockout_until: None,
+                        last_attempt: past,
+                    },
+                );
+            }
+        }
+
+        // A new client triggers an attempt — should prune stale entries and fit
+        let result = guard.try_pair("wrong", "new_client").await;
+        assert!(result.is_ok(), "New client should not be blocked");
+
+        let state = guard.failed_attempts.lock();
+        assert!(
+            state.0.len() <= MAX_TRACKED_CLIENTS,
+            "Map size should stay within bound, got {}",
+            state.0.len()
+        );
+        assert!(
+            state.0.contains_key("new_client"),
+            "New client should be tracked"
+        );
+    }
+
+    #[test]
+    async fn failed_attempt_sweep_prunes_expired_clients() {
+        let guard = PairingGuard::new(true, &[]);
+
+        // Seed a stale entry and set last_sweep to long ago so sweep triggers
+        {
+            let mut state = guard.failed_attempts.lock();
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_RETENTION_SECS + 60,
+                ))
+                .unwrap_or_else(Instant::now);
+            state.0.insert(
+                "stale_client".to_string(),
+                FailedAttemptState {
+                    count: 2,
+                    lockout_until: None,
+                    last_attempt: past,
+                },
+            );
+            // Force last_sweep to be old enough to trigger sweep
+            state.1 = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_SWEEP_INTERVAL_SECS + 1,
+                ))
+                .unwrap_or_else(Instant::now);
+        }
+
+        // Any attempt triggers sweep
+        let _ = guard.try_pair("wrong", "fresh_client").await;
+
+        let state = guard.failed_attempts.lock();
+        assert!(
+            !state.0.contains_key("stale_client"),
+            "Stale client should have been pruned by sweep"
+        );
+        assert!(
+            state.0.contains_key("fresh_client"),
+            "Fresh client should still be tracked"
         );
     }
 

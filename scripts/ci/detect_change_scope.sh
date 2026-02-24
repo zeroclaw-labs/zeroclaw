@@ -30,14 +30,24 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
   exit 0
 fi
 
-CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+# Use merge-base to avoid false positives when the base branch has advanced
+# and the PR branch is temporarily behind. This limits scope to changes
+# introduced by the head branch itself.
+DIFF_BASE="$BASE"
+if MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
+  if [ -n "$MERGE_BASE" ]; then
+    DIFF_BASE="$MERGE_BASE"
+  fi
+fi
+
+CHANGED="$(git diff --name-only "$DIFF_BASE" HEAD || true)"
 if [ -z "$CHANGED" ]; then
   {
     echo "docs_only=false"
     echo "docs_changed=false"
     echo "rust_changed=false"
     echo "workflow_changed=false"
-    echo "base_sha=$BASE"
+    echo "base_sha=$DIFF_BASE"
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
   exit 0
@@ -88,7 +98,7 @@ done <<< "$CHANGED"
   echo "docs_changed=$docs_changed"
   echo "rust_changed=$rust_changed"
   echo "workflow_changed=$workflow_changed"
-  echo "base_sha=$BASE"
+  echo "base_sha=$DIFF_BASE"
   echo "docs_files<<EOF"
   printf '%s\n' "${docs_files[@]}"
   echo "EOF"

@@ -82,6 +82,7 @@
 ## Quản lý tài liệu
 
 - Mục lục thống nhất (TOC): [SUMMARY.md](SUMMARY.md)
+- Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [../../structure/README.md](../../structure/README.md)
 - Danh mục và phân loại tài liệu: [docs-inventory.md](../../docs-inventory.md)
 
 ## Ngôn ngữ khác

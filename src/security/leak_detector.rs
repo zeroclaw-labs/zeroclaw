@@ -7,7 +7,6 @@
 //! Contributed from RustyClaw (MIT licensed).
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 /// Result of leak detection.
@@ -76,57 +75,116 @@ impl LeakDetector {
         let regexes = API_KEY_PATTERNS.get_or_init(|| {
             vec![
                 // Stripe
-                (Regex::new(r"sk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(), "Stripe secret key"),
-                (Regex::new(r"pk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(), "Stripe publishable key"),
+                (
+                    Regex::new(r"sk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
+                    "Stripe secret key",
+                ),
+                (
+                    Regex::new(r"pk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
+                    "Stripe publishable key",
+                ),
                 // OpenAI
-                (Regex::new(r"sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}").unwrap(), "OpenAI API key"),
-                (Regex::new(r"sk-[a-zA-Z0-9]{48,}").unwrap(), "OpenAI-style API key"),
+                (
+                    Regex::new(r"sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}").unwrap(),
+                    "OpenAI API key",
+                ),
+                (
+                    Regex::new(r"sk-[a-zA-Z0-9]{48,}").unwrap(),
+                    "OpenAI-style API key",
+                ),
                 // Anthropic
-                (Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(), "Anthropic API key"),
+                (
+                    Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
+                    "Anthropic API key",
+                ),
                 // Google
-                (Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(), "Google API key"),
+                (
+                    Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
+                    "Google API key",
+                ),
                 // GitHub
-                (Regex::new(r"gh[pousr]_[a-zA-Z0-9]{36,}").unwrap(), "GitHub token"),
-                (Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(), "GitHub PAT"),
+                (
+                    Regex::new(r"gh[pousr]_[a-zA-Z0-9]{36,}").unwrap(),
+                    "GitHub token",
+                ),
+                (
+                    Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(),
+                    "GitHub PAT",
+                ),
                 // Generic
-                (Regex::new(r"api[_-]?key[=:]\s*['\"]*[a-zA-Z0-9_-]{20,}").unwrap(), "Generic API key"),
+                (
+                    Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
+                    "Generic API key",
+                ),
             ]
         });
 
         for (regex, name) in regexes {
             if regex.is_match(content) {
                 patterns.push(name.to_string());
-                *redacted = regex.replace_all(redacted, "[REDACTED_API_KEY]").to_string();
+                *redacted = regex
+                    .replace_all(redacted, "[REDACTED_API_KEY]")
+                    .to_string();
             }
         }
     }
 
     /// Check for AWS credentials.
-    fn check_aws_credentials(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_aws_credentials(
+        &self,
+        content: &str,
+        patterns: &mut Vec<String>,
+        redacted: &mut String,
+    ) {
         static AWS_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = AWS_PATTERNS.get_or_init(|| {
             vec![
-                (Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(), "AWS Access Key ID"),
-                (Regex::new(r"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['\"]*[a-zA-Z0-9/+=]{40}").unwrap(), "AWS Secret Access Key"),
+                (
+                    Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
+                    "AWS Access Key ID",
+                ),
+                (
+                    Regex::new(
+                        r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
+                    )
+                    .unwrap(),
+                    "AWS Secret Access Key",
+                ),
             ]
         });
 
         for (regex, name) in regexes {
             if regex.is_match(content) {
                 patterns.push(name.to_string());
-                *redacted = regex.replace_all(redacted, "[REDACTED_AWS_CREDENTIAL]").to_string();
+                *redacted = regex
+                    .replace_all(redacted, "[REDACTED_AWS_CREDENTIAL]")
+                    .to_string();
             }
         }
     }
 
     /// Check for generic secret patterns.
-    fn check_generic_secrets(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_generic_secrets(
+        &self,
+        content: &str,
+        patterns: &mut Vec<String>,
+        redacted: &mut String,
+    ) {
         static SECRET_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = SECRET_PATTERNS.get_or_init(|| {
             vec![
-                (Regex::new(r"(?i)password[=:]\s*['\"]*[^\s'\"]{8,}").unwrap(), "Password in config"),
-                (Regex::new(r"(?i)secret[=:]\s*['\"]*[a-zA-Z0-9_-]{16,}").unwrap(), "Secret value"),
-                (Regex::new(r"(?i)token[=:]\s*['\"]*[a-zA-Z0-9_.-]{20,}").unwrap(), "Token value"),
+                (
+                    Regex::new(r#"(?i)password[=:]\s*['"]*[^\s'"]{8,}"#).unwrap(),
+                    "Password in config",
+                ),
+                (
+                    Regex::new(r#"(?i)secret[=:]\s*['"]*[a-zA-Z0-9_-]{16,}"#).unwrap(),
+                    "Secret value",
+                ),
+                (
+                    Regex::new(r#"(?i)token[=:]\s*['"]*[a-zA-Z0-9_.-]{20,}"#).unwrap(),
+                    "Token value",
+                ),
             ]
         });
 
@@ -142,10 +200,26 @@ impl LeakDetector {
     fn check_private_keys(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
         // PEM-encoded private keys
         let key_patterns = [
-            ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----", "RSA private key"),
-            ("-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----", "EC private key"),
-            ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----", "Private key"),
-            ("-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----", "OpenSSH private key"),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----",
+                "-----END RSA PRIVATE KEY-----",
+                "RSA private key",
+            ),
+            (
+                "-----BEGIN EC PRIVATE KEY-----",
+                "-----END EC PRIVATE KEY-----",
+                "EC private key",
+            ),
+            (
+                "-----BEGIN PRIVATE KEY-----",
+                "-----END PRIVATE KEY-----",
+                "Private key",
+            ),
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----",
+                "-----END OPENSSH PRIVATE KEY-----",
+                "OpenSSH private key",
+            ),
         ];
 
         for (begin, end, name) in key_patterns {
@@ -177,21 +251,40 @@ impl LeakDetector {
     }
 
     /// Check for database connection URLs.
-    fn check_database_urls(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_database_urls(
+        &self,
+        content: &str,
+        patterns: &mut Vec<String>,
+        redacted: &mut String,
+    ) {
         static DB_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = DB_PATTERNS.get_or_init(|| {
             vec![
-                (Regex::new(r"postgres(ql)?://[^:]+:[^@]+@[^\s]+").unwrap(), "PostgreSQL connection URL"),
-                (Regex::new(r"mysql://[^:]+:[^@]+@[^\s]+").unwrap(), "MySQL connection URL"),
-                (Regex::new(r"mongodb(\+srv)?://[^:]+:[^@]+@[^\s]+").unwrap(), "MongoDB connection URL"),
-                (Regex::new(r"redis://[^:]+:[^@]+@[^\s]+").unwrap(), "Redis connection URL"),
+                (
+                    Regex::new(r"postgres(ql)?://[^:]+:[^@]+@[^\s]+").unwrap(),
+                    "PostgreSQL connection URL",
+                ),
+                (
+                    Regex::new(r"mysql://[^:]+:[^@]+@[^\s]+").unwrap(),
+                    "MySQL connection URL",
+                ),
+                (
+                    Regex::new(r"mongodb(\+srv)?://[^:]+:[^@]+@[^\s]+").unwrap(),
+                    "MongoDB connection URL",
+                ),
+                (
+                    Regex::new(r"redis://[^:]+:[^@]+@[^\s]+").unwrap(),
+                    "Redis connection URL",
+                ),
             ]
         });
 
         for (regex, name) in regexes {
             if regex.is_match(content) {
                 patterns.push(name.to_string());
-                *redacted = regex.replace_all(redacted, "[REDACTED_DATABASE_URL]").to_string();
+                *redacted = regex
+                    .replace_all(redacted, "[REDACTED_DATABASE_URL]")
+                    .to_string();
             }
         }
     }
