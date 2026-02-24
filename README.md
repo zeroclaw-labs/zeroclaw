@@ -621,6 +621,122 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
 
 6. **Test:** Send a message to your WhatsApp Business number — ZeroClaw will respond via the LLM.
 
+### Lark / Feishu Setup
+
+ZeroClaw supports both Lark (international) and Feishu (CN) under a single `channel-lark` feature flag, compiled separately from the default build to keep binary size lean.
+
+- **Lark** — use `[channels_config.lark]`; endpoints route to `open.larksuite.com`
+- **Feishu** — use `[channels_config.feishu]`; endpoints route to `open.feishu.cn`
+
+Both platforms support two receive modes:
+
+- **WebSocket mode** (default): persistent long-connection; no public URL required
+- **Webhook mode**: HTTP callback server; requires a public HTTPS endpoint
+
+#### Step 1: Build with Lark / Feishu support
+
+```bash
+cargo build --features channel-lark
+```
+
+Without `--features channel-lark`, any `[channels_config.lark]` or `[channels_config.feishu]` block in config is silently skipped with a warning. Running `zeroclaw channel list` will confirm which channels are active in the current build.
+
+#### Step 2: Create a bot app and get credentials
+
+- **Lark:** [open.larksuite.com/app](https://open.larksuite.com/app) → Create App → Enable Bot capability
+- **Feishu:** [open.feishu.cn/app](https://open.feishu.cn/app) → 创建应用 → 启用机器人能力
+
+From the app dashboard, collect:
+
+- **App ID** and **App Secret** — from *Credentials & Basic Info*
+- **Verification Token** — from *Event Subscriptions* (needed for webhook mode: Lark/Feishu sends this token in every challenge and event, and ZeroClaw will reject requests where the token does not match)
+
+#### Step 3: Grant bot permissions
+
+In the developer console, add the following permissions under *Permissions & Scopes*:
+
+- `im:message` — receive and send messages
+- `im:message.group_at_msg` — receive group @-mention messages (if using groups)
+
+Publish the app version to apply permissions.
+
+#### WebSocket mode (recommended — no public URL required)
+
+1. **Configure ZeroClaw:**
+
+    ```toml
+    # Lark (international)
+    [channels_config.lark]
+    app_id = "cli_xxxxxxxxxxxx"
+    app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    allowed_users = ["*"]          # or list specific open_ids
+    mention_only = false           # optional: only respond when @mentioned in groups
+    receive_mode = "websocket"     # default; may be omitted
+
+    # Feishu (CN) — separate block, same fields (no mention_only or use_feishu)
+    [channels_config.feishu]
+    app_id = "cli_xxxxxxxxxxxx"
+    app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    allowed_users = ["*"]
+    receive_mode = "websocket"
+    ```
+
+2. **Enable Long Connection in the developer console:**
+    - Go to *Event Subscriptions* → enable **Using Long Connection to Receive Events**
+    - Subscribe to the `im.message.receive_v1` event
+    - No callback URL is needed
+
+3. **Start the channel:**
+
+    ```bash
+    zeroclaw channel start
+    ```
+
+4. **Test:** Send a direct message to your bot — ZeroClaw will respond via the LLM.
+
+#### Webhook mode (legacy — requires a public HTTPS endpoint; WebSocket mode preferred for new setups)
+
+1. **Configure ZeroClaw:**
+
+    ```toml
+    # Lark (international)
+    [channels_config.lark]
+    app_id = "cli_xxxxxxxxxxxx"
+    app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    verification_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    allowed_users = ["*"]
+    mention_only = false
+    receive_mode = "webhook"
+    port = 8081                    # ZeroClaw starts an embedded HTTP server on this port
+
+    # Feishu (CN)
+    [channels_config.feishu]
+    app_id = "cli_xxxxxxxxxxxx"
+    app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    verification_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    allowed_users = ["*"]
+    receive_mode = "webhook"
+    port = 8082                    # use a different port if running both simultaneously
+    ```
+
+2. **Start the channel and expose it with a tunnel:**
+
+    ```bash
+    zeroclaw channel start
+    ```
+
+    This starts an embedded webhook listener on the configured `port` (e.g. `8081`). Lark/Feishu require an HTTPS callback URL, so expose the port with a tunnel (ngrok, Cloudflare Tunnel, Tailscale Funnel).
+
+3. **Configure Event Subscriptions in the developer console:**
+    - Go to *Event Subscriptions* → select **HTTP callback**
+    - Set the **Request URL** to `https://your-tunnel-host/lark`
+    - Subscribe to the `im.message.receive_v1` event
+    - Save — the console immediately verifies the URL; ZeroClaw must be running
+
+4. **Test:** Send a direct message to your bot — ZeroClaw will respond via the LLM.
+
+> **Legacy note:** `[channels_config.lark] use_feishu = true` is still accepted for backward compatibility but is deprecated. Use `[channels_config.feishu]` for new Feishu setups.
+
 ## Configuration
 
 Config: `~/.zeroclaw/config.toml` (created by `onboard`)
