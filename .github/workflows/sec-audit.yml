@@ -121,7 +121,7 @@ jobs:
 
             - name: Upload deny policy artifacts
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: deny-policy-guard
                   path: artifacts/deny-policy-guard.*
@@ -130,7 +130,7 @@ jobs:
 
             - name: Upload deny policy audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: deny-policy-audit-event
                   path: artifacts/audit-event-deny-policy-guard.json
@@ -194,7 +194,7 @@ jobs:
 
             - name: Upload secrets governance artifacts
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: secrets-governance-guard
                   path: artifacts/secrets-governance-guard.*
@@ -203,7 +203,7 @@ jobs:
 
             - name: Upload secrets governance audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: secrets-governance-audit-event
                   path: artifacts/audit-event-secrets-governance-guard.json
@@ -302,7 +302,7 @@ jobs:
 
             - name: Upload gitleaks artifact
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: gitleaks-report
                   path: artifacts/gitleaks.sarif
@@ -325,7 +325,7 @@ jobs:
 
             - name: Upload gitleaks audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: gitleaks-audit-event
                   path: artifacts/audit-event-gitleaks-scan.json
@@ -362,7 +362,7 @@ jobs:
                   } >> "$GITHUB_STEP_SUMMARY"
 
             - name: Upload SBOM artifacts
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: sbom-snapshot
                   path: artifacts/zeroclaw.*.json
@@ -390,7 +390,7 @@ jobs:
 
             - name: Upload SBOM audit event
               if: always()
-              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: sbom-audit-event
                   path: artifacts/audit-event-sbom-snapshot.json
