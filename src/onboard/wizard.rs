@@ -1894,6 +1894,9 @@ pub async fn run_models_status(config: &Config) -> Result<()> {
     }
 
     println!();
+    Ok(())
+}
+
 pub async fn cached_model_catalog_stats(
     config: &Config,
     provider_name: &str,
