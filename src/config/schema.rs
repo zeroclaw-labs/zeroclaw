@@ -834,7 +834,7 @@ pub struct GatewayConfig {
 }
 
 /// Node-control scaffold settings under `[gateway.node_control]`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct NodeControlConfig {
     /// Enable experimental node-control API endpoints.
     #[serde(default)]
@@ -849,16 +849,6 @@ pub struct NodeControlConfig {
     /// Empty means "no explicit allowlist" (accept all IDs).
     #[serde(default)]
     pub allowed_node_ids: Vec<String>,
-}
-
-impl Default for NodeControlConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            auth_token: None,
-            allowed_node_ids: Vec::new(),
-        }
-    }
 }
 
 fn default_gateway_port() -> u16 {
