@@ -60,7 +60,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
 - `.github/workflows/pub-prerelease.yml` (`Pub Pre-release`)
-    - Purpose: validate alpha/beta/rc stage transitions, enforce tag/version integrity, and optionally publish GitHub prerelease assets
+    - Purpose: validate alpha/beta/rc/stable policy matrix integrity, enforce stage progression + monotonic stage numbering + tag/version integrity, publish transition audit trail and release-stage history, and optionally publish GitHub prerelease assets
 - `.github/workflows/ci-canary-gate.yml` (`CI Canary Gate`)
     - Purpose: evaluate canary metrics against policy thresholds (`promote` / `hold` / `abort`) with auditable artifacts, guarded execute mode, and optional auto-dispatch to `CI Rollback Guard` on `abort`
 - `.github/workflows/docs-deploy.yml` (`Docs Deploy`)
@@ -150,7 +150,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 17. Suspected flaky tests: inspect `Test Flake Retry Probe` summary and `test-flake-probe` artifact in `.github/workflows/ci-run.yml`.
 18. Feature-combo regressions: inspect `.github/workflows/feature-matrix.yml` summary artifact and lane JSON reports.
 19. Nightly integration drift: inspect `.github/workflows/nightly-all-features.yml` summary and lane owner mapping.
-20. Pre-release stage gate failures: inspect `.github/workflows/pub-prerelease.yml` guard artifact (`prerelease-guard.json`).
+20. Pre-release stage gate failures: inspect `.github/workflows/pub-prerelease.yml` guard artifact (`prerelease-guard.json`), starting from `transition` and `stage_history` fields.
 21. Canary gate hold/abort decisions: inspect `.github/workflows/ci-canary-gate.yml` guard artifact (`canary-guard.json`); on `abort`, verify rollback dispatch summary and follow-up `ci-rollback` run.
 22. Docs deploy failures: inspect `.github/workflows/docs-deploy.yml` quality lane + preview/deploy artifacts.
 
@@ -165,7 +165,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep audit event schema + retention metadata aligned with `docs/audit-event-schema.md` (`emit_audit_event.py` envelope + workflow artifact policy).
 - Keep rollback operations guarded and reversible (`ci-rollback.yml` defaults to `dry-run`; `execute` is manual and policy-gated).
 - Keep canary policy thresholds and sample-size rules current in `.github/release/canary-policy.json`.
-- Keep pre-release stage transition policy and required checks current in `.github/release/prerelease-stage-gates.json`.
+- Keep pre-release stage transition policy + matrix coverage + transition audit semantics current in `.github/release/prerelease-stage-gates.json`.
 - Keep required check naming stable and documented in `docs/operations/required-check-mapping.md` before changing branch protection settings.
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).

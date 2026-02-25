@@ -2,7 +2,7 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 25, 2026**.
 
 ## Release Goals
 
@@ -123,16 +123,22 @@ Abort integration:
 - Default rollback branch is `dev` (override with `rollback_branch`).
 - Optional explicit rollback target can be passed via `rollback_target_ref`.
 
-### 5.2) Pre-release stage progression (alpha/beta/rc)
+### 5.2) Pre-release stage progression (alpha/beta/rc/stable policy)
 
 For staged release confidence:
 
 1. Cut and push stage tag (`vX.Y.Z-alpha.N`, then beta, then rc).
 2. `Pub Pre-release` validates:
    - stage progression
+   - stage matrix completeness (`alpha|beta|rc|stable` policy coverage)
+   - monotonic same-stage numbering
    - origin/main ancestry
    - Cargo version/tag alignment
-3. Publish prerelease assets only after guard passes.
+3. Guard artifacts publish transition audit evidence and stage history:
+   - `transition.type` / `transition.outcome`
+   - `transition.previous_highest_stage` and `transition.required_previous_tag`
+   - `stage_history.per_stage` and `stage_history.latest_stage`
+4. Publish prerelease assets only after guard passes.
 
 ### 6) Publish Homebrew Core formula (bot-owned)
 
@@ -168,8 +174,9 @@ If tag-push release fails after artifacts are validated:
 If prerelease/canary lanes fail:
 
 1. Inspect guard artifacts (`prerelease-guard.json`, `canary-guard.json`).
-2. Fix stage-policy or quality regressions.
-3. Re-run guard in `dry-run` before any execute/publish action.
+2. For prerelease failures, inspect `transition` + `stage_history` fields first to classify promotion, stage iteration, or demotion-blocked attempts.
+3. Fix stage-policy or quality regressions.
+4. Re-run guard in `dry-run` before any execute/publish action.
 
 ## Operational Notes
 
