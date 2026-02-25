@@ -241,14 +241,14 @@ pub async fn check_for_update() -> Result<Option<String>> {
     let release = fetch_latest_release().await?;
     let latest_version = release.tag_name.trim_start_matches('v');
 
-    if latest_version != current_version() {
+    if latest_version == current_version() {
+        Ok(None)
+    } else {
         Ok(Some(format!(
             "{} (current: {})",
             release.tag_name,
             current_version()
         )))
-    } else {
-        Ok(None)
     }
 }
 
