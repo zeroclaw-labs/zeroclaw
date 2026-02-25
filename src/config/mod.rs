@@ -10,14 +10,14 @@ pub use schema::{
     CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig,
     EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig, HardwareConfig,
     HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig,
-    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
-    NextcloudTalkConfig, ObservabilityConfig, OtpConfig, OtpMethod, PeripheralBoardConfig,
-    PeripheralsConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,
-    ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger, ResourceLimitsConfig, RuntimeConfig,
-    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
-    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig,
+    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MqttConfig,
+    MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, OtpConfig, OtpMethod,
+    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QdrantConfig,
+    QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger,
+    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
+    SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig, SopConfig,
+    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
+    TranscriptionConfig, TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: &Option<T>) -> (&'static str, bool) {
@@ -67,15 +67,6 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         };
-        let feishu = FeishuConfig {
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec![],
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
-        };
 
         let nextcloud_talk = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
@@ -87,7 +78,6 @@ mod tests {
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
         assert_eq!(lark.app_id, "app-id");
-        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }

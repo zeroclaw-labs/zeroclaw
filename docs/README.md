@@ -23,10 +23,12 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 | Operate runtime (day-2 runbook) | [operations-runbook.md](operations-runbook.md) |
 | Operate provider connectivity probes in CI | [operations/connectivity-probes-runbook.md](operations/connectivity-probes-runbook.md) |
 | Troubleshoot install/runtime/channel issues | [troubleshooting.md](troubleshooting.md) |
+| Start a new coding session with required context | [project/session-context-template.md](project/session-context-template.md) |
 | Run Matrix encrypted-room setup and diagnostics | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
 | Build deterministic SOP procedures | [sop/README.md](sop/README.md) |
 | Browse docs by category | [SUMMARY.md](SUMMARY.md) |
 | See project PR/issue docs snapshot | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
+| See project snapshots and SOP foundation plan | [project/README.md](project/README.md) |
 | Perform i18n completion for docs changes | [i18n-guide.md](i18n-guide.md) |
 
 ## Quick Decision Tree (10 seconds)
@@ -89,7 +91,6 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 ## System Navigation & Governance
 
 - Unified TOC: [SUMMARY.md](SUMMARY.md)
-- Docs structure map (language/part/function): [structure/README.md](structure/README.md)
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
 - i18n docs index: [i18n/README.md](i18n/README.md)
 - i18n coverage map: [i18n-coverage.md](i18n-coverage.md)

@@ -293,6 +293,12 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None, // agent struct — SOP engine created internally if needed
+            None, // agent struct — no SOP metrics collector
+            #[cfg(feature = "ampersona-gates")]
+            None, // agent struct — no gate evaluation state wiring
+            #[cfg(not(feature = "ampersona-gates"))]
+            None,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -320,12 +326,8 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
-        let route_model_by_hint: HashMap<String, String> = config
-            .model_routes
-            .iter()
-            .map(|route| (route.hint.clone(), route.model.clone()))
-            .collect();
-        let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
+        let available_hints: Vec<String> =
+            config.model_routes.iter().map(|r| r.hint.clone()).collect();
 
         Agent::builder()
             .provider(provider)
@@ -344,7 +346,6 @@ impl Agent {
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
-            .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(
                 &config.workspace_dir,
@@ -452,24 +453,10 @@ impl Agent {
     }
 
     fn classify_model(&self, user_message: &str) -> String {
-        if let Some(decision) =
-            super::classifier::classify_with_decision(&self.classification_config, user_message)
-        {
-            if self.available_hints.contains(&decision.hint) {
-                let resolved_model = self
-                    .route_model_by_hint
-                    .get(&decision.hint)
-                    .map(String::as_str)
-                    .unwrap_or("unknown");
-                tracing::info!(
-                    target: "query_classification",
-                    hint = decision.hint.as_str(),
-                    model = resolved_model,
-                    rule_priority = decision.priority,
-                    message_length = user_message.len(),
-                    "Classified message route"
-                );
-                return format!("hint:{}", decision.hint);
+        if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
+            if self.available_hints.contains(&hint) {
+                tracing::info!(hint = hint.as_str(), "Auto-classified query");
+                return format!("hint:{hint}");
             }
         }
         self.model_name.clone()
@@ -609,7 +596,7 @@ impl Agent {
             self.history.push(ConversationMessage::AssistantToolCalls {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
-                reasoning_content: response.reasoning_content.clone(),
+                reasoning_content: None,
             });
 
             let results = self.execute_tools(&calls).await;
@@ -714,7 +701,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use parking_lot::Mutex;
-    use std::collections::HashMap;
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -738,43 +724,6 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> Result<crate::providers::ChatResponse> {
-            let mut guard = self.responses.lock();
-            if guard.is_empty() {
-                return Ok(crate::providers::ChatResponse {
-                    text: Some("done".into()),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
-            }
-            Ok(guard.remove(0))
-        }
-    }
-
-    struct ModelCaptureProvider {
-        responses: Mutex<Vec<crate::providers::ChatResponse>>,
-        seen_models: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl Provider for ModelCaptureProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> Result<String> {
-            Ok("ok".into())
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            model: &str,
-            _temperature: f64,
-        ) -> Result<crate::providers::ChatResponse> {
-            self.seen_models.lock().push(model.to_string());
             let mut guard = self.responses.lock();
             if guard.is_empty() {
                 return Ok(crate::providers::ChatResponse {
@@ -897,59 +846,5 @@ mod tests {
             .history()
             .iter()
             .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
-    }
-
-    #[tokio::test]
-    async fn turn_routes_with_hint_when_query_classification_matches() {
-        let seen_models = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(ModelCaptureProvider {
-            responses: Mutex::new(vec![crate::providers::ChatResponse {
-                text: Some("classified".into()),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            }]),
-            seen_models: seen_models.clone(),
-        });
-
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut route_model_by_hint = HashMap::new();
-        route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .classification_config(crate::config::QueryClassificationConfig {
-                enabled: true,
-                rules: vec![crate::config::ClassificationRule {
-                    hint: "fast".to_string(),
-                    keywords: vec!["quick".to_string()],
-                    patterns: vec![],
-                    min_length: None,
-                    max_length: None,
-                    priority: 10,
-                }],
-            })
-            .available_hints(vec!["fast".to_string()])
-            .route_model_by_hint(route_model_by_hint)
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let response = agent.turn("quick summary please").await.unwrap();
-        assert_eq!(response, "classified");
-        let seen = seen_models.lock();
-        assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
     }
 }

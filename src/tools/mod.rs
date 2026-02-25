@@ -33,11 +33,8 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
-#[cfg(feature = "hardware")]
 pub mod hardware_board_info;
-#[cfg(feature = "hardware")]
 pub mod hardware_memory_map;
-#[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
@@ -53,6 +50,11 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
 pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
@@ -75,11 +77,8 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
-#[cfg(feature = "hardware")]
 pub use hardware_board_info::HardwareBoardInfoTool;
-#[cfg(feature = "hardware")]
 pub use hardware_memory_map::HardwareMemoryMapTool;
-#[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
@@ -96,6 +95,11 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use sop_advance::SopAdvanceTool;
+pub use sop_approve::SopApproveTool;
+pub use sop_execute::SopExecuteTool;
+pub use sop_list::SopListTool;
+pub use sop_status::SopStatusTool;
 pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -107,9 +111,30 @@ use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
+#[cfg(feature = "ampersona-gates")]
+use crate::sop::GateEvalState;
+use crate::sop::{SopEngine, SopMetricsCollector};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Create the shared SOP engine if SOP is enabled. Returns `None` if disabled.
+///
+/// Call this before `all_tools_with_runtime` when you need a reference to the engine
+/// for runtime polling (e.g. approval timeout checks in the agent loop).
+pub fn create_sop_engine(
+    config: &crate::config::SopConfig,
+    workspace_dir: &std::path::Path,
+) -> Option<Arc<Mutex<SopEngine>>> {
+    if !config.enabled {
+        return None;
+    }
+    let engine = Arc::new(Mutex::new(SopEngine::new(config.clone())));
+    if let Ok(mut e) = engine.lock() {
+        e.reload(workspace_dir);
+    }
+    Some(engine)
+}
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -180,6 +205,8 @@ pub fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_collector: Option<Arc<SopMetricsCollector>>,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         config,
@@ -195,10 +222,25 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        sop_engine,
+        sop_collector,
+        #[cfg(feature = "ampersona-gates")]
+        None,
+        #[cfg(not(feature = "ampersona-gates"))]
+        None,
     )
 }
 
 /// Create full tool registry including memory tools and optional Composio.
+///
+/// Pass a pre-created `sop_engine` to share the same engine between the tool
+/// registry and runtime polling (e.g. approval timeout checks). If `None` and
+/// SOP is enabled, an engine is created internally.
+///
+/// **Timeout auto-approve policy**: Approval timeout polling runs only in the
+/// interactive agent loop (`run()` in `loop_.rs`). Channel, gateway, and
+/// one-shot `process_message()` paths pass `None` — SOP runs started there
+/// rely on explicit `sop_approve` tool calls or the next interactive session.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
@@ -214,6 +256,10 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_collector: Option<Arc<SopMetricsCollector>>,
+    #[cfg(feature = "ampersona-gates")] sop_gate_eval: Option<Arc<GateEvalState>>,
+    #[cfg(not(feature = "ampersona-gates"))] _sop_gate_eval: Option<()>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime.clone())),
@@ -231,7 +277,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
@@ -395,6 +441,37 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // SOP tools (when enabled)
+    if root_config.sop.enabled {
+        // Use pre-created engine if provided, otherwise create one
+        let engine = sop_engine.unwrap_or_else(|| {
+            create_sop_engine(&root_config.sop, workspace_dir)
+                .expect("SOP is enabled but engine creation failed")
+        });
+        let audit = Arc::new(crate::sop::SopAuditLogger::new(memory.clone()));
+        tool_arcs.push(Arc::new(SopListTool::new(engine.clone())));
+        tool_arcs.push(Arc::new(
+            SopExecuteTool::new(engine.clone()).with_audit(audit.clone()),
+        ));
+        let mut status = SopStatusTool::new(engine.clone());
+        if let Some(ref collector) = sop_collector {
+            status = status.with_collector(Arc::clone(collector));
+        }
+        #[cfg(feature = "ampersona-gates")]
+        if let Some(ref gate_eval) = sop_gate_eval {
+            status = status.with_gate_eval(Arc::clone(gate_eval));
+        }
+        tool_arcs.push(Arc::new(status));
+        let mut approve = SopApproveTool::new(engine.clone()).with_audit(audit.clone());
+        let mut advance = SopAdvanceTool::new(engine).with_audit(audit);
+        if let Some(ref collector) = sop_collector {
+            approve = approve.with_collector(Arc::clone(collector));
+            advance = advance.with_collector(Arc::clone(collector));
+        }
+        tool_arcs.push(Arc::new(approve));
+        tool_arcs.push(Arc::new(advance));
+    }
+
     boxed_registry_from_arcs(tool_arcs)
 }
 
@@ -452,6 +529,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -494,6 +573,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -644,6 +725,8 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
+            None,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -677,8 +760,56 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn all_tools_includes_sop_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let web_fetch = crate::config::WebFetchConfig::default();
+
+        let mut cfg = test_config(&tmp);
+        cfg.sop.enabled = true;
+
+        let sop_engine = Arc::new(Mutex::new(SopEngine::new(
+            crate::config::SopConfig::default(),
+        )));
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web_fetch,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            Some(sop_engine),
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"sop_list"), "missing sop_list tool");
+        assert!(names.contains(&"sop_execute"), "missing sop_execute tool");
+        assert!(names.contains(&"sop_status"), "missing sop_status tool");
+        assert!(names.contains(&"sop_approve"), "missing sop_approve tool");
+        assert!(names.contains(&"sop_advance"), "missing sop_advance tool");
     }
 }

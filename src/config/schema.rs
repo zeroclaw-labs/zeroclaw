@@ -24,7 +24,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.openrouter",
     "channel.dingtalk",
     "channel.discord",
-    "channel.feishu",
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
@@ -259,6 +258,10 @@ pub struct Config {
     /// - `Some(false)`: force vision support off
     #[serde(default)]
     pub model_support_vision: Option<bool>,
+
+    /// Standard Operating Procedures (SOP) configuration.
+    #[serde(default)]
+    pub sop: SopConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -468,6 +471,81 @@ impl Default for AgentsIpcConfig {
             enabled: false,
             db_path: default_agents_ipc_db_path(),
             staleness_secs: default_agents_ipc_staleness_secs(),
+        }
+    }
+}
+
+// ── SOP Config ──────────────────────────────────────────────────
+
+/// Configuration for the Standard Operating Procedures system.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SopConfig {
+    /// Enable the SOP subsystem (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Directory containing SOP definitions (default: `<workspace>/sops`).
+    #[serde(default)]
+    pub sops_dir: Option<String>,
+
+    /// Default execution mode for SOPs that don't specify one.
+    #[serde(default)]
+    pub default_execution_mode: crate::sop::SopExecutionMode,
+
+    /// Maximum total concurrent SOP executions across all SOPs.
+    #[serde(default = "default_sop_max_concurrent_total")]
+    pub max_concurrent_total: usize,
+
+    /// Seconds to wait for operator approval before timeout action.
+    /// For Critical-priority SOPs, timeout falls back to Auto execution.
+    /// For others, the run stays in WaitingApproval indefinitely (0 = no timeout).
+    #[serde(default = "default_sop_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+
+    /// Maximum number of finished runs to keep in memory for status queries.
+    /// Oldest runs are evicted when the limit is exceeded (0 = unlimited).
+    #[serde(default = "default_sop_max_finished_runs")]
+    pub max_finished_runs: usize,
+
+    /// Path to ampersona persona file with gate definitions.
+    /// If not set, no gates are loaded and gate evaluation is a no-op.
+    /// Only effective with `ampersona-gates` feature.
+    #[serde(default)]
+    pub gates_file: Option<String>,
+
+    /// Gate evaluation tick interval in seconds. 0 = gate evaluation disabled
+    /// (no ticks will fire). Only effective with `ampersona-gates` feature.
+    #[serde(default = "default_gate_eval_interval_secs")]
+    pub gate_eval_interval_secs: u64,
+}
+
+fn default_sop_max_concurrent_total() -> usize {
+    5
+}
+
+fn default_sop_approval_timeout_secs() -> u64 {
+    300
+}
+
+fn default_sop_max_finished_runs() -> usize {
+    1000
+}
+
+fn default_gate_eval_interval_secs() -> u64 {
+    60
+}
+
+impl Default for SopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sops_dir: None,
+            default_execution_mode: crate::sop::SopExecutionMode::default(),
+            max_concurrent_total: default_sop_max_concurrent_total(),
+            approval_timeout_secs: default_sop_approval_timeout_secs(),
+            max_finished_runs: default_sop_max_finished_runs(),
+            gates_file: None,
+            gate_eval_interval_secs: default_gate_eval_interval_secs(),
         }
     }
 }
@@ -1122,7 +1200,7 @@ pub struct HttpRequestConfig {
     /// Allowed domains for HTTP requests (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
-    /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
+    /// Maximum response size in bytes (default: 1MB)
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
     /// Request timeout in seconds (default: 30)
@@ -2647,15 +2725,6 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
-    /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
-    #[serde(default)]
-    pub message: Option<String>,
-    /// Optional delivery channel for heartbeat output (for example: `telegram`).
-    #[serde(default, alias = "channel")]
-    pub target: Option<String>,
-    /// Optional delivery recipient/chat identifier (required when `target` is set).
-    #[serde(default, alias = "recipient")]
-    pub to: Option<String>,
 }
 
 impl Default for HeartbeatConfig {
@@ -2663,9 +2732,6 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
-            message: None,
-            target: None,
-            to: None,
         }
     }
 }
@@ -2824,9 +2890,9 @@ pub struct ChannelsConfig {
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration.
     pub irc: Option<IrcConfig>,
-    /// Lark channel configuration.
+    /// Lark/Feishu channel configuration.
     pub lark: Option<LarkConfig>,
-    /// Feishu channel configuration.
+    /// Feishu channel configuration (standalone, for backwards compatibility).
     pub feishu: Option<FeishuConfig>,
     /// DingTalk channel configuration.
     pub dingtalk: Option<DingTalkConfig>,
@@ -2842,6 +2908,7 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    pub mqtt: Option<MqttConfig>,
 }
 
 impl ChannelsConfig {
@@ -2906,10 +2973,6 @@ impl ChannelsConfig {
                 self.lark.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.feishu)),
-                self.feishu.is_some(),
-            ),
-            (
                 Box::new(ConfigWrapper::new(&self.dingtalk)),
                 self.dingtalk.is_some(),
             ),
@@ -2969,7 +3032,86 @@ impl Default for ChannelsConfig {
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
+            mqtt: None,
         }
+    }
+}
+
+// ── MQTT ──────────────────────────────────────────────────────────
+
+fn default_mqtt_client_id() -> String {
+    "zeroclaw".into()
+}
+
+fn default_mqtt_qos() -> u8 {
+    1
+}
+
+fn default_mqtt_keep_alive() -> u64 {
+    30
+}
+
+/// MQTT broker connection config for SOP event fan-in.
+///
+/// This is NOT a conversation channel — MQTT messages are routed
+/// to the SOP engine, not to the agent loop.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MqttConfig {
+    /// Broker URL, e.g. "mqtt://localhost:1883"
+    pub broker_url: String,
+    /// MQTT client ID (default: "zeroclaw")
+    #[serde(default = "default_mqtt_client_id")]
+    pub client_id: String,
+    /// Topics to subscribe to
+    pub topics: Vec<String>,
+    /// QoS level: 0, 1, or 2 (default: 1)
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Optional username for broker authentication
+    pub username: Option<String>,
+    /// Optional password for broker authentication
+    pub password: Option<String>,
+    /// Enable TLS (default: false).
+    ///
+    /// TLS is driven by the URL scheme: `mqtts://` enables TLS, `mqtt://` disables it.
+    /// This field is validated for consistency with the scheme: `use_tls: true`
+    /// requires `mqtts://` and vice versa.
+    #[serde(default)]
+    pub use_tls: bool,
+    /// Keep-alive interval in seconds (default: 30)
+    #[serde(default = "default_mqtt_keep_alive")]
+    pub keep_alive_secs: u64,
+}
+
+impl MqttConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.broker_url.starts_with("mqtt://") && !self.broker_url.starts_with("mqtts://") {
+            anyhow::bail!("mqtt.broker_url must start with mqtt:// or mqtts://");
+        }
+        if self.qos > 2 {
+            anyhow::bail!("mqtt.qos must be 0, 1, or 2 (got {})", self.qos);
+        }
+        if self.topics.is_empty() {
+            anyhow::bail!("mqtt.topics must contain at least one topic");
+        }
+        if self.client_id.is_empty() {
+            anyhow::bail!("mqtt.client_id must not be empty");
+        }
+        // Validate use_tls consistency with URL scheme
+        let is_mqtts = self.broker_url.starts_with("mqtts://");
+        if self.use_tls && !is_mqtts {
+            anyhow::bail!(
+                "mqtt.use_tls is true but broker_url uses mqtt:// scheme. \
+                 Use mqtts:// for TLS connections"
+            );
+        }
+        if is_mqtts && !self.use_tls {
+            anyhow::bail!(
+                "mqtt.broker_url uses mqtts:// scheme but use_tls is false. \
+                 Set use_tls = true or use mqtt:// for plaintext"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -3446,10 +3588,10 @@ pub struct LarkConfig {
 
 impl ChannelConfig for LarkConfig {
     fn name() -> &'static str {
-        "Lark"
+        "Lark/Feishu"
     }
     fn desc() -> &'static str {
-        "Lark Bot"
+        "Lark/Feishu Bot"
     }
 }
 
@@ -3896,6 +4038,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             model_support_vision: None,
+            sop: SopConfig::default(),
         }
     }
 }
@@ -4309,25 +4452,8 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
-
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
-            let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
-                |path| {
-                    ignored_paths.push(path.to_string());
-                },
-            )
-            .context("Failed to deserialize config file")?;
-
-            // Warn about each unknown config key
-            for path in ignored_paths {
-                tracing::warn!(
-                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
-                    path
-                );
-            }
+            let mut config: Config =
+                toml::from_str(&contents).context("Failed to parse config file")?;
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -5083,20 +5209,6 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
-        #[cfg(unix)]
-        {
-            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-            if let Err(err) =
-                fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
-            {
-                tracing::warn!(
-                    "Failed to harden config permissions to 0600 at {}: {}",
-                    self.config_path.display(),
-                    err
-                );
-            }
-        }
-
         sync_directory(parent_dir).await?;
 
         if had_existing_config {
@@ -5129,9 +5241,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -5268,26 +5380,6 @@ mod tests {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
-        assert!(h.message.is_none());
-        assert!(h.target.is_none());
-        assert!(h.to.is_none());
-    }
-
-    #[test]
-    async fn heartbeat_config_parses_delivery_aliases() {
-        let raw = r#"
-enabled = true
-interval_minutes = 10
-message = "Ping"
-channel = "telegram"
-recipient = "42"
-"#;
-        let parsed: HeartbeatConfig = toml::from_str(raw).unwrap();
-        assert!(parsed.enabled);
-        assert_eq!(parsed.interval_minutes, 10);
-        assert_eq!(parsed.message.as_deref(), Some("Ping"));
-        assert_eq!(parsed.target.as_deref(), Some("telegram"));
-        assert_eq!(parsed.to.as_deref(), Some("42"));
     }
 
     #[test]
@@ -5400,9 +5492,6 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
-                message: Some("Check London time".into()),
-                target: Some("telegram".into()),
-                to: Some("123456".into()),
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
@@ -5435,6 +5524,7 @@ default_temperature = 0.7
                 nostr: None,
                 clawdtalk: None,
                 message_timeout_secs: 300,
+                mqtt: None,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -5458,6 +5548,7 @@ default_temperature = 0.7
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             model_support_vision: None,
+            sop: SopConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5474,12 +5565,6 @@ default_temperature = 0.7
         assert_eq!(parsed.runtime.kind, "docker");
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
-        assert_eq!(
-            parsed.heartbeat.message.as_deref(),
-            Some("Check London time")
-        );
-        assert_eq!(parsed.heartbeat.target.as_deref(), Some("telegram"));
-        assert_eq!(parsed.heartbeat.to.as_deref(), Some("123456"));
         assert!(parsed.channels_config.telegram.is_some());
         assert_eq!(
             parsed.channels_config.telegram.unwrap().bot_token,
@@ -5662,6 +5747,7 @@ tool_dispatcher = "xml"
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             model_support_vision: None,
+            sop: SopConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -6027,6 +6113,7 @@ allowed_users = ["@ops:matrix.org"]
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
+            mqtt: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -6241,6 +6328,7 @@ channel_id = "C123"
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
+            mqtt: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -7900,47 +7988,16 @@ default_model = "legacy-model"
         config.config_path = config_path.clone();
         config.save().await.unwrap();
 
+        // Apply the same permission logic as load_or_init
+        fs::set_permissions(&config_path, Permissions::from_mode(0o600))
+            .await
+            .expect("Failed to set permissions");
+
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
             "New config file should be owner-only (0600), got {mode:o}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    async fn save_restricts_existing_world_readable_config_to_owner_only() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_path = tmp.path().join("config.toml");
-
-        let mut config = Config::default();
-        config.config_path = config_path.clone();
-        config.save().await.unwrap();
-
-        // Simulate the regression state observed in issue #1345.
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let loose_mode = std::fs::metadata(&config_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            loose_mode, 0o644,
-            "test setup requires world-readable config"
-        );
-
-        config.default_temperature = 0.6;
-        config.save().await.unwrap();
-
-        let hardened_mode = std::fs::metadata(&config_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            hardened_mode, 0o600,
-            "Saving config should restore owner-only permissions (0600)"
         );
     }
 

@@ -389,7 +389,7 @@ Notes:
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
-| `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
+| `allowed_commands` | _required for shell execution_ | allowlist of executable names |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -404,7 +404,6 @@ Notes:
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
-- `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
 
@@ -526,6 +525,21 @@ max_length = 50
 priority = 5
 ```
 
+## `[sop]`
+
+Standard Operating Procedures engine.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable SOP subsystem |
+| `sops_dir` | `None` | SOP definitions path (relative to workspace). Defaults to `sops` if unset. |
+| `default_execution_mode` | `supervised` | Fallback mode when `execution_mode` is omitted in `SOP.toml` |
+| `max_concurrent_total` | `5` | Global concurrency limit for SOP runs |
+| `approval_timeout_secs` | `300` | Wait time for human approval |
+| `max_finished_runs` | `1000` | Number of finished runs kept for `sop_status` history (`0` = unlimited) |
+| `gates_file` | `None` | Path to ampersona persona JSON with gate definitions (requires `ampersona-gates`) |
+| `gate_eval_interval_secs` | `60` | Gate evaluation tick interval (`0` disables gate evaluation) |
+
 ## `[channels_config]`
 
 Top-level channel options are configured under `channels_config`.
@@ -543,6 +557,7 @@ Examples:
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
 - `[channels_config.nostr]`
+- `[channels_config.mqtt]` (SOP Event Fan-In)
 
 Notes:
 

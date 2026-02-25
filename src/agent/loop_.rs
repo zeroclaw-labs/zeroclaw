@@ -1109,6 +1109,9 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None, // sop_engine — loop_ does not wire SOP engine
+        None, // sop_collector
+        None, // sop_gate_eval
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -1581,6 +1584,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None, // sop_engine — loop_ does not wire SOP engine
+        None, // sop_collector
+        None, // sop_gate_eval
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;

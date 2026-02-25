@@ -304,7 +304,6 @@ fn config_channels_all_optional_channels_none_by_default() {
     assert!(channels.slack.is_none());
     assert!(channels.matrix.is_none());
     assert!(channels.lark.is_none());
-    assert!(channels.feishu.is_none());
     assert!(channels.webhook.is_none());
 }
 
