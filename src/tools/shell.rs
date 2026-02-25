@@ -57,6 +57,41 @@ pub(super) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<S
     out
 }
 
+fn extract_command_argument(args: &serde_json::Value) -> Option<String> {
+    if let Some(command) = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+    {
+        return Some(command.to_string());
+    }
+
+    for alias in [
+        "cmd",
+        "script",
+        "shell_command",
+        "command_line",
+        "bash",
+        "sh",
+        "input",
+    ] {
+        if let Some(command) = args
+            .get(alias)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+        {
+            return Some(command.to_string());
+        }
+    }
+
+    args.as_str()
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .map(ToString::to_string)
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -86,9 +121,7 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
+        let command = extract_command_argument(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
         let approved = args
             .get("approved")
@@ -103,7 +136,7 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
+        match self.security.validate_command_execution(&command, approved) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -114,7 +147,7 @@ impl Tool for ShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(command) {
+        if let Some(path) = self.security.forbidden_path_argument(&command) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -135,7 +168,7 @@ impl Tool for ShellTool {
         // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(&command, &self.security.workspace_dir)
         {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -246,6 +279,22 @@ mod tests {
         assert!(schema["properties"]["approved"].is_object());
     }
 
+    #[test]
+    fn extract_command_argument_supports_aliases() {
+        assert_eq!(
+            extract_command_argument(&json!({"cmd": "echo from-cmd"})).as_deref(),
+            Some("echo from-cmd")
+        );
+        assert_eq!(
+            extract_command_argument(&json!({"script": "echo from-script"})).as_deref(),
+            Some("echo from-script")
+        );
+        assert_eq!(
+            extract_command_argument(&json!("echo from-string")).as_deref(),
+            Some("echo from-string")
+        );
+    }
+
     #[tokio::test]
     async fn shell_executes_allowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -256,6 +305,17 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_executes_command_from_cmd_alias() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"cmd": "echo alias"}))
+            .await
+            .expect("cmd alias execution should succeed");
+        assert!(result.success);
+        assert!(result.output.trim().contains("alias"));
     }
 
     #[tokio::test]

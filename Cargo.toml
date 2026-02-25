@@ -58,8 +58,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML to plain text conversion (web_fetch tool)
-nanohtml2text = "0.2"
+# HTML conversion providers (web_fetch tool)
+fast_html2md = { version = "0.0.58", optional = true }
+nanohtml2text = { version = "0.2", optional = true }
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
@@ -181,12 +182,15 @@ rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["channel-lark"]
+default = ["channel-lark", "web-fetch-html2md"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+web-fetch-html2md = ["dep:fast_html2md"]
+web-fetch-plaintext = ["dep:nanohtml2text"]
+firecrawl = []
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
@@ -226,7 +230,7 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tempfile = "3.14"
+tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"

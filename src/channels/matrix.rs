@@ -323,6 +323,7 @@ impl MatrixChannel {
             Relation::Reply { in_reply_to } => Some(in_reply_to.event_id.to_string()),
             Relation::Thread(thread) => thread.in_reply_to.as_ref().map(|r| r.event_id.to_string()),
             Relation::Replacement(_) | Relation::_Custom(_) => None,
+            _ => None, // Handle any future relation types added by the Matrix SDK
         }
     }
 

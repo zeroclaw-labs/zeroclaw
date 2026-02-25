@@ -1,20 +1,24 @@
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{
+    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
+/// Web fetch tool: fetches a web page and returns text/markdown content for LLM consumption.
 ///
-/// Unlike `http_request` (an API client returning raw responses), this tool:
-/// - Only supports GET
-/// - Follows redirects (up to 10)
-/// - Converts HTML to clean plain text via `nanohtml2text`
-/// - Passes through text/plain, text/markdown, and application/json as-is
-/// - Sets a descriptive User-Agent
+/// Providers:
+/// - `fast_html2md`: fetch with reqwest, convert HTML to markdown
+/// - `nanohtml2text`: fetch with reqwest, convert HTML to plaintext
+/// - `firecrawl`: fetch using Firecrawl cloud/self-hosted API
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
+    provider: String,
+    api_key: Option<String>,
+    api_url: Option<String>,
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
     max_response_size: usize,
@@ -22,15 +26,27 @@ pub struct WebFetchTool {
 }
 
 impl WebFetchTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         security: Arc<SecurityPolicy>,
+        provider: String,
+        api_key: Option<String>,
+        api_url: Option<String>,
         allowed_domains: Vec<String>,
         blocked_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
     ) -> Self {
+        let provider = provider.trim().to_lowercase();
         Self {
             security,
+            provider: if provider.is_empty() {
+                "fast_html2md".to_string()
+            } else {
+                provider
+            },
+            api_key,
+            api_url,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             blocked_domains: normalize_allowed_domains(blocked_domains),
             max_response_size,
@@ -39,42 +55,18 @@ impl WebFetchTool {
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        let url = raw_url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "web_fetch tool is enabled but no allowed_domains are configured. \
-                 Add [web_fetch].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if host_matches_allowlist(&host, &self.blocked_domains) {
-            anyhow::bail!("Host '{host}' is in web_fetch.blocked_domains");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in web_fetch.allowed_domains");
-        }
-
-        Ok(url.to_string())
+        validate_url(
+            raw_url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &self.blocked_domains,
+                allowed_field_name: "web_fetch.allowed_domains",
+                blocked_field_name: Some("web_fetch.blocked_domains"),
+                empty_allowed_message: "web_fetch tool is enabled but no allowed_domains are configured. Add [web_fetch].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpOrHttps,
+                ipv6_error_context: "web_fetch",
+            },
+        )
     }
 
     fn truncate_response(&self, text: &str) -> String {
@@ -89,6 +81,198 @@ impl WebFetchTool {
             text.to_string()
         }
     }
+
+    fn effective_timeout_secs(&self) -> u64 {
+        if self.timeout_secs == 0 {
+            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 30s");
+            30
+        } else {
+            self.timeout_secs
+        }
+    }
+
+    #[allow(unused_variables)]
+    fn convert_html_to_output(&self, body: &str) -> anyhow::Result<String> {
+        match self.provider.as_str() {
+            "fast_html2md" => {
+                #[cfg(feature = "web-fetch-html2md")]
+                {
+                    Ok(html2md::rewrite_html(body, false))
+                }
+                #[cfg(not(feature = "web-fetch-html2md"))]
+                {
+                    anyhow::bail!(
+                        "web_fetch provider 'fast_html2md' requires Cargo feature 'web-fetch-html2md'"
+                    );
+                }
+            }
+            "nanohtml2text" => {
+                #[cfg(feature = "web-fetch-plaintext")]
+                {
+                    Ok(nanohtml2text::html2text(body))
+                }
+                #[cfg(not(feature = "web-fetch-plaintext"))]
+                {
+                    anyhow::bail!(
+                        "web_fetch provider 'nanohtml2text' requires Cargo feature 'web-fetch-plaintext'"
+                    );
+                }
+            }
+            _ => anyhow::bail!(
+                "Unknown web_fetch provider: '{}'. Set tools.web_fetch.provider to 'fast_html2md', 'nanohtml2text', or 'firecrawl' in config.toml",
+                self.provider
+            ),
+        }
+    }
+
+    fn build_http_client(&self) -> anyhow::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.effective_timeout_secs()))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("ZeroClaw/0.1 (web_fetch)");
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
+        Ok(builder.build()?)
+    }
+
+    async fn fetch_with_http_provider(&self, url: &str) -> anyhow::Result<String> {
+        let client = self.build_http_client()?;
+        let response = client.get(url).send().await?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?;
+
+            let redirected_url = reqwest::Url::parse(url)
+                .and_then(|base| base.join(location))
+                .or_else(|_| reqwest::Url::parse(location))
+                .map_err(|e| anyhow::anyhow!("Invalid redirect Location header: {e}"))?
+                .to_string();
+
+            // Validate redirect target with the same SSRF/allowlist policy.
+            self.validate_url(&redirected_url)?;
+            return Ok(redirected_url);
+        }
+
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "HTTP {} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown")
+            );
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let body = response.text().await?;
+
+        if content_type.contains("text/plain")
+            || content_type.contains("text/markdown")
+            || content_type.contains("application/json")
+        {
+            return Ok(body);
+        }
+
+        if content_type.contains("text/html") || content_type.is_empty() {
+            return self.convert_html_to_output(&body);
+        }
+
+        anyhow::bail!(
+            "Unsupported content type: {content_type}. web_fetch supports text/html, text/plain, text/markdown, and application/json."
+        )
+    }
+
+    #[cfg(feature = "firecrawl")]
+    async fn fetch_with_firecrawl(&self, url: &str) -> anyhow::Result<String> {
+        let auth_token = match self.api_key.as_ref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim(),
+            _ => {
+                anyhow::bail!(
+                    "web_fetch provider 'firecrawl' requires [web_fetch].api_key in config.toml"
+                );
+            }
+        };
+
+        let api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.firecrawl.dev");
+        let endpoint = format!("{}/v1/scrape", api_url.trim_end_matches('/'));
+
+        let response = self
+            .build_http_client()?
+            .post(endpoint)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {auth_token}"),
+            )
+            .json(&json!({
+                "url": url,
+                "formats": ["markdown"],
+                "onlyMainContent": true,
+                "timeout": (self.effective_timeout_secs() * 1000) as u64
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "Firecrawl scrape failed with status {}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid Firecrawl response JSON: {e}"))?;
+        if !parsed
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = parsed
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            anyhow::bail!("Firecrawl scrape failed: {error}");
+        }
+
+        let data = parsed
+            .get("data")
+            .ok_or_else(|| anyhow::anyhow!("Firecrawl response missing data field"))?;
+        let output = data
+            .get("markdown")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| data.get("html").and_then(serde_json::Value::as_str))
+            .or_else(|| data.get("rawHtml").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_string();
+
+        if output.trim().is_empty() {
+            anyhow::bail!("Firecrawl returned empty content");
+        }
+
+        Ok(output)
+    }
+
+    #[cfg(not(feature = "firecrawl"))]
+    #[allow(clippy::unused_async)]
+    async fn fetch_with_firecrawl(&self, _url: &str) -> anyhow::Result<String> {
+        anyhow::bail!("web_fetch provider 'firecrawl' requires Cargo feature 'firecrawl'")
+    }
 }
 
 #[async_trait]
@@ -98,11 +282,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a web page and return its content as clean plain text. \
-         HTML pages are automatically converted to readable text. \
-         JSON and plain text responses are returned as-is. \
-         Only GET requests; follows redirects. \
-         Security: allowlist-only domains, no local/private hosts."
+        "Fetch a web page and return markdown/text content for LLM consumption. Providers: fast_html2md, nanohtml2text, firecrawl. Security: allowlist-only domains, blocked_domains, and no local/private hosts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -147,265 +327,57 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                })
+                });
             }
         };
 
-        // Build client: follow redirects, set timeout, set User-Agent
-        let timeout_secs = if self.timeout_secs == 0 {
-            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 30s");
-            30
-        } else {
-            self.timeout_secs
+        let result = match self.provider.as_str() {
+            "fast_html2md" | "nanohtml2text" => self.fetch_with_http_provider(&url).await,
+            "firecrawl" => self.fetch_with_firecrawl(&url).await,
+            _ => Err(anyhow::anyhow!(
+                "Unknown web_fetch provider: '{}'. Set tools.web_fetch.provider to 'fast_html2md', 'nanohtml2text', or 'firecrawl' in config.toml",
+                self.provider
+            )),
         };
 
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .user_agent("ZeroClaw/0.1 (web_fetch)");
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
-        let client = match builder.build() {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to build HTTP client: {e}")),
-                })
-            }
-        };
-
-        let response = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("HTTP request failed: {e}")),
-                })
-            }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            return Ok(ToolResult {
+        match result {
+            Ok(output) => Ok(ToolResult {
+                success: true,
+                output: self.truncate_response(&output),
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "HTTP {} {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Unknown")
-                )),
-            });
+                error: Some(e.to_string()),
+            }),
         }
-
-        // Determine content type for processing strategy
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let body = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                })
-            }
-        };
-
-        let text = if content_type.contains("text/html") {
-            nanohtml2text::html2text(&body)
-        } else if content_type.contains("text/plain")
-            || content_type.contains("text/markdown")
-            || content_type.contains("application/json")
-        {
-            body
-        } else if content_type.is_empty() {
-            // No content-type header; try HTML conversion as best-effort
-            nanohtml2text::html2text(&body)
-        } else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Unsupported content type: {content_type}. \
-                     web_fetch supports text/html, text/plain, text/markdown, and application/json."
-                )),
-            });
-        };
-
-        let output = self.truncate_response(&text);
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
     }
-}
-
-// ── Helper functions (independent from http_request.rs per DRY rule-of-three) ──
-
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in web_fetch");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
-}
-
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    let has_local_tld = bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
-        return true;
-    }
-
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
-    }
-
-    false
-}
-
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || (a == 100 && (64..=127).contains(&b))
-        || a >= 240
-        || (a == 192 && b == 0 && (c == 0 || c == 2))
-        || (a == 198 && b == 51)
-        || (a == 203 && b == 0)
-        || (a == 198 && (18..=19).contains(&b))
-}
-
-fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00
-        || (segs[0] & 0xffc0) == 0xfe80
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::url_validation::{is_private_or_local_host, normalize_domain};
 
     fn test_tool(allowed_domains: Vec<&str>) -> WebFetchTool {
-        test_tool_with_blocklist(allowed_domains, vec![])
+        test_tool_with_provider(allowed_domains, vec![], "fast_html2md", None, None)
     }
 
     fn test_tool_with_blocklist(
         allowed_domains: Vec<&str>,
         blocked_domains: Vec<&str>,
+    ) -> WebFetchTool {
+        test_tool_with_provider(allowed_domains, blocked_domains, "fast_html2md", None, None)
+    }
+
+    fn test_tool_with_provider(
+        allowed_domains: Vec<&str>,
+        blocked_domains: Vec<&str>,
+        provider: &str,
+        provider_key: Option<&str>,
+        api_url: Option<&str>,
     ) -> WebFetchTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -413,14 +385,15 @@ mod tests {
         });
         WebFetchTool::new(
             security,
+            provider.to_string(),
+            provider_key.map(ToOwned::to_owned),
+            api_url.map(ToOwned::to_owned),
             allowed_domains.into_iter().map(String::from).collect(),
             blocked_domains.into_iter().map(String::from).collect(),
             500_000,
             30,
         )
     }
-
-    // ── Name and schema ──────────────────────────────────────────
 
     #[test]
     fn name_is_web_fetch() {
@@ -437,20 +410,28 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("url")));
     }
 
-    // ── HTML to text conversion ──────────────────────────────────
-
+    #[cfg(feature = "web-fetch-html2md")]
     #[test]
-    fn html_to_text_conversion() {
-        let html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
-        let text = nanohtml2text::html2text(html);
-        assert!(text.contains("Title"));
-        assert!(text.contains("Hello"));
-        assert!(text.contains("world"));
-        assert!(!text.contains("<h1>"));
-        assert!(!text.contains("<p>"));
+    fn html_to_markdown_conversion_preserves_structure() {
+        let tool = test_tool(vec!["example.com"]);
+        let html = "<html><body><h1>Title</h1><ul><li>Hello</li></ul></body></html>";
+        let markdown = tool.convert_html_to_output(html).unwrap();
+        assert!(markdown.contains("Title"));
+        assert!(markdown.contains("Hello"));
+        assert!(!markdown.contains("<h1>"));
     }
 
-    // ── URL validation ───────────────────────────────────────────
+    #[cfg(feature = "web-fetch-plaintext")]
+    #[test]
+    fn html_to_plaintext_conversion_removes_html_tags() {
+        let tool =
+            test_tool_with_provider(vec!["example.com"], vec![], "nanohtml2text", None, None);
+        let html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
+        let text = tool.convert_html_to_output(html).unwrap();
+        assert!(text.contains("Title"));
+        assert!(text.contains("Hello"));
+        assert!(!text.contains("<h1>"));
+    }
 
     #[test]
     fn validate_accepts_exact_domain() {
@@ -508,15 +489,22 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = WebFetchTool::new(security, vec![], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(
+            security,
+            "fast_html2md".into(),
+            None,
+            None,
+            vec![],
+            vec![],
+            500_000,
+            30,
+        );
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
     }
-
-    // ── SSRF protection ──────────────────────────────────────────
 
     #[test]
     fn ssrf_blocks_localhost() {
@@ -561,15 +549,22 @@ mod tests {
         assert!(err.contains("local/private"));
     }
 
-    // ── Security policy ──────────────────────────────────────────
-
     #[tokio::test]
     async fn blocks_readonly_mode() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(
+            security,
+            "fast_html2md".into(),
+            None,
+            None,
+            vec!["example.com".into()],
+            vec![],
+            500_000,
+            30,
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -584,7 +579,16 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(
+            security,
+            "fast_html2md".into(),
+            None,
+            None,
+            vec!["example.com".into()],
+            vec![],
+            500_000,
+            30,
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -592,8 +596,6 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
     }
-
-    // ── Response truncation ──────────────────────────────────────
 
     #[test]
     fn truncate_within_limit() {
@@ -606,6 +608,9 @@ mod tests {
     fn truncate_over_limit() {
         let tool = WebFetchTool::new(
             Arc::new(SecurityPolicy::default()),
+            "fast_html2md".into(),
+            None,
+            None,
             vec!["example.com".into()],
             vec![],
             10,
@@ -615,8 +620,6 @@ mod tests {
         let truncated = tool.truncate_response(text);
         assert!(truncated.contains("[Response truncated"));
     }
-
-    // ── Domain normalization ─────────────────────────────────────
 
     #[test]
     fn normalize_domain_strips_scheme_and_case() {
@@ -633,8 +636,6 @@ mod tests {
         ]);
         assert_eq!(got, vec!["example.com".to_string()]);
     }
-
-    // ── Blocked domains ──────────────────────────────────────────
 
     #[test]
     fn blocklist_rejects_exact_match() {
@@ -670,5 +671,21 @@ mod tests {
     fn blocklist_allows_non_blocked() {
         let tool = test_tool_with_blocklist(vec!["*"], vec!["evil.com"]);
         assert!(tool.validate_url("https://example.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn firecrawl_provider_requires_api_key() {
+        let tool = test_tool_with_provider(vec!["*"], vec![], "firecrawl", None, None);
+        let result = tool
+            .execute(json!({"url": "https://example.com"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        if cfg!(feature = "firecrawl") {
+            assert!(error.contains("requires [web_fetch].api_key"));
+        } else {
+            assert!(error.contains("requires Cargo feature 'firecrawl'"));
+        }
     }
 }

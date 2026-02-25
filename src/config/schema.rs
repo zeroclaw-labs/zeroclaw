@@ -244,6 +244,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Inter-process agent communication (`[agents_ipc]`).
+    #[serde(default)]
+    pub agents_ipc: AgentsIpcConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -415,6 +419,44 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+// ── Agents IPC ──────────────────────────────────────────────────
+
+fn default_agents_ipc_db_path() -> String {
+    "~/.zeroclaw/agents.db".into()
+}
+
+fn default_agents_ipc_staleness_secs() -> u64 {
+    300
+}
+
+/// Inter-process agent communication configuration (`[agents_ipc]` section).
+///
+/// When enabled, registers 5 IPC tools that let independent ZeroClaw processes
+/// on the same host discover each other and exchange messages via a shared
+/// SQLite database. Disabled by default (zero overhead when off).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentsIpcConfig {
+    /// Enable inter-process agent communication tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to shared SQLite database (all agents on this host share one file).
+    #[serde(default = "default_agents_ipc_db_path")]
+    pub db_path: String,
+    /// Agents not seen within this window are considered offline (seconds).
+    #[serde(default = "default_agents_ipc_staleness_secs")]
+    pub staleness_secs: u64,
+}
+
+impl Default for AgentsIpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: default_agents_ipc_db_path(),
+            staleness_secs: default_agents_ipc_staleness_secs(),
         }
     }
 }
@@ -1109,6 +1151,15 @@ pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
     pub enabled: bool,
+    /// Provider: "fast_html2md", "nanohtml2text", or "firecrawl"
+    #[serde(default = "default_web_fetch_provider")]
+    pub provider: String,
+    /// Optional provider API key (required for provider = "firecrawl")
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional provider API URL override (for self-hosted providers)
+    #[serde(default)]
+    pub api_url: Option<String>,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -1127,6 +1178,10 @@ fn default_web_fetch_max_response_size() -> usize {
     500_000 // 500KB
 }
 
+fn default_web_fetch_provider() -> String {
+    "fast_html2md".into()
+}
+
 fn default_web_fetch_timeout_secs() -> u64 {
     30
 }
@@ -1135,6 +1190,9 @@ impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: default_web_fetch_provider(),
+            api_key: None,
+            api_url: None,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
@@ -1154,6 +1212,12 @@ pub struct WebSearchConfig {
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
+    /// Generic provider API key (used by firecrawl and as fallback for brave)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional provider API URL override (for self-hosted providers)
+    #[serde(default)]
+    pub api_url: Option<String>,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
@@ -1182,6 +1246,8 @@ impl Default for WebSearchConfig {
         Self {
             enabled: false,
             provider: default_web_search_provider(),
+            api_key: None,
+            api_url: None,
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -3713,6 +3779,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         }
     }
 }
@@ -4164,6 +4231,16 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
+                &mut config.web_fetch.api_key,
+                "config.web_fetch.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.api_key,
+                "config.web_search.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
@@ -4371,6 +4448,29 @@ impl Config {
         }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
+        }
+
+        // Web tools
+        let web_fetch_provider = self.web_fetch.provider.trim().to_lowercase();
+        if !web_fetch_provider.is_empty()
+            && !matches!(
+                web_fetch_provider.as_str(),
+                "fast_html2md" | "nanohtml2text" | "firecrawl"
+            )
+        {
+            anyhow::bail!(
+                "web_fetch.provider must be one of: fast_html2md, nanohtml2text, firecrawl"
+            );
+        }
+
+        let web_search_provider = self.web_search.provider.trim().to_lowercase();
+        if !web_search_provider.is_empty()
+            && !matches!(
+                web_search_provider.as_str(),
+                "duckduckgo" | "ddg" | "brave" | "firecrawl"
+            )
+        {
+            anyhow::bail!("web_search.provider must be one of: duckduckgo, brave, firecrawl");
         }
 
         // Model routes
@@ -4640,6 +4740,36 @@ impl Config {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
 
+        // Web fetch provider: ZEROCLAW_WEB_FETCH_PROVIDER or WEB_FETCH_PROVIDER
+        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_FETCH_PROVIDER")
+            .or_else(|_| std::env::var("WEB_FETCH_PROVIDER"))
+        {
+            let provider = provider.trim();
+            if !provider.is_empty() {
+                self.web_fetch.provider = provider.to_string();
+            }
+        }
+
+        // Web fetch provider API key: ZEROCLAW_WEB_FETCH_API_KEY or WEB_FETCH_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_WEB_FETCH_API_KEY")
+            .or_else(|_| std::env::var("WEB_FETCH_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_fetch.api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Web fetch provider API URL: ZEROCLAW_WEB_FETCH_API_URL or WEB_FETCH_API_URL
+        if let Ok(api_url) = std::env::var("ZEROCLAW_WEB_FETCH_API_URL")
+            .or_else(|_| std::env::var("WEB_FETCH_API_URL"))
+        {
+            let api_url = api_url.trim();
+            if !api_url.is_empty() {
+                self.web_fetch.api_url = Some(api_url.to_string());
+            }
+        }
+
         // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
         if let Ok(provider) = std::env::var("ZEROCLAW_WEB_SEARCH_PROVIDER")
             .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
@@ -4647,6 +4777,26 @@ impl Config {
             let provider = provider.trim();
             if !provider.is_empty() {
                 self.web_search.provider = provider.to_string();
+            }
+        }
+
+        // Web search provider API key: ZEROCLAW_WEB_SEARCH_API_KEY or WEB_SEARCH_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_WEB_SEARCH_API_KEY")
+            .or_else(|_| std::env::var("WEB_SEARCH_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Web search provider API URL: ZEROCLAW_WEB_SEARCH_API_URL or WEB_SEARCH_API_URL
+        if let Ok(api_url) = std::env::var("ZEROCLAW_WEB_SEARCH_API_URL")
+            .or_else(|_| std::env::var("WEB_SEARCH_API_URL"))
+        {
+            let api_url = api_url.trim();
+            if !api_url.is_empty() {
+                self.web_search.api_url = Some(api_url.to_string());
             }
         }
 
@@ -4798,6 +4948,16 @@ impl Config {
             "config.browser.computer_use.api_key",
         )?;
 
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_fetch.api_key,
+            "config.web_fetch.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.api_key,
+            "config.web_search.api_key",
+        )?;
         encrypt_optional_secret(
             &store,
             &mut config_to_save.web_search.brave_api_key,
@@ -5260,6 +5420,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5443,6 +5604,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5477,6 +5639,8 @@ tool_dispatcher = "xml"
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
+        config.web_fetch.api_key = Some("web-fetch-credential".into());
+        config.web_search.api_key = Some("web-search-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
 
@@ -5523,6 +5687,24 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
+        );
+
+        let web_fetch_encrypted = stored.web_fetch.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            web_fetch_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(web_fetch_encrypted).unwrap(),
+            "web-fetch-credential"
+        );
+
+        let web_search_generic_encrypted = stored.web_search.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            web_search_generic_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(web_search_generic_encrypted).unwrap(),
+            "web-search-credential"
         );
 
         let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
@@ -7235,6 +7417,8 @@ default_model = "legacy-model"
 
         std::env::set_var("WEB_SEARCH_ENABLED", "false");
         std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
+        std::env::set_var("WEB_SEARCH_API_KEY", "web-search-api-key");
+        std::env::set_var("WEB_SEARCH_API_URL", "https://search.example.com/v1");
         std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
         std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
         std::env::set_var("BRAVE_API_KEY", "brave-test-key");
@@ -7243,6 +7427,14 @@ default_model = "legacy-model"
 
         assert!(!config.web_search.enabled);
         assert_eq!(config.web_search.provider, "brave");
+        assert_eq!(
+            config.web_search.api_key.as_deref(),
+            Some("web-search-api-key")
+        );
+        assert_eq!(
+            config.web_search.api_url.as_deref(),
+            Some("https://search.example.com/v1")
+        );
         assert_eq!(config.web_search.max_results, 7);
         assert_eq!(config.web_search.timeout_secs, 20);
         assert_eq!(
@@ -7252,9 +7444,37 @@ default_model = "legacy-model"
 
         std::env::remove_var("WEB_SEARCH_ENABLED");
         std::env::remove_var("WEB_SEARCH_PROVIDER");
+        std::env::remove_var("WEB_SEARCH_API_KEY");
+        std::env::remove_var("WEB_SEARCH_API_URL");
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
         std::env::remove_var("BRAVE_API_KEY");
+    }
+
+    #[test]
+    async fn env_override_web_fetch_provider_config() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::set_var("WEB_FETCH_PROVIDER", "firecrawl");
+        std::env::set_var("WEB_FETCH_API_KEY", "web-fetch-api-key");
+        std::env::set_var("WEB_FETCH_API_URL", "https://firecrawl.example.com/v1");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.web_fetch.provider, "firecrawl");
+        assert_eq!(
+            config.web_fetch.api_key.as_deref(),
+            Some("web-fetch-api-key")
+        );
+        assert_eq!(
+            config.web_fetch.api_url.as_deref(),
+            Some("https://firecrawl.example.com/v1")
+        );
+
+        std::env::remove_var("WEB_FETCH_PROVIDER");
+        std::env::remove_var("WEB_FETCH_API_KEY");
+        std::env::remove_var("WEB_FETCH_API_URL");
     }
 
     #[test]

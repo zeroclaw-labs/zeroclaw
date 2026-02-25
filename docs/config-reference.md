@@ -317,6 +317,46 @@ Notes:
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
 
+## `[web_fetch]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_fetch` tool for page retrieval |
+| `provider` | `fast_html2md` | Fetch provider: `fast_html2md`, `nanohtml2text`, or `firecrawl` |
+| `api_key` | unset | Provider API key (required for `provider = "firecrawl"`) |
+| `api_url` | unset | Optional provider API base URL override (self-hosted endpoints) |
+| `allowed_domains` | `["*"]` | Allowed domains for web fetch (exact/subdomain match) |
+| `blocked_domains` | `[]` | Blocklist that overrides allowlist |
+| `max_response_size` | `500000` | Maximum output payload length in bytes |
+| `timeout_secs` | `30` | Request timeout in seconds |
+
+Notes:
+
+- URL policy is deny-by-default when `allowed_domains` is empty.
+- Local/private addresses are blocked even when allowlist contains `"*"`.
+- Redirect responses return the validated redirect target URL string instead of destination page content.
+- `fast_html2md` is the markdown-preserving default provider.
+- `nanohtml2text` requires Cargo feature `web-fetch-plaintext`.
+- `firecrawl` requires Cargo feature `firecrawl`.
+
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_search_tool` |
+| `provider` | `duckduckgo` | Search provider: `duckduckgo`, `brave`, or `firecrawl` |
+| `api_key` | unset | Generic provider API key (`firecrawl`, optional fallback for `brave`) |
+| `api_url` | unset | Optional provider API base URL override (self-hosted Firecrawl) |
+| `brave_api_key` | unset | Brave Search API key (used when `provider = "brave"`) |
+| `max_results` | `5` | Result count (clamped to 1..10) |
+| `timeout_secs` | `15` | Request timeout in seconds |
+
+Notes:
+
+- `provider = "duckduckgo"` needs no API key.
+- `provider = "brave"` uses `brave_api_key` first, then falls back to `api_key`.
+- `provider = "firecrawl"` requires `api_key` and Cargo feature `firecrawl`.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
