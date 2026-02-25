@@ -22,6 +22,8 @@ Last verified: **February 21, 2026**.
 Release automation lives in:
 
 - `.github/workflows/pub-release.yml`
+- `.github/workflows/pub-prerelease.yml`
+- `.github/workflows/ci-canary-gate.yml`
 - `.github/workflows/pub-homebrew-core.yml` (manual Homebrew formula PR, bot-owned)
 
 Modes:
@@ -29,6 +31,8 @@ Modes:
 - Tag push `v*`: publish mode.
 - Manual dispatch: verification-only or publish mode.
 - Weekly schedule: verification-only mode.
+- Pre-release tags (`vX.Y.Z-alpha.N`, `vX.Y.Z-beta.N`, `vX.Y.Z-rc.N`): prerelease publish path.
+- Canary gate (weekly/manual): promote/hold/abort decision path.
 
 Publish-mode guardrails:
 
@@ -95,6 +99,35 @@ Expected publish outputs:
 2. Verify GHCR tags for the released version (`vX.Y.Z`) and release commit SHA tag (`sha-<12>`).
 3. Verify install paths that rely on release assets (for example bootstrap binary download).
 
+### 5.1) Canary gate before broad rollout
+
+Run `CI Canary Gate` (`.github/workflows/ci-canary-gate.yml`) in `dry-run` first, then `execute` when metrics are complete.
+
+Required inputs:
+
+- candidate tag/SHA
+- observed error rate
+- observed crash rate
+- observed p95 latency
+- observed sample size
+
+Decision output:
+
+- `promote`: thresholds satisfied
+- `hold`: insufficient evidence or soft breach
+- `abort`: hard threshold breach
+
+### 5.2) Pre-release stage progression (alpha/beta/rc)
+
+For staged release confidence:
+
+1. Cut and push stage tag (`vX.Y.Z-alpha.N`, then beta, then rc).
+2. `Pub Pre-release` validates:
+   - stage progression
+   - origin/main ancestry
+   - Cargo version/tag alignment
+3. Publish prerelease assets only after guard passes.
+
 ### 6) Publish Homebrew Core formula (bot-owned)
 
 Run `Pub Homebrew Core` manually:
@@ -125,6 +158,12 @@ If tag-push release fails after artifacts are validated:
    - `release_tag=<existing tag>`
    - `release_ref` is automatically pinned to `release_tag` in publish mode
 3. Re-validate released assets.
+
+If prerelease/canary lanes fail:
+
+1. Inspect guard artifacts (`prerelease-guard.json`, `canary-guard.json`).
+2. Fix stage-policy or quality regressions.
+3. Re-run guard in `dry-run` before any execute/publish action.
 
 ## Operational Notes
 

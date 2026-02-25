@@ -31,6 +31,11 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
     - Purpose: PR Docker smoke check on `dev`/`main` PRs and publish images on tag pushes (`v*`) only
+- `.github/workflows/feature-matrix.yml` (`Feature Matrix`)
+    - Purpose: compile-time matrix validation for `default`, `whatsapp-web`, `browser-native`, and `nightly-all-features` lanes
+    - Additional behavior: each lane emits machine-readable result artifacts; summary lane aggregates owner routing from `.github/release/nightly-owner-routing.json`
+- `.github/workflows/nightly-all-features.yml` (`Nightly All-Features`)
+    - Purpose: scheduled high-risk matrix execution with per-lane artifacts and summary rollup for overnight signal quality
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA), policy/license checks (`cargo deny`), gitleaks-based secrets governance (allowlist policy metadata + expiry guard), and SBOM snapshot artifacts (`CycloneDX` + `SPDX`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
@@ -54,6 +59,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
+- `.github/workflows/pub-prerelease.yml` (`Pub Pre-release`)
+    - Purpose: validate alpha/beta/rc stage transitions, enforce tag/version integrity, and optionally publish GitHub prerelease assets
+- `.github/workflows/ci-canary-gate.yml` (`CI Canary Gate`)
+    - Purpose: evaluate canary metrics against policy thresholds (`promote` / `hold` / `abort`) with auditable artifacts and guarded execute mode
+- `.github/workflows/docs-deploy.yml` (`Docs Deploy`)
+    - Purpose: docs quality checks + preview artifacts + GitHub Pages production deployment lane
 - `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
     - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
     - Guardrail: release tag must match `Cargo.toml` version
@@ -93,7 +104,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `CI`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`
 - `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
+- `Feature Matrix`: PR/push on Rust + workflow paths, merge queue, weekly schedule, manual dispatch
+- `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
+- `Pub Pre-release`: pre-release tag pushes (`v*-alpha.*`, `v*-beta.*`, `v*-rc.*`) and manual dispatch
+- `CI Canary Gate`: weekly schedule (policy check) and manual dispatch (`dry-run` / `execute`)
+- `Docs Deploy`: docs/README path changes on PR/push + manual dispatch (`preview` / `production`)
 - `Connectivity Probes`: manual dispatch only (legacy wrapper)
 - `Pub Homebrew Core`: manual dispatch only
 - `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`, weekly schedule
@@ -132,6 +148,11 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 15. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
 16. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 17. Suspected flaky tests: inspect `Test Flake Retry Probe` summary and `test-flake-probe` artifact in `.github/workflows/ci-run.yml`.
+18. Feature-combo regressions: inspect `.github/workflows/feature-matrix.yml` summary artifact and lane JSON reports.
+19. Nightly integration drift: inspect `.github/workflows/nightly-all-features.yml` summary and lane owner mapping.
+20. Pre-release stage gate failures: inspect `.github/workflows/pub-prerelease.yml` guard artifact (`prerelease-guard.json`).
+21. Canary gate hold/abort decisions: inspect `.github/workflows/ci-canary-gate.yml` guard artifact (`canary-guard.json`).
+22. Docs deploy failures: inspect `.github/workflows/docs-deploy.yml` quality lane + preview/deploy artifacts.
 
 ## Maintenance Rules
 
@@ -143,6 +164,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep gitleaks allowlist governance metadata current in `.github/security/gitleaks-allowlist-governance.json` (owner/reason/expiry/ticket enforced by `secrets_governance_guard.py`).
 - Keep audit event schema + retention metadata aligned with `docs/audit-event-schema.md` (`emit_audit_event.py` envelope + workflow artifact policy).
 - Keep rollback operations guarded and reversible (`ci-rollback.yml` defaults to `dry-run`; `execute` is manual and policy-gated).
+- Keep canary policy thresholds and sample-size rules current in `.github/release/canary-policy.json`.
+- Keep pre-release stage transition policy and required checks current in `.github/release/prerelease-stage-gates.json`.
+- Keep required check naming stable and documented in `docs/operations/required-check-mapping.md` before changing branch protection settings.
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
