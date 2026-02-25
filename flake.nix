@@ -8,8 +8,15 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, flake-utils, fenix, nixpkgs }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      flake-utils,
+      fenix,
+      nixpkgs,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -20,10 +27,13 @@
         };
       in
       {
+        formatter = pkgs.nixfmt-tree;
+
         packages = {
           default = self.packages.${system}.zeroclaw;
           inherit (pkgs) zeroclaw;
         };
+
         devShells.default = pkgs.mkShell {
           inputsFrom = [ pkgs.zeroclaw ];
           packages = [
