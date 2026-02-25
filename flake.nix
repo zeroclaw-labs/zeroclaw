@@ -31,7 +31,10 @@
 
         packages = {
           default = self.packages.${system}.zeroclaw;
-          inherit (pkgs) zeroclaw;
+          inherit (pkgs)
+            zeroclaw
+            zeroclaw-web
+            ;
         };
 
         devShells.default = pkgs.mkShell {

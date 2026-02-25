@@ -1,4 +1,6 @@
 final: prev: {
+  zeroclaw-web = final.callPackage ./web/package.nix { };
+
   zeroclaw = final.callPackage ./package.nix {
     rustPlatform =
       let
