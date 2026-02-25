@@ -972,7 +972,7 @@ mod tests {
         let normalized = normalize_group_reply_allowed_sender_ids(vec![
             " user-1 ".into(),
             "user-1".into(),
-            "".into(),
+            String::new(),
             "user-2".into(),
         ]);
         assert_eq!(normalized, vec!["user-1".to_string(), "user-2".to_string()]);

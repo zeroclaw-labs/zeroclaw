@@ -1118,7 +1118,7 @@ mod tests {
         let normalized = normalize_group_reply_allowed_sender_ids(vec![
             " 111 ".into(),
             "111".into(),
-            "".into(),
+            String::new(),
             "  ".into(),
             "222".into(),
         ]);
