@@ -95,13 +95,17 @@ pub trait Channel: Send + Sync {
     }
 
     /// Update a previously sent draft message with new accumulated content.
+    ///
+    /// Returns `Ok(None)` to keep the current draft message ID, or
+    /// `Ok(Some(new_id))` when a continuation message was created
+    /// (e.g. after hitting a platform edit-count cap).
     async fn update_draft(
         &self,
         _recipient: &str,
         _message_id: &str,
         _text: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).

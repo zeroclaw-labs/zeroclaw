@@ -23,6 +23,7 @@ pub struct WebFetchTool {
     blocked_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    user_agent: String,
 }
 
 impl WebFetchTool {
@@ -36,6 +37,7 @@ impl WebFetchTool {
         blocked_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        user_agent: String,
     ) -> Self {
         let provider = provider.trim().to_lowercase();
         Self {
@@ -51,6 +53,7 @@ impl WebFetchTool {
             blocked_domains: normalize_allowed_domains(blocked_domains),
             max_response_size,
             timeout_secs,
+            user_agent,
         }
     }
 
@@ -130,7 +133,7 @@ impl WebFetchTool {
             .timeout(Duration::from_secs(self.effective_timeout_secs()))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("ZeroClaw/0.1 (web_fetch)");
+            .user_agent(self.user_agent.as_str());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
         Ok(builder.build()?)
     }
@@ -392,6 +395,7 @@ mod tests {
             blocked_domains.into_iter().map(String::from).collect(),
             500_000,
             30,
+            "ZeroClaw/1.0".to_string(),
         )
     }
 
@@ -498,6 +502,7 @@ mod tests {
             vec![],
             500_000,
             30,
+            "test".to_string(),
         );
         let err = tool
             .validate_url("https://example.com")
@@ -564,6 +569,7 @@ mod tests {
             vec![],
             500_000,
             30,
+            "test".to_string(),
         );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -588,6 +594,7 @@ mod tests {
             vec![],
             500_000,
             30,
+            "test".to_string(),
         );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -615,6 +622,7 @@ mod tests {
             vec![],
             10,
             30,
+            "test".to_string(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);

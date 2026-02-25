@@ -21,5 +21,11 @@ allowed_hosts = []
 [runtime.wasm.security]
 require_workspace_relative_tools_dir = true
 reject_symlink_modules = true
+reject_symlink_tools_dir = true
 strict_host_validation = true
 capability_escalation_mode = "deny"
+module_hash_policy = "warn"
+
+[runtime.wasm.security.module_sha256]
+# Production recommendation: pin all deployed modules and then set module_hash_policy = "enforce".
+# calc = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

@@ -12,9 +12,10 @@
 //! The default ZeroClaw binary excludes it to maintain the 4.6 MB size target.
 
 use super::traits::RuntimeAdapter;
-use crate::config::{WasmCapabilityEscalationMode, WasmRuntimeConfig};
+use crate::config::{WasmCapabilityEscalationMode, WasmModuleHashPolicy, WasmRuntimeConfig};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 /// WASM sandbox runtime — executes tool modules in an isolated interpreter.
@@ -35,6 +36,8 @@ pub struct WasmExecutionResult {
     pub exit_code: i32,
     /// Fuel consumed during execution
     pub fuel_consumed: u64,
+    /// SHA-256 digest (hex) of the executed module bytes.
+    pub module_sha256: String,
 }
 
 /// Capabilities granted to a WASM tool module.
@@ -120,6 +123,16 @@ impl WasmRuntime {
             self.config.allowed_hosts.iter().map(String::as_str),
             "runtime.wasm.allowed_hosts",
         )?;
+        let normalized_pins = self.normalize_module_sha256_pins()?;
+        if matches!(
+            self.config.security.module_hash_policy,
+            WasmModuleHashPolicy::Enforce
+        ) && normalized_pins.is_empty()
+        {
+            bail!(
+                "runtime.wasm.security.module_hash_policy='enforce' requires at least one module pin in runtime.wasm.security.module_sha256"
+            );
+        }
         Ok(())
     }
 
@@ -247,6 +260,68 @@ impl WasmRuntime {
             }
         }
         Ok(normalized)
+    }
+
+    fn normalize_sha256_pin(module_name: &str, raw: &str) -> Result<String> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized.len() != 64 || !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            bail!(
+                "runtime.wasm.security.module_sha256.{module_name} must be a 64-character hex SHA-256 digest"
+            );
+        }
+        Ok(normalized)
+    }
+
+    fn normalize_module_sha256_pins(&self) -> Result<BTreeMap<String, String>> {
+        let mut normalized = BTreeMap::new();
+        for (module_name, digest) in &self.config.security.module_sha256 {
+            Self::validate_module_name(module_name)?;
+            normalized.insert(
+                module_name.clone(),
+                Self::normalize_sha256_pin(module_name, digest)?,
+            );
+        }
+        Ok(normalized)
+    }
+
+    fn check_module_integrity(&self, module_name: &str, wasm_bytes: &[u8]) -> Result<String> {
+        let digest = hex::encode(Sha256::digest(wasm_bytes));
+        let normalized_pins = self.normalize_module_sha256_pins()?;
+        match self.config.security.module_hash_policy {
+            WasmModuleHashPolicy::Disabled => {}
+            WasmModuleHashPolicy::Warn => match normalized_pins.get(module_name) {
+                Some(expected) if expected == &digest => {}
+                Some(expected) => {
+                    tracing::warn!(
+                        module = module_name,
+                        expected_sha256 = expected,
+                        actual_sha256 = digest,
+                        "WASM module SHA-256 mismatch (warn mode)"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        module = module_name,
+                        actual_sha256 = digest,
+                        "WASM module has no SHA-256 pin configured (warn mode)"
+                    );
+                }
+            },
+            WasmModuleHashPolicy::Enforce => match normalized_pins.get(module_name) {
+                Some(expected) if expected == &digest => {}
+                Some(expected) => {
+                    bail!(
+                        "WASM module integrity mismatch for '{module_name}': expected sha256={expected}, got sha256={digest}"
+                    );
+                }
+                None => {
+                    bail!(
+                        "WASM module '{module_name}' is missing required SHA-256 pin (runtime.wasm.security.module_hash_policy='enforce')"
+                    );
+                }
+            },
+        }
+        Ok(digest)
     }
 
     fn validate_capabilities(&self, caps: &WasmCapabilities) -> Result<WasmCapabilities> {
@@ -384,6 +459,20 @@ impl WasmRuntime {
                 tools_path.display()
             );
         }
+        if self.config.security.reject_symlink_tools_dir {
+            let tools_meta = std::fs::symlink_metadata(&tools_path).with_context(|| {
+                format!(
+                    "Failed to inspect WASM tools directory metadata: {}",
+                    tools_path.display()
+                )
+            })?;
+            if tools_meta.file_type().is_symlink() {
+                bail!(
+                    "WASM tools directory must not be a symlink: {}",
+                    tools_path.display()
+                );
+            }
+        }
         let canonical_tools_path = std::fs::canonicalize(&tools_path).with_context(|| {
             format!(
                 "Failed to canonicalize WASM tools directory: {}",
@@ -474,6 +563,7 @@ impl WasmRuntime {
                 canonical_module_path.display()
             )
         })?;
+        let module_sha256 = self.check_module_integrity(module_name, &wasm_bytes)?;
 
         // Configure engine with fuel metering
         let mut engine_config = wasmi::Config::default();
@@ -526,6 +616,7 @@ impl WasmRuntime {
                         ),
                         exit_code: -1,
                         fuel_consumed: fuel,
+                        module_sha256: module_sha256.clone(),
                     });
                 }
                 bail!("WASM execution error in '{module_name}': {e}");
@@ -539,6 +630,7 @@ impl WasmRuntime {
             stderr: String::new(),
             exit_code,
             fuel_consumed,
+            module_sha256,
         })
     }
 
@@ -821,6 +913,38 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_invalid_module_sha256_pin_format() {
+        let mut cfg = default_config();
+        cfg.security
+            .module_sha256
+            .insert("calc".into(), "not-a-sha256".into());
+        let rt = WasmRuntime::new(cfg);
+        let err = rt.validate_config().unwrap_err();
+        assert!(err.to_string().contains("64-character hex"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_module_sha256_pin_name() {
+        let mut cfg = default_config();
+        cfg.security.module_sha256.insert(
+            "bad$name".into(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        let rt = WasmRuntime::new(cfg);
+        let err = rt.validate_config().unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn validate_rejects_enforce_hash_policy_without_pins() {
+        let mut cfg = default_config();
+        cfg.security.module_hash_policy = WasmModuleHashPolicy::Enforce;
+        let rt = WasmRuntime::new(cfg);
+        let err = rt.validate_config().unwrap_err();
+        assert!(err.to_string().contains("requires at least one module pin"));
+    }
+
+    #[test]
     fn validate_accepts_max_memory() {
         let mut cfg = default_config();
         cfg.memory_limit_mb = 4096;
@@ -1063,6 +1187,97 @@ mod tests {
         // But if it did exist and was 51 MB, the size check would catch it
         let result = rt.execute_module("oversized", dir.path(), &caps);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_module_enforce_hash_policy_rejects_mismatch() {
+        if !WasmRuntime::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tools_dir = dir.path().join("tools/wasm");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let mut cfg = default_config();
+        cfg.security.module_hash_policy = WasmModuleHashPolicy::Enforce;
+        cfg.security.module_sha256.insert(
+            "calc".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+
+        let rt = WasmRuntime::new(cfg);
+        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("integrity mismatch"));
+    }
+
+    #[test]
+    fn execute_module_warn_hash_policy_allows_execution_path() {
+        if !WasmRuntime::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tools_dir = dir.path().join("tools/wasm");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let mut cfg = default_config();
+        cfg.security.module_hash_policy = WasmModuleHashPolicy::Warn;
+        cfg.security.module_sha256.insert(
+            "calc".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+
+        let rt = WasmRuntime::new(cfg);
+        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must export a 'run() -> i32'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_module_rejects_symlink_tools_dir_when_enabled() {
+        if !WasmRuntime::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let real_tools_dir = dir.path().join("real-tools");
+        std::fs::create_dir_all(&real_tools_dir).unwrap();
+        std::fs::write(real_tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let tools_parent = dir.path().join("tools");
+        std::fs::create_dir_all(&tools_parent).unwrap();
+        std::os::unix::fs::symlink(&real_tools_dir, tools_parent.join("wasm")).unwrap();
+
+        let rt = WasmRuntime::new(default_config());
+        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("tools directory must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_module_allows_symlink_tools_dir_when_disabled() {
+        if !WasmRuntime::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let real_tools_dir = dir.path().join("real-tools");
+        std::fs::create_dir_all(&real_tools_dir).unwrap();
+        std::fs::write(real_tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let tools_parent = dir.path().join("tools");
+        std::fs::create_dir_all(&tools_parent).unwrap();
+        std::os::unix::fs::symlink(&real_tools_dir, tools_parent.join("wasm")).unwrap();
+
+        let mut cfg = default_config();
+        cfg.security.reject_symlink_tools_dir = false;
+        cfg.security.module_hash_policy = WasmModuleHashPolicy::Disabled;
+        let rt = WasmRuntime::new(cfg);
+        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must export a 'run() -> i32'"));
     }
 
     // ── Feature gate check ─────────────────────────────────────

@@ -15,6 +15,7 @@ pub struct WebSearchTool {
     api_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
+    user_agent: String,
 }
 
 impl WebSearchTool {
@@ -25,6 +26,7 @@ impl WebSearchTool {
         api_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
+        user_agent: String,
     ) -> Self {
         Self {
             security,
@@ -33,6 +35,7 @@ impl WebSearchTool {
             api_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
+            user_agent,
         }
     }
 
@@ -42,7 +45,7 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent(self.user_agent.as_str())
             .build()?;
 
         let response = client.get(&search_url).send().await?;
@@ -120,6 +123,7 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
             .build()?;
 
         let response = client
@@ -191,6 +195,7 @@ impl WebSearchTool {
         let endpoint = format!("{}/v1/search", api_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
             .build()?;
 
         let response = client
@@ -374,19 +379,43 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         assert!(tool.description().contains("Search the web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
@@ -400,7 +429,15 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool
             .parse_duckduckgo_results("<html>No results here</html>", "test")
             .unwrap();
@@ -409,7 +446,15 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -421,7 +466,15 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_decodes_redirect_url() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let html = r#"
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -433,7 +486,15 @@ mod tests {
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 0, 0);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            0,
+            0,
+            "test".to_string(),
+        );
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -444,21 +505,45 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new(test_security(), "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({"query": ""})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_brave_without_api_key() {
-        let tool = WebSearchTool::new(test_security(), "brave".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "brave".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
@@ -466,7 +551,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_firecrawl_without_api_key() {
-        let tool = WebSearchTool::new(test_security(), "firecrawl".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            test_security(),
+            "firecrawl".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
@@ -483,7 +576,15 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = WebSearchTool::new(security, "duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new(
+            security,
+            "duckduckgo".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({"query": "rust"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));

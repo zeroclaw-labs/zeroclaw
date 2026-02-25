@@ -13,11 +13,10 @@ Use this with:
 | Event | Main workflows |
 | --- | --- |
 | PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-auto-response.yml` |
-| PR activity (`pull_request`) | `ci-run.yml`, `feature-matrix.yml` (Rust/workflow paths), `sec-audit.yml`, `sec-codeql.yml` (when Rust/codeql paths change), `main-promotion-gate.yml` (for `main` PRs), plus path-scoped workflows |
-| Push to `dev`/`main` | `ci-run.yml`, `feature-matrix.yml` (Rust/workflow paths), `sec-audit.yml`, `sec-codeql.yml` (when Rust/codeql paths change), plus path-scoped workflows |
-| Merge queue (`merge_group`) | `ci-run.yml`, `feature-matrix.yml`, `sec-audit.yml`, `sec-codeql.yml` |
-| Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job, `pub-prerelease.yml` (for `v*-alpha.*`, `v*-beta.*`, `v*-rc.*`) |
-| Scheduled/manual | `pub-release.yml` verification mode, `pub-prerelease.yml` (manual), `ci-canary-gate.yml`, `pub-homebrew-core.yml` (manual), `sec-codeql.yml`, `ci-connectivity-probes.yml`, `ci-provider-connectivity.yml`, `ci-reproducible-build.yml`, `ci-supply-chain-provenance.yml`, `ci-change-audit.yml` (manual), `ci-rollback.yml` (weekly/manual), `feature-matrix.yml`, `nightly-all-features.yml`, `docs-deploy.yml` (manual), `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
+| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, `main-promotion-gate.yml` (for `main` PRs), plus path-scoped workflows |
+| Push to `dev`/`main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
+| Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job |
+| Scheduled/manual | `pub-release.yml` verification mode, `sec-codeql.yml`, `feature-matrix.yml`, `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
 
 ## Runtime and Docker Matrix
 
@@ -35,7 +34,6 @@ Observed averages below are from recent completed runs (sampled from GitHub Acti
 | `pub-docker-img.yml` (`pull_request`) | Docker build-input PR changes | 240.4s | Yes | Yes | No |
 | `pub-docker-img.yml` (`push`) | tag push `v*` | 139.9s | Yes | No | Yes |
 | `pub-release.yml` | Tag push `v*` (publish) + manual/scheduled verification (no publish) | N/A in recent sample | No | No | No |
-| `pub-homebrew-core.yml` | Manual workflow dispatch only | N/A in recent sample | No | No | No |
 
 Notes:
 
@@ -203,12 +201,6 @@ Canary policy lane:
 1. `.github/workflows/ci-canary-gate.yml` runs weekly or manually.
 2. `scripts/ci/canary_guard.py` evaluates metrics against `.github/release/canary-policy.json`.
 3. Decision output is explicit (`promote`, `hold`, `abort`) with auditable artifacts and optional dispatch signal.
-
-Manual Homebrew formula flow:
-
-1. Run `.github/workflows/pub-homebrew-core.yml` with `release_tag=vX.Y.Z`.
-2. Use `dry_run=true` first to validate formula patch and metadata.
-3. Use `dry_run=false` to push from bot fork and open `homebrew-core` PR.
 
 ## Merge/Policy Notes
 

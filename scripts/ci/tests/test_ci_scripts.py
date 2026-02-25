@@ -2768,6 +2768,101 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["failed"], 1)
         self.assertEqual(report["passed"], 1)
 
+    def test_nightly_matrix_report_includes_history_trend_snapshot(self) -> None:
+        lane_root = self.tmp / "lane-artifacts-trend"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        (lane_root / "nightly-result-default.json").write_text(
+            json.dumps(
+                {
+                    "lane": "default",
+                    "status": "success",
+                    "exit_code": 0,
+                    "duration_seconds": 11,
+                    "command": "cargo test --locked --test agent_e2e --verbose",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        owners = self.tmp / "owners-trend.json"
+        owners.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.nightly-owner-routing.v1",
+                    "owners": {"default": "@ops"},
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        history = self.tmp / "nightly-history.json"
+        history.write_text(
+            json.dumps(
+                [
+                    {
+                        "run_id": 101,
+                        "url": "https://example.test/runs/101",
+                        "event": "workflow_dispatch",
+                        "conclusion": "success",
+                        "created_at": "2026-02-25T01:00:00Z",
+                    },
+                    {
+                        "run_id": 100,
+                        "url": "https://example.test/runs/100",
+                        "event": "schedule",
+                        "conclusion": "failure",
+                        "created_at": "2026-02-24T01:00:00Z",
+                    },
+                    {
+                        "run_id": 99,
+                        "url": "https://example.test/runs/99",
+                        "event": "schedule",
+                        "conclusion": "success",
+                        "created_at": "2026-02-23T01:00:00Z",
+                    },
+                ],
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "nightly-summary-trend.json"
+        out_md = self.tmp / "nightly-summary-trend.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("nightly_matrix_report.py"),
+                "--input-dir",
+                str(lane_root),
+                "--owners-file",
+                str(owners),
+                "--history-file",
+                str(history),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-failure",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        trend = report["trend_snapshot"]
+        self.assertEqual(trend["history_total"], 3)
+        self.assertEqual(trend["history_passed"], 2)
+        self.assertEqual(trend["history_failed"], 1)
+        self.assertEqual(trend["history_pass_rate"], 0.6667)
+        self.assertEqual(trend["history_runs"][0]["run_id"], 101)
+
+        markdown = out_md.read_text(encoding="utf-8")
+        self.assertIn("## Recent Nightly Runs", markdown)
+        self.assertIn("example.test/runs/101", markdown)
+
     def test_canary_guard_promote_when_metrics_within_threshold(self) -> None:
         policy = self.tmp / "canary-policy.json"
         policy.write_text(
@@ -2776,6 +2871,16 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                     "schema_version": "zeroclaw.canary-policy.v1",
                     "minimum_sample_size": 300,
                     "observation_window_minutes": 60,
+                    "cohorts": [
+                        {"name": "canary-5pct", "traffic_percent": 5, "duration_minutes": 20},
+                        {"name": "canary-20pct", "traffic_percent": 20, "duration_minutes": 20},
+                    ],
+                    "observability_signals": [
+                        "error_rate",
+                        "crash_rate",
+                        "p95_latency_ms",
+                        "sample_size",
+                    ],
                     "thresholds": {
                         "max_error_rate": 0.02,
                         "max_crash_rate": 0.01,
@@ -2818,6 +2923,12 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         report = json.loads(out_json.read_text(encoding="utf-8"))
         self.assertEqual(report["decision"], "promote")
         self.assertTrue(report["ready_to_execute"])
+        self.assertEqual(report["cohorts"][0]["name"], "canary-5pct")
+        self.assertEqual(report["cohorts"][1]["traffic_percent"], 20)
+        self.assertEqual(
+            report["observability_signals"],
+            ["error_rate", "crash_rate", "p95_latency_ms", "sample_size"],
+        )
 
     def test_prerelease_guard_requires_previous_stage(self) -> None:
         repo = self.tmp / "repo"

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -172,6 +172,10 @@ pub struct Config {
     #[serde(default)]
     pub cron: CronConfig,
 
+    /// Goal loop configuration for autonomous long-term goal execution (`[goal_loop]`).
+    #[serde(default)]
+    pub goal_loop: GoalLoopConfig,
+
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels_config]`).
     #[serde(default)]
     pub channels_config: ChannelsConfig,
@@ -239,6 +243,10 @@ pub struct Config {
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
+
+    /// Delegate coordination runtime configuration (`[coordination]`).
+    #[serde(default)]
+    pub coordination: CoordinationConfig,
 
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
@@ -547,6 +555,69 @@ impl Default for AgentsIpcConfig {
             enabled: false,
             db_path: default_agents_ipc_db_path(),
             staleness_secs: default_agents_ipc_staleness_secs(),
+        }
+    }
+}
+
+fn default_coordination_enabled() -> bool {
+    true
+}
+
+fn default_coordination_lead_agent() -> String {
+    "delegate-lead".into()
+}
+
+fn default_coordination_max_inbox_messages_per_agent() -> usize {
+    256
+}
+
+fn default_coordination_max_dead_letters() -> usize {
+    256
+}
+
+fn default_coordination_max_context_entries() -> usize {
+    512
+}
+
+fn default_coordination_max_seen_message_ids() -> usize {
+    4096
+}
+
+/// Delegate coordination runtime configuration (`[coordination]` section).
+///
+/// Controls typed delegate message-bus integration used by `delegate` and
+/// `delegate_coordination_status` tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CoordinationConfig {
+    /// Enable delegate coordination tracing/runtime bus integration.
+    #[serde(default = "default_coordination_enabled")]
+    pub enabled: bool,
+    /// Logical lead-agent identity used as coordinator sender/recipient.
+    #[serde(default = "default_coordination_lead_agent")]
+    pub lead_agent: String,
+    /// Maximum retained inbox messages per registered agent.
+    #[serde(default = "default_coordination_max_inbox_messages_per_agent")]
+    pub max_inbox_messages_per_agent: usize,
+    /// Maximum retained dead-letter entries.
+    #[serde(default = "default_coordination_max_dead_letters")]
+    pub max_dead_letters: usize,
+    /// Maximum retained shared-context entries (`ContextPatch` state keys).
+    #[serde(default = "default_coordination_max_context_entries")]
+    pub max_context_entries: usize,
+    /// Maximum retained dedupe window size for processed message IDs.
+    #[serde(default = "default_coordination_max_seen_message_ids")]
+    pub max_seen_message_ids: usize,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_coordination_enabled(),
+            lead_agent: default_coordination_lead_agent(),
+            max_inbox_messages_per_agent: default_coordination_max_inbox_messages_per_agent(),
+            max_dead_letters: default_coordination_max_dead_letters(),
+            max_context_entries: default_coordination_max_context_entries(),
+            max_seen_message_ids: default_coordination_max_seen_message_ids(),
         }
     }
 }
@@ -1197,6 +1268,9 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+    /// User-Agent string sent with HTTP requests (env: ZEROCLAW_HTTP_REQUEST_USER_AGENT)
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
 }
 
 impl Default for HttpRequestConfig {
@@ -1206,6 +1280,7 @@ impl Default for HttpRequestConfig {
             allowed_domains: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
+            user_agent: default_user_agent(),
         }
     }
 }
@@ -1252,6 +1327,9 @@ pub struct WebFetchConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_web_fetch_timeout_secs")]
     pub timeout_secs: u64,
+    /// User-Agent string sent with fetch requests (env: ZEROCLAW_WEB_FETCH_USER_AGENT)
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
 }
 
 fn default_web_fetch_max_response_size() -> usize {
@@ -1277,6 +1355,7 @@ impl Default for WebFetchConfig {
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
             timeout_secs: default_web_fetch_timeout_secs(),
+            user_agent: default_user_agent(),
         }
     }
 }
@@ -1307,6 +1386,9 @@ pub struct WebSearchConfig {
     /// Request timeout in seconds
     #[serde(default = "default_web_search_timeout_secs")]
     pub timeout_secs: u64,
+    /// User-Agent string sent with search requests (env: ZEROCLAW_WEB_SEARCH_USER_AGENT)
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
 }
 
 fn default_web_search_provider() -> String {
@@ -1331,8 +1413,13 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+            user_agent: default_user_agent(),
         }
     }
+}
+
+fn default_user_agent() -> String {
+    "ZeroClaw/1.0".into()
 }
 
 // ── Proxy ───────────────────────────────────────────────────────
@@ -2153,6 +2240,24 @@ pub struct BuiltinHooksConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
+/// Natural-language behavior for non-CLI approval-management commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonCliNaturalLanguageApprovalMode {
+    /// Do not treat natural-language text as approval-management commands.
+    /// Operators must use explicit slash commands.
+    Disabled,
+    /// Natural-language approval phrases create a pending request that must be
+    /// confirmed with a request ID.
+    RequestConfirm,
+    /// Natural-language approval phrases directly approve the named tool.
+    ///
+    /// This keeps private-chat workflows simple while still requiring a human
+    /// sender and passing the same approver allowlist checks as slash commands.
+    #[default]
+    Direct,
+}
+
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
@@ -2208,6 +2313,41 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Optional allowlist for who can manage non-CLI approval commands.
+    ///
+    /// When empty, any sender already admitted by the channel allowlist can
+    /// use approval-management commands.
+    ///
+    /// Supported entry formats:
+    /// - `"*"`: allow any sender on any channel
+    /// - `"alice"`: allow sender `alice` on any channel
+    /// - `"telegram:alice"`: allow sender `alice` only on `telegram`
+    /// - `"telegram:*"`: allow any sender on `telegram`
+    /// - `"*:alice"`: allow sender `alice` on any channel
+    #[serde(default)]
+    pub non_cli_approval_approvers: Vec<String>,
+
+    /// Natural-language handling mode for non-CLI approval-management commands.
+    ///
+    /// Values:
+    /// - `direct` (default): phrases like `授权工具 shell` immediately approve.
+    /// - `request_confirm`: phrases create pending requests requiring confirm.
+    /// - `disabled`: ignore natural-language approval commands (slash only).
+    #[serde(default)]
+    pub non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
+
+    /// Optional per-channel override for natural-language approval mode.
+    ///
+    /// Keys are channel names (for example: `telegram`, `discord`, `slack`).
+    /// Values use the same enum as `non_cli_natural_language_approval_mode`.
+    ///
+    /// Example:
+    /// - `telegram = "direct"` for private-chat ergonomics
+    /// - `discord = "request_confirm"` for stricter team channels
+    #[serde(default)]
+    pub non_cli_natural_language_approval_mode_by_channel:
+        HashMap<String, NonCliNaturalLanguageApprovalMode>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -2305,6 +2445,9 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: default_non_cli_excluded_tools(),
+            non_cli_approval_approvers: Vec::new(),
+            non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
+            non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
         }
     }
 }
@@ -2420,7 +2563,21 @@ pub enum WasmCapabilityEscalationMode {
     Clamp,
 }
 
+/// Integrity policy for WASM modules pinned by SHA-256 digest.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmModuleHashPolicy {
+    /// Disable module hash validation.
+    Disabled,
+    /// Warn on missing or mismatched hashes, but allow execution.
+    #[default]
+    Warn,
+    /// Require exact hash match before execution.
+    Enforce,
+}
+
 /// Security policy controls for WASM runtime hardening.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WasmSecurityConfig {
     /// Require `runtime.wasm.tools_dir` to stay workspace-relative and traversal-free.
@@ -2431,6 +2588,10 @@ pub struct WasmSecurityConfig {
     #[serde(default = "default_true")]
     pub reject_symlink_modules: bool,
 
+    /// Reject `runtime.wasm.tools_dir` when it is itself a symlink.
+    #[serde(default = "default_true")]
+    pub reject_symlink_tools_dir: bool,
+
     /// Strictly validate host allowlist entries (`host` or `host:port` only).
     #[serde(default = "default_true")]
     pub strict_host_validation: bool,
@@ -2438,6 +2599,14 @@ pub struct WasmSecurityConfig {
     /// Capability escalation handling policy.
     #[serde(default)]
     pub capability_escalation_mode: WasmCapabilityEscalationMode,
+
+    /// Module digest verification policy.
+    #[serde(default)]
+    pub module_hash_policy: WasmModuleHashPolicy,
+
+    /// Optional pinned SHA-256 digest map keyed by module name (without `.wasm`).
+    #[serde(default)]
+    pub module_sha256: BTreeMap<String, String>,
 }
 
 fn default_runtime_kind() -> String {
@@ -2510,8 +2679,11 @@ impl Default for WasmSecurityConfig {
         Self {
             require_workspace_relative_tools_dir: true,
             reject_symlink_modules: true,
+            reject_symlink_tools_dir: true,
             strict_host_validation: true,
             capability_escalation_mode: WasmCapabilityEscalationMode::Deny,
+            module_hash_policy: WasmModuleHashPolicy::Warn,
+            module_sha256: BTreeMap::new(),
         }
     }
 }
@@ -2882,6 +3054,40 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── Goal Loop Config ────────────────────────────────────────────
+
+/// Configuration for the autonomous goal loop engine (`[goal_loop]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoalLoopConfig {
+    /// Enable autonomous goal execution. Default: `false`.
+    pub enabled: bool,
+    /// Interval in minutes between goal loop cycles. Default: `10`.
+    pub interval_minutes: u32,
+    /// Timeout in seconds for a single step execution. Default: `120`.
+    pub step_timeout_secs: u64,
+    /// Maximum steps to execute per cycle. Default: `3`.
+    pub max_steps_per_cycle: u32,
+    /// Optional channel to deliver goal events to (e.g. "lark", "telegram").
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional recipient/chat_id for goal event delivery.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+impl Default for GoalLoopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 10,
+            step_timeout_secs: 120,
+            max_steps_per_cycle: 3,
+            channel: None,
+            target: None,
+        }
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 /// Cron job configuration (`[cron]` section).
@@ -3200,6 +3406,63 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+/// Group-chat reply trigger mode for channels that support mention gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupReplyMode {
+    /// Reply only when the bot is explicitly @-mentioned in group chats.
+    MentionOnly,
+    /// Reply to every message in group chats.
+    AllMessages,
+}
+
+impl GroupReplyMode {
+    #[must_use]
+    pub fn requires_mention(self) -> bool {
+        matches!(self, Self::MentionOnly)
+    }
+}
+
+/// Advanced group-chat trigger controls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GroupReplyConfig {
+    /// Optional explicit trigger mode.
+    ///
+    /// If omitted, channel-specific legacy behavior is used for compatibility.
+    #[serde(default)]
+    pub mode: Option<GroupReplyMode>,
+    /// Sender IDs that always trigger group replies.
+    ///
+    /// These IDs bypass mention gating in group chats, but do not bypass the
+    /// channel-level inbound allowlist (`allowed_users` / equivalents).
+    #[serde(default)]
+    pub allowed_sender_ids: Vec<String>,
+}
+
+fn resolve_group_reply_mode(
+    group_reply: Option<&GroupReplyConfig>,
+    legacy_mention_only: Option<bool>,
+    default_mode: GroupReplyMode,
+) -> GroupReplyMode {
+    if let Some(mode) = group_reply.and_then(|cfg| cfg.mode) {
+        return mode;
+    }
+    if let Some(mention_only) = legacy_mention_only {
+        return if mention_only {
+            GroupReplyMode::MentionOnly
+        } else {
+            GroupReplyMode::AllMessages
+        };
+    }
+    default_mode
+}
+
+fn clone_group_reply_allowed_sender_ids(group_reply: Option<&GroupReplyConfig>) -> Vec<String> {
+    group_reply
+        .map(|cfg| cfg.allowed_sender_ids.clone())
+        .unwrap_or_default()
+}
+
 /// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
@@ -3221,6 +3484,9 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Group-chat trigger controls.
+    #[serde(default)]
+    pub group_reply: Option<GroupReplyConfig>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -3229,6 +3495,22 @@ impl ChannelConfig for TelegramConfig {
     }
     fn desc() -> &'static str {
         "connect your bot"
+    }
+}
+
+impl TelegramConfig {
+    #[must_use]
+    pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
+        resolve_group_reply_mode(
+            self.group_reply.as_ref(),
+            Some(self.mention_only),
+            GroupReplyMode::AllMessages,
+        )
+    }
+
+    #[must_use]
+    pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
+        clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
     }
 }
 
@@ -3250,6 +3532,9 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Group-chat trigger controls.
+    #[serde(default)]
+    pub group_reply: Option<GroupReplyConfig>,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -3258,6 +3543,22 @@ impl ChannelConfig for DiscordConfig {
     }
     fn desc() -> &'static str {
         "connect your bot"
+    }
+}
+
+impl DiscordConfig {
+    #[must_use]
+    pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
+        resolve_group_reply_mode(
+            self.group_reply.as_ref(),
+            Some(self.mention_only),
+            GroupReplyMode::AllMessages,
+        )
+    }
+
+    #[must_use]
+    pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
+        clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
     }
 }
 
@@ -3274,6 +3575,9 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Group-chat trigger controls.
+    #[serde(default)]
+    pub group_reply: Option<GroupReplyConfig>,
 }
 
 impl ChannelConfig for SlackConfig {
@@ -3282,6 +3586,18 @@ impl ChannelConfig for SlackConfig {
     }
     fn desc() -> &'static str {
         "connect your bot"
+    }
+}
+
+impl SlackConfig {
+    #[must_use]
+    pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
+        resolve_group_reply_mode(self.group_reply.as_ref(), None, GroupReplyMode::AllMessages)
+    }
+
+    #[must_use]
+    pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
+        clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
     }
 }
 
@@ -3305,6 +3621,9 @@ pub struct MattermostConfig {
     /// Other messages in the channel are silently ignored.
     #[serde(default)]
     pub mention_only: Option<bool>,
+    /// Group-chat trigger controls.
+    #[serde(default)]
+    pub group_reply: Option<GroupReplyConfig>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -3313,6 +3632,22 @@ impl ChannelConfig for MattermostConfig {
     }
     fn desc() -> &'static str {
         "connect to your bot"
+    }
+}
+
+impl MattermostConfig {
+    #[must_use]
+    pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
+        resolve_group_reply_mode(
+            self.group_reply.as_ref(),
+            Some(self.mention_only.unwrap_or(false)),
+            GroupReplyMode::AllMessages,
+        )
+    }
+
+    #[must_use]
+    pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
+        clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
     }
 }
 
@@ -3623,6 +3958,14 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+pub fn default_lark_draft_update_interval_ms() -> u64 {
+    3000
+}
+
+pub fn default_lark_max_draft_edits() -> u32 {
+    20
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3644,6 +3987,9 @@ pub struct LarkConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Group-chat trigger controls.
+    #[serde(default)]
+    pub group_reply: Option<GroupReplyConfig>,
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
@@ -3654,6 +4000,12 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Minimum interval (ms) between draft message edits. Default: 3000.
+    #[serde(default = "default_lark_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Maximum number of edits per draft message before stopping updates.
+    #[serde(default = "default_lark_max_draft_edits")]
+    pub max_draft_edits: u32,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -3662,6 +4014,22 @@ impl ChannelConfig for LarkConfig {
     }
     fn desc() -> &'static str {
         "Lark Bot"
+    }
+}
+
+impl LarkConfig {
+    #[must_use]
+    pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
+        resolve_group_reply_mode(
+            self.group_reply.as_ref(),
+            Some(self.mention_only),
+            GroupReplyMode::AllMessages,
+        )
+    }
+
+    #[must_use]
+    pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
+        clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
     }
 }
 
@@ -3681,6 +4049,9 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Group-chat trigger controls.
+    #[serde(default)]
+    pub group_reply: Option<GroupReplyConfig>,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -3688,6 +4059,12 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Minimum interval between streaming draft edits (milliseconds).
+    #[serde(default = "default_lark_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Maximum number of draft edits per message before finalizing.
+    #[serde(default = "default_lark_max_draft_edits")]
+    pub max_draft_edits: u32,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -3696,6 +4073,18 @@ impl ChannelConfig for FeishuConfig {
     }
     fn desc() -> &'static str {
         "Feishu Bot"
+    }
+}
+
+impl FeishuConfig {
+    #[must_use]
+    pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
+        resolve_group_reply_mode(self.group_reply.as_ref(), None, GroupReplyMode::AllMessages)
+    }
+
+    #[must_use]
+    pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
+        clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
     }
 }
 
@@ -4228,6 +4617,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -4245,6 +4635,7 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            coordination: CoordinationConfig::default(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -5047,6 +5438,21 @@ impl Config {
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.proxy.http_proxy,
+                "config.proxy.http_proxy",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.proxy.https_proxy,
+                "config.proxy.https_proxy",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.proxy.all_proxy,
+                "config.proxy.all_proxy",
+            )?;
 
             decrypt_optional_secret(
                 &store,
@@ -5508,6 +5914,23 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
+        // Delegate coordination runtime safety bounds.
+        if self.coordination.enabled && self.coordination.lead_agent.trim().is_empty() {
+            anyhow::bail!("coordination.lead_agent must not be empty when coordination is enabled");
+        }
+        if self.coordination.max_inbox_messages_per_agent == 0 {
+            anyhow::bail!("coordination.max_inbox_messages_per_agent must be greater than 0");
+        }
+        if self.coordination.max_dead_letters == 0 {
+            anyhow::bail!("coordination.max_dead_letters must be greater than 0");
+        }
+        if self.coordination.max_context_entries == 0 {
+            anyhow::bail!("coordination.max_context_entries must be greater than 0");
+        }
+        if self.coordination.max_seen_message_ids == 0 {
+            anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
+        }
+
         Ok(())
     }
 
@@ -5849,6 +6272,21 @@ impl Config {
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.proxy.http_proxy,
+            "config.proxy.http_proxy",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.proxy.https_proxy,
+            "config.proxy.https_proxy",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.proxy.all_proxy,
+            "config.proxy.all_proxy",
+        )?;
 
         encrypt_optional_secret(
             &store,
@@ -6059,6 +6497,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
         });
         config.agents.insert(
             "worker".into(),
@@ -6240,11 +6679,17 @@ allowed_roots = []
         assert!(r.wasm.allowed_hosts.is_empty());
         assert!(r.wasm.security.require_workspace_relative_tools_dir);
         assert!(r.wasm.security.reject_symlink_modules);
+        assert!(r.wasm.security.reject_symlink_tools_dir);
         assert!(r.wasm.security.strict_host_validation);
         assert_eq!(
             r.wasm.security.capability_escalation_mode,
             WasmCapabilityEscalationMode::Deny
         );
+        assert_eq!(
+            r.wasm.security.module_hash_policy,
+            WasmModuleHashPolicy::Warn
+        );
+        assert!(r.wasm.security.module_sha256.is_empty());
     }
 
     #[test]
@@ -6369,6 +6814,10 @@ default_temperature = 0.7
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                non_cli_approval_approvers: vec![],
+                non_cli_natural_language_approval_mode:
+                    NonCliNaturalLanguageApprovalMode::RequestConfirm,
+                non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {
@@ -6378,6 +6827,7 @@ default_temperature = 0.7
             research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -6390,6 +6840,7 @@ default_temperature = 0.7
                 to: Some("123456".into()),
             },
             cron: CronConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -6399,6 +6850,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    group_reply: None,
                 }),
                 discord: None,
                 slack: None,
@@ -6554,8 +7006,13 @@ allowed_hosts = ["api.example.com", "cdn.example.com:443"]
 [runtime.wasm.security]
 require_workspace_relative_tools_dir = false
 reject_symlink_modules = false
+reject_symlink_tools_dir = false
 strict_host_validation = false
 capability_escalation_mode = "clamp"
+module_hash_policy = "enforce"
+
+[runtime.wasm.security.module_sha256]
+calc = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
@@ -6578,10 +7035,19 @@ capability_escalation_mode = "clamp"
                 .require_workspace_relative_tools_dir
         );
         assert!(!parsed.runtime.wasm.security.reject_symlink_modules);
+        assert!(!parsed.runtime.wasm.security.reject_symlink_tools_dir);
         assert!(!parsed.runtime.wasm.security.strict_host_validation);
         assert_eq!(
             parsed.runtime.wasm.security.capability_escalation_mode,
             WasmCapabilityEscalationMode::Clamp
+        );
+        assert_eq!(
+            parsed.runtime.wasm.security.module_hash_policy,
+            WasmModuleHashPolicy::Enforce
+        );
+        assert_eq!(
+            parsed.runtime.wasm.security.module_sha256.get("calc"),
+            Some(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         );
     }
 
@@ -6766,12 +7232,14 @@ tool_dispatcher = "xml"
             research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6828,6 +7296,9 @@ tool_dispatcher = "xml"
         config.config_path = dir.join("config.toml");
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
+        config.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".into());
+        config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
+        config.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
@@ -6840,6 +7311,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
         });
 
         config.agents.insert(
@@ -6876,6 +7348,31 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(composio_encrypted).unwrap(),
             "composio-credential"
+        );
+
+        let proxy_http_encrypted = stored.proxy.http_proxy.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            proxy_http_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(proxy_http_encrypted).unwrap(),
+            "http://user:pass@proxy.internal:8080"
+        );
+        let proxy_https_encrypted = stored.proxy.https_proxy.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            proxy_https_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(proxy_https_encrypted).unwrap(),
+            "https://user:pass@proxy.internal:8443"
+        );
+        let proxy_all_encrypted = stored.proxy.all_proxy.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            proxy_all_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(proxy_all_encrypted).unwrap(),
+            "socks5://user:pass@proxy.internal:1080"
         );
 
         let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();
@@ -6973,6 +7470,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            group_reply: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -6990,6 +7488,34 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+        assert!(parsed.group_reply_allowed_sender_ids().is_empty());
+    }
+
+    #[test]
+    async fn telegram_group_reply_config_overrides_legacy_mention_only() {
+        let json = r#"{
+            "bot_token":"tok",
+            "allowed_users":["*"],
+            "mention_only":false,
+            "group_reply":{
+                "mode":"mention_only",
+                "allowed_sender_ids":["1001","1002"]
+            }
+        }"#;
+
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            parsed.group_reply_allowed_sender_ids(),
+            vec!["1001".to_string(), "1002".to_string()]
+        );
     }
 
     #[test]
@@ -7000,6 +7526,7 @@ tool_dispatcher = "xml"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -7015,10 +7542,46 @@ tool_dispatcher = "xml"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.guild_id.is_none());
+    }
+
+    #[test]
+    async fn discord_group_reply_mode_falls_back_to_legacy_mention_only() {
+        let json = r#"{
+            "bot_token":"tok",
+            "mention_only":true
+        }"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert!(parsed.group_reply_allowed_sender_ids().is_empty());
+    }
+
+    #[test]
+    async fn discord_group_reply_mode_overrides_legacy_mention_only() {
+        let json = r#"{
+            "bot_token":"tok",
+            "mention_only":true,
+            "group_reply":{
+                "mode":"all_messages",
+                "allowed_sender_ids":["111"]
+            }
+        }"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+        assert_eq!(
+            parsed.group_reply_allowed_sender_ids(),
+            vec!["111".to_string()]
+        );
     }
 
     // ── iMessage / Matrix config ────────────────────────────
@@ -7229,6 +7792,10 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
     }
 
     #[test]
@@ -7258,6 +7825,66 @@ channel_id = "C123"
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+    }
+
+    #[test]
+    async fn slack_group_reply_config_supports_sender_overrides() {
+        let json = r#"{
+            "bot_token":"xoxb-tok",
+            "group_reply":{
+                "mode":"mention_only",
+                "allowed_sender_ids":["U111"]
+            }
+        }"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            parsed.group_reply_allowed_sender_ids(),
+            vec!["U111".to_string()]
+        );
+    }
+
+    #[test]
+    async fn mattermost_group_reply_mode_falls_back_to_legacy_mention_only() {
+        let json = r#"{
+            "url":"https://mm.example.com",
+            "bot_token":"token",
+            "mention_only":true
+        }"#;
+        let parsed: MattermostConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+    }
+
+    #[test]
+    async fn mattermost_group_reply_mode_overrides_legacy_mention_only() {
+        let json = r#"{
+            "url":"https://mm.example.com",
+            "bot_token":"token",
+            "mention_only":true,
+            "group_reply":{
+                "mode":"all_messages",
+                "allowed_sender_ids":["u1","u2"]
+            }
+        }"#;
+        let parsed: MattermostConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+        assert_eq!(
+            parsed.group_reply_allowed_sender_ids(),
+            vec!["u1".to_string(), "u2".to_string()]
+        );
     }
 
     #[test]
@@ -8922,9 +9549,12 @@ default_model = "legacy-model"
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -8945,9 +9575,12 @@ default_model = "legacy-model"
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -8965,6 +9598,10 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.mention_only);
         assert!(!parsed.use_feishu);
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
     }
 
     #[test]
@@ -8985,6 +9622,28 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn lark_group_reply_mode_overrides_legacy_mention_only() {
+        let json = r#"{
+            "app_id":"cli_123",
+            "app_secret":"secret",
+            "mention_only":true,
+            "group_reply":{
+                "mode":"all_messages",
+                "allowed_sender_ids":["ou_1"]
+            }
+        }"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+        assert_eq!(
+            parsed.group_reply_allowed_sender_ids(),
+            vec!["ou_1".to_string()]
+        );
+    }
+
+    #[test]
     async fn feishu_config_serde() {
         let fc = FeishuConfig {
             app_id: "cli_feishu_123".into(),
@@ -8992,8 +9651,11 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            group_reply: None,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -9012,8 +9674,11 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -9032,6 +9697,31 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+    }
+
+    #[test]
+    async fn feishu_group_reply_mode_supports_mention_only() {
+        let json = r#"{
+            "app_id":"cli_123",
+            "app_secret":"secret",
+            "group_reply":{
+                "mode":"mention_only",
+                "allowed_sender_ids":["ou_9"]
+            }
+        }"#;
+        let parsed: FeishuConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            parsed.group_reply_allowed_sender_ids(),
+            vec!["ou_9".to_string()]
+        );
     }
 
     #[test]
@@ -9357,5 +10047,88 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert!(err
             .to_string()
             .contains("max_denied_events_per_minute must be less than or equal"));
+    }
+
+    #[test]
+    async fn coordination_config_defaults() {
+        let config = Config::default();
+        assert!(config.coordination.enabled);
+        assert_eq!(config.coordination.lead_agent, "delegate-lead");
+        assert_eq!(config.coordination.max_inbox_messages_per_agent, 256);
+        assert_eq!(config.coordination.max_dead_letters, 256);
+        assert_eq!(config.coordination.max_context_entries, 512);
+        assert_eq!(config.coordination.max_seen_message_ids, 4096);
+    }
+
+    #[test]
+    async fn config_roundtrip_with_coordination_section() {
+        let mut config = Config::default();
+        config.coordination.enabled = true;
+        config.coordination.lead_agent = "runtime-lead".into();
+        config.coordination.max_inbox_messages_per_agent = 128;
+        config.coordination.max_dead_letters = 64;
+        config.coordination.max_context_entries = 32;
+        config.coordination.max_seen_message_ids = 1024;
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.coordination.enabled);
+        assert_eq!(parsed.coordination.lead_agent, "runtime-lead");
+        assert_eq!(parsed.coordination.max_inbox_messages_per_agent, 128);
+        assert_eq!(parsed.coordination.max_dead_letters, 64);
+        assert_eq!(parsed.coordination.max_context_entries, 32);
+        assert_eq!(parsed.coordination.max_seen_message_ids, 1024);
+    }
+
+    #[test]
+    async fn coordination_validation_rejects_invalid_limits_and_lead_agent() {
+        let mut config = Config::default();
+        config.coordination.max_inbox_messages_per_agent = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination inbox limit validation failure");
+        assert!(err
+            .to_string()
+            .contains("coordination.max_inbox_messages_per_agent"));
+
+        let mut config = Config::default();
+        config.coordination.max_dead_letters = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination dead-letter limit validation failure");
+        assert!(err.to_string().contains("coordination.max_dead_letters"));
+
+        let mut config = Config::default();
+        config.coordination.max_context_entries = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination context limit validation failure");
+        assert!(err.to_string().contains("coordination.max_context_entries"));
+
+        let mut config = Config::default();
+        config.coordination.max_seen_message_ids = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination dedupe-window validation failure");
+        assert!(err
+            .to_string()
+            .contains("coordination.max_seen_message_ids"));
+
+        let mut config = Config::default();
+        config.coordination.lead_agent = "   ".into();
+        let err = config
+            .validate()
+            .expect_err("expected coordination lead-agent validation failure");
+        assert!(err.to_string().contains("coordination.lead_agent"));
+    }
+
+    #[test]
+    async fn coordination_validation_allows_empty_lead_agent_when_disabled() {
+        let mut config = Config::default();
+        config.coordination.enabled = false;
+        config.coordination.lead_agent = String::new();
+        config
+            .validate()
+            .expect("disabled coordination should allow empty lead agent");
     }
 }

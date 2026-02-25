@@ -303,8 +303,18 @@ Notes:
 |---|---|---|
 | `require_workspace_relative_tools_dir` | `true` | Require `runtime.wasm.tools_dir` to be workspace-relative and reject `..` traversal |
 | `reject_symlink_modules` | `true` | Block symlinked `.wasm` module files during execution |
+| `reject_symlink_tools_dir` | `true` | Block execution when `runtime.wasm.tools_dir` is itself a symlink |
 | `strict_host_validation` | `true` | Fail config/invocation on invalid host entries instead of dropping them |
 | `capability_escalation_mode` | `"deny"` | Escalation policy: `deny` or `clamp` |
+| `module_hash_policy` | `"warn"` | Module integrity policy: `disabled`, `warn`, or `enforce` |
+| `module_sha256` | `{}` | Optional map of module names to pinned SHA-256 digests |
+
+Notes:
+
+- `module_sha256` keys must match module names (without `.wasm`) and use `[A-Za-z0-9_-]` only.
+- `module_sha256` values must be 64-character hexadecimal SHA-256 strings.
+- `module_hash_policy = "warn"` allows execution but logs missing/mismatched digests.
+- `module_hash_policy = "enforce"` blocks execution on missing/mismatched digests and requires at least one pin.
 
 WASM profile templates:
 
@@ -484,6 +494,10 @@ Notes:
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
+| `non_cli_excluded_tools` | `[]` | tools hidden from non-CLI channel tool specs |
+| `non_cli_approval_approvers` | `[]` | optional allowlist for who can run non-CLI approval-management commands |
+| `non_cli_natural_language_approval_mode` | `direct` | natural-language behavior for approval-management commands (`direct`, `request_confirm`, `disabled`) |
+| `non_cli_natural_language_approval_mode_by_channel` | `{}` | per-channel override map for natural-language approval mode |
 
 Notes:
 
@@ -493,6 +507,25 @@ Notes:
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+- In supervised mode on non-CLI channels, operators can persist human-approved tools with:
+  - One-step flow: `/approve <tool>`.
+  - Two-step flow: `/approve-request <tool>` then `/approve-confirm <request-id>` (same sender + same chat/channel).
+  Both paths write to `autonomy.auto_approve` and remove the tool from `autonomy.always_ask`.
+- `non_cli_natural_language_approval_mode` controls how strict natural-language approval intents are:
+  - `direct` (default): natural-language approval grants immediately (private-chat friendly).
+  - `request_confirm`: natural-language approval creates a pending request that needs explicit confirm.
+  - `disabled`: natural-language approval commands are rejected; use slash commands only.
+- `non_cli_natural_language_approval_mode_by_channel` can override that mode for specific channels (keys are channel names like `telegram`, `discord`, `slack`).
+  - Example: keep global `direct`, but force `discord = "request_confirm"` for team chats.
+- `non_cli_approval_approvers` can restrict who is allowed to run approval commands (`/approve*`, `/unapprove`, `/approvals`):
+  - `*` allows all channel-admitted senders.
+  - `alice` allows sender `alice` on any channel.
+  - `telegram:alice` allows only that channel+sender pair.
+  - `telegram:*` allows any sender on Telegram.
+  - `*:alice` allows `alice` on any channel.
+- Use `/unapprove <tool>` to remove persisted approval from `autonomy.auto_approve`.
+- `/approve-pending` lists pending requests for the current sender+chat/channel scope.
+- If a tool remains unavailable after approval, check `autonomy.non_cli_excluded_tools` (runtime `/approvals` shows this list). Channel runtime reloads this list from `config.toml` automatically.
 
 ```toml
 [autonomy]
@@ -640,6 +673,12 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- Telegram/Discord/Slack/Mattermost/Lark/Feishu support `[channels_config.<channel>.group_reply]`:
+  - `mode = "all_messages"` or `mode = "mention_only"`
+  - `allowed_sender_ids = ["..."]` to bypass mention gating in groups
+  - `allowed_users` allowlist checks still run first
+- Legacy `mention_only` flags (Telegram/Discord/Mattermost/Lark) remain supported as fallback only.
+  If `group_reply.mode` is set, it takes precedence over legacy `mention_only`.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 ### `[channels_config.nostr]`
@@ -778,6 +817,31 @@ Notes:
 
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
+
+## `[agents_ipc]`
+
+Inter-process communication for independent ZeroClaw agents on the same host.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable IPC tools (`agents_list`, `agents_send`, `agents_inbox`, `state_get`, `state_set`) |
+| `db_path` | `~/.zeroclaw/agents.db` | Shared SQLite database path (all agents on this host share one file) |
+| `staleness_secs` | `300` | Agents not seen within this window are considered offline (seconds) |
+
+Notes:
+
+- When `enabled = false` (default), no IPC tools are registered and no database is created.
+- All agents that share a `db_path` can discover each other and exchange messages.
+- Agent identity is derived from `workspace_dir` (SHA-256 hash), not user-supplied.
+
+Example:
+
+```toml
+[agents_ipc]
+enabled = true
+db_path = "~/.zeroclaw/agents.db"
+staleness_secs = 300
+```
 
 ## Security-Relevant Defaults
 

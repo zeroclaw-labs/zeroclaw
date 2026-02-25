@@ -14,11 +14,38 @@ Policy: `.github/release/canary-policy.json`
 - `rollback_branch` (workflow_dispatch only, default `dev`)
 - `rollback_target_ref` (optional explicit rollback target ref)
 
+## Cohort Progression
+
+Defined in `.github/release/canary-policy.json`:
+
+- `canary-5pct` for 20 minutes
+- `canary-20pct` for 20 minutes
+- `canary-50pct` for 20 minutes
+- `canary-100pct` for 60 minutes (final confidence window)
+
+Promotion guidance:
+
+1. Run `dry-run` for each cohort window first.
+2. Promote to next cohort only when decision is `promote`.
+3. Stop progression on `hold` and open investigation.
+4. Trigger rollback flow on `abort`.
+
 ## Decision Model
 
 - `promote`: all metrics within configured thresholds
 - `hold`: soft breach or policy violations (for example insufficient sample)
 - `abort`: hard breach (`>1.5x` threshold)
+
+## Observability Signals
+
+Guarded policy signals:
+
+- `error_rate`
+- `crash_rate`
+- `p95_latency_ms`
+- `sample_size`
+
+All signals are emitted in `canary-guard.json` and rendered in run summary.
 
 ## Execution Modes
 

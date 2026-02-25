@@ -57,11 +57,13 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod coordination;
 mod cost;
 mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
+mod goals;
 mod hardware;
 mod health;
 mod heartbeat;

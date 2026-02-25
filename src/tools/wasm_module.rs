@@ -176,6 +176,7 @@ impl Tool for WasmModuleTool {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&json!({
                             "module": module,
+                            "module_sha256": result.module_sha256,
                             "exit_code": result.exit_code,
                             "fuel_consumed": result.fuel_consumed,
                             "stdout": result.stdout,

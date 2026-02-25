@@ -3,7 +3,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Maximum file size we will read and base64-encode (5 MB).
@@ -116,6 +116,32 @@ impl ImageInfoTool {
         }
         None
     }
+
+    fn resolve_image_path(&self, path_str: &str) -> Result<PathBuf, String> {
+        // Syntax-level checks first.
+        if !self.security.is_path_allowed(path_str) {
+            return Err(format!(
+                "Path not allowed: {path_str} (must be within workspace)"
+            ));
+        }
+
+        let raw_path = Path::new(path_str);
+        let candidate = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            self.security.workspace_dir.join(raw_path)
+        };
+
+        let resolved = candidate
+            .canonicalize()
+            .map_err(|_| format!("File not found: {path_str}"))?;
+
+        if !self.security.is_resolved_path_allowed(&resolved) {
+            return Err(self.security.resolved_path_violation_message(&resolved));
+        }
+
+        Ok(resolved)
+    }
 }
 
 #[async_trait]
@@ -156,28 +182,26 @@ impl Tool for ImageInfoTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let path = Path::new(path_str);
+        let resolved_path = match self.resolve_image_path(path_str) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        };
 
-        // Restrict reads to workspace directory to prevent arbitrary file exfiltration
-        if !self.security.is_path_allowed(path_str) {
+        if !resolved_path.is_file() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Path not allowed: {path_str} (must be within workspace)"
-                )),
+                error: Some(format!("Not a file: {}", resolved_path.display())),
             });
         }
 
-        if !path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("File not found: {path_str}")),
-            });
-        }
-
-        let metadata = tokio::fs::metadata(path)
+        let metadata = tokio::fs::metadata(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -193,7 +217,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
+        let bytes = tokio::fs::read(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 
@@ -232,6 +256,17 @@ impl Tool for ImageInfoTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    fn symlink_file(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_file(src, dst).expect("symlink should be created");
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -489,5 +524,37 @@ mod tests {
         assert!(result.output.contains("data:image/png;base64,"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn execute_blocks_symlink_escape_outside_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let outside = temp.path().join("secret.png");
+        std::fs::write(&outside, b"not-an-image").expect("fixture should be written");
+
+        let link = workspace.join("link.png");
+        symlink_file(&outside, &link);
+
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: PathBuf::from(&workspace),
+            workspace_only: true,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = ImageInfoTool::new(policy);
+
+        let result = tool.execute(json!({"path": "link.png"})).await.unwrap();
+        assert!(!result.success, "symlink escape must be blocked");
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("escapes workspace allowlist")
+                || err.contains("Path not allowed")
+                || err.contains("outside"),
+            "unexpected error message: {err}"
+        );
     }
 }

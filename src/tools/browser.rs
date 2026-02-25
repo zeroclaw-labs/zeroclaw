@@ -11,7 +11,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -718,6 +720,61 @@ impl BrowserTool {
         Ok(())
     }
 
+    async fn resolve_output_path_for_write(
+        &self,
+        key: &str,
+        path: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let trimmed = path.trim();
+        self.validate_output_path(key, trimmed)?;
+
+        tokio::fs::create_dir_all(&self.security.workspace_dir).await?;
+        let workspace_root = tokio::fs::canonicalize(&self.security.workspace_dir)
+            .await
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+
+        let raw_path = Path::new(trimmed);
+        let output_path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            workspace_root.join(raw_path)
+        };
+
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("'{key}' path has no parent directory"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let resolved_parent = tokio::fs::canonicalize(parent).await?;
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+            anyhow::bail!(
+                "{}",
+                self.security
+                    .resolved_path_violation_message(&resolved_parent)
+            );
+        }
+
+        match tokio::fs::symlink_metadata(&output_path).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "Refusing to write browser output through symlink: {}",
+                        output_path.display()
+                    );
+                }
+                if !meta.is_file() {
+                    anyhow::bail!(
+                        "Browser output path is not a regular file: {}",
+                        output_path.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        Ok(output_path)
+    }
+
     fn validate_computer_use_action(
         &self,
         action: &str,
@@ -797,6 +854,15 @@ impl BrowserTool {
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
+        if action == "screen_capture" {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                let resolved = self.resolve_output_path_for_write("path", path).await?;
+                params.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
+            }
+        }
 
         let payload = json!({
             "action": action,
@@ -2349,6 +2415,16 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_dir(src, dst).expect("symlink should be created");
+    }
 
     #[test]
     fn normalize_domains_works() {

@@ -22,9 +22,6 @@ Last verified: **February 25, 2026**.
 Release automation lives in:
 
 - `.github/workflows/pub-release.yml`
-- `.github/workflows/pub-prerelease.yml`
-- `.github/workflows/ci-canary-gate.yml`
-- `.github/workflows/pub-homebrew-core.yml` (manual Homebrew formula PR, bot-owned)
 
 Modes:
 
@@ -156,26 +153,6 @@ For staged release confidence:
    - `transition.previous_highest_stage` and `transition.required_previous_tag`
    - `stage_history.per_stage` and `stage_history.latest_stage`
 4. Publish prerelease assets only after guard passes.
-
-### 6) Publish Homebrew Core formula (bot-owned)
-
-Run `Pub Homebrew Core` manually:
-
-- `release_tag`: `vX.Y.Z`
-- `dry_run`: `true` first, then `false`
-
-Required repository settings for non-dry-run:
-
-- secret: `HOMEBREW_CORE_BOT_TOKEN` (token from a dedicated bot account, not a personal maintainer account)
-- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `zeroclaw-release-bot/homebrew-core`)
-- optional variable: `HOMEBREW_CORE_BOT_EMAIL`
-
-Workflow guardrails:
-
-- release tag must match `Cargo.toml` version
-- formula source URL and SHA256 are updated from the tagged tarball
-- formula license is normalized to `Apache-2.0 OR MIT`
-- PR is opened from the bot fork into `Homebrew/homebrew-core:master`
 
 ## Emergency / Recovery Path
 

@@ -117,6 +117,10 @@ pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+/// Sentinel prefix for internal progress deltas (thinking/tool execution trace).
+/// Channel layers can suppress these messages by default and only expose them
+/// when the user explicitly asks for command/tool execution details.
+pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
 
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
@@ -352,6 +356,20 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let bypass_non_cli_approval_for_turn =
+        approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
+    if bypass_non_cli_approval_for_turn {
+        runtime_trace::record_event(
+            "approval_bypass_one_time_all_tools_consumed",
+            Some(channel_name),
+            Some(provider_name),
+            Some(model),
+            Some(&turn_id),
+            Some(true),
+            Some("consumed one-time non-cli allow-all approval token"),
+            serde_json::json!({}),
+        );
+    }
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -383,7 +401,7 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
             };
-            let _ = tx.send(phase).await;
+            let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}{phase}")).await;
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -583,7 +601,7 @@ pub(crate) async fn run_tool_call_loop(
             if !tool_calls.is_empty() {
                 let _ = tx
                     .send(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                        "{DRAFT_PROGRESS_SENTINEL}\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
                         tool_calls.len()
                     ))
                     .await;
@@ -731,7 +749,14 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if mgr.needs_approval(&tool_name) {
+                if bypass_non_cli_approval_for_turn {
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        ApprovalResponse::Yes,
+                        channel_name,
+                    );
+                } else if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
@@ -835,7 +860,9 @@ pub(crate) async fn run_tool_call_loop(
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
-                let _ = tx.send(progress).await;
+                let _ = tx
+                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
+                    .await;
             }
 
             executable_indices.push(idx);
@@ -906,7 +933,12 @@ pub(crate) async fn run_tool_call_loop(
                     "\u{274c}"
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+                let _ = tx
+                    .send(format!(
+                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
+                        call.name
+                    ))
+                    .await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -971,9 +1003,17 @@ pub(crate) async fn run_tool_call_loop(
     anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
-/// Build the tool instruction block for the system prompt so the LLM knows
-/// how to invoke tools.
+/// Build the tool instruction block for the system prompt from concrete tool
+/// specs so the LLM knows how to invoke tools.
 pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+    let specs: Vec<crate::tools::ToolSpec> =
+        tools_registry.iter().map(|tool| tool.spec()).collect();
+    build_tool_instructions_from_specs(&specs)
+}
+
+/// Build the tool instruction block for the system prompt from concrete tool
+/// specs so the LLM knows how to invoke tools.
+pub(crate) fn build_tool_instructions_from_specs(tool_specs: &[crate::tools::ToolSpec]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -981,20 +1021,23 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str(
         "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
     );
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
+    instructions.push_str(
+        "When a tool is needed, emit a real call (not prose), for example:\n\
+<tool_call>\n\
+{\"name\":\"tool_name\",\"arguments\":{}}\n\
+</tool_call>\n\n",
+    );
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
-    for tool in tools_registry {
+    for tool in tool_specs {
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
-            tool.name(),
-            tool.description(),
-            tool.parameters_schema()
+            tool.name, tool.description, tool.parameters
         );
     }
 
@@ -2362,6 +2405,64 @@ mod tests {
             0,
             "shell tool must not execute when approval is unavailable on non-CLI channels"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_consumes_one_time_non_cli_allow_all_token() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        approval_mgr.grant_non_cli_allow_all_once();
+        assert_eq!(approval_mgr.non_cli_allow_all_once_remaining(), 1);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell once"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should consume one-time allow-all token");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "shell tool should execute after consuming one-time allow-all token"
+        );
+        assert_eq!(approval_mgr.non_cli_allow_all_once_remaining(), 0);
     }
 
     #[tokio::test]

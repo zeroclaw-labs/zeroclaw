@@ -404,6 +404,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -429,6 +430,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -537,6 +539,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();

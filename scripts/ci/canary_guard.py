@@ -13,6 +13,64 @@ from pathlib import Path
 SEMVER_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$")
 
 
+def parse_string_list(raw: object, *, field: str, violations: list[str]) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        violations.append(f"Policy field `{field}` must be a list of strings.")
+        return []
+    out: list[str] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            violations.append(f"Policy field `{field}` has invalid entry at index {idx}.")
+            continue
+        out.append(item.strip())
+    return out
+
+
+def parse_cohorts(raw: object, violations: list[str]) -> list[dict[str, int | str]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        violations.append("Policy field `cohorts` must be a list.")
+        return []
+
+    cohorts: list[dict[str, int | str]] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            violations.append(f"Policy field `cohorts` entry {idx} must be an object.")
+            continue
+        name = item.get("name")
+        traffic = item.get("traffic_percent")
+        duration = item.get("duration_minutes")
+        if not isinstance(name, str) or not name.strip():
+            violations.append(f"Policy field `cohorts` entry {idx} missing non-empty `name`.")
+            continue
+        if not isinstance(traffic, int) or traffic <= 0 or traffic > 100:
+            violations.append(f"Policy field `cohorts` entry {idx} has invalid `traffic_percent`.")
+            continue
+        if not isinstance(duration, int) or duration <= 0:
+            violations.append(f"Policy field `cohorts` entry {idx} has invalid `duration_minutes`.")
+            continue
+        cohorts.append(
+            {
+                "name": name.strip(),
+                "traffic_percent": traffic,
+                "duration_minutes": duration,
+            }
+        )
+
+    names = [str(item["name"]) for item in cohorts]
+    if len(set(names)) != len(names):
+        violations.append("Policy field `cohorts` must use unique cohort names.")
+
+    traffic_steps = [int(item["traffic_percent"]) for item in cohorts]
+    if traffic_steps != sorted(traffic_steps):
+        violations.append("Policy field `cohorts` must be ordered by ascending `traffic_percent`.")
+
+    return cohorts
+
+
 def build_markdown(report: dict) -> str:
     lines: list[str] = []
     lines.append("# Canary Guard Report")
@@ -30,6 +88,20 @@ def build_markdown(report: dict) -> str:
     lines.append(f"- P95 latency ms: `{report['metrics']['p95_latency_ms']}` (max `{report['thresholds']['max_p95_latency_ms']}`)")
     lines.append(f"- Sample size: `{report['metrics']['sample_size']}` (min `{report['minimum_sample_size']}`)")
     lines.append("")
+
+    if report["cohorts"]:
+        lines.append("## Cohorts")
+        for item in report["cohorts"]:
+            lines.append(
+                f"- `{item['name']}`: {item['traffic_percent']}% traffic for {item['duration_minutes']} minutes"
+            )
+        lines.append("")
+
+    if report["observability_signals"]:
+        lines.append("## Observability Signals")
+        for signal in report["observability_signals"]:
+            lines.append(f"- `{signal}`")
+        lines.append("")
 
     if report["violations"]:
         lines.append("## Violations")
@@ -62,10 +134,16 @@ def main() -> int:
     args = parser.parse_args()
 
     policy = json.loads(Path(args.policy_file).read_text(encoding="utf-8"))
-    thresholds = policy.get("thresholds", {})
-
     violations: list[str] = []
     warnings: list[str] = []
+
+    thresholds = policy.get("thresholds", {})
+    cohorts = parse_cohorts(policy.get("cohorts"), violations)
+    observability_signals = parse_string_list(
+        policy.get("observability_signals"),
+        field="observability_signals",
+        violations=violations,
+    )
 
     if not SEMVER_TAG_RE.fullmatch(args.candidate_tag):
         violations.append(
@@ -114,6 +192,8 @@ def main() -> int:
         "ready_to_execute": ready_to_execute,
         "observation_window_minutes": int(policy.get("observation_window_minutes", 0)),
         "minimum_sample_size": min_sample_size,
+        "cohorts": cohorts,
+        "observability_signals": observability_signals,
         "thresholds": {
             "max_error_rate": max_error_rate,
             "max_crash_rate": max_crash_rate,

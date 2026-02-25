@@ -78,8 +78,8 @@ default_temperature = 0.7
 
 [gateway]
 port = 42617
-host = "[::]"
-allow_public_bind = true
+host = "127.0.0.1"
+allow_public_bind = false
 EOF
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────

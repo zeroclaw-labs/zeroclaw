@@ -96,12 +96,28 @@ Recommended path:
 
 1. Start with `dev` for module integration (`capability_escalation_mode = "clamp"`).
 2. Move to `staging` and fix denied escalation paths.
-3. Promote to `prod` with minimal permissions.
+3. Pin module digests with `runtime.wasm.security.module_sha256`.
+4. Promote to `prod` with minimal permissions.
+5. Set `runtime.wasm.security.module_hash_policy = "enforce"` after all module pins are in place.
 
 Example apply flow:
 
 ```bash
 cp dev/config.wasm.staging.toml target/.zeroclaw/config.toml
+```
+
+Example SHA-256 pin generation:
+
+```bash
+sha256sum tools/wasm/*.wasm
+```
+
+Then copy each digest into:
+
+```toml
+[runtime.wasm.security.module_sha256]
+calc = "<64-char sha256>"
+formatter = "<64-char sha256>"
 ```
 
 ## Local CI/CD (Docker-Only)

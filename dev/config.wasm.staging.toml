@@ -21,5 +21,11 @@ allowed_hosts = ["api.staging.internal", "cdn.staging.internal:443"]
 [runtime.wasm.security]
 require_workspace_relative_tools_dir = true
 reject_symlink_modules = true
+reject_symlink_tools_dir = true
 strict_host_validation = true
 capability_escalation_mode = "deny"
+module_hash_policy = "warn"
+
+[runtime.wasm.security.module_sha256]
+# Populate pins and switch module_hash_policy to "enforce" after validation.
+# calc = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
