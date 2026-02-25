@@ -455,12 +455,52 @@ Notes:
 | `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for outbound HTTP requests |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
+- Shell `curl`/`wget` are classified as high-risk and may be blocked by autonomy policy. Prefer `http_request` for direct HTTP calls.
+
+## `[web_fetch]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_fetch` for page-to-text extraction |
+| `provider` | `fast_html2md` | Fetch/render backend: `fast_html2md`, `nanohtml2text`, `firecrawl` |
+| `api_key` | unset | API key for provider backends that require it (e.g. `firecrawl`) |
+| `api_url` | unset | Optional API URL override (self-hosted/alternate endpoint) |
+| `allowed_domains` | `["*"]` | Domain allowlist (`"*"` allows all public domains) |
+| `blocked_domains` | `[]` | Denylist applied before allowlist |
+| `max_response_size` | `500000` | Maximum returned payload size in bytes |
+| `timeout_secs` | `30` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for fetch requests |
+
+Notes:
+
+- `web_fetch` is optimized for summarization/data extraction from web pages.
+- Redirect targets are revalidated against allow/deny domain policy.
+- Local/private network targets remain blocked even when `allowed_domains = ["*"]`.
+
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_search_tool` |
+| `provider` | `duckduckgo` | Search backend: `duckduckgo`, `brave`, `firecrawl` |
+| `api_key` | unset | Generic provider key (used by `firecrawl`, fallback for `brave`) |
+| `api_url` | unset | Optional API URL override |
+| `brave_api_key` | unset | Dedicated Brave key (required for `provider = "brave"` unless `api_key` is set) |
+| `max_results` | `5` | Maximum search results returned (clamped to 1-10) |
+| `timeout_secs` | `15` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for search requests |
+
+Notes:
+
+- If DuckDuckGo returns `403`/`429` in your network, switch provider to `brave` or `firecrawl`.
+- `web_search` finds candidate URLs; pair it with `web_fetch` for page content extraction.
 
 ## `[gateway]`
 

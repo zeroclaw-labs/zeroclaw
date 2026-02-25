@@ -192,6 +192,97 @@ zeroclaw channel doctor
 
 Then verify channel-specific credentials + allowlist fields in config.
 
+## Web Access Issues
+
+### `curl`/`wget` blocked in shell tool
+
+Symptom:
+
+- tool output includes `Command blocked: high-risk command is disallowed by policy`
+- model says `curl`/`wget` is blocked
+
+Why this happens:
+
+- `curl`/`wget` are high-risk shell commands and may be blocked by autonomy policy.
+
+Preferred fix:
+
+- use purpose-built tools instead of shell fetch:
+  - `http_request` for direct API/HTTP calls
+  - `web_fetch` for page content extraction/summarization
+
+Minimal config:
+
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+provider = "fast_html2md"
+allowed_domains = ["*"]
+```
+
+### `web_search_tool` fails with `403`/`429`
+
+Symptom:
+
+- tool output includes `DuckDuckGo search failed with status: 403` (or `429`)
+
+Why this happens:
+
+- some networks/proxies/rate limits block DuckDuckGo HTML search endpoint traffic.
+
+Fix options:
+
+1. Switch provider to Brave (recommended when you have an API key):
+
+```toml
+[web_search]
+enabled = true
+provider = "brave"
+brave_api_key = "<SECRET>"
+```
+
+2. Switch provider to Firecrawl (if enabled in your build):
+
+```toml
+[web_search]
+enabled = true
+provider = "firecrawl"
+api_key = "<SECRET>"
+```
+
+3. Keep DuckDuckGo for search, but use `web_fetch` to read pages once you have URLs.
+
+### `web_fetch`/`http_request` says host is not allowed
+
+Symptom:
+
+- errors like `Host '<domain>' is not in http_request.allowed_domains`
+- or `web_fetch tool is enabled but no allowed_domains are configured`
+
+Fix:
+
+- include exact domains or `"*"` for public internet access:
+
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+```
+
+Security notes:
+
+- local/private network targets are blocked even with `"*"`
+- keep explicit domain allowlists in production environments when possible
+
 ## Service Mode
 
 ### Service installed but not running
