@@ -128,7 +128,7 @@ Xem tất cả tùy chọn:
 
 ## Tài liệu liên quan
 
-- [README.vi.md](../../../README.vi.md)
+- [docs/i18n/vi/README.md](README.md)
 - [commands-reference.md](commands-reference.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)

@@ -8,8 +8,8 @@
 
 ## クイックリンク
 
-- 日本語ルート README: [../../../README.ja.md](../../../README.ja.md)
-- 日本語ドキュメント入口（互換）: [../../README.ja.md](../../README.ja.md)
+- 日本語ルート README: [docs/i18n/ja/README.md](README.md)
+- 日本語ドキュメント入口（互換）: [docs/i18n/ja/README.md](README.md)
 - 日本語目次（互換）: [../../SUMMARY.ja.md](../../SUMMARY.ja.md)
 - 英語ドキュメント入口: [../../README.md](../../README.md)
 

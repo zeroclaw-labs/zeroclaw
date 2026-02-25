@@ -8,8 +8,8 @@
 
 ## 快速入口
 
-- 中文根 README：[../../../README.zh-CN.md](../../../README.zh-CN.md)
-- 中文文档入口（兼容路径）：[../../README.zh-CN.md](../../README.zh-CN.md)
+- 中文根 README：[docs/i18n/zh-CN/README.md](README.md)
+- 中文文档入口（兼容路径）：[docs/i18n/zh-CN/README.md](README.md)
 - 中文目录（兼容路径）：[../../SUMMARY.zh-CN.md](../../SUMMARY.zh-CN.md)
 - 英文文档入口：[../../README.md](../../README.md)
 

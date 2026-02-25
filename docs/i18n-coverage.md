@@ -11,25 +11,23 @@ Gap backlog: [i18n-gap-backlog.md](i18n-gap-backlog.md)
 
 Use these i18n paths:
 
-- Root language landing: `README.<locale>.md`
+- Root language landing: `README.md` (language switch links to localized hubs)
 - Full localized docs tree: `docs/i18n/<locale>/...`
 - Optional compatibility shims at docs root:
-  - `docs/README.<locale>.md`
-  - `docs/commands-reference.<locale>.md`
-  - `docs/config-reference.<locale>.md`
-  - `docs/troubleshooting.<locale>.md`
+  - `docs/SUMMARY.<locale>.md`
+  - `docs/vi/**`
 
 ## Locale Coverage Matrix
 
 | Locale | Root README | Canonical Docs Hub | Commands Ref | Config Ref | Troubleshooting | Status |
 |---|---|---|---|---|---|---|
 | `en` | `README.md` | `docs/README.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | Source of truth |
-| `zh-CN` | `README.zh-CN.md` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/commands-reference.md` | `docs/i18n/zh-CN/config-reference.md` | `docs/i18n/zh-CN/troubleshooting.md` | Full top-level parity (bridge + localized) |
-| `ja` | `README.ja.md` | `docs/i18n/ja/README.md` | `docs/i18n/ja/commands-reference.md` | `docs/i18n/ja/config-reference.md` | `docs/i18n/ja/troubleshooting.md` | Full top-level parity (bridge + localized) |
-| `ru` | `README.ru.md` | `docs/i18n/ru/README.md` | `docs/i18n/ru/commands-reference.md` | `docs/i18n/ru/config-reference.md` | `docs/i18n/ru/troubleshooting.md` | Full top-level parity (bridge + localized) |
-| `fr` | `README.fr.md` | `docs/i18n/fr/README.md` | `docs/i18n/fr/commands-reference.md` | `docs/i18n/fr/config-reference.md` | `docs/i18n/fr/troubleshooting.md` | Full top-level parity (bridge + localized) |
-| `vi` | `README.vi.md` | `docs/i18n/vi/README.md` | `docs/i18n/vi/commands-reference.md` | `docs/i18n/vi/config-reference.md` | `docs/i18n/vi/troubleshooting.md` | Full tree localized |
-| `el` | `README.el.md` | `docs/i18n/el/README.md` | `docs/i18n/el/commands-reference.md` | `docs/i18n/el/config-reference.md` | `docs/i18n/el/troubleshooting.md` | Full tree localized |
+| `zh-CN` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/commands-reference.md` | `docs/i18n/zh-CN/config-reference.md` | `docs/i18n/zh-CN/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `ja` | `docs/i18n/ja/README.md` | `docs/i18n/ja/README.md` | `docs/i18n/ja/commands-reference.md` | `docs/i18n/ja/config-reference.md` | `docs/i18n/ja/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `ru` | `docs/i18n/ru/README.md` | `docs/i18n/ru/README.md` | `docs/i18n/ru/commands-reference.md` | `docs/i18n/ru/config-reference.md` | `docs/i18n/ru/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `fr` | `docs/i18n/fr/README.md` | `docs/i18n/fr/README.md` | `docs/i18n/fr/commands-reference.md` | `docs/i18n/fr/config-reference.md` | `docs/i18n/fr/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `vi` | `docs/i18n/vi/README.md` | `docs/i18n/vi/README.md` | `docs/i18n/vi/commands-reference.md` | `docs/i18n/vi/config-reference.md` | `docs/i18n/vi/troubleshooting.md` | Full tree localized |
+| `el` | `docs/i18n/el/README.md` | `docs/i18n/el/README.md` | `docs/i18n/el/commands-reference.md` | `docs/i18n/el/config-reference.md` | `docs/i18n/el/troubleshooting.md` | Full tree localized |
 
 ## Top-Level Parity Snapshot
 
@@ -57,9 +55,9 @@ As of 2026-02-24:
 | `vi` | N/A | Existing localization style kept as full localized tree |
 | `el` | N/A | Existing localization style kept as full localized tree |
 
-## Root README Completeness
+## Localized Landing Completeness
 
-Not all root READMEs are full translations of `README.md`:
+Not all localized landing pages are full translations of `README.md`:
 
 | Locale | Style | Approximate Coverage |
 |---|---|---|
@@ -73,19 +71,19 @@ Not all root READMEs are full translations of `README.md`:
 
 Hub-style entry points provide quick-start orientation and language navigation but do not replicate the full English README content. This is an accurate status record, not a gap to be immediately resolved.
 
-For `zh-CN`, `ja`, `ru`, and `fr`, canonical i18n directory hubs now include full top-level parity coverage and continue linking docs-root compatibility shims during migration.
+For `zh-CN`, `ja`, `ru`, and `fr`, canonical `docs/i18n/<locale>/` hubs include full top-level parity coverage and maintain language navigation through canonical i18n paths.
 
 ## Collection Index i18n
 
 Localized category index files now exist for all supported locales under:
 
-- `docs/getting-started/README.<locale>.md`
-- `docs/reference/README.<locale>.md`
-- `docs/operations/README.<locale>.md`
-- `docs/security/README.<locale>.md`
-- `docs/hardware/README.<locale>.md`
-- `docs/contributing/README.<locale>.md`
-- `docs/project/README.<locale>.md`
+- `docs/i18n/<locale>/getting-started/README.md`
+- `docs/i18n/<locale>/reference/README.md`
+- `docs/i18n/<locale>/operations/README.md`
+- `docs/i18n/<locale>/security/README.md`
+- `docs/i18n/<locale>/hardware/README.md`
+- `docs/i18n/<locale>/contributing/README.md`
+- `docs/i18n/<locale>/project/README.md`
 
 This closes collection-index localization parity for supported locales.
 
@@ -103,13 +101,12 @@ This closes collection-index localization parity for supported locales.
 
 ## Adding a New Locale
 
-1. Create `README.<locale>.md`.
+1. Add locale entry to `README.md` language switch pointing to `docs/i18n/<locale>/README.md`.
 2. Create canonical docs tree under `docs/i18n/<locale>/` (at least `README.md`, `commands-reference.md`, `config-reference.md`, `troubleshooting.md`).
 3. Add locale links to:
-   - root language nav in every `README*.md`
    - localized hubs line in `docs/README.md`
-   - "Other languages" section in every `docs/README*.md`
-   - language entry section in `docs/SUMMARY.md`
+   - "Other languages" section in every `docs/i18n/*/README.md`
+   - language entry section in `docs/SUMMARY.md`, `docs/i18n/*/SUMMARY.md`, and docs-root `docs/SUMMARY.<locale>.md` shims if present
 4. Optionally add docs-root shim files for backward compatibility.
 5. Update this file (`docs/i18n-coverage.md`) and run link validation.
 

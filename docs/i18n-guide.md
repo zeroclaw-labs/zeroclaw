@@ -8,9 +8,9 @@ Use this guide when a PR touches any user-facing docs navigation, shared docs wo
 
 Primary docs surfaces:
 
-- Root READMEs: `README.md`, `README.<locale>.md`
+- Root landing: `README.md` (language switch links to `docs/i18n/<locale>/README.md`)
 - Docs hubs: `docs/README.md`, `docs/i18n/<locale>/README.md`
-- Unified TOC: `docs/SUMMARY.md`
+- Unified TOC: `docs/SUMMARY.md`, `docs/SUMMARY.<locale>.md` (compatibility shims, if present)
 - i18n index and coverage: `docs/i18n/README.md`, `docs/i18n-coverage.md`, `docs/i18n-gap-backlog.md`
 
 Supported locales:
@@ -22,11 +22,12 @@ Supported locales:
 
 Required structure:
 
-- Root language landing: `README.<locale>.md`
+- Root language landing: `README.md`
 - Canonical localized docs hub: `docs/i18n/<locale>/README.md`
 - Canonical localized summary: `docs/i18n/<locale>/SUMMARY.md`
+- Optional compatibility shims: `docs/SUMMARY.<locale>.md` (if kept for backward links)
 
-Compatibility shims may exist at docs root (for example `docs/README.zh-CN.md`, `docs/SUMMARY.zh-CN.md`) and must remain aligned when touched.
+Compatibility shims may exist at docs root (for example `docs/SUMMARY.zh-CN.md`) and must remain aligned when touched.
 
 ## Trigger Matrix
 
@@ -34,12 +35,12 @@ Use this matrix to decide required i18n follow-through in the same PR.
 
 | Change type | Required i18n follow-through |
 |---|---|
-| Root README language switch line changed | Update language switch line in all root `README*.md` files |
-| Docs hub language links changed | Update localized hub links in `docs/README.md` and every `docs/README*.md` / `docs/i18n/*/README.md` with an "Other languages" section |
-| Unified TOC language entry changed | Update `docs/SUMMARY.md` and every localized `docs/SUMMARY*.md` / `docs/i18n/*/SUMMARY.md` language-entry section |
-| Collection index changed (`docs/<collection>/README.md`) | Update every matching `docs/<collection>/README.<locale>.md` for all supported locales |
+| Root README language switch line changed | Update language switch line in `README.md` and verify all localized links resolve to `docs/i18n/<locale>/README.md` |
+| Docs hub language links changed | Update localized hub links in `docs/README.md` and every `docs/i18n/*/README.md` with an "Other languages" section |
+| Unified TOC language entry changed | Update `docs/SUMMARY.md`, every `docs/i18n/*/SUMMARY.md`, and docs-root `docs/SUMMARY*.md` shims if present |
+| Collection index changed (`docs/<collection>/README.md`) | Update matching localized collection indexes under `docs/i18n/<locale>/<collection>/README.md` for locales that keep localized collection trees |
 | Any top-level runtime/governance/security doc changed under `docs/*.md` | Update corresponding file under every `docs/i18n/<locale>/` in the same PR |
-| Locale added/removed/renamed | Update root READMEs, docs hubs, summaries, `docs/i18n/README.md`, `docs/i18n-coverage.md`, and `docs/i18n-gap-backlog.md` |
+| Locale added/removed/renamed | Update `README.md`, docs hubs, summaries, `docs/i18n/README.md`, `docs/i18n-coverage.md`, and `docs/i18n-gap-backlog.md` |
 
 ## Completion Checklist (Mandatory)
 
@@ -98,7 +99,7 @@ Examples:
 
 ```bash
 # search locale references
-rg -n "README\.el\.md|i18n/el/README\.md|i18n/vi/README\.md|i18n/zh-CN/README\.md" README*.md docs/README*.md docs/SUMMARY*.md
+rg -n "docs/i18n/(zh-CN|ja|ru|fr|vi|el)/README\.md|SUMMARY\.(zh-CN|ja|ru|fr|vi|el)\.md" README.md docs/SUMMARY*.md docs/i18n/*/README.md docs/i18n/*/SUMMARY.md
 
 # check changed markdown files
 git status --short

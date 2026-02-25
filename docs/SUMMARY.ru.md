@@ -10,12 +10,12 @@
 
 - Карта структуры docs (язык/раздел/функция): [structure/README.md](structure/README.md)
 - README на английском: [../README.md](../README.md)
-- README на китайском: [../README.zh-CN.md](../README.zh-CN.md)
-- README на японском: [../README.ja.md](../README.ja.md)
-- README на русском: [../README.ru.md](../README.ru.md)
-- README на французском: [../README.fr.md](../README.fr.md)
-- README на вьетнамском: [../README.vi.md](../README.vi.md)
-- README на греческом: [../README.el.md](../README.el.md)
+- README на китайском: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- README на японском: [docs/i18n/ja/README.md](i18n/ja/README.md)
+- README на русском: [docs/i18n/ru/README.md](i18n/ru/README.md)
+- README на французском: [docs/i18n/fr/README.md](i18n/fr/README.md)
+- README на вьетнамском: [docs/i18n/vi/README.md](i18n/vi/README.md)
+- README на греческом: [docs/i18n/el/README.md](i18n/el/README.md)
 - Документация на английском: [README.md](README.md)
 - Документация на китайском: [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - Документация на японском: [i18n/ja/README.md](i18n/ja/README.md)
@@ -32,13 +32,13 @@
 
 ### 1) Начало работы
 
-- [getting-started/README.ru.md](getting-started/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/one-click-bootstrap.md](i18n/ru/one-click-bootstrap.md)
 - [i18n/ru/android-setup.md](i18n/ru/android-setup.md)
 
 ### 2) Справочник команд, конфигурации и интеграций
 
-- [reference/README.ru.md](reference/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/commands-reference.md](i18n/ru/commands-reference.md)
 - [i18n/ru/providers-reference.md](i18n/ru/providers-reference.md)
 - [i18n/ru/channels-reference.md](i18n/ru/channels-reference.md)
@@ -50,7 +50,7 @@
 
 ### 3) Эксплуатация и развёртывание
 
-- [operations/README.ru.md](operations/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/operations-runbook.md](i18n/ru/operations-runbook.md)
 - [i18n/ru/release-process.md](i18n/ru/release-process.md)
 - [i18n/ru/troubleshooting.md](i18n/ru/troubleshooting.md)
@@ -60,7 +60,7 @@
 
 ### 4) Безопасность и управление
 
-- [security/README.ru.md](security/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/agnostic-security.md](i18n/ru/agnostic-security.md)
 - [i18n/ru/frictionless-security.md](i18n/ru/frictionless-security.md)
 - [i18n/ru/sandboxing.md](i18n/ru/sandboxing.md)
@@ -71,7 +71,7 @@
 
 ### 5) Оборудование и периферия
 
-- [hardware/README.ru.md](hardware/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/hardware-peripherals-design.md](i18n/ru/hardware-peripherals-design.md)
 - [i18n/ru/adding-boards-and-tools.md](i18n/ru/adding-boards-and-tools.md)
 - [i18n/ru/nucleo-setup.md](i18n/ru/nucleo-setup.md)
@@ -80,7 +80,7 @@
 
 ### 6) Участие в проекте и CI
 
-- [contributing/README.ru.md](contributing/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - [i18n/ru/pr-workflow.md](i18n/ru/pr-workflow.md)
 - [i18n/ru/reviewer-playbook.md](i18n/ru/reviewer-playbook.md)
@@ -89,7 +89,7 @@
 
 ### 7) Состояние проекта и снимки
 
-- [project/README.ru.md](project/README.ru.md)
+- [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/project-triage-snapshot-2026-02-18.md](i18n/ru/project-triage-snapshot-2026-02-18.md)
 - [i18n/ru/docs-audit-2026-02-24.md](i18n/ru/docs-audit-2026-02-24.md)
 - [i18n/ru/docs-inventory.md](i18n/ru/docs-inventory.md)

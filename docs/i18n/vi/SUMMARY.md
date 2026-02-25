@@ -7,7 +7,7 @@
 ## Điểm vào
 
 - Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [../../structure/README.md](../../structure/README.md)
-- README tiếng Việt: [../../../README.vi.md](../../../README.vi.md)
+- README tiếng Việt: [docs/i18n/vi/README.md](README.md)
 - Docs hub tiếng Việt: [README.md](README.md)
 
 ## Danh mục

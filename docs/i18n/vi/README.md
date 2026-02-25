@@ -10,7 +10,7 @@
 
 | Tôi muốn… | Xem tài liệu |
 |---|---|
-| Cài đặt và chạy nhanh | [../../../README.vi.md](../../../README.vi.md) / [../../../README.md](../../../README.md) |
+| Cài đặt và chạy nhanh | [docs/i18n/vi/README.md](README.md) / [../../../README.md](../../../README.md) |
 | Cài đặt bằng một lệnh | [one-click-bootstrap.md](one-click-bootstrap.md) |
 | Cài đặt trên Android (Termux/ADB) | [android-setup.md](android-setup.md) |
 | Tìm lệnh theo tác vụ | [commands-reference.md](commands-reference.md) |

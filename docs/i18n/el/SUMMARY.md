@@ -7,12 +7,12 @@
 ## Επιλογή Γλώσσας
 
 - English README: [../README.md](../README.md)
-- Chinese README: [../../README.zh-CN.md](../../README.zh-CN.md)
-- Japanese README: [../../README.ja.md](../../README.ja.md)
-- Russian README: [../../README.ru.md](../../README.ru.md)
-- French README: [../../README.fr.md](../../README.fr.md)
-- Vietnamese README: [../../README.vi.md](../../README.vi.md)
-- Ελληνικό README: [../../README.el.md](../../README.el.md)
+- Chinese README: [docs/i18n/zh-CN/README.md](../zh-CN/README.md)
+- Japanese README: [docs/i18n/ja/README.md](../ja/README.md)
+- Russian README: [docs/i18n/ru/README.md](../ru/README.md)
+- French README: [docs/i18n/fr/README.md](../fr/README.md)
+- Vietnamese README: [docs/i18n/vi/README.md](../vi/README.md)
+- Ελληνικό README: [docs/i18n/el/README.md](README.md)
 - English Docs Hub: [README.md](README.md)
 - Chinese Docs Hub: [../zh-CN/README.md](../zh-CN/README.md)
 - Japanese Docs Hub: [../ja/README.md](../ja/README.md)
