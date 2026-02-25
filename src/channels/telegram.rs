@@ -4798,7 +4798,7 @@ mod tests {
 
         let groq = OpenAiCompatibleProvider::new(
             "Groq",
-            "https://api.groq.com/openai",
+            "https://api.groq.com/openai/v1",
             Some("fake_key"),
             AuthStyle::Bearer,
         );
