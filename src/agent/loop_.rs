@@ -1,10 +1,10 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::cosmic::{
-    AgentPool, CausalGraph, ConsolidationEngine, Constitution, CosmicGate, CosmicMemoryGraph,
-    CosmicPersistence, CounterfactualEngine, DriftDetector, EmotionalModulator, FreeEnergyState,
-    GlobalWorkspace, InputSignal, IntegrationMeter, NormativeEngine, PolicyEngine, SelfModel,
-    SensoryThalamus, SignalSource, SubsystemId, WorldModel,
+    AgentPool, BeliefSource, CausalGraph, ConsolidationEngine, Constitution, CosmicGate,
+    CosmicMemoryGraph, CosmicPersistence, CounterfactualEngine, DriftDetector, EmotionalModulator,
+    FreeEnergyState, GlobalWorkspace, InputSignal, IntegrationMeter, NormativeEngine, PolicyEngine,
+    SelfModel, SensoryThalamus, SignalSource, SubsystemId, WorldModel,
 };
 use crate::cost::{self, CostTracker, TokenUsage};
 
@@ -894,6 +894,9 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -920,6 +923,9 @@ pub(crate) async fn run_tool_call_loop(
     model_prices: Option<&std::collections::HashMap<String, crate::config::schema::ModelPricing>>,
     cosmic_gate: Option<&CosmicGate>,
     cosmic_workspace: Option<&Mutex<GlobalWorkspace>>,
+    cosmic_free_energy: Option<&Mutex<FreeEnergyState>>,
+    cosmic_world_model: Option<&Mutex<WorldModel>>,
+    cosmic_thalamus: Option<&Mutex<SensoryThalamus>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1176,6 +1182,20 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            if let Some(wm_mutex) = cosmic_world_model {
+                let reliability_key = format!("world:tool_{}_reliability", call.name);
+                let wm = wm_mutex.lock();
+                if let Some(belief) = wm.get_belief(&reliability_key) {
+                    if belief.value < 0.3 {
+                        tracing::warn!(
+                            tool = %call.name,
+                            reliability = belief.value,
+                            "Low-reliability tool — cosmic brain flagging"
+                        );
+                    }
+                }
+            }
+
             let blocked_by_gate = cosmic_gate.and_then(|gate| {
                 let decision = gate.check_action(&call.name, &call.name);
                 if decision.allowed {
@@ -1196,6 +1216,11 @@ pub(crate) async fn run_tool_call_loop(
 
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
+            });
+            let tool_domain = format!("tool_{}", call.name);
+            let tool_pred_id = cosmic_free_energy.map(|fe| {
+                let mut fe = fe.lock();
+                fe.predict(&tool_domain, 0.8, 0.7)
             });
             let start = Instant::now();
             let result = if let Some(blocked_msg) = blocked_by_gate {
@@ -1239,6 +1264,48 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 format!("Unknown tool: {}", call.name)
             };
+
+            let tool_succeeded = !result.starts_with("Error");
+            if let (Some(fe_mutex), Some(pred_id)) = (cosmic_free_energy, tool_pred_id) {
+                let observe_val = if tool_succeeded { 0.9 } else { 0.2 };
+                let should_update = {
+                    let mut fe = fe_mutex.lock();
+                    fe.observe(&pred_id, observe_val);
+                    fe.should_update_model(&tool_domain, 0.3)
+                };
+                if should_update {
+                    if let Some(wm_mutex) = cosmic_world_model {
+                        let reliability_key = format!("world:{tool_domain}_reliability");
+                        let mut wm = wm_mutex.lock();
+                        wm.update_belief(
+                            &reliability_key,
+                            observe_val,
+                            0.8,
+                            BeliefSource::Observed,
+                        );
+                    }
+                }
+            }
+
+            if let Some(gate) = cosmic_gate {
+                gate.record_tool_outcome(&call.name, &call.name, tool_succeeded);
+            }
+
+            if let Some(thal_mutex) = cosmic_thalamus {
+                let signal = InputSignal {
+                    source: SignalSource::Tool,
+                    content: call.name.clone(),
+                    raw_salience: if tool_succeeded { 0.5 } else { 0.8 },
+                    timestamp: chrono::Utc::now(),
+                };
+                let mut thal = thal_mutex.lock();
+                if thal.process_signal(&signal).is_none() {
+                    tracing::debug!(
+                        tool = %call.name,
+                        "Thalamus filtered out tool result signal"
+                    );
+                }
+            }
 
             individual_results.push(result.clone());
             let _ = writeln!(
@@ -1405,6 +1472,18 @@ pub async fn run(
             let p = persistence.lock();
             match p.load_all() {
                 Ok(snapshot) => {
+                    if let Some(data) = snapshot.modules.get("self_model") {
+                        if let Some(restored) = SelfModel::restore(data, 500) {
+                            *self_model.lock() = restored;
+                            tracing::info!("Restored self_model from persisted state");
+                        }
+                    }
+                    if let Some(data) = snapshot.modules.get("world_model") {
+                        if let Some(restored) = WorldModel::restore(data, 500) {
+                            *world_model.lock() = restored;
+                            tracing::info!("Restored world_model from persisted state");
+                        }
+                    }
                     tracing::info!(
                         version = snapshot.version,
                         modules = snapshot.modules.len(),
@@ -1483,6 +1562,9 @@ pub async fn run(
     });
 
     let cosmic_ws = cosmic_brain.as_ref().map(|b| &*b.workspace);
+    let cosmic_fe = cosmic_brain.as_ref().map(|b| &*b.free_energy);
+    let cosmic_wm = cosmic_brain.as_ref().map(|b| &*b.world_model);
+    let cosmic_thal = cosmic_brain.as_ref().map(|b| &*b.thalamus);
     let mut bias_temperature_adj: f64 = 0.0;
 
     // ── Cost tracking (budget enforcement) ──────────────────────────
@@ -1837,6 +1919,9 @@ pub async fn run(
             Some(&config.cost.prices),
             cosmic_gate.as_ref(),
             cosmic_ws,
+            cosmic_fe,
+            cosmic_wm,
+            cosmic_thal,
         )
         .await?;
         final_output = response.clone();
@@ -1844,10 +1929,52 @@ pub async fn run(
         observer.record_event(&ObserverEvent::TurnComplete);
 
         if let Some(ref brain) = cosmic_brain {
+            #[allow(clippy::cast_possible_truncation)]
+            let prediction_confidence: f32 = {
+                let sm = brain.self_model.lock();
+                sm.get_belief("self:prediction_accuracy")
+                    .map(|b| (b.value.clamp(0.3, 0.95)) as f32)
+                    .unwrap_or(0.7)
+            };
             let mut fe = brain.free_energy.lock();
-            let pred_id = fe.predict("turn_success", 0.8, 0.7);
+            let pred_id = fe.predict("turn_success", 0.8, prediction_confidence);
             let success_score = if response.is_empty() { 0.2 } else { 0.9 };
             fe.observe(&pred_id, success_score);
+
+            if fe.should_update_model("turn_success", 0.3) {
+                let mut wm = brain.world_model.lock();
+                wm.update_belief(
+                    "world:turn_success_rate",
+                    success_score,
+                    0.8,
+                    BeliefSource::Observed,
+                );
+            }
+
+            {
+                let prediction_accuracy = fe.accuracy("turn_success").unwrap_or(0.5);
+                let free_energy_level = fe.free_energy();
+                let mut sm = brain.self_model.lock();
+                sm.update_belief(
+                    "self:prediction_accuracy",
+                    prediction_accuracy,
+                    0.8,
+                    BeliefSource::Observed,
+                );
+                let metacog = sm.metacognitive_accuracy();
+                sm.update_belief(
+                    "self:metacognitive_score",
+                    metacog,
+                    0.8,
+                    BeliefSource::Observed,
+                );
+                sm.update_belief(
+                    "self:free_energy_level",
+                    free_energy_level,
+                    0.8,
+                    BeliefSource::Observed,
+                );
+            }
 
             if let Some(key) = response.get(..80) {
                 let mut g = brain.graph.lock();
@@ -1874,12 +2001,19 @@ pub async fn run(
             {
                 let mut c = brain.causal.lock();
                 c.record_event("provider", "memory", 0.5, 0.5, 10);
+                c.record_event("free_energy", "self_model", 0.5, 0.5, 10);
+                c.record_event("free_energy", "world_model", 0.5, 0.5, 10);
             }
 
             {
                 let mut m = brain.modulator.lock();
                 m.apply_free_energy_signal(fe.free_energy(), fe.free_energy());
             }
+
+            let turn_success_rate = {
+                let wm = brain.world_model.lock();
+                wm.get_belief("world:turn_success_rate").map(|b| b.value)
+            };
 
             {
                 let m = brain.modulator.lock();
@@ -1889,6 +2023,14 @@ pub async fn run(
 
                 if m.is_overloaded() {
                     bias_temperature_adj -= 0.1;
+                }
+
+                if let Some(rate) = turn_success_rate {
+                    if rate < 0.5 {
+                        bias_temperature_adj -= 0.05;
+                    } else if rate > 0.8 {
+                        bias_temperature_adj += 0.03;
+                    }
                 }
 
                 tracing::debug!(
@@ -1918,6 +2060,16 @@ pub async fn run(
                     let arousal = m.get_variable(crate::cosmic::GlobalVariable::Arousal);
                     let mut t = brain.thalamus.lock();
                     t.adjust_threshold(arousal);
+
+                    let drift_signal = InputSignal {
+                        source: SignalSource::System,
+                        content: "drift_alert".into(),
+                        raw_salience: 0.9,
+                        timestamp: chrono::Utc::now(),
+                    };
+                    if t.process_signal(&drift_signal).is_none() {
+                        tracing::debug!("Thalamus filtered out drift alert signal");
+                    }
 
                     tracing::warn!(
                         drifting_subsystems = drift_alerts.alerts.len(),
@@ -1954,9 +2106,17 @@ pub async fn run(
                 }
             }
 
-            tracing::trace!(
-                "Cosmic persistence available — periodic save will be wired in life loop"
-            );
+            {
+                let c = brain.constitution.lock();
+                let check = c.verify_integrity();
+                if !check.passed {
+                    tracing::error!(
+                        expected = %check.expected_hash,
+                        actual = %check.actual_hash,
+                        "Constitution integrity check FAILED — values may have been tampered"
+                    );
+                }
+            }
         }
 
         // Auto-save assistant response to daily log
@@ -2105,6 +2265,9 @@ pub async fn run(
                 Some(&config.cost.prices),
                 cosmic_gate.as_ref(),
                 cosmic_ws,
+                cosmic_fe,
+                cosmic_wm,
+                cosmic_thal,
             )
             .await
             {

@@ -147,6 +147,8 @@ pub fn gather_snapshot(
     drift: &crate::cosmic::DriftDetector,
     thalamus: &crate::cosmic::SensoryThalamus,
     workspace: &crate::cosmic::GlobalWorkspace,
+    self_model: &crate::cosmic::SelfModel,
+    world_model: &crate::cosmic::WorldModel,
 ) -> CosmicSnapshot {
     let mut modules = HashMap::new();
 
@@ -169,6 +171,9 @@ pub fn gather_snapshot(
     if let Ok(val) = serde_json::to_value(&ws_snap) {
         modules.insert("workspace".to_string(), val);
     }
+
+    modules.insert("self_model".to_string(), self_model.snapshot());
+    modules.insert("world_model".to_string(), world_model.snapshot());
 
     CosmicSnapshot {
         modules,
@@ -302,16 +307,23 @@ mod tests {
 
     #[test]
     fn gather_snapshot_collects_modules() {
-        use crate::cosmic::{DriftDetector, EmotionalModulator, GlobalWorkspace, SensoryThalamus};
+        use crate::cosmic::{
+            DriftDetector, EmotionalModulator, GlobalWorkspace, SelfModel, SensoryThalamus,
+            WorldModel,
+        };
         let m = EmotionalModulator::new();
         let d = DriftDetector::new(50, 0.1);
         let t = SensoryThalamus::new(0.3, 100);
         let w = GlobalWorkspace::new(0.3, 5, 50);
-        let snap = super::gather_snapshot(&m, &d, &t, &w);
+        let sm = SelfModel::new(500);
+        let wm = WorldModel::new(500);
+        let snap = super::gather_snapshot(&m, &d, &t, &w, &sm, &wm);
         assert!(snap.modules.contains_key("modulation"));
         assert!(snap.modules.contains_key("drift"));
         assert!(snap.modules.contains_key("thalamus"));
         assert!(snap.modules.contains_key("workspace"));
+        assert!(snap.modules.contains_key("self_model"));
+        assert!(snap.modules.contains_key("world_model"));
         assert_eq!(snap.version, 1);
     }
 }

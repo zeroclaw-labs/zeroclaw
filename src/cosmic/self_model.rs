@@ -31,13 +31,13 @@ pub struct WorldBelief {
     pub last_updated: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfModel {
     beliefs: HashMap<String, SelfBelief>,
     capacity: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldModel {
     beliefs: HashMap<String, WorldBelief>,
     capacity: usize,
@@ -148,6 +148,16 @@ impl SelfModel {
         self.beliefs.len()
     }
 
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_default()
+    }
+
+    pub fn restore(value: &serde_json::Value, capacity: usize) -> Option<Self> {
+        let mut model: Self = serde_json::from_value(value.clone()).ok()?;
+        model.capacity = capacity;
+        Some(model)
+    }
+
     fn prune_lowest_confidence(&mut self) {
         if let Some(weakest) = self
             .beliefs
@@ -234,6 +244,16 @@ impl WorldModel {
 
     pub fn belief_count(&self) -> usize {
         self.beliefs.len()
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_default()
+    }
+
+    pub fn restore(value: &serde_json::Value, capacity: usize) -> Option<Self> {
+        let mut model: Self = serde_json::from_value(value.clone()).ok()?;
+        model.capacity = capacity;
+        Some(model)
     }
 
     fn prune_lowest_confidence(&mut self) {

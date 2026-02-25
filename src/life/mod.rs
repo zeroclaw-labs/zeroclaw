@@ -1,8 +1,9 @@
 use crate::channels::traits::Channel;
 use crate::config::LifeConfig;
 use crate::cosmic::{
-    ConsolidationEngine, CosmicPersistence, CosmicSnapshot, DriftDetector, EmotionalModulator,
-    GlobalWorkspace, IntegrationMeter, SensoryThalamus,
+    BeliefSource, ConsolidationEngine, CosmicMemoryGraph, CosmicPersistence, CosmicSnapshot,
+    DriftDetector, EmotionalModulator, GlobalWorkspace, IntegrationMeter, SelfModel,
+    SensoryThalamus, WorldModel,
 };
 use crate::memory::traits::Memory;
 use crate::observability::{Observer, ObserverEvent};
@@ -35,6 +36,9 @@ pub struct LifeLoop {
     persistence: Option<Arc<Mutex<CosmicPersistence>>>,
     thalamus: Option<Arc<Mutex<SensoryThalamus>>>,
     workspace: Option<Arc<Mutex<GlobalWorkspace>>>,
+    world_model: Option<Arc<Mutex<WorldModel>>>,
+    self_model: Option<Arc<Mutex<SelfModel>>>,
+    graph: Option<Arc<Mutex<CosmicMemoryGraph>>>,
     consolidation_counter: u32,
     persistence_counter: u32,
     config: LifeConfig,
@@ -53,6 +57,9 @@ impl LifeLoop {
         persistence: Option<Arc<Mutex<CosmicPersistence>>>,
         thalamus: Option<Arc<Mutex<SensoryThalamus>>>,
         workspace: Option<Arc<Mutex<GlobalWorkspace>>>,
+        world_model: Option<Arc<Mutex<WorldModel>>>,
+        self_model: Option<Arc<Mutex<SelfModel>>>,
+        graph: Option<Arc<Mutex<CosmicMemoryGraph>>>,
         config: LifeConfig,
     ) -> Self {
         let emotional_state = Arc::new(Mutex::new(EmotionalState::load_or_default(
@@ -97,6 +104,9 @@ impl LifeLoop {
             persistence,
             thalamus,
             workspace,
+            world_model,
+            self_model,
+            graph,
             consolidation_counter: 0,
             persistence_counter: 0,
             config,
@@ -168,6 +178,40 @@ impl LifeLoop {
                         pruned = result.pruned_count,
                         "Life loop consolidation tick"
                     );
+
+                    if let Some(ref wm) = self.world_model {
+                        let mut wm = wm.lock().await;
+                        let health = result.merged_count as f64
+                            / result.total_remaining.max(1) as f64;
+                        let confidence = (result.patterns_found as f32 * 0.1).min(1.0);
+                        wm.update_belief(
+                            "world:memory_consolidation_health",
+                            health,
+                            confidence,
+                            BeliefSource::Observed,
+                        );
+                        let density = result.patterns_found as f64
+                            / result.total_remaining.max(1) as f64;
+                        wm.update_belief(
+                            "world:memory_pattern_density",
+                            density,
+                            confidence,
+                            BeliefSource::Observed,
+                        );
+                    }
+
+                    if let Some(ref graph) = self.graph {
+                        let top = c.top_patterns(3);
+                        let mut g = graph.lock().await;
+                        for pat in top {
+                            g.insert_node(
+                                pat.id.clone(),
+                                pat.description.clone(),
+                                "pattern".to_string(),
+                                vec![],
+                            );
+                        }
+                    }
                 }
                 self.consolidation_counter = 0;
             }
@@ -215,6 +259,15 @@ impl LifeLoop {
                             }
                         }
 
+                        if let Some(ref sm) = self.self_model {
+                            let sm = sm.lock().await;
+                            modules.insert("self_model".to_string(), sm.snapshot());
+                        }
+                        if let Some(ref wm) = self.world_model {
+                            let wm = wm.lock().await;
+                            modules.insert("world_model".to_string(), wm.snapshot());
+                        }
+
                         CosmicSnapshot {
                             modules,
                             version: 1,
@@ -223,12 +276,23 @@ impl LifeLoop {
                     };
 
                     let p = persistence.lock().await;
-                    if let Err(e) = p.save_all(&snapshot) {
-                        tracing::warn!("Persistence save failed: {e}");
-                    } else {
+                    let save_ok = p.save_all(&snapshot).is_ok();
+                    if save_ok {
                         tracing::debug!(
                             modules = snapshot.modules.len(),
                             "Life loop persistence checkpoint saved"
+                        );
+                    } else {
+                        tracing::warn!("Persistence save failed");
+                    }
+                    if let Some(ref sm) = self.self_model {
+                        let mut sm = sm.lock().await;
+                        let value = if save_ok { 1.0 } else { 0.2 };
+                        sm.update_belief(
+                            "self:persistence_health",
+                            value,
+                            0.95,
+                            BeliefSource::Observed,
                         );
                     }
                 }

@@ -230,6 +230,24 @@ impl PolicyEngine {
         matching as f64 / action_words.len().max(1) as f64
     }
 
+    pub fn record_outcome(&mut self, tool_name: &str, action: &str, success: bool) {
+        let policy_id = format!("learned_{tool_name}");
+        if let Some(existing) = self.policies.get_mut(&policy_id) {
+            let adjustment = if success { 0.05 } else { -0.1 };
+            existing.weight = (existing.weight + adjustment).clamp(0.0, 1.0);
+        } else if !success {
+            self.register_policy(
+                &policy_id,
+                PolicyLayer::Learned,
+                tool_name,
+                action,
+                "proceed with caution",
+                0.4,
+                0.3,
+            );
+        }
+    }
+
     fn record_decision(&mut self, decision: PolicyDecision) {
         self.decisions.push(decision);
         if self.decisions.len() > self.decision_capacity {

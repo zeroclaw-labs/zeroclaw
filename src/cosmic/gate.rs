@@ -14,7 +14,7 @@ pub struct GateDecision {
 pub struct CosmicGate {
     normative: Arc<Mutex<NormativeEngine>>,
     policy: Arc<Mutex<PolicyEngine>>,
-    _counterfactual: Arc<Mutex<CounterfactualEngine>>,
+    counterfactual: Arc<Mutex<CounterfactualEngine>>,
 }
 
 impl CosmicGate {
@@ -26,7 +26,7 @@ impl CosmicGate {
         Self {
             normative,
             policy,
-            _counterfactual: counterfactual,
+            counterfactual,
         }
     }
 
@@ -60,10 +60,44 @@ impl CosmicGate {
             };
         }
 
+        let cf_result = {
+            let mut cf = self.counterfactual.lock();
+            let scenario = super::Scenario {
+                id: format!("gate_{tool_name}"),
+                action: action_description.to_string(),
+                context: std::collections::HashMap::new(),
+                created_at: chrono::Utc::now(),
+            };
+            cf.simulate(&scenario)
+        };
+
+        if cf_result.risk > 0.8 && cf_result.confidence > 0.5 {
+            return GateDecision {
+                allowed: false,
+                reason: Some(format!(
+                    "Counterfactual simulation blocked tool '{tool_name}': risk={:.2}, confidence={:.2}",
+                    cf_result.risk, cf_result.confidence
+                )),
+                risk_score: cf_result.risk,
+            };
+        }
+
+        let combined_risk = (policy_score.score.abs() * 0.5 + cf_result.risk * 0.5).min(1.0);
+
         GateDecision {
             allowed: true,
             reason: None,
-            risk_score: policy_score.score.abs().min(1.0),
+            risk_score: combined_risk,
+        }
+    }
+
+    pub fn record_tool_outcome(&self, tool_name: &str, action: &str, success: bool) {
+        let mut policy = self.policy.lock();
+        policy.record_outcome(tool_name, action, success);
+
+        if !success {
+            let mut cf = self.counterfactual.lock();
+            cf.update_world_state(&format!("tool_{tool_name}_reliability"), 0.3);
         }
     }
 }
