@@ -43,6 +43,7 @@ pub mod approval;
 pub mod auth;
 pub mod channels;
 pub mod config;
+pub mod control;
 pub mod cost;
 pub mod cron;
 pub mod daemon;

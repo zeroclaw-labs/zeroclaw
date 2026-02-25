@@ -276,6 +276,8 @@ pub struct AppState {
     pub whatsapp_app_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    pub control_store: Option<Arc<crate::control::ControlStore>>,
+    pub control_events_tx: Option<tokio::sync::broadcast::Sender<String>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -477,6 +479,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         observer,
+        control_store: None,
+        control_events_tx: None,
     };
 
     // Build router with middleware
@@ -487,6 +491,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route(
+            "/api/control/metrics",
+            get(crate::control::handlers::handle_control_metrics),
+        )
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1063,6 +1071,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            control_store: None,
+            control_events_tx: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1104,6 +1114,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer,
+            control_store: None,
+            control_events_tx: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1455,6 +1467,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            control_store: None,
+            control_events_tx: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1511,6 +1525,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            control_store: None,
+            control_events_tx: None,
         };
 
         let headers = HeaderMap::new();
@@ -1576,6 +1592,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            control_store: None,
+            control_events_tx: None,
         };
 
         let response = handle_webhook(
@@ -1614,6 +1632,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            control_store: None,
+            control_events_tx: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1655,6 +1675,8 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            control_store: None,
+            control_events_tx: None,
         };
 
         let mut headers = HeaderMap::new();

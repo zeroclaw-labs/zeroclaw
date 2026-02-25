@@ -47,6 +47,7 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod control;
 mod cost {
     pub use zeroclaw::cost::*;
 }
