@@ -1,5 +1,5 @@
 # Default owner for all files
-* @theonlyhennygod @chumyin
+* @theonlyhennygod
 
 # Important functional modules
 /src/agent/** @theonlyhennygod
@@ -8,25 +8,25 @@
 /src/tools/** @theonlyhennygod
 /src/gateway/** @theonlyhennygod
 /src/runtime/** @theonlyhennygod
-/src/memory/** @theonlyhennygod @chumyin
+/src/memory/** @theonlyhennygod
 /Cargo.toml @theonlyhennygod
 /Cargo.lock @theonlyhennygod
 
 # Security / tests / CI-CD ownership
-/src/security/** @chumyin
-/tests/** @chumyin
-/.github/** @chumyin
-/.github/workflows/** @chumyin
-/.github/codeql/** @chumyin
-/.github/dependabot.yml @chumyin
-/SECURITY.md @chumyin
-/docs/actions-source-policy.md @chumyin
-/docs/ci-map.md @chumyin
+/src/security/** @theonlyhennygod
+/tests/** @theonlyhennygod
+/.github/** @theonlyhennygod
+/.github/workflows/** @theonlyhennygod
+/.github/codeql/** @theonlyhennygod
+/.github/dependabot.yml @theonlyhennygod
+/SECURITY.md @theonlyhennygod
+/docs/actions-source-policy.md @theonlyhennygod
+/docs/ci-map.md @theonlyhennygod
 
 # Docs & governance
-/docs/** @chumyin
-/AGENTS.md @chumyin
-/CLAUDE.md @chumyin
-/CONTRIBUTING.md @chumyin
-/docs/pr-workflow.md @chumyin
-/docs/reviewer-playbook.md @chumyin
+/docs/** @theonlyhennygod
+/AGENTS.md @theonlyhennygod
+/CLAUDE.md @theonlyhennygod
+/CONTRIBUTING.md @theonlyhennygod
+/docs/pr-workflow.md @theonlyhennygod
+/docs/reviewer-playbook.md @theonlyhennygod
