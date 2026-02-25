@@ -336,10 +336,7 @@ impl std::fmt::Debug for DelegateAgentConfig {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("system_prompt", &self.system_prompt)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| "***REDACTED***".to_string()),
-            )
+            .field("api_key_configured", &self.api_key.is_some())
             .field("temperature", &self.temperature)
             .field("max_depth", &self.max_depth)
             .field("agentic", &self.agentic)
@@ -383,10 +380,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("workspace_dir", &self.workspace_dir)
             .field("config_path", &self.config_path)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| "***REDACTED***".to_string()),
-            )
+            .field("api_key_configured", &self.api_key.is_some())
             .field("api_url_configured", &self.api_url.is_some())
             .field("default_provider", &self.default_provider)
             .field("provider_api", &self.provider_api)
@@ -5690,17 +5684,20 @@ mod tests {
         let debug_output = format!("{config:?}");
         assert!(debug_output.contains("***REDACTED***"));
 
-        for secret in [
+        for (idx, secret) in [
             "root-credential",
             "postgres://user:pw@host/db",
             "browser-credential",
             "zc_0123456789abcdef",
             "telegram-credential",
             "agent-credential",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
                 !debug_output.contains(secret),
-                "debug output leaked secret value: {secret}"
+                "debug output leaked secret value at index {idx}"
             );
         }
 
