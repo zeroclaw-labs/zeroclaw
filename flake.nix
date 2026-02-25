@@ -8,21 +8,6 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-    let
-      nixosModule = { pkgs, ... }: {
-        nixpkgs.overlays = [ fenix.overlays.default ];
-        environment.systemPackages = [
-          (pkgs.fenix.stable.withComponents [
-            "cargo"
-            "clippy"
-            "rust-src"
-            "rustc"
-            "rustfmt"
-          ])
-          pkgs.rust-analyzer
-        ];
-      };
-    in
   outputs = { self, flake-utils, fenix, nixpkgs }:
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -33,8 +18,8 @@
             (import ./overlay.nix)
           ];
         };
-      in {
-        formatter = pkgs.nixfmt-tree;
+      in
+      {
         packages = {
           default = self.packages.${system}.zeroclaw;
           inherit (pkgs) zeroclaw;
@@ -45,17 +30,6 @@
             pkgs.rust-analyzer
           ];
         };
-      }) // {
-      nixosConfigurations = {
-        nixos = nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [ nixosModule ];
-        };
-
-        nixos-aarch64 = nixpkgs.lib.nixosSystem {
-          system = "aarch64-linux";
-          modules = [ nixosModule ];
-        };
-      };
-    };
+      }
+    );
 }
