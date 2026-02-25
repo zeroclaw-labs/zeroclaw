@@ -1697,6 +1697,206 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertGreaterEqual(len(report["files"]), 3)
         self.assertIn("zeroclaw-x86_64-unknown-linux-gnu.tar.gz", checksums.read_text(encoding="utf-8"))
 
+    def test_release_trigger_guard_allows_authorized_actor_and_tagger(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0", "-m", "v0.2.0"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+
+        out_json = self.tmp / "release-trigger-guard.json"
+        out_md = self.tmp / "release-trigger-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_trigger_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--origin-url",
+                str(repo),
+                "--event-name",
+                "push",
+                "--actor",
+                "chumyin",
+                "--release-ref",
+                "v0.2.0",
+                "--release-tag",
+                "v0.2.0",
+                "--publish-release",
+                "true",
+                "--authorized-actors",
+                "willsarg,theonlyhennygod,chumyin",
+                "--authorized-tagger-emails",
+                "test@example.com",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready_to_publish"])
+        self.assertTrue(report["authorization"]["actor_authorized"])
+        self.assertTrue(report["authorization"]["tagger_authorized"])
+        self.assertTrue(report["tag_metadata"]["annotated_tag"])
+        self.assertEqual(report["tag_metadata"]["cargo_version"], "0.2.0")
+
+    def test_release_trigger_guard_blocks_unauthorized_actor(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0", "-m", "v0.2.0"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+
+        out_json = self.tmp / "release-trigger-guard-unauthorized.json"
+        out_md = self.tmp / "release-trigger-guard-unauthorized.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_trigger_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--origin-url",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--actor",
+                "intruder",
+                "--release-ref",
+                "v0.2.0",
+                "--release-tag",
+                "v0.2.0",
+                "--publish-release",
+                "true",
+                "--authorized-actors",
+                "willsarg,theonlyhennygod,chumyin",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready_to_publish"])
+        self.assertFalse(report["authorization"]["actor_authorized"])
+        joined = "\n".join(report["violations"])
+        self.assertIn("not authorized", joined)
+
+    def test_release_trigger_guard_rejects_lightweight_tag(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        tag_proc = run_cmd(["git", "update-ref", "refs/tags/v0.2.0", "HEAD"], cwd=repo)
+        self.assertEqual(tag_proc.returncode, 0, msg=tag_proc.stderr)
+        tag_list = run_cmd(["git", "tag", "--list", "v0.2.0"], cwd=repo)
+        self.assertEqual(tag_list.stdout.strip(), "v0.2.0")
+        remote_proc = run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        self.assertEqual(remote_proc.returncode, 0, msg=remote_proc.stderr)
+
+        out_json = self.tmp / "release-trigger-guard-lightweight.json"
+        out_md = self.tmp / "release-trigger-guard-lightweight.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_trigger_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--origin-url",
+                str(repo),
+                "--event-name",
+                "push",
+                "--actor",
+                "chumyin",
+                "--release-ref",
+                "v0.2.0",
+                "--release-tag",
+                "v0.2.0",
+                "--publish-release",
+                "true",
+                "--authorized-actors",
+                "willsarg,theonlyhennygod,chumyin",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("annotated tag", joined)
+
     def test_nightly_matrix_report_fails_on_failed_lane(self) -> None:
         lane_root = self.tmp / "lane-artifacts"
         lane_root.mkdir(parents=True, exist_ok=True)
