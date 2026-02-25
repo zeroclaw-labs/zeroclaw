@@ -669,7 +669,6 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     struct EnvGuard {
         key: &'static str,
@@ -695,13 +694,6 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
     }
 
     #[test]
@@ -751,7 +743,6 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_prefers_explicit_endpoint_env() {
-        let _env_lock = env_lock();
         let _endpoint_guard = EnvGuard::set(
             CODEX_RESPONSES_URL_ENV,
             Some("https://env.example.com/v1/responses"),
@@ -767,7 +758,6 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
-        let _env_lock = env_lock();
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
@@ -795,10 +785,6 @@ mod tests {
 
     #[test]
     fn constructor_enables_custom_endpoint_key_mode() {
-        let _env_lock = env_lock();
-        let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
-        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
-
         let options = ProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
             ..ProviderRuntimeOptions::default()
@@ -1032,9 +1018,6 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
-            custom_provider_api_mode: None,
-            max_tokens_override: None,
-            model_support_vision: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

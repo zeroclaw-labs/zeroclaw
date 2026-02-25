@@ -123,10 +123,6 @@ Notes:
 - `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
 - `zeroclaw doctor traces --id <TRACE_ID>`
 
-Provider connectivity matrix CI/local helper:
-
-- `python3 scripts/ci/provider_connectivity_matrix.py --binary target/release-fast/zeroclaw --contract .github/connectivity/probe-contract.json`
-
 `doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`

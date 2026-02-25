@@ -59,30 +59,6 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 // ── Top-level config ──────────────────────────────────────────────
 
-/// Protocol mode for `custom:` OpenAI-compatible providers.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderApiMode {
-    /// Default behavior: `/chat/completions` first, optional `/responses`
-    /// fallback when supported.
-    OpenAiChatCompletions,
-    /// Responses-first behavior: call `/responses` directly.
-    OpenAiResponses,
-}
-
-impl ProviderApiMode {
-    pub fn as_compatible_mode(self) -> crate::providers::compatible::CompatibleApiMode {
-        match self {
-            Self::OpenAiChatCompletions => {
-                crate::providers::compatible::CompatibleApiMode::OpenAiChatCompletions
-            }
-            Self::OpenAiResponses => {
-                crate::providers::compatible::CompatibleApiMode::OpenAiResponses
-            }
-        }
-    }
-}
-
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
@@ -101,9 +77,6 @@ pub struct Config {
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
     #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
-    /// Optional API protocol mode for `custom:` providers.
-    #[serde(default)]
-    pub provider_api: Option<ProviderApiMode>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     #[serde(alias = "model")]
     pub default_model: Option<String>,
@@ -128,10 +101,6 @@ pub struct Config {
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
     pub runtime: RuntimeConfig,
-
-    /// Research phase configuration (`[research]`). Proactive information gathering.
-    #[serde(default)]
-    pub research: ResearchPhaseConfig,
 
     /// Reliability settings: retries, fallback providers, backoff (`[reliability]`).
     #[serde(default)]
@@ -248,17 +217,6 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
-
-    /// Inter-process agent communication (`[agents_ipc]`).
-    #[serde(default)]
-    pub agents_ipc: AgentsIpcConfig,
-
-    /// Vision support override for the active provider/model.
-    /// - `None` (default): use provider's built-in default
-    /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
-    /// - `Some(false)`: force vision support off
-    #[serde(default)]
-    pub model_support_vision: Option<bool>,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -430,44 +388,6 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
-        }
-    }
-}
-
-// ── Agents IPC ──────────────────────────────────────────────────
-
-fn default_agents_ipc_db_path() -> String {
-    "~/.zeroclaw/agents.db".into()
-}
-
-fn default_agents_ipc_staleness_secs() -> u64 {
-    300
-}
-
-/// Inter-process agent communication configuration (`[agents_ipc]` section).
-///
-/// When enabled, registers IPC tools that let independent ZeroClaw processes
-/// on the same host discover each other and exchange messages via a shared
-/// SQLite database. Disabled by default (zero overhead when off).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AgentsIpcConfig {
-    /// Enable inter-process agent communication tools.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to shared SQLite database (all agents on this host share one file).
-    #[serde(default = "default_agents_ipc_db_path")]
-    pub db_path: String,
-    /// Agents not seen within this window are considered offline (seconds).
-    #[serde(default = "default_agents_ipc_staleness_secs")]
-    pub staleness_secs: u64,
-}
-
-impl Default for AgentsIpcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            db_path: default_agents_ipc_db_path(),
-            staleness_secs: default_agents_ipc_staleness_secs(),
         }
     }
 }
@@ -880,28 +800,6 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
-
-    /// Node-control protocol scaffold (`[gateway.node_control]`).
-    #[serde(default)]
-    pub node_control: NodeControlConfig,
-}
-
-/// Node-control scaffold settings under `[gateway.node_control]`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct NodeControlConfig {
-    /// Enable experimental node-control API endpoints.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Optional extra shared token for node-control API calls.
-    /// When set, clients must send this value in `X-Node-Control-Token`.
-    #[serde(default)]
-    pub auth_token: Option<String>,
-
-    /// Allowlist of remote node IDs for `node.describe`/`node.invoke`.
-    /// Empty means "no explicit allowlist" (accept all IDs).
-    #[serde(default)]
-    pub allowed_node_ids: Vec<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -950,7 +848,6 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
-            node_control: NodeControlConfig::default(),
         }
     }
 }
@@ -1162,15 +1059,6 @@ pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
     pub enabled: bool,
-    /// Provider: "fast_html2md", "nanohtml2text", or "firecrawl"
-    #[serde(default = "default_web_fetch_provider")]
-    pub provider: String,
-    /// Optional provider API key (required for provider = "firecrawl")
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Optional provider API URL override (for self-hosted providers)
-    #[serde(default)]
-    pub api_url: Option<String>,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -1189,10 +1077,6 @@ fn default_web_fetch_max_response_size() -> usize {
     500_000 // 500KB
 }
 
-fn default_web_fetch_provider() -> String {
-    "fast_html2md".into()
-}
-
 fn default_web_fetch_timeout_secs() -> u64 {
     30
 }
@@ -1201,9 +1085,6 @@ impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: default_web_fetch_provider(),
-            api_key: None,
-            api_url: None,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
@@ -1223,12 +1104,6 @@ pub struct WebSearchConfig {
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
-    /// Generic provider API key (used by firecrawl and as fallback for brave)
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Optional provider API URL override (for self-hosted providers)
-    #[serde(default)]
-    pub api_url: Option<String>,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
@@ -1257,8 +1132,6 @@ impl Default for WebSearchConfig {
         Self {
             enabled: false,
             provider: default_web_search_provider(),
-            api_key: None,
-            api_url: None,
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -1776,14 +1649,6 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
-
-    /// Enable TLS for the PostgreSQL connection.
-    ///
-    /// `true` — require TLS (skips certificate verification; suitable for
-    /// self-signed certs and most managed databases).
-    /// `false` (default) — plain TCP, backward-compatible.
-    #[serde(default)]
-    pub tls: bool,
 }
 
 fn default_storage_schema() -> String {
@@ -1802,7 +1667,6 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
-            tls: false,
         }
     }
 }
@@ -2316,109 +2180,6 @@ impl Default for RuntimeConfig {
     }
 }
 
-// ── Research Phase ───────────────────────────────────────────────
-
-/// Research phase trigger mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ResearchTrigger {
-    /// Never trigger research phase.
-    #[default]
-    Never,
-    /// Always trigger research phase before responding.
-    Always,
-    /// Trigger when message contains configured keywords.
-    Keywords,
-    /// Trigger when message exceeds minimum length.
-    Length,
-    /// Trigger when message contains a question mark.
-    Question,
-}
-
-/// Research phase configuration (`[research]` section).
-///
-/// When enabled, the agent proactively gathers information using tools
-/// before generating its main response. This creates a "thinking" phase
-/// where the agent explores the codebase, searches memory, or fetches
-/// external data to inform its answer.
-///
-/// ```toml
-/// [research]
-/// enabled = true
-/// trigger = "keywords"
-/// keywords = ["find", "search", "check", "investigate"]
-/// max_iterations = 5
-/// show_progress = true
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ResearchPhaseConfig {
-    /// Enable the research phase.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// When to trigger research phase.
-    #[serde(default)]
-    pub trigger: ResearchTrigger,
-
-    /// Keywords that trigger research phase (when `trigger = "keywords"`).
-    #[serde(default = "default_research_keywords")]
-    pub keywords: Vec<String>,
-
-    /// Minimum message length to trigger research (when `trigger = "length"`).
-    #[serde(default = "default_research_min_length")]
-    pub min_message_length: usize,
-
-    /// Maximum tool call iterations during research phase.
-    #[serde(default = "default_research_max_iterations")]
-    pub max_iterations: usize,
-
-    /// Show detailed progress during research (tool calls, results).
-    #[serde(default = "default_true")]
-    pub show_progress: bool,
-
-    /// Custom system prompt prefix for research phase.
-    /// If empty, uses default research instructions.
-    #[serde(default)]
-    pub system_prompt_prefix: String,
-}
-
-fn default_research_keywords() -> Vec<String> {
-    vec![
-        "find".into(),
-        "search".into(),
-        "check".into(),
-        "investigate".into(),
-        "look".into(),
-        "research".into(),
-        "найди".into(),
-        "проверь".into(),
-        "исследуй".into(),
-        "поищи".into(),
-    ]
-}
-
-fn default_research_min_length() -> usize {
-    50
-}
-
-fn default_research_max_iterations() -> usize {
-    5
-}
-
-impl Default for ResearchPhaseConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            trigger: ResearchTrigger::default(),
-            keywords: default_research_keywords(),
-            min_message_length: default_research_min_length(),
-            max_iterations: default_research_max_iterations(),
-            show_progress: true,
-            system_prompt_prefix: String::new(),
-        }
-    }
-}
-
 // ── Reliability / supervision ────────────────────────────────────
 
 /// Reliability and supervision configuration (`[reliability]` section).
@@ -2441,9 +2202,6 @@ pub struct ReliabilityConfig {
     pub api_keys: Vec<String>,
     /// Per-model fallback chains. When a model fails, try these alternatives in order.
     /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
-    ///
-    /// Compatibility behavior: keys matching configured provider names are treated
-    /// as provider-scoped remap chains during provider fallback.
     #[serde(default)]
     pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
     /// Initial backoff for channel/daemon restarts.
@@ -2563,10 +2321,6 @@ pub struct ModelRouteConfig {
     pub provider: String,
     /// Model to use with that provider
     pub model: String,
-    /// Optional max_tokens override for this route.
-    /// When set, provider requests cap output tokens to this value.
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
@@ -2915,9 +2669,7 @@ impl ChannelsConfig {
             ),
             (
                 Box::new(ConfigWrapper::new(&self.qq)),
-                self.qq
-                    .as_ref()
-                    .is_some_and(|qq| qq.receive_mode == QQReceiveMode::Websocket)
+                self.qq.is_some()
             ),
             (
                 Box::new(ConfigWrapper::new(&self.nostr)),
@@ -3155,9 +2907,6 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
-    /// When true, only respond to direct rooms, explicit @-mentions, or replies to bot messages.
-    #[serde(default)]
-    pub mention_only: bool,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -3779,15 +3528,6 @@ impl ChannelConfig for DingTalkConfig {
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum QQReceiveMode {
-    Websocket,
-    #[default]
-    Webhook,
-}
-
-/// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
     /// App ID from QQ Bot developer console
@@ -3797,9 +3537,6 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// Event receive mode: "webhook" (default) or "websocket".
-    #[serde(default)]
-    pub receive_mode: QQReceiveMode,
 }
 
 impl ChannelConfig for QQConfig {
@@ -3856,7 +3593,6 @@ impl Default for Config {
             api_key: None,
             api_url: None,
             default_provider: Some("openrouter".to_string()),
-            provider_api: None,
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             default_temperature: 0.7,
@@ -3864,7 +3600,6 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
-            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
@@ -3894,8 +3629,6 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
-            agents_ipc: AgentsIpcConfig::default(),
-            model_support_vision: None,
         }
     }
 }
@@ -4567,20 +4300,6 @@ impl Config {
             if route.model.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].model must not be empty");
             }
-            if route.max_tokens == Some(0) {
-                anyhow::bail!("model_routes[{i}].max_tokens must be greater than 0");
-            }
-        }
-
-        if self.provider_api.is_some()
-            && !self
-                .default_provider
-                .as_deref()
-                .is_some_and(|provider| provider.starts_with("custom:"))
-        {
-            anyhow::bail!(
-                "provider_api is only valid when default_provider uses the custom:<url> format"
-            );
         }
 
         // Embedding routes
@@ -4812,18 +4531,6 @@ impl Config {
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
                 "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
-                _ => {}
-            }
-        }
-
-        // Vision support override: ZEROCLAW_MODEL_SUPPORT_VISION or MODEL_SUPPORT_VISION
-        if let Ok(flag) = std::env::var("ZEROCLAW_MODEL_SUPPORT_VISION")
-            .or_else(|_| std::env::var("MODEL_SUPPORT_VISION"))
-        {
-            let normalized = flag.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "1" | "true" | "yes" | "on" => self.model_support_vision = Some(true),
-                "0" | "false" | "no" | "off" => self.model_support_vision = Some(false),
                 _ => {}
             }
         }
@@ -5362,7 +5069,6 @@ default_temperature = 0.7
             api_key: Some("sk-test-key".into()),
             api_url: None,
             default_provider: Some("openrouter".into()),
-            provider_api: None,
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.5,
@@ -5390,7 +5096,6 @@ default_temperature = 0.7
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
             },
-            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -5456,8 +5161,6 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
-            agents_ipc: AgentsIpcConfig::default(),
-            model_support_vision: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5550,24 +5253,6 @@ reasoning_enabled = false
     }
 
     #[test]
-    async fn model_support_vision_deserializes() {
-        let raw = r#"
-default_temperature = 0.7
-model_support_vision = true
-"#;
-
-        let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.model_support_vision, Some(true));
-
-        // Default (omitted) should be None
-        let raw_no_vision = r#"
-default_temperature = 0.7
-"#;
-        let parsed2: Config = toml::from_str(raw_no_vision).unwrap();
-        assert_eq!(parsed2.model_support_vision, None);
-    }
-
-    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -5622,7 +5307,6 @@ tool_dispatcher = "xml"
             api_key: Some("sk-roundtrip".into()),
             api_url: None,
             default_provider: Some("openrouter".into()),
-            provider_api: None,
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.9,
@@ -5630,7 +5314,6 @@ tool_dispatcher = "xml"
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
-            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -5660,8 +5343,6 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
-            agents_ipc: AgentsIpcConfig::default(),
-            model_support_vision: None,
         };
 
         config.save().await.unwrap();
@@ -5899,7 +5580,6 @@ tool_dispatcher = "xml"
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
-            mention_only: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -5920,7 +5600,6 @@ tool_dispatcher = "xml"
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
-            mention_only: true,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -5941,7 +5620,6 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.homeserver, "https://matrix.org");
         assert!(parsed.user_id.is_none());
         assert!(parsed.device_id.is_none());
-        assert!(!parsed.mention_only);
     }
 
     #[test]
@@ -6011,7 +5689,6 @@ allowed_users = ["@ops:matrix.org"]
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
-                mention_only: false,
             }),
             signal: None,
             whatsapp: None,
@@ -6294,9 +5971,6 @@ channel_id = "C123"
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
         assert_eq!(g.idempotency_max_keys, 10_000);
-        assert!(!g.node_control.enabled);
-        assert!(g.node_control.auth_token.is_none());
-        assert!(g.node_control.allowed_node_ids.is_empty());
     }
 
     #[test]
@@ -6328,11 +6002,6 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
-            node_control: NodeControlConfig {
-                enabled: true,
-                auth_token: Some("node-token".into()),
-                allowed_node_ids: vec!["node-1".into(), "node-2".into()],
-            },
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -6345,15 +6014,6 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
-        assert!(parsed.node_control.enabled);
-        assert_eq!(
-            parsed.node_control.auth_token.as_deref(),
-            Some("node-token")
-        );
-        assert_eq!(
-            parsed.node_control.allowed_node_ids,
-            vec!["node-1", "node-2"]
-        );
     }
 
     #[test]
@@ -6774,54 +6434,6 @@ requires_openai_auth = true
 
         std::env::remove_var("ZEROCLAW_PROVIDER");
         std::env::remove_var("PROVIDER");
-    }
-
-    #[test]
-    async fn provider_api_requires_custom_default_provider() {
-        let mut config = Config::default();
-        config.default_provider = Some("openai".to_string());
-        config.provider_api = Some(ProviderApiMode::OpenAiResponses);
-
-        let err = config
-            .validate()
-            .expect_err("provider_api should be rejected for non-custom provider");
-        assert!(err.to_string().contains(
-            "provider_api is only valid when default_provider uses the custom:<url> format"
-        ));
-    }
-
-    #[test]
-    async fn provider_api_invalid_value_is_rejected() {
-        let toml = r#"
-default_provider = "custom:https://example.com/v1"
-default_model = "gpt-4o"
-default_temperature = 0.7
-provider_api = "not-a-real-mode"
-"#;
-        let parsed = toml::from_str::<Config>(toml);
-        assert!(
-            parsed.is_err(),
-            "invalid provider_api should fail to deserialize"
-        );
-    }
-
-    #[test]
-    async fn model_route_max_tokens_must_be_positive_when_set() {
-        let mut config = Config::default();
-        config.model_routes = vec![ModelRouteConfig {
-            hint: "reasoning".to_string(),
-            provider: "openrouter".to_string(),
-            model: "anthropic/claude-sonnet-4.6".to_string(),
-            max_tokens: Some(0),
-            api_key: None,
-        }];
-
-        let err = config
-            .validate()
-            .expect_err("model route max_tokens=0 should be rejected");
-        assert!(err
-            .to_string()
-            .contains("model_routes[0].max_tokens must be greater than 0"));
     }
 
     #[test]
@@ -7435,28 +7047,6 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn env_override_model_support_vision() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.model_support_vision, None);
-
-        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "true");
-        config.apply_env_overrides();
-        assert_eq!(config.model_support_vision, Some(true));
-
-        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "false");
-        config.apply_env_overrides();
-        assert_eq!(config.model_support_vision, Some(false));
-
-        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "maybe");
-        config.model_support_vision = Some(true);
-        config.apply_env_overrides();
-        assert_eq!(config.model_support_vision, Some(true));
-
-        std::env::remove_var("ZEROCLAW_MODEL_SUPPORT_VISION");
-    }
-
-    #[test]
     async fn env_override_invalid_port_ignored() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -7676,9 +7266,6 @@ default_model = "legacy-model"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
-        assert!(!g.node_control.enabled);
-        assert!(g.node_control.auth_token.is_none());
-        assert!(g.node_control.allowed_node_ids.is_empty());
     }
 
     // ── Peripherals config ───────────────────────────────────────
@@ -7838,28 +7425,6 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
-    }
-
-    #[test]
-    async fn qq_config_defaults_to_webhook_receive_mode() {
-        let json = r#"{"app_id":"123","app_secret":"secret"}"#;
-        let parsed: QQConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
-        assert!(parsed.allowed_users.is_empty());
-    }
-
-    #[test]
-    async fn qq_config_toml_roundtrip_receive_mode() {
-        let qc = QQConfig {
-            app_id: "123".into(),
-            app_secret: "secret".into(),
-            allowed_users: vec!["*".into()],
-            receive_mode: QQReceiveMode::Websocket,
-        };
-        let toml_str = toml::to_string(&qc).unwrap();
-        let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
-        assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
     #[test]

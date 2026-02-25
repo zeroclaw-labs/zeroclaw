@@ -15,7 +15,6 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
-pub mod agents_ipc;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -46,16 +45,13 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
-pub mod process;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
-pub mod task_plan;
 pub mod traits;
-pub mod url_validation;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -88,7 +84,6 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
-pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -96,7 +91,6 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
-pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -216,8 +210,7 @@ pub fn all_tools_with_runtime(
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime.clone())),
-        Arc::new(ProcessTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -233,7 +226,6 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
-        Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -288,9 +280,6 @@ pub fn all_tools_with_runtime(
     if web_fetch_config.enabled {
         tool_arcs.push(Arc::new(WebFetchTool::new(
             security.clone(),
-            web_fetch_config.provider.clone(),
-            web_fetch_config.api_key.clone(),
-            web_fetch_config.api_url.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
@@ -300,20 +289,9 @@ pub fn all_tools_with_runtime(
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
-        let provider = root_config.web_search.provider.trim().to_lowercase();
-        let api_key = if provider == "brave" {
-            root_config
-                .web_search
-                .brave_api_key
-                .clone()
-                .or_else(|| root_config.web_search.api_key.clone())
-        } else {
-            root_config.web_search.api_key.clone()
-        };
         tool_arcs.push(Arc::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
-            api_key,
-            root_config.web_search.api_url.clone(),
+            root_config.web_search.brave_api_key.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
         )));
@@ -360,39 +338,11 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
-                custom_provider_api_mode: root_config
-                    .provider_api
-                    .map(|mode| mode.as_compatible_mode()),
-                max_tokens_override: None,
-                model_support_vision: root_config.model_support_vision,
             },
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
-    }
-
-    // Inter-process agent communication (opt-in)
-    if root_config.agents_ipc.enabled {
-        match agents_ipc::IpcDb::open(workspace_dir, &root_config.agents_ipc) {
-            Ok(ipc_db) => {
-                let ipc_db = Arc::new(ipc_db);
-                tool_arcs.push(Arc::new(agents_ipc::AgentsListTool::new(ipc_db.clone())));
-                tool_arcs.push(Arc::new(agents_ipc::AgentsSendTool::new(
-                    ipc_db.clone(),
-                    security.clone(),
-                )));
-                tool_arcs.push(Arc::new(agents_ipc::AgentsInboxTool::new(ipc_db.clone())));
-                tool_arcs.push(Arc::new(agents_ipc::StateGetTool::new(ipc_db.clone())));
-                tool_arcs.push(Arc::new(agents_ipc::StateSetTool::new(
-                    ipc_db,
-                    security.clone(),
-                )));
-            }
-            Err(e) => {
-                tracing::warn!("agents_ipc: failed to open IPC database: {e}");
-            }
-        }
     }
 
     boxed_registry_from_arcs(tool_arcs)

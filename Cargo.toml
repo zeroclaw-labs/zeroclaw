@@ -46,7 +46,7 @@ schemars = "1.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "chrono"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
@@ -58,9 +58,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML conversion providers (web_fetch tool)
-fast_html2md = { version = "0.0.58", optional = true }
-nanohtml2text = { version = "0.2", optional = true }
+# HTML to plain text conversion (web_fetch tool)
+nanohtml2text = "0.2"
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
@@ -101,7 +100,6 @@ prost = { version = "0.14", default-features = false, features = ["derive"], opt
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
-tokio-postgres-rustls = { version = "0.12", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -181,16 +179,17 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
+# Unix-specific dependencies (for root check, etc.)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
-default = ["channel-lark", "web-fetch-html2md"]
+default = []
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
-memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
+memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-web-fetch-html2md = ["dep:fast_html2md"]
-web-fetch-plaintext = ["dep:nanohtml2text"]
-firecrawl = []
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
@@ -230,7 +229,7 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tempfile = "3.26"
+tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"

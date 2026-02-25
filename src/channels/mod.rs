@@ -67,9 +67,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{
-    build_shell_policy_instructions, build_tool_instructions, run_tool_call_loop, scrub_credentials,
-};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -411,17 +409,6 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
-        ),
-        "whatsapp" => Some(
-            "When responding on WhatsApp:\n\
-             - Use *bold* for emphasis (WhatsApp uses single asterisks).\n\
-             - Be concise. No markdown headers (## etc.) — they don't render.\n\
-             - No markdown tables — use bullet lists instead.\n\
-             - For sending images, documents, videos, or audio files use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>]\n\
-             - The path MUST be an absolute filesystem path to a local file (e.g. [IMAGE:/home/nicolas/.zeroclaw/workspace/images/chart.png]).\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - You can combine text and media in one response — text is sent first, then each attachment.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         _ => None,
@@ -2764,18 +2751,15 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(
-                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                    mx.homeserver.clone(),
-                    mx.access_token.clone(),
-                    mx.room_id.clone(),
-                    mx.allowed_users.clone(),
-                    mx.user_id.clone(),
-                    mx.device_id.clone(),
-                    config.config_path.parent().map(|path| path.to_path_buf()),
-                )
-                .with_mention_only(mx.mention_only),
-            ),
+            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                mx.homeserver.clone(),
+                mx.access_token.clone(),
+                mx.room_id.clone(),
+                mx.allowed_users.clone(),
+                mx.user_id.clone(),
+                mx.device_id.clone(),
+                config.config_path.parent().map(|path| path.to_path_buf()),
+            )),
         });
     }
 
@@ -2962,20 +2946,14 @@ fn collect_configured_channels(
     }
 
     if let Some(ref qq) = config.channels_config.qq {
-        if qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook {
-            tracing::info!(
-                "QQ channel configured with receive_mode=webhook; websocket listener startup skipped."
-            );
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "QQ",
-                channel: Arc::new(QQChannel::new(
-                    qq.app_id.clone(),
-                    qq.app_secret.clone(),
-                    qq.allowed_users.clone(),
-                )),
-            });
-        }
+        channels.push(ConfiguredChannel {
+            display_name: "QQ",
+            channel: Arc::new(QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            )),
+        });
     }
 
     if let Some(ref ct) = config.channels_config.clawdtalk {
@@ -3056,9 +3034,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
-        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
-        max_tokens_override: None,
-        model_support_vision: config.model_support_vision,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -3216,7 +3191,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
-    system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
     if !skills.is_empty() {
         println!(

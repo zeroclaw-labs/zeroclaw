@@ -16,13 +16,13 @@ import { setLocale, type Locale } from './lib/i18n';
 
 // Locale context
 interface LocaleContextType {
-  locale: Locale;
-  setAppLocale: (locale: Locale) => void;
+  locale: string;
+  setAppLocale: (locale: string) => void;
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
   locale: 'tr',
-  setAppLocale: (_locale: Locale) => {},
+  setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -80,12 +80,12 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 }
 
 function AppContent() {
-  const { isAuthenticated, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState<Locale>('tr');
+  const { isAuthenticated, loading, pair, logout } = useAuth();
+  const [locale, setLocaleState] = useState('tr');
 
-  const setAppLocale = (newLocale: Locale) => {
+  const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
-    setLocale(newLocale);
+    setLocale(newLocale as Locale);
   };
 
   // Listen for 401 events to force logout

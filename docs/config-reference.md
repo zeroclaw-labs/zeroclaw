@@ -23,17 +23,8 @@ Schema export command:
 | Key | Default | Notes |
 |---|---|---|
 | `default_provider` | `openrouter` | provider ID or alias |
-| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
-| `model_support_vision` | unset (`None`) | Vision support override for active provider/model |
-
-Notes:
-
-- `model_support_vision = true` forces vision support on (e.g. Ollama running `llava`).
-- `model_support_vision = false` forces vision support off.
-- Unset keeps the provider's built-in default.
-- Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION` or `MODEL_SUPPORT_VISION` (values: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`).
 
 ## `[observability]`
 
@@ -80,10 +71,6 @@ Operational note for container users:
 
 - If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
 - Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
-- For OpenAI-compatible Responses fallback transport:
-  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode (`wss://.../responses`) for compatible providers.
-  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` forces HTTP-only mode.
-  - Unset = auto (websocket-first only when endpoint host is `api.openai.com`, then HTTP fallback if websocket fails).
 
 ## `[agent]`
 
@@ -185,47 +172,6 @@ provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
 ```
-
-## `[research]`
-
-Research phase allows the agent to gather information through tools before generating the main response.
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable research phase |
-| `trigger` | `never` | Research trigger strategy: `never`, `always`, `keywords`, `length`, `question` |
-| `keywords` | `["find", "search", "check", "investigate"]` | Keywords that trigger research (when trigger = `keywords`) |
-| `min_message_length` | `50` | Minimum message length to trigger research (when trigger = `length`) |
-| `max_iterations` | `5` | Maximum tool calls during research phase |
-| `show_progress` | `true` | Show research progress to user |
-
-Notes:
-
-- Research phase is **disabled by default** (`trigger = never`).
-- When enabled, the agent first gathers facts through tools (grep, file_read, shell, memory search), then responds using the collected context.
-- Research runs before the main agent turn and does not count toward `agent.max_tool_iterations`.
-- Trigger strategies:
-  - `never` — research disabled (default)
-  - `always` — research on every user message
-  - `keywords` — research when message contains any keyword from the list
-  - `length` — research when message length exceeds `min_message_length`
-  - `question` — research when message contains '?'
-
-Example:
-
-```toml
-[research]
-enabled = true
-trigger = "keywords"
-keywords = ["find", "show", "check", "how many"]
-max_iterations = 3
-show_progress = true
-```
-
-The agent will research the codebase before responding to queries like:
-- "Find all TODO in src/"
-- "Show contents of main.rs"
-- "How many files in the project?"
 
 ## `[runtime]`
 
@@ -375,14 +321,6 @@ Notes:
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
 
-## `[gateway.node_control]` (experimental)
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | enable node-control scaffold endpoint (`POST /api/node-control`) |
-| `auth_token` | `null` | optional extra shared token checked via `X-Node-Control-Token` |
-| `allowed_node_ids` | `[]` | allowlist for `node.describe`/`node.invoke` (`[]` accepts any) |
-
 ## `[autonomy]`
 
 | Key | Default | Purpose |
@@ -442,7 +380,6 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
-| `max_tokens` | unset | Optional per-route output token cap forwarded to provider APIs |
 | `api_key` | unset | Optional API key override for this route's provider |
 
 ### `[[embedding_routes]]`
@@ -463,7 +400,6 @@ embedding_model = "hint:semantic"
 hint = "reasoning"
 provider = "openrouter"
 model = "provider/model-id"
-max_tokens = 8192
 
 [[embedding_routes]]
 hint = "semantic"
