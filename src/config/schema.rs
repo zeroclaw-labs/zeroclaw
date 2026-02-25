@@ -110,6 +110,9 @@ pub struct Config {
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
+    /// Provider-specific behavior overrides (`[provider]`).
+    #[serde(default)]
+    pub provider: ProviderConfig,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
@@ -276,6 +279,15 @@ pub struct ModelProviderConfig {
     /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
     #[serde(default)]
     pub requires_openai_auth: bool,
+}
+
+/// Provider behavior overrides (`[provider]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ProviderConfig {
+    /// Optional reasoning level override for providers that support explicit levels
+    /// (e.g. OpenAI Codex `/responses` reasoning effort).
+    #[serde(default)]
+    pub reasoning_level: Option<String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -3859,6 +3871,7 @@ impl Default for Config {
             provider_api: None,
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
+            provider: ProviderConfig::default(),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -5365,6 +5378,7 @@ default_temperature = 0.7
             provider_api: None,
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
+            provider: ProviderConfig::default(),
             default_temperature: 0.5,
             observability: ObservabilityConfig {
                 backend: "log".into(),
@@ -5638,6 +5652,7 @@ tool_dispatcher = "xml"
             provider_api: None,
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
+            provider: ProviderConfig::default(),
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
