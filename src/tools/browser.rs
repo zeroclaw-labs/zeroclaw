@@ -704,6 +704,20 @@ impl BrowserTool {
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
     }
 
+    fn validate_output_path(&self, key: &str, path: &str) -> anyhow::Result<()> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("'{key}' path cannot be empty");
+        }
+        if trimmed.contains('\0') {
+            anyhow::bail!("'{key}' path contains invalid null byte");
+        }
+        if !self.security.is_path_allowed(trimmed) {
+            anyhow::bail!("'{key}' path blocked by security policy: {trimmed}");
+        }
+        Ok(())
+    }
+
     fn validate_computer_use_action(
         &self,
         action: &str,
@@ -732,6 +746,37 @@ impl BrowserTool {
                 self.validate_coordinate("to_x", to_x, self.computer_use.max_coordinate_x)?;
                 self.validate_coordinate("from_y", from_y, self.computer_use.max_coordinate_y)?;
                 self.validate_coordinate("to_y", to_y, self.computer_use.max_coordinate_y)?;
+            }
+            "key_type" => {
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'text' for key_type action"))?;
+                if text.trim().is_empty() {
+                    anyhow::bail!("'text' for key_type must not be empty");
+                }
+                if text.len() > 4096 {
+                    anyhow::bail!("'text' for key_type exceeds maximum length (4096 chars)");
+                }
+            }
+            "key_press" => {
+                let key = params
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'key' for key_press action"))?;
+                let valid = !key.trim().is_empty()
+                    && key.len() <= 32
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'));
+                if !valid {
+                    anyhow::bail!("'key' for key_press must be 1-32 chars of [A-Za-z0-9_+-]");
+                }
+            }
+            "screen_capture" => {
+                if let Some(path) = params.get("path").and_then(Value::as_str) {
+                    self.validate_output_path("path", path)?;
+                }
             }
             _ => {}
         }
@@ -1081,6 +1126,19 @@ impl Tool for BrowserTool {
                 });
             }
         };
+
+        if let BrowserAction::Screenshot {
+            path: Some(path), ..
+        } = &action
+        {
+            if let Err(err) = self.validate_output_path("path", path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
 
         self.execute_action(action, backend).await
     }
@@ -2549,6 +2607,50 @@ mod tests {
             .is_err());
         assert!(tool
             .validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
+            .is_err());
+    }
+
+    #[test]
+    fn screenshot_path_validation_blocks_escaped_paths() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        assert!(tool.validate_output_path("path", "/etc/passwd").is_err());
+        assert!(tool.validate_output_path("path", "../outside.png").is_err());
+        assert!(tool
+            .validate_output_path("path", "captures/page.png")
+            .is_ok());
+    }
+
+    #[test]
+    fn computer_use_key_actions_validate_params() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        let key_type_args = serde_json::json!({"text": "hello"});
+        assert!(tool
+            .validate_computer_use_action("key_type", key_type_args.as_object().unwrap())
+            .is_ok());
+        let missing_key_type = serde_json::json!({});
+        assert!(tool
+            .validate_computer_use_action("key_type", missing_key_type.as_object().unwrap())
+            .is_err());
+
+        let key_press_args = serde_json::json!({"key": "Enter"});
+        assert!(tool
+            .validate_computer_use_action("key_press", key_press_args.as_object().unwrap())
+            .is_ok());
+        let bad_key_press_args = serde_json::json!({"key": "Ctrl+Shift+Enter!!"});
+        assert!(tool
+            .validate_computer_use_action("key_press", bad_key_press_args.as_object().unwrap())
             .is_err());
     }
 

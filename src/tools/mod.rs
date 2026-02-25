@@ -311,6 +311,7 @@ pub fn all_tools_with_runtime(
             root_config.web_search.api_key.clone()
         };
         tool_arcs.push(Arc::new(WebSearchTool::new(
+            security.clone(),
             root_config.web_search.provider.clone(),
             api_key,
             root_config.web_search.api_url.clone(),
