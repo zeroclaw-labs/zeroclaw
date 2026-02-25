@@ -8,7 +8,6 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-  outputs = { flake-utils, fenix, nixpkgs, ... }:
     let
       nixosModule = { pkgs, ... }: {
         nixpkgs.overlays = [ fenix.overlays.default ];
@@ -24,11 +23,15 @@
         ];
       };
     in
+  outputs = { self, flake-utils, fenix, nixpkgs }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ fenix.overlays.default ];
+          overlays = [
+            fenix.overlays.default
+            (import ./overlay.nix)
+          ];
         };
         rustToolchain = pkgs.fenix.stable.withComponents [
           "cargo"
@@ -38,7 +41,11 @@
           "rustfmt"
         ];
       in {
-        packages.default = fenix.packages.${system}.stable.toolchain;
+        formatter = pkgs.nixfmt-tree;
+        packages = {
+          default = self.packages.${system}.zeroclaw;
+          inherit (pkgs) zeroclaw;
+        };
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
