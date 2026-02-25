@@ -1,7 +1,6 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, QQReceiveMode, SignalConfig, StreamMode,
-    WhatsAppConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -134,7 +133,6 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         },
         api_url: provider_api_url,
         default_provider: Some(provider),
-        provider_api: None,
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
@@ -142,7 +140,6 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
-        research: crate::config::ResearchPhaseConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
@@ -172,8 +169,6 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
-        agents_ipc: crate::config::AgentsIpcConfig::default(),
-        model_support_vision: None,
     };
 
     println!(
@@ -489,7 +484,6 @@ async fn run_quick_setup_with_home(
         }),
         api_url: None,
         default_provider: Some(provider_name.clone()),
-        provider_api: None,
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
@@ -497,7 +491,6 @@ async fn run_quick_setup_with_home(
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
-        research: crate::config::ResearchPhaseConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
@@ -527,8 +520,6 @@ async fn run_quick_setup_with_home(
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
-        agents_ipc: crate::config::AgentsIpcConfig::default(),
-        model_support_vision: None,
     };
 
     config.save().await?;
@@ -712,7 +703,6 @@ fn default_model_for_provider(provider: &str) -> String {
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
-        "hunyuan" => "hunyuan-t1-latest".into(),
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
@@ -861,20 +851,6 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "deepseek-reasoner".to_string(),
                 "DeepSeek Reasoner (mapped to V3.2 thinking)".to_string(),
-            ),
-        ],
-        "hunyuan" => vec![
-            (
-                "hunyuan-t1-latest".to_string(),
-                "Hunyuan T1 (deep reasoning, latest)".to_string(),
-            ),
-            (
-                "hunyuan-turbo-latest".to_string(),
-                "Hunyuan Turbo (fast, general purpose)".to_string(),
-            ),
-            (
-                "hunyuan-pro".to_string(),
-                "Hunyuan Pro (high quality)".to_string(),
             ),
         ],
         "xai" => vec![
@@ -2212,7 +2188,6 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("qwen", "Qwen — DashScope China endpoint"),
             ("qwen-intl", "Qwen — DashScope international endpoint"),
             ("qwen-us", "Qwen — DashScope US endpoint"),
-            ("hunyuan", "Hunyuan — Tencent large models (T1, Turbo, Pro)"),
             ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
             ("zai", "Z.AI — global coding endpoint"),
             ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
@@ -2898,7 +2873,6 @@ fn provider_env_var(name: &str) -> &'static str {
         "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "qwen" => "DASHSCOPE_API_KEY",
-        "hunyuan" => "HUNYUAN_API_KEY",
         "qianfan" => "QIANFAN_API_KEY",
         "zai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
@@ -3359,7 +3333,8 @@ enum ChannelMenuChoice {
     NextcloudTalk,
     DingTalk,
     QqOfficial,
-    LarkFeishu,
+    Lark,
+    Feishu,
     Nostr,
     Done,
 }
@@ -3378,7 +3353,8 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
-    ChannelMenuChoice::LarkFeishu,
+    ChannelMenuChoice::Lark,
+    ChannelMenuChoice::Feishu,
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
 ];
@@ -3504,12 +3480,22 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— Tencent QQ Bot"
                     }
                 ),
-                ChannelMenuChoice::LarkFeishu => format!(
-                    "Lark/Feishu {}",
-                    if config.lark.is_some() {
+                ChannelMenuChoice::Lark => format!(
+                    "Lark       {}",
+                    if config.lark.as_ref().is_some_and(|cfg| !cfg.use_feishu) {
                         "✅ connected"
                     } else {
-                        "— Lark/Feishu Bot"
+                        "— Lark Bot"
+                    }
+                ),
+                ChannelMenuChoice::Feishu => format!(
+                    "Feishu     {}",
+                    if config.feishu.is_some()
+                        || config.lark.as_ref().is_some_and(|cfg| cfg.use_feishu)
+                    {
+                        "✅ connected"
+                    } else {
+                        "— Feishu Bot"
                     }
                 ),
                 ChannelMenuChoice::Nostr => format!(
@@ -4014,7 +4000,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     device_id: detected_device_id,
                     room_id,
                     allowed_users,
-                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4763,35 +4748,36 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .filter(|s| !s.is_empty())
                     .collect();
 
-                let receive_mode_choice = Select::new()
-                    .with_prompt("  Receive mode")
-                    .items(["Webhook (recommended)", "WebSocket (legacy fallback)"])
-                    .default(0)
-                    .interact()?;
-                let receive_mode = if receive_mode_choice == 0 {
-                    QQReceiveMode::Webhook
-                } else {
-                    QQReceiveMode::Websocket
-                };
-
                 config.qq = Some(QQConfig {
                     app_id,
                     app_secret,
                     allowed_users,
-                    receive_mode,
                 });
             }
-            ChannelMenuChoice::LarkFeishu => {
-                // ── Lark/Feishu ──
+            ChannelMenuChoice::Lark | ChannelMenuChoice::Feishu => {
+                let is_feishu = matches!(choice, ChannelMenuChoice::Feishu);
+                let provider_label = if is_feishu { "Feishu" } else { "Lark" };
+                let provider_host = if is_feishu {
+                    "open.feishu.cn"
+                } else {
+                    "open.larksuite.com"
+                };
+                let base_url = if is_feishu {
+                    "https://open.feishu.cn/open-apis"
+                } else {
+                    "https://open.larksuite.com/open-apis"
+                };
+
+                // ── Lark / Feishu ──
                 println!();
                 println!(
                     "  {} {}",
-                    style("Lark/Feishu Setup").white().bold(),
-                    style("— talk to ZeroClaw from Lark or Feishu").dim()
+                    style(format!("{provider_label} Setup")).white().bold(),
+                    style(format!("— talk to ZeroClaw from {provider_label}")).dim()
                 );
-                print_bullet(
-                    "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
-                );
+                print_bullet(&format!(
+                    "1. Go to {provider_label} Open Platform ({provider_host})"
+                ));
                 print_bullet("2. Create an app and enable 'Bot' capability");
                 print_bullet("3. Copy the App ID and App Secret");
                 println!();
@@ -4813,20 +4799,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let use_feishu = Select::new()
-                    .with_prompt("  Region")
-                    .items(["Feishu (CN)", "Lark (International)"])
-                    .default(0)
-                    .interact()?
-                    == 0;
-
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let base_url = if use_feishu {
-                    "https://open.feishu.cn/open-apis"
-                } else {
-                    "https://open.larksuite.com/open-apis"
-                };
                 let app_id_clone = app_id.clone();
                 let app_secret_clone = app_secret.clone();
                 let endpoint = format!("{base_url}/auth/v3/tenant_access_token/internal");
@@ -4872,7 +4846,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 match thread_result {
                     Ok(Ok(())) => {
                         println!(
-                            "\r  {} Lark/Feishu credentials verified        ",
+                            "\r  {} {provider_label} credentials verified        ",
                             style("✅").green().bold()
                         );
                     }
@@ -4952,7 +4926,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 if allowed_users.is_empty() {
                     println!(
-                        "  {} No users allowlisted — Lark/Feishu inbound messages will be denied until you add Open IDs or '*'.",
+                        "  {} No users allowlisted — {provider_label} inbound messages will be denied until you add Open IDs or '*'.",
                         style("⚠").yellow().bold()
                     );
                 }
@@ -4964,7 +4938,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     encrypt_key: None,
                     allowed_users,
                     mention_only: false,
-                    use_feishu,
+                    use_feishu: is_feishu,
                     receive_mode,
                     port,
                 });
@@ -5792,29 +5766,6 @@ mod tests {
         }
     }
 
-    async fn run_quick_setup_with_clean_env(
-        credential_override: Option<&str>,
-        provider: Option<&str>,
-        model_override: Option<&str>,
-        memory_backend: Option<&str>,
-        force: bool,
-        home: &Path,
-    ) -> Result<Config> {
-        let _env_guard = env_lock().lock().await;
-        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
-        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
-
-        run_quick_setup_with_home(
-            credential_override,
-            provider,
-            model_override,
-            memory_backend,
-            force,
-            home,
-        )
-        .await
-    }
-
     // ── ProjectContext defaults ──────────────────────────────────
 
     #[test]
@@ -5879,9 +5830,12 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_model_override_persists_to_config_toml() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_clean_env(
+        let config = run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("openrouter"),
             Some("custom-model-946"),
@@ -5903,9 +5857,12 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_without_model_uses_provider_default_model() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_clean_env(
+        let config = run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("anthropic"),
             None,
@@ -5923,6 +5880,9 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_requires_force_when_non_interactive() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
         let zeroclaw_dir = tmp.path().join(".zeroclaw");
         let config_path = zeroclaw_dir.join("config.toml");
@@ -5932,7 +5892,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_clean_env(
+        let err = run_quick_setup_with_home(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
@@ -5950,6 +5910,9 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_overwrites_with_force() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
         let zeroclaw_dir = tmp.path().join(".zeroclaw");
         let config_path = zeroclaw_dir.join("config.toml");
@@ -5962,7 +5925,7 @@ mod tests {
         .await
         .unwrap();
 
-        let config = run_quick_setup_with_clean_env(
+        let config = run_quick_setup_with_home(
             Some("sk-force"),
             Some("openrouter"),
             Some("custom-model-fresh"),
@@ -6508,8 +6471,6 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
-        assert_eq!(default_model_for_provider("hunyuan"), "hunyuan-t1-latest");
-        assert_eq!(default_model_for_provider("tencent"), "hunyuan-t1-latest");
         assert_eq!(
             default_model_for_provider("nvidia"),
             "meta/llama-3.3-70b-instruct"
@@ -7088,8 +7049,6 @@ mod tests {
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
-        assert_eq!(provider_env_var("hunyuan"), "HUNYUAN_API_KEY");
-        assert_eq!(provider_env_var("tencent"), "HUNYUAN_API_KEY"); // alias
     }
 
     #[test]
@@ -7176,13 +7135,15 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+    fn channel_menu_choices_include_signal_nextcloud_lark_and_feishu() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Lark));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Feishu));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
+    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_feishu() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -7212,7 +7173,6 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
-            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7222,6 +7182,18 @@ mod tests {
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.nextcloud_talk = None;
+        channels.feishu = Some(crate::config::schema::FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
         });
         assert!(has_launchable_channels(&channels));
     }

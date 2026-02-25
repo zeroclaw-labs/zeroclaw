@@ -17,21 +17,6 @@ pub enum AutonomyLevel {
     Full,
 }
 
-impl std::str::FromStr for AutonomyLevel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "read_only" | "readonly" => Ok(Self::ReadOnly),
-            "supervised" => Ok(Self::Supervised),
-            "full" => Ok(Self::Full),
-            _ => Err(format!(
-                "invalid autonomy level '{s}': expected read_only, supervised, or full"
-            )),
-        }
-    }
-}
-
 /// Risk score for shell command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRiskLevel {

@@ -147,28 +147,28 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - os: blacksmith-2vcpu-ubuntu-2404
+                    - os: ubuntu-latest
                       target: x86_64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: blacksmith-2vcpu-ubuntu-2404
+                    - os: ubuntu-latest
                       target: aarch64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-aarch64-linux-gnu
                       linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
                       linker: aarch64-linux-gnu-gcc
-                    - os: blacksmith-2vcpu-ubuntu-2404
+                    - os: ubuntu-latest
                       target: armv7-unknown-linux-gnueabihf
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-arm-linux-gnueabihf
                       linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
                       linker: arm-linux-gnueabihf-gcc
-                    - os: blacksmith-2vcpu-ubuntu-2404
+                    - os: ubuntu-latest
                       target: armv7-linux-androideabi
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -177,7 +177,7 @@ jobs:
                       linker: ""
                       android_ndk: true
                       android_api: 21
-                    - os: blacksmith-2vcpu-ubuntu-2404
+                    - os: ubuntu-latest
                       target: aarch64-linux-android
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -225,32 +225,7 @@ jobs:
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
               run: |
                   sudo apt-get update -qq
-                  sudo apt-get install -y "${{ matrix.cross_compiler }}"
-
-            - name: Setup Android NDK
-              if: matrix.android_ndk
-              uses: nttld/setup-ndk@v1
-              id: setup-ndk
-              with:
-                  ndk-version: r26d
-                  add-to-path: true
-
-            - name: Configure Android toolchain
-              if: matrix.android_ndk
-              run: |
-                  echo "Setting up Android NDK toolchain for ${{ matrix.target }}"
-                  NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
-                  TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-                  
-                  # Add to path for linker resolution
-                  echo "$TOOLCHAIN" >> "$GITHUB_PATH"
-                  
-                  # Set linker environment variables
-                  if [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
-                    echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
-                  elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
-                    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
-                  fi
+                  sudo apt-get install -y ${{ matrix.cross_compiler }}
 
             - name: Setup Android NDK
               if: matrix.android_ndk
@@ -406,12 +381,8 @@ jobs:
                   path: artifacts
 
             - name: Install syft
-              shell: bash
               run: |
-                  set -euo pipefail
-                  mkdir -p "${RUNNER_TEMP}/bin"
-                  ./scripts/ci/install_syft.sh "${RUNNER_TEMP}/bin"
-                  echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+                  curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
 
             - name: Generate SBOM (CycloneDX)
               run: |

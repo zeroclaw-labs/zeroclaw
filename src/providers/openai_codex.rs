@@ -22,6 +22,8 @@ pub struct OpenAiCodexProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     client: Client,
+    /// Configured reasoning level from config (low, medium, high, xhigh).
+    reasoning_level: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +111,7 @@ impl OpenAiCodexProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            reasoning_level: options.reasoning_level.clone(),
         })
     }
 }
@@ -304,11 +307,16 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model_id: &str) -> String {
-    let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
-        .ok()
-        .and_then(|value| first_nonempty(Some(&value)))
-        .unwrap_or_else(|| "xhigh".to_string())
+fn resolve_reasoning_effort(model_id: &str, config_level: Option<&str>) -> String {
+    // Priority: config value > env var > default
+    let raw = config_level
+        .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) })
+        .or_else(|| {
+            std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
+                .ok()
+                .and_then(|value| first_nonempty(Some(&value)))
+        })
+        .unwrap_or_else(|| "high".to_string())
         .to_ascii_lowercase();
     clamp_reasoning_effort(model_id, &raw)
 }
@@ -572,7 +580,7 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
+                effort: resolve_reasoning_effort(normalized_model, self.reasoning_level.as_deref()),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -669,7 +677,6 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     struct EnvGuard {
         key: &'static str,
@@ -695,13 +702,6 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
     }
 
     #[test]
@@ -751,7 +751,6 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_prefers_explicit_endpoint_env() {
-        let _env_lock = env_lock();
         let _endpoint_guard = EnvGuard::set(
             CODEX_RESPONSES_URL_ENV,
             Some("https://env.example.com/v1/responses"),
@@ -767,7 +766,6 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
-        let _env_lock = env_lock();
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
@@ -795,10 +793,6 @@ mod tests {
 
     #[test]
     fn constructor_enables_custom_endpoint_key_mode() {
-        let _env_lock = env_lock();
-        let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
-        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
-
         let options = ProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
             ..ProviderRuntimeOptions::default()
@@ -871,6 +865,38 @@ mod tests {
             clamp_reasoning_effort("gpt-5.3-codex", "xhigh"),
             "xhigh".to_string()
         );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_uses_config_level_when_provided() {
+        // Config level takes priority
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("low")),
+            "low".to_string()
+        );
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("medium")),
+            "medium".to_string()
+        );
+        // Config level is clamped appropriately
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("xhigh")),
+            "high".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_uses_default_when_no_config() {
+        // No config, no env var -> default "high"
+        let result = resolve_reasoning_effort("gpt-5.3-codex", None);
+        assert_eq!(result, "high".to_string());
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_empty_config_uses_default() {
+        // Empty config string is treated as None
+        let result = resolve_reasoning_effort("gpt-5.3-codex", Some(""));
+        assert_eq!(result, "high".to_string());
     }
 
     #[test]
@@ -1032,9 +1058,7 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
-            custom_provider_api_mode: None,
-            max_tokens_override: None,
-            model_support_vision: None,
+            reasoning_level: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
