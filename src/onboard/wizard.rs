@@ -554,7 +554,7 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx, &memory_config.backend).await?;
+    scaffold_workspace(&workspace_dir, &default_ctx, &config.memory.backend).await?;
 
     println!(
         "  {} Workspace:  {}",
