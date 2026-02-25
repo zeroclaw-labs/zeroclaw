@@ -986,6 +986,7 @@ mod tests {
             encrypt_key: Some("feishu-encrypt-key".to_string()),
             verification_token: Some("feishu-verify-token".to_string()),
             allowed_users: vec!["*".to_string()],
+            group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(42617),
         });
@@ -1067,6 +1068,7 @@ mod tests {
             encrypt_key: Some("feishu-encrypt-key".to_string()),
             verification_token: Some("feishu-verify-token".to_string()),
             allowed_users: vec!["*".to_string()],
+            group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(42617),
         });
