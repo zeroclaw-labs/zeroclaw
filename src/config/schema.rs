@@ -94,7 +94,8 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// API key for the selected provider. Overridden by `ZEROCLAW_API_KEY` or `API_KEY` env vars.
+    /// API key for the selected provider. Always overridden by `ZEROCLAW_API_KEY` env var.
+    /// `API_KEY` env var is only used as fallback when no config key is set.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
@@ -5936,10 +5937,19 @@ impl Config {
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
-        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
+        // API Key: ZEROCLAW_API_KEY always wins (explicit intent).
+        // API_KEY (generic) is only used as a fallback when config has no api_key,
+        // because API_KEY is a very common env var name that may be set by unrelated
+        // tools and should not silently override an already-configured key.
+        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY") {
             if !key.is_empty() {
                 self.api_key = Some(key);
+            }
+        } else if self.api_key.as_ref().map_or(true, |k| k.is_empty()) {
+            if let Ok(key) = std::env::var("API_KEY") {
+                if !key.is_empty() {
+                    self.api_key = Some(key);
+                }
             }
         }
         // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
@@ -8415,6 +8425,35 @@ default_temperature = 0.7
         assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
 
         std::env::remove_var("API_KEY");
+    }
+
+    #[test]
+    async fn env_override_api_key_generic_does_not_override_config() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.api_key = Some("sk-config-key".to_string());
+
+        std::env::remove_var("ZEROCLAW_API_KEY");
+        std::env::set_var("API_KEY", "sk-generic-env-key");
+        config.apply_env_overrides();
+        // Generic API_KEY must NOT override an existing config key
+        assert_eq!(config.api_key.as_deref(), Some("sk-config-key"));
+
+        std::env::remove_var("API_KEY");
+    }
+
+    #[test]
+    async fn env_override_zeroclaw_api_key_overrides_config() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.api_key = Some("sk-config-key".to_string());
+
+        std::env::set_var("ZEROCLAW_API_KEY", "sk-explicit-env-key");
+        config.apply_env_overrides();
+        // ZEROCLAW_API_KEY should always win, even over config
+        assert_eq!(config.api_key.as_deref(), Some("sk-explicit-env-key"));
+
+        std::env::remove_var("ZEROCLAW_API_KEY");
     }
 
     #[test]
