@@ -1272,6 +1272,13 @@ fn install_registry_skill_source(
             let tool_dir = skill_dir.join("tools").join(&tool.name);
             std::fs::create_dir_all(&tool_dir)?;
 
+            // Validate artifact URLs: must be HTTPS and on the same host as the
+            // registry to prevent SSRF via a malicious registry response.
+            validate_artifact_url(&tool.wasm_url, registry_url)
+                .with_context(|| format!("unsafe wasm_url for tool '{}'", tool.name))?;
+            validate_artifact_url(&tool.manifest_url, registry_url)
+                .with_context(|| format!("unsafe manifest_url for tool '{}'", tool.name))?;
+
             // Download tool.wasm
             println!("  Downloading tool: {}", tool.name);
             let wasm_bytes = fetch_url_blocking(&tool.wasm_url)
@@ -1353,6 +1360,36 @@ struct RegistryToolEntry {
 }
 
 /// Blocking HTTP GET using the system `curl` binary (avoids adding a sync HTTP
+/// Validate that an artifact URL (wasm_url / manifest_url from the registry index)
+/// is HTTPS and served from the same host as the registry, preventing SSRF via a
+/// malicious registry response redirecting downloads to internal hosts.
+fn validate_artifact_url(artifact_url: &str, registry_url: &str) -> Result<()> {
+    if !artifact_url.starts_with("https://") {
+        anyhow::bail!("artifact URL must use HTTPS: {artifact_url}");
+    }
+    // Extract hostname (portion between "https://" and first '/', '?', '#', ':').
+    let registry_host = registry_url
+        .strip_prefix("https://")
+        .unwrap_or("")
+        .split(&['/', '?', '#', ':'][..])
+        .next()
+        .unwrap_or("");
+    let artifact_host = artifact_url
+        .strip_prefix("https://")
+        .unwrap_or("")
+        .split(&['/', '?', '#', ':'][..])
+        .next()
+        .unwrap_or("");
+    if registry_host.is_empty() || artifact_host != registry_host {
+        anyhow::bail!(
+            "artifact host '{}' is not allowed (expected '{}')",
+            artifact_host,
+            registry_host
+        );
+    }
+    Ok(())
+}
+
 /// crate to this sync code path). Falls back to a basic TCP approach is not needed
 /// because `curl` is universally available on target platforms.
 fn fetch_url_blocking(url: &str) -> Result<Vec<u8>> {

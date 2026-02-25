@@ -221,7 +221,7 @@ zeroclaw agent --provider anthropic -m "hello"
 ### 运行时支持（当前）
 
 - ✅ 当前支持：`runtime.kind = "native"` 或 `runtime.kind = "docker"`
-- 🚧 计划中，尚未实现：WASM 边缘运行时（基于 runtime.kind）。**注意：** 此项仅指基于 `runtime.kind` 的边缘运行时，与下方第 228–246 行描述的 WASM skill/tool 层无关——后者已可用。
+- 🚧 计划中，尚未实现：WASM 边缘运行时（基于 runtime.kind）。**注意：** 此项仅指基于 `runtime.kind` 的边缘运行时，与下方"WASM 技能（ZeroMarket）"章节描述的 WASM skill/tool 层无关——后者已可用。
 
 配置了不支持的 `runtime.kind` 时，ZeroClaw 会以明确的错误退出，而非静默回退到 native。
 

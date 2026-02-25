@@ -647,7 +647,7 @@ pub struct WasmConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Maximum linear memory per WASM invocation in MiB.
-    /// Clamped between 1 and 256. Default: `64`.
+    /// Valid range: 1..=256. Default: `64`.
     #[serde(default = "default_wasm_memory_limit_mb")]
     pub memory_limit_mb: u64,
     /// CPU fuel budget per invocation (roughly one unit ≈ one WASM instruction).
@@ -5200,10 +5200,16 @@ impl Config {
         }
         {
             let url = &self.wasm.registry_url;
-            let host = url
+            // Extract what comes after "https://" and check that the host part
+            // (up to the first '/', '?', '#', or ':') is non-empty.
+            let has_valid_host = url
                 .strip_prefix("https://")
-                .filter(|rest| !rest.is_empty() && !rest.starts_with('/'));
-            if host.is_none() {
+                .map(|rest| {
+                    let host = rest.split(&['/', '?', '#', ':'][..]).next().unwrap_or("");
+                    !host.is_empty()
+                })
+                .unwrap_or(false);
+            if !has_valid_host {
                 anyhow::bail!(
                     "wasm.registry_url must be a valid HTTPS URL with a non-empty host, got '{url}'"
                 );
@@ -5764,6 +5770,16 @@ mod tests {
         c.wasm = WasmConfig::default();
         c.wasm.registry_url = "https://".to_string();
         assert!(c.validate().is_err(), "https:// without host should fail");
+
+        // port-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://:443".to_string();
+        assert!(c.validate().is_err(), "https://:443 should fail");
+
+        // query-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://?q=1".to_string();
+        assert!(c.validate().is_err(), "https://?q=1 should fail");
     }
 
     #[test]

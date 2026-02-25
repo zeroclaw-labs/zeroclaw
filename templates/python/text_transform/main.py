@@ -43,8 +43,6 @@ def main():
         return
     try:
         result = run(args)
-    except TypeError:
-        raise
     except Exception as exc:
         result = {"success": False, "output": "", "error": str(exc)}
 
