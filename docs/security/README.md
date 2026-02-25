@@ -6,6 +6,13 @@ This section mixes current hardening guidance and proposal/roadmap documents.
 
 For current runtime behavior, start here:
 
+- Repository security policy and vulnerability handling workflow: [../../SECURITY.md](../../SECURITY.md)
+- Private vulnerability report template: [private-vulnerability-report-template.md](private-vulnerability-report-template.md)
+- 私密漏洞报告模板（中文）: [private-vulnerability-report-template.zh-CN.md](private-vulnerability-report-template.zh-CN.md)
+- Advisory maintainer checklist: [advisory-maintainer-checklist.md](advisory-maintainer-checklist.md)
+- Advisory 维护者检查清单（中文）: [advisory-maintainer-checklist.zh-CN.md](advisory-maintainer-checklist.zh-CN.md)
+- Advisory metadata template: [advisory-metadata-template.md](advisory-metadata-template.md)
+- Advisory 元数据模板（中文）: [advisory-metadata-template.zh-CN.md](advisory-metadata-template.zh-CN.md)
 - Config reference: [../config-reference.md](../config-reference.md)
 - Operations runbook: [../operations-runbook.md](../operations-runbook.md)
 - Troubleshooting: [../troubleshooting.md](../troubleshooting.md)
