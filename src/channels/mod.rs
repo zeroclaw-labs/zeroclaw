@@ -1262,12 +1262,13 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    let without_tool_tags = strip_tool_call_tags(response);
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    strip_isolated_tool_json_artifacts(&without_tool_tags, &known_tool_names)
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -6209,6 +6210,34 @@ This is an example JSON object for profile settings."#;
 
         let result = strip_isolated_tool_json_artifacts(input, &known_tools);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_tool_call_tags_and_tool_json_artifacts() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+
+        let input = r#"Let me check.
+<tool_call>
+{"name":"debug_trace","arguments":{"foo":"bar"}}
+</tool_call>
+{"name":"mock_price","parameters":{"symbol":"BTC"}}
+{"result":{"symbol":"BTC","price_usd":65000}}
+BTC is currently around $65,000 based on latest tool output."#;
+
+        let result = sanitize_channel_response(input, &tools);
+        let normalized = result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            normalized,
+            "Let me check.\nBTC is currently around $65,000 based on latest tool output."
+        );
+        assert!(!result.contains("<tool_call>"));
+        assert!(!result.contains("\"name\":\"mock_price\""));
+        assert!(!result.contains("\"result\""));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

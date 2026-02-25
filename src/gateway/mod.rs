@@ -958,6 +958,16 @@ async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow:
     crate::agent::process_message(config, message).await
 }
 
+fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    let sanitized = crate::channels::sanitize_channel_response(response, tools);
+    if sanitized.is_empty() && !response.trim().is_empty() {
+        "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+            .to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -1278,6 +1288,8 @@ async fn handle_webhook(
 
     match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
+            let safe_response =
+                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
             let duration = started_at.elapsed();
             state
                 .observer
@@ -1303,7 +1315,7 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": safe_response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -1482,9 +1494,11 @@ async fn handle_whatsapp_message(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
+                let safe_response =
+                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
                 // Send reply via WhatsApp
                 if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
@@ -1590,9 +1604,11 @@ async fn handle_linq_webhook(
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
+                let safe_response =
+                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
                 // Send reply via Linq
                 if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Linq reply: {e}");
@@ -1682,9 +1698,11 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
+                let safe_response =
+                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
                 // Send reply via WATI
                 if let Err(e) = wati
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send WATI reply: {e}");
@@ -1786,8 +1804,10 @@ async fn handle_nextcloud_talk_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
+                let safe_response =
+                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
                 if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Nextcloud Talk reply: {e}");
@@ -1875,9 +1895,11 @@ async fn handle_qq_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
+                let safe_response =
+                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
                 if let Err(e) = qq
                     .send(
-                        &SendMessage::new(response, &msg.reply_target)
+                        &SendMessage::new(safe_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -2373,6 +2395,72 @@ mod tests {
 
         let key = qq_memory_key(&msg);
         assert_eq!(key, "qq_user_openid_msg-123");
+    }
+
+    struct MockScheduleTool;
+
+    #[async_trait]
+    impl Tool for MockScheduleTool {
+        fn name(&self) -> &str {
+            "schedule"
+        }
+
+        fn description(&self) -> &str {
+            "Mock schedule tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn sanitize_gateway_response_removes_tool_call_tags() {
+        let input = r#"Before
+<tool_call>
+{"name":"schedule","arguments":{"action":"create"}}
+</tool_call>
+After"#;
+
+        let result = sanitize_gateway_response(input, &[]);
+        let normalized = result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(normalized, "Before\nAfter");
+        assert!(!result.contains("<tool_call>"));
+        assert!(!result.contains("\"name\":\"schedule\""));
+    }
+
+    #[test]
+    fn sanitize_gateway_response_removes_isolated_tool_json_artifacts() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let input = r#"{"name":"schedule","parameters":{"action":"create"}}
+{"result":{"status":"scheduled"}}
+Reminder set successfully."#;
+
+        let result = sanitize_gateway_response(input, &tools);
+        assert_eq!(result, "Reminder set successfully.");
+        assert!(!result.contains("\"name\":\"schedule\""));
+        assert!(!result.contains("\"result\""));
     }
 
     #[derive(Default)]
