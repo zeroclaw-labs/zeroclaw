@@ -960,4 +960,24 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "First\nSecond");
     }
+
+    #[test]
+    fn linq_parse_v3_skip_outbound_not_is_me() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3" },
+                "direction": "outbound",
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": false
+                },
+                "parts": [{ "type": "text", "value": "Forwarded message" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "outbound messages should be skipped even when is_me is false");
+    }
 }
