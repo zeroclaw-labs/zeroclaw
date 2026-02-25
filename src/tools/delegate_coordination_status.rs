@@ -202,10 +202,7 @@ impl Tool for DelegateCoordinationStatusTool {
             let mut message_preview = Vec::new();
             if include_messages {
                 let matched_messages = if let Some(correlation_id) = filter_correlation.as_deref() {
-                    message_total = self
-                        .bus
-                        .pending_for_agent_correlation(&agent, correlation_id)
-                        .unwrap_or(0);
+                    message_total = pending_filtered.unwrap_or(0);
                     self.bus
                         .peek_for_agent_correlation_with_offset(
                             &agent,

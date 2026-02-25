@@ -1273,7 +1273,10 @@ fn parse_delegate_context_correlation_from_key(key: &str) -> Option<&str> {
         return None;
     }
     // Require at least one trailing segment (e.g. delegate/<corr>/state).
-    let _tail = parts.next()?;
+    let tail = parts.next()?.trim();
+    if tail.is_empty() {
+        return None;
+    }
     Some(correlation)
 }
 
@@ -1604,6 +1607,35 @@ mod tests {
         assert_eq!(bus.dead_letter_count(), 1);
     }
 
+    #[test]
+    fn delegate_context_patch_rejects_empty_tail_segment() {
+        let bus = InMemoryMessageBus::new();
+
+        let mut patch = CoordinationEnvelope::new_broadcast(
+            "lead",
+            "conv-delegate-context-key-tail",
+            "delegate.state",
+            CoordinationPayload::ContextPatch {
+                key: "delegate/corr-a/".to_string(),
+                expected_version: 0,
+                value: json!({"phase":"queued"}),
+            },
+        );
+        patch.id = "msg-delegate-key-tail".to_string();
+        patch.correlation_id = Some("corr-a".to_string());
+        let error = bus
+            .publish(patch)
+            .expect_err("delegate context patch with empty tail must fail");
+        assert_eq!(
+            error,
+            CoordinationError::InvalidDelegateContextKey {
+                key: "delegate/corr-a/".to_string(),
+                message_id: "msg-delegate-key-tail".to_string(),
+            }
+        );
+        assert_eq!(bus.dead_letter_count(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_publish_keeps_inbox_order() {
         let bus = InMemoryMessageBus::new();
@@ -1814,6 +1846,58 @@ mod tests {
                 .expect("pending corr-a should succeed after drain"),
             2
         );
+    }
+
+    #[test]
+    fn inbox_correlation_counts_stay_consistent_with_overflow_evictions() {
+        let bus = InMemoryMessageBus::with_limits(InMemoryMessageBusLimits {
+            max_inbox_messages_per_agent: 2,
+            max_dead_letters: 16,
+            max_context_entries: 16,
+            max_seen_message_ids: 32,
+        });
+        bus.register_agent("worker").expect("register worker");
+
+        for (id, corr) in [("m0", "corr-a"), ("m1", "corr-b"), ("m2", "corr-a")] {
+            let mut envelope = CoordinationEnvelope::new_direct(
+                "lead",
+                "worker",
+                "conv-overflow-corr",
+                "coordination",
+                CoordinationPayload::DelegateTask {
+                    task_id: id.to_string(),
+                    summary: "overflow".to_string(),
+                    metadata: json!({}),
+                },
+            );
+            envelope.id = id.to_string();
+            envelope.correlation_id = Some(corr.to_string());
+            bus.publish(envelope).expect("publish should succeed");
+        }
+
+        // m0 (corr-a) should be evicted by inbox overflow.
+        assert_eq!(
+            bus.pending_for_agent_correlation("worker", "corr-a")
+                .expect("corr-a pending should work"),
+            1
+        );
+        assert_eq!(
+            bus.pending_for_agent_correlation("worker", "corr-b")
+                .expect("corr-b pending should work"),
+            1
+        );
+
+        let corr_a_page = bus
+            .peek_for_agent_correlation_with_offset("worker", "corr-a", 0, 10)
+            .expect("corr-a peek should work");
+        assert_eq!(corr_a_page.len(), 1);
+        assert_eq!(corr_a_page[0].envelope.id, "m2");
+
+        let corr_b_page = bus
+            .peek_for_agent_correlation_with_offset("worker", "corr-b", 0, 10)
+            .expect("corr-b peek should work");
+        assert_eq!(corr_b_page.len(), 1);
+        assert_eq!(corr_b_page[0].envelope.id, "m1");
     }
 
     #[test]
