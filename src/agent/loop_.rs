@@ -117,6 +117,10 @@ pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+/// Sentinel prefix for internal progress deltas (thinking/tool execution trace).
+/// Channel layers can suppress these messages by default and only expose them
+/// when the user explicitly asks for command/tool execution details.
+pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
 
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
@@ -383,7 +387,7 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
             };
-            let _ = tx.send(phase).await;
+            let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}{phase}")).await;
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -583,7 +587,7 @@ pub(crate) async fn run_tool_call_loop(
             if !tool_calls.is_empty() {
                 let _ = tx
                     .send(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                        "{DRAFT_PROGRESS_SENTINEL}\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
                         tool_calls.len()
                     ))
                     .await;
@@ -835,7 +839,9 @@ pub(crate) async fn run_tool_call_loop(
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
-                let _ = tx.send(progress).await;
+                let _ = tx
+                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
+                    .await;
             }
 
             executable_indices.push(idx);
@@ -906,7 +912,12 @@ pub(crate) async fn run_tool_call_loop(
                     "\u{274c}"
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+                let _ = tx
+                    .send(format!(
+                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
+                        call.name
+                    ))
+                    .await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));

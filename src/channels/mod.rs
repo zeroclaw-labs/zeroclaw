@@ -432,10 +432,153 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
+fn should_expose_internal_tool_details(user_message: &str) -> bool {
+    let trimmed = user_message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mentions_internal_details_en = lower.contains("command")
+        || lower.contains("tool call")
+        || lower.contains("function call")
+        || lower.contains("execution trace")
+        || lower.contains("internal step");
+    let mentions_internal_details_cjk = trimmed.contains("命令")
+        || trimmed.contains("工具调用")
+        || trimmed.contains("函数调用")
+        || trimmed.contains("执行过程");
+
+    // Fail closed for negated phrasing ("don't show commands", "不要显示命令").
+    const ENGLISH_NEGATIVE_HINTS: [&str; 18] = [
+        "don't show command",
+        "don't show commands",
+        "do not show command",
+        "do not show commands",
+        "don't output command",
+        "do not output command",
+        "without command",
+        "without commands",
+        "no command output",
+        "hide command",
+        "hide commands",
+        "omit command",
+        "omit commands",
+        "skip command",
+        "skip commands",
+        "don't show tool call",
+        "do not show tool call",
+        "do not show function call",
+    ];
+    if mentions_internal_details_en
+        && ENGLISH_NEGATIVE_HINTS
+            .iter()
+            .any(|hint| lower.contains(hint))
+    {
+        return false;
+    }
+
+    const CJK_NEGATIVE_HINTS: [&str; 22] = [
+        "不要输出命令",
+        "不要显示命令",
+        "不要展示命令",
+        "不要带上命令",
+        "不要附上命令",
+        "别输出命令",
+        "别显示命令",
+        "别展示命令",
+        "不要输出工具调用",
+        "不要显示工具调用",
+        "不要展示工具调用",
+        "别输出工具调用",
+        "别显示工具调用",
+        "不要输出函数调用",
+        "不要显示函数调用",
+        "不要展示函数调用",
+        "别输出函数调用",
+        "别显示函数调用",
+        "不要执行过程",
+        "不要过程",
+        "不要内部步骤",
+        "别把命令",
+    ];
+    if mentions_internal_details_cjk && CJK_NEGATIVE_HINTS.iter().any(|hint| trimmed.contains(hint))
+    {
+        return false;
+    }
+
+    const ENGLISH_HINTS: [&str; 20] = [
+        "show command",
+        "show commands",
+        "output command",
+        "output commands",
+        "print command",
+        "print commands",
+        "include command",
+        "include commands",
+        "with command",
+        "with commands",
+        "show tool call",
+        "show tool calls",
+        "show function call",
+        "show function calls",
+        "reveal tool call",
+        "reveal function call",
+        "tool call json",
+        "function call json",
+        "execution trace",
+        "internal steps",
+    ];
+    if ENGLISH_HINTS.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    const ENGLISH_VERBS: [&str; 7] = [
+        "show", "output", "print", "include", "reveal", "display", "share",
+    ];
+    if mentions_internal_details_en && ENGLISH_VERBS.iter().any(|verb| lower.contains(verb)) {
+        return true;
+    }
+
+    const CJK_HINTS: [&str; 14] = [
+        "输出命令",
+        "显示命令",
+        "展示命令",
+        "命令发给我",
+        "带上命令",
+        "输出工具调用",
+        "显示工具调用",
+        "展示工具调用",
+        "输出函数调用",
+        "显示函数调用",
+        "展示函数调用",
+        "函数指令",
+        "工具指令",
+        "执行过程",
+    ];
+    if CJK_HINTS.iter().any(|hint| trimmed.contains(hint)) {
+        return true;
+    }
+
+    const CJK_VERBS: [&str; 9] = [
+        "输出", "显示", "展示", "发我", "给我", "带上", "附上", "贴出", "列出",
+    ];
+    mentions_internal_details_cjk && CJK_VERBS.iter().any(|verb| trimmed.contains(verb))
+}
+
+fn split_internal_progress_delta(delta: &str) -> (bool, &str) {
+    if let Some(rest) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_SENTINEL) {
+        (true, rest)
+    } else {
+        (false, delta)
+    }
+}
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
+    expose_internal_tool_details: bool,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -444,6 +587,25 @@ fn build_channel_system_prompt(
             prompt = instructions.to_string();
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
+        }
+    }
+
+    if channel_name != "cli" {
+        let visibility_instruction = if expose_internal_tool_details {
+            "Execution visibility: the user explicitly requested command/tool details. \
+             You may include command lines or tool-step traces when directly relevant, \
+             but keep credentials and secrets redacted."
+        } else {
+            "Execution visibility: run tools/functions in the background and return an \
+             integrated final result. Do not reveal raw tool names, tool-call syntax, \
+             function arguments, shell commands, or internal execution traces unless the \
+             user explicitly asks for those details."
+        };
+
+        if prompt.is_empty() {
+            prompt = visibility_instruction.to_string();
+        } else {
+            prompt = format!("{prompt}\n\n{visibility_instruction}");
         }
     }
 
@@ -1670,8 +1832,14 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+    let expose_internal_tool_details =
+        msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
+    let system_prompt = build_channel_system_prompt(
+        ctx.system_prompt.as_str(),
+        &msg.channel,
+        &msg.reply_target,
+        expose_internal_tool_details,
+    );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -1722,6 +1890,7 @@ async fn process_channel_message(
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
+        let suppress_internal_progress = !expose_internal_tool_details;
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -1729,7 +1898,12 @@ async fn process_channel_message(
                     accumulated.clear();
                     continue;
                 }
-                accumulated.push_str(&delta);
+                let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
+                if suppress_internal_progress && is_internal_progress {
+                    continue;
+                }
+
+                accumulated.push_str(visible_delta);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
@@ -3772,6 +3946,13 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct DraftStreamingRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        draft_updates: tokio::sync::Mutex<Vec<String>>,
+        finalized_drafts: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -3798,6 +3979,60 @@ mod tests {
         }
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DraftStreamingRecordingChannel {
+        fn name(&self) -> &str {
+            "draft-streaming-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("draft:{}:{}", message.recipient, message.content));
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn update_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.draft_updates.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn finalize_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push(text.to_string());
             Ok(())
         }
     }
@@ -4307,6 +4542,152 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             !assistant_turn.content.contains("[Used tools:"),
             "telegram history should not persist tool-summary prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_hides_internal_progress_by_default() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-hide".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            !updates.is_empty(),
+            "draft updates should still include streamed final answer"
+        );
+        assert!(
+            !updates.iter().any(|entry| {
+                entry.contains("Thinking")
+                    || entry.contains("Got 1 tool call(s)")
+                    || entry.contains("mock_price")
+                    || entry.contains("⏳")
+            }),
+            "internal tool progress should stay hidden by default, got updates: {updates:?}"
+        );
+        drop(updates);
+
+        let finalized = channel_impl.finalized_drafts.lock().await;
+        assert_eq!(finalized.len(), 1);
+        assert!(finalized[0].contains("BTC is currently around"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_shows_internal_progress_on_explicit_request() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-show".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "Please show commands and tool calls you used.".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("Got 1 tool call(s)")),
+            "explicit requests should expose internal progress details, got updates: {updates:?}"
+        );
+        assert!(
+            updates.iter().any(|entry| entry.contains("Thinking")),
+            "explicit requests should expose internal thinking/progress text, got updates: {updates:?}"
         );
     }
 
@@ -6209,6 +6590,54 @@ Done reminder set for 1:38 AM."#;
             normalized,
             "Let me create the reminder properly:\nDone reminder set for 1:38 AM."
         );
+    }
+
+    #[test]
+    fn should_expose_internal_tool_details_matches_explicit_requests() {
+        assert!(should_expose_internal_tool_details(
+            "Please show commands and tool calls you used."
+        ));
+        assert!(should_expose_internal_tool_details(
+            "请输出命令和工具调用过程"
+        ));
+        assert!(!should_expose_internal_tool_details(
+            "帮我直接给最终结论，不要过程。"
+        ));
+    }
+
+    #[test]
+    fn should_expose_internal_tool_details_respects_negative_requests() {
+        assert!(!should_expose_internal_tool_details(
+            "Please do not show commands or tool calls, only final answer."
+        ));
+        assert!(!should_expose_internal_tool_details(
+            "不要显示命令和工具调用，直接给最终结论。"
+        ));
+    }
+
+    #[test]
+    fn split_internal_progress_delta_detects_sentinel_prefix() {
+        let payload = format!(
+            "{}⏳ shell: ls -la\n",
+            crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+        );
+        let (is_internal, visible) = split_internal_progress_delta(&payload);
+        assert!(is_internal);
+        assert_eq!(visible, "⏳ shell: ls -la\n");
+
+        let (is_internal_plain, plain) = split_internal_progress_delta("final answer");
+        assert!(!is_internal_plain);
+        assert_eq!(plain, "final answer");
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_visibility_policy() {
+        let hidden = build_channel_system_prompt("base", "telegram", "chat", false);
+        assert!(hidden.contains("run tools/functions in the background"));
+        assert!(hidden.contains("Do not reveal raw tool names"));
+
+        let exposed = build_channel_system_prompt("base", "telegram", "chat", true);
+        assert!(exposed.contains("user explicitly requested command/tool details"));
     }
 
     #[test]
