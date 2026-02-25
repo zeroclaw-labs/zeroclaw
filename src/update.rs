@@ -10,7 +10,8 @@ use std::process::Command;
 
 /// GitHub repository for releases
 const GITHUB_REPO: &str = "zeroclaw-labs/zeroclaw";
-const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
+const GITHUB_API_RELEASES: &str =
+    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
 
 /// Release information from GitHub API
 #[derive(Debug, serde::Deserialize)]
@@ -133,8 +134,7 @@ async fn download_binary(asset: &Asset, temp_dir: &Path) -> Result<PathBuf> {
         .await
         .context("Failed to read download content")?;
 
-    fs::write(&archive_path, &archive_bytes)
-        .context("Failed to write archive to temp file")?;
+    fs::write(&archive_path, &archive_bytes).context("Failed to write archive to temp file")?;
 
     tracing::info!("Extracting {}...", asset.name);
 
@@ -220,10 +220,8 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let old_path = current_exe.with_extension("exe.old");
-        fs::rename(current_exe, &old_path)
-            .context("Failed to rename old binary")?;
-        fs::copy(new_binary, current_exe)
-            .context("Failed to copy new binary")?;
+        fs::rename(current_exe, &old_path).context("Failed to rename old binary")?;
+        fs::copy(new_binary, current_exe).context("Failed to copy new binary")?;
         // Try to remove the old binary (may fail if still locked)
         let _ = fs::remove_file(&old_path);
     }
@@ -232,8 +230,7 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         // Use rename for atomic replacement on Unix
-        fs::rename(new_binary, current_exe)
-            .context("Failed to replace binary")?;
+        fs::rename(new_binary, current_exe).context("Failed to replace binary")?;
     }
 
     Ok(())
@@ -245,7 +242,11 @@ pub async fn check_for_update() -> Result<Option<String>> {
     let latest_version = release.tag_name.trim_start_matches('v');
 
     if latest_version != current_version() {
-        Ok(Some(format!("{} (current: {})", release.tag_name, current_version())))
+        Ok(Some(format!(
+            "{} (current: {})",
+            release.tag_name,
+            current_version()
+        )))
     } else {
         Ok(None)
     }
@@ -276,13 +277,21 @@ pub async fn self_update(force: bool, check_only: bool) -> Result<()> {
 
     if check_only {
         println!();
-        println!("Update available: {} -> {}", current_version(), latest_version);
+        println!(
+            "Update available: {} -> {}",
+            current_version(),
+            latest_version
+        );
         println!("Run `zeroclaw update` to install the update.");
         return Ok(());
     }
 
     println!();
-    println!("Updating from v{} to {}...", current_version(), latest_version);
+    println!(
+        "Updating from v{} to {}...",
+        current_version(),
+        latest_version
+    );
 
     // Find the appropriate asset
     let asset = find_asset_for_platform(&release)?;
