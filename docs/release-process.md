@@ -117,6 +117,12 @@ Decision output:
 - `hold`: insufficient evidence or soft breach
 - `abort`: hard threshold breach
 
+Abort integration:
+
+- In `execute` mode, if decision is `abort` and `trigger_rollback_on_abort=true`, canary gate dispatches `CI Rollback Guard` automatically.
+- Default rollback branch is `dev` (override with `rollback_branch`).
+- Optional explicit rollback target can be passed via `rollback_target_ref`.
+
 ### 5.2) Pre-release stage progression (alpha/beta/rc)
 
 For staged release confidence:

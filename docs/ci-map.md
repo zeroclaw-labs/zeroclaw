@@ -53,7 +53,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/ci-supply-chain-provenance.yml` (`CI Supply Chain Provenance`)
     - Purpose: release-fast artifact provenance statement generation + keyless signature bundle for supply-chain traceability
 - `.github/workflows/ci-rollback.yml` (`CI Rollback Guard`)
-    - Purpose: deterministic rollback plan generation with guarded execute mode (manual), marker-tag option, and rollback audit artifacts
+    - Purpose: deterministic rollback plan generation with guarded execute mode, marker-tag option, rollback audit artifacts, and dispatch contract for canary-abort auto-triggering
 - `.github/workflows/sec-vorpal-reviewdog.yml` (`Sec Vorpal Reviewdog`)
     - Purpose: manual secure-coding feedback scan for supported non-Rust files (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`) using reviewdog annotations
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
@@ -62,7 +62,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/pub-prerelease.yml` (`Pub Pre-release`)
     - Purpose: validate alpha/beta/rc stage transitions, enforce tag/version integrity, and optionally publish GitHub prerelease assets
 - `.github/workflows/ci-canary-gate.yml` (`CI Canary Gate`)
-    - Purpose: evaluate canary metrics against policy thresholds (`promote` / `hold` / `abort`) with auditable artifacts and guarded execute mode
+    - Purpose: evaluate canary metrics against policy thresholds (`promote` / `hold` / `abort`) with auditable artifacts, guarded execute mode, and optional auto-dispatch to `CI Rollback Guard` on `abort`
 - `.github/workflows/docs-deploy.yml` (`Docs Deploy`)
     - Purpose: docs quality checks + preview artifacts + GitHub Pages production deployment lane
 - `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
@@ -151,7 +151,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 18. Feature-combo regressions: inspect `.github/workflows/feature-matrix.yml` summary artifact and lane JSON reports.
 19. Nightly integration drift: inspect `.github/workflows/nightly-all-features.yml` summary and lane owner mapping.
 20. Pre-release stage gate failures: inspect `.github/workflows/pub-prerelease.yml` guard artifact (`prerelease-guard.json`).
-21. Canary gate hold/abort decisions: inspect `.github/workflows/ci-canary-gate.yml` guard artifact (`canary-guard.json`).
+21. Canary gate hold/abort decisions: inspect `.github/workflows/ci-canary-gate.yml` guard artifact (`canary-guard.json`); on `abort`, verify rollback dispatch summary and follow-up `ci-rollback` run.
 22. Docs deploy failures: inspect `.github/workflows/docs-deploy.yml` quality lane + preview/deploy artifacts.
 
 ## Maintenance Rules

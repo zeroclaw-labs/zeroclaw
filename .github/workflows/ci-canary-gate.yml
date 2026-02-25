@@ -46,6 +46,24 @@ on:
                 required: true
                 default: false
                 type: boolean
+            trigger_rollback_on_abort:
+                description: "Automatically dispatch CI Rollback Guard when canary decision is abort"
+                required: true
+                default: true
+                type: boolean
+            rollback_branch:
+                description: "Rollback integration branch used by CI Rollback Guard dispatch"
+                required: true
+                default: dev
+                type: choice
+                options:
+                    - dev
+                    - main
+            rollback_target_ref:
+                description: "Optional explicit rollback target ref passed to CI Rollback Guard"
+                required: false
+                default: ""
+                type: string
             fail_on_violation:
                 description: "Fail on policy violations"
                 required: true
@@ -71,6 +89,9 @@ jobs:
             mode: ${{ steps.inputs.outputs.mode }}
             candidate_tag: ${{ steps.inputs.outputs.candidate_tag }}
             candidate_sha: ${{ steps.inputs.outputs.candidate_sha }}
+            trigger_rollback_on_abort: ${{ steps.inputs.outputs.trigger_rollback_on_abort }}
+            rollback_branch: ${{ steps.inputs.outputs.rollback_branch }}
+            rollback_target_ref: ${{ steps.inputs.outputs.rollback_target_ref }}
             decision: ${{ steps.extract.outputs.decision }}
             ready_to_execute: ${{ steps.extract.outputs.ready_to_execute }}
         steps:
@@ -92,6 +113,9 @@ jobs:
                   crash_rate="0.0"
                   p95_latency_ms="0"
                   sample_size="0"
+                  trigger_rollback_on_abort="true"
+                  rollback_branch="dev"
+                  rollback_target_ref=""
                   fail_on_violation="true"
 
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
@@ -102,6 +126,9 @@ jobs:
                     crash_rate="${{ github.event.inputs.crash_rate || '0.0' }}"
                     p95_latency_ms="${{ github.event.inputs.p95_latency_ms || '0' }}"
                     sample_size="${{ github.event.inputs.sample_size || '0' }}"
+                    trigger_rollback_on_abort="${{ github.event.inputs.trigger_rollback_on_abort || 'true' }}"
+                    rollback_branch="${{ github.event.inputs.rollback_branch || 'dev' }}"
+                    rollback_target_ref="${{ github.event.inputs.rollback_target_ref || '' }}"
                     fail_on_violation="${{ github.event.inputs.fail_on_violation || 'true' }}"
                   else
                     git fetch --tags --force origin
@@ -119,6 +146,9 @@ jobs:
                     echo "crash_rate=${crash_rate}"
                     echo "p95_latency_ms=${p95_latency_ms}"
                     echo "sample_size=${sample_size}"
+                    echo "trigger_rollback_on_abort=${trigger_rollback_on_abort}"
+                    echo "rollback_branch=${rollback_branch}"
+                    echo "rollback_target_ref=${rollback_target_ref}"
                     echo "fail_on_violation=${fail_on_violation}"
                   } >> "$GITHUB_OUTPUT"
 
@@ -205,6 +235,7 @@ jobs:
         timeout-minutes: 10
         permissions:
             contents: write
+            actions: write
         steps:
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -237,3 +268,56 @@ jobs:
                           source_sha: context.sha
                         }
                       });
+
+            - name: Trigger rollback guard workflow on abort
+              if: needs.canary-plan.outputs.decision == 'abort' && needs.canary-plan.outputs.trigger_rollback_on_abort == 'true'
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const rollbackBranch = "${{ needs.canary-plan.outputs.rollback_branch }}" || "dev";
+                      const rollbackTargetRef = `${{ needs.canary-plan.outputs.rollback_target_ref }}`.trim();
+                      const workflowRef = process.env.GITHUB_REF_NAME || "dev";
+
+                      const inputs = {
+                        branch: rollbackBranch,
+                        mode: "execute",
+                        allow_non_ancestor: "false",
+                        fail_on_violation: "true",
+                        create_marker_tag: "true",
+                        emit_repository_dispatch: "true",
+                      };
+
+                      if (rollbackTargetRef.length > 0) {
+                        inputs.target_ref = rollbackTargetRef;
+                      }
+
+                      await github.rest.actions.createWorkflowDispatch({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        workflow_id: "ci-rollback.yml",
+                        ref: workflowRef,
+                        inputs,
+                      });
+
+            - name: Publish rollback trigger summary
+              if: needs.canary-plan.outputs.decision == 'abort'
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ "${{ needs.canary-plan.outputs.trigger_rollback_on_abort }}" = "true" ]; then
+                    {
+                      echo "### Canary Abort Rollback Trigger"
+                      echo "- CI Rollback Guard dispatch: triggered"
+                      echo "- Rollback branch: \`${{ needs.canary-plan.outputs.rollback_branch }}\`"
+                      if [ -n "${{ needs.canary-plan.outputs.rollback_target_ref }}" ]; then
+                        echo "- Rollback target ref: \`${{ needs.canary-plan.outputs.rollback_target_ref }}\`"
+                      else
+                        echo "- Rollback target ref: _auto (latest release tag strategy)_"
+                      fi
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    {
+                      echo "### Canary Abort Rollback Trigger"
+                      echo "- CI Rollback Guard dispatch: skipped (trigger_rollback_on_abort=false)"
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  fi
