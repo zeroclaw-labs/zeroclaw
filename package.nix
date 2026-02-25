@@ -1,4 +1,8 @@
-{ rustPlatform, lib }:
+{
+  rustPlatform,
+  lib,
+  zeroclaw-web,
+}:
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "zeroclaw";
   version = "0.1.7";
@@ -16,7 +20,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
           ./Cargo.lock
           ./crates
           ./benches
-          ./web
         ]
         ++ (lib.optionals finalAttrs.doCheck [
           ./tests
@@ -24,6 +27,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
         ])
       );
     };
+  prePatch = ''
+    mkdir web
+    ln -s ${zeroclaw-web} web/dist
+  '';
 
   cargoLock.lockFile = ./Cargo.lock;
 
