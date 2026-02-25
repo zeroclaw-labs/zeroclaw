@@ -498,8 +498,7 @@ impl WasmRuntime {
 
         // Instantiate module
         let instance = linker
-            .instantiate(&mut store, &module)
-            .and_then(|pre| pre.start(&mut store))
+            .instantiate_and_start(&mut store, &module)
             .with_context(|| format!("Failed to instantiate WASM module: {module_name}"))?;
 
         // Look for exported entry point
