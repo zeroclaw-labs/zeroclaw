@@ -1,0 +1,62 @@
+name: Build Docker image
+
+on:
+  push:
+    branches:
+      - 'fork/**'
+  pull_request:
+    branches:
+      - dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: |
+          cargo build --release
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          # Use provided secrets if available; no secrets required for a public push step here.
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          tags: |
+            ${{ github.repository_owner }}/zeroclaw:${{ github.sha }}
+
+      - name: Upload image digest as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: |
+            ./image-tag.txt
