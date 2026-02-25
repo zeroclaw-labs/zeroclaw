@@ -4256,7 +4256,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     println!();
 
     let mut healthy = 0_u32;
-    let mut unhealthy = init_failures.len() as u32;
+    let mut unhealthy = u32::try_from(init_failures.len()).unwrap_or(u32::MAX);
     let mut timeout = 0_u32;
     let has_runtime_channels = !channels.is_empty();
 
@@ -5669,19 +5669,21 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 1);
-        let first_call = &calls[0];
-        assert!(!first_call.is_empty());
-        assert_eq!(first_call[0].0, "system");
-        let system_prompt = &first_call[0].1;
-        assert!(system_prompt.contains("Runtime Tool Availability (Authoritative)"));
-        assert!(system_prompt.contains("Excluded by runtime policy: mock_price"));
-        assert!(system_prompt.contains("`mock_echo`"));
-        assert!(!system_prompt.contains("**mock_price**:"));
+        {
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 1);
+            let first_call = &calls[0];
+            assert!(!first_call.is_empty());
+            assert_eq!(first_call[0].0, "system");
+            let system_prompt = &first_call[0].1;
+            assert!(system_prompt.contains("Runtime Tool Availability (Authoritative)"));
+            assert!(system_prompt.contains("Excluded by runtime policy: mock_price"));
+            assert!(system_prompt.contains("`mock_echo`"));
+            assert!(!system_prompt.contains("**mock_price**:"));
+        }
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
