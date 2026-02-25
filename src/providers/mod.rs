@@ -721,7 +721,7 @@ fn token_end(input: &str, from: usize) -> usize {
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
 /// `ghu_`, `github_pat_`, `AIza`, and `AKIA`.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [(&str, usize); 24] = [
+    const PREFIXES: [(&str, usize); 26] = [
         ("sk-", 1),
         ("xoxb-", 1),
         ("xoxp-", 1),
@@ -734,6 +734,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         ("\"access_token\":\"", 8),
         ("\"refresh_token\":\"", 8),
         ("\"id_token\":\"", 8),
+        ("\"token\":\"", 8),
         ("\"api_key\":\"", 8),
         ("\"client_secret\":\"", 8),
         ("\"app_secret\":\"", 8),
@@ -741,6 +742,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         ("access_token=", 8),
         ("refresh_token=", 8),
         ("id_token=", 8),
+        ("token=", 8),
         ("api_key=", 8),
         ("client_secret=", 8),
         ("app_secret=", 8),
@@ -2912,6 +2914,24 @@ mod tests {
         let result = sanitize_api_error(input);
         assert!(!result.contains("supersecret1234567890"));
         assert!(!result.contains("client_secret"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_json_token_field() {
+        let input = r#"{"token":"abcd1234efgh5678","error":"forbidden"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("abcd1234efgh5678"));
+        assert!(!result.contains("\"token\""));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_query_token_field() {
+        let input = "request rejected: token=abcd1234efgh5678";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("abcd1234efgh5678"));
+        assert!(!result.contains("token="));
         assert!(result.contains("[REDACTED]"));
     }
 

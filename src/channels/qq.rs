@@ -403,7 +403,8 @@ impl QQChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ {op} failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ {op} failed ({status}): {sanitized}");
         }
 
         Ok(())
@@ -435,7 +436,8 @@ impl QQChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ upload media failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ upload media failed ({status}): {sanitized}");
         }
 
         let payload: Value = resp.json().await?;
@@ -466,7 +468,8 @@ impl QQChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ token request failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ token request failed ({status}): {sanitized}");
         }
 
         let data: serde_json::Value = resp.json().await?;
@@ -529,7 +532,8 @@ impl QQChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ gateway request failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ gateway request failed ({status}): {sanitized}");
         }
 
         let data: serde_json::Value = resp.json().await?;

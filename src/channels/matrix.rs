@@ -405,7 +405,8 @@ impl MatrixChannel {
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
-            anyhow::bail!("Matrix whoami failed: {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Matrix whoami failed: {sanitized}");
         }
 
         Ok(resp.json().await?)
@@ -536,7 +537,10 @@ impl MatrixChannel {
 
             if !resp.status().is_success() {
                 let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Matrix room alias resolution failed for '{configured}': {err}");
+                let sanitized = crate::providers::sanitize_api_error(&err);
+                anyhow::bail!(
+                    "Matrix room alias resolution failed for '{configured}': {sanitized}"
+                );
             }
 
             let resolved: RoomAliasResponse = resp.json().await?;
@@ -564,7 +568,8 @@ impl MatrixChannel {
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Matrix room access check failed for '{room_id}': {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Matrix room access check failed for '{room_id}': {sanitized}");
         }
 
         Ok(())
@@ -593,7 +598,8 @@ impl MatrixChannel {
         }
 
         let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Matrix room encryption check failed for '{room_id}': {err}");
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Matrix room encryption check failed for '{room_id}': {sanitized}");
     }
 
     async fn ensure_room_supported(&self, room_id: &str) -> anyhow::Result<()> {

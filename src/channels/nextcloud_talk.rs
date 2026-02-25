@@ -196,7 +196,8 @@ impl NextcloudTalkChannel {
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        tracing::error!("Nextcloud Talk send failed: {status} — {body}");
+        let sanitized = crate::providers::sanitize_api_error(&body);
+        tracing::error!("Nextcloud Talk send failed: {status} — {sanitized}");
         anyhow::bail!("Nextcloud Talk API error: {status}");
     }
 }

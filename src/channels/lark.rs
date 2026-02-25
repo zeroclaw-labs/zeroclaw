@@ -278,18 +278,24 @@ fn next_token_refresh_deadline(now: Instant, ttl_seconds: u64) -> Instant {
     now + refresh_in
 }
 
+fn sanitize_lark_body(body: &serde_json::Value) -> String {
+    crate::providers::sanitize_api_error(&body.to_string())
+}
+
 fn ensure_lark_send_success(
     status: reqwest::StatusCode,
     body: &serde_json::Value,
     context: &str,
 ) -> anyhow::Result<()> {
     if !status.is_success() {
-        anyhow::bail!("Lark send failed {context}: status={status}, body={body}");
+        let sanitized = sanitize_lark_body(body);
+        anyhow::bail!("Lark send failed {context}: status={status}, body={sanitized}");
     }
 
     let code = extract_lark_response_code(body).unwrap_or(0);
     if code != 0 {
-        anyhow::bail!("Lark send failed {context}: code={code}, body={body}");
+        let sanitized = sanitize_lark_body(body);
+        anyhow::bail!("Lark send failed {context}: code={code}, body={sanitized}");
     }
 
     Ok(())
@@ -511,7 +517,7 @@ impl LarkChannel {
 
             anyhow::bail!(
                 "Lark image download failed: status={status}, body={}",
-                String::from_utf8_lossy(&body)
+                crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
             );
         }
     }
@@ -587,8 +593,9 @@ impl LarkChannel {
             if !response.status().is_success() {
                 let status = response.status();
                 let err_body = response.text().await.unwrap_or_default();
+                let sanitized = crate::providers::sanitize_api_error(&err_body);
                 tracing::warn!(
-                    "Lark: add reaction failed for {message_id}: status={status}, body={err_body}"
+                    "Lark: add reaction failed for {message_id}: status={status}, body={sanitized}"
                 );
                 return;
             }
@@ -948,7 +955,10 @@ impl LarkChannel {
         let data: serde_json::Value = resp.json().await?;
 
         if !status.is_success() {
-            anyhow::bail!("Lark tenant_access_token request failed: status={status}, body={data}");
+            let sanitized = sanitize_lark_body(&data);
+            anyhow::bail!(
+                "Lark tenant_access_token request failed: status={status}, body={sanitized}"
+            );
         }
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -1014,21 +1024,24 @@ impl LarkChannel {
             let refreshed = self.get_tenant_access_token().await?;
             let (retry_status, retry_body) = self.fetch_bot_open_id_with_token(&refreshed).await?;
             if !retry_status.is_success() {
+                let sanitized = sanitize_lark_body(&retry_body);
                 anyhow::bail!(
-                    "Lark bot info request failed after token refresh: status={retry_status}, body={retry_body}"
+                    "Lark bot info request failed after token refresh: status={retry_status}, body={sanitized}"
                 );
             }
             retry_body
         } else {
             if !status.is_success() {
-                anyhow::bail!("Lark bot info request failed: status={status}, body={body}");
+                let sanitized = sanitize_lark_body(&body);
+                anyhow::bail!("Lark bot info request failed: status={status}, body={sanitized}");
             }
             body
         };
 
         let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            anyhow::bail!("Lark bot info failed: code={code}, body={body}");
+            let sanitized = sanitize_lark_body(&body);
+            anyhow::bail!("Lark bot info failed: code={code}, body={sanitized}");
         }
 
         let bot_open_id = body
@@ -1379,8 +1392,9 @@ impl Channel for LarkChannel {
                 self.send_text_once(&url, &new_token, &body).await?;
 
             if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                let sanitized = sanitize_lark_body(&retry_response);
                 anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                    "Lark send failed after token refresh: status={retry_status}, body={sanitized}"
                 );
             }
 

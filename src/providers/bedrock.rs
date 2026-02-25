@@ -1458,9 +1458,10 @@ impl Provider for BedrockProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| "unknown error".to_string());
+                let sanitized = super::sanitize_api_error(&body);
                 let _ = tx
                     .send(Err(StreamError::Provider(format!(
-                        "Bedrock stream request failed ({status}): {body}"
+                        "Bedrock stream request failed ({status}): {sanitized}"
                     ))))
                     .await;
                 return;

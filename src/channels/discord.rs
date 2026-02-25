@@ -291,7 +291,8 @@ async fn send_discord_message_json(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord send message failed ({status}): {err}");
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord send message failed ({status}): {sanitized}");
     }
 
     Ok(())
@@ -339,7 +340,8 @@ async fn send_discord_message_with_files(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord send message with files failed ({status}): {err}");
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord send message with files failed ({status}): {sanitized}");
     }
 
     Ok(())
@@ -909,7 +911,8 @@ impl Channel for DiscordChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            anyhow::bail!("Discord add reaction failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Discord add reaction failed ({status}): {sanitized}");
         }
 
         Ok(())
@@ -936,7 +939,8 @@ impl Channel for DiscordChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            anyhow::bail!("Discord remove reaction failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Discord remove reaction failed ({status}): {sanitized}");
         }
 
         Ok(())

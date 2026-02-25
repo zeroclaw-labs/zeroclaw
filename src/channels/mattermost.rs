@@ -124,7 +124,8 @@ impl Channel for MattermostChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Mattermost post failed ({status}): {body}");
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            bail!("Mattermost post failed ({status}): {sanitized}");
         }
 
         Ok(())
