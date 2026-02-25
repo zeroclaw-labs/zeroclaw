@@ -28,6 +28,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod delegate_coordination_status;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -71,6 +72,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use delegate_coordination_status::DelegateCoordinationStatusTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -394,7 +396,7 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
-        let delegate_tool = DelegateTool::new_with_options(
+        let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
@@ -417,7 +419,50 @@ pub fn all_tools_with_runtime(
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
-        tool_arcs.push(Arc::new(delegate_tool));
+
+        if root_config.coordination.enabled {
+            let coordination_lead_agent = {
+                let value = root_config.coordination.lead_agent.trim();
+                if value.is_empty() {
+                    "delegate-lead".to_string()
+                } else {
+                    value.to_string()
+                }
+            };
+            let coordination_bus = crate::coordination::InMemoryMessageBus::with_limits(
+                crate::coordination::InMemoryMessageBusLimits {
+                    max_inbox_messages_per_agent: root_config
+                        .coordination
+                        .max_inbox_messages_per_agent,
+                    max_dead_letters: root_config.coordination.max_dead_letters,
+                    max_context_entries: root_config.coordination.max_context_entries,
+                    max_seen_message_ids: root_config.coordination.max_seen_message_ids,
+                },
+            );
+            if let Err(error) = coordination_bus.register_agent(coordination_lead_agent.clone()) {
+                tracing::warn!(
+                    "delegate coordination: failed to register lead agent '{coordination_lead_agent}': {error}"
+                );
+            }
+            for agent_name in agents.keys() {
+                if let Err(error) = coordination_bus.register_agent(agent_name.clone()) {
+                    tracing::warn!(
+                        "delegate coordination: failed to register agent '{agent_name}': {error}"
+                    );
+                }
+            }
+
+            delegate_tool = delegate_tool
+                .with_coordination_bus(coordination_bus.clone(), coordination_lead_agent);
+            tool_arcs.push(Arc::new(delegate_tool));
+            tool_arcs.push(Arc::new(DelegateCoordinationStatusTool::new(
+                coordination_bus,
+                security.clone(),
+            )));
+        } else {
+            delegate_tool = delegate_tool.with_coordination_disabled();
+            tool_arcs.push(Arc::new(delegate_tool));
+        }
     }
 
     // Inter-process agent communication (opt-in)
@@ -763,6 +808,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"delegate_coordination_status"));
     }
 
     #[test]
@@ -796,5 +842,57 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
+        assert!(!names.contains(&"delegate_coordination_status"));
+    }
+
+    #[test]
+    fn all_tools_disables_coordination_tool_when_coordination_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.coordination.enabled = false;
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &agents,
+            Some("delegate-test-credential"),
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"delegate"));
+        assert!(!names.contains(&"delegate_coordination_status"));
     }
 }

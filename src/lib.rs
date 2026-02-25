@@ -44,6 +44,7 @@ pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod channels;
 pub mod config;
+pub mod coordination;
 pub(crate) mod cost;
 pub(crate) mod cron;
 pub(crate) mod daemon;

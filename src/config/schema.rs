@@ -240,6 +240,10 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Delegate coordination runtime configuration (`[coordination]`).
+    #[serde(default)]
+    pub coordination: CoordinationConfig,
+
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -547,6 +551,69 @@ impl Default for AgentsIpcConfig {
             enabled: false,
             db_path: default_agents_ipc_db_path(),
             staleness_secs: default_agents_ipc_staleness_secs(),
+        }
+    }
+}
+
+fn default_coordination_enabled() -> bool {
+    true
+}
+
+fn default_coordination_lead_agent() -> String {
+    "delegate-lead".into()
+}
+
+fn default_coordination_max_inbox_messages_per_agent() -> usize {
+    256
+}
+
+fn default_coordination_max_dead_letters() -> usize {
+    256
+}
+
+fn default_coordination_max_context_entries() -> usize {
+    512
+}
+
+fn default_coordination_max_seen_message_ids() -> usize {
+    4096
+}
+
+/// Delegate coordination runtime configuration (`[coordination]` section).
+///
+/// Controls typed delegate message-bus integration used by `delegate` and
+/// `delegate_coordination_status` tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CoordinationConfig {
+    /// Enable delegate coordination tracing/runtime bus integration.
+    #[serde(default = "default_coordination_enabled")]
+    pub enabled: bool,
+    /// Logical lead-agent identity used as coordinator sender/recipient.
+    #[serde(default = "default_coordination_lead_agent")]
+    pub lead_agent: String,
+    /// Maximum retained inbox messages per registered agent.
+    #[serde(default = "default_coordination_max_inbox_messages_per_agent")]
+    pub max_inbox_messages_per_agent: usize,
+    /// Maximum retained dead-letter entries.
+    #[serde(default = "default_coordination_max_dead_letters")]
+    pub max_dead_letters: usize,
+    /// Maximum retained shared-context entries (`ContextPatch` state keys).
+    #[serde(default = "default_coordination_max_context_entries")]
+    pub max_context_entries: usize,
+    /// Maximum retained dedupe window size for processed message IDs.
+    #[serde(default = "default_coordination_max_seen_message_ids")]
+    pub max_seen_message_ids: usize,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_coordination_enabled(),
+            lead_agent: default_coordination_lead_agent(),
+            max_inbox_messages_per_agent: default_coordination_max_inbox_messages_per_agent(),
+            max_dead_letters: default_coordination_max_dead_letters(),
+            max_context_entries: default_coordination_max_context_entries(),
+            max_seen_message_ids: default_coordination_max_seen_message_ids(),
         }
     }
 }
@@ -4274,6 +4341,7 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            coordination: CoordinationConfig::default(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -5537,6 +5605,23 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
+        // Delegate coordination runtime safety bounds.
+        if self.coordination.enabled && self.coordination.lead_agent.trim().is_empty() {
+            anyhow::bail!("coordination.lead_agent must not be empty when coordination is enabled");
+        }
+        if self.coordination.max_inbox_messages_per_agent == 0 {
+            anyhow::bail!("coordination.max_inbox_messages_per_agent must be greater than 0");
+        }
+        if self.coordination.max_dead_letters == 0 {
+            anyhow::bail!("coordination.max_dead_letters must be greater than 0");
+        }
+        if self.coordination.max_context_entries == 0 {
+            anyhow::bail!("coordination.max_context_entries must be greater than 0");
+        }
+        if self.coordination.max_seen_message_ids == 0 {
+            anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
+        }
+
         Ok(())
     }
 
@@ -6413,6 +6498,7 @@ default_temperature = 0.7
             research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -6815,6 +6901,7 @@ tool_dispatcher = "xml"
             research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -9406,5 +9493,88 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert!(err
             .to_string()
             .contains("max_denied_events_per_minute must be less than or equal"));
+    }
+
+    #[test]
+    async fn coordination_config_defaults() {
+        let config = Config::default();
+        assert!(config.coordination.enabled);
+        assert_eq!(config.coordination.lead_agent, "delegate-lead");
+        assert_eq!(config.coordination.max_inbox_messages_per_agent, 256);
+        assert_eq!(config.coordination.max_dead_letters, 256);
+        assert_eq!(config.coordination.max_context_entries, 512);
+        assert_eq!(config.coordination.max_seen_message_ids, 4096);
+    }
+
+    #[test]
+    async fn config_roundtrip_with_coordination_section() {
+        let mut config = Config::default();
+        config.coordination.enabled = true;
+        config.coordination.lead_agent = "runtime-lead".into();
+        config.coordination.max_inbox_messages_per_agent = 128;
+        config.coordination.max_dead_letters = 64;
+        config.coordination.max_context_entries = 32;
+        config.coordination.max_seen_message_ids = 1024;
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.coordination.enabled);
+        assert_eq!(parsed.coordination.lead_agent, "runtime-lead");
+        assert_eq!(parsed.coordination.max_inbox_messages_per_agent, 128);
+        assert_eq!(parsed.coordination.max_dead_letters, 64);
+        assert_eq!(parsed.coordination.max_context_entries, 32);
+        assert_eq!(parsed.coordination.max_seen_message_ids, 1024);
+    }
+
+    #[test]
+    async fn coordination_validation_rejects_invalid_limits_and_lead_agent() {
+        let mut config = Config::default();
+        config.coordination.max_inbox_messages_per_agent = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination inbox limit validation failure");
+        assert!(err
+            .to_string()
+            .contains("coordination.max_inbox_messages_per_agent"));
+
+        let mut config = Config::default();
+        config.coordination.max_dead_letters = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination dead-letter limit validation failure");
+        assert!(err.to_string().contains("coordination.max_dead_letters"));
+
+        let mut config = Config::default();
+        config.coordination.max_context_entries = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination context limit validation failure");
+        assert!(err.to_string().contains("coordination.max_context_entries"));
+
+        let mut config = Config::default();
+        config.coordination.max_seen_message_ids = 0;
+        let err = config
+            .validate()
+            .expect_err("expected coordination dedupe-window validation failure");
+        assert!(err
+            .to_string()
+            .contains("coordination.max_seen_message_ids"));
+
+        let mut config = Config::default();
+        config.coordination.lead_agent = "   ".into();
+        let err = config
+            .validate()
+            .expect_err("expected coordination lead-agent validation failure");
+        assert!(err.to_string().contains("coordination.lead_agent"));
+    }
+
+    #[test]
+    async fn coordination_validation_allows_empty_lead_agent_when_disabled() {
+        let mut config = Config::default();
+        config.coordination.enabled = false;
+        config.coordination.lead_agent = String::new();
+        config
+            .validate()
+            .expect("disabled coordination should allow empty lead agent");
     }
 }
