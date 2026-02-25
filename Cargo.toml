@@ -230,7 +230,7 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tempfile = "3.14"
+tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
