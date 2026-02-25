@@ -57,6 +57,7 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod coordination;
 mod cost;
 mod cron;
 mod daemon;
