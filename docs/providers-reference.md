@@ -215,6 +215,8 @@ Behavior:
 - Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
 - When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT`.
 - Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- Legacy compatibility: `runtime.reasoning_level` is accepted but deprecated; prefer `provider.reasoning_level`.
+- If both `provider.reasoning_level` and `runtime.reasoning_level` are set, provider-level value wins.
 
 ### Kimi Code Notes
 

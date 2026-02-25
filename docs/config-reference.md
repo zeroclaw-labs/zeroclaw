@@ -238,6 +238,7 @@ Notes:
 - `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
+- Deprecated compatibility alias: `runtime.reasoning_level` is still accepted but should be migrated to `provider.reasoning_level`.
 
 ## `[provider]`
 
@@ -250,6 +251,7 @@ Notes:
 - Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
 - When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT` for OpenAI Codex requests.
 - Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- If both `provider.reasoning_level` and deprecated `runtime.reasoning_level` are set, provider-level value wins.
 
 ## `[skills]`
 

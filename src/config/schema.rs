@@ -2328,6 +2328,13 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+
+    /// Deprecated compatibility alias for `[provider].reasoning_level`.
+    /// - Canonical key: `provider.reasoning_level`
+    /// - Legacy key accepted for compatibility: `runtime.reasoning_level`
+    /// - When both are set, provider-level value wins.
+    #[serde(default)]
+    pub reasoning_level: Option<String>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -2402,6 +2409,7 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            reasoning_level: None,
         }
     }
 }
@@ -4854,6 +4862,68 @@ impl Config {
         }
     }
 
+    fn normalize_reasoning_level_override(raw: Option<&str>, source: &str) -> Option<String> {
+        let value = raw?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+        match normalized.as_str() {
+            "minimal" | "low" | "medium" | "high" | "xhigh" => Some(normalized),
+            _ => {
+                tracing::warn!(
+                    reasoning_level = %value,
+                    source,
+                    "Ignoring invalid reasoning level override"
+                );
+                None
+            }
+        }
+    }
+
+    /// Resolve provider reasoning level with backward-compatible runtime alias.
+    ///
+    /// Priority:
+    /// 1) `provider.reasoning_level` (canonical)
+    /// 2) `runtime.reasoning_level` (deprecated compatibility alias)
+    pub fn effective_provider_reasoning_level(&self) -> Option<String> {
+        let provider_level = Self::normalize_reasoning_level_override(
+            self.provider.reasoning_level.as_deref(),
+            "provider.reasoning_level",
+        );
+        let runtime_level = Self::normalize_reasoning_level_override(
+            self.runtime.reasoning_level.as_deref(),
+            "runtime.reasoning_level",
+        );
+
+        match (provider_level, runtime_level) {
+            (Some(provider_level), Some(runtime_level)) => {
+                if provider_level == runtime_level {
+                    tracing::warn!(
+                        reasoning_level = %provider_level,
+                        "`runtime.reasoning_level` is deprecated; keep only `provider.reasoning_level`"
+                    );
+                } else {
+                    tracing::warn!(
+                        provider_reasoning_level = %provider_level,
+                        runtime_reasoning_level = %runtime_level,
+                        "`runtime.reasoning_level` is deprecated and ignored when `provider.reasoning_level` is set"
+                    );
+                }
+                Some(provider_level)
+            }
+            (Some(provider_level), None) => Some(provider_level),
+            (None, Some(runtime_level)) => {
+                tracing::warn!(
+                    reasoning_level = %runtime_level,
+                    "`runtime.reasoning_level` is deprecated; using it as compatibility fallback to `provider.reasoning_level`"
+                );
+                Some(runtime_level)
+            }
+            (None, None) => None,
+        }
+    }
+
     fn lookup_model_provider_profile(
         &self,
         provider_name: &str,
@@ -5282,6 +5352,28 @@ impl Config {
                 "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
                 "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
                 _ => {}
+            }
+        }
+
+        // Deprecated reasoning level alias: ZEROCLAW_REASONING_LEVEL or REASONING_LEVEL
+        let alias_level = std::env::var("ZEROCLAW_REASONING_LEVEL")
+            .ok()
+            .map(|value| ("ZEROCLAW_REASONING_LEVEL", value))
+            .or_else(|| {
+                std::env::var("REASONING_LEVEL")
+                    .ok()
+                    .map(|value| ("REASONING_LEVEL", value))
+            });
+        if let Some((env_name, level)) = alias_level {
+            if let Some(normalized) =
+                Self::normalize_reasoning_level_override(Some(&level), env_name)
+            {
+                tracing::warn!(
+                    env_name,
+                    reasoning_level = %normalized,
+                    "{env_name} is deprecated; prefer provider.reasoning_level in config"
+                );
+                self.runtime.reasoning_level = Some(normalized);
             }
         }
 
@@ -6155,6 +6247,46 @@ reasoning_level = "high"
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.provider.reasoning_level.as_deref(), Some("high"));
+        assert_eq!(
+            parsed.effective_provider_reasoning_level().as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    async fn runtime_reasoning_level_alias_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_level = "xhigh"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_level.as_deref(), Some("xhigh"));
+        assert_eq!(
+            parsed.effective_provider_reasoning_level().as_deref(),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    async fn provider_reasoning_level_wins_over_runtime_alias() {
+        let raw = r#"
+default_temperature = 0.7
+
+[provider]
+reasoning_level = "medium"
+
+[runtime]
+reasoning_level = "high"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.effective_provider_reasoning_level().as_deref(),
+            Some("medium")
+        );
     }
 
     #[test]
@@ -8054,6 +8186,36 @@ default_model = "legacy-model"
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
         std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_reasoning_level_alias() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_level, None);
+
+        std::env::set_var("ZEROCLAW_REASONING_LEVEL", "xhigh");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level.as_deref(), Some("xhigh"));
+        assert_eq!(
+            config.effective_provider_reasoning_level().as_deref(),
+            Some("xhigh")
+        );
+
+        std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
+    }
+
+    #[test]
+    async fn env_override_reasoning_level_alias_invalid_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.runtime.reasoning_level = Some("medium".to_string());
+
+        std::env::set_var("ZEROCLAW_REASONING_LEVEL", "invalid");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level.as_deref(), Some("medium"));
+
+        std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
     }
 
     #[test]
