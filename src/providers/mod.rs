@@ -719,9 +719,9 @@ fn token_end(input: &str, from: usize) -> usize {
 /// Scrub known secret-like token prefixes from provider error strings.
 ///
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, `AIza`, and `AKIA`.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 9] = [
         "sk-",
         "xoxb-",
         "xoxp-",
@@ -729,6 +729,8 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "gho_",
         "ghu_",
         "github_pat_",
+        "AIza",
+        "AKIA",
     ];
 
     let mut scrubbed = input.to_string();
@@ -2863,6 +2865,20 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_google_api_key_prefix() {
+        let input = "upstream returned key AIzaSyA8exampleToken123456";
+        let result = scrub_secret_patterns(input);
+        assert_eq!(result, "upstream returned key [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_aws_access_key_prefix() {
+        let input = "credential leak AKIAIOSFODNN7EXAMPLE";
+        let result = scrub_secret_patterns(input);
+        assert_eq!(result, "credential leak [REDACTED]");
     }
 
     #[test]

@@ -86,7 +86,7 @@ impl ProviderApiMode {
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
@@ -293,7 +293,7 @@ pub struct ProviderConfig {
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
     pub provider: String,
@@ -328,6 +328,79 @@ fn default_max_depth() -> u32 {
 
 fn default_max_tool_iterations() -> usize {
     10
+}
+
+impl std::fmt::Debug for DelegateAgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegateAgentConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("system_prompt", &self.system_prompt)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| "***REDACTED***".to_string()),
+            )
+            .field("temperature", &self.temperature)
+            .field("max_depth", &self.max_depth)
+            .field("agentic", &self.agentic)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("max_iterations", &self.max_iterations)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let model_provider_ids: Vec<&str> =
+            self.model_providers.keys().map(String::as_str).collect();
+        let delegate_agent_ids: Vec<&str> = self.agents.keys().map(String::as_str).collect();
+        let enabled_channel_count = [
+            self.channels_config.telegram.is_some(),
+            self.channels_config.discord.is_some(),
+            self.channels_config.slack.is_some(),
+            self.channels_config.mattermost.is_some(),
+            self.channels_config.webhook.is_some(),
+            self.channels_config.imessage.is_some(),
+            self.channels_config.matrix.is_some(),
+            self.channels_config.signal.is_some(),
+            self.channels_config.whatsapp.is_some(),
+            self.channels_config.linq.is_some(),
+            self.channels_config.wati.is_some(),
+            self.channels_config.nextcloud_talk.is_some(),
+            self.channels_config.email.is_some(),
+            self.channels_config.irc.is_some(),
+            self.channels_config.lark.is_some(),
+            self.channels_config.feishu.is_some(),
+            self.channels_config.dingtalk.is_some(),
+            self.channels_config.qq.is_some(),
+            self.channels_config.nostr.is_some(),
+            self.channels_config.clawdtalk.is_some(),
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+
+        f.debug_struct("Config")
+            .field("workspace_dir", &self.workspace_dir)
+            .field("config_path", &self.config_path)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| "***REDACTED***".to_string()),
+            )
+            .field("api_url_configured", &self.api_url.is_some())
+            .field("default_provider", &self.default_provider)
+            .field("provider_api", &self.provider_api)
+            .field("default_model", &self.default_model)
+            .field("model_providers", &model_provider_ids)
+            .field("default_temperature", &self.default_temperature)
+            .field("model_routes_count", &self.model_routes.len())
+            .field("embedding_routes_count", &self.embedding_routes.len())
+            .field("delegate_agents", &delegate_agent_ids)
+            .field("cli_channel_enabled", &self.channels_config.cli)
+            .field("enabled_channels_count", &enabled_channel_count)
+            .field("sensitive_sections", &"***REDACTED***")
+            .finish_non_exhaustive()
+    }
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -2139,7 +2212,7 @@ pub struct AutonomyConfig {
     ///
     /// When a tool is listed here, non-CLI channels will not expose it to the
     /// model in tool specs.
-    #[serde(default)]
+    #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
 }
 
@@ -2149,6 +2222,35 @@ fn default_auto_approve() -> Vec<String> {
 
 fn default_always_ask() -> Vec<String> {
     vec![]
+}
+
+fn default_non_cli_excluded_tools() -> Vec<String> {
+    [
+        "shell",
+        "file_write",
+        "file_edit",
+        "git_operations",
+        "browser",
+        "browser_open",
+        "http_request",
+        "schedule",
+        "cron_add",
+        "cron_remove",
+        "cron_update",
+        "cron_run",
+        "memory_store",
+        "memory_forget",
+        "proxy_config",
+        "model_routing_config",
+        "pushover",
+        "composio",
+        "delegate",
+        "screenshot",
+        "image_info",
+    ]
+    .into_iter()
+    .map(std::string::ToString::to_string)
+    .collect()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -2208,7 +2310,7 @@ impl Default for AutonomyConfig {
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
-            non_cli_excluded_tools: Vec::new(),
+            non_cli_excluded_tools: default_non_cli_excluded_tools(),
         }
     }
 }
@@ -4177,6 +4279,21 @@ fn decrypt_secret(
     Ok(())
 }
 
+fn decrypt_vec_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut [String],
+    field_name: &str,
+) -> Result<()> {
+    for (idx, value) in values.iter_mut().enumerate() {
+        if crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .decrypt(value)
+                .with_context(|| format!("Failed to decrypt {field_name}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -4203,6 +4320,345 @@ fn encrypt_secret(
         *value = store
             .encrypt(value)
             .with_context(|| format!("Failed to encrypt {field_name}"))?;
+    }
+    Ok(())
+}
+
+fn encrypt_vec_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut [String],
+    field_name: &str,
+) -> Result<()> {
+    for (idx, value) in values.iter_mut().enumerate() {
+        if !crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .encrypt(value)
+                .with_context(|| format!("Failed to encrypt {field_name}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn decrypt_channel_secrets(
+    store: &crate::security::SecretStore,
+    channels: &mut ChannelsConfig,
+) -> Result<()> {
+    if let Some(ref mut telegram) = channels.telegram {
+        decrypt_secret(
+            store,
+            &mut telegram.bot_token,
+            "config.channels_config.telegram.bot_token",
+        )?;
+    }
+    if let Some(ref mut discord) = channels.discord {
+        decrypt_secret(
+            store,
+            &mut discord.bot_token,
+            "config.channels_config.discord.bot_token",
+        )?;
+    }
+    if let Some(ref mut slack) = channels.slack {
+        decrypt_secret(
+            store,
+            &mut slack.bot_token,
+            "config.channels_config.slack.bot_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut slack.app_token,
+            "config.channels_config.slack.app_token",
+        )?;
+    }
+    if let Some(ref mut mattermost) = channels.mattermost {
+        decrypt_secret(
+            store,
+            &mut mattermost.bot_token,
+            "config.channels_config.mattermost.bot_token",
+        )?;
+    }
+    if let Some(ref mut webhook) = channels.webhook {
+        decrypt_optional_secret(
+            store,
+            &mut webhook.secret,
+            "config.channels_config.webhook.secret",
+        )?;
+    }
+    if let Some(ref mut matrix) = channels.matrix {
+        decrypt_secret(
+            store,
+            &mut matrix.access_token,
+            "config.channels_config.matrix.access_token",
+        )?;
+    }
+    if let Some(ref mut whatsapp) = channels.whatsapp {
+        decrypt_optional_secret(
+            store,
+            &mut whatsapp.access_token,
+            "config.channels_config.whatsapp.access_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut whatsapp.app_secret,
+            "config.channels_config.whatsapp.app_secret",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut whatsapp.verify_token,
+            "config.channels_config.whatsapp.verify_token",
+        )?;
+    }
+    if let Some(ref mut linq) = channels.linq {
+        decrypt_secret(
+            store,
+            &mut linq.api_token,
+            "config.channels_config.linq.api_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut linq.signing_secret,
+            "config.channels_config.linq.signing_secret",
+        )?;
+    }
+    if let Some(ref mut nextcloud) = channels.nextcloud_talk {
+        decrypt_secret(
+            store,
+            &mut nextcloud.app_token,
+            "config.channels_config.nextcloud_talk.app_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut nextcloud.webhook_secret,
+            "config.channels_config.nextcloud_talk.webhook_secret",
+        )?;
+    }
+    if let Some(ref mut irc) = channels.irc {
+        decrypt_optional_secret(
+            store,
+            &mut irc.server_password,
+            "config.channels_config.irc.server_password",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut irc.nickserv_password,
+            "config.channels_config.irc.nickserv_password",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut irc.sasl_password,
+            "config.channels_config.irc.sasl_password",
+        )?;
+    }
+    if let Some(ref mut lark) = channels.lark {
+        decrypt_secret(
+            store,
+            &mut lark.app_secret,
+            "config.channels_config.lark.app_secret",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut lark.encrypt_key,
+            "config.channels_config.lark.encrypt_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut lark.verification_token,
+            "config.channels_config.lark.verification_token",
+        )?;
+    }
+    if let Some(ref mut dingtalk) = channels.dingtalk {
+        decrypt_secret(
+            store,
+            &mut dingtalk.client_secret,
+            "config.channels_config.dingtalk.client_secret",
+        )?;
+    }
+    if let Some(ref mut qq) = channels.qq {
+        decrypt_secret(
+            store,
+            &mut qq.app_secret,
+            "config.channels_config.qq.app_secret",
+        )?;
+    }
+    if let Some(ref mut nostr) = channels.nostr {
+        decrypt_secret(
+            store,
+            &mut nostr.private_key,
+            "config.channels_config.nostr.private_key",
+        )?;
+    }
+    if let Some(ref mut clawdtalk) = channels.clawdtalk {
+        decrypt_secret(
+            store,
+            &mut clawdtalk.api_key,
+            "config.channels_config.clawdtalk.api_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut clawdtalk.webhook_secret,
+            "config.channels_config.clawdtalk.webhook_secret",
+        )?;
+    }
+    Ok(())
+}
+
+fn encrypt_channel_secrets(
+    store: &crate::security::SecretStore,
+    channels: &mut ChannelsConfig,
+) -> Result<()> {
+    if let Some(ref mut telegram) = channels.telegram {
+        encrypt_secret(
+            store,
+            &mut telegram.bot_token,
+            "config.channels_config.telegram.bot_token",
+        )?;
+    }
+    if let Some(ref mut discord) = channels.discord {
+        encrypt_secret(
+            store,
+            &mut discord.bot_token,
+            "config.channels_config.discord.bot_token",
+        )?;
+    }
+    if let Some(ref mut slack) = channels.slack {
+        encrypt_secret(
+            store,
+            &mut slack.bot_token,
+            "config.channels_config.slack.bot_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut slack.app_token,
+            "config.channels_config.slack.app_token",
+        )?;
+    }
+    if let Some(ref mut mattermost) = channels.mattermost {
+        encrypt_secret(
+            store,
+            &mut mattermost.bot_token,
+            "config.channels_config.mattermost.bot_token",
+        )?;
+    }
+    if let Some(ref mut webhook) = channels.webhook {
+        encrypt_optional_secret(
+            store,
+            &mut webhook.secret,
+            "config.channels_config.webhook.secret",
+        )?;
+    }
+    if let Some(ref mut matrix) = channels.matrix {
+        encrypt_secret(
+            store,
+            &mut matrix.access_token,
+            "config.channels_config.matrix.access_token",
+        )?;
+    }
+    if let Some(ref mut whatsapp) = channels.whatsapp {
+        encrypt_optional_secret(
+            store,
+            &mut whatsapp.access_token,
+            "config.channels_config.whatsapp.access_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut whatsapp.app_secret,
+            "config.channels_config.whatsapp.app_secret",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut whatsapp.verify_token,
+            "config.channels_config.whatsapp.verify_token",
+        )?;
+    }
+    if let Some(ref mut linq) = channels.linq {
+        encrypt_secret(
+            store,
+            &mut linq.api_token,
+            "config.channels_config.linq.api_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut linq.signing_secret,
+            "config.channels_config.linq.signing_secret",
+        )?;
+    }
+    if let Some(ref mut nextcloud) = channels.nextcloud_talk {
+        encrypt_secret(
+            store,
+            &mut nextcloud.app_token,
+            "config.channels_config.nextcloud_talk.app_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut nextcloud.webhook_secret,
+            "config.channels_config.nextcloud_talk.webhook_secret",
+        )?;
+    }
+    if let Some(ref mut irc) = channels.irc {
+        encrypt_optional_secret(
+            store,
+            &mut irc.server_password,
+            "config.channels_config.irc.server_password",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut irc.nickserv_password,
+            "config.channels_config.irc.nickserv_password",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut irc.sasl_password,
+            "config.channels_config.irc.sasl_password",
+        )?;
+    }
+    if let Some(ref mut lark) = channels.lark {
+        encrypt_secret(
+            store,
+            &mut lark.app_secret,
+            "config.channels_config.lark.app_secret",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut lark.encrypt_key,
+            "config.channels_config.lark.encrypt_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut lark.verification_token,
+            "config.channels_config.lark.verification_token",
+        )?;
+    }
+    if let Some(ref mut dingtalk) = channels.dingtalk {
+        encrypt_secret(
+            store,
+            &mut dingtalk.client_secret,
+            "config.channels_config.dingtalk.client_secret",
+        )?;
+    }
+    if let Some(ref mut qq) = channels.qq {
+        encrypt_secret(
+            store,
+            &mut qq.app_secret,
+            "config.channels_config.qq.app_secret",
+        )?;
+    }
+    if let Some(ref mut nostr) = channels.nostr {
+        encrypt_secret(
+            store,
+            &mut nostr.private_key,
+            "config.channels_config.nostr.private_key",
+        )?;
+    }
+    if let Some(ref mut clawdtalk) = channels.clawdtalk {
+        encrypt_secret(
+            store,
+            &mut clawdtalk.api_key,
+            "config.channels_config.clawdtalk.api_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut clawdtalk.webhook_secret,
+            "config.channels_config.clawdtalk.webhook_secret",
+        )?;
     }
     Ok(())
 }
@@ -4351,18 +4807,22 @@ impl Config {
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
+            decrypt_vec_secrets(
+                &store,
+                &mut config.reliability.api_keys,
+                "config.reliability.api_keys",
+            )?;
+            decrypt_vec_secrets(
+                &store,
+                &mut config.gateway.paired_tokens,
+                "config.gateway.paired_tokens",
+            )?;
 
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
 
-            if let Some(ref mut ns) = config.channels_config.nostr {
-                decrypt_secret(
-                    &store,
-                    &mut ns.private_key,
-                    "config.channels_config.nostr.private_key",
-                )?;
-            }
+            decrypt_channel_secrets(&store, &mut config.channels_config)?;
 
             config.apply_env_overrides();
             config.validate()?;
@@ -4502,6 +4962,26 @@ impl Config {
             if !is_valid_env_var_name(env_name) {
                 anyhow::bail!(
                     "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+        }
+        let mut seen_non_cli_excluded = std::collections::HashSet::new();
+        for (i, tool_name) in self.autonomy.non_cli_excluded_tools.iter().enumerate() {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("autonomy.non_cli_excluded_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "autonomy.non_cli_excluded_tools[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !seen_non_cli_excluded.insert(normalized.to_string()) {
+                anyhow::bail!(
+                    "autonomy.non_cli_excluded_tools contains duplicate entry: {normalized}"
                 );
             }
         }
@@ -4999,18 +5479,22 @@ impl Config {
             &mut config_to_save.storage.provider.config.db_url,
             "config.storage.provider.config.db_url",
         )?;
+        encrypt_vec_secrets(
+            &store,
+            &mut config_to_save.reliability.api_keys,
+            "config.reliability.api_keys",
+        )?;
+        encrypt_vec_secrets(
+            &store,
+            &mut config_to_save.gateway.paired_tokens,
+            "config.gateway.paired_tokens",
+        )?;
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
-        if let Some(ref mut ns) = config_to_save.channels_config.nostr {
-            encrypt_secret(
-                &store,
-                &mut ns.private_key,
-                "config.channels_config.nostr.private_key",
-            )?;
-        }
+        encrypt_channel_secrets(&store, &mut config_to_save.channels_config)?;
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
@@ -5046,6 +5530,18 @@ impl Config {
                     temp_path.display()
                 )
             })?;
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            fs::set_permissions(&temp_path, Permissions::from_mode(0o600))
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to set secure permissions on temporary config file: {}",
+                        temp_path.display()
+                    )
+                })?;
+        }
         temp_file
             .write_all(toml_str.as_bytes())
             .await
@@ -5081,15 +5577,14 @@ impl Config {
         #[cfg(unix)]
         {
             use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-            if let Err(err) =
-                fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
-            {
-                tracing::warn!(
-                    "Failed to harden config permissions to 0600 at {}: {}",
-                    self.config_path.display(),
-                    err
-                );
-            }
+            fs::set_permissions(&self.config_path, Permissions::from_mode(0o600))
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to enforce secure permissions on config file: {}",
+                        self.config_path.display()
+                    )
+                })?;
         }
 
         sync_directory(parent_dir).await?;
@@ -5158,6 +5653,60 @@ mod tests {
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn config_debug_redacts_sensitive_values() {
+        let mut config = Config::default();
+        config.workspace_dir = PathBuf::from("/tmp/workspace");
+        config.config_path = PathBuf::from("/tmp/config.toml");
+        config.api_key = Some("root-credential".into());
+        config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.browser.computer_use.api_key = Some("browser-credential".into());
+        config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: "telegram-credential".into(),
+            allowed_users: Vec::new(),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.agents.insert(
+            "worker".into(),
+            DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "model-test".into(),
+                system_prompt: None,
+                api_key: Some("agent-credential".into()),
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let debug_output = format!("{config:?}");
+        assert!(debug_output.contains("***REDACTED***"));
+
+        for secret in [
+            "root-credential",
+            "postgres://user:pw@host/db",
+            "browser-credential",
+            "zc_0123456789abcdef",
+            "telegram-credential",
+            "agent-credential",
+        ] {
+            assert!(
+                !debug_output.contains(secret),
+                "debug output leaked secret value: {secret}"
+            );
+        }
+
+        assert!(!debug_output.contains("paired_tokens"));
+        assert!(!debug_output.contains("bot_token"));
+        assert!(!debug_output.contains("db_url"));
     }
 
     #[test]
@@ -5244,6 +5793,41 @@ mod tests {
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+        assert!(a.non_cli_excluded_tools.contains(&"shell".to_string()));
+        assert!(a.non_cli_excluded_tools.contains(&"delegate".to_string()));
+    }
+
+    #[test]
+    async fn autonomy_config_serde_defaults_non_cli_excluded_tools() {
+        let raw = r#"
+level = "supervised"
+workspace_only = true
+allowed_commands = ["git"]
+forbidden_paths = ["/etc"]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = []
+auto_approve = ["file_read"]
+always_ask = []
+allowed_roots = []
+"#;
+        let parsed: AutonomyConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
+        assert!(parsed
+            .non_cli_excluded_tools
+            .contains(&"browser".to_string()));
+    }
+
+    #[test]
+    async fn config_validate_rejects_duplicate_non_cli_excluded_tools() {
+        let mut cfg = Config::default();
+        cfg.autonomy.non_cli_excluded_tools = vec!["shell".into(), "shell".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.non_cli_excluded_tools contains duplicate entry"));
     }
 
     #[test]
@@ -5708,6 +6292,16 @@ tool_dispatcher = "xml"
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.reliability.api_keys = vec!["backup-credential".into()];
+        config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: "telegram-credential".into(),
+            allowed_users: Vec::new(),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
 
         config.agents.insert(
             "worker".into(),
@@ -5773,6 +6367,27 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(storage_db_url).unwrap(),
             "postgres://user:pw@host/db"
+        );
+
+        let reliability_key = &stored.reliability.api_keys[0];
+        assert!(crate::security::SecretStore::is_encrypted(reliability_key));
+        assert_eq!(store.decrypt(reliability_key).unwrap(), "backup-credential");
+
+        let paired_token = &stored.gateway.paired_tokens[0];
+        assert!(crate::security::SecretStore::is_encrypted(paired_token));
+        assert_eq!(store.decrypt(paired_token).unwrap(), "zc_0123456789abcdef");
+
+        let telegram_token = stored
+            .channels_config
+            .telegram
+            .as_ref()
+            .unwrap()
+            .bot_token
+            .clone();
+        assert!(crate::security::SecretStore::is_encrypted(&telegram_token));
+        assert_eq!(
+            store.decrypt(&telegram_token).unwrap(),
+            "telegram-credential"
         );
 
         let _ = fs::remove_dir_all(&dir).await;

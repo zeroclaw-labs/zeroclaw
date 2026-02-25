@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
@@ -178,16 +179,42 @@ impl SecretStore {
             if let Some(parent) = self.key_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&self.key_path, hex_encode(&key))
-                .context("Failed to write secret key file")?;
 
-            // Set restrictive permissions
-            #[cfg(unix)]
+            let key_hex = hex_encode(&key);
+            match fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&self.key_path)
             {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
-                    .context("Failed to set key file permissions")?;
+                Ok(mut key_file) => {
+                    // Set restrictive permissions before writing key bytes.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        key_file
+                            .set_permissions(fs::Permissions::from_mode(0o600))
+                            .context("Failed to set key file permissions")?;
+                    }
+
+                    key_file
+                        .write_all(key_hex.as_bytes())
+                        .context("Failed to write secret key file")?;
+                    key_file
+                        .sync_all()
+                        .context("Failed to fsync secret key file")?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Concurrent creator won the race; read the existing key.
+                    let hex_key = fs::read_to_string(&self.key_path)
+                        .context("Failed to read concurrently created secret key file")?;
+                    return hex_decode(hex_key.trim())
+                        .context("Secret key file is corrupt after concurrent create");
+                }
+                Err(err) => {
+                    return Err(err).context("Failed to create secret key file");
+                }
             }
+
             #[cfg(windows)]
             {
                 // On Windows, use icacls to restrict permissions to current user only
