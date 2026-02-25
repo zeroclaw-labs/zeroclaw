@@ -60,7 +60,6 @@ jobs:
                   event_name="${GITHUB_EVENT_NAME}"
                   publish_release="false"
                   draft_release="false"
-                  semver_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
 
                   if [[ "$event_name" == "push" ]]; then
                     release_ref="${GITHUB_REF_NAME}"
@@ -87,41 +86,6 @@ jobs:
                     release_tag="verify-${GITHUB_SHA::12}"
                   fi
 
-                  if [[ "$publish_release" == "true" ]]; then
-                    if [[ ! "$release_tag" =~ $semver_pattern ]]; then
-                      echo "::error::release_tag must match semver-like format (vX.Y.Z[-suffix])"
-                      exit 1
-                    fi
-                    if ! git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${release_tag}" >/dev/null; then
-                      echo "::error::Tag ${release_tag} does not exist on origin. Push the tag first, then rerun manual publish."
-                      exit 1
-                    fi
-
-                    # Guardrail: release tags must resolve to commits already reachable from main.
-                    tmp_repo="$(mktemp -d)"
-                    trap 'rm -rf "$tmp_repo"' EXIT
-                    git -C "$tmp_repo" init -q
-                    git -C "$tmp_repo" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-                    git -C "$tmp_repo" fetch --quiet --filter=blob:none origin main "refs/tags/${release_tag}:refs/tags/${release_tag}"
-                    if ! git -C "$tmp_repo" merge-base --is-ancestor "refs/tags/${release_tag}" "origin/main"; then
-                      echo "::error::Tag ${release_tag} is not reachable from origin/main. Release tags must be cut from main."
-                      exit 1
-                    fi
-
-                    # Guardrail: release tag and Cargo package version must stay aligned.
-                    tag_version="${release_tag#v}"
-                    cargo_version="$(git -C "$tmp_repo" show "refs/tags/${release_tag}:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n1)"
-                    if [[ -z "$cargo_version" ]]; then
-                      echo "::error::Unable to read Cargo package version from ${release_tag}:Cargo.toml"
-                      exit 1
-                    fi
-                    if [[ "$cargo_version" != "$tag_version" ]]; then
-                      echo "::error::Tag ${release_tag} does not match Cargo.toml version (${cargo_version})."
-                      echo "::error::Bump Cargo.toml version first, then create/publish the matching tag."
-                      exit 1
-                    fi
-                  fi
-
                   {
                     echo "release_ref=${release_ref}"
                     echo "release_tag=${release_tag}"
@@ -137,6 +101,60 @@ jobs:
                     echo "- publish_release: ${publish_release}"
                     echo "- draft_release: ${draft_release}"
                   } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Validate release trigger and authorization guard
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/release_trigger_guard.py \
+                    --repo-root . \
+                    --repository "${GITHUB_REPOSITORY}" \
+                    --event-name "${GITHUB_EVENT_NAME}" \
+                    --actor "${GITHUB_ACTOR}" \
+                    --release-ref "${{ steps.vars.outputs.release_ref }}" \
+                    --release-tag "${{ steps.vars.outputs.release_tag }}" \
+                    --publish-release "${{ steps.vars.outputs.publish_release }}" \
+                    --authorized-actors "${{ vars.RELEASE_AUTHORIZED_ACTORS || 'willsarg,theonlyhennygod,chumyin' }}" \
+                    --authorized-tagger-emails "${{ vars.RELEASE_AUTHORIZED_TAGGER_EMAILS || '' }}" \
+                    --require-annotated-tag true \
+                    --output-json artifacts/release-trigger-guard.json \
+                    --output-md artifacts/release-trigger-guard.md \
+                    --fail-on-violation
+
+            - name: Emit release trigger audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type release_trigger_guard \
+                    --input-json artifacts/release-trigger-guard.json \
+                    --output-json artifacts/audit-event-release-trigger-guard.json \
+                    --artifact-name release-trigger-guard \
+                    --retention-days 30
+
+            - name: Publish release trigger guard summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-trigger-guard.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload release trigger guard artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: release-trigger-guard
+                  path: |
+                      artifacts/release-trigger-guard.json
+                      artifacts/release-trigger-guard.md
+                      artifacts/audit-event-release-trigger-guard.json
+                  if-no-files-found: error
+                  retention-days: 30
 
     build-release:
         name: Build ${{ matrix.target }}
