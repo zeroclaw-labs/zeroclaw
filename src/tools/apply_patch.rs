@@ -2,6 +2,7 @@ use crate::tools::traits::{Tool, ToolResult};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
@@ -98,11 +99,8 @@ impl Tool for ApplyPatchTool {
 
         let repo_root = git_repo_root().await?;
         let mut log = String::new();
-        log.push_str(&format!("Repo root: {}\n", repo_root.display()));
-        log.push_str(&format!(
-            "Mode: {}\n",
-            if dry_run { "dry-run" } else { "apply" }
-        ));
+        let _ = writeln!(log, "Repo root: {}", repo_root.display());
+        let _ = writeln!(log, "Mode: {}", if dry_run { "dry-run" } else { "apply" });
 
         // Write patch to a temp file.
         let mut tmp = NamedTempFile::new().context("Failed to create temp file for patch")?;
@@ -120,7 +118,7 @@ impl Tool for ApplyPatchTool {
             .await?;
 
             log.push_str("\n# git apply --check\n");
-            log.push_str(&format!("exit_code: {code}\n"));
+            let _ = writeln!(log, "exit_code: {code}");
             if !out.is_empty() {
                 log.push_str("stdout:\n");
                 log.push_str(&out);
@@ -164,7 +162,7 @@ impl Tool for ApplyPatchTool {
             .await?;
 
             log.push_str("\n# git apply\n");
-            log.push_str(&format!("exit_code: {code}\n"));
+            let _ = writeln!(log, "exit_code: {code}");
             if !out.is_empty() {
                 log.push_str("stdout:\n");
                 log.push_str(&out);
@@ -214,7 +212,7 @@ impl Tool for ApplyPatchTool {
         if let Some(msg) = commit_message {
             let (code_add, _out_add, err_add) = run_cmd(&repo_root, "git", &["add", "-A"]).await?;
             log.push_str("\n# git add -A\n");
-            log.push_str(&format!("exit_code: {code_add}\n"));
+            let _ = writeln!(log, "exit_code: {code_add}");
             if !err_add.is_empty() {
                 log.push_str("stderr:\n");
                 log.push_str(&err_add);
@@ -233,7 +231,7 @@ impl Tool for ApplyPatchTool {
             let (code_commit, out_commit, err_commit) =
                 run_cmd(&repo_root, "git", &["commit", "-m", msg.as_str()]).await?;
             log.push_str("\n# git commit -m <msg>\n");
-            log.push_str(&format!("exit_code: {code_commit}\n"));
+            let _ = writeln!(log, "exit_code: {code_commit}");
             if !out_commit.is_empty() {
                 log.push_str("stdout:\n");
                 log.push_str(&out_commit);
