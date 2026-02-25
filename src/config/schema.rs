@@ -2241,7 +2241,7 @@ pub struct BuiltinHooksConfig {
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Natural-language behavior for non-CLI approval-management commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NonCliNaturalLanguageApprovalMode {
     /// Do not treat natural-language text as approval-management commands.
@@ -2254,13 +2254,8 @@ pub enum NonCliNaturalLanguageApprovalMode {
     ///
     /// This keeps private-chat workflows simple while still requiring a human
     /// sender and passing the same approver allowlist checks as slash commands.
+    #[default]
     Direct,
-}
-
-impl Default for NonCliNaturalLanguageApprovalMode {
-    fn default() -> Self {
-        Self::Direct
-    }
 }
 
 /// Autonomy and security policy configuration (`[autonomy]` section).

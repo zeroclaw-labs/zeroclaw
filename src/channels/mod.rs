@@ -156,6 +156,7 @@ enum ChannelRuntimeCommand {
     ShowModel,
     SetModel(String),
     NewSession,
+    RequestAllToolsOnce,
     RequestToolApproval(String),
     ConfirmToolApproval(String),
     ListPendingApprovals,
@@ -163,6 +164,8 @@ enum ChannelRuntimeCommand {
     UnapproveTool(String),
     ListApprovals,
 }
+
+const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ModelCacheState {
@@ -697,6 +700,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         // History reset commands are safe for all channels.
         "/new" | "/clear" => Some(ChannelRuntimeCommand::NewSession),
+        "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
         "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
         "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
         "/approve-pending" => Some(ChannelRuntimeCommand::ListPendingApprovals),
@@ -746,6 +750,35 @@ fn extract_runtime_tail_token(text: &str, prefixes: &[&str]) -> Option<String> {
     })
 }
 
+fn contains_any_fragment(haystack: &str, fragments: &[&str]) -> bool {
+    fragments.iter().any(|fragment| haystack.contains(fragment))
+}
+
+fn is_natural_language_all_tools_once_intent(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_allow_verb = contains_any_fragment(&lower, &["approve", "allow"])
+        || contains_any_fragment(trimmed, &["授权", "放开", "允许"]);
+    let has_all_tools_scope = contains_any_fragment(&lower, &["all tools", "all commands"])
+        || contains_any_fragment(trimmed, &["所有工具", "全部工具", "所有命令", "全部命令"]);
+    let has_one_time_scope = contains_any_fragment(&lower, &["once", "one-time", "one time"])
+        || contains_any_fragment(trimmed, &["一次", "这次"]);
+
+    has_allow_verb && has_all_tools_scope && has_one_time_scope
+}
+
+fn approval_target_label(tool_name: &str) -> String {
+    if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+        "all tools/commands (one-time bypass token)".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
 fn parse_natural_language_runtime_command(content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -766,6 +799,14 @@ fn parse_natural_language_runtime_command(content: &str) -> Option<ChannelRuntim
         )
     {
         return Some(ChannelRuntimeCommand::ListApprovals);
+    }
+    if is_natural_language_all_tools_once_intent(trimmed)
+        || matches!(
+            lower.as_str(),
+            "approve all tools once" | "allow all tools once" | "approve all once"
+        )
+    {
+        return Some(ChannelRuntimeCommand::RequestAllToolsOnce);
     }
 
     if let Some(request_id) = extract_runtime_tail_token(&lower, &["confirm "]) {
@@ -798,7 +839,8 @@ fn parse_natural_language_runtime_command(content: &str) -> Option<ChannelRuntim
 fn is_approval_management_command(command: &ChannelRuntimeCommand) -> bool {
     matches!(
         command,
-        ChannelRuntimeCommand::RequestToolApproval(_)
+        ChannelRuntimeCommand::RequestAllToolsOnce
+            | ChannelRuntimeCommand::RequestToolApproval(_)
             | ChannelRuntimeCommand::ConfirmToolApproval(_)
             | ChannelRuntimeCommand::ListPendingApprovals
             | ChannelRuntimeCommand::ApproveTool(_)
@@ -1157,6 +1199,12 @@ async fn describe_non_cli_approvals(
             session_grants.join(", ")
         );
     }
+    let one_time_all_tools_tokens = ctx.approval_manager.non_cli_allow_all_once_remaining();
+    let _ = writeln!(
+        response,
+        "- Runtime one-time all-tools bypass tokens: {}",
+        one_time_all_tools_tokens
+    );
 
     let mut approval_approvers = ctx
         .approval_manager
@@ -1228,7 +1276,10 @@ async fn describe_non_cli_approvals(
             let _ = writeln!(
                 response,
                 "  - {}: tool={}, expires_at={}, reason={}",
-                req.request_id, req.tool_name, req.expires_at, reason
+                req.request_id,
+                approval_target_label(&req.tool_name),
+                req.expires_at,
+                reason
             );
         }
     }
@@ -1641,6 +1692,7 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
     );
     response.push_str("\nSwitch model with `/model <model-id>`.\n");
     response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
+    response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
     response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
     response.push_str("List pending requests with `/approve-pending`.\n");
     response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
@@ -1683,6 +1735,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
     response.push_str("Switch model with `/model <model-id>`.\n\n");
     response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
+    response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
     response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
     response.push_str("List pending requests with `/approve-pending`.\n");
     response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
@@ -1783,7 +1836,7 @@ async fn handle_runtime_command_if_needed(
             .non_cli_natural_language_approval_mode_for_channel(source_channel);
         match mode {
             NonCliNaturalLanguageApprovalMode::Disabled => {
-                let response = "Natural-language approval commands are disabled by runtime policy.\nUse explicit slash commands such as `/approve <tool-name>`, `/approve-request <tool-name>`, `/approve-confirm <request-id>`, `/unapprove <tool-name>`, and `/approvals`.".to_string();
+                let response = "Natural-language approval commands are disabled by runtime policy.\nUse explicit slash commands such as `/approve <tool-name>`, `/approve-request <tool-name>`, `/approve-all-once`, `/approve-confirm <request-id>`, `/unapprove <tool-name>`, and `/approvals`.".to_string();
                 runtime_trace::record_event(
                     "approval_management_natural_language_denied",
                     Some(source_channel),
@@ -1886,6 +1939,35 @@ async fn handle_runtime_command_if_needed(
             clear_sender_history(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::RequestAllToolsOnce => {
+            let req = ctx.approval_manager.create_non_cli_pending_request(
+                APPROVAL_ALL_TOOLS_ONCE_TOKEN,
+                sender,
+                source_channel,
+                reply_target,
+                Some("human-confirmed one-time bypass request for all tools/commands".to_string()),
+            );
+            runtime_trace::record_event(
+                "approval_request_created",
+                Some(source_channel),
+                None,
+                None,
+                None,
+                Some(true),
+                Some("pending one-time all-tools request created"),
+                serde_json::json!({
+                    "request_id": req.request_id,
+                    "tool_name": req.tool_name,
+                    "sender": sender,
+                    "channel": source_channel,
+                    "expires_at": req.expires_at,
+                }),
+            );
+            format!(
+                "One-time all-tools approval request created.\nRequest ID: `{}`\nScope: next non-CLI agent tool-execution turn may run without per-tool approval prompts.\nExpires: `{}`\nConfirm with `/approve-confirm {}` (must be the same sender in this chat/channel).",
+                req.request_id, req.expires_at, req.request_id
+            )
+        }
         ChannelRuntimeCommand::RequestToolApproval(raw_tool_name) => {
             let tool_name = raw_tool_name.trim().to_string();
             if tool_name.is_empty() {
@@ -1956,10 +2038,15 @@ async fn handle_runtime_command_if_needed(
                 ) {
                     Ok(req) => {
                         let tool_name = req.tool_name;
-                        ctx.approval_manager.grant_non_cli_session(&tool_name);
-                        ctx.approval_manager
-                            .apply_persistent_runtime_grant(&tool_name);
-                        let persistence_message =
+                        let approval_message = if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+                            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
+                            format!(
+                                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
+                            )
+                        } else {
+                            ctx.approval_manager.grant_non_cli_session(&tool_name);
+                            ctx.approval_manager
+                                .apply_persistent_runtime_grant(&tool_name);
                             match persist_non_cli_approval_to_config(ctx, &tool_name).await {
                                 Ok(Some(path)) => format!(
                                     "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nPersisted to `{}` so future channel sessions (including after restart) remain approved.",
@@ -1971,7 +2058,8 @@ async fn handle_runtime_command_if_needed(
                                 Err(err) => format!(
                                     "Approved supervised execution for `{tool_name}` from request `{request_id}` in-memory.\nFailed to persist this approval to config: {err}"
                                 ),
-                            };
+                            }
+                        };
                         runtime_trace::record_event(
                             "approval_request_confirmed",
                             Some(source_channel),
@@ -1988,12 +2076,14 @@ async fn handle_runtime_command_if_needed(
                             }),
                         );
 
-                        if is_non_cli_tool_excluded(ctx, &tool_name) {
+                        if tool_name != APPROVAL_ALL_TOOLS_ONCE_TOKEN
+                            && is_non_cli_tool_excluded(ctx, &tool_name)
+                        {
                             format!(
-                                "{persistence_message}\nNote: `{tool_name}` is currently listed in `autonomy.non_cli_excluded_tools` for this runtime. Remove it from config; the channel runtime auto-reloads this list from disk."
+                                "{approval_message}\nNote: `{tool_name}` is currently listed in `autonomy.non_cli_excluded_tools` for this runtime. Remove it from config; the channel runtime auto-reloads this list from disk."
                             )
                         } else {
-                            persistence_message
+                            approval_message
                         }
                     }
                     Err(PendingApprovalError::NotFound) => {
@@ -2012,7 +2102,7 @@ async fn handle_runtime_command_if_needed(
                             }),
                         );
                         format!(
-                            "Pending approval request `{request_id}` was not found. Create one with `/approve-request <tool-name>`."
+                            "Pending approval request `{request_id}` was not found. Create one with `/approve-request <tool-name>` or `/approve-all-once`."
                         )
                     }
                     Err(PendingApprovalError::Expired) => {
@@ -2075,7 +2165,10 @@ async fn handle_runtime_command_if_needed(
                     let _ = writeln!(
                         response,
                         "- {}: tool={}, expires_at={}, reason={}",
-                        req.request_id, req.tool_name, req.expires_at, reason
+                        req.request_id,
+                        approval_target_label(&req.tool_name),
+                        req.expires_at,
+                        reason
                     );
                 }
                 response
@@ -4621,6 +4714,10 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_runtime_command("slack", "/approve-all-once"),
+            Some(ChannelRuntimeCommand::RequestAllToolsOnce)
+        );
+        assert_eq!(
             parse_runtime_command("slack", "/approve-confirm apr-deadbeef"),
             Some(ChannelRuntimeCommand::ConfirmToolApproval(
                 "apr-deadbeef".to_string()
@@ -4664,6 +4761,10 @@ mod tests {
             Some(ChannelRuntimeCommand::RequestToolApproval(
                 "shell".to_string()
             ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "请一次性允许所有工具和命令"),
+            Some(ChannelRuntimeCommand::RequestAllToolsOnce)
         );
         assert_eq!(
             parse_runtime_command("telegram", "确认授权 apr-deadbeef"),
@@ -6468,6 +6569,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &crate::config::AutonomyConfig::default(),
         ));
         approval_manager.grant_non_cli_session("shell");
+        approval_manager.grant_non_cli_allow_all_once();
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -6522,6 +6624,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Supervised non-CLI tool approvals:"));
         assert!(sent[0].contains("Runtime session grants: shell"));
+        assert!(sent[0].contains("Runtime one-time all-tools bypass tokens: 1"));
         assert!(sent[0].contains("Runtime non_cli_approval_approvers:"));
         assert!(sent[0].contains("Runtime non_cli_natural_language_approval_mode:"));
         assert!(sent[0].contains("Runtime non_cli_natural_language_approval_mode_by_channel:"));
@@ -6668,6 +6771,155 @@ BTC is currently around $65,000 based on latest tool output."#
             .auto_approve
             .iter()
             .any(|tool| tool == "mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_all_tools_once_requires_confirm_and_stays_runtime_only() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm;
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            non_cli_natural_language_approval_mode:
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-all-once-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "请一次性允许所有工具和命令".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let request_id = {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(
+                sent[0].contains("One-time all-tools approval request created."),
+                "unexpected response: {}",
+                sent[0]
+            );
+            let request_line = sent[0]
+                .lines()
+                .find(|line| line.starts_with("Request ID: `"))
+                .expect("request line");
+            request_line
+                .trim_start_matches("Request ID: `")
+                .trim_end_matches('`')
+                .to_string()
+        };
+        assert!(request_id.starts_with("apr-"));
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-all-once-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("/approve-confirm {request_id}"),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("Approved one-time all-tools bypass from request"));
+        assert!(sent[1].contains("does not persist to config"));
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_allow_all_once_remaining(),
+            1
+        );
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(
+            saved
+                .autonomy
+                .auto_approve
+                .iter()
+                .all(|tool| tool != APPROVAL_ALL_TOOLS_ONCE_TOKEN && tool != "mock_price"),
+            "persisted config should not persist one-time bypass markers or promote mock_price"
+        );
+        assert!(
+            saved
+                .autonomy
+                .always_ask
+                .iter()
+                .any(|tool| tool == "mock_price"),
+            "persisted config should keep existing always_ask entries untouched"
+        );
     }
 
     #[tokio::test]

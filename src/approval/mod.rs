@@ -81,6 +81,8 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Session-scoped allowlist for non-CLI channels after explicit human approval.
     non_cli_allowlist: Mutex<HashSet<String>>,
+    /// One-time non-CLI bypass tokens that allow a full tool loop turn without prompts.
+    non_cli_allow_all_once_remaining: Mutex<u32>,
     /// Optional allowlist of senders allowed to manage non-CLI approvals.
     non_cli_approval_approvers: RwLock<HashSet<String>>,
     /// Default natural-language handling mode for non-CLI approval-management commands.
@@ -127,6 +129,7 @@ impl ApprovalManager {
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
             non_cli_allowlist: Mutex::new(HashSet::new()),
+            non_cli_allow_all_once_remaining: Mutex::new(0),
             non_cli_approval_approvers: RwLock::new(Self::normalize_non_cli_approvers(
                 &config.non_cli_approval_approvers,
             )),
@@ -235,6 +238,32 @@ impl ApprovalManager {
     /// Get the current non-CLI session allowlist.
     pub fn non_cli_session_allowlist(&self) -> HashSet<String> {
         self.non_cli_allowlist.lock().clone()
+    }
+
+    /// Grant one non-CLI "allow all tools/commands for one turn" token.
+    ///
+    /// Returns the remaining token count after increment.
+    pub fn grant_non_cli_allow_all_once(&self) -> u32 {
+        let mut remaining = self.non_cli_allow_all_once_remaining.lock();
+        *remaining = remaining.saturating_add(1);
+        *remaining
+    }
+
+    /// Consume one non-CLI "allow all tools/commands for one turn" token.
+    ///
+    /// Returns `true` when a token was consumed, `false` when none existed.
+    pub fn consume_non_cli_allow_all_once(&self) -> bool {
+        let mut remaining = self.non_cli_allow_all_once_remaining.lock();
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        true
+    }
+
+    /// Remaining one-time non-CLI "allow all tools/commands" tokens.
+    pub fn non_cli_allow_all_once_remaining(&self) -> u32 {
+        *self.non_cli_allow_all_once_remaining.lock()
     }
 
     /// Snapshot configured non-CLI approval approver entries.
@@ -700,6 +729,23 @@ mod tests {
         let allowlist = mgr.non_cli_session_allowlist();
         assert!(allowlist.contains("shell"));
         assert!(allowlist.contains("file_write"));
+    }
+
+    #[test]
+    fn non_cli_allow_all_once_tokens_are_counted_and_consumed() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 0);
+        assert!(!mgr.consume_non_cli_allow_all_once());
+
+        assert_eq!(mgr.grant_non_cli_allow_all_once(), 1);
+        assert_eq!(mgr.grant_non_cli_allow_all_once(), 2);
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 2);
+
+        assert!(mgr.consume_non_cli_allow_all_once());
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 1);
+        assert!(mgr.consume_non_cli_allow_all_once());
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 0);
+        assert!(!mgr.consume_non_cli_allow_all_once());
     }
 
     #[test]
