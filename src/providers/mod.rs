@@ -721,21 +721,36 @@ fn token_end(input: &str, from: usize) -> usize {
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
 /// `ghu_`, `github_pat_`, `AIza`, and `AKIA`.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 9] = [
-        "sk-",
-        "xoxb-",
-        "xoxp-",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "github_pat_",
-        "AIza",
-        "AKIA",
+    const PREFIXES: [(&str, usize); 24] = [
+        ("sk-", 1),
+        ("xoxb-", 1),
+        ("xoxp-", 1),
+        ("ghp_", 1),
+        ("gho_", 1),
+        ("ghu_", 1),
+        ("github_pat_", 1),
+        ("AIza", 1),
+        ("AKIA", 1),
+        ("\"access_token\":\"", 8),
+        ("\"refresh_token\":\"", 8),
+        ("\"id_token\":\"", 8),
+        ("\"api_key\":\"", 8),
+        ("\"client_secret\":\"", 8),
+        ("\"app_secret\":\"", 8),
+        ("\"verify_token\":\"", 8),
+        ("access_token=", 8),
+        ("refresh_token=", 8),
+        ("id_token=", 8),
+        ("api_key=", 8),
+        ("client_secret=", 8),
+        ("app_secret=", 8),
+        ("Bearer ", 16),
+        ("bearer ", 16),
     ];
 
     let mut scrubbed = input.to_string();
 
-    for prefix in PREFIXES {
+    for (prefix, min_len) in PREFIXES {
         let mut search_from = 0;
         loop {
             let Some(rel) = scrubbed[search_from..].find(prefix) else {
@@ -745,9 +760,10 @@ pub fn scrub_secret_patterns(input: &str) -> String {
             let start = search_from + rel;
             let content_start = start + prefix.len();
             let end = token_end(&scrubbed, content_start);
+            let token_len = end.saturating_sub(content_start);
 
             // Bare prefixes like "sk-" should not stop future scans.
-            if end == content_start {
+            if token_len < min_len {
                 search_from = content_start;
                 continue;
             }
@@ -2879,6 +2895,40 @@ mod tests {
         let input = "credential leak AKIAIOSFODNN7EXAMPLE";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "credential leak [REDACTED]");
+    }
+
+    #[test]
+    fn sanitize_redacts_json_access_token_field() {
+        let input = r#"{"access_token":"ya29.a0AfH6SMB1234567890abcdef","error":"invalid"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("ya29.a0AfH6SMB1234567890abcdef"));
+        assert!(!result.contains("access_token"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_query_client_secret_field() {
+        let input = "upstream rejected request: client_secret=supersecret1234567890";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("supersecret1234567890"));
+        assert!(!result.contains("client_secret"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_bearer_token_sequence() {
+        let input = "authorization failed: Bearer abcdefghijklmnopqrstuvwxyz123456";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(!result.contains("Bearer abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_preserves_short_bearer_phrase_without_secret() {
+        let input = "Unauthorized — provide Authorization: Bearer token";
+        let result = sanitize_api_error(input);
+        assert_eq!(result, input);
     }
 
     #[test]
