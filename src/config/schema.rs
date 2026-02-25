@@ -3601,6 +3601,10 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Syscall anomaly detection profile for daemon shell/process execution.
+    #[serde(default)]
+    pub syscall_anomaly: SyscallAnomalyConfig,
 }
 
 /// OTP validation strategy.
@@ -3708,6 +3712,144 @@ impl Default for EstopConfig {
             enabled: false,
             state_file: default_estop_state_file(),
             require_otp_to_resume: true,
+        }
+    }
+}
+
+/// Syscall anomaly detection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyscallAnomalyConfig {
+    /// Enable syscall anomaly detection.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Treat denied syscall lines as anomalies even when syscall is in baseline.
+    #[serde(default)]
+    pub strict_mode: bool,
+
+    /// Emit anomaly alerts when a syscall appears outside the expected baseline.
+    #[serde(default = "default_true")]
+    pub alert_on_unknown_syscall: bool,
+
+    /// Allowed denied-syscall events per rolling minute before triggering an alert.
+    #[serde(default = "default_syscall_anomaly_max_denied_events_per_minute")]
+    pub max_denied_events_per_minute: u32,
+
+    /// Allowed total syscall telemetry events per rolling minute before triggering an alert.
+    #[serde(default = "default_syscall_anomaly_max_total_events_per_minute")]
+    pub max_total_events_per_minute: u32,
+
+    /// Maximum anomaly alerts emitted per rolling minute (global guardrail).
+    #[serde(default = "default_syscall_anomaly_max_alerts_per_minute")]
+    pub max_alerts_per_minute: u32,
+
+    /// Cooldown between identical anomaly alerts (seconds).
+    #[serde(default = "default_syscall_anomaly_alert_cooldown_secs")]
+    pub alert_cooldown_secs: u64,
+
+    /// Path to syscall anomaly log file (relative to ~/.zeroclaw unless absolute).
+    #[serde(default = "default_syscall_anomaly_log_path")]
+    pub log_path: String,
+
+    /// Expected syscall baseline. Unknown syscall names trigger anomaly when enabled.
+    #[serde(default = "default_syscall_anomaly_baseline_syscalls")]
+    pub baseline_syscalls: Vec<String>,
+}
+
+fn default_syscall_anomaly_max_denied_events_per_minute() -> u32 {
+    5
+}
+
+fn default_syscall_anomaly_max_total_events_per_minute() -> u32 {
+    120
+}
+
+fn default_syscall_anomaly_max_alerts_per_minute() -> u32 {
+    30
+}
+
+fn default_syscall_anomaly_alert_cooldown_secs() -> u64 {
+    20
+}
+
+fn default_syscall_anomaly_log_path() -> String {
+    "syscall-anomalies.log".to_string()
+}
+
+fn default_syscall_anomaly_baseline_syscalls() -> Vec<String> {
+    vec![
+        "read".to_string(),
+        "write".to_string(),
+        "open".to_string(),
+        "openat".to_string(),
+        "close".to_string(),
+        "stat".to_string(),
+        "fstat".to_string(),
+        "newfstatat".to_string(),
+        "lseek".to_string(),
+        "mmap".to_string(),
+        "mprotect".to_string(),
+        "munmap".to_string(),
+        "brk".to_string(),
+        "rt_sigaction".to_string(),
+        "rt_sigprocmask".to_string(),
+        "ioctl".to_string(),
+        "fcntl".to_string(),
+        "access".to_string(),
+        "pipe2".to_string(),
+        "dup".to_string(),
+        "dup2".to_string(),
+        "dup3".to_string(),
+        "epoll_create1".to_string(),
+        "epoll_ctl".to_string(),
+        "epoll_wait".to_string(),
+        "poll".to_string(),
+        "ppoll".to_string(),
+        "select".to_string(),
+        "futex".to_string(),
+        "clock_gettime".to_string(),
+        "nanosleep".to_string(),
+        "getpid".to_string(),
+        "gettid".to_string(),
+        "set_tid_address".to_string(),
+        "set_robust_list".to_string(),
+        "clone".to_string(),
+        "clone3".to_string(),
+        "fork".to_string(),
+        "execve".to_string(),
+        "wait4".to_string(),
+        "exit".to_string(),
+        "exit_group".to_string(),
+        "socket".to_string(),
+        "connect".to_string(),
+        "accept".to_string(),
+        "accept4".to_string(),
+        "listen".to_string(),
+        "sendto".to_string(),
+        "recvfrom".to_string(),
+        "sendmsg".to_string(),
+        "recvmsg".to_string(),
+        "getsockname".to_string(),
+        "getpeername".to_string(),
+        "setsockopt".to_string(),
+        "getsockopt".to_string(),
+        "getrandom".to_string(),
+        "statx".to_string(),
+    ]
+}
+
+impl Default for SyscallAnomalyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            strict_mode: false,
+            alert_on_unknown_syscall: default_true(),
+            max_denied_events_per_minute: default_syscall_anomaly_max_denied_events_per_minute(),
+            max_total_events_per_minute: default_syscall_anomaly_max_total_events_per_minute(),
+            max_alerts_per_minute: default_syscall_anomaly_max_alerts_per_minute(),
+            alert_cooldown_secs: default_syscall_anomaly_alert_cooldown_secs(),
+            log_path: default_syscall_anomaly_log_path(),
+            baseline_syscalls: default_syscall_anomaly_baseline_syscalls(),
         }
     }
 }
@@ -5015,6 +5157,52 @@ impl Config {
         })?;
         if self.security.estop.state_file.trim().is_empty() {
             anyhow::bail!("security.estop.state_file must not be empty");
+        }
+        if self.security.syscall_anomaly.max_denied_events_per_minute == 0 {
+            anyhow::bail!(
+                "security.syscall_anomaly.max_denied_events_per_minute must be greater than 0"
+            );
+        }
+        if self.security.syscall_anomaly.max_total_events_per_minute == 0 {
+            anyhow::bail!(
+                "security.syscall_anomaly.max_total_events_per_minute must be greater than 0"
+            );
+        }
+        if self.security.syscall_anomaly.max_denied_events_per_minute
+            > self.security.syscall_anomaly.max_total_events_per_minute
+        {
+            anyhow::bail!(
+                "security.syscall_anomaly.max_denied_events_per_minute must be less than or equal to security.syscall_anomaly.max_total_events_per_minute"
+            );
+        }
+        if self.security.syscall_anomaly.max_alerts_per_minute == 0 {
+            anyhow::bail!("security.syscall_anomaly.max_alerts_per_minute must be greater than 0");
+        }
+        if self.security.syscall_anomaly.alert_cooldown_secs == 0 {
+            anyhow::bail!("security.syscall_anomaly.alert_cooldown_secs must be greater than 0");
+        }
+        if self.security.syscall_anomaly.log_path.trim().is_empty() {
+            anyhow::bail!("security.syscall_anomaly.log_path must not be empty");
+        }
+        for (i, syscall_name) in self
+            .security
+            .syscall_anomaly
+            .baseline_syscalls
+            .iter()
+            .enumerate()
+        {
+            let normalized = syscall_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.syscall_anomaly.baseline_syscalls[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '#')
+            {
+                anyhow::bail!(
+                    "security.syscall_anomaly.baseline_syscalls[{i}] contains invalid characters: {normalized}"
+                );
+            }
         }
 
         // Scheduler
@@ -8637,6 +8825,9 @@ default_temperature = 0.7
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
+        assert!(parsed.security.syscall_anomaly.enabled);
+        assert!(parsed.security.syscall_anomaly.alert_on_unknown_syscall);
+        assert!(!parsed.security.syscall_anomaly.baseline_syscalls.is_empty());
     }
 
     #[test]
@@ -8660,12 +8851,35 @@ gated_domain_categories = ["banking"]
 enabled = true
 state_file = "~/.zeroclaw/estop-state.json"
 require_otp_to_resume = true
+
+[security.syscall_anomaly]
+enabled = true
+strict_mode = true
+alert_on_unknown_syscall = true
+max_denied_events_per_minute = 3
+max_total_events_per_minute = 60
+max_alerts_per_minute = 10
+alert_cooldown_secs = 15
+log_path = "syscall-anomalies.log"
+baseline_syscalls = ["read", "write", "openat", "close"]
 "#,
         )
         .unwrap();
 
         assert!(parsed.security.otp.enabled);
         assert!(parsed.security.estop.enabled);
+        assert!(parsed.security.syscall_anomaly.strict_mode);
+        assert_eq!(
+            parsed.security.syscall_anomaly.max_denied_events_per_minute,
+            3
+        );
+        assert_eq!(
+            parsed.security.syscall_anomaly.max_total_events_per_minute,
+            60
+        );
+        assert_eq!(parsed.security.syscall_anomaly.max_alerts_per_minute, 10);
+        assert_eq!(parsed.security.syscall_anomaly.alert_cooldown_secs, 15);
+        assert_eq!(parsed.security.syscall_anomaly.baseline_syscalls.len(), 4);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         parsed.validate().unwrap();
@@ -8700,5 +8914,64 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_syscall_threshold() {
+        let mut config = Config::default();
+        config.security.syscall_anomaly.max_denied_events_per_minute = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected syscall threshold validation failure");
+        assert!(err.to_string().contains("max_denied_events_per_minute"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_syscall_baseline_name() {
+        let mut config = Config::default();
+        config.security.syscall_anomaly.baseline_syscalls =
+            vec!["openat".into(), "bad name".into()];
+
+        let err = config
+            .validate()
+            .expect_err("expected syscall baseline name validation failure");
+        assert!(err.to_string().contains("baseline_syscalls"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_syscall_alert_budget() {
+        let mut config = Config::default();
+        config.security.syscall_anomaly.max_alerts_per_minute = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected syscall alert budget validation failure");
+        assert!(err.to_string().contains("max_alerts_per_minute"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_syscall_cooldown() {
+        let mut config = Config::default();
+        config.security.syscall_anomaly.alert_cooldown_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected syscall cooldown validation failure");
+        assert!(err.to_string().contains("alert_cooldown_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_denied_threshold_above_total_threshold() {
+        let mut config = Config::default();
+        config.security.syscall_anomaly.max_denied_events_per_minute = 10;
+        config.security.syscall_anomaly.max_total_events_per_minute = 5;
+
+        let err = config
+            .validate()
+            .expect_err("expected syscall threshold ordering validation failure");
+        assert!(err
+            .to_string()
+            .contains("max_denied_events_per_minute must be less than or equal"));
     }
 }

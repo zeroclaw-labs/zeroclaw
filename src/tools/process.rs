@@ -3,6 +3,7 @@ use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -17,14 +18,21 @@ const MAX_OUTPUT_BYTES: usize = 524_288;
 /// Maximum concurrent background processes.
 const MAX_PROCESSES: usize = 8;
 
+#[derive(Debug, Default, Clone)]
+struct OutputBuffer {
+    data: String,
+    dropped_prefix_bytes: u64,
+}
+
 struct ProcessEntry {
     id: usize,
     command: String,
     pid: u32,
     started_at: Instant,
     child: Mutex<tokio::process::Child>,
-    stdout_buf: Arc<Mutex<String>>,
-    stderr_buf: Arc<Mutex<String>>,
+    stdout_buf: Arc<Mutex<OutputBuffer>>,
+    stderr_buf: Arc<Mutex<OutputBuffer>>,
+    analyzed_offsets: Mutex<(u64, u64)>,
 }
 
 /// Background process management tool.
@@ -35,15 +43,25 @@ struct ProcessEntry {
 pub struct ProcessTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
     processes: Arc<RwLock<HashMap<usize, ProcessEntry>>>,
     next_id: Mutex<usize>,
 }
 
 impl ProcessTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
+        Self::new_with_syscall_detector(security, runtime, None)
+    }
+
+    pub fn new_with_syscall_detector(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
+    ) -> Self {
         Self {
             security,
             runtime,
+            syscall_detector,
             processes: Arc::new(RwLock::new(HashMap::new())),
             next_id: Mutex::new(0),
         }
@@ -164,8 +182,8 @@ impl ProcessTool {
         let pid = child.id().unwrap_or(0);
 
         // Set up background output readers.
-        let stdout_buf = Arc::new(Mutex::new(String::new()));
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stdout_buf = Arc::new(Mutex::new(OutputBuffer::default()));
+        let stderr_buf = Arc::new(Mutex::new(OutputBuffer::default()));
 
         if let Some(stdout) = child.stdout.take() {
             spawn_reader_task(stdout, stdout_buf.clone());
@@ -189,6 +207,7 @@ impl ProcessTool {
             child: Mutex::new(child),
             stdout_buf,
             stderr_buf,
+            analyzed_offsets: Mutex::new((0, 0)),
         };
 
         self.processes.write().unwrap().insert(id, entry);
@@ -274,8 +293,33 @@ impl ProcessTool {
             }
         };
 
-        let stdout = entry.stdout_buf.lock().unwrap().clone();
-        let stderr = entry.stderr_buf.lock().unwrap().clone();
+        let stdout_snapshot = snapshot_output_buffer(&entry.stdout_buf);
+        let stderr_snapshot = snapshot_output_buffer(&entry.stderr_buf);
+        let stdout = stdout_snapshot.data;
+        let stderr = stderr_snapshot.data;
+
+        if let Some(detector) = &self.syscall_detector {
+            let mut offsets = entry.analyzed_offsets.lock().unwrap();
+            let stdout_delta = slice_unseen_output(
+                &stdout,
+                stdout_snapshot.dropped_prefix_bytes,
+                &mut offsets.0,
+            );
+            let stderr_delta = slice_unseen_output(
+                &stderr,
+                stderr_snapshot.dropped_prefix_bytes,
+                &mut offsets.1,
+            );
+
+            if !stdout_delta.is_empty() || !stderr_delta.is_empty() {
+                let _ = detector.inspect_command_output(
+                    &entry.command,
+                    stdout_delta,
+                    stderr_delta,
+                    None,
+                );
+            }
+        }
 
         Ok(ToolResult {
             success: true,
@@ -353,24 +397,27 @@ fn parse_id(args: &serde_json::Value, action: &str) -> anyhow::Result<usize> {
 }
 
 /// Append data to a bounded buffer, draining oldest bytes when over limit.
-fn append_bounded(buf: &Mutex<String>, new_data: &str) {
+fn append_bounded(buf: &Mutex<OutputBuffer>, new_data: &str) {
     let mut guard = buf.lock().unwrap();
-    guard.push_str(new_data);
-    if guard.len() > MAX_OUTPUT_BYTES {
-        let excess = guard.len() - MAX_OUTPUT_BYTES;
+    guard.data.push_str(new_data);
+    if guard.data.len() > MAX_OUTPUT_BYTES {
+        let excess = guard.data.len() - MAX_OUTPUT_BYTES;
         // Find the first valid char boundary at or after `excess`.
         let mut drain_to = excess;
-        while drain_to < guard.len() && !guard.is_char_boundary(drain_to) {
+        while drain_to < guard.data.len() && !guard.data.is_char_boundary(drain_to) {
             drain_to += 1;
         }
-        guard.drain(..drain_to);
+        guard.data.drain(..drain_to);
+        guard.dropped_prefix_bytes = guard
+            .dropped_prefix_bytes
+            .saturating_add(u64::try_from(drain_to).unwrap_or(u64::MAX));
     }
 }
 
 /// Spawn a background task that reads from an async reader into a bounded buffer.
 fn spawn_reader_task<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
-    buf: Arc<Mutex<String>>,
+    buf: Arc<Mutex<OutputBuffer>>,
 ) {
     tokio::spawn(async move {
         let mut chunk = vec![0u8; 8192];
@@ -384,6 +431,35 @@ fn spawn_reader_task<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             }
         }
     });
+}
+
+fn snapshot_output_buffer(buf: &Mutex<OutputBuffer>) -> OutputBuffer {
+    buf.lock().unwrap().clone()
+}
+
+fn slice_unseen_output<'a>(
+    current: &'a str,
+    dropped_prefix_bytes: u64,
+    analyzed: &mut u64,
+) -> &'a str {
+    let len_u64 = u64::try_from(current.len()).unwrap_or(u64::MAX);
+    let available_end = dropped_prefix_bytes.saturating_add(len_u64);
+
+    let start = if *analyzed <= dropped_prefix_bytes {
+        0
+    } else {
+        usize::try_from(analyzed.saturating_sub(dropped_prefix_bytes))
+            .unwrap_or(current.len())
+            .min(current.len())
+    };
+
+    let mut boundary = start;
+    while boundary < current.len() && !current.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+
+    *analyzed = available_end;
+    &current[boundary..]
 }
 
 #[async_trait]
@@ -457,9 +533,11 @@ impl Drop for ProcessTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::NativeRuntime;
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
         let mut policy = SecurityPolicy::default();
@@ -471,6 +549,22 @@ mod tests {
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    fn test_syscall_detector(tmp: &TempDir) -> Arc<SyscallAnomalyDetector> {
+        let log_path = tmp.path().join("process-syscall-anomalies.log");
+        let cfg = SyscallAnomalyConfig {
+            baseline_syscalls: vec!["read".into(), "write".into()],
+            log_path: log_path.to_string_lossy().to_string(),
+            alert_cooldown_secs: 1,
+            max_alerts_per_minute: 50,
+            ..SyscallAnomalyConfig::default()
+        };
+        let audit = AuditConfig {
+            enabled: false,
+            ..AuditConfig::default()
+        };
+        Arc::new(SyscallAnomalyDetector::new(cfg, tmp.path(), audit))
     }
 
     fn make_tool() -> ProcessTool {
@@ -727,10 +821,81 @@ mod tests {
 
     #[test]
     fn append_bounded_truncates_old_data() {
-        let buf = Mutex::new(String::new());
+        let buf = Mutex::new(OutputBuffer::default());
         let data = "x".repeat(MAX_OUTPUT_BYTES + 100);
         append_bounded(&buf, &data);
         let guard = buf.lock().unwrap();
-        assert!(guard.len() <= MAX_OUTPUT_BYTES);
+        assert!(guard.data.len() <= MAX_OUTPUT_BYTES);
+        assert!(guard.dropped_prefix_bytes >= 100);
+    }
+
+    #[test]
+    fn slice_unseen_output_tracks_new_tail_after_rollover() {
+        let mut analyzed = u64::try_from(MAX_OUTPUT_BYTES).expect("size should fit in u64");
+        let current = format!("{}tail", "x".repeat(MAX_OUTPUT_BYTES.saturating_sub(4)));
+        let dropped = 4_u64;
+
+        let delta = slice_unseen_output(&current, dropped, &mut analyzed);
+
+        assert_eq!(delta, "tail");
+        assert_eq!(
+            analyzed,
+            dropped.saturating_add(u64::try_from(current.len()).expect("len should fit in u64"))
+        );
+    }
+
+    #[tokio::test]
+    async fn process_output_runs_syscall_detector_incrementally() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+        let log_path = tmp.path().join("process-syscall-anomalies.log");
+        let tool = ProcessTool::new_with_syscall_detector(
+            test_security(),
+            test_runtime(),
+            Some(test_syscall_detector(&tmp)),
+        );
+
+        let spawn_result = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo seccomp denied syscall=openat"
+            }))
+            .await
+            .expect("spawn should return result");
+        assert!(spawn_result.success);
+        let spawn_output: serde_json::Value =
+            serde_json::from_str(&spawn_result.output).expect("spawn output should be json");
+        let id = spawn_output["id"]
+            .as_u64()
+            .expect("process id should exist");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let first_output = tool
+            .execute(json!({"action": "output", "id": id}))
+            .await
+            .expect("first output should return result");
+        assert!(first_output.success);
+
+        let first_log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("first anomaly log should exist");
+        let first_lines = first_log.lines().count();
+        assert!(first_lines >= 1);
+        assert!(first_log.contains("\"kind\":\"unknown_syscall\""));
+
+        let second_output = tool
+            .execute(json!({"action": "output", "id": id}))
+            .await
+            .expect("second output should return result");
+        assert!(second_output.success);
+
+        let second_log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("second anomaly log should still exist");
+        let second_lines = second_log.lines().count();
+        assert_eq!(
+            second_lines, first_lines,
+            "incremental offsets should prevent duplicate detector emissions for unchanged output"
+        );
     }
 }

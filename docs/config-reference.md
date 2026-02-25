@@ -148,6 +148,42 @@ Notes:
 - Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
 - Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
+## `[security.syscall_anomaly]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable syscall anomaly detection over command output telemetry |
+| `strict_mode` | `false` | Emit anomaly when denied syscalls are observed even if in baseline |
+| `alert_on_unknown_syscall` | `true` | Alert on syscall names not present in baseline |
+| `max_denied_events_per_minute` | `5` | Threshold for denied-syscall spike alerts |
+| `max_total_events_per_minute` | `120` | Threshold for total syscall-event spike alerts |
+| `max_alerts_per_minute` | `30` | Global alert budget guardrail per rolling minute |
+| `alert_cooldown_secs` | `20` | Cooldown between identical anomaly alerts |
+| `log_path` | `syscall-anomalies.log` | JSONL anomaly log path |
+| `baseline_syscalls` | built-in allowlist | Expected syscall profile; unknown entries trigger alerts |
+
+Notes:
+
+- Detection consumes seccomp/audit hints from command `stdout`/`stderr`.
+- Numeric syscall IDs in Linux audit lines are mapped to common x86_64 names when available.
+- Alert budget and cooldown reduce duplicate/noisy events during repeated retries.
+- `max_denied_events_per_minute` must be less than or equal to `max_total_events_per_minute`.
+
+Example:
+
+```toml
+[security.syscall_anomaly]
+enabled = true
+strict_mode = false
+alert_on_unknown_syscall = true
+max_denied_events_per_minute = 5
+max_total_events_per_minute = 120
+max_alerts_per_minute = 30
+alert_cooldown_secs = 20
+log_path = "syscall-anomalies.log"
+baseline_syscalls = ["read", "write", "openat", "close", "execve", "futex"]
+```
+
 ## `[agents.<name>]`
 
 Delegate sub-agent configurations. Each key under `[agents]` defines a named sub-agent that the primary agent can delegate to.

@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
+use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
@@ -21,11 +22,24 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self::new_with_syscall_detector(security, runtime, None)
+    }
+
+    pub fn new_with_syscall_detector(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            syscall_detector,
+        }
     }
 }
 
@@ -212,6 +226,15 @@ impl Tool for ShellTool {
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 
+                if let Some(detector) = &self.syscall_detector {
+                    let _ = detector.inspect_command_output(
+                        &command,
+                        &stdout,
+                        &stderr,
+                        output.status.code(),
+                    );
+                }
+
                 Ok(ToolResult {
                     success: output.status.success(),
                     output: stdout,
@@ -241,8 +264,10 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use tempfile::TempDir;
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -254,6 +279,22 @@ mod tests {
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    fn test_syscall_detector(tmp: &TempDir) -> Arc<SyscallAnomalyDetector> {
+        let log_path = tmp.path().join("shell-syscall-anomalies.log");
+        let cfg = SyscallAnomalyConfig {
+            baseline_syscalls: vec!["read".into(), "write".into()],
+            log_path: log_path.to_string_lossy().to_string(),
+            alert_cooldown_secs: 1,
+            max_alerts_per_minute: 50,
+            ..SyscallAnomalyConfig::default()
+        };
+        let audit = AuditConfig {
+            enabled: false,
+            ..AuditConfig::default()
+        };
+        Arc::new(SyscallAnomalyDetector::new(cfg, tmp.path(), audit))
     }
 
     #[test]
@@ -725,5 +766,30 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    #[tokio::test]
+    async fn shell_syscall_detector_writes_anomaly_log() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+        let log_path = tmp.path().join("shell-syscall-anomalies.log");
+        let detector = test_syscall_detector(&tmp);
+        let tool = ShellTool::new_with_syscall_detector(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            Some(detector),
+        );
+
+        let result = tool
+            .execute(json!({"command": "echo seccomp denied syscall=openat"}))
+            .await
+            .expect("command execution should return result");
+        assert!(result.success);
+        assert!(result.output.contains("openat"));
+
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("syscall anomaly log should be written");
+        assert!(log.contains("\"kind\":\"unknown_syscall\""));
+        assert!(log.contains("\"syscall\":\"openat\""));
     }
 }

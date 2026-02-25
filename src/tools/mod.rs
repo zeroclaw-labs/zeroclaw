@@ -215,9 +215,28 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let zeroclaw_dir = root_config
+        .config_path
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| runtime.storage_path());
+    let syscall_detector = Arc::new(crate::security::SyscallAnomalyDetector::new(
+        root_config.security.syscall_anomaly.clone(),
+        &zeroclaw_dir,
+        root_config.security.audit.clone(),
+    ));
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime.clone())),
-        Arc::new(ProcessTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new_with_syscall_detector(
+            security.clone(),
+            runtime.clone(),
+            Some(syscall_detector.clone()),
+        )),
+        Arc::new(ProcessTool::new_with_syscall_detector(
+            security.clone(),
+            runtime.clone(),
+            Some(syscall_detector),
+        )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),

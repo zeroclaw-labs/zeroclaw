@@ -10,6 +10,7 @@ For current runtime behavior, start here:
 - Operations runbook: [../operations-runbook.md](../operations-runbook.md)
 - Troubleshooting: [../troubleshooting.md](../troubleshooting.md)
 - CI/Security audit event schema: [../audit-event-schema.md](../audit-event-schema.md)
+- Syscall anomaly detection: [./syscall-anomaly-detection.md](./syscall-anomaly-detection.md)
 
 ## Proposal / Roadmap Docs
 
