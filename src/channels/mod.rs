@@ -81,6 +81,9 @@ use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::tools::channel_runtime_context::{
+    with_channel_runtime_context, ChannelRuntimeContext as ToolChannelRuntimeContext,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -3299,29 +3302,38 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
             prompt_tx: approval_prompt_tx.clone(),
         })
     };
-
+    let runtime_context = ToolChannelRuntimeContext {
+        channel: msg.channel.clone(),
+        reply_target: msg.reply_target.clone(),
+        thread_ts: msg.thread_ts.clone(),
+        sender: msg.sender.clone(),
+        message_id: msg.id.clone(),
+    };
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop_with_non_cli_approval_context(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(ctx.approval_manager.as_ref()),
-                msg.channel.as_str(),
-                non_cli_approval_context,
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                &excluded_tools_snapshot,
+            with_channel_runtime_context(
+                runtime_context,
+                run_tool_call_loop_with_non_cli_approval_context(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    ctx.observer.as_ref(),
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(ctx.approval_manager.as_ref()),
+                    msg.channel.as_str(),
+                    non_cli_approval_context,
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx,
+                    ctx.hooks.as_deref(),
+                    &excluded_tools_snapshot,
+                ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -4882,6 +4894,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tool_descs.push((
             "composio",
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
+        ));
+    }
+    if config.channels_config.discord.is_some() {
+        tool_descs.push((
+            "discord_history_fetch",
+            "Fetch Discord message history on demand for current conversation context or explicit channel_id. Useful for tasks like selecting a random participant from recent chat history.",
         ));
     }
     tool_descs.push((

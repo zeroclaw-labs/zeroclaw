@@ -19,6 +19,7 @@ pub mod agents_ipc;
 pub mod apply_patch;
 pub mod browser;
 pub mod browser_open;
+pub mod channel_runtime_context;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -30,6 +31,7 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
 pub mod delegate_coordination_status;
+pub mod discord_history_fetch;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -79,6 +81,7 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use delegate_coordination_status::DelegateCoordinationStatusTool;
+pub use discord_history_fetch::DiscordHistoryFetchTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -276,6 +279,16 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    if let Some(discord) = root_config.channels_config.discord.as_ref() {
+        let token = discord.bot_token.trim();
+        if !token.is_empty() {
+            tool_arcs.push(Arc::new(DiscordHistoryFetchTool::new(
+                security.clone(),
+                token.to_string(),
+            )));
+        }
+    }
 
     if has_shell_access {
         tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
@@ -529,7 +542,7 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig, WasmRuntimeConfig};
+    use crate::config::{BrowserConfig, Config, DiscordConfig, MemoryConfig, WasmRuntimeConfig};
     use crate::runtime::WasmRuntime;
     use tempfile::TempDir;
 
@@ -611,10 +624,52 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"discord_history_fetch"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    #[test]
+    fn all_tools_includes_discord_history_fetch_when_discord_configured() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.channels_config.discord = Some(DiscordConfig {
+            bot_token: "discord-token".into(),
+            guild_id: None,
+            allowed_users: vec!["*".into()],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"discord_history_fetch"));
     }
 
     #[test]

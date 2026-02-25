@@ -1789,6 +1789,12 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
+    if config.channels_config.discord.is_some() {
+        tool_descs.push((
+            "discord_history_fetch",
+            "Fetch Discord message history on demand for current conversation context or explicit channel_id.",
+        ));
+    }
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
@@ -2204,6 +2210,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    if config.channels_config.discord.is_some() {
+        tool_descs.push((
+            "discord_history_fetch",
+            "Fetch Discord message history on demand for current conversation context or explicit channel_id.",
+        ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
         tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
