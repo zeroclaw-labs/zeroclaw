@@ -130,11 +130,13 @@ jobs:
                   print(history.get('latest_tag', 'unknown'))
                   PY
                   )"
-                  echo "ready_to_publish=${ready_to_publish}" >> "$GITHUB_OUTPUT"
-                  echo "stage=${stage}" >> "$GITHUB_OUTPUT"
-                  echo "transition_outcome=${transition_outcome}" >> "$GITHUB_OUTPUT"
-                  echo "latest_stage=${latest_stage}" >> "$GITHUB_OUTPUT"
-                  echo "latest_stage_tag=${latest_stage_tag}" >> "$GITHUB_OUTPUT"
+                  {
+                    echo "ready_to_publish=${ready_to_publish}"
+                    echo "stage=${stage}"
+                    echo "transition_outcome=${transition_outcome}"
+                    echo "latest_stage=${latest_stage}"
+                    echo "latest_stage_tag=${latest_stage_tag}"
+                  } >> "$GITHUB_OUTPUT"
 
             - name: Emit prerelease audit event
               if: always()
