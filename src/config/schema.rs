@@ -2240,6 +2240,29 @@ pub struct BuiltinHooksConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
+/// Natural-language behavior for non-CLI approval-management commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonCliNaturalLanguageApprovalMode {
+    /// Do not treat natural-language text as approval-management commands.
+    /// Operators must use explicit slash commands.
+    Disabled,
+    /// Natural-language approval phrases create a pending request that must be
+    /// confirmed with a request ID.
+    RequestConfirm,
+    /// Natural-language approval phrases directly approve the named tool.
+    ///
+    /// This keeps private-chat workflows simple while still requiring a human
+    /// sender and passing the same approver allowlist checks as slash commands.
+    Direct,
+}
+
+impl Default for NonCliNaturalLanguageApprovalMode {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
@@ -2295,6 +2318,41 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Optional allowlist for who can manage non-CLI approval commands.
+    ///
+    /// When empty, any sender already admitted by the channel allowlist can
+    /// use approval-management commands.
+    ///
+    /// Supported entry formats:
+    /// - `"*"`: allow any sender on any channel
+    /// - `"alice"`: allow sender `alice` on any channel
+    /// - `"telegram:alice"`: allow sender `alice` only on `telegram`
+    /// - `"telegram:*"`: allow any sender on `telegram`
+    /// - `"*:alice"`: allow sender `alice` on any channel
+    #[serde(default)]
+    pub non_cli_approval_approvers: Vec<String>,
+
+    /// Natural-language handling mode for non-CLI approval-management commands.
+    ///
+    /// Values:
+    /// - `direct` (default): phrases like `授权工具 shell` immediately approve.
+    /// - `request_confirm`: phrases create pending requests requiring confirm.
+    /// - `disabled`: ignore natural-language approval commands (slash only).
+    #[serde(default)]
+    pub non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
+
+    /// Optional per-channel override for natural-language approval mode.
+    ///
+    /// Keys are channel names (for example: `telegram`, `discord`, `slack`).
+    /// Values use the same enum as `non_cli_natural_language_approval_mode`.
+    ///
+    /// Example:
+    /// - `telegram = "direct"` for private-chat ergonomics
+    /// - `discord = "request_confirm"` for stricter team channels
+    #[serde(default)]
+    pub non_cli_natural_language_approval_mode_by_channel:
+        HashMap<String, NonCliNaturalLanguageApprovalMode>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -5382,6 +5440,21 @@ impl Config {
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.proxy.http_proxy,
+                "config.proxy.http_proxy",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.proxy.https_proxy,
+                "config.proxy.https_proxy",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.proxy.all_proxy,
+                "config.proxy.all_proxy",
+            )?;
 
             decrypt_optional_secret(
                 &store,
@@ -6201,6 +6274,21 @@ impl Config {
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.proxy.http_proxy,
+            "config.proxy.http_proxy",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.proxy.https_proxy,
+            "config.proxy.https_proxy",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.proxy.all_proxy,
+            "config.proxy.all_proxy",
+        )?;
 
         encrypt_optional_secret(
             &store,
@@ -6728,6 +6816,10 @@ default_temperature = 0.7
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                non_cli_approval_approvers: vec![],
+                non_cli_natural_language_approval_mode:
+                    NonCliNaturalLanguageApprovalMode::RequestConfirm,
+                non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {
@@ -7206,6 +7298,9 @@ tool_dispatcher = "xml"
         config.config_path = dir.join("config.toml");
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
+        config.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".into());
+        config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
+        config.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
@@ -7255,6 +7350,31 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(composio_encrypted).unwrap(),
             "composio-credential"
+        );
+
+        let proxy_http_encrypted = stored.proxy.http_proxy.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            proxy_http_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(proxy_http_encrypted).unwrap(),
+            "http://user:pass@proxy.internal:8080"
+        );
+        let proxy_https_encrypted = stored.proxy.https_proxy.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            proxy_https_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(proxy_https_encrypted).unwrap(),
+            "https://user:pass@proxy.internal:8443"
+        );
+        let proxy_all_encrypted = stored.proxy.all_proxy.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            proxy_all_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(proxy_all_encrypted).unwrap(),
+            "socks5://user:pass@proxy.internal:1080"
         );
 
         let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();

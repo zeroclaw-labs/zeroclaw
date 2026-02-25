@@ -202,6 +202,128 @@ fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
+fn sanitize_attachment_filename(file_name: &str) -> Option<String> {
+    let basename = Path::new(file_name).file_name()?.to_str()?.trim();
+    if basename.is_empty() || basename == "." || basename == ".." {
+        return None;
+    }
+
+    let sanitized: String = basename
+        .replace(['/', '\\'], "_")
+        .chars()
+        .take(128)
+        .collect();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn sanitize_generated_extension(raw_ext: &str) -> String {
+    let cleaned: String = raw_ext
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        "jpg".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn resolve_workspace_attachment_path(workspace: &Path, target: &str) -> anyhow::Result<PathBuf> {
+    if target.contains('\0') {
+        anyhow::bail!("Telegram attachment path contains null byte");
+    }
+
+    let workspace_root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    let candidate = if let Some(rel) = target.strip_prefix("/workspace/") {
+        workspace.join(rel)
+    } else if target == "/workspace" {
+        workspace.to_path_buf()
+    } else {
+        let raw = Path::new(target);
+        if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.join(raw)
+        }
+    };
+
+    let resolved = candidate
+        .canonicalize()
+        .with_context(|| format!("Telegram attachment path not found: {target}"))?;
+
+    if !resolved.starts_with(&workspace_root) {
+        anyhow::bail!("Telegram attachment path escapes workspace: {target}");
+    }
+    if !resolved.is_file() {
+        anyhow::bail!(
+            "Telegram attachment path is not a file: {}",
+            resolved.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
+async fn resolve_workspace_attachment_output_path(
+    workspace: &Path,
+    file_name: &str,
+) -> anyhow::Result<PathBuf> {
+    let safe_name = sanitize_attachment_filename(file_name)
+        .ok_or_else(|| anyhow::anyhow!("invalid attachment filename: {file_name}"))?;
+
+    fs::create_dir_all(workspace).await?;
+    let workspace_root = fs::canonicalize(workspace)
+        .await
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    let save_dir = workspace.join("telegram_files");
+    fs::create_dir_all(&save_dir).await?;
+    let resolved_save_dir = fs::canonicalize(&save_dir).await.with_context(|| {
+        format!(
+            "failed to resolve Telegram attachment save directory: {}",
+            save_dir.display()
+        )
+    })?;
+
+    if !resolved_save_dir.starts_with(&workspace_root) {
+        anyhow::bail!(
+            "Telegram attachment save directory escapes workspace: {}",
+            save_dir.display()
+        );
+    }
+
+    let output_path = resolved_save_dir.join(safe_name);
+    match fs::symlink_metadata(&output_path).await {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write Telegram attachment through symlink: {}",
+                    output_path.display()
+                );
+            }
+            if !meta.is_file() {
+                anyhow::bail!(
+                    "Telegram attachment output path is not a regular file: {}",
+                    output_path.display()
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(output_path)
+}
+
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
     let normalized = target
         .split('?')
@@ -1139,12 +1261,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             None
         })?;
 
-        let save_dir = workspace.join("telegram_files");
-        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("Failed to create telegram_files directory: {e}");
-            return None;
-        }
-
         // Download file from Telegram
         let tg_file_path = match self.get_file_path(&attachment.file_id).await {
             Ok(p) => p,
@@ -1164,15 +1280,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Determine local filename
         let local_filename = match &attachment.file_name {
-            Some(name) => name.clone(),
+            Some(name) => sanitize_attachment_filename(name)
+                .unwrap_or_else(|| format!("attachment_{chat_id}_{message_id}.bin")),
             None => {
                 // For photos, derive extension from Telegram file path
-                let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                let ext =
+                    sanitize_generated_extension(tg_file_path.rsplit('.').next().unwrap_or("jpg"));
                 format!("photo_{chat_id}_{message_id}.{ext}")
             }
         };
 
-        let local_path = save_dir.join(&local_filename);
+        let local_path =
+            match resolve_workspace_attachment_output_path(workspace, &local_filename).await {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve attachment output path for {}: {e}",
+                        local_filename
+                    );
+                    return None;
+                }
+            };
         if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
             tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
             return None;
@@ -1909,34 +2037,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return Ok(());
         }
 
-        // Remap Docker container workspace path (/workspace/...) to the host
-        // workspace directory so files written by the containerised runtime
-        // can be found and sent by the host-side Telegram sender.
-        let remapped;
-        let target = if let Some(rel) = target.strip_prefix("/workspace/") {
-            if let Some(ws) = &self.workspace_dir {
-                remapped = ws.join(rel);
-                remapped.to_str().unwrap_or(target)
-            } else {
-                target
-            }
-        } else {
-            target
-        };
-
-        let path = Path::new(target);
-        if !path.exists() {
-            anyhow::bail!("Telegram attachment path not found: {target}");
-        }
+        let workspace = self.workspace_dir.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workspace_dir is not configured; local file attachments are disabled")
+        })?;
+        let path = resolve_workspace_attachment_path(workspace, target)?;
 
         match attachment.kind {
-            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, &path, None).await,
             TelegramAttachmentKind::Document => {
-                self.send_document(chat_id, thread_id, path, None).await
+                self.send_document(chat_id, thread_id, &path, None).await
             }
-            TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, &path, None).await,
+            TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, &path, None).await,
+            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, &path, None).await,
         }
     }
 
@@ -2930,6 +3043,27 @@ Ensure only one `zeroclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[cfg(unix)]
+    fn symlink_file(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_file(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(unix)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_dir(src, dst).expect("symlink should be created");
+    }
 
     #[test]
     fn telegram_channel_name() {
@@ -3272,6 +3406,94 @@ mod tests {
     #[test]
     fn parse_path_only_attachment_rejects_sentence_text() {
         assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
+    }
+
+    #[test]
+    fn sanitize_attachment_filename_strips_path_traversal() {
+        assert_eq!(
+            sanitize_attachment_filename("../../tmp/evil.txt").as_deref(),
+            Some("evil.txt")
+        );
+        assert_eq!(
+            sanitize_attachment_filename(r"..\\..\\secrets\\token.env").as_deref(),
+            Some("..__..__secrets__token.env")
+        );
+        assert!(sanitize_attachment_filename("..").is_none());
+        assert!(sanitize_attachment_filename("").is_none());
+    }
+
+    #[test]
+    fn resolve_workspace_attachment_path_rejects_escape_and_accepts_workspace_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let in_workspace = workspace.join("report.txt");
+        std::fs::write(&in_workspace, b"ok").expect("workspace fixture should be written");
+        let resolved = resolve_workspace_attachment_path(&workspace, "report.txt")
+            .expect("workspace relative path should resolve");
+        assert!(resolved.starts_with(workspace.canonicalize().unwrap_or(workspace.clone())));
+
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").expect("outside fixture should be written");
+        let escaped =
+            resolve_workspace_attachment_path(&workspace, outside.to_string_lossy().as_ref());
+        assert!(escaped.is_err(), "outside workspace path must be rejected");
+    }
+
+    #[test]
+    fn resolve_workspace_attachment_path_accepts_workspace_prefix_mapping() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("sub")).expect("workspace dir should exist");
+        let nested = workspace.join("sub/file.txt");
+        std::fs::write(&nested, b"content").expect("fixture should be written");
+
+        let resolved = resolve_workspace_attachment_path(&workspace, "/workspace/sub/file.txt")
+            .expect("/workspace prefix should map to workspace root");
+        assert_eq!(
+            resolved,
+            nested
+                .canonicalize()
+                .expect("canonical path should resolve")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_attachment_output_path_rejects_symlinked_save_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace dir should exist");
+
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside)
+            .await
+            .expect("outside dir should exist");
+        symlink_dir(&outside, &workspace.join("telegram_files"));
+
+        let result = resolve_workspace_attachment_output_path(&workspace, "doc.txt").await;
+        assert!(result.is_err(), "symlinked save dir must be rejected");
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_attachment_output_path_rejects_symlink_target_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let save_dir = workspace.join("telegram_files");
+        tokio::fs::create_dir_all(&save_dir)
+            .await
+            .expect("save dir should exist");
+
+        let outside = temp.path().join("outside.txt");
+        tokio::fs::write(&outside, b"secret")
+            .await
+            .expect("outside fixture should be written");
+        symlink_file(&outside, &save_dir.join("doc.txt"));
+
+        let result = resolve_workspace_attachment_output_path(&workspace, "doc.txt").await;
+        assert!(result.is_err(), "symlink target file must be rejected");
     }
 
     #[test]

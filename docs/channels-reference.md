@@ -37,15 +37,29 @@ cli = true
 
 Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
 
-## In-Chat Runtime Model Switching (Telegram / Discord)
+One ZeroClaw runtime can serve multiple channels at once: if you configure several
+channel sub-tables, `zeroclaw channel start` launches all of them in the same process.
+Channel startup is best-effort: a single channel init failure is reported and skipped,
+while remaining channels continue running.
 
-When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+## In-Chat Runtime Commands
 
+When running `zeroclaw channel start` (or daemon mode), runtime commands include:
+
+Telegram/Discord sender-scoped model routing:
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
 - `/new` — clear conversation history and start a fresh session
+
+Supervised tool approvals (all non-CLI channels):
+- `/approve-request <tool-name>` — create a pending approval request
+- `/approve-confirm <request-id>` — confirm pending request (same sender + same chat/channel only)
+- `/approve-pending` — list pending requests for your current sender+chat/channel scope
+- `/approve <tool-name>` — direct one-step approve + persist (`autonomy.auto_approve`, compatibility path)
+- `/unapprove <tool-name>` — revoke and remove persisted approval
+- `/approvals` — inspect runtime grants, persisted approval lists, and excluded tools
 
 Notes:
 
@@ -53,6 +67,16 @@ Notes:
 - `/new` clears the sender's conversation history without changing provider or model selection.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
+- Natural-language approval intents are supported with strict parsing and policy control:
+  - `direct` mode (default): `授权工具 shell` grants immediately.
+  - `request_confirm` mode: `授权工具 shell` creates pending request, then confirm with request ID.
+  - `disabled` mode: approval-management must use slash commands.
+- You can override natural-language approval mode per channel via `[autonomy].non_cli_natural_language_approval_mode_by_channel`.
+- Approval commands are intercepted before LLM execution, so the model cannot self-escalate permissions through tool calls.
+- You can restrict who can use approval-management commands via `[autonomy].non_cli_approval_approvers`.
+- Configure natural-language approval mode via `[autonomy].non_cli_natural_language_approval_mode`.
+- `autonomy.non_cli_excluded_tools` is reloaded from `config.toml` at runtime; `/approvals` shows the currently effective list.
+- Each incoming message injects a runtime tool-availability snapshot into the system prompt, derived from the same exclusion policy used by execution.
 
 ## Inbound Image Marker Protocol
 

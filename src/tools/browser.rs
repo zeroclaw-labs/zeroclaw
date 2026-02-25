@@ -11,7 +11,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -797,6 +799,15 @@ impl BrowserTool {
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
+        if action == "screen_capture" {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                let resolved = self.resolve_output_path_for_write("path", path).await?;
+                params.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
+            }
+        }
 
         let payload = json!({
             "action": action,
@@ -1116,7 +1127,7 @@ impl Tool for BrowserTool {
             });
         }
 
-        let action = match parse_browser_action(action_str, &args) {
+        let mut action = match parse_browser_action(action_str, &args) {
             Ok(a) => a,
             Err(e) => {
                 return Ok(ToolResult {
@@ -2349,6 +2360,16 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_dir(src, dst).expect("symlink should be created");
+    }
 
     #[test]
     fn normalize_domains_works() {

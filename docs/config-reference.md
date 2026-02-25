@@ -494,6 +494,10 @@ Notes:
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
+| `non_cli_excluded_tools` | `[]` | tools hidden from non-CLI channel tool specs |
+| `non_cli_approval_approvers` | `[]` | optional allowlist for who can run non-CLI approval-management commands |
+| `non_cli_natural_language_approval_mode` | `direct` | natural-language behavior for approval-management commands (`direct`, `request_confirm`, `disabled`) |
+| `non_cli_natural_language_approval_mode_by_channel` | `{}` | per-channel override map for natural-language approval mode |
 
 Notes:
 
@@ -503,6 +507,25 @@ Notes:
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+- In supervised mode on non-CLI channels, operators can persist human-approved tools with:
+  - One-step flow: `/approve <tool>`.
+  - Two-step flow: `/approve-request <tool>` then `/approve-confirm <request-id>` (same sender + same chat/channel).
+  Both paths write to `autonomy.auto_approve` and remove the tool from `autonomy.always_ask`.
+- `non_cli_natural_language_approval_mode` controls how strict natural-language approval intents are:
+  - `direct` (default): natural-language approval grants immediately (private-chat friendly).
+  - `request_confirm`: natural-language approval creates a pending request that needs explicit confirm.
+  - `disabled`: natural-language approval commands are rejected; use slash commands only.
+- `non_cli_natural_language_approval_mode_by_channel` can override that mode for specific channels (keys are channel names like `telegram`, `discord`, `slack`).
+  - Example: keep global `direct`, but force `discord = "request_confirm"` for team chats.
+- `non_cli_approval_approvers` can restrict who is allowed to run approval commands (`/approve*`, `/unapprove`, `/approvals`):
+  - `*` allows all channel-admitted senders.
+  - `alice` allows sender `alice` on any channel.
+  - `telegram:alice` allows only that channel+sender pair.
+  - `telegram:*` allows any sender on Telegram.
+  - `*:alice` allows `alice` on any channel.
+- Use `/unapprove <tool>` to remove persisted approval from `autonomy.auto_approve`.
+- `/approve-pending` lists pending requests for the current sender+chat/channel scope.
+- If a tool remains unavailable after approval, check `autonomy.non_cli_excluded_tools` (runtime `/approvals` shows this list). Channel runtime reloads this list from `config.toml` automatically.
 
 ```toml
 [autonomy]

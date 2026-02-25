@@ -604,11 +604,20 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     mask_optional_secret(&mut masked.api_key);
     mask_vec_secrets(&mut masked.reliability.api_keys);
     mask_optional_secret(&mut masked.composio.api_key);
+    mask_optional_secret(&mut masked.proxy.http_proxy);
+    mask_optional_secret(&mut masked.proxy.https_proxy);
+    mask_optional_secret(&mut masked.proxy.all_proxy);
     mask_optional_secret(&mut masked.browser.computer_use.api_key);
     mask_optional_secret(&mut masked.web_fetch.api_key);
     mask_optional_secret(&mut masked.web_search.api_key);
     mask_optional_secret(&mut masked.web_search.brave_api_key);
     mask_optional_secret(&mut masked.storage.provider.config.db_url);
+    if let Some(cloudflare) = masked.tunnel.cloudflare.as_mut() {
+        mask_required_secret(&mut cloudflare.token);
+    }
+    if let Some(ngrok) = masked.tunnel.ngrok.as_mut() {
+        mask_required_secret(&mut ngrok.auth_token);
+    }
 
     for agent in masked.agents.values_mut() {
         mask_optional_secret(&mut agent.api_key);
@@ -642,9 +651,15 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut linq.api_token);
         mask_optional_secret(&mut linq.signing_secret);
     }
+    if let Some(wati) = masked.channels_config.wati.as_mut() {
+        mask_required_secret(&mut wati.api_token);
+    }
     if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
         mask_required_secret(&mut nextcloud.app_token);
         mask_optional_secret(&mut nextcloud.webhook_secret);
+    }
+    if let Some(email) = masked.channels_config.email.as_mut() {
+        mask_required_secret(&mut email.password);
     }
     if let Some(irc) = masked.channels_config.irc.as_mut() {
         mask_optional_secret(&mut irc.server_password);
@@ -655,6 +670,11 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut lark.app_secret);
         mask_optional_secret(&mut lark.encrypt_key);
         mask_optional_secret(&mut lark.verification_token);
+    }
+    if let Some(feishu) = masked.channels_config.feishu.as_mut() {
+        mask_required_secret(&mut feishu.app_secret);
+        mask_optional_secret(&mut feishu.encrypt_key);
+        mask_optional_secret(&mut feishu.verification_token);
     }
     if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
@@ -682,6 +702,9 @@ fn restore_masked_sensitive_fields(
         &current.reliability.api_keys,
     );
     restore_optional_secret(&mut incoming.composio.api_key, &current.composio.api_key);
+    restore_optional_secret(&mut incoming.proxy.http_proxy, &current.proxy.http_proxy);
+    restore_optional_secret(&mut incoming.proxy.https_proxy, &current.proxy.https_proxy);
+    restore_optional_secret(&mut incoming.proxy.all_proxy, &current.proxy.all_proxy);
     restore_optional_secret(
         &mut incoming.browser.computer_use.api_key,
         &current.browser.computer_use.api_key,
@@ -699,6 +722,18 @@ fn restore_masked_sensitive_fields(
         &mut incoming.storage.provider.config.db_url,
         &current.storage.provider.config.db_url,
     );
+    if let (Some(incoming_tunnel), Some(current_tunnel)) = (
+        incoming.tunnel.cloudflare.as_mut(),
+        current.tunnel.cloudflare.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_tunnel.token, &current_tunnel.token);
+    }
+    if let (Some(incoming_tunnel), Some(current_tunnel)) = (
+        incoming.tunnel.ngrok.as_mut(),
+        current.tunnel.ngrok.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_tunnel.auth_token, &current_tunnel.auth_token);
+    }
 
     for (name, agent) in &mut incoming.agents {
         if let Some(current_agent) = current.agents.get(name) {
@@ -759,11 +794,23 @@ fn restore_masked_sensitive_fields(
         restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.wati.as_mut(),
+        current.channels_config.wati.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.nextcloud_talk.as_mut(),
         current.channels_config.nextcloud_talk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.app_token, &current_ch.app_token);
         restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.email.as_mut(),
+        current.channels_config.email.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.irc.as_mut(),
@@ -782,6 +829,17 @@ fn restore_masked_sensitive_fields(
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.lark.as_mut(),
         current.channels_config.lark.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
+        restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
+        restore_optional_secret(
+            &mut incoming_ch.verification_token,
+            &current_ch.verification_token,
+        );
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.feishu.as_mut(),
+        current.channels_config.feishu.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
         restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
@@ -831,6 +889,9 @@ fn hydrate_config_for_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::{
+        CloudflareTunnelConfig, LarkReceiveMode, NgrokTunnelConfig, WatiConfig,
+    };
 
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
@@ -895,5 +956,181 @@ mod tests {
             .try_into()
             .expect("normalized toml should parse as Config");
         assert_eq!(parsed.reliability.api_keys, vec![MASKED_SECRET.to_string()]);
+    }
+
+    #[test]
+    fn mask_sensitive_fields_covers_wati_email_and_feishu_secrets() {
+        let mut cfg = crate::config::Config::default();
+        cfg.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
+        cfg.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
+        cfg.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".to_string());
+        cfg.tunnel.cloudflare = Some(CloudflareTunnelConfig {
+            token: "cloudflare-real-token".to_string(),
+        });
+        cfg.tunnel.ngrok = Some(NgrokTunnelConfig {
+            auth_token: "ngrok-real-token".to_string(),
+            domain: Some("zeroclaw.ngrok.app".to_string()),
+        });
+        cfg.channels_config.wati = Some(WatiConfig {
+            api_token: "wati-real-token".to_string(),
+            api_url: "https://live-mt-server.wati.io".to_string(),
+            tenant_id: Some("tenant-1".to_string()),
+            allowed_numbers: vec!["*".to_string()],
+        });
+        let mut email = crate::channels::email_channel::EmailConfig::default();
+        email.password = "email-real-password".to_string();
+        cfg.channels_config.email = Some(email);
+        cfg.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "cli_app_id".to_string(),
+            app_secret: "feishu-real-secret".to_string(),
+            encrypt_key: Some("feishu-encrypt-key".to_string()),
+            verification_token: Some("feishu-verify-token".to_string()),
+            allowed_users: vec!["*".to_string()],
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(42617),
+        });
+
+        let masked = mask_sensitive_fields(&cfg);
+        assert_eq!(masked.proxy.http_proxy.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(masked.proxy.https_proxy.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(masked.proxy.all_proxy.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(
+            masked
+                .tunnel
+                .cloudflare
+                .as_ref()
+                .map(|value| value.token.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked
+                .tunnel
+                .ngrok
+                .as_ref()
+                .map(|value| value.auth_token.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked
+                .channels_config
+                .wati
+                .as_ref()
+                .map(|value| value.api_token.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked
+                .channels_config
+                .email
+                .as_ref()
+                .map(|value| value.password.as_str()),
+            Some(MASKED_SECRET)
+        );
+        let masked_feishu = masked
+            .channels_config
+            .feishu
+            .as_ref()
+            .expect("feishu config should exist");
+        assert_eq!(masked_feishu.app_secret, MASKED_SECRET);
+        assert_eq!(masked_feishu.encrypt_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(
+            masked_feishu.verification_token.as_deref(),
+            Some(MASKED_SECRET)
+        );
+    }
+
+    #[test]
+    fn hydrate_config_for_save_restores_wati_email_and_feishu_secrets() {
+        let mut current = crate::config::Config::default();
+        current.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
+        current.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
+        current.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".to_string());
+        current.tunnel.cloudflare = Some(CloudflareTunnelConfig {
+            token: "cloudflare-real-token".to_string(),
+        });
+        current.tunnel.ngrok = Some(NgrokTunnelConfig {
+            auth_token: "ngrok-real-token".to_string(),
+            domain: Some("zeroclaw.ngrok.app".to_string()),
+        });
+        current.channels_config.wati = Some(WatiConfig {
+            api_token: "wati-real-token".to_string(),
+            api_url: "https://live-mt-server.wati.io".to_string(),
+            tenant_id: Some("tenant-1".to_string()),
+            allowed_numbers: vec!["*".to_string()],
+        });
+        let mut email = crate::channels::email_channel::EmailConfig::default();
+        email.password = "email-real-password".to_string();
+        current.channels_config.email = Some(email);
+        current.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "cli_app_id".to_string(),
+            app_secret: "feishu-real-secret".to_string(),
+            encrypt_key: Some("feishu-encrypt-key".to_string()),
+            verification_token: Some("feishu-verify-token".to_string()),
+            allowed_users: vec!["*".to_string()],
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(42617),
+        });
+
+        let incoming = mask_sensitive_fields(&current);
+        let restored = hydrate_config_for_save(incoming, &current);
+
+        assert_eq!(
+            restored.proxy.http_proxy.as_deref(),
+            Some("http://user:pass@proxy.internal:8080")
+        );
+        assert_eq!(
+            restored.proxy.https_proxy.as_deref(),
+            Some("https://user:pass@proxy.internal:8443")
+        );
+        assert_eq!(
+            restored.proxy.all_proxy.as_deref(),
+            Some("socks5://user:pass@proxy.internal:1080")
+        );
+        assert_eq!(
+            restored
+                .tunnel
+                .cloudflare
+                .as_ref()
+                .map(|value| value.token.as_str()),
+            Some("cloudflare-real-token")
+        );
+        assert_eq!(
+            restored
+                .tunnel
+                .ngrok
+                .as_ref()
+                .map(|value| value.auth_token.as_str()),
+            Some("ngrok-real-token")
+        );
+        assert_eq!(
+            restored
+                .channels_config
+                .wati
+                .as_ref()
+                .map(|value| value.api_token.as_str()),
+            Some("wati-real-token")
+        );
+        assert_eq!(
+            restored
+                .channels_config
+                .email
+                .as_ref()
+                .map(|value| value.password.as_str()),
+            Some("email-real-password")
+        );
+        let restored_feishu = restored
+            .channels_config
+            .feishu
+            .as_ref()
+            .expect("feishu config should exist");
+        assert_eq!(restored_feishu.app_secret, "feishu-real-secret");
+        assert_eq!(
+            restored_feishu.encrypt_key.as_deref(),
+            Some("feishu-encrypt-key")
+        );
+        assert_eq!(
+            restored_feishu.verification_token.as_deref(),
+            Some("feishu-verify-token")
+        );
     }
 }
