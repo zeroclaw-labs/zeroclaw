@@ -746,7 +746,8 @@ fn classify_message_route(
     ctx: &ChannelRuntimeContext,
     message: &str,
 ) -> Option<ChannelRouteSelection> {
-    let decision = crate::agent::classifier::classify_with_decision(&ctx.query_classification, message)?;
+    let decision =
+        crate::agent::classifier::classify_with_decision(&ctx.query_classification, message)?;
 
     // Find the matching model route
     let route = ctx.model_routes.iter().find(|r| r.hint == decision.hint)?;
@@ -3594,8 +3595,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-        query_classification: crate::config::QueryClassificationConfig::default(),
-        model_routes: Vec::new(),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3645,8 +3646,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-        query_classification: crate::config::QueryClassificationConfig::default(),
-        model_routes: Vec::new(),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3699,8 +3700,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-        query_classification: crate::config::QueryClassificationConfig::default(),
-        model_routes: Vec::new(),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
