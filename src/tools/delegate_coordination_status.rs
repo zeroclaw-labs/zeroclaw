@@ -139,14 +139,14 @@ impl Tool for DelegateCoordinationStatusTool {
         let message_limit = clamp_usize(
             args.get("message_limit")
                 .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
+                .and_then(|value| usize::try_from(value).ok()),
             DEFAULT_MESSAGE_LIMIT,
             MAX_MESSAGE_LIMIT,
         );
         let message_offset = clamp_offset(
             args.get("message_offset")
                 .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
+                .and_then(|value| usize::try_from(value).ok()),
             MAX_MESSAGE_OFFSET,
         );
         let include_dead_letters = args
@@ -156,27 +156,27 @@ impl Tool for DelegateCoordinationStatusTool {
         let dead_letter_limit = clamp_usize(
             args.get("dead_letter_limit")
                 .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
+                .and_then(|value| usize::try_from(value).ok()),
             DEFAULT_DEAD_LETTER_LIMIT,
             MAX_DEAD_LETTER_LIMIT,
         );
         let dead_letter_offset = clamp_offset(
             args.get("dead_letter_offset")
                 .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
+                .and_then(|value| usize::try_from(value).ok()),
             MAX_DEAD_LETTER_OFFSET,
         );
         let context_limit = clamp_usize(
             args.get("context_limit")
                 .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
+                .and_then(|value| usize::try_from(value).ok()),
             DEFAULT_CONTEXT_LIMIT,
             MAX_CONTEXT_LIMIT,
         );
         let context_offset = clamp_offset(
             args.get("context_offset")
                 .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
+                .and_then(|value| usize::try_from(value).ok()),
             MAX_CONTEXT_OFFSET,
         );
 

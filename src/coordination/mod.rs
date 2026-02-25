@@ -1143,7 +1143,7 @@ fn apply_context_patch_locked(
             }
             let evicted_correlation = state.context_correlation_by_key.remove(&evicted_key);
             if let Some(correlation_id) = evicted_correlation.as_deref() {
-                remove_key_from_context_correlation_order(state, &correlation_id, &evicted_key);
+                remove_key_from_context_correlation_order(state, correlation_id, &evicted_key);
             }
             if evicted_key.starts_with("delegate/") {
                 remove_key_from_delegate_context_order(
