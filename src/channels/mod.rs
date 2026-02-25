@@ -3693,8 +3693,11 @@ fn load_openclaw_bootstrap_files(
         inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
 
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    // MEMORY.md — curated long-term memory (main session only, when present)
+    let memory_path = workspace_dir.join("MEMORY.md");
+    if memory_path.exists() {
+        inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    }
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -3704,7 +3707,7 @@ fn load_openclaw_bootstrap_files(
 /// 2. Safety — guardrail reminder
 /// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
+/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY (when present)
 /// 6. Date & Time — timezone for cache stability
 /// 7. Runtime — host, OS, model
 ///
