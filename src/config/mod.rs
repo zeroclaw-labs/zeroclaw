@@ -12,12 +12,12 @@ pub use schema::{
     HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
     NextcloudTalkConfig, ObservabilityConfig, OtpConfig, OtpMethod, PeripheralBoardConfig,
-    PeripheralsConfig, ProviderConfig, ProxyConfig, ProxyScope, QdrantConfig,
-    QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig,
-    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
-    TranscriptionConfig, TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    PeripheralsConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,
+    ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger, ResourceLimitsConfig, RuntimeConfig,
+    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
+    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
