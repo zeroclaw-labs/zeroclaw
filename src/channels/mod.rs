@@ -3904,11 +3904,13 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
-#[allow(unused_variables)]
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
+    // Keep this symbol used even when Matrix support is compiled in and
+    // `#[cfg(not(feature = "channel-matrix"))]` blocks are removed.
+    let _ = matrix_skip_context;
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
