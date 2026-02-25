@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -16,6 +17,7 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
+    workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
@@ -33,8 +35,15 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
+            workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure workspace directory used for validating local attachment paths.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -52,6 +61,42 @@ impl DiscordChannel {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    fn resolve_local_attachment_path(&self, target: &str) -> anyhow::Result<PathBuf> {
+        let workspace = self.workspace_dir.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workspace_dir is not configured; local file attachments are disabled")
+        })?;
+        let workspace_root = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+
+        let target_path = if let Some(rel) = target.strip_prefix("/workspace/") {
+            workspace.join(rel)
+        } else if target == "/workspace" {
+            workspace.to_path_buf()
+        } else {
+            let path = Path::new(target);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workspace.join(path)
+            }
+        };
+
+        let resolved = target_path
+            .canonicalize()
+            .with_context(|| format!("attachment path not found: {target}"))?;
+
+        if !resolved.starts_with(&workspace_root) {
+            anyhow::bail!("attachment path escapes workspace: {target}");
+        }
+
+        if !resolved.is_file() {
+            anyhow::bail!("attachment path is not a file: {}", resolved.display());
+        }
+
+        Ok(resolved)
     }
 }
 
@@ -188,10 +233,10 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
 
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
-) -> (Vec<PathBuf>, Vec<String>, Vec<String>) {
+) -> (Vec<DiscordAttachment>, Vec<String>, Vec<String>) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
-    let mut unresolved_markers = Vec::new();
+    let unresolved_markers = Vec::new();
 
     for attachment in attachments {
         let target = attachment.target.trim();
@@ -200,13 +245,7 @@ fn classify_outgoing_attachments(
             continue;
         }
 
-        let path = Path::new(target);
-        if path.exists() && path.is_file() {
-            local_files.push(path.to_path_buf());
-            continue;
-        }
-
-        unresolved_markers.push(format!("[{}:{}]", attachment.kind.marker_name(), target));
+        local_files.push(attachment.clone());
     }
 
     (local_files, remote_urls, unresolved_markers)
@@ -490,8 +529,28 @@ impl Channel for DiscordChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = super::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
-        let (mut local_files, remote_urls, unresolved_markers) =
+        let (local_attachment_targets, remote_urls, mut unresolved_markers) =
             classify_outgoing_attachments(&parsed_attachments);
+        let mut local_files = Vec::new();
+
+        for attachment in &local_attachment_targets {
+            let target = attachment.target.trim();
+            match self.resolve_local_attachment_path(target) {
+                Ok(path) => local_files.push(path),
+                Err(error) => {
+                    tracing::warn!(
+                        target,
+                        error = %error,
+                        "discord: local attachment rejected by workspace policy"
+                    );
+                    unresolved_markers.push(format!(
+                        "[{}:{}]",
+                        attachment.kind.marker_name(),
+                        target
+                    ));
+                }
+            }
+        }
 
         if !unresolved_markers.is_empty() {
             tracing::warn!(
@@ -1483,13 +1542,11 @@ mod tests {
         ];
 
         let (locals, remotes, unresolved) = classify_outgoing_attachments(&attachments);
-        assert_eq!(locals.len(), 1);
-        assert_eq!(locals[0], file_path);
+        assert_eq!(locals.len(), 2);
+        assert_eq!(locals[0].target, file_path.to_string_lossy());
+        assert_eq!(locals[1].target, "/tmp/does-not-exist.mp4");
         assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
-        assert_eq!(
-            unresolved,
-            vec!["[VIDEO:/tmp/does-not-exist.mp4]".to_string()]
-        );
+        assert!(unresolved.is_empty());
     }
 
     #[test]
@@ -1503,5 +1560,38 @@ mod tests {
             rendered,
             "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
         );
+    }
+
+    #[test]
+    fn with_workspace_dir_sets_field() {
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false)
+            .with_workspace_dir(PathBuf::from("/tmp/discord-workspace"));
+        assert_eq!(
+            channel.workspace_dir.as_deref(),
+            Some(Path::new("/tmp/discord-workspace"))
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_blocks_workspace_escape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").expect("fixture should be written");
+
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false)
+            .with_workspace_dir(workspace.clone());
+
+        let allowed_path = workspace.join("ok.txt");
+        std::fs::write(&allowed_path, b"ok").expect("workspace fixture should be written");
+        let allowed = channel
+            .resolve_local_attachment_path("ok.txt")
+            .expect("workspace file should be allowed");
+        assert!(allowed.starts_with(workspace.canonicalize().unwrap_or(workspace)));
+
+        let escaped = channel.resolve_local_attachment_path(outside.to_string_lossy().as_ref());
+        assert!(escaped.is_err(), "path outside workspace must be rejected");
     }
 }

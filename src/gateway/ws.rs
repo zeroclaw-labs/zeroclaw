@@ -11,34 +11,30 @@
 
 use super::AppState;
 use crate::agent::loop_::run_tool_call_loop;
+use crate::approval::ApprovalManager;
 use crate::providers::ChatMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Query, State, WebSocketUpgrade,
+        State, WebSocketUpgrade,
     },
+    http::{header, HeaderMap},
     response::IntoResponse,
 };
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-pub struct WsQuery {
-    pub token: Option<String>,
-}
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
-    Query(params): Query<WsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth via query param (browser WebSocket limitation)
+    // Auth via Authorization header or websocket protocol token.
     if state.pairing.require_pairing() {
-        let token = params.token.as_deref().unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
+        let token = extract_ws_bearer_token(&headers).unwrap_or_default();
+        if !state.pairing.is_authenticated(&token) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide ?token=<bearer_token>",
+                "Unauthorized — provide Authorization: Bearer <token> or Sec-WebSocket-Protocol: bearer.<token>",
             )
                 .into_response();
         }
@@ -67,6 +63,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
     // Add system message to history
     history.push(ChatMessage::system(&system_prompt));
+
+    let approval_manager = {
+        let config_guard = state.config.lock();
+        ApprovalManager::from_config(&config_guard.autonomy)
+    };
 
     while let Some(msg) = socket.recv().await {
         let msg = match msg {
@@ -123,7 +124,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             &state.model,
             state.temperature,
             true, // silent - no console output
-            None, // approval manager
+            Some(&approval_manager),
             "webchat",
             &state.multimodal,
             state.max_tool_iterations,
@@ -169,5 +170,86 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 }));
             }
         }
+    }
+}
+
+fn extract_ws_bearer_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth_header) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        if let Some(token) = auth_header.strip_prefix("Bearer ") {
+            if !token.trim().is_empty() {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+
+    let offered = headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())?;
+
+    for protocol in offered.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(token) = protocol.strip_prefix("bearer.") {
+            if !token.trim().is_empty() {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn extract_ws_bearer_token_prefers_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer from-auth-header"),
+        );
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer.from-protocol"),
+        );
+
+        assert_eq!(
+            extract_ws_bearer_token(&headers).as_deref(),
+            Some("from-auth-header")
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_reads_websocket_protocol_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer.protocol-token"),
+        );
+
+        assert_eq!(
+            extract_ws_bearer_token(&headers).as_deref(),
+            Some("protocol-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_rejects_empty_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer    "),
+        );
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer."),
+        );
+
+        assert!(extract_ws_bearer_token(&headers).is_none());
     }
 }
