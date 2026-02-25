@@ -5863,7 +5863,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -5940,7 +5940,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
