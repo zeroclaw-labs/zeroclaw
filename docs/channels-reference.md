@@ -142,6 +142,27 @@ Field names differ by channel:
 - `allowed_contacts` (iMessage)
 - `allowed_pubkeys` (Nostr)
 
+### Group-Chat Trigger Policy (Telegram/Discord/Slack/Mattermost/Lark/Feishu)
+
+These channels support an explicit `group_reply` policy:
+
+- `mode = "all_messages"`: reply to all group messages (subject to channel allowlist checks).
+- `mode = "mention_only"`: in groups, require explicit bot mention.
+- `allowed_sender_ids`: sender IDs that bypass mention gating in groups.
+
+Important behavior:
+
+- `allowed_sender_ids` only bypasses mention gating.
+- Sender allowlists (`allowed_users`) are still enforced first.
+
+Example shape:
+
+```toml
+[channels_config.telegram.group_reply]
+mode = "mention_only"                      # all_messages | mention_only
+allowed_sender_ids = ["123456789", "987"] # optional; "*" allowed
+```
+
 ---
 
 ## 4. Per-Channel Config Examples
@@ -154,8 +175,12 @@ bot_token = "123456:telegram-token"
 allowed_users = ["*"]
 stream_mode = "off"               # optional: off | partial
 draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
-mention_only = false              # optional: require @mention in groups
+mention_only = false              # legacy fallback; used when group_reply.mode is not set
 interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
+
+[channels_config.telegram.group_reply]
+mode = "all_messages"             # optional: all_messages | mention_only
+allowed_sender_ids = []           # optional: sender IDs that bypass mention gate
 ```
 
 Telegram notes:
@@ -171,7 +196,11 @@ bot_token = "discord-bot-token"
 guild_id = "123456789012345678"   # optional
 allowed_users = ["*"]
 listen_to_bots = false
-mention_only = false
+mention_only = false              # legacy fallback; used when group_reply.mode is not set
+
+[channels_config.discord.group_reply]
+mode = "all_messages"             # optional: all_messages | mention_only
+allowed_sender_ids = []           # optional: sender IDs that bypass mention gate
 ```
 
 ### 4.3 Slack
@@ -182,6 +211,10 @@ bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
 channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
 allowed_users = ["*"]
+
+[channels_config.slack.group_reply]
+mode = "all_messages"              # optional: all_messages | mention_only
+allowed_sender_ids = []            # optional: sender IDs that bypass mention gate
 ```
 
 Slack listen behavior:
@@ -197,6 +230,11 @@ url = "https://mm.example.com"
 bot_token = "mattermost-token"
 channel_id = "channel-id"          # required for listening
 allowed_users = ["*"]
+mention_only = false               # legacy fallback; used when group_reply.mode is not set
+
+[channels_config.mattermost.group_reply]
+mode = "all_messages"              # optional: all_messages | mention_only
+allowed_sender_ids = []            # optional: sender IDs that bypass mention gate
 ```
 
 ### 4.5 Matrix
@@ -314,10 +352,14 @@ app_secret = "your_lark_app_secret"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
-mention_only = false              # optional: require @mention in groups (DMs always allowed)
+mention_only = false                # legacy fallback; used when group_reply.mode is not set
 use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+
+[channels_config.lark.group_reply]
+mode = "all_messages"               # optional: all_messages | mention_only
+allowed_sender_ids = []             # optional: sender open_ids that bypass mention gate
 ```
 
 ### 4.12 Feishu
@@ -331,6 +373,10 @@ verification_token = ""             # optional
 allowed_users = ["*"]
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+
+[channels_config.feishu.group_reply]
+mode = "all_messages"               # optional: all_messages | mention_only
+allowed_sender_ids = []             # optional: sender open_ids that bypass mention gate
 ```
 
 Migration note:

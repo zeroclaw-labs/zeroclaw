@@ -17,6 +17,7 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
+    group_reply_allowed_sender_ids: Vec<String>,
     workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
@@ -35,9 +36,16 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
+            group_reply_allowed_sender_ids: Vec::new(),
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure sender IDs that bypass mention gating in guild channels.
+    pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
+        self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+        self
     }
 
     /// Configure workspace directory used for validating local attachment paths.
@@ -55,6 +63,16 @@ impl DiscordChannel {
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    fn is_group_sender_trigger_enabled(&self, sender_id: &str) -> bool {
+        let sender_id = sender_id.trim();
+        if sender_id.is_empty() {
+            return false;
+        }
+        self.group_reply_allowed_sender_ids
+            .iter()
+            .any(|entry| entry == "*" || entry == sender_id)
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -98,6 +116,17 @@ impl DiscordChannel {
 
         Ok(resolved)
     }
+}
+
+fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = sender_ids
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 /// Process Discord message attachments and return a string to append to the
@@ -458,19 +487,19 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
 
 fn normalize_incoming_content(
     content: &str,
-    mention_only: bool,
+    require_mention: bool,
     bot_user_id: &str,
 ) -> Option<String> {
     if content.is_empty() {
         return None;
     }
 
-    if mention_only && !contains_bot_mention(content, bot_user_id) {
+    if require_mention && !contains_bot_mention(content, bot_user_id) {
         return None;
     }
 
     let mut normalized = content.to_string();
-    if mention_only {
+    if require_mention {
         for tag in mention_tags(bot_user_id) {
             normalized = normalized.replace(&tag, " ");
         }
@@ -761,8 +790,13 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let is_group_message = d.get("guild_id").is_some();
+                    let allow_sender_without_mention =
+                        is_group_message && self.is_group_sender_trigger_enabled(author_id);
+                    let require_mention =
+                        self.mention_only && is_group_message && !allow_sender_without_mention;
                     let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                        normalize_incoming_content(content, require_mention, &bot_user_id)
                     else {
                         continue;
                     };
@@ -1077,6 +1111,28 @@ mod tests {
     fn normalize_incoming_content_rejects_empty_after_strip() {
         let cleaned = normalize_incoming_content("<@12345>", true, "12345");
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_group_reply_allowed_sender_ids_trims_and_deduplicates() {
+        let normalized = normalize_group_reply_allowed_sender_ids(vec![
+            " 111 ".into(),
+            "111".into(),
+            "".into(),
+            "  ".into(),
+            "222".into(),
+        ]);
+        assert_eq!(normalized, vec!["111".to_string(), "222".to_string()]);
+    }
+
+    #[test]
+    fn group_reply_sender_override_matches_exact_and_wildcard() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true)
+            .with_group_reply_allowed_senders(vec!["111".into(), "*".into()]);
+
+        assert!(ch.is_group_sender_trigger_enabled("111"));
+        assert!(ch.is_group_sender_trigger_enabled("anyone"));
+        assert!(!ch.is_group_sender_trigger_enabled(""));
     }
 
     // Message splitting tests

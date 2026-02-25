@@ -9,11 +9,11 @@ pub use schema::{
     BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
     CoordinationConfig, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig,
     DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
-    HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
-    IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig,
-    MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, OtpConfig, OtpMethod,
-    PeripheralBoardConfig, PeripheralsConfig, ProviderConfig, ProxyConfig, ProxyScope,
-    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
+    GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
+    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
+    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
+    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProviderConfig, ProxyConfig,
+    ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode,
     SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
@@ -48,6 +48,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
         };
 
         let discord = DiscordConfig {
@@ -56,6 +57,7 @@ mod tests {
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         };
 
         let lark = LarkConfig {
@@ -65,6 +67,7 @@ mod tests {
             verification_token: None,
             allowed_users: vec![],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
@@ -75,6 +78,7 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec![],
+            group_reply: None,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         };

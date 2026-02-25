@@ -650,6 +650,12 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- Telegram/Discord/Slack/Mattermost/Lark/Feishu support `[channels_config.<channel>.group_reply]`:
+  - `mode = "all_messages"` or `mode = "mention_only"`
+  - `allowed_sender_ids = ["..."]` to bypass mention gating in groups
+  - `allowed_users` allowlist checks still run first
+- Legacy `mention_only` flags (Telegram/Discord/Mattermost/Lark) remain supported as fallback only.
+  If `group_reply.mode` is set, it takes precedence over legacy `mention_only`.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 ### `[channels_config.nostr]`

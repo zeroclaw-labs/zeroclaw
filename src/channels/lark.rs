@@ -313,6 +313,7 @@ pub struct LarkChannel {
     verification_token: String,
     port: Option<u16>,
     allowed_users: Vec<String>,
+    group_reply_allowed_sender_ids: Vec<String>,
     /// Bot open_id resolved at runtime via `/bot/v3/info`.
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
@@ -360,6 +361,7 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
+            group_reply_allowed_sender_ids: Vec::new(),
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
             platform,
@@ -383,9 +385,11 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            config.mention_only,
+            config.effective_group_reply_mode().requires_mention(),
             platform,
         );
+        ch.group_reply_allowed_sender_ids =
+            normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
@@ -397,9 +401,11 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            config.mention_only,
+            config.effective_group_reply_mode().requires_mention(),
             LarkPlatform::Lark,
         );
+        ch.group_reply_allowed_sender_ids =
+            normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
@@ -411,9 +417,11 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            false,
+            config.effective_group_reply_mode().requires_mention(),
             LarkPlatform::Feishu,
         );
+        ch.group_reply_allowed_sender_ids =
+            normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
@@ -888,6 +896,8 @@ impl LarkChannel {
                     if lark_msg.chat_type == "group"
                         && !should_respond_in_group(
                             self.mention_only,
+                            sender_open_id,
+                            &self.group_reply_allowed_sender_ids,
                             bot_open_id.as_deref(),
                             &lark_msg.mentions,
                             &post_mentioned_open_ids,
@@ -1189,6 +1199,8 @@ impl LarkChannel {
         if chat_type == "group"
             && !should_respond_in_group(
                 self.mention_only,
+                open_id,
+                &self.group_reply_allowed_sender_ids,
                 bot_open_id.as_deref(),
                 &mentions,
                 &post_mentioned_open_ids,
@@ -1326,6 +1338,8 @@ impl LarkChannel {
         if chat_type == "group"
             && !should_respond_in_group(
                 self.mention_only,
+                open_id,
+                &self.group_reply_allowed_sender_ids,
                 bot_open_id.as_deref(),
                 &mentions,
                 &post_mentioned_open_ids,
@@ -1844,13 +1858,41 @@ fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -
         .is_some_and(|value| value == bot_open_id)
 }
 
-/// In group chats, only respond when the bot is explicitly @-mentioned.
+fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = sender_ids
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn sender_has_group_reply_override(sender_open_id: &str, allowed_sender_ids: &[String]) -> bool {
+    let sender_open_id = sender_open_id.trim();
+    if sender_open_id.is_empty() {
+        return false;
+    }
+    allowed_sender_ids
+        .iter()
+        .any(|entry| entry == "*" || entry == sender_open_id)
+}
+
+/// Group-chat response policy:
+/// - sender override IDs always trigger
+/// - otherwise, mention gating applies when enabled
 fn should_respond_in_group(
     mention_only: bool,
+    sender_open_id: &str,
+    group_reply_allowed_sender_ids: &[String],
     bot_open_id: Option<&str>,
     mentions: &[serde_json::Value],
     post_mentioned_open_ids: &[String],
 ) -> bool {
+    if sender_has_group_reply_override(sender_open_id, group_reply_allowed_sender_ids) {
+        return true;
+    }
     if !mention_only {
         return true;
     }
@@ -1919,6 +1961,8 @@ mod tests {
         })];
         assert!(!should_respond_in_group(
             true,
+            "ou_user",
+            &[],
             Some("ou_bot"),
             &mentions,
             &[]
@@ -1929,6 +1973,8 @@ mod tests {
         })];
         assert!(should_respond_in_group(
             true,
+            "ou_user",
+            &[],
             Some("ou_bot"),
             &mentions,
             &[]
@@ -1940,16 +1986,37 @@ mod tests {
         let mentions = vec![serde_json::json!({
             "id": { "open_id": "ou_any" }
         })];
-        assert!(!should_respond_in_group(true, None, &mentions, &[]));
+        assert!(!should_respond_in_group(
+            true,
+            "ou_user",
+            &[],
+            None,
+            &mentions,
+            &[]
+        ));
     }
 
     #[test]
     fn lark_group_response_allows_post_mentions_for_bot_open_id() {
         assert!(should_respond_in_group(
             true,
+            "ou_user",
+            &[],
             Some("ou_bot"),
             &[],
             &[String::from("ou_bot")]
+        ));
+    }
+
+    #[test]
+    fn lark_group_response_allows_sender_override_without_mention() {
+        assert!(should_respond_in_group(
+            true,
+            "ou_priority_user",
+            &[String::from("ou_priority_user")],
+            Some("ou_bot"),
+            &[],
+            &[]
         ));
     }
 
@@ -2303,6 +2370,7 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
@@ -2325,6 +2393,7 @@ mod tests {
             verification_token: Some("tok".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -2359,6 +2428,7 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -2383,6 +2453,7 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -2405,6 +2476,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };
@@ -2577,6 +2649,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            group_reply: None,
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
         };

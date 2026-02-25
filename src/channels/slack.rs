@@ -8,6 +8,8 @@ pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
+    mention_only: bool,
+    group_reply_allowed_sender_ids: Vec<String>,
 }
 
 impl SlackChannel {
@@ -16,7 +18,21 @@ impl SlackChannel {
             bot_token,
             channel_id,
             allowed_users,
+            mention_only: false,
+            group_reply_allowed_sender_ids: Vec::new(),
         }
+    }
+
+    /// Configure group-chat trigger policy.
+    pub fn with_group_reply_policy(
+        mut self,
+        mention_only: bool,
+        allowed_sender_ids: Vec<String>,
+    ) -> Self {
+        self.mention_only = mention_only;
+        self.group_reply_allowed_sender_ids =
+            Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -28,6 +44,17 @@ impl SlackChannel {
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    fn is_group_sender_trigger_enabled(&self, user_id: &str) -> bool {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return false;
+        }
+
+        self.group_reply_allowed_sender_ids
+            .iter()
+            .any(|entry| entry == "*" || entry == user_id)
     }
 
     /// Get the bot's own user ID so we can ignore our own messages
@@ -66,6 +93,61 @@ impl SlackChannel {
 
     fn configured_channel_id(&self) -> Option<String> {
         Self::normalized_channel_id(self.channel_id.as_deref())
+    }
+
+    fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+        let mut normalized = sender_ids
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        normalized
+    }
+
+    fn is_group_channel_id(channel_id: &str) -> bool {
+        matches!(channel_id.chars().next(), Some('C' | 'G'))
+    }
+
+    fn contains_bot_mention(text: &str, bot_user_id: &str) -> bool {
+        if bot_user_id.is_empty() {
+            return false;
+        }
+        text.contains(&format!("<@{bot_user_id}>"))
+    }
+
+    fn strip_bot_mentions(text: &str, bot_user_id: &str) -> String {
+        if bot_user_id.is_empty() {
+            return text.trim().to_string();
+        }
+        text.replace(&format!("<@{bot_user_id}>"), " ")
+            .trim()
+            .to_string()
+    }
+
+    fn normalize_incoming_content(
+        text: &str,
+        require_mention: bool,
+        bot_user_id: &str,
+    ) -> Option<String> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        if require_mention && !Self::contains_bot_mention(text, bot_user_id) {
+            return None;
+        }
+
+        let normalized = if require_mention {
+            Self::strip_bot_mentions(text, bot_user_id)
+        } else {
+            text.trim().to_string()
+        };
+
+        if normalized.is_empty() {
+            return None;
+        }
+        Some(normalized)
     }
 
     fn extract_channel_ids(list_payload: &serde_json::Value) -> Vec<String> {
@@ -358,13 +440,24 @@ impl Channel for SlackChannel {
                             continue;
                         }
 
+                        let is_group_message = Self::is_group_channel_id(&channel_id);
+                        let allow_sender_without_mention =
+                            is_group_message && self.is_group_sender_trigger_enabled(user);
+                        let require_mention =
+                            self.mention_only && is_group_message && !allow_sender_without_mention;
+                        let Some(normalized_text) =
+                            Self::normalize_incoming_content(text, require_mention, &bot_user_id)
+                        else {
+                            continue;
+                        };
+
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
 
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender: user.to_string(),
                             reply_target: channel_id.clone(),
-                            content: text.to_string(),
+                            content: normalized_text,
                             channel: "slack".to_string(),
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -410,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn slack_group_reply_policy_defaults_to_all_messages() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        assert!(!ch.mention_only);
+        assert!(ch.group_reply_allowed_sender_ids.is_empty());
+    }
+
+    #[test]
+    fn slack_group_reply_policy_applies_sender_overrides() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()])
+            .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
+
+        assert!(ch.mention_only);
+        assert_eq!(
+            ch.group_reply_allowed_sender_ids,
+            vec!["U111".to_string(), "U222".to_string()]
+        );
+        assert!(ch.is_group_sender_trigger_enabled("U111"));
+        assert!(!ch.is_group_sender_trigger_enabled("U999"));
+    }
+
+    #[test]
     fn normalized_channel_id_respects_wildcard_and_blank() {
         assert_eq!(SlackChannel::normalized_channel_id(None), None);
         assert_eq!(SlackChannel::normalized_channel_id(Some("")), None);
@@ -420,6 +534,14 @@ mod tests {
             SlackChannel::normalized_channel_id(Some(" C12345 ")),
             Some("C12345".to_string())
         );
+    }
+
+    #[test]
+    fn is_group_channel_id_detects_channel_prefixes() {
+        assert!(SlackChannel::is_group_channel_id("C123"));
+        assert!(SlackChannel::is_group_channel_id("G123"));
+        assert!(!SlackChannel::is_group_channel_id("D123"));
+        assert!(!SlackChannel::is_group_channel_id(""));
     }
 
     #[test]
@@ -448,6 +570,23 @@ mod tests {
     fn wildcard_allows_everyone() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_requires_mention_when_enabled() {
+        assert!(SlackChannel::normalize_incoming_content("hello", true, "U_BOT").is_none());
+        assert_eq!(
+            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, "U_BOT").as_deref(),
+            Some("run")
+        );
+    }
+
+    #[test]
+    fn normalize_incoming_content_without_mention_mode_keeps_message() {
+        assert_eq!(
+            SlackChannel::normalize_incoming_content("  hello world  ", false, "U_BOT").as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]

@@ -333,6 +333,7 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    group_reply_allowed_sender_ids: Vec<String>,
     bot_username: Mutex<Option<String>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
@@ -366,6 +367,7 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            group_reply_allowed_sender_ids: Vec::new(),
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
@@ -388,6 +390,13 @@ impl TelegramChannel {
     ) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
+        self
+    }
+
+    /// Configure sender IDs that bypass mention gating in group chats.
+    pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
+        self.group_reply_allowed_sender_ids =
+            Self::normalize_group_reply_allowed_sender_ids(sender_ids);
         self
     }
 
@@ -475,6 +484,27 @@ impl TelegramChannel {
             .map(|entry| Self::normalize_identity(&entry))
             .filter(|entry| !entry.is_empty())
             .collect()
+    }
+
+    fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+        let mut normalized = sender_ids
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        normalized
+    }
+
+    fn is_group_sender_trigger_enabled(&self, sender_id: Option<&str>) -> bool {
+        let Some(sender_id) = sender_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return false;
+        };
+
+        self.group_reply_allowed_sender_ids
+            .iter()
+            .any(|entry| entry == "*" || entry == sender_id)
     }
 
     async fn load_config_without_env() -> anyhow::Result<Config> {
@@ -1235,7 +1265,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Voice messages have no text to mention the bot, so ignore in mention_only mode when in groups.
         // Private chats are always processed.
         let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
+        let allow_sender_without_mention =
+            is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
+        if self.mention_only && is_group && !allow_sender_without_mention {
             return None;
         }
 
@@ -1423,7 +1455,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
+        let allow_sender_without_mention =
+            is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
+
+        if self.mention_only && is_group && !allow_sender_without_mention {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
                 if !Self::contains_bot_mention(text, bot_username) {
@@ -1458,7 +1493,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let content = if self.mention_only && is_group && !allow_sender_without_mention {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
@@ -3954,6 +3989,37 @@ mod tests {
         });
 
         assert!(ch.parse_update_message(&empty_update).is_none());
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_allows_configured_sender_without_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true)
+            .with_group_reply_allowed_senders(vec!["555".into()]);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 13,
+            "message": {
+                "message_id": 47,
+                "text": "run daily sync",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("sender override should bypass mention requirement");
+        assert_eq!(parsed.content, "run daily sync");
     }
 
     #[test]

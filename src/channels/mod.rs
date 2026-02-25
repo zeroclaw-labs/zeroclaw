@@ -2737,8 +2737,9 @@ fn collect_configured_channels(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
                     tg.allowed_users.clone(),
-                    tg.mention_only,
+                    tg.effective_group_reply_mode().requires_mention(),
                 )
+                .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
@@ -2755,8 +2756,9 @@ fn collect_configured_channels(
                     dc.guild_id.clone(),
                     dc.allowed_users.clone(),
                     dc.listen_to_bots,
-                    dc.mention_only,
+                    dc.effective_group_reply_mode().requires_mention(),
                 )
+                .with_group_reply_allowed_senders(dc.group_reply_allowed_sender_ids())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
@@ -2765,25 +2767,34 @@ fn collect_configured_channels(
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
             display_name: "Slack",
-            channel: Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.channel_id.clone(),
+                    sl.allowed_users.clone(),
+                )
+                .with_group_reply_policy(
+                    sl.effective_group_reply_mode().requires_mention(),
+                    sl.group_reply_allowed_sender_ids(),
+                ),
+            ),
         });
     }
 
     if let Some(ref mm) = config.channels_config.mattermost {
         channels.push(ConfiguredChannel {
             display_name: "Mattermost",
-            channel: Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )),
+            channel: Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.channel_id.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.effective_group_reply_mode().requires_mention(),
+                )
+                .with_group_reply_allowed_senders(mm.group_reply_allowed_sender_ids()),
+            ),
         });
     }
 
@@ -6422,6 +6433,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             allowed_users: vec![],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
 
         let channels = collect_configured_channels(&config, "test");
