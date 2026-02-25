@@ -36,11 +36,15 @@ Modes:
 
 Publish-mode guardrails:
 
-- Tag must match semver-like format `vX.Y.Z[-suffix]`.
+- Tag must match stable format `vX.Y.Z` (pre-release tags are handled by `Pub Pre-release`).
 - Tag must already exist on origin.
+- Tag must be annotated (lightweight tags are rejected).
 - Tag commit must be reachable from `origin/main`.
+- Publish trigger actor must be in `RELEASE_AUTHORIZED_ACTORS` allowlist.
+- Optional tagger-email allowlist can be enforced via `RELEASE_AUTHORIZED_TAGGER_EMAILS`.
 - Matching GHCR image tag (`ghcr.io/<owner>/<repo>:<tag>`) must be available before GitHub Release publish completes.
 - Artifacts are verified before publish.
+- Trigger provenance is recorded in `release-trigger-guard.json` and `audit-event-release-trigger-guard.json`.
 
 ## Maintainer Procedure
 
@@ -62,6 +66,7 @@ Expected outcome:
 - Full target matrix builds successfully.
 - `verify-artifacts` confirms all expected archives exist.
 - No GitHub Release is published.
+- `release-trigger-guard` artifact is emitted with authorization/provenance evidence.
 
 ### 3) Cut release tag
 
@@ -76,7 +81,7 @@ This script enforces:
 - clean working tree
 - `HEAD == origin/main`
 - non-duplicate tag
-- semver-like tag format
+- stable semver tag format (`vX.Y.Z`)
 
 ### 4) Monitor publish run
 

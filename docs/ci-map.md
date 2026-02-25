@@ -59,6 +59,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
+    - Additional behavior: `release_trigger_guard.py` enforces stable-tag contract, annotated-tag requirement, actor authorization allowlist, and emits trigger-provenance audit artifacts
 - `.github/workflows/pub-prerelease.yml` (`Pub Pre-release`)
     - Purpose: validate alpha/beta/rc/stable policy matrix integrity, enforce stage progression + monotonic stage numbering + tag/version integrity, publish transition audit trail and release-stage history, and optionally publish GitHub prerelease assets
 - `.github/workflows/ci-canary-gate.yml` (`CI Canary Gate`)
@@ -134,6 +135,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 1. `CI Required Gate` failing: start with `.github/workflows/ci-run.yml`.
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
+   - Start with `release-trigger-guard.json` / `audit-event-release-trigger-guard.json` artifacts for authorization and provenance failures.
 4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
 5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
 6. Connectivity probe failures: inspect `connectivity-summary.md` and `connectivity-report.json` artifacts from `.github/workflows/ci-connectivity-probes.yml`; apply runbook in `docs/operations/connectivity-probes-runbook.md`.

@@ -178,8 +178,9 @@ Workflow: `.github/workflows/pub-release.yml`
    - Tag push `v*` -> publish mode.
    - Manual dispatch -> verification-only or publish mode (input-driven).
    - Weekly schedule -> verification-only mode.
-2. `prepare` resolves release context (`release_ref`, `release_tag`, publish/draft mode) and validates manual publish inputs.
-   - publish mode enforces `release_tag` == `Cargo.toml` version at the tag commit.
+2. `prepare` resolves release context (`release_ref`, `release_tag`, publish/draft mode) and runs `scripts/ci/release_trigger_guard.py`.
+   - publish mode enforces actor authorization, stable annotated tag policy, `origin/main` ancestry, and `release_tag` == `Cargo.toml` version at the tag commit.
+   - trigger provenance is emitted as `release-trigger-guard` artifacts.
 3. `build-release` builds matrix artifacts across Linux/macOS/Windows targets.
 4. `verify-artifacts` enforces presence of all expected archives before any publish attempt.
 5. In publish mode, workflow generates SBOM (`CycloneDX` + `SPDX`), `SHA256SUMS`, keyless cosign signatures, and verifies GHCR release-tag availability.
