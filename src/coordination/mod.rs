@@ -215,6 +215,19 @@ pub enum CoordinationError {
     UnknownTarget { agent: String, message_id: String },
     #[error("agent `{agent}` is not registered")]
     UnknownAgent { agent: String },
+    #[error("invalid delegate context key `{key}` on message `{message_id}`")]
+    InvalidDelegateContextKey { key: String, message_id: String },
+    #[error("delegate context key `{key}` requires `correlation_id` on message `{message_id}`")]
+    MissingDelegateContextCorrelation { key: String, message_id: String },
+    #[error(
+        "delegate context key `{key}` correlation mismatch on message `{message_id}`: key has `{key_correlation_id}`, envelope has `{envelope_correlation_id}`"
+    )]
+    DelegateContextCorrelationMismatch {
+        key: String,
+        message_id: String,
+        key_correlation_id: String,
+        envelope_correlation_id: String,
+    },
     #[error("context version mismatch for key `{key}`: expected {expected}, actual {actual}")]
     ContextVersionMismatch {
         key: String,
@@ -655,10 +668,7 @@ impl InMemoryMessageBus {
         Ok(inbox
             .iter()
             .filter(|entry| {
-                entry
-                    .envelope
-                    .correlation_id
-                    .as_deref()
+                normalized_non_empty(entry.envelope.correlation_id.as_deref())
                     .is_some_and(|value| value == correlation_id)
             })
             .skip(offset)
@@ -1088,6 +1098,31 @@ fn apply_context_patch_locked(
     expected_version: u64,
     value: &Value,
 ) -> Result<(), CoordinationError> {
+    let key_delegate_correlation = if key.starts_with("delegate/") {
+        let parsed = parse_delegate_context_correlation_from_key(key).ok_or_else(|| {
+            CoordinationError::InvalidDelegateContextKey {
+                key: key.to_string(),
+                message_id: envelope.id.clone(),
+            }
+        })?;
+        let envelope_correlation = normalized_non_empty(envelope.correlation_id.as_deref())
+            .ok_or_else(|| CoordinationError::MissingDelegateContextCorrelation {
+                key: key.to_string(),
+                message_id: envelope.id.clone(),
+            })?;
+        if parsed != envelope_correlation {
+            return Err(CoordinationError::DelegateContextCorrelationMismatch {
+                key: key.to_string(),
+                message_id: envelope.id.clone(),
+                key_correlation_id: parsed.to_string(),
+                envelope_correlation_id: envelope_correlation.to_string(),
+            });
+        }
+        Some(parsed)
+    } else {
+        None
+    };
+
     let current_version = state.context.get(key).map_or(0, |entry| entry.version);
     if current_version != expected_version {
         return Err(CoordinationError::ContextVersionMismatch {
@@ -1098,7 +1133,7 @@ fn apply_context_patch_locked(
     }
 
     let key_owned = key.to_string();
-    let key_is_delegate = key.starts_with("delegate/");
+    let key_is_delegate = key_delegate_correlation.is_some();
     let previous_correlation = state.context_correlation_by_key.get(key).cloned();
     let is_new_key = !state.context.contains_key(key);
     if is_new_key && state.context.len() >= state.limits.max_context_entries {
@@ -1225,6 +1260,21 @@ fn remove_key_from_delegate_context_order(
 
 fn normalized_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn parse_delegate_context_correlation_from_key(key: &str) -> Option<&str> {
+    let mut parts = key.splitn(3, '/');
+    let namespace = parts.next()?;
+    if namespace != "delegate" {
+        return None;
+    }
+    let correlation = parts.next()?.trim();
+    if correlation.is_empty() {
+        return None;
+    }
+    // Require at least one trailing segment (e.g. delegate/<corr>/state).
+    let _tail = parts.next()?;
+    Some(correlation)
 }
 
 #[cfg(test)]
@@ -1466,6 +1516,94 @@ mod tests {
         assert_eq!(bus.dead_letters().len(), 1);
     }
 
+    #[test]
+    fn delegate_context_patch_requires_correlation_id() {
+        let bus = InMemoryMessageBus::new();
+
+        let mut patch = CoordinationEnvelope::new_broadcast(
+            "lead",
+            "conv-delegate-context-correlation",
+            "delegate.state",
+            CoordinationPayload::ContextPatch {
+                key: "delegate/corr-a/state".to_string(),
+                expected_version: 0,
+                value: json!({"phase":"queued"}),
+            },
+        );
+        patch.id = "msg-delegate-corr-required".to_string();
+        let error = bus
+            .publish(patch)
+            .expect_err("delegate context patch without correlation must fail");
+        assert_eq!(
+            error,
+            CoordinationError::MissingDelegateContextCorrelation {
+                key: "delegate/corr-a/state".to_string(),
+                message_id: "msg-delegate-corr-required".to_string(),
+            }
+        );
+        assert_eq!(bus.dead_letter_count(), 1);
+    }
+
+    #[test]
+    fn delegate_context_patch_rejects_mismatched_correlation_id() {
+        let bus = InMemoryMessageBus::new();
+
+        let mut patch = CoordinationEnvelope::new_broadcast(
+            "lead",
+            "conv-delegate-context-correlation-mismatch",
+            "delegate.state",
+            CoordinationPayload::ContextPatch {
+                key: "delegate/corr-a/state".to_string(),
+                expected_version: 0,
+                value: json!({"phase":"queued"}),
+            },
+        );
+        patch.id = "msg-delegate-corr-mismatch".to_string();
+        patch.correlation_id = Some("corr-b".to_string());
+        let error = bus
+            .publish(patch)
+            .expect_err("delegate context patch with mismatch must fail");
+        assert_eq!(
+            error,
+            CoordinationError::DelegateContextCorrelationMismatch {
+                key: "delegate/corr-a/state".to_string(),
+                message_id: "msg-delegate-corr-mismatch".to_string(),
+                key_correlation_id: "corr-a".to_string(),
+                envelope_correlation_id: "corr-b".to_string(),
+            }
+        );
+        assert_eq!(bus.dead_letter_count(), 1);
+    }
+
+    #[test]
+    fn delegate_context_patch_rejects_invalid_delegate_key_shape() {
+        let bus = InMemoryMessageBus::new();
+
+        let mut patch = CoordinationEnvelope::new_broadcast(
+            "lead",
+            "conv-delegate-context-key-shape",
+            "delegate.state",
+            CoordinationPayload::ContextPatch {
+                key: "delegate/corr-a".to_string(),
+                expected_version: 0,
+                value: json!({"phase":"queued"}),
+            },
+        );
+        patch.id = "msg-delegate-key-shape".to_string();
+        patch.correlation_id = Some("corr-a".to_string());
+        let error = bus
+            .publish(patch)
+            .expect_err("delegate context patch with invalid key shape must fail");
+        assert_eq!(
+            error,
+            CoordinationError::InvalidDelegateContextKey {
+                key: "delegate/corr-a".to_string(),
+                message_id: "msg-delegate-key-shape".to_string(),
+            }
+        );
+        assert_eq!(bus.dead_letter_count(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_publish_keeps_inbox_order() {
         let bus = InMemoryMessageBus::new();
@@ -1679,6 +1817,38 @@ mod tests {
     }
 
     #[test]
+    fn correlation_peek_normalizes_whitespace_in_message_correlation_id() {
+        let bus = InMemoryMessageBus::new();
+        bus.register_agent("worker").expect("register worker");
+
+        let mut envelope = CoordinationEnvelope::new_direct(
+            "lead",
+            "worker",
+            "conv-corr-normalize",
+            "coordination",
+            CoordinationPayload::DelegateTask {
+                task_id: "task-1".to_string(),
+                summary: "normalize".to_string(),
+                metadata: json!({}),
+            },
+        );
+        envelope.id = "msg-corr-whitespace".to_string();
+        envelope.correlation_id = Some(" corr-a ".to_string());
+        bus.publish(envelope).expect("publish should succeed");
+
+        assert_eq!(
+            bus.pending_for_agent_correlation("worker", "corr-a")
+                .expect("pending by normalized correlation should succeed"),
+            1
+        );
+        let page = bus
+            .peek_for_agent_correlation_with_offset("worker", "corr-a", 0, 10)
+            .expect("peek by normalized correlation should succeed");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].envelope.id, "msg-corr-whitespace");
+    }
+
+    #[test]
     fn registered_agents_and_context_snapshot_are_available() {
         let bus = InMemoryMessageBus::new();
         bus.register_agent("worker-b").expect("register worker-b");
@@ -1874,6 +2044,7 @@ mod tests {
             },
         );
         patch_a.id = "ctx-lru-a0".to_string();
+        patch_a.correlation_id = Some("corr-a".to_string());
         bus.publish(patch_a).expect("first patch should publish");
 
         let mut patch_b = CoordinationEnvelope::new_broadcast(
@@ -1887,6 +2058,7 @@ mod tests {
             },
         );
         patch_b.id = "ctx-lru-b0".to_string();
+        patch_b.correlation_id = Some("corr-b".to_string());
         bus.publish(patch_b).expect("second patch should publish");
 
         // Update key A to make it the most recently written key.
@@ -1901,6 +2073,7 @@ mod tests {
             },
         );
         patch_a_update.id = "ctx-lru-a1".to_string();
+        patch_a_update.correlation_id = Some("corr-a".to_string());
         bus.publish(patch_a_update)
             .expect("recency update patch should publish");
 
@@ -1915,6 +2088,7 @@ mod tests {
             },
         );
         patch_c.id = "ctx-lru-c0".to_string();
+        patch_c.correlation_id = Some("corr-c".to_string());
         bus.publish(patch_c)
             .expect("new key should trigger eviction under limit");
 
@@ -1955,6 +2129,8 @@ mod tests {
                 },
             );
             patch.id = format!("ctx-page-{key}");
+            patch.correlation_id =
+                parse_delegate_context_correlation_from_key(key).map(str::to_string);
             bus.publish(patch).expect("context patch should publish");
         }
 

@@ -317,9 +317,19 @@ impl Tool for DelegateCoordinationStatusTool {
         let dead_letter_next_offset =
             dead_letters_truncated.then_some(dead_letter_offset + dead_letters_returned);
 
+        let delegate_context_count_filtered = filter_correlation
+            .as_deref()
+            .map(|correlation_id| {
+                self.bus
+                    .delegate_context_count_for_correlation(correlation_id)
+            })
+            .unwrap_or_else(|| self.bus.delegate_context_count());
+
         let output = json!({
             "subscriber_count": self.bus.subscriber_count(),
             "context_count": self.bus.context_count(),
+            "delegate_context_count": self.bus.delegate_context_count(),
+            "delegate_context_count_filtered": delegate_context_count_filtered,
             "dead_letter_count": self.bus.dead_letter_count(),
             "limits": self.bus.limits(),
             "stats": self.bus.stats(),
@@ -444,6 +454,8 @@ mod tests {
             serde_json::from_str(&result.output).expect("output must be valid JSON");
         assert_eq!(parsed["inboxes"].as_array().map(Vec::len), Some(1));
         assert_eq!(parsed["context_count"], json!(1));
+        assert_eq!(parsed["delegate_context_count"], json!(1));
+        assert_eq!(parsed["delegate_context_count_filtered"], json!(1));
         assert_eq!(parsed["contexts_total"], json!(1));
         assert_eq!(parsed["contexts_offset"], json!(0));
         assert_eq!(parsed["contexts_returned"], json!(1));
