@@ -4301,12 +4301,12 @@ mod tests {
             *cache = Some("mybot".to_string());
         }
 
-        let update = serde_json::json!({
+        let _update = serde_json::json!({
             "update_id": 100,
             "message": {
                 "message_id": 1,
                 "photo": [
-                    {"file_id": "photo_id", "file_size": 1000}
+                    {"file_id": "photo_id", "file_size": 1_000}
                 ],
                 "from": {
                     "id": 555,
@@ -4335,12 +4335,12 @@ mod tests {
         }
 
         // Photo with caption that doesn't mention the bot
-        let update = serde_json::json!({
+        let _update = serde_json::json!({
             "update_id": 101,
             "message": {
                 "message_id": 2,
                 "photo": [
-                    {"file_id": "photo_id", "file_size": 1000}
+                    {"file_id": "photo_id", "file_size": 1_000}
                 ],
                 "caption": "Look at this image",
                 "from": {
@@ -4367,19 +4367,19 @@ mod tests {
             *cache = Some("mybot".to_string());
         }
 
-        let update = serde_json::json!({
+        let _update = serde_json::json!({
             "update_id": 102,
             "message": {
                 "message_id": 3,
                 "photo": [
-                    {"file_id": "photo_id", "file_size": 1000}
+                    {"file_id": "photo_id", "file_size": 1_000}
                 ],
                 "from": {
                     "id": 555,
                     "username": "alice"
                 },
                 "chat": {
-                    "id": 123456,
+                    "id": 123_456,
                     "type": "private"
                 }
             }
@@ -4447,7 +4447,7 @@ mod tests {
 
     #[test]
     fn telegram_split_many_short_lines() {
-        let msg: String = (0..1000)
+        let msg: String = (0..1_000)
             .map(|i| format!("line {i}\n"))
             .collect::<Vec<_>>()
             .concat();
@@ -4924,7 +4924,7 @@ mod tests {
         // Photo with caption
         let photo_msg = serde_json::json!({
             "photo": [
-                {"file_id": "photo_id", "file_size": 1000}
+                    {"file_id": "photo_id", "file_size": 1_000}
             ],
             "caption": "Look at this"
         });
