@@ -103,7 +103,9 @@ struct RoomAliasResponse {
 
 impl MatrixChannel {
     fn sanitize_error_for_log(error: &impl std::fmt::Display) -> String {
-        crate::providers::sanitize_api_error(&error.to_string())
+        // Avoid formatting potentially sensitive upstream payloads into logs.
+        let error_type = std::any::type_name_of_val(error);
+        format!("{error_type} (details redacted)")
     }
 
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
