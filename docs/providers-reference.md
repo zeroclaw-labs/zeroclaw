@@ -44,6 +44,7 @@ credential is not reused for fallback providers.
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
 | `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
+| `hunyuan` | `tencent` | No | `HUNYUAN_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
@@ -92,6 +93,13 @@ credential is not reused for fallback providers.
 - ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
+
+### Hunyuan Notes
+
+- Provider ID: `hunyuan` (alias: `tencent`)
+- Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
+- Authentication: `HUNYUAN_API_KEY` (obtain from [Tencent Cloud console](https://console.cloud.tencent.com/hunyuan))
+- Recommended models: `hunyuan-t1-latest` (deep reasoning), `hunyuan-turbo-latest` (fast), `hunyuan-pro` (high quality)
 
 ### llama.cpp Server Notes
 
@@ -151,6 +159,25 @@ Behavior:
 - `false`: sends `think: false` to Ollama `/api/chat` requests.
 - `true`: sends `think: true`.
 - Unset: omits `think` and keeps Ollama/model defaults.
+
+### Ollama Vision Override
+
+Some Ollama models support vision (e.g. `llava`, `llama3.2-vision`) while others do not.
+Since ZeroClaw cannot auto-detect this, you can override it in `config.toml`:
+
+```toml
+default_provider = "ollama"
+default_model = "llava"
+model_support_vision = true
+```
+
+Behavior:
+
+- `true`: enables image attachment processing in the agent loop.
+- `false`: disables vision even if the provider reports support.
+- Unset: uses the provider's built-in default.
+
+Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
 
 ### Kimi Code Notes
 

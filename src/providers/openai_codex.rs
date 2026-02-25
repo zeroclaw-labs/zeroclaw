@@ -1034,6 +1034,7 @@ data: [DONE]
             reasoning_enabled: None,
             custom_provider_api_mode: None,
             max_tokens_override: None,
+            model_support_vision: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

@@ -1137,6 +1137,7 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
     };
 
     let provider: Box<dyn Provider> =
@@ -1600,6 +1601,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
     };
     let provider: Box<dyn Provider> =
         providers::create_routed_provider_with_options_and_model_providers(

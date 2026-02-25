@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -468,13 +468,6 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
-        crate::providers::traits::ProviderCapabilities {
-            vision: true,
-            native_tool_calling: true,
-        }
-    }
-
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -564,6 +557,13 @@ impl Provider for AnthropicProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
     }
 
     async fn chat_with_tools(

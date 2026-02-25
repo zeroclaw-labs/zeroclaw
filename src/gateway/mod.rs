@@ -365,6 +365,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             reasoning_enabled: config.runtime.reasoning_enabled,
             custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
             max_tokens_override: None,
+            model_support_vision: config.model_support_vision,
         },
     )?);
     let model = config

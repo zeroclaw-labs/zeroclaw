@@ -34,6 +34,127 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::select;
 
+// ── Media attachment support ──────────────────────────────────────────
+
+/// Supported WhatsApp media attachment kinds.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy)]
+enum WaAttachmentKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WaAttachmentKind {
+    /// Parse from the marker prefix (case-insensitive).
+    fn from_marker(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "IMAGE" => Some(Self::Image),
+            "DOCUMENT" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            _ => None,
+        }
+    }
+
+    /// Map to the wa-rs `MediaType` used for upload encryption.
+    fn media_type(self) -> wa_rs_core::download::MediaType {
+        match self {
+            Self::Image => wa_rs_core::download::MediaType::Image,
+            Self::Document => wa_rs_core::download::MediaType::Document,
+            Self::Video => wa_rs_core::download::MediaType::Video,
+            Self::Audio => wa_rs_core::download::MediaType::Audio,
+        }
+    }
+}
+
+/// A parsed media attachment from `[KIND:path]` markers in the response text.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct WaAttachment {
+    kind: WaAttachmentKind,
+    target: String,
+}
+
+/// Parse `[IMAGE:/path]`, `[DOCUMENT:/path]`, etc. markers out of a message.
+/// Returns the cleaned text (markers removed) and a vec of attachments.
+#[cfg(feature = "whatsapp-web")]
+fn parse_wa_attachment_markers(message: &str) -> (String, Vec<WaAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = WaAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(WaAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            // Not a valid media marker — keep the original text.
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+/// Infer MIME type from file extension.
+#[cfg(feature = "whatsapp-web")]
+fn mime_from_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
@@ -233,6 +354,108 @@ impl WhatsAppWebChannel {
 
         Ok(wa_rs_binary::jid::Jid::pn(digits))
     }
+
+    /// Upload a file to WhatsApp media servers and send it as the appropriate message type.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_media_attachment(
+        &self,
+        client: &Arc<wa_rs::Client>,
+        to: &wa_rs_binary::jid::Jid,
+        attachment: &WaAttachment,
+    ) -> Result<()> {
+        use std::path::Path;
+
+        let path = Path::new(&attachment.target);
+        if !path.exists() {
+            anyhow::bail!("Media file not found: {}", attachment.target);
+        }
+
+        let data = tokio::fs::read(path).await?;
+        let file_len = data.len() as u64;
+        let mimetype = mime_from_path(path).to_string();
+
+        tracing::info!(
+            "WhatsApp Web: uploading {:?} ({} bytes, {})",
+            attachment.kind,
+            file_len,
+            mimetype
+        );
+
+        let upload = client.upload(data, attachment.kind.media_type()).await?;
+
+        let outgoing = match attachment.kind {
+            WaAttachmentKind::Image => wa_rs_proto::whatsapp::Message {
+                image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mimetype),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WaAttachmentKind::Document => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                wa_rs_proto::whatsapp::Message {
+                    document_message: Some(Box::new(
+                        wa_rs_proto::whatsapp::message::DocumentMessage {
+                            url: Some(upload.url),
+                            direct_path: Some(upload.direct_path),
+                            media_key: Some(upload.media_key),
+                            file_enc_sha256: Some(upload.file_enc_sha256),
+                            file_sha256: Some(upload.file_sha256),
+                            file_length: Some(upload.file_length),
+                            mimetype: Some(mimetype),
+                            file_name: Some(file_name),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }
+            }
+            WaAttachmentKind::Video => wa_rs_proto::whatsapp::Message {
+                video_message: Some(Box::new(wa_rs_proto::whatsapp::message::VideoMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mimetype),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WaAttachmentKind::Audio => wa_rs_proto::whatsapp::Message {
+                audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mimetype),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        };
+
+        let msg_id = client.send_message(to.clone(), outgoing).await?;
+        tracing::info!(
+            "WhatsApp Web: sent {:?} media (id: {})",
+            attachment.kind,
+            msg_id
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -261,17 +484,59 @@ impl Channel for WhatsAppWebChannel {
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
-        let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
-            ..Default::default()
-        };
 
-        let message_id = client.send_message(to, outgoing).await?;
-        tracing::debug!(
-            "WhatsApp Web: sent message to {} (id: {})",
-            message.recipient,
-            message_id
-        );
+        // Parse media attachment markers from the response text.
+        let (text_without_markers, attachments) = parse_wa_attachment_markers(&message.content);
+
+        // Send any text portion first.
+        if !text_without_markers.is_empty() {
+            let text_msg = wa_rs_proto::whatsapp::Message {
+                conversation: Some(text_without_markers.clone()),
+                ..Default::default()
+            };
+            let msg_id = client.send_message(to.clone(), text_msg).await?;
+            tracing::debug!(
+                "WhatsApp Web: sent text to {} (id: {})",
+                message.recipient,
+                msg_id
+            );
+        }
+
+        // Send each media attachment.
+        for attachment in &attachments {
+            if let Err(e) = self.send_media_attachment(&client, &to, attachment).await {
+                tracing::error!(
+                    "WhatsApp Web: failed to send {:?} attachment {}: {}",
+                    attachment.kind,
+                    attachment.target,
+                    e
+                );
+                // Fall back to sending the path as text so the user knows something went wrong.
+                let fallback = wa_rs_proto::whatsapp::Message {
+                    conversation: Some(format!("[Failed to send media: {}]", attachment.target)),
+                    ..Default::default()
+                };
+                let _ = client.send_message(to.clone(), fallback).await;
+            }
+        }
+
+        // If there were no markers and no text (shouldn't happen), send original content.
+        if attachments.is_empty()
+            && text_without_markers.is_empty()
+            && !message.content.trim().is_empty()
+        {
+            let outgoing = wa_rs_proto::whatsapp::Message {
+                conversation: Some(message.content.clone()),
+                ..Default::default()
+            };
+            let message_id = client.send_message(to, outgoing).await?;
+            tracing::debug!(
+                "WhatsApp Web: sent message to {} (id: {})",
+                message.recipient,
+                message_id
+            );
+        }
+
         Ok(())
     }
 
@@ -719,5 +984,45 @@ mod tests {
     async fn whatsapp_web_health_check_disconnected() {
         let ch = make_channel();
         assert!(!ch.health_check().await);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_image() {
+        let msg = "Here is the timeline [IMAGE:/tmp/chart.png]";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Here is the timeline");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].target, "/tmp/chart.png");
+        assert!(matches!(attachments[0].kind, WaAttachmentKind::Image));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_multiple() {
+        let msg = "Text [IMAGE:/a.png] more [DOCUMENT:/b.pdf]";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Text  more");
+        assert_eq!(attachments.len(), 2);
+        assert!(matches!(attachments[0].kind, WaAttachmentKind::Image));
+        assert!(matches!(attachments[1].kind, WaAttachmentKind::Document));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_no_markers() {
+        let msg = "Just regular text";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Just regular text");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_wa_markers_unknown_kind_preserved() {
+        let msg = "Check [UNKNOWN:/foo] out";
+        let (text, attachments) = parse_wa_attachment_markers(msg);
+        assert_eq!(text, "Check [UNKNOWN:/foo] out");
+        assert!(attachments.is_empty());
     }
 }

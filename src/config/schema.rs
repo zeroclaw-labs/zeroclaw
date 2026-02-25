@@ -129,6 +129,10 @@ pub struct Config {
     #[serde(default)]
     pub runtime: RuntimeConfig,
 
+    /// Research phase configuration (`[research]`). Proactive information gathering.
+    #[serde(default)]
+    pub research: ResearchPhaseConfig,
+
     /// Reliability settings: retries, fallback providers, backoff (`[reliability]`).
     #[serde(default)]
     pub reliability: ReliabilityConfig,
@@ -248,6 +252,13 @@ pub struct Config {
     /// Inter-process agent communication (`[agents_ipc]`).
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
+
+    /// Vision support override for the active provider/model.
+    /// - `None` (default): use provider's built-in default
+    /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
+    /// - `Some(false)`: force vision support off
+    #[serde(default)]
+    pub model_support_vision: Option<bool>,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -439,7 +450,7 @@ fn default_agents_ipc_staleness_secs() -> u64 {
 
 /// Inter-process agent communication configuration (`[agents_ipc]` section).
 ///
-/// When enabled, registers 5 IPC tools that let independent ZeroClaw processes
+/// When enabled, registers IPC tools that let independent ZeroClaw processes
 /// on the same host discover each other and exchange messages via a shared
 /// SQLite database. Disabled by default (zero overhead when off).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2309,6 +2320,109 @@ impl Default for RuntimeConfig {
     }
 }
 
+// ── Research Phase ───────────────────────────────────────────────
+
+/// Research phase trigger mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchTrigger {
+    /// Never trigger research phase.
+    #[default]
+    Never,
+    /// Always trigger research phase before responding.
+    Always,
+    /// Trigger when message contains configured keywords.
+    Keywords,
+    /// Trigger when message exceeds minimum length.
+    Length,
+    /// Trigger when message contains a question mark.
+    Question,
+}
+
+/// Research phase configuration (`[research]` section).
+///
+/// When enabled, the agent proactively gathers information using tools
+/// before generating its main response. This creates a "thinking" phase
+/// where the agent explores the codebase, searches memory, or fetches
+/// external data to inform its answer.
+///
+/// ```toml
+/// [research]
+/// enabled = true
+/// trigger = "keywords"
+/// keywords = ["find", "search", "check", "investigate"]
+/// max_iterations = 5
+/// show_progress = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResearchPhaseConfig {
+    /// Enable the research phase.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// When to trigger research phase.
+    #[serde(default)]
+    pub trigger: ResearchTrigger,
+
+    /// Keywords that trigger research phase (when `trigger = "keywords"`).
+    #[serde(default = "default_research_keywords")]
+    pub keywords: Vec<String>,
+
+    /// Minimum message length to trigger research (when `trigger = "length"`).
+    #[serde(default = "default_research_min_length")]
+    pub min_message_length: usize,
+
+    /// Maximum tool call iterations during research phase.
+    #[serde(default = "default_research_max_iterations")]
+    pub max_iterations: usize,
+
+    /// Show detailed progress during research (tool calls, results).
+    #[serde(default = "default_true")]
+    pub show_progress: bool,
+
+    /// Custom system prompt prefix for research phase.
+    /// If empty, uses default research instructions.
+    #[serde(default)]
+    pub system_prompt_prefix: String,
+}
+
+fn default_research_keywords() -> Vec<String> {
+    vec![
+        "find".into(),
+        "search".into(),
+        "check".into(),
+        "investigate".into(),
+        "look".into(),
+        "research".into(),
+        "найди".into(),
+        "проверь".into(),
+        "исследуй".into(),
+        "поищи".into(),
+    ]
+}
+
+fn default_research_min_length() -> usize {
+    50
+}
+
+fn default_research_max_iterations() -> usize {
+    5
+}
+
+impl Default for ResearchPhaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: ResearchTrigger::default(),
+            keywords: default_research_keywords(),
+            min_message_length: default_research_min_length(),
+            max_iterations: default_research_max_iterations(),
+            show_progress: true,
+            system_prompt_prefix: String::new(),
+        }
+    }
+}
+
 // ── Reliability / supervision ────────────────────────────────────
 
 /// Reliability and supervision configuration (`[reliability]` section).
@@ -3754,6 +3868,7 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
+            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
@@ -3784,6 +3899,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            model_support_vision: None,
         }
     }
 }
@@ -4250,16 +4366,6 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
-                &mut config.web_fetch.api_key,
-                "config.web_fetch.api_key",
-            )?;
-            decrypt_optional_secret(
-                &store,
-                &mut config.web_search.api_key,
-                "config.web_search.api_key",
-            )?;
-            decrypt_optional_secret(
-                &store,
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
@@ -4483,29 +4589,6 @@ impl Config {
         }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
-        }
-
-        // Web tools
-        let web_fetch_provider = self.web_fetch.provider.trim().to_lowercase();
-        if !web_fetch_provider.is_empty()
-            && !matches!(
-                web_fetch_provider.as_str(),
-                "fast_html2md" | "nanohtml2text" | "firecrawl"
-            )
-        {
-            anyhow::bail!(
-                "web_fetch.provider must be one of: fast_html2md, nanohtml2text, firecrawl"
-            );
-        }
-
-        let web_search_provider = self.web_search.provider.trim().to_lowercase();
-        if !web_search_provider.is_empty()
-            && !matches!(
-                web_search_provider.as_str(),
-                "duckduckgo" | "ddg" | "brave" | "firecrawl"
-            )
-        {
-            anyhow::bail!("web_search.provider must be one of: duckduckgo, brave, firecrawl");
         }
 
         // Model routes
@@ -4768,41 +4851,23 @@ impl Config {
             }
         }
 
+        // Vision support override: ZEROCLAW_MODEL_SUPPORT_VISION or MODEL_SUPPORT_VISION
+        if let Ok(flag) = std::env::var("ZEROCLAW_MODEL_SUPPORT_VISION")
+            .or_else(|_| std::env::var("MODEL_SUPPORT_VISION"))
+        {
+            let normalized = flag.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.model_support_vision = Some(true),
+                "0" | "false" | "no" | "off" => self.model_support_vision = Some(false),
+                _ => {}
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
         {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
-        }
-
-        // Web fetch provider: ZEROCLAW_WEB_FETCH_PROVIDER or WEB_FETCH_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_FETCH_PROVIDER")
-            .or_else(|_| std::env::var("WEB_FETCH_PROVIDER"))
-        {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.web_fetch.provider = provider.to_string();
-            }
-        }
-
-        // Web fetch provider API key: ZEROCLAW_WEB_FETCH_API_KEY or WEB_FETCH_API_KEY
-        if let Ok(api_key) = std::env::var("ZEROCLAW_WEB_FETCH_API_KEY")
-            .or_else(|_| std::env::var("WEB_FETCH_API_KEY"))
-        {
-            let api_key = api_key.trim();
-            if !api_key.is_empty() {
-                self.web_fetch.api_key = Some(api_key.to_string());
-            }
-        }
-
-        // Web fetch provider API URL: ZEROCLAW_WEB_FETCH_API_URL or WEB_FETCH_API_URL
-        if let Ok(api_url) = std::env::var("ZEROCLAW_WEB_FETCH_API_URL")
-            .or_else(|_| std::env::var("WEB_FETCH_API_URL"))
-        {
-            let api_url = api_url.trim();
-            if !api_url.is_empty() {
-                self.web_fetch.api_url = Some(api_url.to_string());
-            }
         }
 
         // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
@@ -4812,26 +4877,6 @@ impl Config {
             let provider = provider.trim();
             if !provider.is_empty() {
                 self.web_search.provider = provider.to_string();
-            }
-        }
-
-        // Web search provider API key: ZEROCLAW_WEB_SEARCH_API_KEY or WEB_SEARCH_API_KEY
-        if let Ok(api_key) = std::env::var("ZEROCLAW_WEB_SEARCH_API_KEY")
-            .or_else(|_| std::env::var("WEB_SEARCH_API_KEY"))
-        {
-            let api_key = api_key.trim();
-            if !api_key.is_empty() {
-                self.web_search.api_key = Some(api_key.to_string());
-            }
-        }
-
-        // Web search provider API URL: ZEROCLAW_WEB_SEARCH_API_URL or WEB_SEARCH_API_URL
-        if let Ok(api_url) = std::env::var("ZEROCLAW_WEB_SEARCH_API_URL")
-            .or_else(|_| std::env::var("WEB_SEARCH_API_URL"))
-        {
-            let api_url = api_url.trim();
-            if !api_url.is_empty() {
-                self.web_search.api_url = Some(api_url.to_string());
             }
         }
 
@@ -4983,16 +5028,6 @@ impl Config {
             "config.browser.computer_use.api_key",
         )?;
 
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.web_fetch.api_key,
-            "config.web_fetch.api_key",
-        )?;
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.web_search.api_key,
-            "config.web_search.api_key",
-        )?;
         encrypt_optional_secret(
             &store,
             &mut config_to_save.web_search.brave_api_key,
@@ -5398,6 +5433,7 @@ default_temperature = 0.7
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
             },
+            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -5464,6 +5500,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            model_support_vision: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5556,6 +5593,24 @@ reasoning_enabled = false
     }
 
     #[test]
+    async fn model_support_vision_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+model_support_vision = true
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.model_support_vision, Some(true));
+
+        // Default (omitted) should be None
+        let raw_no_vision = r#"
+default_temperature = 0.7
+"#;
+        let parsed2: Config = toml::from_str(raw_no_vision).unwrap();
+        assert_eq!(parsed2.model_support_vision, None);
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -5618,6 +5673,7 @@ tool_dispatcher = "xml"
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
+            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -5648,6 +5704,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            model_support_vision: None,
         };
 
         config.save().await.unwrap();
@@ -5682,8 +5739,6 @@ tool_dispatcher = "xml"
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
-        config.web_fetch.api_key = Some("web-fetch-credential".into());
-        config.web_search.api_key = Some("web-search-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.model_providers.insert(
@@ -5740,24 +5795,6 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
-        );
-
-        let web_fetch_encrypted = stored.web_fetch.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            web_fetch_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(web_fetch_encrypted).unwrap(),
-            "web-fetch-credential"
-        );
-
-        let web_search_generic_encrypted = stored.web_search.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            web_search_generic_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(web_search_generic_encrypted).unwrap(),
-            "web-search-credential"
         );
 
         let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
@@ -7562,6 +7599,28 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn env_override_model_support_vision() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.model_support_vision, None);
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "true");
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(true));
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "false");
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(false));
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "maybe");
+        config.model_support_vision = Some(true);
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(true));
+
+        std::env::remove_var("ZEROCLAW_MODEL_SUPPORT_VISION");
+    }
+
+    #[test]
     async fn env_override_invalid_port_ignored() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -7581,8 +7640,6 @@ default_model = "legacy-model"
 
         std::env::set_var("WEB_SEARCH_ENABLED", "false");
         std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
-        std::env::set_var("WEB_SEARCH_API_KEY", "web-search-api-key");
-        std::env::set_var("WEB_SEARCH_API_URL", "https://search.example.com/v1");
         std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
         std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
         std::env::set_var("BRAVE_API_KEY", "brave-test-key");
@@ -7591,14 +7648,6 @@ default_model = "legacy-model"
 
         assert!(!config.web_search.enabled);
         assert_eq!(config.web_search.provider, "brave");
-        assert_eq!(
-            config.web_search.api_key.as_deref(),
-            Some("web-search-api-key")
-        );
-        assert_eq!(
-            config.web_search.api_url.as_deref(),
-            Some("https://search.example.com/v1")
-        );
         assert_eq!(config.web_search.max_results, 7);
         assert_eq!(config.web_search.timeout_secs, 20);
         assert_eq!(
@@ -7608,37 +7657,9 @@ default_model = "legacy-model"
 
         std::env::remove_var("WEB_SEARCH_ENABLED");
         std::env::remove_var("WEB_SEARCH_PROVIDER");
-        std::env::remove_var("WEB_SEARCH_API_KEY");
-        std::env::remove_var("WEB_SEARCH_API_URL");
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
         std::env::remove_var("BRAVE_API_KEY");
-    }
-
-    #[test]
-    async fn env_override_web_fetch_provider_config() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        std::env::set_var("WEB_FETCH_PROVIDER", "firecrawl");
-        std::env::set_var("WEB_FETCH_API_KEY", "web-fetch-api-key");
-        std::env::set_var("WEB_FETCH_API_URL", "https://firecrawl.example.com/v1");
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.web_fetch.provider, "firecrawl");
-        assert_eq!(
-            config.web_fetch.api_key.as_deref(),
-            Some("web-fetch-api-key")
-        );
-        assert_eq!(
-            config.web_fetch.api_url.as_deref(),
-            Some("https://firecrawl.example.com/v1")
-        );
-
-        std::env::remove_var("WEB_FETCH_PROVIDER");
-        std::env::remove_var("WEB_FETCH_API_KEY");
-        std::env::remove_var("WEB_FETCH_API_URL");
     }
 
     #[test]

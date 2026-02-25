@@ -5,9 +5,8 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    FeishuConfig, HeartbeatConfig, HttpRequestConfig, IMessageConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
-    TelegramConfig, WebSearchConfig, WebhookConfig,
+    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
+    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -23,9 +22,8 @@ use console::style;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
@@ -110,8 +108,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let tunnel_config = setup_tunnel()?;
 
     print_step(5, 9, "Tool Mode & Security");
-    let (composio_config, secrets_config, browser_config, http_request_config, web_search_config) =
-        setup_tool_mode()?;
+    let (composio_config, secrets_config) = setup_tool_mode()?;
 
     print_step(6, 9, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
@@ -145,6 +142,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
+        research: crate::config::ResearchPhaseConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
@@ -160,11 +158,11 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
         secrets: secrets_config,
-        browser: browser_config,
-        http_request: http_request_config,
+        browser: BrowserConfig::default(),
+        http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
-        web_search: web_search_config,
+        web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -175,6 +173,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         agents_ipc: crate::config::AgentsIpcConfig::default(),
+        model_support_vision: None,
     };
 
     println!(
@@ -498,6 +497,7 @@ async fn run_quick_setup_with_home(
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
+        research: crate::config::ResearchPhaseConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
@@ -528,6 +528,7 @@ async fn run_quick_setup_with_home(
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         agents_ipc: crate::config::AgentsIpcConfig::default(),
+        model_support_vision: None,
     };
 
     config.save().await?;
@@ -612,10 +613,32 @@ async fn run_quick_setup_with_home(
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
-        println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/.zeroclaw/config.toml");
-        println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
-        println!("    4. Gateway:           zeroclaw gateway");
+        if provider_supports_keyless_local_usage(&provider_name) {
+            println!("    1. Chat:     zeroclaw agent -m \"Hello!\"");
+            println!("    2. Gateway:  zeroclaw gateway");
+            println!("    3. Status:   zeroclaw status");
+        } else if provider_supports_device_flow(&provider_name) {
+            if canonical_provider_name(&provider_name) == "copilot" {
+                println!("    1. Chat:              zeroclaw agent -m \"Hello!\"");
+                println!("       (device / OAuth auth will prompt on first run)");
+                println!("    2. Gateway:           zeroclaw gateway");
+                println!("    3. Status:            zeroclaw status");
+            } else {
+                println!(
+                    "    1. Login:             zeroclaw auth login --provider {}",
+                    provider_name
+                );
+                println!("    2. Chat:              zeroclaw agent -m \"Hello!\"");
+                println!("    3. Gateway:           zeroclaw gateway");
+                println!("    4. Status:            zeroclaw status");
+            }
+        } else {
+            let env_var = provider_env_var(&provider_name);
+            println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
+            println!("    2. Or edit:           ~/.zeroclaw/config.toml");
+            println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
+            println!("    4. Gateway:           zeroclaw gateway");
+        }
     } else {
         println!("    1. Chat:     zeroclaw agent -m \"Hello!\"");
         println!("    2. Gateway:  zeroclaw gateway");
@@ -639,6 +662,8 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "grok" => "xai",
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
+        "github-copilot" => "copilot",
+        "openai_codex" | "codex" => "openai-codex",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
@@ -683,9 +708,11 @@ fn default_model_for_provider(provider: &str) -> String {
         "xai" => "grok-4-1-fast-reasoning".into(),
         "perplexity" => "sonar-pro".into(),
         "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".into(),
+        "novita" => "minimax/minimax-m2.5".into(),
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
+        "hunyuan" => "hunyuan-t1-latest".into(),
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
@@ -836,6 +863,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "DeepSeek Reasoner (mapped to V3.2 thinking)".to_string(),
             ),
         ],
+        "hunyuan" => vec![
+            (
+                "hunyuan-t1-latest".to_string(),
+                "Hunyuan T1 (deep reasoning, latest)".to_string(),
+            ),
+            (
+                "hunyuan-turbo-latest".to_string(),
+                "Hunyuan Turbo (fast, general purpose)".to_string(),
+            ),
+            (
+                "hunyuan-pro".to_string(),
+                "Hunyuan Pro (high quality)".to_string(),
+            ),
+        ],
         "xai" => vec![
             (
                 "grok-4-1-fast-reasoning".to_string(),
@@ -876,6 +917,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Mixtral 8x22B".to_string(),
             ),
         ],
+        "novita" => vec![(
+            "minimax/minimax-m2.5".to_string(),
+            "MiniMax M2.5".to_string(),
+        )],
         "together-ai" => vec![
             (
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -1109,9 +1154,14 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
 }
 
 fn supports_live_model_fetch(provider_name: &str) -> bool {
+    if provider_name.trim().starts_with("custom:") {
+        return true;
+    }
+
     matches!(
         canonical_provider_name(provider_name),
         "openrouter"
+            | "openai-codex"
             | "openai"
             | "anthropic"
             | "groq"
@@ -1128,6 +1178,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "astrai"
             | "venice"
             | "fireworks"
+            | "novita"
             | "cohere"
             | "moonshot"
             | "glm"
@@ -1145,7 +1196,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
         "glm-cn" | "bigmodel" => Some("https://open.bigmodel.cn/api/paas/v4/models"),
         "zai-cn" | "z.ai-cn" => Some("https://open.bigmodel.cn/api/coding/paas/v4/models"),
         _ => match canonical_provider_name(provider_name) {
-            "openai" => Some("https://api.openai.com/v1/models"),
+            "openai-codex" | "openai" => Some("https://api.openai.com/v1/models"),
             "venice" => Some("https://api.venice.ai/api/v1/models"),
             "groq" => Some("https://api.groq.com/openai/v1/models"),
             "mistral" => Some("https://api.mistral.ai/v1/models"),
@@ -1153,6 +1204,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "xai" => Some("https://api.x.ai/v1/models"),
             "together-ai" => Some("https://api.together.xyz/v1/models"),
             "fireworks" => Some("https://api.fireworks.ai/inference/v1/models"),
+            "novita" => Some("https://api.novita.ai/openai/v1/models"),
             "cohere" => Some("https://api.cohere.com/compatibility/v1/models"),
             "moonshot" => Some("https://api.moonshot.ai/v1/models"),
             "glm" => Some("https://api.z.ai/api/paas/v4/models"),
@@ -1178,14 +1230,16 @@ fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
 }
 
 fn normalize_model_ids(ids: Vec<String>) -> Vec<String> {
-    let mut unique = BTreeSet::new();
+    let mut unique = BTreeMap::new();
     for id in ids {
         let trimmed = id.trim();
         if !trimmed.is_empty() {
-            unique.insert(trimmed.to_string());
+            unique
+                .entry(trimmed.to_ascii_lowercase())
+                .or_insert_with(|| trimmed.to_string());
         }
     }
-    unique.into_iter().collect()
+    unique.into_values().collect()
 }
 
 fn parse_openai_compatible_model_ids(payload: &Value) -> Vec<String> {
@@ -1394,10 +1448,34 @@ fn resolve_live_models_endpoint(
     provider_name: &str,
     provider_api_url: Option<&str>,
 ) -> Option<String> {
+    if let Some(raw_base) = provider_name.strip_prefix("custom:") {
+        let normalized = raw_base.trim().trim_end_matches('/');
+        if normalized.is_empty() {
+            return None;
+        }
+        if normalized.ends_with("/models") {
+            return Some(normalized.to_string());
+        }
+        return Some(format!("{normalized}/models"));
+    }
+
     if matches!(
         canonical_provider_name(provider_name),
         "llamacpp" | "sglang" | "vllm" | "osaurus"
     ) {
+        if let Some(url) = provider_api_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            let normalized = url.trim_end_matches('/');
+            if normalized.ends_with("/models") {
+                return Some(normalized.to_string());
+            }
+            return Some(format!("{normalized}/models"));
+        }
+    }
+
+    if canonical_provider_name(provider_name) == "openai-codex" {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -2097,6 +2175,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
             ("fireworks", "Fireworks AI — fast open-source inference"),
+            ("novita", "Novita AI — affordable open-source inference"),
             ("together-ai", "Together AI — open-source model hosting"),
             ("nvidia", "NVIDIA NIM — DeepSeek, Llama, & more"),
         ],
@@ -2133,6 +2212,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("qwen", "Qwen — DashScope China endpoint"),
             ("qwen-intl", "Qwen — DashScope international endpoint"),
             ("qwen-us", "Qwen — DashScope US endpoint"),
+            ("hunyuan", "Hunyuan — Tencent large models (T1, Turbo, Pro)"),
             ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
             ("zai", "Z.AI — global coding endpoint"),
             ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
@@ -2520,6 +2600,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "deepseek" => "https://platform.deepseek.com/api_keys",
                 "together-ai" => "https://api.together.xyz/settings/api-keys",
                 "fireworks" => "https://fireworks.ai/account/api-keys",
+                "novita" => "https://novita.ai/settings/key-management",
                 "perplexity" => "https://www.perplexity.ai/settings/api",
                 "xai" => "https://console.x.ai",
                 "cohere" => "https://dashboard.cohere.com/api-keys",
@@ -2796,7 +2877,7 @@ fn provider_env_var(name: &str) -> &'static str {
     match canonical_provider_name(name) {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
-        "openai" => "OPENAI_API_KEY",
+        "openai-codex" | "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "sglang" => "SGLANG_API_KEY",
@@ -2809,6 +2890,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "xai" => "XAI_API_KEY",
         "together-ai" => "TOGETHER_API_KEY",
         "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
+        "novita" => "NOVITA_API_KEY",
         "perplexity" => "PERPLEXITY_API_KEY",
         "cohere" => "COHERE_API_KEY",
         "kimi-code" => "KIMI_CODE_API_KEY",
@@ -2816,6 +2898,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "qwen" => "DASHSCOPE_API_KEY",
+        "hunyuan" => "HUNYUAN_API_KEY",
         "qianfan" => "QIANFAN_API_KEY",
         "zai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
@@ -2837,15 +2920,16 @@ fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     )
 }
 
+fn provider_supports_device_flow(provider_name: &str) -> bool {
+    matches!(
+        canonical_provider_name(provider_name),
+        "copilot" | "gemini" | "openai-codex"
+    )
+}
+
 // ── Step 5: Tool Mode & Security ────────────────────────────────
 
-fn setup_tool_mode() -> Result<(
-    ComposioConfig,
-    SecretsConfig,
-    BrowserConfig,
-    HttpRequestConfig,
-    WebSearchConfig,
-)> {
+fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
     println!();
@@ -2904,283 +2988,6 @@ fn setup_tool_mode() -> Result<(
         ComposioConfig::default()
     };
 
-    // ── Tool selection ──
-    println!();
-    print_bullet("Choose optional network tools to enable.");
-    print_bullet("Core local tools stay enabled (shell, file_read/file_write, memory_*).");
-
-    let browser_runtime = detect_browser_runtime_availability();
-    let rust_native_backend_ready =
-        browser_runtime.rust_native_compiled && browser_runtime.docker_webdriver_available;
-    if browser_runtime.in_container
-        && !browser_runtime.brave_available
-        && !browser_runtime.agent_browser_available
-        && !browser_runtime.local_computer_use_available
-        && !rust_native_backend_ready
-    {
-        println!();
-        print_bullet("Browser preflight: no local browser backend detected in this container.");
-        print_bullet("browser_open requires Brave/Brave Browser binary.");
-        print_bullet(
-            "browser backend requires agent-browser CLI or reachable computer_use sidecar.",
-        );
-        if browser_runtime.docker_webdriver_url.is_some() && !browser_runtime.rust_native_compiled {
-            print_bullet(
-                "This binary was not built with browser-native, so WebDriver cannot be used.",
-            );
-        }
-        print_bullet(
-            "You can still enable browser now, but calls will fail until backend setup is done.",
-        );
-    }
-
-    let mut browser_config = BrowserConfig::default();
-    let enable_browser = Confirm::new()
-        .with_prompt("  Enable browser tools (browser_open + browser)?")
-        .default(false)
-        .interact()?;
-
-    if enable_browser {
-        browser_config.enabled = true;
-        browser_config.allowed_domains = prompt_allowed_domains_for_tool("browser")?;
-        println!(
-            "  {} browser.allowed_domains = [{}]",
-            style("✓").green().bold(),
-            style(browser_config.allowed_domains.join(", ")).green()
-        );
-
-        let mut backend_configured = false;
-        if let Some(webdriver_url) = browser_runtime.docker_webdriver_url.as_deref() {
-            if browser_runtime.rust_native_compiled {
-                let use_rust_native = Confirm::new()
-                    .with_prompt(format!(
-                        "  Use rust_native backend with provisioned WebDriver ({webdriver_url})?"
-                    ))
-                    .default(browser_runtime.docker_webdriver_available)
-                    .interact()?;
-                if use_rust_native {
-                    browser_config.backend = "rust_native".to_string();
-                    browser_config.native_webdriver_url = webdriver_url.to_string();
-                    backend_configured = true;
-                    println!(
-                        "  {} browser backend: {}",
-                        style("✓").green().bold(),
-                        style("rust_native").green()
-                    );
-                    if browser_runtime.docker_webdriver_available {
-                        println!(
-                            "  {} rust-native webdriver endpoint: {}",
-                            style("✓").green().bold(),
-                            style("reachable").green()
-                        );
-                    } else {
-                        println!(
-                            "  {} rust-native webdriver endpoint: {}",
-                            style("!").yellow().bold(),
-                            style("unreachable right now").yellow()
-                        );
-                        print_bullet(
-                            "Browser automation will fail until the configured WebDriver endpoint is reachable.",
-                        );
-                    }
-                }
-            } else {
-                println!(
-                    "  {} browser-native build feature: {}",
-                    style("!").yellow().bold(),
-                    style("not enabled in this binary").yellow()
-                );
-                print_bullet(
-                    "A Docker WebDriver sidecar is configured, but this build cannot use rust_native backend.",
-                );
-            }
-        }
-
-        if !backend_configured {
-            let enable_computer_use = Confirm::new()
-                .with_prompt("  Enable browser.computer_use backend?")
-                .default(false)
-                .interact()?;
-
-            if enable_computer_use {
-                browser_config.backend = "computer_use".to_string();
-                let endpoint: String = Input::new()
-                    .with_prompt("  browser.computer_use endpoint")
-                    .default(browser_config.computer_use.endpoint.clone())
-                    .interact_text()?;
-                let endpoint = endpoint.trim();
-                if !endpoint.is_empty() {
-                    browser_config.computer_use.endpoint = endpoint.to_string();
-                }
-                let allow_remote_endpoint = Confirm::new()
-                    .with_prompt("  Allow remote computer_use endpoint?")
-                    .default(browser_config.computer_use.allow_remote_endpoint)
-                    .interact()?;
-                browser_config.computer_use.allow_remote_endpoint = allow_remote_endpoint;
-                println!(
-                    "  {} browser.computer_use: {}",
-                    style("✓").green().bold(),
-                    style("enabled").green()
-                );
-                print_bullet(&format!(
-                    "computer_use endpoint: {}",
-                    browser_config.computer_use.endpoint
-                ));
-                if endpoint_is_reachable(
-                    &browser_config.computer_use.endpoint,
-                    Duration::from_millis(600),
-                ) {
-                    println!(
-                        "  {} computer_use sidecar endpoint: {}",
-                        style("✓").green().bold(),
-                        style("reachable").green()
-                    );
-                } else {
-                    println!(
-                        "  {} computer_use sidecar endpoint: {}",
-                        style("!").yellow().bold(),
-                        style("unreachable right now").yellow()
-                    );
-                    print_bullet(
-                        "Browser automation will fail until the configured computer_use sidecar is reachable.",
-                    );
-                }
-            } else {
-                println!(
-                    "  {} browser backend: {}",
-                    style("✓").green().bold(),
-                    style(browser_config.backend.as_str()).green()
-                );
-                if !browser_runtime.agent_browser_available {
-                    println!(
-                        "  {} agent-browser CLI: {}",
-                        style("!").yellow().bold(),
-                        style("not detected").yellow()
-                    );
-                    print_bullet(
-                        "browser backend is set to agent_browser, but the CLI is unavailable in this environment.",
-                    );
-                }
-            }
-        }
-
-        if !browser_runtime.brave_available {
-            println!(
-                "  {} browser_open executable: {}",
-                style("!").yellow().bold(),
-                style("Brave not detected").yellow()
-            );
-            print_bullet("browser_open requires Brave Browser in PATH.");
-        }
-
-        let browser_backend_ready =
-            browser_backend_looks_available(&browser_config, &browser_runtime);
-        let browser_open_ready = browser_runtime.brave_available;
-        if !browser_backend_ready && !browser_open_ready {
-            println!(
-                "  {} Browser tools enabled but no working backend detected in this environment.",
-                style("!").yellow().bold()
-            );
-            let keep_enabled = Confirm::new()
-                .with_prompt("  Keep browser tools enabled anyway?")
-                .default(false)
-                .interact()?;
-            if !keep_enabled {
-                browser_config = BrowserConfig::default();
-                println!(
-                    "  {} browser tools: {}",
-                    style("✓").green().bold(),
-                    style("disabled").dim()
-                );
-            }
-        }
-    } else {
-        println!(
-            "  {} browser tools: {}",
-            style("✓").green().bold(),
-            style("disabled").dim()
-        );
-    }
-
-    let mut http_request_config = HttpRequestConfig::default();
-    let enable_http_request = Confirm::new()
-        .with_prompt("  Enable http_request tool for API calls?")
-        .default(false)
-        .interact()?;
-
-    if enable_http_request {
-        http_request_config.enabled = true;
-        http_request_config.allowed_domains = prompt_allowed_domains_for_tool("http_request")?;
-        println!(
-            "  {} http_request.allowed_domains = [{}]",
-            style("✓").green().bold(),
-            style(http_request_config.allowed_domains.join(", ")).green()
-        );
-    } else {
-        println!(
-            "  {} http_request: {}",
-            style("✓").green().bold(),
-            style("disabled").dim()
-        );
-    }
-
-    let mut web_search_config = WebSearchConfig::default();
-    let enable_web_search = Confirm::new()
-        .with_prompt("  Enable web_search_tool?")
-        .default(false)
-        .interact()?;
-
-    if enable_web_search {
-        web_search_config.enabled = true;
-
-        let provider_options = vec![
-            "DuckDuckGo (free, no API key)",
-            "Brave Search (requires API key)",
-        ];
-        let provider_choice = Select::new()
-            .with_prompt("  web_search provider")
-            .items(&provider_options)
-            .default(0)
-            .interact()?;
-
-        if provider_choice == 1 {
-            web_search_config.provider = "brave".to_string();
-            let brave_api_key: String = Input::new()
-                .with_prompt("  Brave API key (or Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
-            if brave_api_key.trim().is_empty() {
-                println!(
-                    "  {} Brave key skipped — set web_search.brave_api_key in config.toml later",
-                    style("→").dim()
-                );
-            } else {
-                web_search_config.brave_api_key = Some(brave_api_key);
-                println!(
-                    "  {} Brave API key: {}",
-                    style("✓").green().bold(),
-                    style("configured").green()
-                );
-            }
-        } else {
-            web_search_config.provider = "duckduckgo".to_string();
-        }
-
-        web_search_config.max_results = prompt_optional_max_results(web_search_config.max_results)?;
-        println!(
-            "  {} web_search: {} (max_results: {})",
-            style("✓").green().bold(),
-            style(web_search_config.provider.as_str()).green(),
-            web_search_config.max_results
-        );
-    } else {
-        println!(
-            "  {} web_search_tool: {}",
-            style("✓").green().bold(),
-            style("disabled").dim()
-        );
-    }
-
     // ── Encrypted secrets ──
     println!();
     print_bullet("ZeroClaw can encrypt API keys stored in config.toml.");
@@ -3207,240 +3014,7 @@ fn setup_tool_mode() -> Result<(
         );
     }
 
-    Ok((
-        composio_config,
-        secrets_config,
-        browser_config,
-        http_request_config,
-        web_search_config,
-    ))
-}
-
-#[allow(clippy::struct_excessive_bools)] // Capability probe flags are intentionally independent.
-#[derive(Debug, Clone)]
-struct BrowserRuntimeAvailability {
-    brave_available: bool,
-    agent_browser_available: bool,
-    local_computer_use_available: bool,
-    rust_native_compiled: bool,
-    docker_webdriver_url: Option<String>,
-    docker_webdriver_available: bool,
-    in_container: bool,
-}
-
-fn detect_browser_runtime_availability() -> BrowserRuntimeAvailability {
-    let docker_webdriver_url = docker_webdriver_url_from_env();
-    let docker_webdriver_available = docker_webdriver_url
-        .as_deref()
-        .is_some_and(|url| endpoint_is_reachable(url, Duration::from_millis(600)));
-
-    BrowserRuntimeAvailability {
-        brave_available: command_available("brave-browser", &["--version"])
-            || command_available("brave", &["--version"]),
-        agent_browser_available: command_available("agent-browser", &["--version"]),
-        local_computer_use_available: endpoint_is_reachable(
-            "http://127.0.0.1:8787/v1/actions",
-            Duration::from_millis(600),
-        ),
-        rust_native_compiled: cfg!(feature = "browser-native"),
-        docker_webdriver_url,
-        docker_webdriver_available,
-        in_container: Path::new("/.dockerenv").exists()
-            || std::env::var_os("ZEROCLAW_DOCKER_BOOTSTRAP").is_some(),
-    }
-}
-
-fn docker_webdriver_url_from_env() -> Option<String> {
-    std::env::var("ZEROCLAW_DOCKER_WEBDRIVER_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn command_available(command: &str, args: &[&str]) -> bool {
-    std::process::Command::new(command)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn endpoint_is_reachable(endpoint: &str, timeout: Duration) -> bool {
-    let parsed = match reqwest::Url::parse(endpoint) {
-        Ok(url) => url,
-        Err(_) => return false,
-    };
-
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-
-    let host = match parsed.host_str() {
-        Some(host) if !host.is_empty() => host.to_string(),
-        _ => return false,
-    };
-
-    let port = match parsed.port_or_known_default() {
-        Some(port) => port,
-        None => return false,
-    };
-
-    let addrs = match (host.as_str(), port).to_socket_addrs() {
-        Ok(addrs) => addrs,
-        Err(_) => return false,
-    };
-
-    for addr in addrs {
-        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn browser_backend_looks_available(
-    browser_config: &BrowserConfig,
-    runtime: &BrowserRuntimeAvailability,
-) -> bool {
-    let rust_native_ready = runtime.rust_native_compiled
-        && endpoint_is_reachable(
-            &browser_config.native_webdriver_url,
-            Duration::from_millis(600),
-        );
-
-    match browser_config.backend.trim().to_ascii_lowercase().as_str() {
-        "computer_use" | "computeruse" => endpoint_is_reachable(
-            &browser_config.computer_use.endpoint,
-            Duration::from_millis(600),
-        ),
-        "agent_browser" | "agentbrowser" => runtime.agent_browser_available,
-        "auto" => {
-            runtime.agent_browser_available
-                || endpoint_is_reachable(
-                    &browser_config.computer_use.endpoint,
-                    Duration::from_millis(600),
-                )
-                || rust_native_ready
-        }
-        "rust_native" | "native" => rust_native_ready,
-        _ => false,
-    }
-}
-
-fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
-    let options = vec![
-        "Restricted allowlist (recommended)",
-        "Allow ANY public domain (*)",
-    ];
-
-    let choice = Select::new()
-        .with_prompt(format!("  {tool_name}: domain access policy"))
-        .items(&options)
-        .default(0)
-        .interact()?;
-
-    if choice == 1 {
-        print_bullet("ANY-domain mode still blocks localhost and private network targets.");
-        return Ok(vec!["*".to_string()]);
-    }
-
-    prompt_domain_list(&format!(
-        "  {tool_name}: allowed domains (comma-separated, e.g. docs.rs, github.com)"
-    ))
-}
-
-fn prompt_domain_list(prompt: &str) -> Result<Vec<String>> {
-    loop {
-        let raw: String = Input::new()
-            .with_prompt(prompt)
-            .allow_empty(true)
-            .interact_text()?;
-
-        let domains = parse_domain_list(&raw);
-        if !domains.is_empty() {
-            return Ok(domains);
-        }
-
-        println!(
-            "  {} {}",
-            style("✗").red().bold(),
-            style("Enter at least one domain, or choose ANY domain.").yellow()
-        );
-    }
-}
-
-fn parse_domain_list(raw: &str) -> Vec<String> {
-    let mut domains: Vec<String> = raw.split(',').filter_map(normalize_domain_entry).collect();
-    domains.sort_unstable();
-    domains.dedup();
-    domains
-}
-
-fn normalize_domain_entry(raw: &str) -> Option<String> {
-    let mut domain = raw.trim().to_lowercase();
-    if domain.is_empty() {
-        return None;
-    }
-
-    if domain == "*" {
-        return Some(domain);
-    }
-
-    if let Some(stripped) = domain.strip_prefix("https://") {
-        domain = stripped.to_string();
-    } else if let Some(stripped) = domain.strip_prefix("http://") {
-        domain = stripped.to_string();
-    }
-
-    if let Some((host, _)) = domain.split_once('/') {
-        domain = host.to_string();
-    }
-
-    domain = domain
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_string();
-
-    if let Some((host, _)) = domain.split_once(':') {
-        domain = host.to_string();
-    }
-
-    if domain.is_empty() || domain.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(domain)
-}
-
-fn prompt_optional_max_results(default_value: usize) -> Result<usize> {
-    loop {
-        let raw: String = Input::new()
-            .with_prompt(format!(
-                "  web_search max results (1-10, Enter for default {default_value})"
-            ))
-            .allow_empty(true)
-            .interact_text()?;
-
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Ok(default_value);
-        }
-
-        if let Ok(parsed) = trimmed.parse::<usize>() {
-            if (1..=10).contains(&parsed) {
-                return Ok(parsed);
-            }
-        }
-
-        println!(
-            "  {} {}",
-            style("✗").red().bold(),
-            style("Enter a number between 1 and 10.").yellow()
-        );
-    }
+    Ok((composio_config, secrets_config))
 }
 
 // ── Step 6: Hardware (Physical World) ───────────────────────────
@@ -3785,8 +3359,7 @@ enum ChannelMenuChoice {
     NextcloudTalk,
     DingTalk,
     QqOfficial,
-    Lark,
-    Feishu,
+    LarkFeishu,
     Nostr,
     Done,
 }
@@ -3805,8 +3378,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
-    ChannelMenuChoice::Lark,
-    ChannelMenuChoice::Feishu,
+    ChannelMenuChoice::LarkFeishu,
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
 ];
@@ -3932,22 +3504,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— Tencent QQ Bot"
                     }
                 ),
-                ChannelMenuChoice::Lark => format!(
-                    "Lark       {}",
-                    if config.lark.as_ref().is_some_and(|cfg| !cfg.use_feishu) {
+                ChannelMenuChoice::LarkFeishu => format!(
+                    "Lark/Feishu {}",
+                    if config.lark.is_some() {
                         "✅ connected"
                     } else {
-                        "— Lark Bot"
-                    }
-                ),
-                ChannelMenuChoice::Feishu => format!(
-                    "Feishu     {}",
-                    if config.feishu.is_some()
-                        || config.lark.as_ref().is_some_and(|cfg| cfg.use_feishu)
-                    {
-                        "✅ connected"
-                    } else {
-                        "— Feishu Bot"
+                        "— Lark/Feishu Bot"
                     }
                 ),
                 ChannelMenuChoice::Nostr => format!(
@@ -5201,37 +4763,35 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .filter(|s| !s.is_empty())
                     .collect();
 
+                let receive_mode_choice = Select::new()
+                    .with_prompt("  Receive mode")
+                    .items(["Webhook (recommended)", "WebSocket (legacy fallback)"])
+                    .default(0)
+                    .interact()?;
+                let receive_mode = if receive_mode_choice == 0 {
+                    QQReceiveMode::Webhook
+                } else {
+                    QQReceiveMode::Websocket
+                };
+
                 config.qq = Some(QQConfig {
                     app_id,
                     app_secret,
                     allowed_users,
-                    receive_mode: QQReceiveMode::Webhook,
+                    receive_mode,
                 });
             }
-            ChannelMenuChoice::Lark | ChannelMenuChoice::Feishu => {
-                let is_feishu = matches!(choice, ChannelMenuChoice::Feishu);
-                let provider_label = if is_feishu { "Feishu" } else { "Lark" };
-                let provider_host = if is_feishu {
-                    "open.feishu.cn"
-                } else {
-                    "open.larksuite.com"
-                };
-                let base_url = if is_feishu {
-                    "https://open.feishu.cn/open-apis"
-                } else {
-                    "https://open.larksuite.com/open-apis"
-                };
-
-                // ── Lark / Feishu ──
+            ChannelMenuChoice::LarkFeishu => {
+                // ── Lark/Feishu ──
                 println!();
                 println!(
                     "  {} {}",
-                    style(format!("{provider_label} Setup")).white().bold(),
-                    style(format!("— talk to ZeroClaw from {provider_label}")).dim()
+                    style("Lark/Feishu Setup").white().bold(),
+                    style("— talk to ZeroClaw from Lark or Feishu").dim()
                 );
-                print_bullet(&format!(
-                    "1. Go to {provider_label} Open Platform ({provider_host})"
-                ));
+                print_bullet(
+                    "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
+                );
                 print_bullet("2. Create an app and enable 'Bot' capability");
                 print_bullet("3. Copy the App ID and App Secret");
                 println!();
@@ -5253,8 +4813,20 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
+                let use_feishu = Select::new()
+                    .with_prompt("  Region")
+                    .items(["Feishu (CN)", "Lark (International)"])
+                    .default(0)
+                    .interact()?
+                    == 0;
+
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
+                let base_url = if use_feishu {
+                    "https://open.feishu.cn/open-apis"
+                } else {
+                    "https://open.larksuite.com/open-apis"
+                };
                 let app_id_clone = app_id.clone();
                 let app_secret_clone = app_secret.clone();
                 let endpoint = format!("{base_url}/auth/v3/tenant_access_token/internal");
@@ -5300,7 +4872,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 match thread_result {
                     Ok(Ok(())) => {
                         println!(
-                            "\r  {} {provider_label} credentials verified        ",
+                            "\r  {} Lark/Feishu credentials verified        ",
                             style("✅").green().bold()
                         );
                     }
@@ -5380,34 +4952,22 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 if allowed_users.is_empty() {
                     println!(
-                        "  {} No users allowlisted — {provider_label} inbound messages will be denied until you add Open IDs or '*'.",
+                        "  {} No users allowlisted — Lark/Feishu inbound messages will be denied until you add Open IDs or '*'.",
                         style("⚠").yellow().bold()
                     );
                 }
 
-                if is_feishu {
-                    config.feishu = Some(FeishuConfig {
-                        app_id,
-                        app_secret,
-                        verification_token,
-                        encrypt_key: None,
-                        allowed_users,
-                        receive_mode,
-                        port,
-                    });
-                } else {
-                    config.lark = Some(LarkConfig {
-                        app_id,
-                        app_secret,
-                        verification_token,
-                        encrypt_key: None,
-                        allowed_users,
-                        mention_only: false,
-                        use_feishu: false,
-                        receive_mode,
-                        port,
-                    });
-                }
+                config.lark = Some(LarkConfig {
+                    app_id,
+                    app_secret,
+                    verification_token,
+                    encrypt_key: None,
+                    allowed_users,
+                    mention_only: false,
+                    use_feishu,
+                    receive_mode,
+                    port,
+                });
             }
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──
@@ -6048,51 +5608,6 @@ fn print_summary(config: &Config) {
         }
     );
 
-    println!(
-        "    {} Browser:       {}",
-        style("🌍").cyan(),
-        if config.browser.enabled {
-            let domains = if config.browser.allowed_domains.is_empty() {
-                "(none configured)".to_string()
-            } else {
-                config.browser.allowed_domains.join(", ")
-            };
-            format!("enabled ({}, domains: {})", config.browser.backend, domains)
-        } else {
-            "disabled".to_string()
-        }
-    );
-
-    println!(
-        "    {} HTTP request:  {}",
-        style("🌐").cyan(),
-        if config.http_request.enabled {
-            if config.http_request.allowed_domains.is_empty() {
-                "enabled (domains not configured)".to_string()
-            } else {
-                format!(
-                    "enabled (domains: {})",
-                    config.http_request.allowed_domains.join(", ")
-                )
-            }
-        } else {
-            "disabled".to_string()
-        }
-    );
-
-    println!(
-        "    {} Web search:    {}",
-        style("🔎").cyan(),
-        if config.web_search.enabled {
-            format!(
-                "enabled ({}, max_results: {})",
-                config.web_search.provider, config.web_search.max_results
-            )
-        } else {
-            "disabled".to_string()
-        }
-    );
-
     // Secrets
     println!("    {} Secrets:       configured", style("🔒").cyan());
 
@@ -6277,6 +5792,29 @@ mod tests {
         }
     }
 
+    async fn run_quick_setup_with_clean_env(
+        credential_override: Option<&str>,
+        provider: Option<&str>,
+        model_override: Option<&str>,
+        memory_backend: Option<&str>,
+        force: bool,
+        home: &Path,
+    ) -> Result<Config> {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+
+        run_quick_setup_with_home(
+            credential_override,
+            provider,
+            model_override,
+            memory_backend,
+            force,
+            home,
+        )
+        .await
+    }
+
     // ── ProjectContext defaults ──────────────────────────────────
 
     #[test]
@@ -6318,19 +5856,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_domain_list_normalizes_and_deduplicates_entries() {
-        let parsed =
-            parse_domain_list(" https://Docs.Example.com/path , docs.example.com, example.com ");
-        assert_eq!(parsed, vec!["docs.example.com", "example.com"]);
-    }
-
-    #[test]
-    fn parse_domain_list_preserves_wildcard_entries() {
-        let parsed = parse_domain_list("*,*.example.com");
-        assert_eq!(parsed, vec!["*", "*.example.com"]);
-    }
-
-    #[test]
     fn apply_provider_update_clears_api_key_when_empty() {
         let mut config = Config::default();
         config.api_key = Some("sk-old".to_string());
@@ -6354,12 +5879,9 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_model_override_persists_to_config_toml() {
-        let _env_guard = env_lock().lock().await;
-        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
-        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = run_quick_setup_with_clean_env(
             Some("sk-issue946"),
             Some("openrouter"),
             Some("custom-model-946"),
@@ -6381,12 +5903,9 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_without_model_uses_provider_default_model() {
-        let _env_guard = env_lock().lock().await;
-        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
-        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = run_quick_setup_with_clean_env(
             Some("sk-issue946"),
             Some("anthropic"),
             None,
@@ -6404,9 +5923,6 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_requires_force_when_non_interactive() {
-        let _env_guard = env_lock().lock().await;
-        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
-        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
         let zeroclaw_dir = tmp.path().join(".zeroclaw");
         let config_path = zeroclaw_dir.join("config.toml");
@@ -6416,7 +5932,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_home(
+        let err = run_quick_setup_with_clean_env(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
@@ -6434,9 +5950,6 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_overwrites_with_force() {
-        let _env_guard = env_lock().lock().await;
-        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
-        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
         let zeroclaw_dir = tmp.path().join(".zeroclaw");
         let config_path = zeroclaw_dir.join("config.toml");
@@ -6449,7 +5962,7 @@ mod tests {
         .await
         .unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = run_quick_setup_with_clean_env(
             Some("sk-force"),
             Some("openrouter"),
             Some("custom-model-fresh"),
@@ -6995,6 +6508,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
+        assert_eq!(default_model_for_provider("hunyuan"), "hunyuan-t1-latest");
+        assert_eq!(default_model_for_provider("tencent"), "hunyuan-t1-latest");
         assert_eq!(
             default_model_for_provider("nvidia"),
             "meta/llama-3.3-70b-instruct"
@@ -7021,6 +6536,8 @@ mod tests {
         assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
         assert_eq!(canonical_provider_name("qwen-code"), "qwen-code");
         assert_eq!(canonical_provider_name("qwen-oauth"), "qwen-code");
+        assert_eq!(canonical_provider_name("codex"), "openai-codex");
+        assert_eq!(canonical_provider_name("openai_codex"), "openai-codex");
         assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
         assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
         assert_eq!(canonical_provider_name("kimi_coding"), "kimi-code");
@@ -7255,6 +6772,10 @@ mod tests {
     #[test]
     fn models_endpoint_for_provider_supports_additional_openai_compatible_providers() {
         assert_eq!(
+            models_endpoint_for_provider("openai-codex"),
+            Some("https://api.openai.com/v1/models")
+        );
+        assert_eq!(
             models_endpoint_for_provider("venice"),
             Some("https://api.venice.ai/api/v1/models")
         );
@@ -7324,6 +6845,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_live_models_endpoint_supports_custom_provider_urls() {
+        assert_eq!(
+            resolve_live_models_endpoint("custom:https://proxy.example.com/v1", None),
+            Some("https://proxy.example.com/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("custom:https://proxy.example.com/v1/models", None),
+            Some("https://proxy.example.com/v1/models".to_string())
+        );
+    }
+
+    #[test]
     fn normalize_ollama_endpoint_url_strips_api_suffix_and_trailing_slash() {
         assert_eq!(
             normalize_ollama_endpoint_url(" https://ollama.com/api/ "),
@@ -7384,6 +6917,17 @@ mod tests {
 
         let ids = parse_openai_compatible_model_ids(&payload);
         assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn normalize_model_ids_deduplicates_case_insensitively() {
+        let ids = normalize_model_ids(vec![
+            "GPT-5".to_string(),
+            "gpt-5".to_string(),
+            "gpt-5-mini".to_string(),
+            " GPT-5-MINI ".to_string(),
+        ]);
+        assert_eq!(ids, vec!["GPT-5".to_string(), "gpt-5-mini".to_string()]);
     }
 
     #[test]
@@ -7512,6 +7056,7 @@ mod tests {
     fn provider_env_var_known_providers() {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
+        assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
@@ -7543,6 +7088,8 @@ mod tests {
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
+        assert_eq!(provider_env_var("hunyuan"), "HUNYUAN_API_KEY");
+        assert_eq!(provider_env_var("tencent"), "HUNYUAN_API_KEY"); // alias
     }
 
     #[test]
@@ -7553,6 +7100,16 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("sglang"));
         assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
+    }
+
+    #[test]
+    fn provider_supports_device_flow_copilot() {
+        assert!(provider_supports_device_flow("copilot"));
+        assert!(provider_supports_device_flow("github-copilot"));
+        assert!(provider_supports_device_flow("gemini"));
+        assert!(provider_supports_device_flow("openai-codex"));
+        assert!(!provider_supports_device_flow("openai"));
+        assert!(!provider_supports_device_flow("openrouter"));
     }
 
     #[test]
@@ -7619,15 +7176,13 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_nextcloud_lark_and_feishu() {
+    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
-        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Lark));
-        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Feishu));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_feishu() {
+    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -7667,18 +7222,6 @@ mod tests {
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
-        });
-        assert!(has_launchable_channels(&channels));
-
-        channels.nextcloud_talk = None;
-        channels.feishu = Some(crate::config::schema::FeishuConfig {
-            app_id: "cli_123".into(),
-            app_secret: "secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec!["*".into()],
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
         });
         assert!(has_launchable_channels(&channels));
     }

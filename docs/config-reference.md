@@ -26,6 +26,14 @@ Schema export command:
 | `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+| `model_support_vision` | unset (`None`) | Vision support override for active provider/model |
+
+Notes:
+
+- `model_support_vision = true` forces vision support on (e.g. Ollama running `llava`).
+- `model_support_vision = false` forces vision support off.
+- Unset keeps the provider's built-in default.
+- Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION` or `MODEL_SUPPORT_VISION` (values: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`).
 
 ## `[observability]`
 
@@ -198,6 +206,47 @@ model = "qwen2.5-coder:32b"
 temperature = 0.2
 ```
 
+## `[research]`
+
+Research phase allows the agent to gather information through tools before generating the main response.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable research phase |
+| `trigger` | `never` | Research trigger strategy: `never`, `always`, `keywords`, `length`, `question` |
+| `keywords` | `["find", "search", "check", "investigate"]` | Keywords that trigger research (when trigger = `keywords`) |
+| `min_message_length` | `50` | Minimum message length to trigger research (when trigger = `length`) |
+| `max_iterations` | `5` | Maximum tool calls during research phase |
+| `show_progress` | `true` | Show research progress to user |
+
+Notes:
+
+- Research phase is **disabled by default** (`trigger = never`).
+- When enabled, the agent first gathers facts through tools (grep, file_read, shell, memory search), then responds using the collected context.
+- Research runs before the main agent turn and does not count toward `agent.max_tool_iterations`.
+- Trigger strategies:
+  - `never` — research disabled (default)
+  - `always` — research on every user message
+  - `keywords` — research when message contains any keyword from the list
+  - `length` — research when message length exceeds `min_message_length`
+  - `question` — research when message contains '?'
+
+Example:
+
+```toml
+[research]
+enabled = true
+trigger = "keywords"
+keywords = ["find", "show", "check", "how many"]
+max_iterations = 3
+show_progress = true
+```
+
+The agent will research the codebase before responding to queries like:
+- "Find all TODO in src/"
+- "Show contents of main.rs"
+- "How many files in the project?"
+
 ## `[runtime]`
 
 | Key | Default | Purpose |
@@ -336,46 +385,6 @@ Notes:
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
-
-## `[web_fetch]`
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable `web_fetch` tool for page retrieval |
-| `provider` | `fast_html2md` | Fetch provider: `fast_html2md`, `nanohtml2text`, or `firecrawl` |
-| `api_key` | unset | Provider API key (required for `provider = "firecrawl"`) |
-| `api_url` | unset | Optional provider API base URL override (self-hosted endpoints) |
-| `allowed_domains` | `["*"]` | Allowed domains for web fetch (exact/subdomain match) |
-| `blocked_domains` | `[]` | Blocklist that overrides allowlist |
-| `max_response_size` | `500000` | Maximum output payload length in bytes |
-| `timeout_secs` | `30` | Request timeout in seconds |
-
-Notes:
-
-- URL policy is deny-by-default when `allowed_domains` is empty.
-- Local/private addresses are blocked even when allowlist contains `"*"`.
-- Redirect responses return the validated redirect target URL string instead of destination page content.
-- `fast_html2md` is the markdown-preserving default provider.
-- `nanohtml2text` requires Cargo feature `web-fetch-plaintext`.
-- `firecrawl` requires Cargo feature `firecrawl`.
-
-## `[web_search]`
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable `web_search_tool` |
-| `provider` | `duckduckgo` | Search provider: `duckduckgo`, `brave`, or `firecrawl` |
-| `api_key` | unset | Generic provider API key (`firecrawl`, optional fallback for `brave`) |
-| `api_url` | unset | Optional provider API base URL override (self-hosted Firecrawl) |
-| `brave_api_key` | unset | Brave Search API key (used when `provider = "brave"`) |
-| `max_results` | `5` | Result count (clamped to 1..10) |
-| `timeout_secs` | `15` | Request timeout in seconds |
-
-Notes:
-
-- `provider = "duckduckgo"` needs no API key.
-- `provider = "brave"` uses `brave_api_key` first, then falls back to `api_key`.
-- `provider = "firecrawl"` requires `api_key` and Cargo feature `firecrawl`.
 
 ## `[gateway]`
 

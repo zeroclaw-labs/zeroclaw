@@ -65,6 +65,28 @@ export API_KEY="your-api-key"
 zeroclaw agent
 ```
 
+## Hunyuan (Tencent)
+
+ZeroClaw includes a first-class provider for [Tencent Hunyuan](https://hunyuan.tencent.com/):
+
+- Provider ID: `hunyuan` (alias: `tencent`)
+- Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
+
+Configure ZeroClaw:
+
+```toml
+default_provider = "hunyuan"
+default_model = "hunyuan-t1-latest"
+default_temperature = 0.7
+```
+
+Set your API key:
+
+```bash
+export HUNYUAN_API_KEY="your-api-key"
+zeroclaw agent -m "hello"
+```
+
 ## llama.cpp Server (Recommended Local Setup)
 
 ZeroClaw includes a first-class local provider for `llama-server`:

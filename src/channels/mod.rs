@@ -413,6 +413,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "whatsapp" => Some(
+            "When responding on WhatsApp:\n\
+             - Use *bold* for emphasis (WhatsApp uses single asterisks).\n\
+             - Be concise. No markdown headers (## etc.) — they don't render.\n\
+             - No markdown tables — use bullet lists instead.\n\
+             - For sending images, documents, videos, or audio files use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>]\n\
+             - The path MUST be an absolute filesystem path to a local file (e.g. [IMAGE:/home/nicolas/.zeroclaw/workspace/images/chart.png]).\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - You can combine text and media in one response — text is sent first, then each attachment.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
         _ => None,
     }
 }
@@ -3047,6 +3058,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(

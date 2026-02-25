@@ -612,6 +612,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("qianfan")
     } else if is_doubao_alias(name) {
         Some("doubao")
+    } else if matches!(name, "hunyuan" | "tencent") {
+        Some("hunyuan")
     } else {
         None
     }
@@ -678,6 +680,7 @@ pub struct ProviderRuntimeOptions {
     pub reasoning_enabled: Option<bool>,
     pub custom_provider_api_mode: Option<CompatibleApiMode>,
     pub max_tokens_override: Option<u32>,
+    pub model_support_vision: Option<bool>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -690,6 +693,7 @@ impl Default for ProviderRuntimeOptions {
             reasoning_enabled: None,
             custom_provider_api_mode: None,
             max_tokens_override: None,
+            model_support_vision: None,
         }
     }
 }
@@ -836,6 +840,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
         // not a single API key. Credential resolution happens inside BedrockProvider.
         "bedrock" | "aws-bedrock" => return None,
+        "hunyuan" | "tencent" => vec!["HUNYUAN_API_KEY"],
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
@@ -1085,6 +1090,12 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
+        "hunyuan" | "tencent" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Hunyuan",
+            "https://api.hunyuan.cloud.tencent.com/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
@@ -1475,7 +1486,8 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_vision_override(options.model_support_vision);
 
     Ok(Box::new(reliable))
 }
@@ -1623,8 +1635,7 @@ where
         );
         let resolved_route_provider_name = resolved_route.provider_name.clone();
 
-        let mut route_options = options.clone();
-        route_options.max_tokens_override = route.max_tokens;
+        let route_options = options.clone();
 
         match create_resilient_provider_with_options(
             &resolved_route_provider_name,
@@ -1655,11 +1666,24 @@ where
         }
     }
 
-    Ok(Box::new(router::RouterProvider::new(
-        providers,
-        routes,
-        default_model.to_string(),
-    )))
+    // Build route table
+    let routes: Vec<(String, router::Route)> = model_routes
+        .iter()
+        .map(|r| {
+            (
+                r.hint.clone(),
+                router::Route {
+                    provider_name: r.provider.clone(),
+                    model: r.model.clone(),
+                },
+            )
+        })
+        .collect();
+
+    Ok(Box::new(
+        router::RouterProvider::new(providers, routes, default_model.to_string())
+            .with_vision_override(options.model_support_vision),
+    ))
 }
 
 /// Information about a supported provider for display purposes.
@@ -1792,6 +1816,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "bedrock",
             display_name: "Amazon Bedrock",
             aliases: &["aws-bedrock"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "hunyuan",
+            display_name: "Hunyuan (Tencent)",
+            aliases: &["tencent"],
             local: false,
         },
         ProviderInfo {
@@ -2155,6 +2185,8 @@ mod tests {
         assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
         assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
+        assert_eq!(canonical_china_provider_name("hunyuan"), Some("hunyuan"));
+        assert_eq!(canonical_china_provider_name("tencent"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
 
@@ -2344,6 +2376,12 @@ mod tests {
         assert!(create_provider("aws-bedrock", None).is_ok());
         // Passing an api_key is harmless (ignored).
         assert!(create_provider("bedrock", Some("ignored")).is_ok());
+    }
+
+    #[test]
+    fn factory_hunyuan() {
+        assert!(create_provider("hunyuan", Some("key")).is_ok());
+        assert!(create_provider("tencent", Some("key")).is_ok());
     }
 
     #[test]

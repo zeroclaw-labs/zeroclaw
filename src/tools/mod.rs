@@ -364,6 +364,7 @@ pub fn all_tools_with_runtime(
                     .provider_api
                     .map(|mode| mode.as_compatible_mode()),
                 max_tokens_override: None,
+                model_support_vision: root_config.model_support_vision,
             },
         )
         .with_parent_tools(parent_tools)
