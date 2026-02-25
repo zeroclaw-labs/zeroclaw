@@ -31,7 +31,7 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, LoopContext};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -701,29 +701,29 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-        run_tool_call_loop(
-            active_provider.as_ref(),
-            &mut history,
-            ctx.tools_registry.as_ref(),
-            ctx.observer.as_ref(),
-            route.provider.as_str(),
-            route.model.as_str(),
-            ctx.temperature,
-            true,
-            None,
-            msg.channel.as_str(),
-            ctx.max_tool_iterations,
-            delta_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
+        run_tool_call_loop(LoopContext {
+            provider: active_provider.as_ref(),
+            history: &mut history,
+            tools_registry: ctx.tools_registry.as_ref(),
+            observer: ctx.observer.as_ref(),
+            provider_name: route.provider.as_str(),
+            model: route.model.as_str(),
+            temperature: ctx.temperature,
+            silent: true,
+            approval: None,
+            channel_name: msg.channel.as_str(),
+            max_tool_iterations: ctx.max_tool_iterations,
+            on_delta: delta_tx,
+            survival: None,
+            model_strategy: None,
+            cost_tracker: None,
+            model_prices: None,
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
+        }),
     )
     .await;
 

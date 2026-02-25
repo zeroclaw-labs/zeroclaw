@@ -48,6 +48,9 @@ mod rag {
 }
 mod config;
 mod control;
+mod continuity {
+    pub use zeroclaw::continuity::*;
+}
 mod cosmic {
     pub use zeroclaw::cosmic::*;
 }

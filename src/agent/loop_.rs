@@ -875,7 +875,7 @@ pub(crate) async fn agent_turn(
     survival: Option<&Mutex<SurvivalMonitor>>,
     model_strategy: Option<&Mutex<ModelStrategy>>,
 ) -> Result<String> {
-    run_tool_call_loop(
+    run_tool_call_loop(LoopContext {
         provider,
         history,
         tools_registry,
@@ -884,49 +884,72 @@ pub(crate) async fn agent_turn(
         model,
         temperature,
         silent,
-        None,
-        "channel",
+        approval: None,
+        channel_name: "channel",
         max_tool_iterations,
-        None,
+        on_delta: None,
         survival,
         model_strategy,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+        cost_tracker: None,
+        model_prices: None,
+        cosmic_gate: None,
+        cosmic_workspace: None,
+        cosmic_free_energy: None,
+        cosmic_world_model: None,
+        cosmic_thalamus: None,
+    })
     .await
 }
 
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tool_call_loop(
-    provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: f64,
-    silent: bool,
-    approval: Option<&ApprovalManager>,
-    channel_name: &str,
-    max_tool_iterations: usize,
-    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
-    survival: Option<&Mutex<SurvivalMonitor>>,
-    model_strategy: Option<&Mutex<ModelStrategy>>,
-    cost_tracker: Option<&Arc<Mutex<CostTracker>>>,
-    model_prices: Option<&std::collections::HashMap<String, crate::config::schema::ModelPricing>>,
-    cosmic_gate: Option<&CosmicGate>,
-    cosmic_workspace: Option<&Mutex<GlobalWorkspace>>,
-    cosmic_free_energy: Option<&Mutex<FreeEnergyState>>,
-    cosmic_world_model: Option<&Mutex<WorldModel>>,
-    cosmic_thalamus: Option<&Mutex<SensoryThalamus>>,
-) -> Result<String> {
+pub(crate) struct LoopContext<'a> {
+    pub provider: &'a dyn Provider,
+    pub history: &'a mut Vec<ChatMessage>,
+    pub tools_registry: &'a [Box<dyn Tool>],
+    pub observer: &'a dyn Observer,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub temperature: f64,
+    pub silent: bool,
+    pub approval: Option<&'a ApprovalManager>,
+    pub channel_name: &'a str,
+    pub max_tool_iterations: usize,
+    pub on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    pub survival: Option<&'a Mutex<SurvivalMonitor>>,
+    pub model_strategy: Option<&'a Mutex<ModelStrategy>>,
+    pub cost_tracker: Option<&'a Arc<Mutex<CostTracker>>>,
+    pub model_prices:
+        Option<&'a std::collections::HashMap<String, crate::config::schema::ModelPricing>>,
+    pub cosmic_gate: Option<&'a CosmicGate>,
+    pub cosmic_workspace: Option<&'a Mutex<GlobalWorkspace>>,
+    pub cosmic_free_energy: Option<&'a Mutex<FreeEnergyState>>,
+    pub cosmic_world_model: Option<&'a Mutex<WorldModel>>,
+    pub cosmic_thalamus: Option<&'a Mutex<SensoryThalamus>>,
+}
+
+pub(crate) async fn run_tool_call_loop(ctx: LoopContext<'_>) -> Result<String> {
+    let LoopContext {
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        max_tool_iterations,
+        on_delta,
+        survival,
+        model_strategy,
+        cost_tracker,
+        model_prices,
+        cosmic_gate,
+        cosmic_workspace,
+        cosmic_free_energy,
+        cosmic_world_model,
+        cosmic_thalamus,
+    } = ctx;
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1900,29 +1923,29 @@ pub async fn run(
         ];
 
         let effective_temp = (temperature + bias_temperature_adj).clamp(0.0, 1.5);
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
+        let response = run_tool_call_loop(LoopContext {
+            provider: provider.as_ref(),
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: observer.as_ref(),
             provider_name,
-            model_name,
-            effective_temp,
-            false,
-            Some(&approval_manager),
-            "cli",
-            config.agent.max_tool_iterations,
-            None,
-            survival_monitor.as_deref(),
-            model_strategy.as_deref(),
-            cost_tracker.as_ref(),
-            Some(&config.cost.prices),
-            cosmic_gate.as_ref(),
-            cosmic_ws,
-            cosmic_fe,
-            cosmic_wm,
-            cosmic_thal,
-        )
+            model: model_name,
+            temperature: effective_temp,
+            silent: false,
+            approval: Some(&approval_manager),
+            channel_name: "cli",
+            max_tool_iterations: config.agent.max_tool_iterations,
+            on_delta: None,
+            survival: survival_monitor.as_deref(),
+            model_strategy: model_strategy.as_deref(),
+            cost_tracker: cost_tracker.as_ref(),
+            model_prices: Some(&config.cost.prices),
+            cosmic_gate: cosmic_gate.as_ref(),
+            cosmic_workspace: cosmic_ws,
+            cosmic_free_energy: cosmic_fe,
+            cosmic_world_model: cosmic_wm,
+            cosmic_thalamus: cosmic_thal,
+        })
         .await?;
         final_output = response.clone();
         println!("{response}");
@@ -2246,29 +2269,29 @@ pub async fn run(
             history.push(ChatMessage::user(&enriched));
 
             let effective_temp = (temperature + bias_temperature_adj).clamp(0.0, 1.5);
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
+            let response = match run_tool_call_loop(LoopContext {
+                provider: provider.as_ref(),
+                history: &mut history,
+                tools_registry: &tools_registry,
+                observer: observer.as_ref(),
                 provider_name,
-                model_name,
-                effective_temp,
-                false,
-                Some(&approval_manager),
-                "cli",
-                config.agent.max_tool_iterations,
-                None,
-                survival_monitor.as_deref(),
-                model_strategy.as_deref(),
-                cost_tracker.as_ref(),
-                Some(&config.cost.prices),
-                cosmic_gate.as_ref(),
-                cosmic_ws,
-                cosmic_fe,
-                cosmic_wm,
-                cosmic_thal,
-            )
+                model: model_name,
+                temperature: effective_temp,
+                silent: false,
+                approval: Some(&approval_manager),
+                channel_name: "cli",
+                max_tool_iterations: config.agent.max_tool_iterations,
+                on_delta: None,
+                survival: survival_monitor.as_deref(),
+                model_strategy: model_strategy.as_deref(),
+                cost_tracker: cost_tracker.as_ref(),
+                model_prices: Some(&config.cost.prices),
+                cosmic_gate: cosmic_gate.as_ref(),
+                cosmic_workspace: cosmic_ws,
+                cosmic_free_energy: cosmic_fe,
+                cosmic_world_model: cosmic_wm,
+                cosmic_thalamus: cosmic_thal,
+            })
             .await
             {
                 Ok(resp) => resp,
@@ -2519,6 +2542,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
     );
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
+
+    if let Ok(cont_dir) = crate::continuity::continuity_dir(&config.workspace_dir, None) {
+        if let Ok(prefs) = crate::continuity::load_preferences(&cont_dir) {
+            let model = crate::continuity::PreferenceModel::from_preferences(
+                prefs,
+                crate::continuity::DriftLimits::default(),
+            );
+            let pref_ctx = model.to_prompt_context();
+            if !pref_ctx.is_empty() {
+                system_prompt.push('\n');
+                system_prompt.push_str(&pref_ctx);
+            }
+        }
+    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };

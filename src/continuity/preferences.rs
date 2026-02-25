@@ -142,6 +142,26 @@ impl PreferenceModel {
         std::mem::take(&mut self.deltas)
     }
 
+    pub fn to_prompt_context(&self) -> String {
+        if self.preferences.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec!["[User Preferences]".to_string()];
+        for pref in &self.preferences {
+            if pref.confidence >= 0.3 {
+                lines.push(format!(
+                    "- {}: {} (confidence: {:.1})",
+                    pref.key, pref.value, pref.confidence
+                ));
+            }
+        }
+        if lines.len() == 1 {
+            return String::new();
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
     pub fn decay_and_gc(&mut self, max_age_secs: u64, min_confidence: f64) -> usize {
         let now = now_timestamp();
         for pref in &mut self.preferences {
@@ -226,6 +246,41 @@ mod tests {
         assert_eq!(removed, 0);
         let p = model.get("fresh").unwrap();
         assert!((p.confidence - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn to_prompt_context_empty_for_no_prefs() {
+        let model = PreferenceModel::new(DriftLimits::default());
+        assert!(model.to_prompt_context().is_empty());
+    }
+
+    #[test]
+    fn to_prompt_context_includes_high_confidence_prefs() {
+        let prefs = vec![
+            Preference {
+                key: "response_style".into(),
+                value: "concise".into(),
+                confidence: 0.8,
+                category: PreferenceCategory::Communication,
+                last_updated: now_timestamp(),
+                reasoning: None,
+                evolution_history: vec![],
+            },
+            Preference {
+                key: "low_conf".into(),
+                value: "ignored".into(),
+                confidence: 0.1,
+                category: PreferenceCategory::Technical,
+                last_updated: now_timestamp(),
+                reasoning: None,
+                evolution_history: vec![],
+            },
+        ];
+        let model = PreferenceModel::from_preferences(prefs, DriftLimits::default());
+        let ctx = model.to_prompt_context();
+        assert!(ctx.contains("response_style"));
+        assert!(ctx.contains("concise"));
+        assert!(!ctx.contains("low_conf"));
     }
 
     #[test]
