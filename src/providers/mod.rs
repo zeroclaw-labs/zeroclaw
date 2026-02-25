@@ -29,6 +29,7 @@ pub mod reliable;
 pub mod router;
 pub mod telnyx;
 pub mod traits;
+pub mod wangshu;
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -995,6 +996,30 @@ fn create_provider_with_url_and_options(
             )))
         }
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
+
+        // ── Wangshu Consciousness Provider ────────────────────────
+        "wangshu" | "consciousness" => {
+            use wangshu::{WangshuConfig, WangshuProvider};
+            
+            let config = WangshuConfig {
+                inner_provider: api_url
+                    .map(|u| u.trim().trim_start_matches("wangshu:"))
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or("openai")
+                    .to_string(),
+                memory_path: options
+                    .zeroclaw_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(".zeroclaw"))
+                    .join("wangshu-memory"),
+                philosophy_enabled: true,
+                iching_enabled: true,
+                model: None,
+                temperature: 0.7,
+            };
+            
+            Ok(Box::new(WangshuProvider::new(config)?))
+        }
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
