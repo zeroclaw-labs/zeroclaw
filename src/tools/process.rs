@@ -779,6 +779,10 @@ mod tests {
     struct NoLongRunningRuntime;
 
     impl RuntimeAdapter for NoLongRunningRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn name(&self) -> &str {
             "test-restricted"
         }

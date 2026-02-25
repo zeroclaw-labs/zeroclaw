@@ -84,6 +84,26 @@ Stop containers and remove volumes and generated config:
 
 **Note:** This removes `target/.zeroclaw` (config/DB) but leaves the `playground/` directory intact. To fully wipe everything, manually delete `playground/`.
 
+## WASM Security Profiles
+
+If you run `runtime.kind = "wasm"`, prebuilt baseline templates are available:
+
+- `dev/config.wasm.dev.toml`
+- `dev/config.wasm.staging.toml`
+- `dev/config.wasm.prod.toml`
+
+Recommended path:
+
+1. Start with `dev` for module integration (`capability_escalation_mode = "clamp"`).
+2. Move to `staging` and fix denied escalation paths.
+3. Promote to `prod` with minimal permissions.
+
+Example apply flow:
+
+```bash
+cp dev/config.wasm.staging.toml target/.zeroclaw/config.toml
+```
+
 ## Local CI/CD (Docker-Only)
 
 Use this when you want CI-style validation without relying on GitHub Actions and without running Rust toolchain commands on your host.

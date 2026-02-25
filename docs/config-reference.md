@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 25, 2026**.
 
 Config path resolution at startup:
 
@@ -267,6 +267,7 @@ The agent will research the codebase before responding to queries like:
 
 | Key | Default | Purpose |
 |---|---|---|
+| `kind` | `native` | Runtime backend: `native`, `docker`, or `wasm` |
 | `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
 
 Notes:
@@ -275,6 +276,41 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 - Deprecated compatibility alias: `runtime.reasoning_level` is still accepted but should be migrated to `provider.reasoning_level`.
+- `runtime.kind = "wasm"` enables capability-bounded module execution and disables shell/process style execution.
+
+### `[runtime.wasm]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `tools_dir` | `"tools/wasm"` | Workspace-relative directory containing `.wasm` modules |
+| `fuel_limit` | `1000000` | Instruction budget per module invocation |
+| `memory_limit_mb` | `64` | Per-module memory cap (MB) |
+| `max_module_size_mb` | `50` | Maximum allowed `.wasm` file size (MB) |
+| `allow_workspace_read` | `false` | Allow WASM host calls to read workspace files (future-facing) |
+| `allow_workspace_write` | `false` | Allow WASM host calls to write workspace files (future-facing) |
+| `allowed_hosts` | `[]` | Explicit network host allowlist for WASM host calls (future-facing) |
+
+Notes:
+
+- `allowed_hosts` entries must be normalized `host` or `host:port` strings; wildcards, schemes, and paths are rejected when `runtime.wasm.security.strict_host_validation = true`.
+- Invocation-time capability overrides are controlled by `runtime.wasm.security.capability_escalation_mode`:
+  - `deny` (default): reject escalation above runtime baseline.
+  - `clamp`: reduce requested capabilities to baseline.
+
+### `[runtime.wasm.security]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `require_workspace_relative_tools_dir` | `true` | Require `runtime.wasm.tools_dir` to be workspace-relative and reject `..` traversal |
+| `reject_symlink_modules` | `true` | Block symlinked `.wasm` module files during execution |
+| `strict_host_validation` | `true` | Fail config/invocation on invalid host entries instead of dropping them |
+| `capability_escalation_mode` | `"deny"` | Escalation policy: `deny` or `clamp` |
+
+WASM profile templates:
+
+- `dev/config.wasm.dev.toml`
+- `dev/config.wasm.staging.toml`
+- `dev/config.wasm.prod.toml`
 
 ## `[provider]`
 

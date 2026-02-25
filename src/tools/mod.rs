@@ -56,6 +56,7 @@ pub mod shell;
 pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
+pub mod wasm_module;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -100,6 +101,7 @@ pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use wasm_module::WasmModuleTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -155,14 +157,25 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
-        Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security.clone())),
-        Box::new(FileEditTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security.clone())),
-        Box::new(ContentSearchTool::new(security)),
-    ]
+    let has_shell_access = runtime.has_shell_access();
+    let has_filesystem_access = runtime.has_filesystem_access();
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+    if has_shell_access {
+        tools.push(Box::new(ShellTool::new(security.clone(), runtime.clone())));
+    }
+    if has_filesystem_access {
+        tools.push(Box::new(FileReadTool::new(security.clone())));
+        tools.push(Box::new(FileWriteTool::new(security.clone())));
+        tools.push(Box::new(FileEditTool::new(security.clone())));
+        tools.push(Box::new(GlobSearchTool::new(security.clone())));
+        tools.push(Box::new(ContentSearchTool::new(security.clone())));
+    }
+    if runtime.as_any().is::<crate::runtime::WasmRuntime>() {
+        tools.push(Box::new(WasmModuleTool::new(security, runtime)));
+    }
+
+    tools
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -215,6 +228,8 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let has_shell_access = runtime.has_shell_access();
+    let has_filesystem_access = runtime.has_filesystem_access();
     let zeroclaw_dir = root_config
         .config_path
         .parent()
@@ -227,21 +242,6 @@ pub fn all_tools_with_runtime(
     ));
 
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new_with_syscall_detector(
-            security.clone(),
-            runtime.clone(),
-            Some(syscall_detector.clone()),
-        )),
-        Arc::new(ProcessTool::new_with_syscall_detector(
-            security.clone(),
-            runtime.clone(),
-            Some(syscall_detector),
-        )),
-        Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(FileEditTool::new(security.clone())),
-        Arc::new(GlobSearchTool::new(security.clone())),
-        Arc::new(ContentSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
@@ -258,15 +258,42 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    if has_shell_access {
+        tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
+            security.clone(),
+            runtime.clone(),
+            Some(syscall_detector.clone()),
+        )));
+        tool_arcs.push(Arc::new(ProcessTool::new_with_syscall_detector(
+            security.clone(),
+            runtime.clone(),
+            Some(syscall_detector),
+        )));
+        tool_arcs.push(Arc::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )));
+    }
+
+    if has_filesystem_access {
+        tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
+        tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
+        tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
+        tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
+        tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
+    }
+    if runtime.as_any().is::<crate::runtime::WasmRuntime>() {
+        tool_arcs.push(Arc::new(WasmModuleTool::new(
+            security.clone(),
+            runtime.clone(),
+        )));
+    }
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -422,7 +449,8 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig, WasmRuntimeConfig};
+    use crate::runtime::WasmRuntime;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -438,6 +466,31 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[test]
+    fn default_tools_with_runtime_includes_wasm_module_for_wasm_runtime() {
+        let security = Arc::new(SecurityPolicy::default());
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let tools = default_tools_with_runtime(security, runtime);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"wasm_module"));
+    }
+
+    #[test]
+    fn default_tools_with_runtime_excludes_shell_and_fs_for_wasm_runtime() {
+        let security = Arc::new(SecurityPolicy::default());
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let tools = default_tools_with_runtime(security, runtime);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"shell"));
+        assert!(!names.contains(&"file_read"));
+        assert!(!names.contains(&"file_write"));
+        assert!(!names.contains(&"file_edit"));
+        assert!(!names.contains(&"glob_search"));
+        assert!(!names.contains(&"content_search"));
     }
 
     #[test]
@@ -522,6 +575,48 @@ mod tests {
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    #[test]
+    fn all_tools_with_runtime_includes_wasm_module_for_wasm_runtime() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            runtime,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"wasm_module"));
+        assert!(!names.contains(&"shell"));
+        assert!(!names.contains(&"process"));
+        assert!(!names.contains(&"git_operations"));
+        assert!(!names.contains(&"file_read"));
+        assert!(!names.contains(&"file_write"));
+        assert!(!names.contains(&"file_edit"));
     }
 
     #[test]

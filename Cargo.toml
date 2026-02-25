@@ -65,6 +65,9 @@ nanohtml2text = { version = "0.2", optional = true }
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
 
+# Optional in-process WASM runtime for sandboxed tool execution
+wasmi = { version = "0.38", optional = true, default-features = true }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
@@ -196,6 +199,8 @@ peripheral-rpi = ["rppal"]
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
 fantoccini = ["browser-native"]
+# In-process WASM runtime (capability-based sandbox)
+runtime-wasm = ["dep:wasmi"]
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")
 sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []

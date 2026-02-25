@@ -2314,13 +2314,17 @@ impl Default for AutonomyConfig {
 /// Runtime adapter configuration (`[runtime]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeConfig {
-    /// Runtime kind (`native` | `docker`).
+    /// Runtime kind (`native` | `docker` | `wasm`).
     #[serde(default = "default_runtime_kind")]
     pub kind: String,
 
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
+
+    /// WASM runtime settings (used when `kind = "wasm"`).
+    #[serde(default)]
+    pub wasm: WasmRuntimeConfig,
 
     /// Global reasoning override for providers that expose explicit controls.
     /// - `None`: provider default behavior
@@ -2369,6 +2373,73 @@ pub struct DockerRuntimeConfig {
     pub allowed_workspace_roots: Vec<String>,
 }
 
+/// WASM runtime configuration (`[runtime.wasm]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmRuntimeConfig {
+    /// Workspace-relative directory that stores `.wasm` modules.
+    #[serde(default = "default_wasm_tools_dir")]
+    pub tools_dir: String,
+
+    /// Fuel limit per invocation (instruction budget).
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+
+    /// Memory limit per invocation in MB.
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+
+    /// Maximum `.wasm` module size in MB.
+    #[serde(default = "default_wasm_max_module_size_mb")]
+    pub max_module_size_mb: u64,
+
+    /// Allow reading files from workspace inside WASM host calls (future-facing).
+    #[serde(default)]
+    pub allow_workspace_read: bool,
+
+    /// Allow writing files to workspace inside WASM host calls (future-facing).
+    #[serde(default)]
+    pub allow_workspace_write: bool,
+
+    /// Explicit host allowlist for outbound HTTP from WASM modules (future-facing).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+
+    /// WASM runtime security controls (`[runtime.wasm.security]` section).
+    #[serde(default)]
+    pub security: WasmSecurityConfig,
+}
+
+/// How to handle invocation capabilities that exceed baseline runtime policy.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmCapabilityEscalationMode {
+    /// Reject any invocation that asks for capabilities above runtime config.
+    #[default]
+    Deny,
+    /// Automatically clamp invocation capabilities to runtime config ceilings.
+    Clamp,
+}
+
+/// Security policy controls for WASM runtime hardening.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmSecurityConfig {
+    /// Require `runtime.wasm.tools_dir` to stay workspace-relative and traversal-free.
+    #[serde(default = "default_true")]
+    pub require_workspace_relative_tools_dir: bool,
+
+    /// Reject module files that are symlinks before execution.
+    #[serde(default = "default_true")]
+    pub reject_symlink_modules: bool,
+
+    /// Strictly validate host allowlist entries (`host` or `host:port` only).
+    #[serde(default = "default_true")]
+    pub strict_host_validation: bool,
+
+    /// Capability escalation handling policy.
+    #[serde(default)]
+    pub capability_escalation_mode: WasmCapabilityEscalationMode,
+}
+
 fn default_runtime_kind() -> String {
     "native".into()
 }
@@ -2389,6 +2460,22 @@ fn default_docker_cpu_limit() -> Option<f64> {
     Some(1.0)
 }
 
+fn default_wasm_tools_dir() -> String {
+    "tools/wasm".into()
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000
+}
+
+fn default_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_wasm_max_module_size_mb() -> u64 {
+    50
+}
+
 impl Default for DockerRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -2403,11 +2490,38 @@ impl Default for DockerRuntimeConfig {
     }
 }
 
+impl Default for WasmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tools_dir: default_wasm_tools_dir(),
+            fuel_limit: default_wasm_fuel_limit(),
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            max_module_size_mb: default_wasm_max_module_size_mb(),
+            allow_workspace_read: false,
+            allow_workspace_write: false,
+            allowed_hosts: Vec::new(),
+            security: WasmSecurityConfig::default(),
+        }
+    }
+}
+
+impl Default for WasmSecurityConfig {
+    fn default() -> Self {
+        Self {
+            require_workspace_relative_tools_dir: true,
+            reject_symlink_modules: true,
+            strict_host_validation: true,
+            capability_escalation_mode: WasmCapabilityEscalationMode::Deny,
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            wasm: WasmRuntimeConfig::default(),
             reasoning_enabled: None,
             reasoning_level: None,
         }
@@ -6117,6 +6231,20 @@ allowed_roots = []
         assert_eq!(r.docker.cpu_limit, Some(1.0));
         assert!(r.docker.read_only_rootfs);
         assert!(r.docker.mount_workspace);
+        assert_eq!(r.wasm.tools_dir, "tools/wasm");
+        assert_eq!(r.wasm.fuel_limit, 1_000_000);
+        assert_eq!(r.wasm.memory_limit_mb, 64);
+        assert_eq!(r.wasm.max_module_size_mb, 50);
+        assert!(!r.wasm.allow_workspace_read);
+        assert!(!r.wasm.allow_workspace_write);
+        assert!(r.wasm.allowed_hosts.is_empty());
+        assert!(r.wasm.security.require_workspace_relative_tools_dir);
+        assert!(r.wasm.security.reject_symlink_modules);
+        assert!(r.wasm.security.strict_host_validation);
+        assert_eq!(
+            r.wasm.security.capability_escalation_mode,
+            WasmCapabilityEscalationMode::Deny
+        );
     }
 
     #[test]
@@ -6404,6 +6532,100 @@ reasoning_enabled = false
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
+    }
+
+    #[test]
+    async fn runtime_wasm_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+kind = "wasm"
+
+[runtime.wasm]
+tools_dir = "skills/wasm"
+fuel_limit = 500000
+memory_limit_mb = 32
+max_module_size_mb = 8
+allow_workspace_read = true
+allow_workspace_write = false
+allowed_hosts = ["api.example.com", "cdn.example.com:443"]
+
+[runtime.wasm.security]
+require_workspace_relative_tools_dir = false
+reject_symlink_modules = false
+strict_host_validation = false
+capability_escalation_mode = "clamp"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.kind, "wasm");
+        assert_eq!(parsed.runtime.wasm.tools_dir, "skills/wasm");
+        assert_eq!(parsed.runtime.wasm.fuel_limit, 500_000);
+        assert_eq!(parsed.runtime.wasm.memory_limit_mb, 32);
+        assert_eq!(parsed.runtime.wasm.max_module_size_mb, 8);
+        assert!(parsed.runtime.wasm.allow_workspace_read);
+        assert!(!parsed.runtime.wasm.allow_workspace_write);
+        assert_eq!(
+            parsed.runtime.wasm.allowed_hosts,
+            vec!["api.example.com", "cdn.example.com:443"]
+        );
+        assert!(
+            !parsed
+                .runtime
+                .wasm
+                .security
+                .require_workspace_relative_tools_dir
+        );
+        assert!(!parsed.runtime.wasm.security.reject_symlink_modules);
+        assert!(!parsed.runtime.wasm.security.strict_host_validation);
+        assert_eq!(
+            parsed.runtime.wasm.security.capability_escalation_mode,
+            WasmCapabilityEscalationMode::Clamp
+        );
+    }
+
+    #[test]
+    async fn runtime_wasm_dev_template_deserializes() {
+        let raw = include_str!("../../dev/config.wasm.dev.toml");
+        let parsed: Config = toml::from_str(raw).expect("dev wasm template should parse");
+
+        assert_eq!(parsed.runtime.kind, "wasm");
+        assert!(parsed.runtime.wasm.allow_workspace_read);
+        assert!(parsed.runtime.wasm.allow_workspace_write);
+        assert_eq!(
+            parsed.runtime.wasm.security.capability_escalation_mode,
+            WasmCapabilityEscalationMode::Clamp
+        );
+    }
+
+    #[test]
+    async fn runtime_wasm_staging_template_deserializes() {
+        let raw = include_str!("../../dev/config.wasm.staging.toml");
+        let parsed: Config = toml::from_str(raw).expect("staging wasm template should parse");
+
+        assert_eq!(parsed.runtime.kind, "wasm");
+        assert!(parsed.runtime.wasm.allow_workspace_read);
+        assert!(!parsed.runtime.wasm.allow_workspace_write);
+        assert_eq!(
+            parsed.runtime.wasm.security.capability_escalation_mode,
+            WasmCapabilityEscalationMode::Deny
+        );
+    }
+
+    #[test]
+    async fn runtime_wasm_prod_template_deserializes() {
+        let raw = include_str!("../../dev/config.wasm.prod.toml");
+        let parsed: Config = toml::from_str(raw).expect("prod wasm template should parse");
+
+        assert_eq!(parsed.runtime.kind, "wasm");
+        assert!(!parsed.runtime.wasm.allow_workspace_read);
+        assert!(!parsed.runtime.wasm.allow_workspace_write);
+        assert!(parsed.runtime.wasm.allowed_hosts.is_empty());
+        assert_eq!(
+            parsed.runtime.wasm.security.capability_escalation_mode,
+            WasmCapabilityEscalationMode::Deny
+        );
     }
 
     #[test]
