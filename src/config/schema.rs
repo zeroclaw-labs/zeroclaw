@@ -110,9 +110,6 @@ pub struct Config {
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
-    /// Provider-specific behavior overrides (`[provider]`).
-    #[serde(default)]
-    pub provider: ProviderConfig,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
@@ -279,15 +276,6 @@ pub struct ModelProviderConfig {
     /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
     #[serde(default)]
     pub requires_openai_auth: bool,
-}
-
-/// Provider behavior overrides (`[provider]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct ProviderConfig {
-    /// Optional reasoning level override for providers that support explicit levels
-    /// (e.g. OpenAI Codex `/responses` reasoning effort).
-    #[serde(default)]
-    pub reasoning_level: Option<String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -549,7 +537,7 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
     /// Default: `false` (opt-in).
@@ -563,6 +551,16 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            open_skills_enabled: false,
+            open_skills_dir: None,
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -2078,10 +2076,18 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
+}
+
+impl Default for BuiltinHooksConfig {
+    fn default() -> Self {
+        Self {
+            command_logger: false,
+        }
+    }
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
@@ -2232,6 +2238,16 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+
+    /// Reasoning effort level for providers that support configurable reasoning.
+    /// Valid values: "low", "medium", "high", "xhigh".
+    /// - `None`: provider default (typically "high" or equivalent)
+    /// - `Some(level)`: request specific reasoning effort level
+    ///
+    /// Note: Not all providers support all levels. Invalid levels are clamped
+    /// to valid values by each provider.
+    #[serde(default)]
+    pub reasoning_level: Option<String>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -2306,6 +2322,7 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            reasoning_level: None,
         }
     }
 }
@@ -2768,7 +2785,7 @@ pub struct CustomTunnelConfig {
 struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
 
 impl<T: ChannelConfig> ConfigWrapper<T> {
-    fn new(_: Option<&T>) -> Self {
+    fn new(_: &Option<T>) -> Self {
         Self(std::marker::PhantomData)
     }
 }
@@ -2844,81 +2861,81 @@ impl ChannelsConfig {
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
             (
-                Box::new(ConfigWrapper::new(self.telegram.as_ref())),
+                Box::new(ConfigWrapper::new(&self.telegram)),
                 self.telegram.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.discord.as_ref())),
+                Box::new(ConfigWrapper::new(&self.discord)),
                 self.discord.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.slack.as_ref())),
+                Box::new(ConfigWrapper::new(&self.slack)),
                 self.slack.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.mattermost.as_ref())),
+                Box::new(ConfigWrapper::new(&self.mattermost)),
                 self.mattermost.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.imessage.as_ref())),
+                Box::new(ConfigWrapper::new(&self.imessage)),
                 self.imessage.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.matrix.as_ref())),
+                Box::new(ConfigWrapper::new(&self.matrix)),
                 self.matrix.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.signal.as_ref())),
+                Box::new(ConfigWrapper::new(&self.signal)),
                 self.signal.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.whatsapp.as_ref())),
+                Box::new(ConfigWrapper::new(&self.whatsapp)),
                 self.whatsapp.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.linq.as_ref())),
+                Box::new(ConfigWrapper::new(&self.linq)),
                 self.linq.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.wati.as_ref())),
+                Box::new(ConfigWrapper::new(&self.wati)),
                 self.wati.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.nextcloud_talk.as_ref())),
+                Box::new(ConfigWrapper::new(&self.nextcloud_talk)),
                 self.nextcloud_talk.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.email.as_ref())),
+                Box::new(ConfigWrapper::new(&self.email)),
                 self.email.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.irc.as_ref())),
+                Box::new(ConfigWrapper::new(&self.irc)),
                 self.irc.is_some()
             ),
             (
-                Box::new(ConfigWrapper::new(self.lark.as_ref())),
+                Box::new(ConfigWrapper::new(&self.lark)),
                 self.lark.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.feishu.as_ref())),
+                Box::new(ConfigWrapper::new(&self.feishu)),
                 self.feishu.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.dingtalk.as_ref())),
+                Box::new(ConfigWrapper::new(&self.dingtalk)),
                 self.dingtalk.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.qq.as_ref())),
+                Box::new(ConfigWrapper::new(&self.qq)),
                 self.qq
                     .as_ref()
                     .is_some_and(|qq| qq.receive_mode == QQReceiveMode::Websocket)
             ),
             (
-                Box::new(ConfigWrapper::new(self.nostr.as_ref())),
+                Box::new(ConfigWrapper::new(&self.nostr)),
                 self.nostr.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
+                Box::new(ConfigWrapper::new(&self.clawdtalk)),
                 self.clawdtalk.is_some(),
             ),
         ]
@@ -2927,7 +2944,7 @@ impl ChannelsConfig {
     pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         let mut ret = self.channels_except_webhook();
         ret.push((
-            Box::new(ConfigWrapper::new(self.webhook.as_ref())),
+            Box::new(ConfigWrapper::new(&self.webhook)),
             self.webhook.is_some(),
         ));
         ret
@@ -3853,7 +3870,6 @@ impl Default for Config {
             provider_api: None,
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
-            provider: ProviderConfig::default(),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -4823,6 +4839,19 @@ impl Config {
             }
         }
 
+        // Reasoning level: ZEROCLAW_REASONING_LEVEL or REASONING_LEVEL
+        if let Ok(level) =
+            std::env::var("ZEROCLAW_REASONING_LEVEL").or_else(|_| std::env::var("REASONING_LEVEL"))
+        {
+            let level = level.trim().to_ascii_lowercase();
+            if matches!(
+                level.as_str(),
+                "low" | "medium" | "high" | "xhigh" | "minimal"
+            ) {
+                self.runtime.reasoning_level = Some(level);
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -5111,7 +5140,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
         dir.sync_all()
             .await
             .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
-        Ok(())
+        return Ok(());
     }
 
     #[cfg(not(unix))]
@@ -5360,7 +5389,6 @@ default_temperature = 0.7
             provider_api: None,
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
-            provider: ProviderConfig::default(),
             default_temperature: 0.5,
             observability: ObservabilityConfig {
                 backend: "log".into(),
@@ -5564,19 +5592,6 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn provider_reasoning_level_deserializes() {
-        let raw = r#"
-default_temperature = 0.7
-
-[provider]
-reasoning_level = "high"
-"#;
-
-        let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.provider.reasoning_level.as_deref(), Some("high"));
-    }
-
-    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -5634,7 +5649,6 @@ tool_dispatcher = "xml"
             provider_api: None,
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
-            provider: ProviderConfig::default(),
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -7464,6 +7478,37 @@ default_model = "legacy-model"
         assert_eq!(config.model_support_vision, Some(true));
 
         std::env::remove_var("ZEROCLAW_MODEL_SUPPORT_VISION");
+    }
+
+    #[test]
+    async fn env_override_reasoning_level() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_level, None);
+
+        std::env::set_var("ZEROCLAW_REASONING_LEVEL", "high");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level, Some("high".to_string()));
+
+        std::env::set_var("ZEROCLAW_REASONING_LEVEL", "xhigh");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level, Some("xhigh".to_string()));
+
+        std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
+    }
+
+    #[test]
+    async fn env_override_reasoning_level_invalid_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.runtime.reasoning_level = Some("medium".to_string());
+
+        std::env::set_var("ZEROCLAW_REASONING_LEVEL", "invalid");
+        config.apply_env_overrides();
+        // Invalid value should not change the config
+        assert_eq!(config.runtime.reasoning_level, Some("medium".to_string()));
+
+        std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
     }
 
     #[test]

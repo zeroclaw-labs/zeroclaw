@@ -881,13 +881,15 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            individual_results.push((tool_call_id, outcome.output.clone()));
-            let _ = writeln!(
-                tool_results,
-                "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
-            );
+        for entry in ordered_results {
+            if let Some((tool_name, tool_call_id, outcome)) = entry {
+                individual_results.push((tool_call_id, outcome.output.clone()));
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                    tool_name, outcome.output
+                );
+            }
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -1133,7 +1135,7 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
-        reasoning_level: config.provider.reasoning_level.clone(),
+        reasoning_level: config.runtime.reasoning_level.clone(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
@@ -1596,7 +1598,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
-        reasoning_level: config.provider.reasoning_level.clone(),
+        reasoning_level: config.runtime.reasoning_level.clone(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
