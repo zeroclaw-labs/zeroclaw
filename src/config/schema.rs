@@ -163,6 +163,12 @@ pub struct Config {
 
     #[serde(default)]
     pub security: SecurityConfig,
+
+    #[serde(default)]
+    pub cosmic_brain: CosmicBrainConfig,
+
+    #[serde(default)]
+    pub life: LifeConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -2840,6 +2846,80 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+// ── Cosmic Brain Config ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CosmicBrainConfig {
+    pub enabled: bool,
+    pub graph_max_nodes: usize,
+    pub graph_prune_threshold: usize,
+    pub spreading_activation_decay: f32,
+    pub spreading_activation_max_hops: u32,
+    pub free_energy_capacity: usize,
+    pub free_energy_update_threshold: f64,
+    pub free_energy_act_threshold: f64,
+    pub integration_tick_secs: u32,
+    pub persistence_dir: String,
+    pub multi_agent_pool_size: usize,
+    pub policy_conflict_resolution: String,
+    pub counterfactual_max_scenarios: usize,
+    pub consolidation_interval_secs: u32,
+    pub drift_window_size: usize,
+    pub drift_threshold: f64,
+}
+
+impl Default for CosmicBrainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            graph_max_nodes: 10000,
+            graph_prune_threshold: 8000,
+            spreading_activation_decay: 0.7,
+            spreading_activation_max_hops: 4,
+            free_energy_capacity: 1000,
+            free_energy_update_threshold: 0.3,
+            free_energy_act_threshold: 0.5,
+            integration_tick_secs: 60,
+            persistence_dir: "data/cosmic".to_string(),
+            multi_agent_pool_size: 4,
+            policy_conflict_resolution: "highest_layer".to_string(),
+            counterfactual_max_scenarios: 10,
+            consolidation_interval_secs: 3600,
+            drift_window_size: 50,
+            drift_threshold: 0.1,
+        }
+    }
+}
+
+// ── Life Config ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifeConfig {
+    pub enabled: bool,
+    pub tick_interval_secs: u32,
+    pub curiosity_initiative_threshold: f32,
+    pub silence_initiative_hours: u32,
+    pub initiative_cooldown_minutes: u32,
+    pub dream_idle_hours: u32,
+    pub emotional_persistence_path: String,
+}
+
+impl Default for LifeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tick_interval_secs: 30,
+            curiosity_initiative_threshold: 0.75,
+            silence_initiative_hours: 8,
+            initiative_cooldown_minutes: 30,
+            dream_idle_hours: 4,
+            emotional_persistence_path: "data/emotional_state.json".to_string(),
+        }
+    }
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -2888,6 +2968,8 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             skillforge: SkillForgeConfig::default(),
             security: SecurityConfig::default(),
+            cosmic_brain: CosmicBrainConfig::default(),
+            life: LifeConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
     }
@@ -3725,6 +3807,8 @@ default_temperature = 0.7
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             security: SecurityConfig::default(),
+            cosmic_brain: CosmicBrainConfig::default(),
+            life: LifeConfig::default(),
             skillforge: SkillForgeConfig::default(),
         };
 
@@ -3872,6 +3956,8 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             security: SecurityConfig::default(),
+            cosmic_brain: CosmicBrainConfig::default(),
+            life: LifeConfig::default(),
             skillforge: SkillForgeConfig::default(),
         };
 

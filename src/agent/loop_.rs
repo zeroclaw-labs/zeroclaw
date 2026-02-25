@@ -1,6 +1,29 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::cosmic::{
+    AgentPool, CausalGraph, ConsolidationEngine, Constitution, CosmicMemoryGraph,
+    CosmicPersistence, CounterfactualEngine, DriftDetector, EmotionalModulator, FreeEnergyState,
+    IntegrationMeter, NormativeEngine, PolicyEngine, SelfModel, WorldModel,
+};
 use crate::cost::{self, CostTracker, TokenUsage};
+
+type CosmicBrain = (
+    Arc<Mutex<CosmicMemoryGraph>>,
+    Arc<Mutex<FreeEnergyState>>,
+    Arc<Mutex<IntegrationMeter>>,
+    Arc<Mutex<CausalGraph>>,
+    Arc<Mutex<SelfModel>>,
+    Arc<Mutex<WorldModel>>,
+    Arc<Mutex<NormativeEngine>>,
+    Arc<Mutex<EmotionalModulator>>,
+    Arc<Mutex<DriftDetector>>,
+    Arc<Mutex<CounterfactualEngine>>,
+    Arc<Mutex<PolicyEngine>>,
+    Arc<Mutex<Constitution>>,
+    Arc<Mutex<ConsolidationEngine>>,
+    Arc<Mutex<CosmicPersistence>>,
+    Arc<Mutex<AgentPool>>,
+);
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
@@ -1264,6 +1287,110 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    let cosmic_brain: Option<CosmicBrain> = if config.cosmic_brain.enabled {
+        let graph = Arc::new(Mutex::new(CosmicMemoryGraph::new(
+            config.cosmic_brain.graph_max_nodes,
+        )));
+        let free_energy = Arc::new(Mutex::new(FreeEnergyState::new(
+            config.cosmic_brain.free_energy_capacity,
+        )));
+        let integration = Arc::new(Mutex::new(IntegrationMeter::new()));
+
+        {
+            let mut meter = integration.lock();
+            meter.register_subsystem("memory", vec!["provider".into(), "conscience".into()]);
+            meter.register_subsystem("provider", vec!["memory".into(), "tools".into()]);
+            meter.register_subsystem("tools", vec!["provider".into(), "security".into()]);
+            meter.register_subsystem("security", vec!["tools".into(), "conscience".into()]);
+            meter.register_subsystem("conscience", vec!["memory".into(), "security".into()]);
+        }
+
+        let causal = Arc::new(Mutex::new(CausalGraph::new(1000)));
+        let self_model = Arc::new(Mutex::new(SelfModel::new(500)));
+        let world_model = Arc::new(Mutex::new(WorldModel::new(500)));
+        let normative = Arc::new(Mutex::new(NormativeEngine::new(500, 500)));
+        let modulator = Arc::new(Mutex::new(EmotionalModulator::new()));
+        let drift = Arc::new(Mutex::new(DriftDetector::new(
+            config.cosmic_brain.drift_window_size,
+            config.cosmic_brain.drift_threshold,
+        )));
+        let counterfactual = Arc::new(Mutex::new(CounterfactualEngine::new(
+            config.cosmic_brain.counterfactual_max_scenarios,
+            500,
+        )));
+        let policy = Arc::new(Mutex::new(PolicyEngine::new(500)));
+        let constitution = Arc::new(Mutex::new(Constitution::new()));
+        {
+            let mut c = constitution.lock();
+            c.register_value("safety", "Never cause harm to users or systems", 1.0, true);
+            c.register_value(
+                "honesty",
+                "Always provide truthful accurate information",
+                1.0,
+                true,
+            );
+            c.register_value(
+                "helpfulness",
+                "Assist users in achieving their goals",
+                0.9,
+                true,
+            );
+            c.register_value(
+                "privacy",
+                "Protect user data and maintain confidentiality",
+                0.95,
+                true,
+            );
+            c.register_value(
+                "autonomy",
+                "Respect user agency and decision-making",
+                0.85,
+                false,
+            );
+            c.seal();
+        }
+        let consolidation = Arc::new(Mutex::new(ConsolidationEngine::new(0.7)));
+        let persistence = Arc::new(Mutex::new(CosmicPersistence::new(
+            &config.cosmic_brain.persistence_dir,
+        )));
+        let agent_pool = Arc::new(Mutex::new(AgentPool::new(
+            config.cosmic_brain.multi_agent_pool_size,
+            100,
+        )));
+
+        {
+            let p = persistence.lock();
+            if let Ok(_graph_data) = p.load_module("graph") {
+                tracing::info!("Loaded persisted cosmic graph state");
+            }
+        }
+
+        tracing::info!(
+            graph_capacity = config.cosmic_brain.graph_max_nodes,
+            fe_capacity = config.cosmic_brain.free_energy_capacity,
+            "Cosmic brain initialized (14 modules)"
+        );
+        Some((
+            graph,
+            free_energy,
+            integration,
+            causal,
+            self_model,
+            world_model,
+            normative,
+            modulator,
+            drift,
+            counterfactual,
+            policy,
+            constitution,
+            consolidation,
+            persistence,
+            agent_pool,
+        ))
+    } else {
+        None
+    };
+
     // ── Cost tracking (budget enforcement) ──────────────────────────
     let cost_tracker = if config.cost.enabled {
         match cost::create_tracker_from_json(
@@ -1601,6 +1728,66 @@ pub async fn run(
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
 
+        if let Some((
+            ref graph,
+            ref free_energy,
+            ref integration,
+            ref causal,
+            ref _self_model,
+            ref _world_model,
+            ref _normative,
+            ref modulator,
+            ref drift,
+            ref _counterfactual,
+            ref _policy,
+            ref _constitution,
+            ref _consolidation,
+            ref _persistence,
+            ref _agent_pool,
+        )) = cosmic_brain
+        {
+            let mut fe = free_energy.lock();
+            let pred_id = fe.predict("turn_success", 0.8, 0.7);
+            let success_score = if response.is_empty() { 0.2 } else { 0.9 };
+            fe.observe(&pred_id, success_score);
+
+            if let Some(key) = response.get(..80) {
+                let mut g = graph.lock();
+                let node_id = format!("turn_{}", start.elapsed().as_millis());
+                g.insert_node(node_id, key.to_string(), "conversation".into(), vec![]);
+            }
+
+            let mut meter = integration.lock();
+            meter.update_state("memory", 0.8);
+            meter.update_state("provider", if response.is_empty() { 0.3 } else { 0.9 });
+            let snap = meter.snapshot();
+            tracing::debug!(
+                phi = snap.phi,
+                free_energy = fe.free_energy(),
+                "Cosmic brain tick"
+            );
+
+            {
+                let mut d = drift.lock();
+                d.record_sample("provider", if response.is_empty() { 0.3 } else { 0.9 });
+                d.record_sample("memory", 0.8);
+            }
+
+            {
+                let mut c = causal.lock();
+                c.record_event("provider", "memory", 0.5, 0.5, 10);
+            }
+
+            {
+                let mut m = modulator.lock();
+                m.apply_free_energy_signal(fe.free_energy(), fe.free_energy());
+            }
+
+            tracing::trace!(
+                "Cosmic persistence available — periodic save will be wired in life loop"
+            );
+        }
+
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
             let summary = truncate_with_ellipsis(&response, 100);
@@ -1810,6 +1997,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
     )?);
 
+    let cosmic_free_energy: Option<Arc<Mutex<FreeEnergyState>>> = if config.cosmic_brain.enabled {
+        Some(Arc::new(Mutex::new(FreeEnergyState::new(
+            config.cosmic_brain.free_energy_capacity,
+        ))))
+    } else {
+        None
+    };
+
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -1987,7 +2182,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
+    let reply = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -2000,7 +2195,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         survival_monitor.as_deref(),
         model_strategy.as_deref(),
     )
-    .await
+    .await?;
+
+    if let Some(ref fe_arc) = cosmic_free_energy {
+        let mut fe = fe_arc.lock();
+        let pred_id = fe.predict("msg_success", 0.8, 0.7);
+        let success = if reply.is_empty() { 0.2 } else { 0.9 };
+        fe.observe(&pred_id, success);
+        tracing::debug!(free_energy = fe.free_energy(), "Cosmic brain msg tick");
+    }
+
+    Ok(reply)
 }
 
 #[cfg(test)]
