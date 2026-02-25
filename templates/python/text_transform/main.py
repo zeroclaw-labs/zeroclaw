@@ -39,13 +39,17 @@ def main():
         args = json.loads(raw)
     except json.JSONDecodeError as exc:
         sys.stdout.write(json.dumps({"success": False, "output": "", "error": f"invalid JSON: {exc}"}))
+        sys.stdout.flush()
         return
     try:
         result = run(args)
+    except TypeError:
+        raise
     except Exception as exc:
         result = {"success": False, "output": "", "error": str(exc)}
 
     sys.stdout.write(json.dumps(result))
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

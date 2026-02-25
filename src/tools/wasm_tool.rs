@@ -64,6 +64,10 @@ mod inner {
         parameters_schema: Value,
         engine: Engine,
         module: Module,
+        /// Guards against concurrent invocations: epoch tickers from concurrent
+        /// calls would advance the shared engine epoch at a multiple of 1 Hz,
+        /// causing premature timeouts.
+        is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl WasmTool {
@@ -89,6 +93,7 @@ mod inner {
                 parameters_schema,
                 engine,
                 module,
+                is_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         }
 
@@ -167,24 +172,44 @@ mod inner {
         }
 
         async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-            // Clone the fields needed inside the blocking closure.
+            use std::sync::atomic::Ordering;
+
+            // Prevent concurrent invocations: two simultaneous tickers would
+            // advance the shared engine epoch at 2 Hz, halving the timeout.
+            if self
+                .is_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                bail!(
+                    "WASM tool '{}' is already running; concurrent invocations are not supported",
+                    self.name
+                );
+            }
+
+            // Clone fields needed inside the blocking closure.
             // Engine and Module are cheaply Arc-backed clones.
             let name = self.name.clone();
             let engine = self.engine.clone();
             let module = self.module.clone();
             let schema = self.parameters_schema.clone();
             let desc = self.description.clone();
+            let is_running = self.is_running.clone();
 
             tokio::task::spawn_blocking(move || {
                 let tool = WasmTool {
-                    name: name.clone(),
+                    name,
                     description: desc,
                     parameters_schema: schema,
                     engine,
                     module,
+                    is_running: is_running.clone(),
                 };
-                tool.invoke_sync(&args)
-                    .with_context(|| format!("WASM tool '{}' execution failed", name))
+                let result = tool
+                    .invoke_sync(&args)
+                    .with_context(|| format!("WASM tool '{}' execution failed", tool.name));
+                is_running.store(false, Ordering::Release);
+                result
             })
             .await
             .context("WASM blocking task panicked")?
@@ -357,17 +382,19 @@ fn load_single_tool(
         }
     };
 
-    // Validate manifest.name: must be a safe identifier (no path separators).
+    // Validate manifest.name: snake_case only (lowercase letters, digits,
+    // underscores), non-empty, max 64 chars (matches function-calling API limits).
     let name_ok = !manifest.name.is_empty()
+        && manifest.name.len() <= 64
         && manifest
             .name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if !name_ok {
         tracing::warn!(
             path = %manifest_path.display(),
             name = %manifest.name,
-            "skipping WASM tool: manifest name contains invalid characters"
+            "skipping WASM tool: invalid name (must be snake_case, max 64 chars)"
         );
         return;
     }

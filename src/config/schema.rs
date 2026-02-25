@@ -5198,11 +5198,16 @@ impl Config {
         if self.wasm.fuel_limit == 0 {
             anyhow::bail!("wasm.fuel_limit must be greater than 0");
         }
-        if self.wasm.registry_url.is_empty() || !self.wasm.registry_url.starts_with("https://") {
-            anyhow::bail!(
-                "wasm.registry_url must be a valid HTTPS URL, got '{}'",
-                self.wasm.registry_url
-            );
+        {
+            let url = &self.wasm.registry_url;
+            let host = url
+                .strip_prefix("https://")
+                .filter(|rest| !rest.is_empty() && !rest.starts_with('/'));
+            if host.is_none() {
+                anyhow::bail!(
+                    "wasm.registry_url must be a valid HTTPS URL with a non-empty host, got '{url}'"
+                );
+            }
         }
 
         Ok(())
@@ -5725,6 +5730,40 @@ mod tests {
         assert_eq!(cfg.memory_limit_mb, 64);
         assert_eq!(cfg.fuel_limit, 1_000_000_000);
         assert_eq!(cfg.registry_url, "https://zeromarket.vercel.app/api");
+    }
+
+    #[test]
+    async fn wasm_config_invalid_values_rejected() {
+        let mut c = Config::default();
+
+        // memory_limit_mb = 0
+        c.wasm.memory_limit_mb = 0;
+        assert!(c.validate().is_err(), "memory_limit_mb=0 should fail");
+
+        // memory_limit_mb = 257
+        c.wasm = WasmConfig::default();
+        c.wasm.memory_limit_mb = 257;
+        assert!(c.validate().is_err(), "memory_limit_mb=257 should fail");
+
+        // fuel_limit = 0
+        c.wasm = WasmConfig::default();
+        c.wasm.fuel_limit = 0;
+        assert!(c.validate().is_err(), "fuel_limit=0 should fail");
+
+        // empty registry_url
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = String::new();
+        assert!(c.validate().is_err(), "empty registry_url should fail");
+
+        // http:// instead of https://
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "http://example.com".to_string();
+        assert!(c.validate().is_err(), "http registry_url should fail");
+
+        // bare "https://"
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://".to_string();
+        assert!(c.validate().is_err(), "https:// without host should fail");
     }
 
     #[test]

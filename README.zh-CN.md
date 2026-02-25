@@ -221,7 +221,7 @@ zeroclaw agent --provider anthropic -m "hello"
 ### 运行时支持（当前）
 
 - ✅ 当前支持：`runtime.kind = "native"` 或 `runtime.kind = "docker"`
-- 🚧 计划中，尚未实现：WASM 边缘运行时（基于 runtime.kind）
+- 🚧 计划中，尚未实现：WASM 边缘运行时（基于 runtime.kind）。**注意：** 此项仅指基于 `runtime.kind` 的边缘运行时，与下方第 228–246 行描述的 WASM skill/tool 层无关——后者已可用。
 
 配置了不支持的 `runtime.kind` 时，ZeroClaw 会以明确的错误退出，而非静默回退到 native。
 
@@ -243,7 +243,7 @@ cargo build --release                         # 默认启用 wasm-tools
 cargo build --release --no-default-features   # 禁用 wasm-tools 以减小二进制体积
 ```
 
-发布自己的技能到 ZeroMarket：将 WASM 编译产物连同 `tool.wasm`、`manifest.json` 和 `SKILL.md` 通过 ZeroMarket 上传页面提交。使用 `zeroclaw skill new <name>` 可快速创建新技能项目脚手架。
+发布自己的技能到 ZeroMarket：将 WASM 编译产物连同 `tool.wasm`、`manifest.json` 和 `SKILL.md` 通过 ZeroMarket 上传页面提交。使用 `zeroclaw skill new <name> --template <lang>` 可快速创建新技能项目脚手架（支持的语言：rust、python、go、typescript）。例如：`zeroclaw skill new myskill --template rust`。
 
 ### 记忆系统（全栈搜索引擎）
 

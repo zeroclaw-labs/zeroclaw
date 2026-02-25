@@ -739,7 +739,7 @@ ZeroClaw prend en charge les skills compilées en WASM installables depuis le re
 zeroclaw skill install namespace/name
 ```
 
-Les skills sont installées dans `~/.zeroclaw/workspace/skills/<name>/` et chargées automatiquement comme outils. Activé par défaut (`--features wasm-tools`).
+Les skills sont installées dans `~/.zeroclaw/workspace/skills/<name>/` et chargées automatiquement comme outils au démarrage de l'agent. Le support WASM est activé par défaut ; pour le désactiver, compilez avec `--no-default-features`.
 
 ## Développement
 

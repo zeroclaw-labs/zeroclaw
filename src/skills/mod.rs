@@ -1094,6 +1094,17 @@ fn resolve_wasm_path(
 
     // 2. Named tool inside installed layout
     if let Some(name) = tool_name {
+        // Validate: must be a single normal path component (no traversal or separators).
+        use std::path::Component;
+        let name_path = std::path::Path::new(name);
+        let is_single_normal = {
+            let mut comps = name_path.components();
+            matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+        };
+        if !is_single_normal || name != name_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        {
+            anyhow::bail!("invalid tool name '{}': must be a simple filename", name);
+        }
         let named = skill_path.join("tools").join(name).join("tool.wasm");
         if named.exists() {
             return Ok(named);
@@ -1227,6 +1238,13 @@ fn install_registry_skill_source(
     // Destination skill directory: `skills/<pkg_name>/`
     let skill_dir_name = pkg_name.to_string();
     let skill_dir = skills_path.join(&skill_dir_name);
+    if skill_dir.exists() {
+        anyhow::bail!(
+            "skill '{}' is already installed at {}; remove it first to reinstall",
+            pkg_name,
+            skill_dir.display()
+        );
+    }
     std::fs::create_dir_all(&skill_dir)?;
 
     // Run the actual work in a closure so we can clean up skill_dir on any error.

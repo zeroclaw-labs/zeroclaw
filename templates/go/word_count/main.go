@@ -2,7 +2,7 @@
 //
 // Counts words, lines, and characters in text.
 // Protocol: read JSON from stdin, write JSON result to stdout.
-// Build:    tinygo build -o tool.wasm -target wasi .
+// Build:    tinygo build -target=wasip1 -o tool.wasm .
 // Test:     zeroclaw skill test . --args '{"text":"hello world"}'
 
 package main
@@ -65,7 +65,11 @@ func main() {
 		Data: &counts,
 	}
 
-	out, _ := json.Marshal(result)
+	out, err := json.Marshal(result)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "json marshal error:", err)
+		os.Exit(1)
+	}
 	os.Stdout.Write(out)
 }
 
@@ -78,6 +82,10 @@ func plural(n int, singular, pluralForm string) string {
 
 func writeError(msg string) {
 	result := ToolResult{Success: false, Error: &msg}
-	out, _ := json.Marshal(result)
+	out, err := json.Marshal(result)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "json marshal error:", err)
+		os.Exit(1)
+	}
 	os.Stdout.Write(out)
 }
