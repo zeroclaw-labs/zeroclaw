@@ -11,7 +11,7 @@ pub use schema::{
     DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
     GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
     HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
+    MultimodalConfig, NextcloudTalkConfig, NonCliNaturalLanguageApprovalMode, ObservabilityConfig,
     OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProviderConfig, ProxyConfig,
     ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,

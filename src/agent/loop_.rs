@@ -984,6 +984,14 @@ pub(crate) async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt from concrete tool
 /// specs so the LLM knows how to invoke tools.
+pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+    let specs: Vec<crate::tools::ToolSpec> =
+        tools_registry.iter().map(|tool| tool.spec()).collect();
+    build_tool_instructions_from_specs(&specs)
+}
+
+/// Build the tool instruction block for the system prompt from concrete tool
+/// specs so the LLM knows how to invoke tools.
 pub(crate) fn build_tool_instructions_from_specs(tool_specs: &[crate::tools::ToolSpec]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");

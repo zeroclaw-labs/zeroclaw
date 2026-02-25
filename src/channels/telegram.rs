@@ -7,7 +7,7 @@ use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::fs;

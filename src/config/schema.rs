@@ -2450,6 +2450,9 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: default_non_cli_excluded_tools(),
+            non_cli_approval_approvers: Vec::new(),
+            non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
+            non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
         }
     }
 }
