@@ -99,7 +99,10 @@ impl Tool for ApplyPatchTool {
         let repo_root = git_repo_root().await?;
         let mut log = String::new();
         log.push_str(&format!("Repo root: {}\n", repo_root.display()));
-        log.push_str(&format!("Mode: {}\n", if dry_run { "dry-run" } else { "apply" }));
+        log.push_str(&format!(
+            "Mode: {}\n",
+            if dry_run { "dry-run" } else { "apply" }
+        ));
 
         // Write patch to a temp file.
         let mut tmp = NamedTempFile::new().context("Failed to create temp file for patch")?;
@@ -188,8 +191,7 @@ impl Tool for ApplyPatchTool {
 
         // Show status.
         {
-            let (_code, out, err) =
-                run_cmd(&repo_root, "git", &["status", "--porcelain"]).await?;
+            let (_code, out, err) = run_cmd(&repo_root, "git", &["status", "--porcelain"]).await?;
             log.push_str("\n# git status --porcelain\n");
             if out.trim().is_empty() {
                 log.push_str("(no changes)\n");
@@ -228,12 +230,8 @@ impl Tool for ApplyPatchTool {
                 });
             }
 
-            let (code_commit, out_commit, err_commit) = run_cmd(
-                &repo_root,
-                "git",
-                &["commit", "-m", msg.as_str()],
-            )
-            .await?;
+            let (code_commit, out_commit, err_commit) =
+                run_cmd(&repo_root, "git", &["commit", "-m", msg.as_str()]).await?;
             log.push_str("\n# git commit -m <msg>\n");
             log.push_str(&format!("exit_code: {code_commit}\n"));
             if !out_commit.is_empty() {
@@ -256,7 +254,9 @@ impl Tool for ApplyPatchTool {
                 return Ok(ToolResult {
                     success: false,
                     output: log,
-                    error: Some("git commit failed (possibly nothing to commit, or hooks rejected)".into()),
+                    error: Some(
+                        "git commit failed (possibly nothing to commit, or hooks rejected)".into(),
+                    ),
                 });
             }
 
