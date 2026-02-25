@@ -11,14 +11,14 @@ pub use schema::{
     DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
     GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
     HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
+    MemoryConfig, ModelRouteConfig, MqttConfig, MultimodalConfig, NextcloudTalkConfig,
     NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpConfig, OtpMethod,
     PeripheralBoardConfig, PeripheralsConfig, ProviderConfig, ProxyConfig, ProxyScope,
     QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig,
+    SlackConfig, SopConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
+    StreamMode, SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig,
     WasmCapabilityEscalationMode, WasmModuleHashPolicy, WasmRuntimeConfig, WasmSecurityConfig,
     WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
@@ -77,19 +77,6 @@ mod tests {
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
-        let feishu = FeishuConfig {
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec![],
-            group_reply: None,
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
-            ),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
-        };
 
         let nextcloud_talk = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
@@ -101,7 +88,6 @@ mod tests {
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
         assert_eq!(lark.app_id, "app-id");
-        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }

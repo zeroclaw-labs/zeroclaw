@@ -1,8 +1,10 @@
 use crate::config::Config;
+use crate::sop::dispatch::SopCronCache;
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -23,11 +25,69 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
+    // ── Shared SOP resources (single engine for all components) ──
+    let sop_engine: Option<Arc<Mutex<crate::sop::SopEngine>>> =
+        crate::tools::create_sop_engine(&config.sop, &config.workspace_dir);
+    let sop_memory: Option<Arc<dyn crate::memory::traits::Memory>> = if sop_engine.is_some() {
+        let mem = crate::memory::create_memory(&config.memory, &config.workspace_dir, None)
+            .map_err(|e| {
+                tracing::error!("SOP enabled but memory backend init failed: {e}");
+                anyhow::anyhow!("SOP requires a working memory backend but init failed: {e}")
+            })?;
+        Some(Arc::from(mem) as Arc<dyn crate::memory::traits::Memory>)
+    } else {
+        None
+    };
+    let sop_audit: Option<Arc<crate::sop::SopAuditLogger>> = sop_memory
+        .as_ref()
+        .map(|m| Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(m))));
+    let sop_collector: Option<Arc<crate::sop::SopMetricsCollector>> =
+        if let Some(ref mem) = sop_memory {
+            match crate::sop::SopMetricsCollector::rebuild_from_memory(mem.as_ref()).await {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::warn!(
+                        "SOP metrics warm-start failed in daemon, using empty collector: {e}"
+                    );
+                    Some(Arc::new(crate::sop::SopMetricsCollector::new()))
+                }
+            }
+        } else {
+            None
+        };
+    #[cfg(feature = "ampersona-gates")]
+    let gate_eval: Option<Arc<crate::sop::GateEvalState>> = if let Some(ref mem) = sop_memory {
+        match crate::sop::GateEvalState::rebuild_from_memory(
+            Arc::clone(mem),
+            "zeroclaw",
+            config.sop.gates_file.as_deref().map(std::path::Path::new),
+            config.sop.gate_eval_interval_secs,
+        )
+        .await
+        {
+            Ok(g) => Some(Arc::new(g)),
+            Err(e) => {
+                tracing::warn!("Gate eval warm-start failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "ampersona-gates"))]
+    let gate_eval: Option<()> = None;
+
+    let sop_cron_cache: Option<SopCronCache> = sop_engine.as_ref().map(SopCronCache::from_engine);
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
+    // ── Gateway ──
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let engine_for_gw = sop_engine.clone();
+        let audit_for_gw = sop_audit.clone();
+        let collector_for_gw = sop_collector.clone();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -35,11 +95,17 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                let engine = engine_for_gw.clone();
+                let audit = audit_for_gw.clone();
+                let collector = collector_for_gw.clone();
+                async move {
+                    crate::gateway::run_gateway(&host, port, cfg, engine, audit, collector).await
+                }
             },
         ));
     }
 
+    // ── Channels ──
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
@@ -58,6 +124,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
+    // ── Heartbeat ──
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -71,20 +138,62 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    // ── Scheduler ──
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
+        let engine_for_sched = sop_engine.clone();
+        let audit_for_sched = sop_audit.clone();
+        let cache_for_sched = sop_cron_cache.clone();
+        let collector_for_sched = sop_collector.clone();
+        // gate_eval is Option<Arc<_>> with ampersona-gates, Option<()> without
+        #[allow(clippy::clone_on_copy)]
+        let gate_eval_for_sched = gate_eval.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
+                let engine = engine_for_sched.clone();
+                let audit = audit_for_sched.clone();
+                let cache = cache_for_sched.clone();
+                let collector = collector_for_sched.clone();
+                #[allow(clippy::clone_on_copy)]
+                let ge = gate_eval_for_sched.clone();
+                async move {
+                    crate::cron::scheduler::run(cfg, engine, audit, cache, collector, ge).await
+                }
             },
         ));
     } else {
         crate::health::mark_component_ok("scheduler");
         tracing::info!("Cron disabled; scheduler supervisor not started");
+    }
+
+    // ── MQTT SOP listener ──
+    if let Some(ref mqtt_config) = config.channels_config.mqtt {
+        if let (Some(ref engine), Some(ref audit)) = (&sop_engine, &sop_audit) {
+            let mqtt_cfg = mqtt_config.clone();
+            let engine_for_mqtt = Arc::clone(engine);
+            let audit_for_mqtt = Arc::clone(audit);
+            handles.push(spawn_component_supervisor(
+                "mqtt",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = mqtt_cfg.clone();
+                    let engine = Arc::clone(&engine_for_mqtt);
+                    let audit = Arc::clone(&audit_for_mqtt);
+                    async move {
+                        crate::channels::mqtt::run_mqtt_sop_listener(&cfg, engine, audit).await
+                    }
+                },
+            ));
+        } else {
+            tracing::warn!(
+                "MQTT config present but SOP engine not available; MQTT listener disabled"
+            );
+        }
     }
 
     println!("🧠 ZeroClaw daemon started");
@@ -181,7 +290,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         observer,
     );
-    let delivery = heartbeat_delivery_target(&config)?;
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -189,8 +297,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     loop {
         interval.tick().await;
 
-        let file_tasks = engine.collect_tasks().await?;
-        let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
+        let tasks = engine.collect_tasks().await?;
         if tasks.is_empty() {
             continue;
         }
@@ -198,7 +305,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            match crate::agent::run(
+            if let Err(e) = crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -209,113 +316,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
-                Ok(output) => {
-                    crate::health::mark_component_ok("heartbeat");
-                    let announcement = if output.trim().is_empty() {
-                        "heartbeat task executed".to_string()
-                    } else {
-                        output
-                    };
-                    if let Some((channel, target)) = &delivery {
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &announcement,
-                        )
-                        .await
-                        {
-                            crate::health::mark_component_error(
-                                "heartbeat",
-                                format!("delivery failed: {e}"),
-                            );
-                            tracing::warn!("Heartbeat delivery failed: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    crate::health::mark_component_error("heartbeat", e.to_string());
-                    tracing::warn!("Heartbeat task failed: {e}");
-                }
+                crate::health::mark_component_error("heartbeat", e.to_string());
+                tracing::warn!("Heartbeat task failed: {e}");
+            } else {
+                crate::health::mark_component_ok("heartbeat");
             }
         }
     }
-}
-
-fn heartbeat_tasks_for_tick(
-    file_tasks: Vec<String>,
-    fallback_message: Option<&str>,
-) -> Vec<String> {
-    if !file_tasks.is_empty() {
-        return file_tasks;
-    }
-
-    fallback_message
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(|message| vec![message.to_string()])
-        .unwrap_or_default()
-}
-
-fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>> {
-    let channel = config
-        .heartbeat
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let target = config
-        .heartbeat
-        .to
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    match (channel, target) {
-        (None, None) => Ok(None),
-        (Some(_), None) => anyhow::bail!("heartbeat.to is required when heartbeat.target is set"),
-        (None, Some(_)) => anyhow::bail!("heartbeat.target is required when heartbeat.to is set"),
-        (Some(channel), Some(target)) => {
-            validate_heartbeat_channel_config(config, channel)?;
-            Ok(Some((channel.to_string(), target.to_string())))
-        }
-    }
-}
-
-fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            if config.channels_config.telegram.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to telegram but channels_config.telegram is not configured"
-                );
-            }
-        }
-        "discord" => {
-            if config.channels_config.discord.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to discord but channels_config.discord is not configured"
-                );
-            }
-        }
-        "slack" => {
-            if config.channels_config.slack.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to slack but channels_config.slack is not configured"
-                );
-            }
-        }
-        "mattermost" => {
-            if config.channels_config.mattermost.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
-                );
-            }
-        }
-        other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
-    }
-
-    Ok(())
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
@@ -459,7 +466,6 @@ mod tests {
         });
         assert!(has_supervised_channels(&config));
     }
-
     #[test]
     fn heartbeat_tasks_use_file_tasks_when_available() {
         let tasks =
