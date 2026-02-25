@@ -1645,8 +1645,13 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    // Inject per-message timestamp so the LLM always knows the current time,
+    // even in multi-turn conversations where the system prompt may be stale.
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let timestamped_content = format!("[{now}] {}", msg.content);
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&timestamped_content));
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1665,7 +1670,7 @@ async fn process_channel_message(
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+                last_turn.content = format!("{memory_context}{timestamped_content}");
             }
         }
     }
@@ -2064,7 +2069,7 @@ async fn process_channel_message(
                     .downcast_ref::<providers::ProviderCapabilityError>()
                     .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
