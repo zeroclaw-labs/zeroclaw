@@ -32,7 +32,7 @@ use super::traits::{Tool, ToolResult};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Maximum tool output size (1 MiB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -45,7 +45,7 @@ const WASM_TIMEOUT_SECS: u64 = 30;
 #[cfg(feature = "wasm-tools")]
 mod inner {
     use super::{
-        async_trait, bail, Context, Path, PathBuf, Tool, ToolResult, Value, MAX_OUTPUT_BYTES,
+        async_trait, bail, Context, Path, Tool, ToolResult, Value, MAX_OUTPUT_BYTES,
         WASM_TIMEOUT_SECS,
     };
     use wasmtime::{Config as WtConfig, Engine, Linker, Module, Store};
@@ -351,7 +351,7 @@ fn load_single_tool(
     manifest_path: &std::path::Path,
     out: &mut Vec<Box<dyn Tool>>,
 ) {
-    let manifest = match WasmManifest::load_from(&manifest_path.to_path_buf()) {
+    let manifest = match WasmManifest::load_from(manifest_path) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(path = %manifest_path.display(), error = %e, "skipping WASM tool: bad manifest");
@@ -360,7 +360,7 @@ fn load_single_tool(
     };
 
     match WasmTool::load(
-        &wasm.to_path_buf(),
+        wasm,
         manifest.name.clone(),
         manifest.description.clone(),
         manifest.parameters.clone(),

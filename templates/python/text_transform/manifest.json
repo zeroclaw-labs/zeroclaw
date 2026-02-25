@@ -12,7 +12,8 @@
       },
       "transform": {
         "type": "string",
-        "description": "Transformation: uppercase, lowercase, reverse, title"
+        "description": "Transformation: uppercase, lowercase, reverse, title",
+        "enum": ["uppercase", "lowercase", "reverse", "title"]
       }
     }
   }

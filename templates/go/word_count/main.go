@@ -45,9 +45,13 @@ func main() {
 		return
 	}
 
+	lines := 0
+	if args.Text != "" {
+		lines = strings.Count(args.Text, "\n") + 1
+	}
 	counts := CountResult{
 		Words:      len(strings.Fields(args.Text)),
-		Lines:      strings.Count(args.Text, "\n") + 1,
+		Lines:      lines,
 		Characters: len([]rune(args.Text)),
 	}
 

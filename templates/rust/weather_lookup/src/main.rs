@@ -33,9 +33,23 @@ struct ToolResult {
     data: Option<WeatherData>,
 }
 
+fn write_result(r: &ToolResult) {
+    let out = serde_json::to_string(r)
+        .unwrap_or_else(|_| r#"{"success":false,"output":"","error":"serialization error"}"#.to_string());
+    let _ = io::stdout().write_all(out.as_bytes());
+}
+
 fn main() {
     let mut buf = String::new();
-    io::stdin().read_to_string(&mut buf).unwrap();
+    if let Err(e) = io::stdin().read_to_string(&mut buf) {
+        write_result(&ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("failed to read stdin: {e}")),
+            data: None,
+        });
+        return;
+    }
 
     let result = match serde_json::from_str::<Args>(&buf) {
         Ok(args) => lookup_weather(&args.city),
@@ -47,8 +61,7 @@ fn main() {
         },
     };
 
-    let out = serde_json::to_string(&result).unwrap();
-    io::stdout().write_all(out.as_bytes()).unwrap();
+    write_result(&result);
 }
 
 fn lookup_weather(city: &str) -> ToolResult {

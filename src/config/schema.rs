@@ -5702,6 +5702,15 @@ mod tests {
     }
 
     #[test]
+    async fn wasm_config_default_has_correct_values() {
+        let cfg = WasmConfig::default();
+        assert!(cfg.enabled, "WASM tools should be enabled by default");
+        assert_eq!(cfg.memory_limit_mb, 64);
+        assert_eq!(cfg.fuel_limit, 1_000_000_000);
+        assert_eq!(cfg.registry_url, "https://zeromarket.vercel.app/api");
+    }
+
+    #[test]
     async fn config_debug_redacts_sensitive_values() {
         let mut config = Config::default();
         config.workspace_dir = PathBuf::from("/tmp/workspace");

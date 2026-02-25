@@ -850,15 +850,14 @@ pub fn scaffold_skill(
     template_name: &str,
     dest_parent: &std::path::Path,
 ) -> Result<()> {
-    // Validate name
+    // Validate name: allowlist only ASCII alphanumeric, '_', '-'; no path traversal.
     if name.is_empty()
-        || name.contains("..")
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains(' ')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         anyhow::bail!(
-            "Invalid skill name '{}': use snake_case or kebab-case",
+            "Invalid skill name '{}': use only letters, digits, '_', or '-' (snake_case or kebab-case)",
             name
         );
     }

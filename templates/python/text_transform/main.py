@@ -28,7 +28,7 @@ def run(args: dict) -> dict:
         return {"success": False, "output": "", "error": f"unknown transform '{transform}' — use: {keys}"}
 
     result = TRANSFORMS[transform](text)
-    return {"success": True, "output": result, "error": None}
+    return {"success": True, "output": result}
 
 
 def main():

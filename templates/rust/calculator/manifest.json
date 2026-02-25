@@ -8,7 +8,7 @@
     "properties": {
       "op": {
         "type": "string",
-        "description": "Operation: add, sub, mul, div (or +, -, *, /)"
+        "description": "Operation: add, sub, mul, div (aliases: +, -, x/*, /)"
       },
       "a": {
         "type": "number",
