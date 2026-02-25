@@ -71,6 +71,7 @@ jobs:
         permissions:
             contents: read
             packages: write
+            security-events: write
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -173,3 +174,70 @@ jobs:
                   fi
 
                   echo "Anonymous GHCR pull access verified."
+
+            - name: Scan published image for vulnerabilities (Trivy)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+
+                  TAG_NAME="${GITHUB_REF#refs/tags/}"
+                  IMAGE_BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+                  VERSION_REF="${IMAGE_BASE}:${TAG_NAME}"
+                  SHA_REF="${IMAGE_BASE}:sha-${GITHUB_SHA::12}"
+                  SARIF_OUT="artifacts/trivy-${TAG_NAME}.sarif"
+                  TABLE_OUT="artifacts/trivy-${TAG_NAME}.txt"
+                  SHA_TABLE_OUT="artifacts/trivy-sha-${GITHUB_SHA::12}.txt"
+
+                  docker run --rm \
+                    -v "$PWD/artifacts:/work" \
+                    aquasec/trivy:0.58.2 image \
+                    --quiet \
+                    --ignore-unfixed \
+                    --severity HIGH,CRITICAL \
+                    --format sarif \
+                    --output "/work/trivy-${TAG_NAME}.sarif" \
+                    --exit-code 1 \
+                    "${VERSION_REF}"
+
+                  docker run --rm \
+                    -v "$PWD/artifacts:/work" \
+                    aquasec/trivy:0.58.2 image \
+                    --quiet \
+                    --ignore-unfixed \
+                    --severity HIGH,CRITICAL \
+                    --format table \
+                    --output "/work/trivy-${TAG_NAME}.txt" \
+                    "${VERSION_REF}"
+
+                  docker run --rm \
+                    -v "$PWD/artifacts:/work" \
+                    aquasec/trivy:0.58.2 image \
+                    --quiet \
+                    --ignore-unfixed \
+                    --severity HIGH,CRITICAL \
+                    --format table \
+                    --output "/work/trivy-sha-${GITHUB_SHA::12}.txt" \
+                    "${SHA_REF}"
+
+                  echo "Generated Trivy reports:"
+                  ls -1 "$SARIF_OUT" "$TABLE_OUT" "$SHA_TABLE_OUT"
+
+            - name: Upload Trivy SARIF
+              if: always()
+              uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+              with:
+                  sarif_file: artifacts/trivy-${{ github.ref_name }}.sarif
+                  category: ghcr-trivy
+
+            - name: Upload Trivy report artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: ghcr-trivy-report
+                  path: |
+                      artifacts/trivy-${{ github.ref_name }}.sarif
+                      artifacts/trivy-${{ github.ref_name }}.txt
+                      artifacts/trivy-sha-*.txt
+                  if-no-files-found: ignore
+                  retention-days: 14

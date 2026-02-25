@@ -1,36 +1,18 @@
-name: Feature Matrix
+name: Nightly All-Features
 
 on:
-    push:
-        branches: [dev, main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
-            - "crates/**"
-            - "tests/**"
-            - "scripts/ci/nightly_matrix_report.py"
-            - ".github/release/nightly-owner-routing.json"
-            - ".github/workflows/feature-matrix.yml"
-    pull_request:
-        branches: [dev, main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
-            - "crates/**"
-            - "tests/**"
-            - "scripts/ci/nightly_matrix_report.py"
-            - ".github/release/nightly-owner-routing.json"
-            - ".github/workflows/feature-matrix.yml"
-    merge_group:
-        branches: [dev, main]
     schedule:
-        - cron: "30 4 * * 1" # Weekly Monday 04:30 UTC
+        - cron: "15 3 * * *" # Daily 03:15 UTC
     workflow_dispatch:
+        inputs:
+            fail_on_failure:
+                description: "Fail workflow when any nightly lane fails"
+                required: true
+                default: true
+                type: boolean
 
 concurrency:
-    group: feature-matrix-${{ github.event.pull_request.number || github.sha }}
+    group: nightly-all-features-${{ github.ref || github.run_id }}
     cancel-in-progress: true
 
 permissions:
@@ -40,25 +22,25 @@ env:
     CARGO_TERM_COLOR: always
 
 jobs:
-    feature-check:
-        name: Matrix Lane (${{ matrix.name }})
+    nightly-lanes:
+        name: Nightly Lane (${{ matrix.name }})
         runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 55
+        timeout-minutes: 70
         strategy:
             fail-fast: false
             matrix:
                 include:
                     - name: default
-                      command: cargo check --locked
+                      command: cargo test --locked --test agent_e2e --verbose
                       install_libudev: false
                     - name: whatsapp-web
-                      command: cargo check --locked --no-default-features --features whatsapp-web
+                      command: cargo check --locked --no-default-features --features whatsapp-web --verbose
                       install_libudev: false
                     - name: browser-native
-                      command: cargo check --locked --no-default-features --features browser-native
+                      command: cargo check --locked --no-default-features --features browser-native --verbose
                       install_libudev: false
                     - name: nightly-all-features
-                      command: cargo check --locked --all-features
+                      command: cargo test --locked --all-features --test agent_e2e --verbose
                       install_libudev: true
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -71,7 +53,7 @@ jobs:
 
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
               with:
-                  prefix-key: feature-matrix-${{ matrix.name }}
+                  prefix-key: nightly-all-features-${{ matrix.name }}
 
             - name: Install Linux deps for all-features lane
               if: matrix.install_libudev
@@ -79,7 +61,7 @@ jobs:
                   sudo apt-get update -qq
                   sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
 
-            - name: Run matrix lane command
+            - name: Run nightly lane command
               id: lane
               shell: bash
               run: |
@@ -109,7 +91,7 @@ jobs:
                   EOF
 
                   {
-                    echo "### Feature Matrix Lane: ${{ matrix.name }}"
+                    echo "### Nightly Lane: ${{ matrix.name }}"
                     echo "- Command: \`${{ matrix.command }}\`"
                     echo "- Status: ${lane_status}"
                     echo "- Exit code: ${status}"
@@ -119,57 +101,64 @@ jobs:
                   echo "lane_status=${lane_status}" >> "$GITHUB_OUTPUT"
                   echo "lane_exit_code=${status}" >> "$GITHUB_OUTPUT"
 
-            - name: Upload lane report
+            - name: Upload nightly lane artifact
               if: always()
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
-                  name: feature-matrix-${{ matrix.name }}
+                  name: nightly-lane-${{ matrix.name }}
                   path: artifacts/nightly-result-${{ matrix.name }}.json
                   if-no-files-found: error
-                  retention-days: 21
+                  retention-days: 30
 
-            - name: Enforce lane success
-              if: steps.lane.outputs.lane_status != 'success'
-              shell: bash
-              run: exit "${{ steps.lane.outputs.lane_exit_code }}"
-
-    summary:
-        name: Feature Matrix Summary
-        needs: [feature-check]
+    nightly-summary:
+        name: Nightly Summary & Routing
+        needs: [nightly-lanes]
         if: always()
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-            - name: Download lane reports
+            - name: Download nightly artifacts
               uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
               with:
                   path: artifacts
 
-            - name: Aggregate matrix summary
+            - name: Aggregate nightly report
               shell: bash
+              env:
+                  FAIL_ON_FAILURE_INPUT: ${{ github.event.inputs.fail_on_failure || 'true' }}
               run: |
                   set -euo pipefail
+                  fail_on_failure="true"
+                  if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+                    fail_on_failure="${FAIL_ON_FAILURE_INPUT}"
+                  fi
+
+                  args=()
+                  if [ "$fail_on_failure" = "true" ]; then
+                    args+=(--fail-on-failure)
+                  fi
+
                   python3 scripts/ci/nightly_matrix_report.py \
                     --input-dir artifacts \
                     --owners-file .github/release/nightly-owner-routing.json \
-                    --output-json artifacts/feature-matrix-summary.json \
-                    --output-md artifacts/feature-matrix-summary.md \
-                    --fail-on-failure
+                    --output-json artifacts/nightly-summary.json \
+                    --output-md artifacts/nightly-summary.md \
+                    "${args[@]}"
 
-            - name: Publish summary
+            - name: Publish nightly summary
               shell: bash
               run: |
                   set -euo pipefail
-                  cat artifacts/feature-matrix-summary.md >> "$GITHUB_STEP_SUMMARY"
+                  cat artifacts/nightly-summary.md >> "$GITHUB_STEP_SUMMARY"
 
-            - name: Upload feature matrix summary artifact
+            - name: Upload nightly summary artifacts
               if: always()
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
-                  name: feature-matrix-summary
+                  name: nightly-all-features-summary
                   path: |
-                      artifacts/feature-matrix-summary.json
-                      artifacts/feature-matrix-summary.md
+                      artifacts/nightly-summary.json
+                      artifacts/nightly-summary.md
                   if-no-files-found: error
-                  retention-days: 21
+                  retention-days: 30

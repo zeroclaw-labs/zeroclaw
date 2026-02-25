@@ -229,31 +229,6 @@ jobs:
 
             - name: Setup Android NDK
               if: matrix.android_ndk
-              uses: nttld/setup-ndk@v1
-              id: setup-ndk
-              with:
-                  ndk-version: r26d
-                  add-to-path: true
-
-            - name: Configure Android toolchain
-              if: matrix.android_ndk
-              run: |
-                  echo "Setting up Android NDK toolchain for ${{ matrix.target }}"
-                  NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
-                  TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-                  
-                  # Add to path for linker resolution
-                  echo "$TOOLCHAIN" >> "$GITHUB_PATH"
-                  
-                  # Set linker environment variables
-                  if [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
-                    echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
-                  elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
-                    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang" >> "$GITHUB_ENV"
-                  fi
-
-            - name: Setup Android NDK
-              if: matrix.android_ndk
               shell: bash
               run: |
                   set -euo pipefail
@@ -428,12 +403,25 @@ jobs:
                   cp LICENSE-MIT artifacts/LICENSE-MIT
                   cp NOTICE artifacts/NOTICE
 
-            - name: Generate SHA256 checksums
+            - name: Generate release manifest + checksums
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
               run: |
-                  cd artifacts
-                  find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.cdx.json' -o -name '*.spdx.json' -o -name 'LICENSE-APACHE' -o -name 'LICENSE-MIT' -o -name 'NOTICE' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
-                  echo "Generated checksums:"
-                  cat SHA256SUMS
+                  set -euo pipefail
+                  python3 scripts/ci/release_manifest.py \
+                    --artifacts-dir artifacts \
+                    --release-tag "${RELEASE_TAG}" \
+                    --output-json artifacts/release-manifest.json \
+                    --output-md artifacts/release-manifest.md \
+                    --checksums-path artifacts/SHA256SUMS \
+                    --fail-empty
+
+            - name: Publish release manifest summary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-manifest.md >> "$GITHUB_STEP_SUMMARY"
 
             - name: Install cosign
               uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0

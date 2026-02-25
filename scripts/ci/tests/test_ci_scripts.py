@@ -1664,6 +1664,231 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("unknown", violation_text)
         self.assertIn("no governance metadata", violation_text)
 
+    def test_release_manifest_generates_checksums_and_report(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"release-asset")
+        (artifacts / "zeroclaw.cdx.json").write_text('{"sbom":"ok"}\n', encoding="utf-8")
+        (artifacts / "LICENSE-APACHE").write_text("license\n", encoding="utf-8")
+
+        out_json = self.tmp / "release-manifest.json"
+        out_md = self.tmp / "release-manifest.md"
+        checksums = self.tmp / "SHA256SUMS"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_manifest.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--release-tag",
+                "v0.2.0-rc.1",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--checksums-path",
+                str(checksums),
+                "--fail-empty",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["release_tag"], "v0.2.0-rc.1")
+        self.assertGreaterEqual(len(report["files"]), 3)
+        self.assertIn("zeroclaw-x86_64-unknown-linux-gnu.tar.gz", checksums.read_text(encoding="utf-8"))
+
+    def test_nightly_matrix_report_fails_on_failed_lane(self) -> None:
+        lane_root = self.tmp / "lane-artifacts"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        (lane_root / "nightly-result-default.json").write_text(
+            json.dumps(
+                {
+                    "lane": "default",
+                    "status": "success",
+                    "exit_code": 0,
+                    "duration_seconds": 12,
+                    "command": "cargo check --locked",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (lane_root / "nightly-result-nightly-all-features.json").write_text(
+            json.dumps(
+                {
+                    "lane": "nightly-all-features",
+                    "status": "failure",
+                    "exit_code": 101,
+                    "duration_seconds": 47,
+                    "command": "cargo test --all-features",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owners = self.tmp / "owners.json"
+        owners.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.nightly-owner-routing.v1",
+                    "owners": {
+                        "default": "@ops",
+                        "nightly-all-features": "@release",
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "nightly-summary.json"
+        out_md = self.tmp / "nightly-summary.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("nightly_matrix_report.py"),
+                "--input-dir",
+                str(lane_root),
+                "--owners-file",
+                str(owners),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-failure",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["passed"], 1)
+
+    def test_canary_guard_promote_when_metrics_within_threshold(self) -> None:
+        policy = self.tmp / "canary-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.canary-policy.v1",
+                    "minimum_sample_size": 300,
+                    "observation_window_minutes": 60,
+                    "thresholds": {
+                        "max_error_rate": 0.02,
+                        "max_crash_rate": 0.01,
+                        "max_p95_latency_ms": 1200,
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_json = self.tmp / "canary.json"
+        out_md = self.tmp / "canary.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("canary_guard.py"),
+                "--policy-file",
+                str(policy),
+                "--candidate-tag",
+                "v0.2.0-rc.1",
+                "--mode",
+                "execute",
+                "--error-rate",
+                "0.01",
+                "--crash-rate",
+                "0.005",
+                "--p95-latency-ms",
+                "900",
+                "--sample-size",
+                "500",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["decision"], "promote")
+        self.assertTrue(report["ready_to_execute"])
+
+    def test_prerelease_guard_requires_previous_stage(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-rc.1", "-m", "v0.2.0-rc.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "rc": ["CI Required Gate", "Nightly All-Features"],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard.json"
+        out_md = self.tmp / "prerelease-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-rc.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("requires at least one `beta` tag", joined)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

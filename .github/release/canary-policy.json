@@ -1,0 +1,11 @@
+{
+  "schema_version": "zeroclaw.canary-policy.v1",
+  "release_channel": "stable",
+  "observation_window_minutes": 60,
+  "minimum_sample_size": 500,
+  "thresholds": {
+    "max_error_rate": 0.02,
+    "max_crash_rate": 0.01,
+    "max_p95_latency_ms": 1200
+  }
+}
