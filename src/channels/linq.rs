@@ -61,24 +61,30 @@ impl LinqChannel {
 
     /// Parse an incoming webhook payload from Linq and extract messages.
     ///
-    /// Linq webhook envelope:
+    /// Supports both legacy and v3 (2026-02-03) webhook payload formats.
+    ///
+    /// Legacy format:
     /// ```json
     /// {
-    ///   "api_version": "v3",
     ///   "event_type": "message.received",
-    ///   "event_id": "...",
-    ///   "created_at": "...",
-    ///   "trace_id": "...",
     ///   "data": {
     ///     "chat_id": "...",
     ///     "from": "+1...",
-    ///     "recipient_phone": "+1...",
     ///     "is_from_me": false,
-    ///     "service": "iMessage",
-    ///     "message": {
-    ///       "id": "...",
-    ///       "parts": [{ "type": "text", "value": "..." }]
-    ///     }
+    ///     "message": { "parts": [{ "type": "text", "value": "..." }] }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// V3 (2026-02-03) format:
+    /// ```json
+    /// {
+    ///   "event_type": "message.received",
+    ///   "data": {
+    ///     "chat": { "id": "..." },
+    ///     "sender_handle": { "handle": "+1...", "is_me": false },
+    ///     "direction": "inbound",
+    ///     "parts": [{ "type": "text", "value": "..." }]
     ///   }
     /// }
     /// ```
@@ -99,18 +105,34 @@ impl LinqChannel {
             return messages;
         };
 
-        // Skip messages sent by the bot itself
-        if data
-            .get("is_from_me")
+        // Skip messages sent by the bot itself.
+        // V3: data.sender_handle.is_me or data.direction == "outbound"
+        // Legacy: data.is_from_me
+        let is_from_me = data
+            .get("sender_handle")
+            .and_then(|sh| sh.get("is_me"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            tracing::debug!("Linq: skipping is_from_me message");
+            .or_else(|| data.get("is_from_me").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        let is_outbound = data
+            .get("direction")
+            .and_then(|d| d.as_str())
+            .is_some_and(|d| d == "outbound");
+        if is_from_me || is_outbound {
+            tracing::debug!("Linq: skipping outbound/is_from_me message");
             return messages;
         }
 
-        // Get sender phone number
-        let Some(from) = data.get("from").and_then(|f| f.as_str()) else {
+        // Get sender phone number.
+        // V3: data.sender_handle.handle
+        // Legacy: data.from
+        let from = data
+            .get("sender_handle")
+            .and_then(|sh| sh.get("handle"))
+            .and_then(|h| h.as_str())
+            .or_else(|| data.get("from").and_then(|f| f.as_str()));
+        let Some(from) = from else {
+            tracing::debug!("Linq: no sender phone found in payload");
             return messages;
         };
 
@@ -131,19 +153,30 @@ impl LinqChannel {
             return messages;
         }
 
-        // Get chat_id for reply routing
+        // Get chat_id for reply routing.
+        // V3: data.chat.id
+        // Legacy: data.chat_id
         let chat_id = data
-            .get("chat_id")
-            .and_then(|c| c.as_str())
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(|id| id.as_str())
+            .or_else(|| data.get("chat_id").and_then(|c| c.as_str()))
             .unwrap_or("")
             .to_string();
 
-        // Extract text from message parts
-        let Some(message) = data.get("message") else {
-            return messages;
-        };
-
-        let Some(parts) = message.get("parts").and_then(|p| p.as_array()) else {
+        // Extract message parts.
+        // V3: data.parts (directly under data)
+        // Legacy: data.message.parts
+        let parts = data
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .or_else(|| {
+                data.get("message")
+                    .and_then(|m| m.get("parts"))
+                    .and_then(|p| p.as_array())
+            });
+        let Some(parts) = parts else {
+            tracing::debug!("Linq: no message parts found in payload");
             return messages;
         };
 
@@ -791,5 +824,160 @@ mod tests {
     fn linq_phone_number_accessor() {
         let ch = make_channel();
         assert_eq!(ch.phone_number(), "+15551234567");
+    }
+
+    // --- V3 (2026-02-03) payload format tests ---
+
+    #[test]
+    fn linq_parse_v3_text_message() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "api_version": "v3",
+            "webhook_version": "2026-02-03",
+            "event_type": "message.received",
+            "event_id": "da0e9e98-1259-4f2e-be61-981013fb2e72",
+            "created_at": "2026-02-25T19:04:25.843133967Z",
+            "trace_id": "e3d445014dce473e75a99ca147e31242",
+            "partner_id": "1fdfb6c9-c237-5aaf-8e03-9fce619289f9",
+            "data": {
+                "chat": {
+                    "id": "28de5f27-e8c4-4d45-a052-4d9ad7d77ef5",
+                    "is_group": false,
+                    "owner_handle": {
+                        "handle": "+15551234567",
+                        "id": "823f96c0-810f-47d0-b7fe-7c45a8ac2c2b",
+                        "is_me": true,
+                        "joined_at": "2026-02-25T17:29:31.050207Z",
+                        "left_at": null,
+                        "service": "iMessage",
+                        "status": "active"
+                    }
+                },
+                "direction": "inbound",
+                "id": "8ddb37aa-968f-4815-bfe3-370d366159b8",
+                "parts": [
+                    { "type": "text", "value": "Hello ZeroClaw!" }
+                ],
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "id": "6d80f902-be03-4e47-ae20-bf69b4ed4b3c",
+                    "is_me": false,
+                    "joined_at": "2026-02-25T17:29:31.050207Z",
+                    "left_at": null,
+                    "service": "iMessage",
+                    "status": "active"
+                },
+                "sent_at": "2026-02-25T19:04:25.361Z",
+                "service": "iMessage"
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].content, "Hello ZeroClaw!");
+        assert_eq!(msgs[0].channel, "linq");
+        assert_eq!(msgs[0].reply_target, "28de5f27-e8c4-4d45-a052-4d9ad7d77ef5");
+    }
+
+    #[test]
+    fn linq_parse_v3_skip_outbound() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3" },
+                "direction": "outbound",
+                "sender_handle": {
+                    "handle": "+15551234567",
+                    "is_me": true
+                },
+                "parts": [{ "type": "text", "value": "My own message" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "outbound/is_me messages should be skipped in v3 format");
+    }
+
+    #[test]
+    fn linq_parse_v3_skip_is_me() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3" },
+                "direction": "inbound",
+                "sender_handle": {
+                    "handle": "+15551234567",
+                    "is_me": true
+                },
+                "parts": [{ "type": "text", "value": "Echoed message" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "sender_handle.is_me should be skipped in v3 format");
+    }
+
+    #[test]
+    fn linq_parse_v3_unauthorized_sender() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3" },
+                "direction": "inbound",
+                "sender_handle": {
+                    "handle": "+9999999999",
+                    "is_me": false
+                },
+                "parts": [{ "type": "text", "value": "Spam" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Unauthorized senders should be filtered in v3 format");
+    }
+
+    #[test]
+    fn linq_parse_v3_multiple_parts() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3" },
+                "direction": "inbound",
+                "sender_handle": { "handle": "+1234567890", "is_me": false },
+                "parts": [
+                    { "type": "text", "value": "First" },
+                    { "type": "text", "value": "Second" }
+                ]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "First\nSecond");
+    }
+
+    #[test]
+    fn linq_parse_v3_skip_outbound_not_is_me() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3" },
+                "direction": "outbound",
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": false
+                },
+                "parts": [{ "type": "text", "value": "Forwarded message" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "outbound messages should be skipped even when is_me is false");
     }
 }
