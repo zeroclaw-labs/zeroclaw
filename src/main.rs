@@ -829,6 +829,10 @@ async fn main() -> Result<()> {
             if let Some(ref backend) = memory_backend {
                 config.memory.backend = backend.clone();
             }
+            // interactive=true only when no --message flag (real REPL session).
+            // Single-shot mode (-m) runs non-interactively: no TTY approval prompt,
+            // so tools are not denied by a stdin read returning EOF.
+            let interactive = message.is_none();
             agent::run(
                 config,
                 message,
@@ -836,7 +840,7 @@ async fn main() -> Result<()> {
                 model,
                 temperature,
                 peripheral,
-                true,
+                interactive,
             )
             .await
             .map(|_| ())

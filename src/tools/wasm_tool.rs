@@ -369,6 +369,52 @@ pub fn load_wasm_tools_from_skills(skills_dir: &std::path::Path) -> Vec<Box<dyn 
     tools
 }
 
+/// Collect the tool names declared by installed WASM skill packages by reading
+/// only the `manifest.json` files — no WASM module is compiled or loaded.
+///
+/// Used to pre-populate `auto_approve` for the channel approval manager so that
+/// sandboxed WASM skills are not denied when running on non-CLI channels.
+pub fn wasm_tool_names_from_skills(skills_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(_) => return names,
+    };
+
+    for entry in entries.flatten() {
+        let skill_dir = entry.path();
+
+        // Dev layout: manifest.json at skill root
+        let manifest_path = skill_dir.join("manifest.json");
+        if manifest_path.exists() {
+            if let Ok(m) = WasmManifest::load_from(&manifest_path) {
+                if !m.name.is_empty() {
+                    names.push(m.name);
+                }
+            }
+            continue;
+        }
+
+        // Installed layout: tools/<name>/manifest.json
+        let tools_subdir = skill_dir.join("tools");
+        if let Ok(tool_entries) = std::fs::read_dir(&tools_subdir) {
+            for tool_entry in tool_entries.flatten() {
+                let manifest_path = tool_entry.path().join("manifest.json");
+                if manifest_path.exists() {
+                    if let Ok(m) = WasmManifest::load_from(&manifest_path) {
+                        if !m.name.is_empty() {
+                            names.push(m.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    names
+}
+
 fn load_single_tool(
     wasm: &std::path::Path,
     manifest_path: &std::path::Path,
