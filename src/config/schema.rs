@@ -3487,6 +3487,11 @@ pub struct TelegramConfig {
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
+    /// Optional custom base URL for Telegram-compatible APIs.
+    /// Defaults to "https://api.telegram.org" when omitted.
+    /// Example for Bale messenger: "https://tapi.bale.ai"
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -6498,6 +6503,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             group_reply: None,
+            base_url: None,
         });
         config.agents.insert(
             "worker".into(),
@@ -6851,6 +6857,7 @@ default_temperature = 0.7
                     interrupt_on_new_message: false,
                     mention_only: false,
                     group_reply: None,
+                    base_url: None,
                 }),
                 discord: None,
                 slack: None,
@@ -7312,6 +7319,7 @@ tool_dispatcher = "xml"
             interrupt_on_new_message: false,
             mention_only: false,
             group_reply: None,
+            base_url: None,
         });
 
         config.agents.insert(
@@ -7471,6 +7479,7 @@ tool_dispatcher = "xml"
             interrupt_on_new_message: true,
             mention_only: false,
             group_reply: None,
+            base_url: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -7488,11 +7497,19 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert!(parsed.base_url.is_none());
         assert_eq!(
             parsed.effective_group_reply_mode(),
             GroupReplyMode::AllMessages
         );
         assert!(parsed.group_reply_allowed_sender_ids().is_empty());
+    }
+
+    #[test]
+    async fn telegram_config_custom_base_url() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"base_url":"https://tapi.bale.ai"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.base_url, Some("https://tapi.bale.ai".to_string()));
     }
 
     #[test]

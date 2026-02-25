@@ -3838,6 +3838,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     interrupt_on_new_message: false,
                     mention_only: false,
                     group_reply: None,
+                    base_url: None,
                 });
             }
             ChannelMenuChoice::Discord => {

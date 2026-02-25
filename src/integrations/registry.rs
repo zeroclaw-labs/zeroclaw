@@ -793,6 +793,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             group_reply: None,
+            base_url: None,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();

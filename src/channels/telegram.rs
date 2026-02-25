@@ -1014,10 +1014,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.bot_token
-        );
+        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
@@ -1687,10 +1684,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .to_string();
 
         // Step 2: download the actual file
-        let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path
-        );
+        let download_url = format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path);
         let img_resp = self.http_client().get(&download_url).send().await?;
         let bytes = img_resp.bytes().await?;
 
@@ -3234,6 +3228,17 @@ mod tests {
         assert_eq!(
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
+        );
+    }
+
+    #[test]
+    fn telegram_custom_base_url() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false)
+            .with_api_base("https://tapi.bale.ai".to_string());
+        assert_eq!(ch.api_url("getMe"), "https://tapi.bale.ai/bot123:ABC/getMe");
+        assert_eq!(
+            ch.api_url("sendMessage"),
+            "https://tapi.bale.ai/bot123:ABC/sendMessage"
         );
     }
 
