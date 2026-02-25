@@ -1,6 +1,8 @@
 use crate::channels::traits::Channel;
 use crate::config::LifeConfig;
-use crate::cosmic::{DriftDetector, EmotionalModulator, IntegrationMeter};
+use crate::cosmic::{
+    ConsolidationEngine, CosmicPersistence, DriftDetector, EmotionalModulator, IntegrationMeter,
+};
 use crate::memory::traits::Memory;
 use crate::observability::{Observer, ObserverEvent};
 use crate::providers::traits::Provider;
@@ -28,6 +30,10 @@ pub struct LifeLoop {
     integration: Arc<Mutex<IntegrationMeter>>,
     drift: Option<Arc<Mutex<DriftDetector>>>,
     modulator: Option<Arc<Mutex<EmotionalModulator>>>,
+    consolidation: Option<Arc<Mutex<ConsolidationEngine>>>,
+    persistence: Option<Arc<Mutex<CosmicPersistence>>>,
+    consolidation_counter: u32,
+    persistence_counter: u32,
     config: LifeConfig,
 }
 
@@ -40,6 +46,8 @@ impl LifeLoop {
         integration: Arc<Mutex<IntegrationMeter>>,
         drift: Option<Arc<Mutex<DriftDetector>>>,
         modulator: Option<Arc<Mutex<EmotionalModulator>>>,
+        consolidation: Option<Arc<Mutex<ConsolidationEngine>>>,
+        persistence: Option<Arc<Mutex<CosmicPersistence>>>,
         config: LifeConfig,
     ) -> Self {
         let emotional_state = Arc::new(Mutex::new(EmotionalState::load_or_default(
@@ -80,6 +88,10 @@ impl LifeLoop {
             integration,
             drift,
             modulator,
+            consolidation,
+            persistence,
+            consolidation_counter: 0,
+            persistence_counter: 0,
             config,
         }
     }
@@ -136,6 +148,30 @@ impl LifeLoop {
                 let state = self.emotional_state.lock().await;
                 let mut m = modulator.lock().await;
                 m.apply_emotional_input(state.valence, state.arousal, state.trust);
+            }
+
+            self.consolidation_counter += 1;
+            if self.consolidation_counter >= 60 {
+                if let Some(ref consolidation) = self.consolidation {
+                    let mut c = consolidation.lock().await;
+                    let result = c.consolidate();
+                    tracing::debug!(
+                        merged = result.merged_count,
+                        patterns = result.patterns_found,
+                        pruned = result.pruned_count,
+                        "Life loop consolidation tick"
+                    );
+                }
+                self.consolidation_counter = 0;
+            }
+
+            self.persistence_counter += 1;
+            if self.persistence_counter >= 30 {
+                if let Some(ref persistence) = self.persistence {
+                    let _p = persistence.lock().await;
+                    tracing::debug!("Life loop persistence checkpoint");
+                }
+                self.persistence_counter = 0;
             }
 
             if let Err(e) = self.maybe_initiate().await {

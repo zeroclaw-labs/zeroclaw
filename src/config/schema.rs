@@ -2867,6 +2867,8 @@ pub struct CosmicBrainConfig {
     pub consolidation_interval_secs: u32,
     pub drift_window_size: usize,
     pub drift_threshold: f64,
+    pub thalamus_threshold: f64,
+    pub workspace_max_active: usize,
 }
 
 impl Default for CosmicBrainConfig {
@@ -2888,6 +2890,8 @@ impl Default for CosmicBrainConfig {
             consolidation_interval_secs: 3600,
             drift_window_size: 50,
             drift_threshold: 0.1,
+            thalamus_threshold: 0.3,
+            workspace_max_active: 5,
         }
     }
 }

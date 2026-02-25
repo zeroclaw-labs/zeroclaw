@@ -48,6 +48,9 @@ mod rag {
 }
 mod config;
 mod control;
+mod cosmic {
+    pub use zeroclaw::cosmic::*;
+}
 mod cost {
     pub use zeroclaw::cost::*;
 }

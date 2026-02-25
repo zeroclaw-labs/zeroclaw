@@ -1,12 +1,13 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
+use crate::cosmic::{AgentPool, AgentRole, WorldModel};
 use crate::providers::{self, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 /// Default timeout for sub-agent provider calls.
@@ -19,10 +20,10 @@ const DELEGATE_TIMEOUT_SECS: u64 = 120;
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
-    /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
-    /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
+    agent_pool: Option<Arc<StdMutex<AgentPool>>>,
+    world_beliefs: Option<Arc<StdMutex<WorldModel>>>,
 }
 
 impl DelegateTool {
@@ -36,12 +37,11 @@ impl DelegateTool {
             security,
             fallback_credential,
             depth: 0,
+            agent_pool: None,
+            world_beliefs: None,
         }
     }
 
-    /// Create a DelegateTool for a sub-agent (with incremented depth).
-    /// When sub-agents eventually get their own tool registry, construct
-    /// their DelegateTool via this method with `depth: parent.depth + 1`.
     pub fn with_depth(
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
@@ -53,7 +53,19 @@ impl DelegateTool {
             security,
             fallback_credential,
             depth,
+            agent_pool: None,
+            world_beliefs: None,
         }
+    }
+
+    pub fn with_cosmic(
+        mut self,
+        pool: Arc<StdMutex<AgentPool>>,
+        world: Arc<StdMutex<WorldModel>>,
+    ) -> Self {
+        self.agent_pool = Some(pool);
+        self.world_beliefs = Some(world);
+        self
     }
 }
 
@@ -182,7 +194,11 @@ impl Tool for DelegateTool {
             });
         }
 
-        // Create provider for this agent
+        if let Some(ref pool) = self.agent_pool {
+            let mut p = pool.lock().unwrap();
+            p.register_agent(agent_name, AgentRole::Advisor);
+        }
+
         let provider_credential_owned = agent_config
             .api_key
             .clone()
@@ -205,11 +221,26 @@ impl Tool for DelegateTool {
                 }
             };
 
-        // Build the message
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
+        let belief_prefix = if let Some(ref world) = self.world_beliefs {
+            let w = world.lock().unwrap();
+            let top = w.most_confident(5);
+            if top.is_empty() {
+                String::new()
+            } else {
+                let entries: Vec<String> = top
+                    .iter()
+                    .map(|b| format!("{}: {:.2}", b.key, b.value))
+                    .collect();
+                format!("[World context: {}]\n", entries.join(", "))
+            }
         } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+            String::new()
+        };
+
+        let full_prompt = if context.is_empty() {
+            format!("{belief_prefix}{prompt}")
+        } else {
+            format!("{belief_prefix}[Context]\n{context}\n\n[Task]\n{prompt}")
         };
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
@@ -229,6 +260,10 @@ impl Tool for DelegateTool {
         let result = match result {
             Ok(inner) => inner,
             Err(_elapsed) => {
+                if let Some(ref pool) = self.agent_pool {
+                    let mut p = pool.lock().unwrap();
+                    p.remove_agent(agent_name);
+                }
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -238,6 +273,11 @@ impl Tool for DelegateTool {
                 });
             }
         };
+
+        if let Some(ref pool) = self.agent_pool {
+            let mut p = pool.lock().unwrap();
+            p.remove_agent(agent_name);
+        }
 
         match result {
             Ok(response) => {

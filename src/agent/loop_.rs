@@ -1,29 +1,32 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::cosmic::{
-    AgentPool, CausalGraph, ConsolidationEngine, Constitution, CosmicMemoryGraph,
+    AgentPool, CausalGraph, ConsolidationEngine, Constitution, CosmicGate, CosmicMemoryGraph,
     CosmicPersistence, CounterfactualEngine, DriftDetector, EmotionalModulator, FreeEnergyState,
-    IntegrationMeter, NormativeEngine, PolicyEngine, SelfModel, WorldModel,
+    GlobalWorkspace, IntegrationMeter, NormativeEngine, PolicyEngine, SelfModel, SensoryThalamus,
+    SubsystemId, WorldModel,
 };
 use crate::cost::{self, CostTracker, TokenUsage};
 
-type CosmicBrain = (
-    Arc<Mutex<CosmicMemoryGraph>>,
-    Arc<Mutex<FreeEnergyState>>,
-    Arc<Mutex<IntegrationMeter>>,
-    Arc<Mutex<CausalGraph>>,
-    Arc<Mutex<SelfModel>>,
-    Arc<Mutex<WorldModel>>,
-    Arc<Mutex<NormativeEngine>>,
-    Arc<Mutex<EmotionalModulator>>,
-    Arc<Mutex<DriftDetector>>,
-    Arc<Mutex<CounterfactualEngine>>,
-    Arc<Mutex<PolicyEngine>>,
-    Arc<Mutex<Constitution>>,
-    Arc<Mutex<ConsolidationEngine>>,
-    Arc<Mutex<CosmicPersistence>>,
-    Arc<Mutex<AgentPool>>,
-);
+struct CosmicBrain {
+    graph: Arc<Mutex<CosmicMemoryGraph>>,
+    free_energy: Arc<Mutex<FreeEnergyState>>,
+    integration: Arc<Mutex<IntegrationMeter>>,
+    causal: Arc<Mutex<CausalGraph>>,
+    self_model: Arc<Mutex<SelfModel>>,
+    world_model: Arc<Mutex<WorldModel>>,
+    normative: Arc<Mutex<NormativeEngine>>,
+    modulator: Arc<Mutex<EmotionalModulator>>,
+    drift: Arc<Mutex<DriftDetector>>,
+    counterfactual: Arc<Mutex<CounterfactualEngine>>,
+    policy: Arc<Mutex<PolicyEngine>>,
+    constitution: Arc<Mutex<Constitution>>,
+    consolidation: Arc<Mutex<ConsolidationEngine>>,
+    persistence: Arc<Mutex<CosmicPersistence>>,
+    agent_pool: Arc<Mutex<AgentPool>>,
+    thalamus: Arc<Mutex<SensoryThalamus>>,
+    workspace: Arc<Mutex<GlobalWorkspace>>,
+}
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
@@ -889,6 +892,7 @@ pub(crate) async fn agent_turn(
         model_strategy,
         None,
         None,
+        None,
     )
     .await
 }
@@ -913,6 +917,7 @@ pub(crate) async fn run_tool_call_loop(
     model_strategy: Option<&Mutex<ModelStrategy>>,
     cost_tracker: Option<&Arc<Mutex<CostTracker>>>,
     model_prices: Option<&std::collections::HashMap<String, crate::config::schema::ModelPricing>>,
+    cosmic_gate: Option<&CosmicGate>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1169,11 +1174,36 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            let blocked_by_gate = cosmic_gate.and_then(|gate| {
+                let decision = gate.check_action(&call.name, &call.name);
+                if decision.allowed {
+                    None
+                } else {
+                    tracing::warn!(
+                        tool = %call.name,
+                        reason = ?decision.reason,
+                        "Cosmic gate blocked tool execution"
+                    );
+                    Some(format!(
+                        "Tool '{}' blocked by cosmic gate: {}",
+                        call.name,
+                        decision.reason.unwrap_or_default()
+                    ))
+                }
+            });
+
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
             let start = Instant::now();
-            let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
+            let result = if let Some(blocked_msg) = blocked_by_gate {
+                observer.record_event(&ObserverEvent::ToolCall {
+                    tool: call.name.clone(),
+                    duration: start.elapsed(),
+                    success: false,
+                });
+                blocked_msg
+            } else if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -1303,6 +1333,9 @@ pub async fn run(
             meter.register_subsystem("tools", vec!["provider".into(), "security".into()]);
             meter.register_subsystem("security", vec!["tools".into(), "conscience".into()]);
             meter.register_subsystem("conscience", vec!["memory".into(), "security".into()]);
+            meter.register_subsystem("causal", vec!["memory".into(), "provider".into()]);
+            meter.register_subsystem("normative", vec!["security".into(), "provider".into()]);
+            meter.register_subsystem("modulation", vec!["memory".into(), "conscience".into()]);
         }
 
         let causal = Arc::new(Mutex::new(CausalGraph::new(1000)));
@@ -1365,12 +1398,37 @@ pub async fn run(
             }
         }
 
+        let thalamus = Arc::new(Mutex::new(SensoryThalamus::new(
+            config.cosmic_brain.thalamus_threshold,
+            500,
+        )));
+        let workspace = Arc::new(Mutex::new(GlobalWorkspace::new(
+            0.3,
+            config.cosmic_brain.workspace_max_active,
+            100,
+        )));
+        {
+            let mut ws = workspace.lock();
+            ws.register_subsystem(SubsystemId::Memory, 0.8);
+            ws.register_subsystem(SubsystemId::FreeEnergy, 0.7);
+            ws.register_subsystem(SubsystemId::Causality, 0.6);
+            ws.register_subsystem(SubsystemId::SelfModel, 0.7);
+            ws.register_subsystem(SubsystemId::WorldModel, 0.7);
+            ws.register_subsystem(SubsystemId::Normative, 0.9);
+            ws.register_subsystem(SubsystemId::Modulation, 0.6);
+            ws.register_subsystem(SubsystemId::Policy, 0.8);
+            ws.register_subsystem(SubsystemId::Counterfactual, 0.5);
+            ws.register_subsystem(SubsystemId::Consolidation, 0.4);
+            ws.register_subsystem(SubsystemId::Drift, 0.5);
+            ws.register_subsystem(SubsystemId::Constitution, 1.0);
+        }
+
         tracing::info!(
             graph_capacity = config.cosmic_brain.graph_max_nodes,
             fe_capacity = config.cosmic_brain.free_energy_capacity,
-            "Cosmic brain initialized (14 modules)"
+            "Cosmic brain initialized (17 modules)"
         );
-        Some((
+        Some(CosmicBrain {
             graph,
             free_energy,
             integration,
@@ -1386,10 +1444,20 @@ pub async fn run(
             consolidation,
             persistence,
             agent_pool,
-        ))
+            thalamus,
+            workspace,
+        })
     } else {
         None
     };
+
+    let cosmic_gate = cosmic_brain.as_ref().map(|brain| {
+        CosmicGate::new(
+            Arc::clone(&brain.normative),
+            Arc::clone(&brain.policy),
+            Arc::clone(&brain.counterfactual),
+        )
+    });
 
     // ── Cost tracking (budget enforcement) ──────────────────────────
     let cost_tracker = if config.cost.enabled {
@@ -1722,42 +1790,26 @@ pub async fn run(
             model_strategy.as_deref(),
             cost_tracker.as_ref(),
             Some(&config.cost.prices),
+            cosmic_gate.as_ref(),
         )
         .await?;
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
 
-        if let Some((
-            ref graph,
-            ref free_energy,
-            ref integration,
-            ref causal,
-            ref _self_model,
-            ref _world_model,
-            ref _normative,
-            ref modulator,
-            ref drift,
-            ref _counterfactual,
-            ref _policy,
-            ref _constitution,
-            ref _consolidation,
-            ref _persistence,
-            ref _agent_pool,
-        )) = cosmic_brain
-        {
-            let mut fe = free_energy.lock();
+        if let Some(ref brain) = cosmic_brain {
+            let mut fe = brain.free_energy.lock();
             let pred_id = fe.predict("turn_success", 0.8, 0.7);
             let success_score = if response.is_empty() { 0.2 } else { 0.9 };
             fe.observe(&pred_id, success_score);
 
             if let Some(key) = response.get(..80) {
-                let mut g = graph.lock();
+                let mut g = brain.graph.lock();
                 let node_id = format!("turn_{}", start.elapsed().as_millis());
                 g.insert_node(node_id, key.to_string(), "conversation".into(), vec![]);
             }
 
-            let mut meter = integration.lock();
+            let mut meter = brain.integration.lock();
             meter.update_state("memory", 0.8);
             meter.update_state("provider", if response.is_empty() { 0.3 } else { 0.9 });
             let snap = meter.snapshot();
@@ -1768,19 +1820,69 @@ pub async fn run(
             );
 
             {
-                let mut d = drift.lock();
+                let mut d = brain.drift.lock();
                 d.record_sample("provider", if response.is_empty() { 0.3 } else { 0.9 });
                 d.record_sample("memory", 0.8);
             }
 
             {
-                let mut c = causal.lock();
+                let mut c = brain.causal.lock();
                 c.record_event("provider", "memory", 0.5, 0.5, 10);
             }
 
             {
-                let mut m = modulator.lock();
+                let mut m = brain.modulator.lock();
                 m.apply_free_energy_signal(fe.free_energy(), fe.free_energy());
+            }
+
+            {
+                let m = brain.modulator.lock();
+                let bias = m.compute_bias();
+                tracing::debug!(
+                    exploration = bias.exploration_vs_exploitation,
+                    speed = bias.speed_vs_caution,
+                    autonomy = bias.autonomy_vs_deference,
+                    depth = bias.depth_vs_breadth,
+                    should_explore = m.should_explore(),
+                    should_defer = m.should_defer(),
+                    overloaded = m.is_overloaded(),
+                    "Cosmic behavioral bias"
+                );
+            }
+
+            // Drift feedback loop: nudge modulator + adjust thalamus threshold
+            {
+                let drift_alerts = {
+                    let d = brain.drift.lock();
+                    d.drift_report()
+                };
+                if drift_alerts.drifting_count > 0 {
+                    let mut m = brain.modulator.lock();
+                    m.nudge_variable(crate::cosmic::GlobalVariable::Urgency, 0.15);
+                    m.nudge_variable(crate::cosmic::GlobalVariable::Risk, 0.1);
+
+                    let arousal = m.get_variable(crate::cosmic::GlobalVariable::Arousal);
+                    let mut t = brain.thalamus.lock();
+                    t.adjust_threshold(arousal);
+
+                    tracing::warn!(
+                        drifting_subsystems = drift_alerts.alerts.len(),
+                        "Drift detected — feedback loop: urgency+risk nudged, thalamus threshold adjusted"
+                    );
+                }
+            }
+
+            // Thalamus habituation decay + workspace competition
+            {
+                let mut t = brain.thalamus.lock();
+                t.decay_habituation();
+
+                let mut ws = brain.workspace.lock();
+                ws.decay_activations(0.05);
+                let broadcast = ws.compete();
+                if let Some(dom) = broadcast.dominant {
+                    tracing::debug!(?dom, coherence = broadcast.coherence, "Workspace broadcast");
+                }
             }
 
             tracing::trace!(
@@ -1912,6 +2014,7 @@ pub async fn run(
                 model_strategy.as_deref(),
                 cost_tracker.as_ref(),
                 Some(&config.cost.prices),
+                cosmic_gate.as_ref(),
             )
             .await
             {
