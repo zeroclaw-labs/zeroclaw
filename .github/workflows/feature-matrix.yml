@@ -131,7 +131,15 @@ jobs:
             - name: Enforce lane success
               if: steps.lane.outputs.lane_status != 'success'
               shell: bash
-              run: exit "${{ steps.lane.outputs.lane_exit_code }}"
+              run: |
+                  set -euo pipefail
+                  code="${{ steps.lane.outputs.lane_exit_code }}"
+                  if [[ "$code" =~ ^[0-9]+$ ]]; then
+                    # shellcheck disable=SC2242
+                    exit "$code"
+                  fi
+                  echo "Invalid lane exit code: $code" >&2
+                  exit 1
 
     summary:
         name: Feature Matrix Summary
