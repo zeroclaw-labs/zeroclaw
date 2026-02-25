@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 24, 2026**.
 
 ## How to List Providers
 
@@ -78,6 +78,28 @@ credential is not reused for fallback providers.
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 - Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
+
+### Qwen (Alibaba Cloud) Notes
+
+- Provider IDs: `qwen`, `qwen-code` (OAuth), `qwen-oauth`, `dashscope`, `qwen-intl`, `qwen-us`
+- **OAuth Free Tier**: Use `qwen-code` or set `api_key = "qwen-oauth"` in config
+  - Endpoint: `portal.qwen.ai/v1`
+  - Credentials: `~/.qwen/oauth_creds.json` (use `qwen login` to authenticate)
+  - Daily quota: 1000 requests
+  - Available model: `qwen3-coder-plus` (verified 2026-02-24)
+  - Context window: ~32K tokens
+- **API Key Access**: Use `qwen` or `dashscope` provider with `DASHSCOPE_API_KEY`
+  - Endpoint: `dashscope.aliyuncs.com/compatible-mode/v1`
+  - Higher quotas and more models available with paid API key
+- **Authentication**: `QWEN_OAUTH_TOKEN` (for OAuth) or `DASHSCOPE_API_KEY` (for API key)
+- **Recommended Model**: `qwen3-coder-plus` - Optimized for coding tasks
+- **Quota Tracking**: `zeroclaw providers-quota --provider qwen-code` shows static quota info (`?/1000` - unknown remaining, 1000/day total)
+  - Qwen OAuth API does not return rate limit headers
+  - Actual request counting requires local counter (not implemented)
+  - Rate limit errors are detected and parsed for retry backoff
+- **Limitations**:
+  - OAuth free tier limited to 1 model and 1000 requests/day
+  - See test report: `docs/qwen-provider-test-report.md`
 
 ### Ollama Vision Notes
 
