@@ -8,7 +8,6 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-  outputs = { flake-utils, fenix, nixpkgs, ... }:
     let
       nixosModule = { pkgs, ... }: {
         nixpkgs.overlays = [ fenix.overlays.default ];
@@ -24,6 +23,7 @@
         ];
       };
     in
+  outputs = { self, flake-utils, fenix, nixpkgs }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {

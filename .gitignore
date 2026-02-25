@@ -29,3 +29,6 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# Nix
+result
