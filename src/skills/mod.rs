@@ -431,17 +431,41 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let name = dir
+    let mut name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let mut version = "0.1.0".to_string();
+    let mut author: Option<String> = None;
+
+    // If _meta.json exists alongside SKILL.md, use it for name/version/author.
+    // This covers skills installed from zip-based registries (e.g. any zip source).
+    let meta_path = dir.join("_meta.json");
+    if meta_path.exists() {
+        if let Ok(raw) = std::fs::read(&meta_path) {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(slug) = meta.get("slug").and_then(|v| v.as_str()) {
+                    let normalized = normalize_skill_name(slug.split('/').last().unwrap_or(slug));
+                    if !normalized.is_empty() {
+                        name = normalized;
+                    }
+                }
+                if let Some(v) = meta.get("version").and_then(|v| v.as_str()) {
+                    version = v.to_string();
+                }
+                if let Some(owner) = meta.get("ownerId").and_then(|v| v.as_str()) {
+                    author = Some(owner.to_string());
+                }
+            }
+        }
+    }
 
     Ok(Skill {
         name,
         description: extract_description(&content),
-        version: "0.1.0".to_string(),
-        author: None,
+        version,
+        author,
         tags: Vec::new(),
         tools: Vec::new(),
         prompts: vec![content],
@@ -1229,7 +1253,7 @@ fn install_registry_skill_source(
     // HTTP GET (synchronous via ureq-like reqwest blocking or std)
     // We use std::process + curl/wget to avoid pulling reqwest into this sync path.
     // At runtime the agent loop uses reqwest; here we keep it minimal.
-    let index_bytes = fetch_url_blocking(&api_url)
+    let index_bytes = fetch_url_blocking(&api_url, None)
         .with_context(|| format!("failed to fetch package index from {api_url}"))?;
 
     let index: RegistryPackageIndex = serde_json::from_slice(&index_bytes)
@@ -1272,22 +1296,23 @@ fn install_registry_skill_source(
             let tool_dir = skill_dir.join("tools").join(&tool.name);
             std::fs::create_dir_all(&tool_dir)?;
 
-            // Validate artifact URLs: must be HTTPS and on the same host as the
-            // registry to prevent SSRF via a malicious registry response.
-            validate_artifact_url(&tool.wasm_url, registry_url)
+            // Validate artifact URLs: must be HTTPS and on an allowed host
+            // (registry host or registry-declared artifact CDN host).
+            let artifact_base = index.artifact_base_url.as_deref();
+            validate_artifact_url(&tool.wasm_url, registry_url, artifact_base)
                 .with_context(|| format!("unsafe wasm_url for tool '{}'", tool.name))?;
-            validate_artifact_url(&tool.manifest_url, registry_url)
+            validate_artifact_url(&tool.manifest_url, registry_url, artifact_base)
                 .with_context(|| format!("unsafe manifest_url for tool '{}'", tool.name))?;
 
             // Download tool.wasm
             println!("  Downloading tool: {}", tool.name);
-            let wasm_bytes = fetch_url_blocking(&tool.wasm_url)
+            let wasm_bytes = fetch_url_blocking(&tool.wasm_url, None)
                 .with_context(|| format!("failed to download WASM for tool '{}'", tool.name))?;
             std::fs::write(tool_dir.join("tool.wasm"), &wasm_bytes)?;
             files_written += 1;
 
             // Download manifest.json
-            let manifest_bytes = fetch_url_blocking(&tool.manifest_url)
+            let manifest_bytes = fetch_url_blocking(&tool.manifest_url, None)
                 .with_context(|| format!("failed to download manifest for tool '{}'", tool.name))?;
 
             // Validate manifest before writing (ensures it parses as WasmManifest)
@@ -1350,6 +1375,15 @@ struct RegistryPackageIndex {
     description: Option<String>,
     #[serde(default)]
     tools: Vec<RegistryToolEntry>,
+    /// Optional CDN base URL where WASM artifacts are hosted.
+    ///
+    /// When present, artifact URLs may use this host instead of (or in addition
+    /// to) the registry host.  The declared host must itself be HTTPS; the client
+    /// validates that each artifact URL's host matches either the registry host or
+    /// this declared base host.  This lets the registry operator store binaries on
+    /// a separate CDN (e.g. Cloudflare R2) without client changes.
+    #[serde(default)]
+    artifact_base_url: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1360,68 +1394,429 @@ struct RegistryToolEntry {
 }
 
 /// Blocking HTTP GET using the system `curl` binary (avoids adding a sync HTTP
+/// Extract the hostname from an `https://` URL (the part before the first
+/// `'/'`, `'?'`, `'#'`, or `':'` after the scheme).
+fn extract_url_host(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .unwrap_or("")
+        .split(&['/', '?', '#', ':'][..])
+        .next()
+        .unwrap_or("")
+}
+
 /// Validate that an artifact URL (wasm_url / manifest_url from the registry index)
-/// is HTTPS and served from the same host as the registry, preventing SSRF via a
-/// malicious registry response redirecting downloads to internal hosts.
-fn validate_artifact_url(artifact_url: &str, registry_url: &str) -> Result<()> {
+/// is HTTPS and served from an allowed host, preventing SSRF via a malicious
+/// registry response redirecting downloads to internal hosts.
+///
+/// Allowed hosts:
+/// 1. The registry host itself (e.g. `zeromarket.vercel.app`).
+/// 2. The declared `artifact_base_url` host from the package index — lets the
+///    registry operator store binaries on a separate CDN (e.g. Cloudflare R2)
+///    without hardcoding CDN domains in the client.  The declared base URL must
+///    also use HTTPS; otherwise it is ignored.
+fn validate_artifact_url(
+    artifact_url: &str,
+    registry_url: &str,
+    artifact_base_url: Option<&str>,
+) -> Result<()> {
     if !artifact_url.starts_with("https://") {
         anyhow::bail!("artifact URL must use HTTPS: {artifact_url}");
     }
-    // Extract hostname (portion between "https://" and first '/', '?', '#', ':').
-    let registry_host = registry_url
-        .strip_prefix("https://")
-        .unwrap_or("")
-        .split(&['/', '?', '#', ':'][..])
-        .next()
-        .unwrap_or("");
-    let artifact_host = artifact_url
-        .strip_prefix("https://")
-        .unwrap_or("")
-        .split(&['/', '?', '#', ':'][..])
-        .next()
-        .unwrap_or("");
-    if registry_host.is_empty() || artifact_host != registry_host {
+    let registry_host = extract_url_host(registry_url);
+    let artifact_host = extract_url_host(artifact_url);
+
+    if registry_host.is_empty() || artifact_host.is_empty() {
         anyhow::bail!(
-            "artifact host '{}' is not allowed (expected '{}')",
-            artifact_host,
-            registry_host
+            "could not determine host from artifact URL '{}' or registry URL '{}'",
+            artifact_url,
+            registry_url
         );
     }
-    Ok(())
+
+    if artifact_host == registry_host {
+        return Ok(());
+    }
+
+    // Allow host declared by the registry as its artifact CDN, if that
+    // declaration is itself a valid HTTPS URL.
+    if let Some(base) = artifact_base_url {
+        if base.starts_with("https://") {
+            let base_host = extract_url_host(base);
+            if !base_host.is_empty() && artifact_host == base_host {
+                return Ok(());
+            }
+        }
+    }
+
+    // Allow Cloudflare R2 public bucket hostnames (`*.r2.dev`) as a trusted CDN
+    // fallback.  R2 is a hosted object-storage service with no access to private
+    // networks, so allowing artifacts from any R2 bucket does not create SSRF risk.
+    // Registries that store binaries on R2 without declaring `artifact_base_url`
+    // still work out of the box.
+    if artifact_host.ends_with(".r2.dev") {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "artifact host '{}' is not allowed (registry host: '{}'; declared artifact host: '{}')",
+        artifact_host,
+        registry_host,
+        artifact_base_url
+            .and_then(|u| {
+                if u.starts_with("https://") {
+                    Some(extract_url_host(u))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("none")
+    );
+}
+
+// ─── ClawhHub skill installer ────────────────────────────────────────────────
+//
+// ClawhHub (https://clawhub.ai) is the OpenClaw skill registry.
+// Supported source formats:
+//   - `https://clawhub.ai/<owner>/<slug>`  (profile URL, auto-detected by domain)
+//   - `clawhub:<slug>`                     (short prefix)
+//
+// The download URL is: https://clawhub.ai/api/v1/download?slug=<slug>
+// Zip contents follow the OpenClaw convention: `_meta.json` + `SKILL.md` + scripts.
+
+const CLAWHUB_DOMAIN: &str = "clawhub.ai";
+const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
+
+/// Returns true if `source` is a ClawhHub skill reference.
+fn is_clawhub_source(source: &str) -> bool {
+    if source.starts_with("clawhub:") {
+        return true;
+    }
+    // Auto-detect from domain: https://clawhub.ai/...
+    if let Some(rest) = source.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        return host == CLAWHUB_DOMAIN;
+    }
+    false
+}
+
+/// Convert a ClawhHub source string into the zip download URL.
+///
+/// - `clawhub:gog`                       → `https://clawhub.ai/api/v1/download?slug=gog`
+/// - `https://clawhub.ai/steipete/gog`   → `https://clawhub.ai/api/v1/download?slug=steipete/gog`
+/// - `https://clawhub.ai/gog`            → `https://clawhub.ai/api/v1/download?slug=gog`
+///
+/// For profile URLs the full path (owner/slug) is forwarded verbatim as the slug query
+/// parameter so the ClawhHub API can resolve owner-namespaced skills correctly.
+fn clawhub_download_url(source: &str) -> Result<String> {
+    // Short prefix: clawhub:<slug>
+    if let Some(slug) = source.strip_prefix("clawhub:") {
+        let slug = slug.trim().trim_end_matches('/');
+        if slug.is_empty() || slug.contains('/') {
+            anyhow::bail!(
+                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
+                source
+            );
+        }
+        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
+    }
+    // Profile URL: https://clawhub.ai/<owner>/<slug>  or  https://clawhub.ai/<slug>
+    // Forward the full path as the slug so the API can resolve owner-namespaced skills.
+    if let Some(rest) = source.strip_prefix("https://") {
+        let path = rest
+            .strip_prefix(CLAWHUB_DOMAIN)
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
+        }
+        // Keep the literal slash so the API receives `slug=owner/name`
+        // (some backends do not decode %2F in query parameters).
+        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
+    }
+    anyhow::bail!("unrecognised ClawhHub source format: {source}")
+}
+
+// ─── Generic zip-URL skill installer ─────────────────────────────────────────
+//
+// Installs a skill from any HTTPS URL that returns a zip archive.
+// Supports two source formats:
+//   - `zip:https://example.com/path/to/skill.zip`  (explicit prefix)
+//   - `https://example.com/skill.zip`              (`.zip` suffix auto-detection)
+//
+// No system-level `unzip` binary is required; extraction is done in-process
+// using the `zip` crate. This makes the feature portable and dependency-free.
+//
+// If the zip contains a `_meta.json` at its root (OpenClaw registry convention),
+// the name, version, and author fields are read from it. Otherwise the skill
+// name is derived from the URL's last path segment.
+
+/// Returns true if `source` should be handled as a zip-URL download.
+fn is_zip_url_source(source: &str) -> bool {
+    // Explicit `zip:https://...` prefix
+    if let Some(rest) = source.strip_prefix("zip:") {
+        return rest.starts_with("https://");
+    }
+    // Direct HTTPS URL ending in `.zip`
+    let path_part = source.split('?').next().unwrap_or(source);
+    source.starts_with("https://") && path_part.ends_with(".zip")
+}
+
+/// Strips the `zip:` prefix if present, returning the bare HTTPS URL.
+fn zip_url_from_source(source: &str) -> &str {
+    source.strip_prefix("zip:").unwrap_or(source)
+}
+
+/// Normalize a raw slug or filename into a valid skill directory name.
+/// Lowercases, replaces hyphens with underscores, strips everything else.
+fn normalize_skill_name(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Read skill metadata (name, version, author) from a zip archive.
+///
+/// Checks for `_meta.json` at the root of the archive first (OpenClaw/ClawhHub
+/// convention). Falls back to the URL-derived name passed via `url_hint`.
+fn extract_zip_skill_meta(
+    bytes: &[u8],
+    url_hint: &str,
+) -> Result<(String, String, Option<String>)> {
+    use std::io::Read as _;
+
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).context("downloaded content is not a valid zip archive")?;
+
+    if let Ok(mut f) = archive.by_name("_meta.json") {
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok();
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&buf) {
+            let slug_raw = meta.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            let base = slug_raw.split('/').last().unwrap_or(slug_raw);
+            let name = normalize_skill_name(base);
+            if !name.is_empty() {
+                let version = meta
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0.1.0")
+                    .to_string();
+                let author = meta
+                    .get("ownerId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                return Ok((name, version, author));
+            }
+        }
+    }
+
+    // Fallback: derive name from the URL path (strip query string and .zip suffix)
+    let url_path = url_hint.split('?').next().unwrap_or(url_hint);
+    let last_seg = url_path.rsplit('/').next().unwrap_or("skill");
+    let base = last_seg.strip_suffix(".zip").unwrap_or(last_seg);
+    let name = normalize_skill_name(base);
+    let name = if name.is_empty() {
+        "skill".to_string()
+    } else {
+        name
+    };
+    Ok((name, "0.1.0".to_string(), None))
+}
+
+/// Install a skill from a local `.zip` file (e.g. downloaded manually from ClawhHub).
+///
+/// Usage: `zeroclaw skill install /path/to/skill.zip`
+fn install_local_zip_source(zip_path: &Path, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let bytes = std::fs::read(zip_path)
+        .with_context(|| format!("failed to read zip file: {}", zip_path.display()))?;
+    let hint = zip_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("skill.zip");
+    extract_zip_bytes_to_skills(&bytes, hint, skills_path)
+}
+
+/// Download a zip archive from `url` and install it as a skill under `skills_path`.
+///
+/// `auth_token` is an optional Bearer token added as `Authorization: Bearer <token>`.
+/// Extraction is done in-process (no `unzip` binary required).
+/// Returns the installed skill directory path and the number of files written.
+fn install_zip_url_source(
+    url: &str,
+    skills_path: &Path,
+    auth_token: Option<&str>,
+) -> Result<(PathBuf, usize)> {
+    let bytes = fetch_url_blocking(url, auth_token)
+        .with_context(|| format!("failed to fetch zip from {url}"))?;
+    extract_zip_bytes_to_skills(&bytes, url, skills_path)
+}
+
+/// Core zip extraction logic shared by local and remote zip installers.
+///
+/// Runs a full security audit on the zip contents before extracting a single byte.
+/// `name_hint` is used as a fallback for skill name detection (URL or filename).
+fn extract_zip_bytes_to_skills(
+    bytes: &[u8],
+    name_hint: &str,
+    skills_path: &Path,
+) -> Result<(PathBuf, usize)> {
+    // ── Security audit BEFORE extraction ────────────────────────────────────
+    // Runs zip-specific checks: entry count, path traversal, native binaries,
+    // per-file and total decompressed size limits, compression ratio (zip bomb),
+    // and high-risk shell pattern detection in text files.
+    let audit_report =
+        audit::audit_zip_bytes(bytes).context("zip pre-extraction security check failed")?;
+    if !audit_report.is_clean() {
+        let findings = audit_report
+            .findings
+            .iter()
+            .map(|f| format!("  - {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "zip skill rejected by security audit ({} finding{}):\n{findings}",
+            audit_report.findings.len(),
+            if audit_report.findings.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+
+    let (skill_name, skill_version, skill_author) = extract_zip_skill_meta(bytes, name_hint)
+        .with_context(|| format!("could not determine skill name from zip: {name_hint}"))?;
+
+    let skill_dir = skills_path.join(&skill_name);
+    if skill_dir.exists() {
+        anyhow::bail!(
+            "skill '{}' already exists at {}; run 'zeroclaw skill remove {}' first",
+            skill_name,
+            skill_dir.display(),
+            skill_name
+        );
+    }
+    std::fs::create_dir_all(&skill_dir)?;
+
+    // Extract zip entries
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).context("failed to re-open zip archive for extraction")?;
+
+    let mut files_written = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+
+        // Security: reject path traversal attempts
+        if raw_name.contains("..") || raw_name.starts_with('/') {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let out_path = skill_dir.join(&raw_name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out_file = std::fs::File::create(&out_path)
+                .with_context(|| format!("failed to create {}", out_path.display()))?;
+            std::io::copy(&mut entry, &mut out_file)?;
+            files_written += 1;
+        }
+    }
+
+    // Write a minimal SKILL.toml so the skill appears in `zeroclaw skill list`
+    // (only if neither SKILL.toml nor SKILL.md was included in the zip)
+    let toml_path = skill_dir.join("SKILL.toml");
+    if !toml_path.exists() && !skill_dir.join("SKILL.md").exists() {
+        let author_line = skill_author
+            .map(|a| format!("author = \"{a}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            &toml_path,
+            format!(
+                "[skill]\nname = \"{skill_name}\"\ndescription = \"Zip-installed skill\"\nversion = \"{skill_version}\"\n{author_line}"
+            ),
+        )?;
+        files_written += 1;
+    }
+
+    Ok((skill_dir, files_written))
 }
 
 /// crate to this sync code path). Falls back to a basic TCP approach is not needed
 /// because `curl` is universally available on target platforms.
-fn fetch_url_blocking(url: &str) -> Result<Vec<u8>> {
+///
+/// `auth_token` — if `Some`, adds `Authorization: Bearer <token>` to the request.
+fn fetch_url_blocking(url: &str, auth_token: Option<&str>) -> Result<Vec<u8>> {
     // Validate URL scheme — only https:// allowed to prevent SSRF
     if !url.starts_with("https://") {
         anyhow::bail!("registry URL must use HTTPS: {url}");
     }
 
-    let output = std::process::Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--proto",
-            "=https",
-            "--max-redirs",
-            "5",
-            "--max-time",
-            "30",
-            url,
-        ])
+    // Use --write-out to append the HTTP status code on a separate line so we
+    // can give actionable error messages (e.g. 429 rate-limit guidance) without
+    // needing a separate HEAD request.
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        "=https",
+        "--max-redirs",
+        "5",
+        "--max-time",
+        "30",
+        "--write-out",
+        "\n%{http_code}",
+    ]);
+    if let Some(token) = auth_token {
+        cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+    }
+    cmd.arg(url);
+
+    let output = cmd
         .output()
         .context("failed to run 'curl' — ensure curl is installed")?;
 
-    if !output.status.success() {
-        // --show-error ensures stderr has the HTTP error message (e.g. "curl: (22) 404 Not Found")
+    // Parse the HTTP status code appended by --write-out.
+    let stdout = output.stdout;
+    let (body, http_status) = if let Some(nl) = stdout.iter().rposition(|&b| b == b'\n') {
+        let code_bytes = stdout[nl + 1..]
+            .iter()
+            .copied()
+            .take_while(|b| b.is_ascii_digit())
+            .collect::<Vec<_>>();
+        let status: u16 = String::from_utf8_lossy(&code_bytes).parse().unwrap_or(0);
+        (stdout[..nl].to_vec(), status)
+    } else {
+        (stdout, 0)
+    };
+
+    if http_status == 429 {
+        anyhow::bail!(
+            "ClawhHub rate limit reached (HTTP 429). \
+             Wait a moment and retry, or set `clawhub_token` in the `[skills]` section \
+             of your config.toml to use authenticated requests."
+        );
+    }
+
+    if !output.status.success() || (http_status != 0 && http_status >= 400) {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if http_status != 0 {
+            anyhow::bail!("HTTP {http_status} from {url}: {stderr}");
+        }
         anyhow::bail!("curl failed for {url}: {stderr}");
     }
 
-    Ok(output.stdout)
+    Ok(body)
 }
 
 // ─── Handle command ───────────────────────────────────────────────────────────
@@ -1614,7 +2009,35 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
-            if is_git_source(&source) {
+            if is_clawhub_source(&source) {
+                let download_url = clawhub_download_url(&source)
+                    .with_context(|| format!("invalid ClawhHub source: {source}"))?;
+                let token = config.skills.clawhub_token.as_deref();
+                let (installed_dir, files_written) =
+                    install_zip_url_source(&download_url, &skills_path, token)
+                        .with_context(|| format!("failed to install ClawhHub skill: {source}"))?;
+                println!(
+                    "  {} ClawhHub skill installed: {} ({} files written)",
+                    console::style("✓").green().bold(),
+                    installed_dir.display(),
+                    files_written
+                );
+                println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+            } else if is_zip_url_source(&source) {
+                // Generic zip-URL install: supports `zip:https://...` prefix and
+                // direct `.zip` URLs.  No system `unzip` binary required.
+                let url = zip_url_from_source(&source);
+                let (installed_dir, files_written) =
+                    install_zip_url_source(url, &skills_path, None)
+                        .with_context(|| format!("failed to install zip skill from: {url}"))?;
+                println!(
+                    "  {} Skill installed from zip: {} ({} files written)",
+                    console::style("✓").green().bold(),
+                    installed_dir.display(),
+                    files_written
+                );
+                println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+            } else if is_git_source(&source) {
                 let (installed_dir, files_scanned) =
                     install_git_skill_source(&source, &skills_path)
                         .with_context(|| format!("failed to install git skill source: {source}"))?;
@@ -1639,15 +2062,36 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 );
                 println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
             } else {
-                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    dest.display(),
-                    files_scanned
-                );
-                println!("  Security audit completed successfully.");
+                // Check if source is a local .zip file before falling back to directory install
+                let source_path = std::path::Path::new(&source);
+                let is_local_zip = source_path
+                    .extension()
+                    .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
+                    && source_path.is_file();
+
+                if is_local_zip {
+                    let (dest, files_written) = install_local_zip_source(source_path, &skills_path)
+                        .with_context(|| format!("failed to install zip skill from: {source}"))?;
+                    println!(
+                        "  {} Skill installed from zip: {} ({} files written)",
+                        console::style("✓").green().bold(),
+                        dest.display(),
+                        files_written
+                    );
+                    println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+                } else {
+                    let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
+                        .with_context(|| {
+                        format!("failed to install local skill source: {source}")
+                    })?;
+                    println!(
+                        "  {} Skill installed and audited: {} ({} files scanned)",
+                        console::style("✓").green().bold(),
+                        dest.display(),
+                        files_scanned
+                    );
+                    println!("  Security audit completed successfully.");
+                }
             }
 
             Ok(())
@@ -2412,6 +2856,109 @@ description = "Bare minimum"
             skill_md.contains("zeroclaw_md_check"),
             "SKILL.md should reference skill name, got:\n{skill_md}"
         );
+    }
+
+    // ── ClawhHub source detection and URL building ────────────────────────────
+
+    #[test]
+    fn is_clawhub_source_accepts_profile_url() {
+        assert!(is_clawhub_source("https://clawhub.ai/steipete/gog"));
+        assert!(is_clawhub_source("https://clawhub.ai/gog"));
+        assert!(is_clawhub_source("https://clawhub.ai/user/my-skill"));
+    }
+
+    #[test]
+    fn is_clawhub_source_accepts_short_prefix() {
+        assert!(is_clawhub_source("clawhub:gog"));
+        assert!(is_clawhub_source("clawhub:weather-lookup"));
+    }
+
+    #[test]
+    fn is_clawhub_source_rejects_other_domains() {
+        assert!(!is_clawhub_source("https://github.com/org/skill"));
+        assert!(!is_clawhub_source("https://example.com/skill.zip"));
+        assert!(!is_clawhub_source("zeroclaw/skill"));
+    }
+
+    #[test]
+    fn clawhub_download_url_from_profile_url() {
+        // Owner-namespaced URL: full path forwarded as slug with literal slash
+        let url = clawhub_download_url("https://clawhub.ai/steipete/gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=steipete/gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_from_single_path_url() {
+        // Single-segment URL: path is just the skill name
+        let url = clawhub_download_url("https://clawhub.ai/gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_from_short_prefix() {
+        let url = clawhub_download_url("clawhub:gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_rejects_slash_in_prefix_slug() {
+        assert!(clawhub_download_url("clawhub:owner/gog").is_err());
+    }
+
+    // ── is_zip_url_source ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_zip_url_source_accepts_explicit_prefix() {
+        assert!(is_zip_url_source("zip:https://example.com/skill.zip"));
+        assert!(is_zip_url_source(
+            "zip:https://example.com/api/download?slug=my-skill"
+        ));
+    }
+
+    #[test]
+    fn is_zip_url_source_accepts_direct_zip_url() {
+        assert!(is_zip_url_source("https://example.com/skill.zip"));
+        assert!(is_zip_url_source(
+            "https://releases.example.com/my-skill-1.0.0.zip"
+        ));
+    }
+
+    #[test]
+    fn is_zip_url_source_rejects_non_zip_https() {
+        // Plain HTTPS URL without .zip suffix and without zip: prefix
+        assert!(!is_zip_url_source("https://github.com/org/skill"));
+        assert!(!is_zip_url_source(
+            "https://example.com/api/download?slug=foo"
+        ));
+    }
+
+    #[test]
+    fn is_zip_url_source_rejects_non_https() {
+        assert!(!is_zip_url_source("zip:http://example.com/skill.zip"));
+        assert!(!is_zip_url_source("http://example.com/skill.zip"));
+        assert!(!is_zip_url_source("ftp://example.com/skill.zip"));
+    }
+
+    #[test]
+    fn is_zip_url_source_rejects_other_formats() {
+        assert!(!is_zip_url_source("zeroclaw/skill"));
+        assert!(!is_zip_url_source("./local/skill.zip"));
+        assert!(!is_zip_url_source("/absolute/path/skill.zip"));
+    }
+
+    // ── normalize_skill_name ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_skill_name_converts_hyphens_and_lowercases() {
+        assert_eq!(normalize_skill_name("My-Skill"), "my_skill");
+        assert_eq!(normalize_skill_name("weather-lookup"), "weather_lookup");
+        assert_eq!(normalize_skill_name("GOG"), "gog");
+    }
+
+    #[test]
+    fn normalize_skill_name_strips_non_alnum() {
+        assert_eq!(normalize_skill_name("skill.v1"), "skillv1");
+        assert_eq!(normalize_skill_name("skill@1.0.0"), "skill100");
     }
 }
 

@@ -1002,7 +1002,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `providers`                                   | List supported providers and aliases                                                 |
 | `channel`                                     | List/start/doctor channels and bind Telegram identities                              |
 | `integrations`                                | Inspect integration setup details                                                    |
-| `skills`                                      | List/install/remove skills; `install namespace/name` fetches from ZeroMarket registry |
+| `skills`                                      | List/install/remove skills; supports ClawhHub URLs, local zip files, ZeroMarket registry, git remotes |
 | `migrate`                                     | Import data from other runtimes (`migrate openclaw`)                                 |
 | `completions`                                 | Generate shell completion scripts (`bash`, `fish`, `zsh`, `powershell`, `elvish`)    |
 | `hardware`                                    | USB discover/introspect/info commands                                                |
@@ -1051,14 +1051,33 @@ Skill installs are now gated by a built-in static security audit. `zeroclaw skil
 
 ### WASM Skills
 
-ZeroClaw supports WASM-compiled skills installable from the [ZeroMarket](https://zeromarket.vercel.app) registry:
+ZeroClaw supports WASM-compiled skills installable from the [ZeroMarket](https://zeromarket.vercel.app) registry and zip-based registries like [ClawhHub](https://clawhub.ai):
 
 ```bash
-# Install a skill from ZeroMarket
+# Install from ZeroMarket registry
 zeroclaw skill install namespace/name
+
+# Install from ClawhHub (auto-detected by domain)
+zeroclaw skill install https://clawhub.ai/steipete/summarize
+
+# Install using ClawhHub short prefix
+zeroclaw skill install clawhub:summarize
+
+# Install from a zip file already downloaded locally
+zeroclaw skill install ~/Downloads/summarize-1.0.0.zip
+
+# Install from any direct zip URL
+zeroclaw skill install zip:https://example.com/my-skill.zip
 ```
 
-Skills are installed to `~/.zeroclaw/workspace/skills/<name>/` and loaded automatically as tools at agent runtime.
+If ClawhHub returns 429 (rate limit) or requires authentication, add to `~/.zeroclaw/config.toml`:
+
+```toml
+[skills]
+clawhub_token = "your-clawhub-token"
+```
+
+Skills are installed to `~/.zeroclaw/workspace/skills/<name>/` and loaded automatically as tools at agent runtime. No system `unzip` binary required — zip extraction is handled in-process.
 
 Build with WASM tool support (enabled by default):
 

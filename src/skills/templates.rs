@@ -2,7 +2,6 @@
 pub struct TemplateFile {
     /// Relative path inside the skill directory (e.g. "src/main.rs")
     pub path: &'static str,
-    /// Raw file content — may contain `__SKILL_NAME__` / `__BIN_NAME__` placeholders.
     pub content: &'static str,
 }
 
