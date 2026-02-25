@@ -989,6 +989,9 @@ mod tests {
             group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(42617),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
 
         let masked = mask_sensitive_fields(&cfg);
@@ -1071,6 +1074,9 @@ mod tests {
             group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(42617),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
 
         let incoming = mask_sensitive_fields(&current);
