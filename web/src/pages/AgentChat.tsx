@@ -2,24 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
+import { randomUUID } from '@/lib/uuid';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
   content: string;
   timestamp: Date;
-}
-
-let fallbackMessageIdCounter = 0;
-
-function makeMessageId(): string {
-  const uuid = globalThis.crypto?.randomUUID?.();
-  if (uuid) return uuid;
-
-  fallbackMessageIdCounter += 1;
-  return `msg_${Date.now().toString(36)}_${fallbackMessageIdCounter.toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2, 10)}`;
 }
 
 export default function AgentChat() {
@@ -64,7 +53,7 @@ export default function AgentChat() {
             setMessages((prev) => [
               ...prev,
               {
-                id: makeMessageId(),
+                id: randomUUID(),
                 role: 'agent',
                 content,
                 timestamp: new Date(),
@@ -80,9 +69,10 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: makeMessageId(),
+              id: randomUUID(),
               role: 'agent',
               content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
+
               timestamp: new Date(),
             },
           ]);
@@ -92,9 +82,10 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: makeMessageId(),
+              id: randomUUID(),
               role: 'agent',
               content: `[Tool Result] ${msg.output ?? ''}`,
+
               timestamp: new Date(),
             },
           ]);
@@ -104,9 +95,10 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: makeMessageId(),
+              id: randomUUID(),
               role: 'agent',
               content: `[Error] ${msg.message ?? 'Unknown error'}`,
+
               timestamp: new Date(),
             },
           ]);
@@ -135,7 +127,7 @@ export default function AgentChat() {
     setMessages((prev) => [
       ...prev,
       {
-        id: makeMessageId(),
+        id: randomUUID(),
         role: 'user',
         content: trimmed,
         timestamp: new Date(),
@@ -184,16 +176,14 @@ export default function AgentChat() {
         {messages.map((msg) => (
           <div
             key={msg.id}
-            className={`flex items-start gap-3 ${
-              msg.role === 'user' ? 'flex-row-reverse' : ''
-            }`}
+            className={`flex items-start gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : ''
+              }`}
           >
             <div
-              className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
-                msg.role === 'user'
+              className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${msg.role === 'user'
                   ? 'bg-blue-600'
                   : 'bg-gray-700'
-              }`}
+                }`}
             >
               {msg.role === 'user' ? (
                 <User className="h-4 w-4 text-white" />
@@ -202,17 +192,15 @@ export default function AgentChat() {
               )}
             </div>
             <div
-              className={`max-w-[75%] rounded-xl px-4 py-3 ${
-                msg.role === 'user'
+              className={`max-w-[75%] rounded-xl px-4 py-3 ${msg.role === 'user'
                   ? 'bg-blue-600 text-white'
                   : 'bg-gray-800 text-gray-100 border border-gray-700'
-              }`}
+                }`}
             >
               <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
               <p
-                className={`text-xs mt-1 ${
-                  msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
-                }`}
+                className={`text-xs mt-1 ${msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
+                  }`}
               >
                 {msg.timestamp.toLocaleTimeString()}
               </p>
@@ -264,9 +252,8 @@ export default function AgentChat() {
         </div>
         <div className="flex items-center justify-center mt-2 gap-2">
           <span
-            className={`inline-block h-2 w-2 rounded-full ${
-              connected ? 'bg-green-500' : 'bg-red-500'
-            }`}
+            className={`inline-block h-2 w-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'
+              }`}
           />
           <span className="text-xs text-gray-500">
             {connected ? 'Connected' : 'Disconnected'}
