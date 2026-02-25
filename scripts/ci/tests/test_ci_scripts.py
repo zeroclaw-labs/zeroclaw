@@ -1889,6 +1889,367 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         joined = "\n".join(report["violations"])
         self.assertIn("requires at least one `beta` tag", joined)
 
+    def test_prerelease_guard_reports_promotion_transition_and_stage_history(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-beta.1", "-m", "v0.2.0-beta.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "rc", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                        "rc": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Nightly Summary & Routing",
+                        ],
+                        "stable": [
+                            "Main Promotion Gate",
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Verify Artifact Set",
+                            "Nightly Summary & Routing",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-promotion.json"
+        out_md = self.tmp / "prerelease-guard-promotion.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-beta.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], "zeroclaw.prerelease-guard.v2")
+        self.assertEqual(report["transition"]["type"], "promotion")
+        self.assertEqual(report["transition"]["outcome"], "promotion")
+        self.assertEqual(report["transition"]["required_previous_tag"], "v0.2.0-alpha.1")
+        self.assertEqual(report["stage_history"]["latest_stage"], "beta")
+        self.assertEqual(report["stage_history"]["latest_tag"], "v0.2.0-beta.1")
+        self.assertIn("v0.2.0-alpha.1", report["stage_history"]["per_stage"]["alpha"])
+        self.assertIn("v0.2.0-beta.1", report["stage_history"]["per_stage"]["beta"])
+
+    def test_prerelease_guard_blocks_demotion_and_records_transition(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-beta.1", "-m", "v0.2.0-beta.1"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.2", "-m", "v0.2.0-alpha.2"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "rc", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                        "rc": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Nightly Summary & Routing",
+                        ],
+                        "stable": [
+                            "Main Promotion Gate",
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Verify Artifact Set",
+                            "Nightly Summary & Routing",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-demotion.json"
+        out_md = self.tmp / "prerelease-guard-demotion.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-alpha.2",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["transition"]["type"], "demotion_blocked")
+        self.assertEqual(report["transition"]["outcome"], "demotion_blocked")
+        self.assertEqual(report["transition"]["previous_highest_stage"], "beta")
+        self.assertEqual(report["transition"]["previous_highest_tag"], "v0.2.0-beta.1")
+        joined = "\n".join(report["violations"])
+        self.assertIn("Refusing stage regression", joined)
+
+    def test_prerelease_guard_requires_monotonic_same_stage_number(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.2", "-m", "v0.2.0-alpha.2"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "rc", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                        "rc": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Nightly Summary & Routing",
+                        ],
+                        "stable": [
+                            "Main Promotion Gate",
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Verify Artifact Set",
+                            "Nightly Summary & Routing",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-monotonic.json"
+        out_md = self.tmp / "prerelease-guard-monotonic.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-alpha.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("must increase monotonically", joined)
+
+    def test_prerelease_guard_detects_incomplete_stage_matrix_config(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "invalid-stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-policy.json"
+        out_md = self.tmp / "prerelease-guard-policy.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-alpha.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "dry-run",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("stage_order", joined)
+        self.assertIn("required_checks.rc", joined)
+        self.assertIn("required_checks.stable", joined)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
