@@ -142,6 +142,41 @@ impl CosmicPersistence {
     }
 }
 
+pub fn gather_snapshot(
+    modulator: &crate::cosmic::EmotionalModulator,
+    drift: &crate::cosmic::DriftDetector,
+    thalamus: &crate::cosmic::SensoryThalamus,
+    workspace: &crate::cosmic::GlobalWorkspace,
+) -> CosmicSnapshot {
+    let mut modules = HashMap::new();
+
+    let mod_snap = modulator.snapshot();
+    if let Ok(val) = serde_json::to_value(&mod_snap) {
+        modules.insert("modulation".to_string(), val);
+    }
+
+    let drift_report = drift.drift_report();
+    if let Ok(val) = serde_json::to_value(&drift_report) {
+        modules.insert("drift".to_string(), val);
+    }
+
+    let thal_snap = thalamus.snapshot();
+    if let Ok(val) = serde_json::to_value(&thal_snap) {
+        modules.insert("thalamus".to_string(), val);
+    }
+
+    let ws_snap = workspace.snapshot();
+    if let Ok(val) = serde_json::to_value(&ws_snap) {
+        modules.insert("workspace".to_string(), val);
+    }
+
+    CosmicSnapshot {
+        modules,
+        version: 1,
+        saved_at: Utc::now(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +298,20 @@ mod tests {
         p.save_all(&snapshot).unwrap();
         let names = p.list_modules().unwrap();
         assert_eq!(names, vec!["only_mod"]);
+    }
+
+    #[test]
+    fn gather_snapshot_collects_modules() {
+        use crate::cosmic::{DriftDetector, EmotionalModulator, GlobalWorkspace, SensoryThalamus};
+        let m = EmotionalModulator::new();
+        let d = DriftDetector::new(50, 0.1);
+        let t = SensoryThalamus::new(0.3, 100);
+        let w = GlobalWorkspace::new(0.3, 5, 50);
+        let snap = super::gather_snapshot(&m, &d, &t, &w);
+        assert!(snap.modules.contains_key("modulation"));
+        assert!(snap.modules.contains_key("drift"));
+        assert!(snap.modules.contains_key("thalamus"));
+        assert!(snap.modules.contains_key("workspace"));
+        assert_eq!(snap.version, 1);
     }
 }

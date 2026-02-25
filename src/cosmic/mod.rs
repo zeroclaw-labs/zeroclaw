@@ -28,7 +28,7 @@ pub use memory::{spreading_activation, CosmicEdge, CosmicMemoryGraph, CosmicNode
 pub use modulation::{BehavioralBias, EmotionalModulator, GlobalVariable, ModulationSnapshot};
 pub use multi_agent::{AgentEntry, AgentPool, AgentRole, ConsensusResult};
 pub use normative::{Norm, NormKind, NormViolation, NormativeEngine};
-pub use persistence::{CosmicPersistence, CosmicSnapshot, PersistenceError};
+pub use persistence::{gather_snapshot, CosmicPersistence, CosmicSnapshot, PersistenceError};
 pub use policy::{Policy, PolicyDecision, PolicyEngine, PolicyLayer};
 pub use self_model::{BeliefSource, SelfBelief, SelfModel, WorldBelief, WorldModel};
 pub use thalamus::{InputSignal, SalienceScore, SensoryThalamus, SignalSource, ThalamusSnapshot};

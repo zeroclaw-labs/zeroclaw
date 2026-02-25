@@ -1,5 +1,20 @@
+[build]
+rustflags = [
+    "--remap-path-prefix=/Users/ricardoprieto/.cargo/registry/src/=crates/",
+    "--remap-path-prefix=/Users/ricardoprieto/zeroclaw/=zeroclaw/",
+    "--remap-path-prefix=/Users/ricardoprieto/ZeroClaw/=zeroclaw/",
+]
+
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "link-arg=-static"]
+rustflags = ["-C", "link-arg=-static",
+    "--remap-path-prefix=/Users/ricardoprieto/.cargo/registry/src/=crates/",
+    "--remap-path-prefix=/Users/ricardoprieto/zeroclaw/=zeroclaw/",
+    "--remap-path-prefix=/Users/ricardoprieto/ZeroClaw/=zeroclaw/",
+]
 
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "link-arg=-static"]
+rustflags = ["-C", "link-arg=-static",
+    "--remap-path-prefix=/Users/ricardoprieto/.cargo/registry/src/=crates/",
+    "--remap-path-prefix=/Users/ricardoprieto/zeroclaw/=zeroclaw/",
+    "--remap-path-prefix=/Users/ricardoprieto/ZeroClaw/=zeroclaw/",
+]

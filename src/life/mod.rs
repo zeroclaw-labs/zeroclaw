@@ -1,7 +1,8 @@
 use crate::channels::traits::Channel;
 use crate::config::LifeConfig;
 use crate::cosmic::{
-    ConsolidationEngine, CosmicPersistence, DriftDetector, EmotionalModulator, IntegrationMeter,
+    ConsolidationEngine, CosmicPersistence, CosmicSnapshot, DriftDetector, EmotionalModulator,
+    GlobalWorkspace, IntegrationMeter, SensoryThalamus,
 };
 use crate::memory::traits::Memory;
 use crate::observability::{Observer, ObserverEvent};
@@ -32,6 +33,8 @@ pub struct LifeLoop {
     modulator: Option<Arc<Mutex<EmotionalModulator>>>,
     consolidation: Option<Arc<Mutex<ConsolidationEngine>>>,
     persistence: Option<Arc<Mutex<CosmicPersistence>>>,
+    thalamus: Option<Arc<Mutex<SensoryThalamus>>>,
+    workspace: Option<Arc<Mutex<GlobalWorkspace>>>,
     consolidation_counter: u32,
     persistence_counter: u32,
     config: LifeConfig,
@@ -48,6 +51,8 @@ impl LifeLoop {
         modulator: Option<Arc<Mutex<EmotionalModulator>>>,
         consolidation: Option<Arc<Mutex<ConsolidationEngine>>>,
         persistence: Option<Arc<Mutex<CosmicPersistence>>>,
+        thalamus: Option<Arc<Mutex<SensoryThalamus>>>,
+        workspace: Option<Arc<Mutex<GlobalWorkspace>>>,
         config: LifeConfig,
     ) -> Self {
         let emotional_state = Arc::new(Mutex::new(EmotionalState::load_or_default(
@@ -90,6 +95,8 @@ impl LifeLoop {
             modulator,
             consolidation,
             persistence,
+            thalamus,
+            workspace,
             consolidation_counter: 0,
             persistence_counter: 0,
             config,
@@ -168,8 +175,62 @@ impl LifeLoop {
             self.persistence_counter += 1;
             if self.persistence_counter >= 30 {
                 if let Some(ref persistence) = self.persistence {
-                    let _p = persistence.lock().await;
-                    tracing::debug!("Life loop persistence checkpoint");
+                    let snapshot = {
+                        let mod_snap = match self.modulator.as_ref() {
+                            Some(m) => Some(m.lock().await.snapshot()),
+                            None => None,
+                        };
+                        let drift_snap = match self.drift.as_ref() {
+                            Some(d) => Some(d.lock().await.drift_report()),
+                            None => None,
+                        };
+                        let thal_snap = match self.thalamus.as_ref() {
+                            Some(t) => Some(t.lock().await.snapshot()),
+                            None => None,
+                        };
+                        let ws_snap = match self.workspace.as_ref() {
+                            Some(w) => Some(w.lock().await.snapshot()),
+                            None => None,
+                        };
+
+                        let mut modules = std::collections::HashMap::new();
+                        if let Some(snap) = mod_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("modulation".to_string(), val);
+                            }
+                        }
+                        if let Some(snap) = drift_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("drift".to_string(), val);
+                            }
+                        }
+                        if let Some(snap) = thal_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("thalamus".to_string(), val);
+                            }
+                        }
+                        if let Some(snap) = ws_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("workspace".to_string(), val);
+                            }
+                        }
+
+                        CosmicSnapshot {
+                            modules,
+                            version: 1,
+                            saved_at: chrono::Utc::now(),
+                        }
+                    };
+
+                    let p = persistence.lock().await;
+                    if let Err(e) = p.save_all(&snapshot) {
+                        tracing::warn!("Persistence save failed: {e}");
+                    } else {
+                        tracing::debug!(
+                            modules = snapshot.modules.len(),
+                            "Life loop persistence checkpoint saved"
+                        );
+                    }
                 }
                 self.persistence_counter = 0;
             }

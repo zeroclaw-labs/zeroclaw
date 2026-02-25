@@ -3,8 +3,8 @@ use crate::config::Config;
 use crate::cosmic::{
     AgentPool, CausalGraph, ConsolidationEngine, Constitution, CosmicGate, CosmicMemoryGraph,
     CosmicPersistence, CounterfactualEngine, DriftDetector, EmotionalModulator, FreeEnergyState,
-    GlobalWorkspace, IntegrationMeter, NormativeEngine, PolicyEngine, SelfModel, SensoryThalamus,
-    SubsystemId, WorldModel,
+    GlobalWorkspace, InputSignal, IntegrationMeter, NormativeEngine, PolicyEngine, SelfModel,
+    SensoryThalamus, SignalSource, SubsystemId, WorldModel,
 };
 use crate::cost::{self, CostTracker, TokenUsage};
 
@@ -893,6 +893,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -918,6 +919,7 @@ pub(crate) async fn run_tool_call_loop(
     cost_tracker: Option<&Arc<Mutex<CostTracker>>>,
     model_prices: Option<&std::collections::HashMap<String, crate::config::schema::ModelPricing>>,
     cosmic_gate: Option<&CosmicGate>,
+    cosmic_workspace: Option<&Mutex<GlobalWorkspace>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1212,6 +1214,14 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
+                            if let Some(ws) = cosmic_workspace {
+                                let mut workspace = ws.lock();
+                                workspace.activate(SubsystemId::Memory, 0.7);
+                                if call.name.contains("shell") || call.name.contains("file") {
+                                    workspace.activate(SubsystemId::Normative, 0.8);
+                                    workspace.activate(SubsystemId::Policy, 0.7);
+                                }
+                            }
                             scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
@@ -1393,8 +1403,21 @@ pub async fn run(
 
         {
             let p = persistence.lock();
-            if let Ok(_graph_data) = p.load_module("graph") {
-                tracing::info!("Loaded persisted cosmic graph state");
+            match p.load_all() {
+                Ok(snapshot) => {
+                    tracing::info!(
+                        version = snapshot.version,
+                        modules = snapshot.modules.len(),
+                        saved_at = %snapshot.saved_at,
+                        "Loaded persisted cosmic state"
+                    );
+                }
+                Err(crate::cosmic::PersistenceError::NotFound(_)) => {
+                    tracing::info!("No persisted cosmic state found — starting fresh");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load cosmic state: {e} — starting fresh");
+                }
             }
         }
 
@@ -1458,6 +1481,9 @@ pub async fn run(
             Arc::clone(&brain.counterfactual),
         )
     });
+
+    let cosmic_ws = cosmic_brain.as_ref().map(|b| &*b.workspace);
+    let mut bias_temperature_adj: f64 = 0.0;
 
     // ── Cost tracking (budget enforcement) ──────────────────────────
     let cost_tracker = if config.cost.enabled {
@@ -1745,7 +1771,25 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory
+        if let Some(ref brain) = cosmic_brain {
+            let signal = InputSignal {
+                source: SignalSource::Channel,
+                content: msg.chars().take(200).collect(),
+                raw_salience: 0.7,
+                timestamp: chrono::Utc::now(),
+            };
+            let mut t = brain.thalamus.lock();
+            if let Some(score) = t.process_signal(&signal) {
+                tracing::debug!(
+                    salience = score.score,
+                    novelty = score.novelty,
+                    "Thalamus: message passed salience filter"
+                );
+            } else {
+                tracing::debug!("Thalamus: message below salience threshold (still processing)");
+            }
+        }
+
         if config.memory.auto_save {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
@@ -1773,6 +1817,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        let effective_temp = (temperature + bias_temperature_adj).clamp(0.0, 1.5);
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -1780,7 +1825,7 @@ pub async fn run(
             observer.as_ref(),
             provider_name,
             model_name,
-            temperature,
+            effective_temp,
             false,
             Some(&approval_manager),
             "cli",
@@ -1791,6 +1836,7 @@ pub async fn run(
             cost_tracker.as_ref(),
             Some(&config.cost.prices),
             cosmic_gate.as_ref(),
+            cosmic_ws,
         )
         .await?;
         final_output = response.clone();
@@ -1838,11 +1884,19 @@ pub async fn run(
             {
                 let m = brain.modulator.lock();
                 let bias = m.compute_bias();
+
+                bias_temperature_adj = (bias.speed_vs_caution - 0.5) * 0.2;
+
+                if m.is_overloaded() {
+                    bias_temperature_adj -= 0.1;
+                }
+
                 tracing::debug!(
                     exploration = bias.exploration_vs_exploitation,
                     speed = bias.speed_vs_caution,
                     autonomy = bias.autonomy_vs_deference,
                     depth = bias.depth_vs_breadth,
+                    temp_adj = bias_temperature_adj,
                     should_explore = m.should_explore(),
                     should_defer = m.should_defer(),
                     overloaded = m.is_overloaded(),
@@ -1872,12 +1926,27 @@ pub async fn run(
                 }
             }
 
-            // Thalamus habituation decay + workspace competition
             {
                 let mut t = brain.thalamus.lock();
                 t.decay_habituation();
 
+                let fe_energy = {
+                    let fe_lock = brain.free_energy.lock();
+                    fe_lock.free_energy()
+                };
+
+                let modulator_arousal = {
+                    let m = brain.modulator.lock();
+                    m.get_variable(crate::cosmic::GlobalVariable::Arousal)
+                };
+
                 let mut ws = brain.workspace.lock();
+                ws.activate(SubsystemId::FreeEnergy, fe_energy.clamp(0.0, 1.0));
+                if fe_energy > 0.5 {
+                    ws.activate(SubsystemId::Counterfactual, 0.6);
+                }
+                ws.activate(SubsystemId::Modulation, modulator_arousal);
+
                 ws.decay_activations(0.05);
                 let broadcast = ws.compete();
                 if let Some(dom) = broadcast.dominant {
@@ -1972,7 +2041,27 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns
+            if let Some(ref brain) = cosmic_brain {
+                let signal = InputSignal {
+                    source: SignalSource::Channel,
+                    content: user_input.chars().take(200).collect(),
+                    raw_salience: 0.7,
+                    timestamp: chrono::Utc::now(),
+                };
+                let mut t = brain.thalamus.lock();
+                if let Some(score) = t.process_signal(&signal) {
+                    tracing::debug!(
+                        salience = score.score,
+                        novelty = score.novelty,
+                        "Thalamus: message passed salience filter"
+                    );
+                } else {
+                    tracing::debug!(
+                        "Thalamus: message below salience threshold (still processing)"
+                    );
+                }
+            }
+
             if config.memory.auto_save {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
@@ -1980,7 +2069,6 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
             let mem_context =
                 build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -1997,6 +2085,7 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            let effective_temp = (temperature + bias_temperature_adj).clamp(0.0, 1.5);
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -2004,7 +2093,7 @@ pub async fn run(
                 observer.as_ref(),
                 provider_name,
                 model_name,
-                temperature,
+                effective_temp,
                 false,
                 Some(&approval_manager),
                 "cli",
@@ -2015,6 +2104,7 @@ pub async fn run(
                 cost_tracker.as_ref(),
                 Some(&config.cost.prices),
                 cosmic_gate.as_ref(),
+                cosmic_ws,
             )
             .await
             {

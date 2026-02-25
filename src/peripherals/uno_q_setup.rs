@@ -8,7 +8,8 @@ const BRIDGE_APP_NAME: &str = "zeroclaw-uno-q-bridge";
 /// Deploy the Bridge app. If host is Some, scp from repo and ssh to start.
 /// If host is None, assume we're ON the Uno Q — use embedded files and start.
 pub fn setup_uno_q_bridge(host: Option<&str>) -> Result<()> {
-    let bridge_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let bridge_dir = std::env::current_dir()
+        .unwrap_or_default()
         .join("firmware")
         .join("zeroclaw-uno-q-bridge");
 

@@ -4,7 +4,6 @@
 //! Requires: cargo install probe-rs-tools --locked
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::process::Command;
 
 const CHIP: &str = "STM32F401RETx";
@@ -29,8 +28,7 @@ pub fn flash_nucleo_firmware() -> Result<()> {
         );
     }
 
-    // CARGO_MANIFEST_DIR = repo root (zeroclaw's Cargo.toml)
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = std::env::current_dir().unwrap_or_default();
     let firmware_dir = repo_root.join("firmware").join("zeroclaw-nucleo");
     if !firmware_dir.join("Cargo.toml").exists() {
         anyhow::bail!(
