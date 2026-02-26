@@ -15,6 +15,27 @@ type ThemeMode = "system" | "dark" | "light";
 type ResolvedTheme = "dark" | "light";
 type ReaderScale = "compact" | "comfortable" | "relaxed";
 type ReaderWidth = "normal" | "wide";
+type Journey =
+  | "start"
+  | "build"
+  | "integrate"
+  | "operate"
+  | "secure"
+  | "contribute"
+  | "reference"
+  | "hardware"
+  | "localize"
+  | "troubleshoot";
+type Audience =
+  | "newcomer"
+  | "builder"
+  | "operator"
+  | "security"
+  | "contributor"
+  | "integrator"
+  | "hardware";
+type DocKind = "guide" | "reference" | "runbook" | "policy" | "template" | "report";
+type GroupMode = "journey" | "section" | "kind" | "language";
 
 type ManifestDoc = {
   id: string;
@@ -23,8 +44,25 @@ type ManifestDoc = {
   summary: string;
   section: string;
   language: string;
+  journey: Journey;
+  audience: Audience;
+  kind: DocKind;
+  tags: string[];
+  readingMinutes: number;
+  startHere: boolean;
   sourceUrl: string;
 };
+
+type ManifestDocRaw = Omit<
+  ManifestDoc,
+  "journey" | "audience" | "kind" | "tags" | "readingMinutes" | "startHere"
+> &
+  Partial<
+    Pick<
+      ManifestDoc,
+      "journey" | "audience" | "kind" | "tags" | "readingMinutes" | "startHere"
+    >
+  >;
 
 type HeadingItem = {
   id: string;
@@ -41,10 +79,6 @@ type PaletteEntry = {
   run: () => void;
 };
 
-const docs = [...(manifestRaw as ManifestDoc[])].sort((a, b) =>
-  a.path.localeCompare(b.path)
-);
-
 const repoBase = "https://github.com/zeroclaw-labs/zeroclaw/blob/main";
 const rawBase = "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main";
 
@@ -57,6 +91,173 @@ const languageNames: Record<string, Localized> = {
   vi: { en: "Vietnamese", zh: "越南文" },
   el: { en: "Greek", zh: "希腊文" },
 };
+
+const journeyOrder: Journey[] = [
+  "start",
+  "build",
+  "integrate",
+  "operate",
+  "secure",
+  "contribute",
+  "reference",
+  "hardware",
+  "localize",
+  "troubleshoot",
+];
+
+const audienceOrder: Audience[] = [
+  "newcomer",
+  "builder",
+  "integrator",
+  "operator",
+  "security",
+  "contributor",
+  "hardware",
+];
+
+const kindOrder: DocKind[] = ["guide", "reference", "runbook", "policy", "template", "report"];
+
+const journeyNames: Record<Journey, Localized> = {
+  start: { en: "Start", zh: "起步" },
+  build: { en: "Build", zh: "构建" },
+  integrate: { en: "Integrate", zh: "集成" },
+  operate: { en: "Operate", zh: "运维" },
+  secure: { en: "Secure", zh: "安全" },
+  contribute: { en: "Contribute", zh: "贡献" },
+  reference: { en: "Reference", zh: "参考" },
+  hardware: { en: "Hardware", zh: "硬件" },
+  localize: { en: "Localization", zh: "多语言" },
+  troubleshoot: { en: "Troubleshoot", zh: "排障" },
+};
+
+const audienceNames: Record<Audience, Localized> = {
+  newcomer: { en: "Newcomer", zh: "新手" },
+  builder: { en: "Builder", zh: "开发者" },
+  integrator: { en: "Integrator", zh: "集成者" },
+  operator: { en: "Operator", zh: "运维" },
+  security: { en: "Security", zh: "安全" },
+  contributor: { en: "Contributor", zh: "贡献者" },
+  hardware: { en: "Hardware", zh: "硬件工程师" },
+};
+
+const kindNames: Record<DocKind, Localized> = {
+  guide: { en: "Guide", zh: "指南" },
+  reference: { en: "Reference", zh: "参考" },
+  runbook: { en: "Runbook", zh: "运行手册" },
+  policy: { en: "Policy", zh: "策略规范" },
+  template: { en: "Template", zh: "模板" },
+  report: { en: "Report", zh: "报告" },
+};
+
+const readingPaths: Array<{
+  id: string;
+  label: Localized;
+  detail: Localized;
+  filters: Partial<{
+    journey: Journey;
+    audience: Audience;
+    kind: DocKind;
+    section: string;
+  }>;
+}> = [
+  {
+    id: "newcomer",
+    label: { en: "New to ZeroClaw", zh: "初次了解 ZeroClaw" },
+    detail: {
+      en: "Onboarding and first successful run in the shortest path.",
+      zh: "最短路径完成安装、配置和首个可运行实例。",
+    },
+    filters: { journey: "start", audience: "newcomer" },
+  },
+  {
+    id: "builder",
+    label: { en: "Build & Extend", zh: "开发与扩展" },
+    detail: {
+      en: "Commands, config, providers, channels, and architecture references.",
+      zh: "命令、配置、Provider、Channel 与架构参考。",
+    },
+    filters: { journey: "build", audience: "builder" },
+  },
+  {
+    id: "operate",
+    label: { en: "Operate in Production", zh: "生产运维" },
+    detail: {
+      en: "Runbooks, CI/CD gates, release flow, and observability checks.",
+      zh: "运行手册、CI/CD 门禁、发布流程与可观测性校验。",
+    },
+    filters: { journey: "operate", audience: "operator" },
+  },
+  {
+    id: "secure",
+    label: { en: "Security Hardening", zh: "安全强化" },
+    detail: {
+      en: "Sandboxing, advisories, and secure runtime baseline.",
+      zh: "沙箱、安全公告与安全运行时基线。",
+    },
+    filters: { journey: "secure", audience: "security" },
+  },
+  {
+    id: "integrate",
+    label: { en: "Integrations", zh: "外部集成" },
+    detail: {
+      en: "Connect ZeroClaw with chat platforms and external providers.",
+      zh: "将 ZeroClaw 接入聊天平台与外部模型能力。",
+    },
+    filters: { journey: "integrate", audience: "integrator" },
+  },
+  {
+    id: "contribute",
+    label: { en: "Contribute", zh: "贡献流程" },
+    detail: {
+      en: "Contributor workflow, reviews, and collaboration playbooks.",
+      zh: "贡献者流程、评审规范与协作手册。",
+    },
+    filters: { journey: "contribute", audience: "contributor" },
+  },
+];
+
+function asJourney(value: string | undefined): Journey {
+  const candidate = (value ?? "").toLowerCase() as Journey;
+  return journeyOrder.includes(candidate) ? candidate : "build";
+}
+
+function asAudience(value: string | undefined): Audience {
+  const candidate = (value ?? "").toLowerCase() as Audience;
+  return audienceOrder.includes(candidate) ? candidate : "builder";
+}
+
+function asKind(value: string | undefined): DocKind {
+  const candidate = (value ?? "").toLowerCase() as DocKind;
+  return kindOrder.includes(candidate) ? candidate : "guide";
+}
+
+function normalizeManifestDoc(doc: ManifestDocRaw): ManifestDoc {
+  const summary = doc.summary?.trim() || "Project documentation.";
+  const tags = Array.isArray(doc.tags)
+    ? doc.tags
+        .map((tag) => tag.trim().toLowerCase())
+        .filter((tag) => tag.length > 0)
+        .slice(0, 8)
+    : [];
+
+  return {
+    ...doc,
+    summary,
+    journey: asJourney(doc.journey),
+    audience: asAudience(doc.audience),
+    kind: asKind(doc.kind),
+    tags,
+    readingMinutes:
+      typeof doc.readingMinutes === "number" && Number.isFinite(doc.readingMinutes)
+        ? Math.max(1, Math.round(doc.readingMinutes))
+        : 1,
+    startHere: Boolean(doc.startHere),
+  };
+}
+
+const docs = [...(manifestRaw as ManifestDocRaw[])]
+  .map((doc) => normalizeManifestDoc(doc))
+  .sort((a, b) => a.path.localeCompare(b.path));
 
 const copy = {
   en: {
@@ -81,11 +282,39 @@ const copy = {
     docsIndexed: "Indexed",
     docsFiltered: "Filtered",
     docsActive: "Active",
+    readingPathsTitle: "Reading paths",
+    readingPathsLead:
+      "Choose a task-oriented route first, then drill down with taxonomy filters.",
+    startHereTitle: "Start here",
+    startHereLead:
+      "Core docs for first-time users who want the fastest reliable onboarding.",
+    noStartHere: "No starter docs matched the current language/filter context.",
+    startBadge: "Starter",
     sectionFilter: "Section",
     languageFilter: "Language",
+    journeyFilter: "Journey",
+    audienceFilter: "Audience",
+    kindFilter: "Doc type",
+    groupBy: "Group by",
+    allJourneys: "All journeys",
+    allAudiences: "All audiences",
+    allKinds: "All doc types",
+    groupJourney: "Journey",
+    groupSection: "Section",
+    groupKind: "Doc type",
+    groupLanguage: "Language",
+    resetFilters: "Reset filters",
     search: "Search docs by title, path, summary, or keyword",
     commandPalette: "Command palette",
     sourceLabel: "Source",
+    docJourney: "Journey",
+    docAudience: "Audience",
+    docKind: "Type",
+    docReadTime: "Read time",
+    docTags: "Tags",
+    minuteUnit: "min",
+    relatedDocs: "Related docs",
+    noRelated: "No strongly related docs found yet.",
     openOnGithub: "Open on GitHub",
     openRaw: "Open raw",
     loading: "Loading document...",
@@ -134,11 +363,37 @@ const copy = {
     docsIndexed: "总文档",
     docsFiltered: "筛选后",
     docsActive: "当前文档",
+    readingPathsTitle: "阅读路径",
+    readingPathsLead: "先按任务路径进入，再用分类筛选做深入浏览。",
+    startHereTitle: "新手起步",
+    startHereLead: "面向首次接触 ZeroClaw 的核心文档，快速完成有效上手。",
+    noStartHere: "当前语言/筛选条件下暂无起步文档。",
+    startBadge: "起步",
     sectionFilter: "分组",
     languageFilter: "语言",
+    journeyFilter: "阶段路径",
+    audienceFilter: "适用角色",
+    kindFilter: "文档类型",
+    groupBy: "分组方式",
+    allJourneys: "全部路径",
+    allAudiences: "全部角色",
+    allKinds: "全部类型",
+    groupJourney: "按路径",
+    groupSection: "按目录",
+    groupKind: "按类型",
+    groupLanguage: "按语言",
+    resetFilters: "重置筛选",
     search: "按标题、路径、摘要或关键字搜索",
     commandPalette: "命令面板",
     sourceLabel: "来源",
+    docJourney: "阶段",
+    docAudience: "角色",
+    docKind: "类型",
+    docReadTime: "阅读时长",
+    docTags: "标签",
+    minuteUnit: "分钟",
+    relatedDocs: "相关推荐",
+    noRelated: "暂未找到高相关文档。",
     openOnGithub: "在 GitHub 打开",
     openRaw: "打开原文",
     loading: "文档加载中...",
@@ -340,6 +595,48 @@ function formatLanguage(language: string, locale: Locale): string {
   return language;
 }
 
+function formatJourney(journey: Journey, locale: Locale): string {
+  return journeyNames[journey][locale];
+}
+
+function formatAudience(audience: Audience, locale: Locale): string {
+  return audienceNames[audience][locale];
+}
+
+function formatKind(kind: DocKind, locale: Locale): string {
+  return kindNames[kind][locale];
+}
+
+function groupLabel(groupBy: GroupMode, key: string, locale: Locale) {
+  if (groupBy === "journey") {
+    return formatJourney(asJourney(key), locale);
+  }
+  if (groupBy === "kind") {
+    return formatKind(asKind(key), locale);
+  }
+  if (groupBy === "language") {
+    return formatLanguage(key, locale);
+  }
+  return inferSectionLabel(key, locale);
+}
+
+function groupOrderIndex(groupBy: GroupMode, key: string): number {
+  if (groupBy === "journey") {
+    return journeyOrder.indexOf(asJourney(key));
+  }
+  if (groupBy === "kind") {
+    return kindOrder.indexOf(asKind(key));
+  }
+  if (groupBy === "language") {
+    return key === "en" ? -1 : 0;
+  }
+  if (groupBy === "section") {
+    if (key === "root") return -2;
+    if (key === "docs") return -1;
+  }
+  return 999;
+}
+
 function canonicalDocPath(candidate: string, docSet: Set<string>): string | null {
   const normalized = normalizePath(candidate);
   const attempts = new Set<string>([normalized]);
@@ -424,6 +721,11 @@ export default function App(): JSX.Element {
   const [query, setQuery] = useState("");
   const [sectionFilter, setSectionFilter] = useState("all");
   const [languageFilter, setLanguageFilter] = useState("all");
+  const [journeyFilter, setJourneyFilter] = useState<Journey | "all">("all");
+  const [audienceFilter, setAudienceFilter] = useState<Audience | "all">("all");
+  const [kindFilter, setKindFilter] = useState<DocKind | "all">("all");
+  const [groupBy, setGroupBy] = useState<GroupMode>("journey");
+  const [activePathway, setActivePathway] = useState<string | null>(null);
 
   const [markdownCache, setMarkdownCache] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
@@ -478,6 +780,21 @@ export default function App(): JSX.Element {
     []
   );
 
+  const journeyOptions = useMemo(
+    () => ["all", ...journeyOrder.filter((journey) => docs.some((doc) => doc.journey === journey))],
+    []
+  );
+
+  const audienceOptions = useMemo(
+    () => ["all", ...audienceOrder.filter((audience) => docs.some((doc) => doc.audience === audience))],
+    []
+  );
+
+  const kindOptions = useMemo(
+    () => ["all", ...kindOrder.filter((kind) => docs.some((doc) => doc.kind === kind))],
+    []
+  );
+
   const filteredDocs = useMemo(() => {
     const needle = query.trim().toLowerCase();
 
@@ -487,6 +804,18 @@ export default function App(): JSX.Element {
       }
 
       if (languageFilter !== "all" && doc.language !== languageFilter) {
+        return false;
+      }
+
+      if (journeyFilter !== "all" && doc.journey !== journeyFilter) {
+        return false;
+      }
+
+      if (audienceFilter !== "all" && doc.audience !== audienceFilter) {
+        return false;
+      }
+
+      if (kindFilter !== "all" && doc.kind !== kindFilter) {
         return false;
       }
 
@@ -500,13 +829,60 @@ export default function App(): JSX.Element {
         doc.path,
         doc.section,
         doc.language,
+        doc.journey,
+        doc.audience,
+        doc.kind,
+        doc.tags.join(" "),
       ]
         .join(" ")
         .toLowerCase();
 
       return bag.includes(needle);
     });
-  }, [languageFilter, query, sectionFilter]);
+  }, [audienceFilter, journeyFilter, kindFilter, languageFilter, query, sectionFilter]);
+
+  const pathwayStats = useMemo(
+    () =>
+      readingPaths.map((pathway) => {
+        const total = docs.filter((doc) => {
+          if (pathway.filters.journey && doc.journey !== pathway.filters.journey) {
+            return false;
+          }
+          if (pathway.filters.audience && doc.audience !== pathway.filters.audience) {
+            return false;
+          }
+          if (pathway.filters.kind && doc.kind !== pathway.filters.kind) {
+            return false;
+          }
+          if (pathway.filters.section && doc.section !== pathway.filters.section) {
+            return false;
+          }
+          return true;
+        }).length;
+
+        return { ...pathway, total };
+      }),
+    []
+  );
+
+  const starterDocs = useMemo(() => {
+    const preferredLanguages = locale === "zh" ? ["zh-CN", "en"] : ["en"];
+
+    return docs
+      .filter((doc) => doc.startHere)
+      .map((doc) => {
+        const languageRank = preferredLanguages.indexOf(doc.language);
+        return {
+          ...doc,
+          _rank:
+            (languageRank === -1 ? 9 : languageRank) * 100 +
+            journeyOrder.indexOf(doc.journey) * 10 +
+            doc.readingMinutes,
+        };
+      })
+      .sort((a, b) => a._rank - b._rank)
+      .slice(0, 8);
+  }, [locale]);
 
   const docsByPath = useMemo(() => new Map(docs.map((doc) => [doc.path, doc])), []);
 
@@ -639,14 +1015,35 @@ export default function App(): JSX.Element {
     const grouped = new Map<string, ManifestDoc[]>();
 
     for (const doc of filteredDocs) {
-      if (!grouped.has(doc.section)) {
-        grouped.set(doc.section, []);
+      const key =
+        groupBy === "journey"
+          ? doc.journey
+          : groupBy === "kind"
+            ? doc.kind
+            : groupBy === "language"
+              ? doc.language
+              : doc.section;
+
+      if (!grouped.has(key)) {
+        grouped.set(key, []);
       }
-      grouped.get(doc.section)?.push(doc);
+      grouped.get(key)?.push(doc);
     }
 
-    return [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  }, [filteredDocs]);
+    return [...grouped.entries()]
+      .map(([key, entries]) => [
+        key,
+        [...entries].sort((a, b) => a.title.localeCompare(b.title)),
+      ] as const)
+      .sort((a, b) => {
+        const aIndex = groupOrderIndex(groupBy, a[0]);
+        const bIndex = groupOrderIndex(groupBy, b[0]);
+        if (aIndex !== bIndex) {
+          return aIndex - bIndex;
+        }
+        return groupLabel(groupBy, a[0], locale).localeCompare(groupLabel(groupBy, b[0], locale));
+      });
+  }, [filteredDocs, groupBy, locale]);
 
   const currentIndex = filteredDocs.findIndex((doc) => doc.path === activePath);
   const previousDoc = currentIndex > 0 ? filteredDocs[currentIndex - 1] : null;
@@ -654,6 +1051,43 @@ export default function App(): JSX.Element {
     currentIndex >= 0 && currentIndex < filteredDocs.length - 1
       ? filteredDocs[currentIndex + 1]
       : null;
+
+  const relatedDocs = useMemo(() => {
+    if (!selectedDoc) {
+      return [];
+    }
+
+    const selectedTags = new Set(selectedDoc.tags);
+
+    return docs
+      .filter((doc) => doc.path !== selectedDoc.path)
+      .map((doc) => {
+        let score = 0;
+
+        if (doc.journey === selectedDoc.journey) score += 4;
+        if (doc.audience === selectedDoc.audience) score += 3;
+        if (doc.kind === selectedDoc.kind) score += 2;
+        if (doc.section === selectedDoc.section) score += 2;
+        if (doc.language === selectedDoc.language) score += 1;
+
+        const sharedTags = doc.tags.filter((tag) => selectedTags.has(tag)).length;
+        score += sharedTags * 2;
+
+        return { doc, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => {
+        if (b.score !== a.score) {
+          return b.score - a.score;
+        }
+        if (a.doc.readingMinutes !== b.doc.readingMinutes) {
+          return a.doc.readingMinutes - b.doc.readingMinutes;
+        }
+        return a.doc.title.localeCompare(b.doc.title);
+      })
+      .slice(0, 8)
+      .map((entry) => entry.doc);
+  }, [selectedDoc]);
 
   const openDoc = (docPath: string, anchor = ""): void => {
     if (!docSet.has(docPath)) {
@@ -680,6 +1114,33 @@ export default function App(): JSX.Element {
 
   const focusSearch = (): void => {
     docsSearchRef.current?.focus();
+  };
+
+  const applyPathway = (pathwayId: string): void => {
+    const pathway = readingPaths.find((entry) => entry.id === pathwayId);
+    if (!pathway) {
+      return;
+    }
+
+    setActivePathway(pathway.id);
+    setQuery("");
+    setSectionFilter(pathway.filters.section ?? "all");
+    setLanguageFilter("all");
+    setJourneyFilter(pathway.filters.journey ?? "all");
+    setAudienceFilter(pathway.filters.audience ?? "all");
+    setKindFilter(pathway.filters.kind ?? "all");
+    setGroupBy("journey");
+  };
+
+  const resetFilters = (): void => {
+    setActivePathway(null);
+    setQuery("");
+    setSectionFilter("all");
+    setLanguageFilter("all");
+    setJourneyFilter("all");
+    setAudienceFilter("all");
+    setKindFilter("all");
+    setGroupBy("journey");
   };
 
   const paletteActions = useMemo(
@@ -728,7 +1189,17 @@ export default function App(): JSX.Element {
           return true;
         }
 
-        return [doc.title, doc.summary, doc.path, doc.section, doc.language]
+        return [
+          doc.title,
+          doc.summary,
+          doc.path,
+          doc.section,
+          doc.language,
+          doc.journey,
+          doc.audience,
+          doc.kind,
+          doc.tags.join(" "),
+        ]
           .join(" ")
           .toLowerCase()
           .includes(needle);
@@ -737,7 +1208,7 @@ export default function App(): JSX.Element {
       .map((doc) => ({
         id: `doc-${doc.id}`,
         label: doc.title,
-        hint: doc.path,
+        hint: `${formatJourney(doc.journey, locale)} · ${doc.path}`,
         run: () => {
           openDoc(doc.path);
           document
@@ -755,7 +1226,7 @@ export default function App(): JSX.Element {
     );
 
     return [...matchedActions, ...docEntries];
-  }, [docs, paletteActions, paletteQuery]);
+  }, [locale, paletteActions, paletteQuery]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
@@ -937,21 +1408,137 @@ export default function App(): JSX.Element {
             <span>
               {text.docsActive}: <strong>{selectedDoc.title}</strong>
             </span>
+            {activePathway ? (
+              <span>
+                {text.readingPathsTitle}:{" "}
+                <strong>
+                  {readingPaths.find((entry) => entry.id === activePathway)?.label[locale] ?? "-"}
+                </strong>
+              </span>
+            ) : null}
           </div>
+
+          <section className="pathway-shell" aria-label={text.readingPathsTitle}>
+            <header className="pathway-head">
+              <h3>{text.readingPathsTitle}</h3>
+              <p>{text.readingPathsLead}</p>
+            </header>
+            <div className="pathway-grid">
+              {pathwayStats.map((pathway) => (
+                <button
+                  key={pathway.id}
+                  type="button"
+                  className={`pathway-card ${activePathway === pathway.id ? "active" : ""}`}
+                  onClick={() => applyPathway(pathway.id)}
+                >
+                  <span className="pathway-title">{pathway.label[locale]}</span>
+                  <span className="pathway-detail">{pathway.detail[locale]}</span>
+                  <span className="pathway-count">{pathway.total}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="starter-shell" aria-label={text.startHereTitle}>
+            <header className="starter-head">
+              <h3>{text.startHereTitle}</h3>
+              <p>{text.startHereLead}</p>
+            </header>
+            <div className="starter-list">
+              {starterDocs.length === 0 ? (
+                <p className="empty-hint">{text.noStartHere}</p>
+              ) : (
+                starterDocs.map((doc) => (
+                  <button
+                    key={doc.id}
+                    type="button"
+                    className={`starter-item ${doc.path === activePath ? "active" : ""}`}
+                    onClick={() => openDoc(doc.path)}
+                  >
+                    <span className="starter-title">{doc.title}</span>
+                    <span className="starter-meta">
+                      {formatJourney(doc.journey, locale)} · {doc.readingMinutes}
+                      {text.minuteUnit}
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+          </section>
 
           <div className="docs-toolbar">
             <input
               ref={docsSearchRef}
               type="search"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                setActivePathway(null);
+                setQuery(event.target.value);
+              }}
               placeholder={text.search}
               aria-label={text.search}
             />
 
             <select
+              value={journeyFilter}
+              onChange={(event) => {
+                setActivePathway(null);
+                setJourneyFilter(event.target.value as Journey | "all");
+              }}
+              aria-label={text.journeyFilter}
+            >
+              <option value="all">{text.allJourneys}</option>
+              {journeyOptions
+                .filter((journey) => journey !== "all")
+                .map((journey) => (
+                  <option key={journey} value={journey}>
+                    {formatJourney(journey as Journey, locale)}
+                  </option>
+                ))}
+            </select>
+
+            <select
+              value={audienceFilter}
+              onChange={(event) => {
+                setActivePathway(null);
+                setAudienceFilter(event.target.value as Audience | "all");
+              }}
+              aria-label={text.audienceFilter}
+            >
+              <option value="all">{text.allAudiences}</option>
+              {audienceOptions
+                .filter((audience) => audience !== "all")
+                .map((audience) => (
+                  <option key={audience} value={audience}>
+                    {formatAudience(audience as Audience, locale)}
+                  </option>
+                ))}
+            </select>
+
+            <select
+              value={kindFilter}
+              onChange={(event) => {
+                setActivePathway(null);
+                setKindFilter(event.target.value as DocKind | "all");
+              }}
+              aria-label={text.kindFilter}
+            >
+              <option value="all">{text.allKinds}</option>
+              {kindOptions
+                .filter((kind) => kind !== "all")
+                .map((kind) => (
+                  <option key={kind} value={kind}>
+                    {formatKind(kind as DocKind, locale)}
+                  </option>
+                ))}
+            </select>
+
+            <select
               value={sectionFilter}
-              onChange={(event) => setSectionFilter(event.target.value)}
+              onChange={(event) => {
+                setActivePathway(null);
+                setSectionFilter(event.target.value);
+              }}
               aria-label={text.sectionFilter}
             >
               <option value="all">{text.allSections}</option>
@@ -966,7 +1553,10 @@ export default function App(): JSX.Element {
 
             <select
               value={languageFilter}
-              onChange={(event) => setLanguageFilter(event.target.value)}
+              onChange={(event) => {
+                setActivePathway(null);
+                setLanguageFilter(event.target.value);
+              }}
               aria-label={text.languageFilter}
             >
               <option value="all">{text.allLanguages}</option>
@@ -979,6 +1569,21 @@ export default function App(): JSX.Element {
                 ))}
             </select>
 
+            <select
+              value={groupBy}
+              onChange={(event) => setGroupBy(event.target.value as GroupMode)}
+              aria-label={text.groupBy}
+            >
+              <option value="journey">{text.groupJourney}</option>
+              <option value="section">{text.groupSection}</option>
+              <option value="kind">{text.groupKind}</option>
+              <option value="language">{text.groupLanguage}</option>
+            </select>
+
+            <button type="button" className="btn ghost" onClick={resetFilters}>
+              {text.resetFilters}
+            </button>
+
             <button type="button" className="btn ghost" onClick={() => setPaletteOpen(true)}>
               {text.commandPalette}
             </button>
@@ -989,9 +1594,9 @@ export default function App(): JSX.Element {
               {filteredDocs.length === 0 ? (
                 <p className="empty-hint">{text.empty}</p>
               ) : (
-                groupedDocs.map(([section, sectionDocs]) => (
-                  <section key={section} className="doc-group">
-                    <h3>{inferSectionLabel(section, locale)}</h3>
+                groupedDocs.map(([groupKey, sectionDocs]) => (
+                  <section key={groupKey} className="doc-group">
+                    <h3>{groupLabel(groupBy, groupKey, locale)}</h3>
                     <div>
                       {sectionDocs.map((doc) => {
                         const isActive = doc.path === activePath;
@@ -1003,10 +1608,20 @@ export default function App(): JSX.Element {
                             onClick={() => openDoc(doc.path)}
                           >
                             <span className="doc-meta">
-                              {formatLanguage(doc.language, locale)}
+                              <span>{formatLanguage(doc.language, locale)}</span>
+                              <span>{formatJourney(doc.journey, locale)}</span>
+                              <span>{formatKind(doc.kind, locale)}</span>
                             </span>
                             <span className="doc-title">{doc.title}</span>
                             <span className="doc-summary">{doc.summary}</span>
+                            <span className="doc-chip-row">
+                              <span className="doc-chip">{formatAudience(doc.audience, locale)}</span>
+                              <span className="doc-chip">
+                                {doc.readingMinutes}
+                                {text.minuteUnit}
+                              </span>
+                              {doc.startHere ? <span className="doc-chip">{text.startBadge}</span> : null}
+                            </span>
                             <span className="doc-path">{doc.path}</span>
                           </button>
                         );
@@ -1021,8 +1636,38 @@ export default function App(): JSX.Element {
               <header className="reader-head">
                 <div>
                   <p>{text.sourceLabel}</p>
+                  <div className="doc-breadcrumb">
+                    <span>{formatJourney(selectedDoc.journey, locale)}</span>
+                    <span>/</span>
+                    <span>{inferSectionLabel(selectedDoc.section, locale)}</span>
+                    <span>/</span>
+                    <span>{selectedDoc.title}</span>
+                  </div>
                   <h3>{selectedDoc.title}</h3>
                   <code>{activePath}</code>
+                  <div className="reader-meta-line">
+                    <span>
+                      {text.docJourney}: <strong>{formatJourney(selectedDoc.journey, locale)}</strong>
+                    </span>
+                    <span>
+                      {text.docAudience}:{" "}
+                      <strong>{formatAudience(selectedDoc.audience, locale)}</strong>
+                    </span>
+                    <span>
+                      {text.docKind}: <strong>{formatKind(selectedDoc.kind, locale)}</strong>
+                    </span>
+                    <span>
+                      {text.docReadTime}: <strong>{selectedDoc.readingMinutes}</strong>{" "}
+                      {text.minuteUnit}
+                    </span>
+                  </div>
+                  {selectedDoc.tags.length > 0 ? (
+                    <div className="reader-tags" aria-label={text.docTags}>
+                      {selectedDoc.tags.map((tag) => (
+                        <span key={tag}>{tag}</span>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <div className="reader-actions">
                   <a href={withRepo(activePath)} target="_blank" rel="noreferrer">
@@ -1201,6 +1846,25 @@ export default function App(): JSX.Element {
                       </li>
                     ))}
                   </ul>
+                )}
+              </section>
+
+              <section className="side-card">
+                <h3>{text.relatedDocs}</h3>
+                {relatedDocs.length === 0 ? (
+                  <p>{text.noRelated}</p>
+                ) : (
+                  <div className="related-list">
+                    {relatedDocs.map((doc) => (
+                      <button key={doc.id} type="button" onClick={() => openDoc(doc.path)}>
+                        <span>{doc.title}</span>
+                        <small>
+                          {formatJourney(doc.journey, locale)} · {doc.readingMinutes}
+                          {text.minuteUnit}
+                        </small>
+                      </button>
+                    ))}
+                  </div>
                 )}
               </section>
 
