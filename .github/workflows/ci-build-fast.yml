@@ -42,7 +42,7 @@ jobs:
     build-fast:
         name: Build (Fast)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true' || needs.changes.outputs.workflow_changed == 'true'
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 25
         steps:
