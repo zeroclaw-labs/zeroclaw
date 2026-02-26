@@ -1,53 +1,55 @@
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap");
-
 :root {
   color-scheme: dark;
 
-  --bg: #05070d;
-  --bg-elevated: #0a101b;
-  --bg-panel: #0f1727;
-  --bg-soft: rgba(14, 22, 38, 0.75);
+  --bg: #050505;
+  --bg-elevated: #0a0a0b;
+  --bg-surface: #0f1012;
+  --bg-soft: #111319;
 
-  --line: rgba(166, 185, 217, 0.2);
-  --line-strong: rgba(96, 165, 250, 0.45);
-  --text: #e8edf9;
-  --text-soft: #adbad3;
-  --text-muted: #8797b5;
+  --line: #26282e;
+  --line-soft: #1b1d23;
+  --line-strong: #3b82f6;
 
-  --accent: #5fa7ff;
-  --accent-strong: #3b82f6;
-  --accent-soft: rgba(95, 167, 255, 0.18);
+  --text: #f5f7fa;
+  --text-soft: #d4d9e3;
+  --text-muted: #99a2b2;
 
-  --shadow-panel: 0 20px 60px rgba(2, 6, 18, 0.55);
-  --shadow-soft: 0 10px 28px rgba(2, 6, 18, 0.4);
+  --accent: #60a5fa;
+  --accent-solid: #2563eb;
+  --accent-soft: rgba(96, 165, 250, 0.14);
 
-  --radius-xl: 22px;
-  --radius-l: 16px;
-  --radius-m: 12px;
+  --radius-xl: 16px;
+  --radius-l: 12px;
+  --radius-m: 10px;
 
-  --container: min(1220px, calc(100% - 2.2rem));
+  --shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.36);
+
+  --container: min(1240px, calc(100% - 2rem));
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
 
-  --bg: #f4f7fc;
+  --bg: #f3f5f8;
   --bg-elevated: #ffffff;
-  --bg-panel: #f8fbff;
-  --bg-soft: rgba(255, 255, 255, 0.78);
+  --bg-surface: #f7f9fc;
+  --bg-soft: #eef2f8;
 
-  --line: rgba(30, 58, 95, 0.18);
-  --line-strong: rgba(59, 130, 246, 0.42);
-  --text: #0f1b2d;
-  --text-soft: #22324d;
-  --text-muted: #5d6e8f;
+  --line: #d8dce6;
+  --line-soft: #e7ebf2;
+  --line-strong: #2563eb;
+
+  --text: #0f172a;
+  --text-soft: #1e293b;
+  --text-muted: #5b6578;
 
   --accent: #2563eb;
-  --accent-strong: #1d4ed8;
+  --accent-solid: #1d4ed8;
   --accent-soft: rgba(37, 99, 235, 0.12);
 
-  --shadow-panel: 0 18px 40px rgba(14, 37, 66, 0.15);
-  --shadow-soft: 0 10px 24px rgba(14, 37, 66, 0.12);
+  --shadow-lg: 0 12px 28px rgba(15, 23, 42, 0.12);
+  --shadow-md: 0 5px 16px rgba(15, 23, 42, 0.1);
 }
 
 * {
@@ -62,23 +64,20 @@ body,
 }
 
 body {
-  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-family: "Geist Sans", "IBM Plex Sans", "Segoe UI", sans-serif;
   color: var(--text-soft);
-  background:
-    radial-gradient(circle at 8% 0%, rgba(56, 138, 255, 0.2), transparent 38%),
-    radial-gradient(circle at 88% 12%, rgba(140, 168, 215, 0.18), transparent 36%),
-    linear-gradient(170deg, var(--bg), #050b16 55%, var(--bg-elevated));
-  background-attachment: fixed;
-  line-height: 1.62;
+  background: radial-gradient(circle at 8% 0%, rgba(37, 99, 235, 0.18), transparent 36%),
+    radial-gradient(circle at 92% 12%, rgba(96, 165, 250, 0.14), transparent 34%),
+    var(--bg);
+  line-height: 1.58;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
 :root[data-theme="light"] body {
-  background:
-    radial-gradient(circle at 8% 0%, rgba(37, 99, 235, 0.12), transparent 42%),
-    radial-gradient(circle at 88% 12%, rgba(125, 163, 255, 0.18), transparent 40%),
-    linear-gradient(170deg, #eef4ff, #f8fbff 62%, #eef4ff);
+  background: radial-gradient(circle at 8% 0%, rgba(37, 99, 235, 0.1), transparent 40%),
+    radial-gradient(circle at 92% 12%, rgba(125, 163, 255, 0.1), transparent 38%),
+    var(--bg);
 }
 
 a {
@@ -104,44 +103,58 @@ input:focus-visible {
 
 .zc-app {
   min-height: 100vh;
+  position: relative;
+}
+
+.zc-app::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  background-image: linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: radial-gradient(circle at 50% 30%, black 34%, transparent 78%);
+  opacity: 0.45;
 }
 
 .topbar {
   position: sticky;
   top: 0;
   z-index: 40;
-  backdrop-filter: blur(14px);
-  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(10px);
+  background: color-mix(in srgb, var(--bg) 84%, transparent);
   border-bottom: 1px solid var(--line);
 }
 
 .topbar-inner {
   width: var(--container);
   margin: 0 auto;
-  min-height: 72px;
+  min-height: 66px;
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 0.9rem;
 }
 
 .brand {
-  font-family: "Sora", sans-serif;
-  font-size: 1.05rem;
-  letter-spacing: 0.02em;
   color: var(--text);
-  margin-right: 1.2rem;
+  font-size: 1rem;
+  letter-spacing: 0.01em;
+  font-weight: 600;
+  margin-right: 1rem;
 }
 
 .top-nav {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 0.9rem;
 }
 
 .top-nav a {
   color: var(--text-muted);
-  font-size: 0.92rem;
-  transition: color 180ms ease;
+  font-size: 0.88rem;
+  transition: color 140ms ease;
 }
 
 .top-nav a:hover {
@@ -152,16 +165,15 @@ input:focus-visible {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.48rem;
 }
 
 .segmented {
   display: inline-flex;
-  align-items: center;
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 2px;
-  background: var(--bg-soft);
+  background: color-mix(in srgb, var(--bg-soft) 88%, transparent 12%);
 }
 
 .segmented button {
@@ -169,197 +181,308 @@ input:focus-visible {
   background: transparent;
   color: var(--text-muted);
   border-radius: 999px;
-  padding: 0.28rem 0.62rem;
-  font-size: 0.76rem;
-  text-transform: uppercase;
+  font-size: 0.72rem;
   letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.28rem 0.58rem;
 }
 
 .segmented button.active {
   color: var(--text);
-  background: var(--accent-soft);
+  background: color-mix(in srgb, var(--accent-soft) 85%, transparent);
 }
 
 .palette-trigger {
   border: 1px solid var(--line);
-  background: var(--bg-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-soft) 90%, transparent);
   color: var(--text-muted);
-  border-radius: 10px;
-  min-width: 54px;
-  padding: 0.35rem 0.65rem;
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 0.78rem;
+  min-width: 48px;
+  min-height: 32px;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
+  font-size: 0.72rem;
 }
 
 main {
   width: var(--container);
   margin: 0 auto;
-  padding: 2.4rem 0 3rem;
+  padding: 1.9rem 0 2.5rem;
 }
 
 .hero {
-  position: relative;
   border: 1px solid var(--line);
-  background: linear-gradient(145deg, var(--bg-panel), color-mix(in srgb, var(--bg-panel) 82%, #040912 18%));
   border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-panel);
-  overflow: hidden;
-  isolation: isolate;
-}
-
-.hero::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background:
-    linear-gradient(120deg, transparent 20%, rgba(95, 167, 255, 0.14) 50%, transparent 80%),
-    linear-gradient(0deg, transparent 55%, rgba(255, 255, 255, 0.02) 100%);
-  pointer-events: none;
+  background: linear-gradient(165deg, var(--bg-surface), color-mix(in srgb, var(--bg-elevated) 90%, #000 10%));
+  box-shadow: var(--shadow-lg);
 }
 
 .hero-inner {
-  position: relative;
-  padding: clamp(2rem, 4vw, 3.3rem);
+  padding: clamp(1.2rem, 2.4vw, 2.2rem);
+}
+
+.hero-layout {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1.38fr) minmax(320px, 0.92fr);
+  align-items: start;
 }
 
 .eyebrow {
   margin: 0;
-  font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
   color: var(--accent);
-  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.74rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
 }
 
 .hero h1 {
-  margin: 0.8rem 0 1rem;
-  font-family: "Sora", sans-serif;
-  line-height: 1.12;
-  font-size: clamp(1.9rem, 4vw, 3.2rem);
+  margin: 0.7rem 0 0.9rem;
   color: var(--text);
-  max-width: 19ch;
+  max-width: 18ch;
+  font-size: clamp(1.8rem, 3.1vw, 2.9rem);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
 }
 
 .lead {
   margin: 0;
-  font-size: clamp(1rem, 1.4vw, 1.16rem);
   color: var(--text-soft);
-  max-width: 66ch;
+  max-width: 64ch;
 }
 
 .lead.muted {
-  margin-top: 0.25rem;
+  margin-top: 0.24rem;
   color: var(--text-muted);
 }
 
 .hero-cta {
   display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  margin-top: 1.4rem;
   flex-wrap: wrap;
+  align-items: center;
+  gap: 0.62rem;
+  margin-top: 1.05rem;
 }
 
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 12px;
-  min-height: 42px;
-  padding: 0 1rem;
   border: 1px solid var(--line);
-  transition:
-    transform 180ms ease,
-    background-color 180ms ease,
-    color 180ms ease,
-    border-color 180ms ease;
-}
-
-.btn:hover {
-  transform: translateY(-1px);
+  border-radius: 9px;
+  min-height: 40px;
+  padding: 0 0.92rem;
+  font-size: 0.9rem;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
 }
 
 .btn.primary {
-  border-color: var(--accent-strong);
-  color: #ffffff;
-  background: linear-gradient(120deg, var(--accent-strong), #1e40af);
+  border-color: color-mix(in srgb, var(--accent-solid) 80%, #0b1220 20%);
+  background: linear-gradient(120deg, var(--accent-solid), #1f5af0);
+  color: #fff;
 }
 
 .btn.ghost {
-  background: var(--bg-soft);
+  background: color-mix(in srgb, var(--bg-soft) 92%, transparent 8%);
   color: var(--text-soft);
 }
 
+.btn:hover {
+  border-color: var(--line-strong);
+}
+
 .notice {
-  margin: 1.2rem 0 0;
-  max-width: 74ch;
+  margin: 1rem 0 0;
   color: var(--text-muted);
-  font-size: 0.92rem;
+  max-width: 72ch;
+  font-size: 0.9rem;
+}
+
+.hero-terminal {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-l);
+  background: color-mix(in srgb, var(--bg) 84%, transparent 16%);
+  overflow: hidden;
+}
+
+.hero-terminal header {
+  padding: 0.82rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg-soft) 88%, transparent 12%);
+}
+
+.hero-terminal h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.hero-terminal p {
+  margin: 0.2rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.hero-terminal ul {
+  list-style: none;
+  margin: 0;
+  padding: 0.35rem 0.5rem 0.5rem;
+}
+
+.hero-terminal li {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0.58rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.hero-terminal li + li {
+  margin-top: 0.26rem;
+}
+
+.hero-terminal li:hover {
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--accent-soft) 44%, transparent);
+}
+
+.hero-terminal code {
+  color: var(--text);
+  font-size: 0.78rem;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
+}
+
+.hero-terminal span {
+  color: var(--text-muted);
+  font-size: 0.8rem;
 }
 
 .metrics {
-  margin-top: 1.5rem;
+  margin-top: 1rem;
   display: grid;
+  gap: 0.56rem;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.7rem;
 }
 
 .metric-card {
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--bg-soft) 85%, transparent);
-  padding: 0.9rem;
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--bg-soft) 84%, transparent);
+  padding: 0.72rem 0.76rem;
 }
 
 .metric-label {
   margin: 0;
   color: var(--text-muted);
-  font-size: 0.8rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
 }
 
 .metric-value {
-  margin: 0.2rem 0 0;
+  margin: 0.24rem 0 0;
   color: var(--text);
-  font-family: "Sora", sans-serif;
-  font-size: 1.22rem;
+  font-size: 1.08rem;
+  font-weight: 600;
+}
+
+.principles {
+  margin-top: 1rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.92rem;
+}
+
+.principles > h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.98rem;
+  letter-spacing: 0.01em;
+}
+
+.principles-grid {
+  margin-top: 0.64rem;
+  display: grid;
+  gap: 0.56rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.principle-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--bg-soft) 75%, transparent);
+  padding: 0.72rem;
+}
+
+.principle-card h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.92rem;
+}
+
+.principle-card p {
+  margin: 0.36rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.84rem;
 }
 
 .docs-shell {
-  margin-top: 1.4rem;
+  margin-top: 1rem;
   border: 1px solid var(--line);
   border-radius: var(--radius-xl);
-  background: color-mix(in srgb, var(--bg-panel) 88%, transparent 12%);
-  box-shadow: var(--shadow-panel);
-  padding: 1.3rem;
+  background: color-mix(in srgb, var(--bg-surface) 94%, transparent);
+  box-shadow: var(--shadow-lg);
+  padding: 1rem;
 }
 
 .docs-head h2 {
   margin: 0;
   color: var(--text);
-  font-size: clamp(1.25rem, 1.8vw, 1.6rem);
-  font-family: "Sora", sans-serif;
+  font-size: clamp(1.18rem, 1.8vw, 1.5rem);
+  letter-spacing: -0.01em;
 }
 
 .docs-head p {
-  margin: 0.38rem 0 0;
+  margin: 0.36rem 0 0;
   color: var(--text-muted);
+  max-width: 76ch;
+}
+
+.workspace-meta {
+  margin-top: 0.72rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.48rem;
+}
+
+.workspace-meta span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.28rem 0.68rem;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--bg-soft) 76%, transparent);
+}
+
+.workspace-meta strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .docs-toolbar {
-  margin-top: 1rem;
+  margin-top: 0.72rem;
   display: flex;
-  gap: 0.75rem;
+  gap: 0.56rem;
 }
 
 .docs-toolbar input {
   flex: 1;
   min-width: 0;
-  min-height: 44px;
-  border-radius: 12px;
+  min-height: 42px;
+  border-radius: 9px;
   border: 1px solid var(--line);
-  background: color-mix(in srgb, var(--bg) 70%, transparent 30%);
+  background: color-mix(in srgb, var(--bg) 76%, transparent);
   color: var(--text);
-  padding: 0 0.95rem;
+  padding: 0 0.85rem;
 }
 
 .docs-toolbar input::placeholder {
@@ -367,40 +490,40 @@ main {
 }
 
 .category-row {
-  margin-top: 0.9rem;
+  margin-top: 0.72rem;
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 0.42rem;
 }
 
 .category-row button {
   border: 1px solid var(--line);
+  border-radius: 999px;
   background: transparent;
   color: var(--text-muted);
-  border-radius: 999px;
-  padding: 0.36rem 0.76rem;
-  font-size: 0.82rem;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.66rem;
 }
 
 .category-row button.active {
   color: var(--text);
   border-color: var(--line-strong);
-  background: var(--accent-soft);
+  background: color-mix(in srgb, var(--accent-soft) 72%, transparent);
 }
 
 .workspace-grid {
-  margin-top: 1rem;
+  margin-top: 0.76rem;
   display: grid;
-  gap: 1rem;
-  grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+  grid-template-columns: minmax(270px, 350px) minmax(0, 1fr);
   align-items: start;
+  gap: 0.75rem;
 }
 
 .doc-list {
   border: 1px solid var(--line);
   border-radius: var(--radius-l);
-  background: color-mix(in srgb, var(--bg) 72%, transparent 28%);
-  padding: 0.6rem;
+  background: color-mix(in srgb, var(--bg) 84%, transparent);
+  padding: 0.52rem;
   max-height: min(72vh, 860px);
   overflow: auto;
 }
@@ -409,128 +532,129 @@ main {
   width: 100%;
   text-align: left;
   border: 1px solid transparent;
-  border-radius: 12px;
+  border-radius: 9px;
   background: transparent;
   color: var(--text-soft);
-  padding: 0.72rem;
   display: grid;
-  gap: 0.24rem;
-  transition: border-color 160ms ease, background-color 160ms ease;
+  gap: 0.23rem;
+  padding: 0.6rem;
+  transition: background-color 150ms ease, border-color 150ms ease;
 }
 
 .doc-item + .doc-item {
-  margin-top: 0.44rem;
+  margin-top: 0.34rem;
 }
 
 .doc-item:hover {
   border-color: var(--line);
-  background: color-mix(in srgb, var(--accent-soft) 34%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 38%, transparent);
 }
 
 .doc-item.active {
   border-color: var(--line-strong);
-  background: color-mix(in srgb, var(--accent-soft) 64%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 68%, transparent);
 }
 
 .doc-meta {
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 0.72rem;
   color: var(--accent);
-  letter-spacing: 0.06em;
+  font-size: 0.68rem;
   text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
 }
 
 .doc-title {
   color: var(--text);
+  font-size: 0.9rem;
   font-weight: 600;
 }
 
 .doc-summary {
   color: var(--text-muted);
-  font-size: 0.88rem;
+  font-size: 0.8rem;
 }
 
 .doc-path {
   color: var(--text-muted);
-  font-size: 0.75rem;
-  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.7rem;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
   overflow-wrap: anywhere;
 }
 
 .empty-hint {
   margin: 0;
   color: var(--text-muted);
+  font-size: 0.85rem;
   padding: 0.8rem;
 }
 
 .doc-reader {
   border: 1px solid var(--line);
   border-radius: var(--radius-l);
-  background: color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+  background: color-mix(in srgb, var(--bg-elevated) 94%, transparent);
   min-height: 520px;
+  overflow: hidden;
 }
 
 .reader-head {
   display: flex;
   justify-content: space-between;
-  gap: 0.75rem;
   align-items: start;
-  padding: 1rem 1.1rem;
+  gap: 0.6rem;
   border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--bg-soft) 82%, transparent);
-  border-top-left-radius: inherit;
-  border-top-right-radius: inherit;
+  background: color-mix(in srgb, var(--bg-soft) 92%, transparent);
+  padding: 0.84rem 0.96rem;
 }
 
 .reader-head p {
   margin: 0;
-  font-size: 0.74rem;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
   color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.66rem;
 }
 
 .reader-head h3 {
-  margin: 0.34rem 0;
+  margin: 0.3rem 0 0.22rem;
   color: var(--text);
-  font-family: "Sora", sans-serif;
-  font-size: 1.06rem;
+  font-size: 0.98rem;
 }
 
 .reader-head code {
   color: var(--text-muted);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 0.76rem;
+  font-size: 0.72rem;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
   overflow-wrap: anywhere;
 }
 
 .reader-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.42rem;
   flex-wrap: wrap;
 }
 
 .reader-actions a {
   border: 1px solid var(--line);
-  border-radius: 10px;
-  font-size: 0.82rem;
+  border-radius: 8px;
   color: var(--text-soft);
-  padding: 0.36rem 0.64rem;
+  padding: 0.3rem 0.56rem;
+  font-size: 0.75rem;
   background: transparent;
 }
 
 .reader-actions a:hover {
-  border-color: var(--line-strong);
   color: var(--text);
+  border-color: var(--line-strong);
 }
 
 .reader-status {
-  margin: 1rem 1.1rem;
+  margin: 0.92rem 0.96rem;
   color: var(--text-muted);
+  font-size: 0.9rem;
 }
 
 .markdown-body {
-  padding: 1.1rem;
+  padding: 0.95rem 0.96rem 1.2rem;
   color: var(--text-soft);
 }
 
@@ -542,25 +666,24 @@ main {
 .markdown-body h2,
 .markdown-body h3,
 .markdown-body h4 {
-  font-family: "Sora", sans-serif;
   color: var(--text);
   line-height: 1.28;
+  letter-spacing: -0.01em;
 }
 
 .markdown-body h1 {
-  font-size: clamp(1.5rem, 2.3vw, 2rem);
-  margin-top: 0.2rem;
+  font-size: clamp(1.4rem, 2vw, 1.85rem);
+  margin-top: 0.1rem;
 }
 
 .markdown-body h2 {
-  margin-top: 1.8rem;
-  font-size: clamp(1.2rem, 1.5vw, 1.46rem);
-  padding-top: 0.2rem;
+  font-size: clamp(1.14rem, 1.4vw, 1.38rem);
+  margin-top: 1.5rem;
 }
 
 .markdown-body h3 {
-  margin-top: 1.28rem;
-  font-size: 1.04rem;
+  font-size: 1.02rem;
+  margin-top: 1.1rem;
 }
 
 .markdown-body p,
@@ -571,7 +694,7 @@ main {
 
 .markdown-body ul,
 .markdown-body ol {
-  padding-left: 1.35rem;
+  padding-left: 1.24rem;
 }
 
 .markdown-body a {
@@ -583,27 +706,27 @@ main {
 .markdown-body hr {
   border: 0;
   border-top: 1px solid var(--line);
-  margin: 1.6rem 0;
+  margin: 1.35rem 0;
 }
 
 .markdown-body pre,
 .markdown-body code {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
 }
 
 .markdown-body pre {
-  margin: 0.9rem 0;
-  background: color-mix(in srgb, var(--bg) 86%, transparent);
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
   overflow: auto;
-  padding: 0.85rem;
+  padding: 0.78rem;
+  margin: 0.85rem 0;
 }
 
 .markdown-body :not(pre) > code {
-  background: color-mix(in srgb, var(--accent-soft) 45%, transparent);
   border-radius: 6px;
-  padding: 0.1rem 0.34rem;
+  background: color-mix(in srgb, var(--accent-soft) 68%, transparent);
+  padding: 0.08rem 0.34rem;
   color: var(--text);
 }
 
@@ -611,54 +734,54 @@ main {
   width: 100%;
   border-collapse: collapse;
   margin: 1rem 0;
-  font-size: 0.9rem;
 }
 
 .markdown-body th,
 .markdown-body td {
   border: 1px solid var(--line);
-  padding: 0.5rem;
   text-align: left;
   vertical-align: top;
+  padding: 0.48rem;
+  font-size: 0.88rem;
 }
 
 .markdown-body th {
   color: var(--text);
-  background: color-mix(in srgb, var(--bg-soft) 92%, transparent);
+  background: color-mix(in srgb, var(--bg-soft) 94%, transparent);
 }
 
 .markdown-body img {
   max-width: 100%;
   height: auto;
-  border-radius: 12px;
+  border-radius: 10px;
   border: 1px solid var(--line);
 }
 
 .footer {
   width: var(--container);
-  margin: 1.4rem auto 2rem;
+  margin: 1rem auto 1.7rem;
   color: var(--text-muted);
+  font-size: 0.8rem;
   text-align: center;
-  font-size: 0.84rem;
 }
 
 .palette-backdrop {
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(6px);
   display: grid;
   place-items: start center;
-  padding-top: min(16vh, 120px);
+  padding-top: min(12vh, 110px);
+  background: rgba(0, 0, 0, 0.58);
+  backdrop-filter: blur(4px);
 }
 
 .palette {
   width: min(760px, calc(100% - 1.2rem));
   border: 1px solid var(--line);
-  border-radius: 16px;
-  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
-  box-shadow: var(--shadow-panel);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-elevated) 96%, transparent 4%);
+  box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
 
@@ -668,108 +791,108 @@ main {
   border-bottom: 1px solid var(--line);
   background: transparent;
   color: var(--text);
-  padding: 0.95rem 1rem;
+  min-height: 46px;
+  padding: 0 0.92rem;
 }
 
 .palette-list {
-  max-height: min(50vh, 460px);
+  max-height: min(52vh, 460px);
   overflow: auto;
-  padding: 0.45rem;
+  padding: 0.44rem;
 }
 
 .palette-list button {
   width: 100%;
   text-align: left;
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text-soft);
-  padding: 0.62rem 0.68rem;
+  padding: 0.54rem 0.62rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.85rem;
 }
 
 .palette-list button:hover {
   border-color: var(--line);
-  background: color-mix(in srgb, var(--accent-soft) 50%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
 }
 
 .palette-list small {
-  font-family: "IBM Plex Mono", monospace;
   color: var(--text-muted);
-  font-size: 0.72rem;
-  overflow-wrap: anywhere;
+  font-size: 0.7rem;
+  font-family: "Geist Mono", "IBM Plex Mono", monospace;
   text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .floating {
   position: fixed;
-  right: 1rem;
-  bottom: 1rem;
+  right: 0.84rem;
+  bottom: 0.84rem;
   z-index: 35;
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--accent-soft) 72%, var(--bg));
+  background: color-mix(in srgb, var(--bg-soft) 84%, var(--accent-soft));
   color: var(--text);
   border-radius: 999px;
-  min-height: 42px;
-  padding: 0 0.92rem;
-  font-size: 0.82rem;
-  box-shadow: var(--shadow-soft);
+  min-height: 38px;
+  padding: 0 0.84rem;
+  font-size: 0.76rem;
+  box-shadow: var(--shadow-md);
 }
 
 @media (max-width: 1120px) {
-  .workspace-grid {
+  .hero-layout {
     grid-template-columns: 1fr;
-  }
-
-  .doc-list {
-    max-height: 340px;
-  }
-}
-
-@media (max-width: 900px) {
-  .topbar-inner {
-    min-height: 64px;
-    flex-wrap: wrap;
-    padding: 0.55rem 0;
-  }
-
-  .top-nav {
-    order: 3;
-    width: 100%;
-    padding-bottom: 0.4rem;
   }
 
   .metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-}
 
-@media (max-width: 640px) {
-  :root {
-    --container: min(1220px, calc(100% - 1rem));
+  .principles-grid {
+    grid-template-columns: 1fr;
   }
 
-  main {
-    padding-top: 1.1rem;
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .doc-list {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 860px) {
+  .topbar-inner {
+    min-height: 60px;
+    flex-wrap: wrap;
+    padding: 0.45rem 0;
+  }
+
+  .top-nav {
+    order: 3;
+    width: 100%;
   }
 
   .controls {
     width: 100%;
     justify-content: space-between;
   }
+}
 
-  .segmented {
-    max-width: calc(100vw - 7.5rem);
-    overflow: auto;
+@media (max-width: 640px) {
+  :root {
+    --container: min(1240px, calc(100% - 1rem));
   }
 
-  .hero-inner {
-    padding: 1.2rem;
+  main {
+    padding-top: 1rem;
   }
 
+  .hero-inner,
   .docs-shell {
     padding: 0.86rem;
   }
@@ -783,9 +906,13 @@ main {
     align-items: stretch;
   }
 
+  .workspace-meta {
+    gap: 0.35rem;
+  }
+
   .floating {
-    right: 0.6rem;
-    bottom: 0.6rem;
+    right: 0.56rem;
+    bottom: 0.56rem;
   }
 }
 
@@ -793,8 +920,8 @@ main {
   *,
   *::before,
   *::after {
-    animation: none !important;
     transition: none !important;
+    animation: none !important;
     scroll-behavior: auto !important;
   }
 }

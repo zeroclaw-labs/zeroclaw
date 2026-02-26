@@ -314,6 +314,64 @@ const categoryLabel: Record<Locale, Record<Category | "All", string>> = {
   },
 };
 
+const engineeringPillars: Array<{
+  title: Localized;
+  detail: Localized;
+}> = [
+  {
+    title: {
+      en: "Trait-driven architecture",
+      zh: "Trait 驱动架构",
+    },
+    detail: {
+      en: "Providers, channels, tools, memory, and tunnels remain swappable through interfaces.",
+      zh: "Provider、Channel、Tool、Memory、Tunnel 通过接口保持可插拔。",
+    },
+  },
+  {
+    title: {
+      en: "Secure by default runtime",
+      zh: "默认安全运行时",
+    },
+    detail: {
+      en: "Pairing, sandboxing, explicit allowlists, and workspace scoping are baseline controls.",
+      zh: "配对、沙箱、显式白名单与工作区作用域作为基线控制。",
+    },
+  },
+  {
+    title: {
+      en: "Build once, run anywhere",
+      zh: "一次构建，到处运行",
+    },
+    detail: {
+      en: "Single-binary Rust workflow across ARM, x86, and RISC-V from edge to cloud.",
+      zh: "单一 Rust 二进制工作流覆盖 ARM、x86、RISC-V，从边缘到云端。",
+    },
+  },
+];
+
+const commandLane: Array<{
+  command: string;
+  hint: Localized;
+}> = [
+  {
+    command: "zeroclaw onboard --interactive",
+    hint: { en: "Generate config and credentials", zh: "生成配置与凭据" },
+  },
+  {
+    command: "zeroclaw agent",
+    hint: { en: "Run interactive agent mode", zh: "运行交互式 Agent 模式" },
+  },
+  {
+    command: "zeroclaw gateway && zeroclaw daemon",
+    hint: { en: "Start runtime services", zh: "启动运行时服务" },
+  },
+  {
+    command: "zeroclaw doctor",
+    hint: { en: "Validate environment and runtime health", zh: "校验环境与运行时健康状态" },
+  },
+];
+
 const copy = {
   en: {
     navDocs: "Docs",
@@ -328,15 +386,21 @@ const copy = {
       "Official source channels: use this repository as the source of truth and zeroclawlabs.ai as the official website.",
     ctaDocs: "Read docs now",
     ctaBootstrap: "One-click bootstrap",
+    commandLaneTitle: "Runtime command lane",
+    commandLaneHint: "From official setup and operations flow",
     metrics: [
       { label: "Runtime Memory", value: "< 5MB" },
       { label: "Cold Start", value: "< 10ms" },
       { label: "Edge Hardware", value: "$10-class" },
       { label: "Language", value: "100% Rust" },
     ],
+    engineeringTitle: "Engineering foundations",
     docsWorkspace: "Documentation Workspace",
     docsLead:
       "Browse, filter, and read project docs directly in-page. Open any item in GitHub when needed.",
+    docsIndexed: "Indexed",
+    docsFiltered: "Filtered",
+    docsActive: "Active",
     search: "Search docs by topic, path, or keyword",
     commandPalette: "Command palette",
     sourceLabel: "Source",
@@ -365,14 +429,20 @@ const copy = {
       "官方信息渠道：请以本仓库为事实来源，以 zeroclawlabs.ai 为官方网站。",
     ctaDocs: "立即阅读文档",
     ctaBootstrap: "一键安装",
+    commandLaneTitle: "运行命令通道",
+    commandLaneHint: "来自官方安装与运维流程",
     metrics: [
       { label: "运行内存", value: "< 5MB" },
       { label: "冷启动", value: "< 10ms" },
       { label: "边缘硬件", value: "$10 级别" },
       { label: "语言", value: "100% Rust" },
     ],
+    engineeringTitle: "工程基础",
     docsWorkspace: "文档工作区",
     docsLead: "在页面内直接浏览、过滤并阅读文档；需要时可一键跳转 GitHub 原文。",
+    docsIndexed: "总文档",
+    docsFiltered: "筛选后",
+    docsActive: "当前文档",
     search: "按主题、路径或关键字搜索",
     commandPalette: "命令面板",
     sourceLabel: "来源",
@@ -744,26 +814,45 @@ export default function App(): JSX.Element {
       <main id="top">
         <section className="hero">
           <div className="hero-inner">
-            <p className="eyebrow">{text.badge}</p>
-            <h1>{text.title}</h1>
-            <p className="lead">{text.summary}</p>
-            <p className="lead muted">{text.summary2}</p>
+            <div className="hero-layout">
+              <div>
+                <p className="eyebrow">{text.badge}</p>
+                <h1>{text.title}</h1>
+                <p className="lead">{text.summary}</p>
+                <p className="lead muted">{text.summary2}</p>
 
-            <div className="hero-cta">
-              <a className="btn primary" href="#docs-workspace">
-                {text.ctaDocs}
-              </a>
-              <a
-                className="btn ghost"
-                href={withRepo("docs/one-click-bootstrap.md")}
-                target="_blank"
-                rel="noreferrer"
-              >
-                {text.ctaBootstrap}
-              </a>
+                <div className="hero-cta">
+                  <a className="btn primary" href="#docs-workspace">
+                    {text.ctaDocs}
+                  </a>
+                  <a
+                    className="btn ghost"
+                    href={withRepo("docs/one-click-bootstrap.md")}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {text.ctaBootstrap}
+                  </a>
+                </div>
+
+                <p className="notice">{text.notice}</p>
+              </div>
+
+              <aside className="hero-terminal" aria-label={text.commandLaneTitle}>
+                <header>
+                  <h2>{text.commandLaneTitle}</h2>
+                  <p>{text.commandLaneHint}</p>
+                </header>
+                <ul>
+                  {commandLane.map((item) => (
+                    <li key={item.command}>
+                      <code>{item.command}</code>
+                      <span>{item.hint[locale]}</span>
+                    </li>
+                  ))}
+                </ul>
+              </aside>
             </div>
-
-            <p className="notice">{text.notice}</p>
 
             <div className="metrics" aria-label="Project metrics">
               {text.metrics.map((metric) => (
@@ -773,6 +862,18 @@ export default function App(): JSX.Element {
                 </article>
               ))}
             </div>
+
+            <section className="principles" aria-label={text.engineeringTitle}>
+              <h2>{text.engineeringTitle}</h2>
+              <div className="principles-grid">
+                {engineeringPillars.map((pillar) => (
+                  <article key={pillar.title.en} className="principle-card">
+                    <h3>{pillar.title[locale]}</h3>
+                    <p>{pillar.detail[locale]}</p>
+                  </article>
+                ))}
+              </div>
+            </section>
           </div>
         </section>
 
@@ -780,6 +881,18 @@ export default function App(): JSX.Element {
           <div className="docs-head">
             <h2>{text.docsWorkspace}</h2>
             <p>{text.docsLead}</p>
+          </div>
+
+          <div className="workspace-meta" aria-label="Workspace state">
+            <span>
+              {text.docsIndexed}: <strong>{docs.length}</strong>
+            </span>
+            <span>
+              {text.docsFiltered}: <strong>{filteredDocs.length}</strong>
+            </span>
+            <span>
+              {text.docsActive}: <strong>{selectedDoc.title[locale]}</strong>
+            </span>
           </div>
 
           <div className="docs-toolbar">
