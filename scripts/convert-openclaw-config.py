@@ -72,10 +72,27 @@ CHANNEL_MAP = {
 }
 
 
+def escape_toml_string(value: str) -> str:
+    """Escape special characters for TOML basic strings."""
+    value = value.replace("\\", "\\\\")
+    value = value.replace('"', '\\"')
+    value = value.replace("\t", "\\t")
+    value = value.replace("\r", "\\r")
+    # Newlines within single-line strings need escaping;
+    # multiline strings are handled separately with triple-quotes.
+    return value
+
+
 def load_openclaw_config(path: str) -> dict:
     """Load and parse OpenClaw's openclaw.json."""
     with open(path, "r") as f:
-        return json.load(f)
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"Error: Failed to parse JSON from {path}: {e}", file=sys.stderr)
+        print(f"  Hint: Make sure the file is valid JSON (not TOML, YAML, etc.)", file=sys.stderr)
+        sys.exit(1)
 
 
 def parse_model_string(model_str: str) -> tuple[str, str]:
@@ -301,11 +318,11 @@ def build_toml(oc: dict) -> str:
                         lines.append(v)
                         lines.append('"""')
                     else:
-                        lines.append(f'{k} = "{v}"')
+                        lines.append(f'{k} = "{escape_toml_string(v)}"')
                 elif isinstance(v, bool):
                     lines.append(f"{k} = {str(v).lower()}")
                 elif isinstance(v, list):
-                    items = ", ".join(f'"{i}"' for i in v)
+                    items = ", ".join(f'"{escape_toml_string(str(i))}"' for i in v)
                     lines.append(f"{k} = [{items}]")
                 else:
                     lines.append(f"{k} = {v}")
@@ -332,7 +349,8 @@ def build_toml(oc: dict) -> str:
         lines.append("[composio]")
         lines.append(f"enabled = {str(composio.get('enabled', False)).lower()}")
         if composio.get("apiKey") or composio.get("api_key"):
-            lines.append(f'api_key = "{composio.get("apiKey", composio.get("api_key", ""))}"')
+            api_key = composio.get("apiKey", composio.get("api_key", ""))
+            lines.append(f'api_key = "{escape_toml_string(api_key)}"')
         lines.append("")
 
     # ── Skills ───────────────────────────────────────────────────────────

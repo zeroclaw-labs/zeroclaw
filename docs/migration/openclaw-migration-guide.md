@@ -8,13 +8,11 @@ This guide walks you through migrating an OpenClaw deployment to ZeroClaw. It co
 # 1. Convert your OpenClaw config
 python scripts/convert-openclaw-config.py ~/.openclaw/openclaw.json -o config.toml
 
-# 2. Copy the endpoint files into ZeroClaw
-cp src/gateway/api_chat.rs        /path/to/zeroclaw/src/gateway/
-cp src/gateway/openai_compat_shim.rs /path/to/zeroclaw/src/gateway/
+# 2. The compatibility layer is built into ZeroClaw — no files to copy.
+#    The endpoints are implemented in src/gateway/openclaw_compat.rs and
+#    are already wired into the router in src/gateway/mod.rs.
 
-# 3. Apply the router patch (see src/gateway/mod_patch.rs for instructions)
-
-# 4. Build and deploy
+# 3. Build and deploy
 cargo build --release
 ```
 
@@ -68,7 +66,6 @@ The clean, ZeroClaw-native endpoint.
 {
   "reply": "Here's what I found on your schedule...",
   "model": "us.anthropic.claude-sonnet-4-6",
-  "provider": "bedrock",
   "session_id": "optional-session-id"
 }
 ```
@@ -271,8 +268,6 @@ The converter handles: provider/model parsing, gateway settings, memory defaults
 
 - [ ] Run config converter and review output
 - [ ] Set API key: `export ZEROCLAW_API_KEY='...'`
-- [ ] Copy `api_chat.rs` and `openai_compat_shim.rs` to `src/gateway/`
-- [ ] Apply router patch from `mod_patch.rs`
 - [ ] Build: `cargo build --release`
 - [ ] Deploy (Docker or native)
 - [ ] Pair: `curl -X POST http://host:port/pair -H 'X-Pairing-Code: ...'`
@@ -286,7 +281,7 @@ The converter handles: provider/model parsing, gateway settings, memory defaults
 
 ## Troubleshooting
 
-**405 on /v1/chat/completions:** The endpoint isn't registered. Make sure you applied the router patch from `mod_patch.rs` and rebuilt.
+**405 on /v1/chat/completions:** The endpoint isn't registered. Make sure you're running a ZeroClaw build that includes the `openclaw_compat` module (check `src/gateway/mod.rs` for the route registration).
 
 **401 Unauthorized:** Pairing is enabled but you're not sending a valid bearer token. Run the `/pair` flow first.
 

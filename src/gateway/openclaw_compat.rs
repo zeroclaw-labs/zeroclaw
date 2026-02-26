@@ -369,6 +369,24 @@ pub async fn handle_v1_chat_completions_with_tools(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
     }
 
+    // ── Auth: require at least one layer for non-loopback ──
+    if !state.pairing.require_pairing()
+        && state.webhook_secret_hash.is_none()
+        && !peer_addr.ip().is_loopback()
+    {
+        tracing::warn!(
+            "/v1/chat/completions (compat): rejected unauthenticated non-loopback request"
+        );
+        let err = serde_json::json!({
+            "error": {
+                "message": "Unauthorized — configure pairing or X-Webhook-Secret for non-local access",
+                "type": "invalid_request_error",
+                "code": "unauthorized"
+            }
+        });
+        return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+    }
+
     // ── Bearer token auth (pairing) ──
     if state.pairing.require_pairing() {
         let auth = headers

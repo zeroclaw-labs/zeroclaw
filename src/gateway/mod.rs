@@ -612,7 +612,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
-    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
@@ -633,7 +632,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if config.gateway.node_control.enabled {
         println!("  POST /api/node-control — experimental node-control RPC scaffold");
     }
-    println!("  POST /v1/chat/completions — OpenAI-compatible chat");
+    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
     println!("  GET  /v1/models — list available models");
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
