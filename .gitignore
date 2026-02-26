@@ -8,6 +8,9 @@ firmware/*/target
 __pycache__/
 *.pyc
 docker-compose.override.yml
+site/node_modules/
+site/.vite/
+gh-pages/
 
 # Environment files (may contain secrets)
 .env
