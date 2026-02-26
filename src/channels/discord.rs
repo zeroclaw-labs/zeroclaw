@@ -132,9 +132,10 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// `text/*` MIME types are fetched and inlined, while `image/*` MIME types are
-/// forwarded as `[IMAGE:<url>]` markers. Other types are skipped. Fetch errors
-/// are logged as warnings.
+/// `image/*` attachments are passed through as `[IMAGE:<url>]` markers so the
+/// downstream model/tooling can reason about visual inputs.
+/// `text/*` attachments are fetched and inlined.
+/// All other types are silently skipped. Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -153,7 +154,9 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-        if ct.starts_with("text/") {
+        if is_image_attachment(ct, name, url) {
+            parts.push(format!("[IMAGE:{url}]"));
+        } else if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
@@ -167,8 +170,6 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
-        } else if ct.starts_with("image/") {
-            parts.push(format!("[IMAGE:{url}]"));
         } else {
             tracing::debug!(
                 name,
@@ -178,6 +179,54 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
+}
+
+fn is_image_attachment(content_type: &str, filename: &str, url: &str) -> bool {
+    let normalized_content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if !normalized_content_type.is_empty() {
+        if normalized_content_type.starts_with("image/") {
+            return true;
+        }
+        // Trust explicit non-image MIME to avoid false positives from filename extensions.
+        if normalized_content_type != "application/octet-stream" {
+            return false;
+        }
+    }
+
+    has_image_extension(filename) || has_image_extension(url)
+}
+
+fn has_image_extension(value: &str) -> bool {
+    let base = value.split('?').next().unwrap_or(value);
+    let base = base.split('#').next().unwrap_or(base);
+    let ext = Path::new(base)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    matches!(
+        ext.as_deref(),
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "tif"
+                | "tiff"
+                | "svg"
+                | "avif"
+                | "heic"
+                | "heif"
+        )
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1561,8 +1610,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_attachments_emits_single_image_marker() {
+    async fn process_attachments_emits_image_marker_for_image_content_type() {
         let client = reqwest::Client::new();
         let attachments = vec![serde_json::json!({
             "url": "https://cdn.discordapp.com/attachments/123/456/photo.png",
@@ -1598,6 +1646,36 @@ mod tests {
         );
     }
 
+    async fn process_attachments_emits_image_marker_from_filename_without_content_type() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024",
+            "filename": "photo.jpeg"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024]"
+        );
+    }
+
+    #[test]
+    fn is_image_attachment_prefers_non_image_content_type_over_extension() {
+        assert!(!is_image_attachment(
+            "text/plain",
+            "photo.png",
+            "https://cdn.discordapp.com/attachments/123/456/photo.png"
+        ));
+    }
+
+    #[test]
+    fn is_image_attachment_allows_octet_stream_extension_fallback() {
+        assert!(is_image_attachment(
+            "application/octet-stream",
+            "photo.png",
+            "https://cdn.discordapp.com/attachments/123/456/photo.png"
+        ));
+    }
     #[test]
     fn parse_attachment_markers_extracts_supported_markers() {
         let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
