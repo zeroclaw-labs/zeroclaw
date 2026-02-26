@@ -9,6 +9,7 @@
 
 pub mod api;
 mod openai_compat;
+mod openclaw_compat;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -610,6 +611,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
+    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
@@ -702,10 +705,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // The OpenAI-compatible endpoints use a larger body limit (512KB) because
     // chat histories can be much bigger than the default 64KB webhook limit.
     // They get their own nested router with a separate body limit layer.
+    //
+    // NOTE: The /v1/chat/completions handler routes through the full agent loop
+    // (run_gateway_chat_with_tools) via openclaw_compat, giving OpenClaw callers
+    // tools + memory support. The original simple-chat handler is preserved in
+    // openai_compat.rs for reference.
     let openai_compat_routes = Router::new()
         .route(
             "/v1/chat/completions",
-            post(openai_compat::handle_v1_chat_completions),
+            post(openclaw_compat::handle_v1_chat_completions_with_tools),
         )
         .layer(RequestBodyLimitLayer::new(
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
@@ -725,6 +733,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
+        // ── OpenClaw migration: tools-enabled chat endpoint ──
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
         // ── OpenAI-compatible endpoints ──
         .route("/v1/models", get(openai_compat::handle_v1_models))
         .merge(openai_compat_routes)
