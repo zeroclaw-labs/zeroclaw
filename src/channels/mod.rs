@@ -2446,38 +2446,14 @@ pub(crate) fn sanitize_channel_response(
     apply_output_guardrail(&cleaned, output_guardrail)
 }
 
-/// Run output guardrails on content before it reaches a channel.
-///
-/// Currently applies credential leak detection; future phases will add
-/// prompt-injection scanning and user-extensible guardrail traits.
+/// Thin re-export of [`crate::security::apply_output_guardrail`] for backward
+/// compatibility within the crate. Prefer calling `security::apply_output_guardrail`
+/// directly from new code.
 pub(crate) fn apply_output_guardrail(
     content: &str,
     config: &crate::config::OutputGuardrailConfig,
 ) -> String {
-    if !config.leak_detection {
-        return content.to_string();
-    }
-
-    use crate::security::{LeakDetector, LeakResult};
-
-    let detector = LeakDetector::with_sensitivity(config.leak_sensitivity);
-    match detector.scan(content) {
-        LeakResult::Clean => content.to_string(),
-        LeakResult::Detected { patterns, redacted } => {
-            tracing::warn!(
-                detected_patterns = ?patterns,
-                "output guardrail: credential leak detected in outbound message"
-            );
-            match config.leak_action {
-                crate::config::LeakAction::Redact => redacted,
-                crate::config::LeakAction::Warn => content.to_string(),
-                crate::config::LeakAction::Block => format!(
-                    "⚠️ Response blocked: potential credential leak detected ({}).",
-                    patterns.join(", ")
-                ),
-            }
-        }
-    }
+    crate::security::apply_output_guardrail(content, config)
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {

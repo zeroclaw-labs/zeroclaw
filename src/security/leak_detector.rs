@@ -9,6 +9,14 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// Minimum sensitivity required to activate heuristic (generic) secret rules.
+///
+/// Structurally identifiable patterns (API keys with known prefixes, AWS keys,
+/// JWTs, PEM blocks, database URLs) are always scanned regardless of sensitivity.
+/// Generic rules (password=, secret=, token=) only fire when `sensitivity` exceeds
+/// this threshold, reducing false positives on technical content.
+const GENERIC_SECRET_SENSITIVITY_THRESHOLD: f64 = 0.5;
+
 /// Result of leak detection.
 #[derive(Debug, Clone)]
 pub enum LeakResult {
@@ -189,7 +197,7 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) && self.sensitivity > 0.5 {
+            if regex.is_match(content) && self.sensitivity > GENERIC_SECRET_SENSITIVITY_THRESHOLD {
                 patterns.push(name.to_string());
                 *redacted = regex.replace_all(redacted, "[REDACTED_SECRET]").to_string();
             }

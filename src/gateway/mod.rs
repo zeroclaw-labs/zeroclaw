@@ -978,6 +978,15 @@ fn sanitize_gateway_response(
     }
 }
 
+/// Convenience wrapper that extracts tools and guardrail config from [`AppState`].
+fn sanitize_gateway_response_from_state(response: &str, state: &AppState) -> String {
+    sanitize_gateway_response(
+        response,
+        state.tools_registry_exec.as_ref(),
+        &state.config.lock().security.output_guardrail,
+    )
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -1280,11 +1289,7 @@ async fn handle_api_chat(
 
     match run_gateway_chat_with_tools(&state, &chat_body.message).await {
         Ok(response) => {
-            let safe_response = sanitize_gateway_response(
-                &response,
-                state.tools_registry_exec.as_ref(),
-                &state.config.lock().security.output_guardrail,
-            );
+            let safe_response = sanitize_gateway_response_from_state(&response, &state);
             let body = serde_json::json!({ "reply": safe_response });
             (StatusCode::OK, Json(body))
         }
@@ -1384,11 +1389,7 @@ async fn handle_webhook(
 
     match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
-            let safe_response = sanitize_gateway_response(
-                &response,
-                state.tools_registry_exec.as_ref(),
-                &state.config.lock().security.output_guardrail,
-            );
+            let safe_response = sanitize_gateway_response_from_state(&response, &state);
             let duration = started_at.elapsed();
             state
                 .observer
@@ -1593,11 +1594,7 @@ async fn handle_whatsapp_message(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response = sanitize_gateway_response(
-                    &response,
-                    state.tools_registry_exec.as_ref(),
-                    &state.config.lock().security.output_guardrail,
-                );
+                let safe_response = sanitize_gateway_response_from_state(&response, &state);
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1715,11 +1712,7 @@ async fn handle_linq_webhook(
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response = sanitize_gateway_response(
-                    &response,
-                    state.tools_registry_exec.as_ref(),
-                    &state.config.lock().security.output_guardrail,
-                );
+                let safe_response = sanitize_gateway_response_from_state(&response, &state);
                 // Send reply via Linq
                 if let Err(e) = linq
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1812,11 +1805,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response = sanitize_gateway_response(
-                    &response,
-                    state.tools_registry_exec.as_ref(),
-                    &state.config.lock().security.output_guardrail,
-                );
+                let safe_response = sanitize_gateway_response_from_state(&response, &state);
                 // Send reply via WATI
                 if let Err(e) = wati
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1921,11 +1910,7 @@ async fn handle_nextcloud_talk_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response = sanitize_gateway_response(
-                    &response,
-                    state.tools_registry_exec.as_ref(),
-                    &state.config.lock().security.output_guardrail,
-                );
+                let safe_response = sanitize_gateway_response_from_state(&response, &state);
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
@@ -2015,11 +2000,7 @@ async fn handle_qq_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response = sanitize_gateway_response(
-                    &response,
-                    state.tools_registry_exec.as_ref(),
-                    &state.config.lock().security.output_guardrail,
-                );
+                let safe_response = sanitize_gateway_response_from_state(&response, &state);
                 if let Err(e) = qq
                     .send(
                         &SendMessage::new(safe_response, &msg.reply_target)

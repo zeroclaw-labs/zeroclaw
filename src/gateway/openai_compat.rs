@@ -278,8 +278,13 @@ async fn handle_non_streaming(
             let duration = started_at.elapsed();
             record_success(&state, &provider_label, &model, duration);
 
+            // Apply output guardrail (credential leak detection) before returning.
+            let guardrail_config = &state.config.lock().security.output_guardrail;
+            let safe_text =
+                crate::security::apply_output_guardrail(&response_text, guardrail_config);
+
             #[allow(clippy::cast_possible_truncation)]
-            let completion_tokens = (response_text.len() / 4) as u32;
+            let completion_tokens = (safe_text.len() / 4) as u32;
             #[allow(clippy::cast_possible_truncation)]
             let prompt_tokens = messages.iter().map(|m| m.content.len() / 4).sum::<usize>() as u32;
 
@@ -292,7 +297,7 @@ async fn handle_non_streaming(
                     index: 0,
                     message: ChatCompletionsResponseMessage {
                         role: "assistant",
-                        content: response_text,
+                        content: safe_text,
                     },
                     finish_reason: "stop",
                 }],
@@ -354,6 +359,11 @@ fn handle_streaming(
                     let duration = started_at.elapsed();
                     record_success(&state, &provider_label, &model_clone, duration);
 
+                    // Apply output guardrail before streaming single-chunk response.
+                    let guardrail_config = &state.config.lock().security.output_guardrail;
+                    let safe_text =
+                        crate::security::apply_output_guardrail(&text, guardrail_config);
+
                     let chunk = ChatCompletionsChunk {
                         id: id.clone(),
                         object: "chat.completion.chunk",
@@ -363,7 +373,7 @@ fn handle_streaming(
                             index: 0,
                             delta: ChunkDelta {
                                 role: Some("assistant"),
-                                content: Some(text),
+                                content: Some(safe_text),
                             },
                             finish_reason: Some("stop"),
                         }],
@@ -395,7 +405,14 @@ fn handle_streaming(
             .into_response();
     }
 
-    // Provider supports native streaming
+    // Provider supports native streaming.
+    //
+    // NOTE(Phase 2): Per-chunk guardrail scanning is intentionally omitted here.
+    // Streaming deltas are typically small fragments; a credential could be split
+    // across consecutive chunks, making per-chunk regex scanning unreliable (false
+    // negatives) and expensive (false positives on partial tokens). Full streaming
+    // guardrail support requires buffered reassembly, which is tracked alongside
+    // the "draft streaming" sanitization work in Phase 2.
     let provider_stream = state.provider.stream_chat_with_history(
         &messages,
         &model,

@@ -60,6 +60,45 @@ pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 
+/// Apply output guardrails to content before it reaches any output channel.
+///
+/// Currently performs credential leak detection via [`LeakDetector`]. Scans for
+/// API keys, AWS credentials, JWTs, PEM private keys, database URLs, and
+/// generic secret patterns. The `sensitivity` field only affects heuristic
+/// rules (generic passwords/secrets/tokens); structurally identifiable patterns
+/// (Stripe, OpenAI, Anthropic, GitHub, AWS, JWT, PEM, DB URLs) are always
+/// detected regardless of sensitivity.
+///
+/// Future phases will add prompt-injection scanning and user-extensible
+/// guardrail traits.
+pub fn apply_output_guardrail(
+    content: &str,
+    config: &crate::config::OutputGuardrailConfig,
+) -> String {
+    if !config.leak_detection {
+        return content.to_string();
+    }
+
+    let detector = LeakDetector::with_sensitivity(config.leak_sensitivity);
+    match detector.scan(content) {
+        LeakResult::Clean => content.to_string(),
+        LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                detected_patterns = ?patterns,
+                "output guardrail: credential leak detected in outbound message"
+            );
+            match config.leak_action {
+                crate::config::LeakAction::Redact => redacted,
+                crate::config::LeakAction::Warn => content.to_string(),
+                crate::config::LeakAction::Block => format!(
+                    "⚠️ Response blocked: potential credential leak detected ({}).",
+                    patterns.join(", ")
+                ),
+            }
+        }
+    }
+}
+
 /// Validate shell environment variable names (`[A-Za-z_][A-Za-z0-9_]*`).
 pub fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();

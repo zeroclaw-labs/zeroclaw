@@ -4151,7 +4151,13 @@ pub struct OutputGuardrailConfig {
     pub leak_detection: bool,
 
     /// Leak detection sensitivity (0.0–1.0, higher = more aggressive).
-    /// Default: `0.7`. Reduce to avoid false positives on technical content.
+    /// Default: `0.7`. Controls heuristic rules only (generic password/secret/token
+    /// patterns, threshold > 0.5). Structurally identifiable patterns — API keys
+    /// with known prefixes (Stripe, OpenAI, Anthropic, Google, GitHub), AWS
+    /// credentials, JWTs, PEM private keys, and database URLs — are always
+    /// detected regardless of this value. Set to 0.0 to disable heuristic rules
+    /// while keeping structural detection active; set `leak_detection = false` to
+    /// disable all scanning entirely.
     #[serde(default = "default_leak_sensitivity")]
     pub leak_sensitivity: f64,
 

@@ -109,7 +109,7 @@ fn finalize_ws_response(
     if let Some(tool_output) = extract_latest_tool_output(history) {
         // Apply output guardrail to tool output — it may contain leaked credentials.
         let safe_output =
-            crate::channels::apply_output_guardrail(tool_output.trim(), output_guardrail);
+            crate::security::apply_output_guardrail(tool_output.trim(), output_guardrail);
         let excerpt = crate::util::truncate_with_ellipsis(&safe_output, 1200);
         return format!(
             "Tool execution completed, but the model returned no final text response.\n\nLatest tool output:\n{excerpt}"
