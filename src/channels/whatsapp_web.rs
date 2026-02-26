@@ -232,23 +232,24 @@ impl WhatsAppWebChannel {
     /// Map a WhatsApp audio MIME type to a filename accepted by the Groq Whisper API.
     ///
     /// WhatsApp voice notes are typically `audio/ogg; codecs=opus`.
+    /// MIME parameters (e.g. `; codecs=opus`) are stripped before matching so that
+    /// `audio/webm; codecs=opus` maps to `voice.webm`, not `voice.opus`.
     #[cfg(feature = "whatsapp-web")]
     fn audio_mime_to_filename(mime: &str) -> &'static str {
-        let lower = mime.to_ascii_lowercase();
-        if lower.contains("ogg") || lower.contains("oga") {
-            "voice.ogg"
-        } else if lower.contains("opus") {
-            "voice.opus"
-        } else if lower.contains("mp4") || lower.contains("m4a") || lower.contains("aac") {
-            "voice.m4a"
-        } else if lower.contains("mpeg") || lower.contains("mp3") {
-            "voice.mp3"
-        } else if lower.contains("webm") {
-            "voice.webm"
-        } else if lower.contains("wav") {
-            "voice.wav"
-        } else {
-            "voice.ogg"
+        let base = mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "audio/ogg" | "audio/oga" => "voice.ogg",
+            "audio/webm" => "voice.webm",
+            "audio/opus" => "voice.opus",
+            "audio/mp4" | "audio/m4a" | "audio/aac" => "voice.m4a",
+            "audio/mpeg" | "audio/mp3" => "voice.mp3",
+            "audio/wav" | "audio/x-wav" => "voice.wav",
+            _ => "voice.ogg",
         }
     }
 
