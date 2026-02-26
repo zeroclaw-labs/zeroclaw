@@ -1211,11 +1211,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             identities.push(id);
         }
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
-            return None;
-        }
-
-        // Check mention_only for group messages (apply to caption for attachments)
+        // Check mention_only BEFORE authorization so that non-mentioned group
+        // attachments are silently ignored instead of triggering "unauthorized"
+        // prompts for users not on the allow-list (#1960).
         let is_group = Self::is_group_message(message);
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
@@ -1228,6 +1226,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // Bot username unknown, can't verify mention
                 return None;
             }
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
         }
 
         let chat_id = message
@@ -1390,6 +1392,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             identities.push(id);
         }
 
+        // Check mention_only BEFORE authorization so that voice messages in
+        // mention_only groups are silently ignored instead of triggering
+        // "unauthorized" prompts for users not on the allow-list (#1960).
+        // Voice messages have no text to mention the bot, so they are always
+        // ignored in mention_only group mode (unless sender_trigger is enabled).
+        let is_group = Self::is_group_message(message);
+        let allow_sender_without_mention =
+            is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
+        if self.mention_only && is_group && !allow_sender_without_mention {
+            return None;
+        }
+
         if !self.is_any_user_allowed(identities.iter().copied()) {
             tracing::debug!(
                 "Skipping voice message from unauthorized user: {} (allowed_users: {:?})",
@@ -1399,15 +1413,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .map(|u| u.iter().cloned().collect::<Vec<_>>())
                     .unwrap_or_default()
             );
-            return None;
-        }
-
-        // Voice messages have no text to mention the bot, so ignore in mention_only mode when in groups.
-        // Private chats are always processed.
-        let is_group = Self::is_group_message(message);
-        let allow_sender_without_mention =
-            is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
-        if self.mention_only && is_group && !allow_sender_without_mention {
             return None;
         }
 
@@ -1597,10 +1602,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             identities.push(id);
         }
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
-            return None;
-        }
-
+        // Check mention_only BEFORE authorization so that non-mentioned group
+        // messages are silently ignored instead of triggering an "unauthorized /
+        // bind-telegram" prompt for users not on the allow-list (#1960).
         let is_group = Self::is_group_message(message);
         let allow_sender_without_mention =
             is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
@@ -1614,6 +1618,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             } else {
                 return None;
             }
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
         }
 
         let chat_id = message
@@ -2967,6 +2975,20 @@ Ensure only one `zeroclaw` process is using this bot token."
                     } else if let Some(m) = self.try_parse_attachment_message(update).await {
                         m
                     } else {
+                        // In mention_only mode, silently ignore group messages
+                        // that don't mention the bot — don't send an
+                        // "unauthorized / bind-telegram" prompt (#1960).
+                        if self.mention_only {
+                            let is_group = update
+                                .get("message")
+                                .and_then(|m| m.get("chat"))
+                                .and_then(|c| c.get("type"))
+                                .and_then(serde_json::Value::as_str)
+                                .map_or(false, |t| t == "group" || t == "supergroup");
+                            if is_group {
+                                continue;
+                            }
+                        }
                         self.handle_unauthorized_message(update).await;
                         continue;
                     };
