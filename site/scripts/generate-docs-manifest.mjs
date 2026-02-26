@@ -64,6 +64,242 @@ function detectSection(relativePath) {
   return parts[1] || "docs";
 }
 
+function detectJourney(relativePath) {
+  const rel = normalizePath(relativePath).toLowerCase();
+
+  if (!rel.startsWith("docs/")) {
+    return "start";
+  }
+
+  if (rel.includes("/i18n/") || rel.startsWith("docs/i18n-")) {
+    return "localize";
+  }
+
+  if (
+    rel.includes("/security/") ||
+    rel.includes("security-roadmap") ||
+    rel.includes("sandbox") ||
+    rel.includes("advisory") ||
+    rel.includes("vulnerability") ||
+    rel.includes("agnostic-security") ||
+    rel.includes("audit-logging")
+  ) {
+    return "secure";
+  }
+
+  if (
+    rel.includes("/operations/") ||
+    rel.includes("/sop/") ||
+    rel.includes("runbook") ||
+    rel.includes("release-process") ||
+    rel.includes("ci-map") ||
+    rel.includes("stage-gates") ||
+    rel.includes("required-check")
+  ) {
+    return "operate";
+  }
+
+  if (
+    rel.includes("/contributing/") ||
+    rel.includes("pr-workflow") ||
+    rel.includes("reviewer-playbook") ||
+    rel.includes("project-triage") ||
+    rel.includes("/project/") ||
+    rel.includes("doc-template")
+  ) {
+    return "contribute";
+  }
+
+  if (
+    rel.includes("/datasheets/") ||
+    rel.includes("/hardware/") ||
+    rel.includes("arduino") ||
+    rel.includes("esp32") ||
+    rel.includes("nucleo") ||
+    rel.includes("hardware-peripherals")
+  ) {
+    return "hardware";
+  }
+
+  if (rel.includes("troubleshooting")) {
+    return "troubleshoot";
+  }
+
+  if (
+    rel.includes("/reference/") ||
+    rel.includes("commands-reference") ||
+    rel.includes("config-reference") ||
+    rel.includes("providers-reference") ||
+    rel.includes("channels-reference") ||
+    rel.includes("resource-limits") ||
+    rel.includes("audit-event-schema")
+  ) {
+    return "reference";
+  }
+
+  if (
+    rel.includes("langgraph") ||
+    rel.includes("custom-providers") ||
+    rel.includes("nextcloud-talk") ||
+    rel.includes("mattermost") ||
+    rel.includes("matrix-e2ee") ||
+    rel.includes("zai-glm") ||
+    rel.includes("qwen-provider") ||
+    rel.includes("proxy-agent")
+  ) {
+    return "integrate";
+  }
+
+  if (
+    rel.includes("getting-started") ||
+    rel.includes("one-click-bootstrap") ||
+    rel.includes("docker-setup") ||
+    rel.includes("network-deployment") ||
+    rel === "docs/readme.md"
+  ) {
+    return "start";
+  }
+
+  return "build";
+}
+
+function detectAudience(relativePath, journey) {
+  const rel = normalizePath(relativePath).toLowerCase();
+
+  if (journey === "start") return "newcomer";
+  if (journey === "operate") return "operator";
+  if (journey === "secure") return "security";
+  if (journey === "contribute" || journey === "localize") return "contributor";
+  if (journey === "integrate") return "integrator";
+  if (journey === "hardware") return "hardware";
+
+  if (rel.includes("troubleshooting")) {
+    return "operator";
+  }
+
+  return "builder";
+}
+
+function detectKind(relativePath) {
+  const rel = normalizePath(relativePath).toLowerCase();
+
+  if (
+    rel.includes("runbook") ||
+    rel.includes("playbook") ||
+    rel.includes("/sop/") ||
+    rel.includes("operations/")
+  ) {
+    return "runbook";
+  }
+
+  if (
+    rel.includes("policy") ||
+    rel.includes("roadmap") ||
+    rel.includes("release-process") ||
+    rel.includes("required-check-mapping") ||
+    rel.includes("stage-gates")
+  ) {
+    return "policy";
+  }
+
+  if (rel.includes("template") || rel.includes("checklist")) {
+    return "template";
+  }
+
+  if (
+    rel.includes("report") ||
+    rel.includes("snapshot") ||
+    rel.includes("inventory") ||
+    rel.includes("docs-audit")
+  ) {
+    return "report";
+  }
+
+  if (
+    rel.includes("/reference/") ||
+    rel.includes("reference") ||
+    rel.includes("schema") ||
+    rel.includes("summary.md")
+  ) {
+    return "reference";
+  }
+
+  return "guide";
+}
+
+function isStartHere(relativePath, journey) {
+  const rel = normalizePath(relativePath).toLowerCase();
+
+  if (journey === "start" && /readme\.md$/.test(rel)) {
+    return true;
+  }
+
+  return (
+    rel === "readme.md" ||
+    rel === "docs/getting-started/readme.md" ||
+    rel === "docs/one-click-bootstrap.md" ||
+    rel === "docs/docker-setup.md" ||
+    rel === "docs/network-deployment.md" ||
+    rel === "docs/commands-reference.md" ||
+    rel === "docs/config-reference.md" ||
+    rel === "docs/troubleshooting.md"
+  );
+}
+
+function wordCount(markdown) {
+  const plain = stripMarkdownSyntax(markdown)
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]+`/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!plain) {
+    return 0;
+  }
+
+  return plain.split(" ").filter(Boolean).length;
+}
+
+function estimateReadingMinutes(markdown) {
+  const words = wordCount(markdown);
+  if (words <= 0) {
+    return 1;
+  }
+
+  return Math.max(1, Math.min(35, Math.ceil(words / 220)));
+}
+
+function inferTags(relativePath, title, summary, journey, audience, kind, section) {
+  const rel = normalizePath(relativePath).toLowerCase();
+  const bag = `${rel} ${title} ${summary}`.toLowerCase();
+  const tags = new Set([journey, audience, kind, section]);
+
+  const rules = [
+    { pattern: /(getting-started|one-click-bootstrap|onboard|setup|readme)/, tag: "onboarding" },
+    { pattern: /(docker|network|gateway|deploy|daemon)/, tag: "deployment" },
+    { pattern: /(security|sandbox|advisory|vulnerability|audit)/, tag: "security" },
+    { pattern: /(commands|config|providers|channels|reference|schema)/, tag: "reference" },
+    { pattern: /(operations|runbook|sop|release|ci|workflow|gate)/, tag: "operations" },
+    { pattern: /(langgraph|matrix|mattermost|nextcloud|qwen|glm|custom-provider)/, tag: "integrations" },
+    { pattern: /(hardware|arduino|esp32|nucleo|datasheet)/, tag: "hardware" },
+    { pattern: /(i18n|translation|locale)/, tag: "i18n" },
+    { pattern: /(contributing|reviewer|pull request|pr-workflow|project)/, tag: "contributing" },
+    { pattern: /(troubleshoot|diagnos|doctor|debug)/, tag: "troubleshooting" },
+  ];
+
+  for (const rule of rules) {
+    if (rule.pattern.test(bag)) {
+      tags.add(rule.tag);
+    }
+  }
+
+  return [...tags]
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, 8);
+}
+
 function fallbackTitle(relativePath) {
   const filename = path.basename(relativePath).replace(/\.(md|mdx)$/i, "");
 
@@ -215,14 +451,27 @@ async function main() {
   for (const filePath of markdownFiles) {
     const relativePath = normalizePath(path.relative(repoRoot, filePath));
     const content = await fs.readFile(filePath, "utf8");
+    const section = detectSection(relativePath);
+    const journey = detectJourney(relativePath);
+    const audience = detectAudience(relativePath, journey);
+    const kind = detectKind(relativePath);
+    const title = extractTitle(content, relativePath);
+    const summary = extractSummary(content);
+    const readingMinutes = estimateReadingMinutes(content);
 
     manifestEntries.push({
       id: toId(relativePath),
       path: relativePath,
-      title: extractTitle(content, relativePath),
-      summary: extractSummary(content),
-      section: detectSection(relativePath),
+      title,
+      summary,
+      section,
       language: detectLanguage(relativePath),
+      journey,
+      audience,
+      kind,
+      tags: inferTags(relativePath, title, summary, journey, audience, kind, section),
+      readingMinutes,
+      startHere: isStartHere(relativePath, journey),
       sourceUrl: `https://github.com/zeroclaw-labs/zeroclaw/blob/main/${relativePath}`,
     });
   }
