@@ -2814,7 +2814,11 @@ async fn process_channel_message(
     let timestamped_content = format!("[{now}] {}", msg.content);
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&timestamped_content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&timestamped_content),
+    );
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
