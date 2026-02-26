@@ -174,6 +174,7 @@ For unsupported channels, point your existing integration at ZeroClaw's `/api/ch
 ## Callsite Migration Examples
 
 ### Before (OpenClaw)
+
 ```typescript
 const response = await fetch(`https://${host}/v1/chat/completions`, {
   method: "POST",
@@ -191,6 +192,7 @@ const reply = data.choices[0].message.content;
 ```
 
 ### After — Option A: Use /api/chat (Recommended)
+
 ```typescript
 const response = await fetch(`https://${host}/api/chat`, {
   method: "POST",
@@ -209,6 +211,7 @@ const reply = data.reply;
 ```
 
 ### After — Option B: Use /v1/chat/completions (Zero Code Changes)
+
 ```typescript
 // Same code as before — just point to ZeroClaw host with gateway token.
 // The compat shim handles the translation.

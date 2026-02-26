@@ -91,7 +91,7 @@ def load_openclaw_config(path: str) -> dict:
         return json.loads(content)
     except json.JSONDecodeError as e:
         print(f"Error: Failed to parse JSON from {path}: {e}", file=sys.stderr)
-        print(f"  Hint: Make sure the file is valid JSON (not TOML, YAML, etc.)", file=sys.stderr)
+        print("  Hint: Make sure the file is valid JSON (not TOML, YAML, etc.)", file=sys.stderr)
         sys.exit(1)
 
 
@@ -172,7 +172,7 @@ def convert_memory(oc: dict) -> dict:
     return result
 
 
-def convert_channels(oc: dict) -> dict:
+def convert_channels(oc: dict) -> tuple[dict, list[str]]:
     """Convert channel configurations."""
     channels = {}
     unsupported = []
@@ -232,9 +232,9 @@ def convert_agents(oc: dict) -> dict:
 def build_toml(oc: dict) -> str:
     """Build ZeroClaw config.toml from parsed OpenClaw config."""
     lines = []
-    lines.append(f"# ZeroClaw configuration")
+    lines.append("# ZeroClaw configuration")
     lines.append(f"# Converted from OpenClaw on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"# Review all values before deploying — some settings may need manual adjustment.")
+    lines.append("# Review all values before deploying — some settings may need manual adjustment.")
     lines.append("")
 
     # ── Core provider settings ───────────────────────────────────────────
@@ -314,8 +314,11 @@ def build_toml(oc: dict) -> str:
                 if isinstance(v, str):
                     # Escape multiline strings
                     if "\n" in v:
+                        # Escape triple quotes inside the value to avoid
+                        # breaking the TOML multiline basic string delimiter.
+                        safe_v = v.replace('"""', '"\\"" ')
                         lines.append(f'{k} = """')
-                        lines.append(v)
+                        lines.append(safe_v)
                         lines.append('"""')
                     else:
                         lines.append(f'{k} = "{escape_toml_string(v)}"')
@@ -337,7 +340,7 @@ def build_toml(oc: dict) -> str:
         lines.append("")
 
     if unsupported:
-        lines.append(f"# WARNING: The following OpenClaw channels are not natively supported in ZeroClaw:")
+        lines.append("# WARNING: The following OpenClaw channels are not natively supported in ZeroClaw:")
         for ch in unsupported:
             lines.append(f"#   - {ch}")
         lines.append("# Consider using the /api/chat endpoint for these channels instead.")

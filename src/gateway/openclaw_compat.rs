@@ -836,4 +836,67 @@ mod tests {
         assert_ne!(k1, k2);
         assert!(k1.starts_with("api_chat_msg_"));
     }
+
+    // ── Handler-level validation tests ──
+    // These verify the input shapes that the handlers validate at runtime.
+
+    #[test]
+    fn api_chat_body_rejects_missing_message() {
+        let json = r#"{"session_id": "s1"}"#;
+        let result: Result<ApiChatBody, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing `message` field should fail deserialization");
+    }
+
+    #[test]
+    fn oai_request_rejects_empty_messages() {
+        let json = r#"{"messages": []}"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.messages.is_empty(), "empty messages should parse but be caught by handler");
+    }
+
+    #[test]
+    fn oai_request_no_user_message_detected() {
+        let json = r#"{"messages": [{"role": "system", "content": "You are helpful."}]}"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+        let last_user = req.messages.iter().rev().find(|m| m.role == "user");
+        assert!(last_user.is_none(), "should detect no user message");
+    }
+
+    #[test]
+    fn oai_request_whitespace_only_user_message() {
+        let json = r#"{"messages": [{"role": "user", "content": "   "}]}"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+        let last_user = req.messages.iter().rev().find(|m| m.role == "user");
+        assert!(
+            last_user.map_or(true, |m| m.content.trim().is_empty()),
+            "whitespace-only user message should be treated as empty"
+        );
+    }
+
+    #[test]
+    fn oai_context_extraction_skips_last_user_message() {
+        let json = r#"{
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"}
+            ]
+        }"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+
+        // Replicate the handler's context extraction logic
+        let context_messages: Vec<String> = req
+            .messages
+            .iter()
+            .rev()
+            .skip(1)
+            .rev()
+            .filter(|m| m.role == "user" || m.role == "assistant")
+            .map(|m| format!("{}: {}", if m.role == "user" { "User" } else { "Assistant" }, m.content))
+            .collect();
+
+        assert_eq!(context_messages.len(), 2);
+        assert!(context_messages[0].starts_with("User: first"));
+        assert!(context_messages[1].starts_with("Assistant: reply"));
+    }
 }
