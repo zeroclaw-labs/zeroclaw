@@ -189,7 +189,6 @@ fn maybe_inject_cron_add_delivery(
 
     let is_agent_job = match args_obj.get("job_type").and_then(serde_json::Value::as_str) {
         Some("agent") => true,
-        Some("shell") => false,
         Some(_) => false,
         None => args_obj.contains_key("prompt"),
     };

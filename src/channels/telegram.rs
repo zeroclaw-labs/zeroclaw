@@ -612,7 +612,7 @@ impl TelegramChannel {
         });
     }
 
-    async fn try_parse_approval_callback_query(
+    fn try_parse_approval_callback_query(
         &self,
         update: &serde_json::Value,
     ) -> Option<ChannelMessage> {
@@ -3133,7 +3133,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
                         m
-                    } else if let Some(m) = self.try_parse_approval_callback_query(update).await {
+                    } else if let Some(m) = self.try_parse_approval_callback_query(update) {
                         m
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
                         m
@@ -3816,7 +3816,7 @@ mod tests {
                 },
                 "message": {
                     "message_id": 44,
-                    "chat": { "id": -100200300 },
+                    "chat": { "id": -100_200_300 },
                     "message_thread_id": 789
                 }
             }
@@ -3824,7 +3824,6 @@ mod tests {
 
         let msg = ch
             .try_parse_approval_callback_query(&update)
-            .await
             .expect("callback query should parse");
 
         assert_eq!(msg.sender, "alice");
