@@ -22,6 +22,9 @@ use axum::{
     response::IntoResponse,
 };
 
+const EMPTY_WS_RESPONSE_FALLBACK: &str =
+    "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
+
 fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
     let sanitized = crate::channels::sanitize_channel_response(response, tools);
     if sanitized.is_empty() && !response.trim().is_empty() {
@@ -30,6 +33,82 @@ fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -
     } else {
         sanitized
     }
+}
+
+fn normalize_prompt_tool_results(content: &str) -> Option<String> {
+    let mut cleaned_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("<tool_result") || trimmed == "</tool_result>" {
+            continue;
+        }
+        cleaned_lines.push(line.trim_end());
+    }
+
+    if cleaned_lines.is_empty() {
+        None
+    } else {
+        Some(cleaned_lines.join("\n"))
+    }
+}
+
+fn extract_latest_tool_output(history: &[ChatMessage]) -> Option<String> {
+    for msg in history.iter().rev() {
+        match msg.role.as_str() {
+            "tool" => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                    if let Some(content) = value
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                    {
+                        return Some(content.to_string());
+                    }
+                }
+
+                let trimmed = msg.content.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            "user" => {
+                if let Some(payload) = msg.content.strip_prefix("[Tool results]") {
+                    let payload = payload.trim_start_matches('\n');
+                    if let Some(cleaned) = normalize_prompt_tool_results(payload) {
+                        return Some(cleaned);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn finalize_ws_response(
+    response: &str,
+    history: &[ChatMessage],
+    tools: &[Box<dyn crate::tools::Tool>],
+) -> String {
+    let sanitized = sanitize_ws_response(response, tools);
+    if !sanitized.trim().is_empty() {
+        return sanitized;
+    }
+
+    if let Some(tool_output) = extract_latest_tool_output(history) {
+        let excerpt = crate::util::truncate_with_ellipsis(tool_output.trim(), 1200);
+        return format!(
+            "Tool execution completed, but the model returned no final text response.\n\nLatest tool output:\n{excerpt}"
+        );
+    }
+
+    EMPTY_WS_RESPONSE_FALLBACK.to_string()
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
@@ -148,7 +227,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         match result {
             Ok(response) => {
                 let safe_response =
-                    sanitize_ws_response(&response, state.tools_registry_exec.as_ref());
+                    finalize_ws_response(&response, &history, state.tools_registry_exec.as_ref());
                 // Add assistant response to history
                 history.push(ChatMessage::assistant(&safe_response));
 
@@ -327,5 +406,44 @@ Reminder set successfully."#;
         assert_eq!(result, "Reminder set successfully.");
         assert!(!result.contains("\"name\":\"schedule\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn finalize_ws_response_uses_prompt_mode_tool_output_when_final_text_empty() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"schedule\">\nDisk usage: 72%\n</tool_result>",
+            ),
+        ];
+
+        let result = finalize_ws_response("", &history, &tools);
+        assert!(result.contains("Latest tool output:"));
+        assert!(result.contains("Disk usage: 72%"));
+        assert!(!result.contains("<tool_result"));
+    }
+
+    #[test]
+    fn finalize_ws_response_uses_native_tool_message_output_when_final_text_empty() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let history = vec![ChatMessage {
+            role: "tool".to_string(),
+            content: r#"{"tool_call_id":"call_1","content":"Filesystem /dev/disk3s1: 210G free"}"#
+                .to_string(),
+        }];
+
+        let result = finalize_ws_response("", &history, &tools);
+        assert!(result.contains("Latest tool output:"));
+        assert!(result.contains("/dev/disk3s1"));
+    }
+
+    #[test]
+    fn finalize_ws_response_uses_static_fallback_when_nothing_available() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let history = vec![ChatMessage::system("sys")];
+
+        let result = finalize_ws_response("", &history, &tools);
+        assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
     }
 }
