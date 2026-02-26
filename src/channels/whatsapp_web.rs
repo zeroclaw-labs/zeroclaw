@@ -185,6 +185,8 @@ pub struct WhatsAppWebChannel {
     client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Voice transcription configuration (Groq Whisper)
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl WhatsAppWebChannel {
@@ -211,6 +213,42 @@ impl WhatsAppWebChannel {
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+            transcription: None,
+        }
+    }
+
+    /// Configure voice transcription via Groq Whisper.
+    ///
+    /// When `config.enabled` is false the builder is a no-op so callers can
+    /// pass `config.transcription.clone()` unconditionally.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
+    }
+
+    /// Map a WhatsApp audio MIME type to a filename accepted by the Groq Whisper API.
+    ///
+    /// WhatsApp voice notes are typically `audio/ogg; codecs=opus`.
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_mime_to_filename(mime: &str) -> &'static str {
+        let lower = mime.to_ascii_lowercase();
+        if lower.contains("ogg") || lower.contains("oga") {
+            "voice.ogg"
+        } else if lower.contains("opus") {
+            "voice.opus"
+        } else if lower.contains("mp4") || lower.contains("m4a") || lower.contains("aac") {
+            "voice.m4a"
+        } else if lower.contains("mpeg") || lower.contains("mp3") {
+            "voice.mp3"
+        } else if lower.contains("webm") {
+            "voice.webm"
+        } else if lower.contains("wav") {
+            "voice.wav"
+        } else {
+            "voice.ogg"
         }
     }
 
@@ -519,6 +557,7 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let transcription = self.transcription.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
@@ -527,6 +566,7 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, _client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let transcription = transcription.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -551,13 +591,82 @@ impl Channel for WhatsAppWebChannel {
 
                             if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
                                 let trimmed = text.trim();
-                                if trimmed.is_empty() {
+                                let content = if !trimmed.is_empty() {
+                                    trimmed.to_string()
+                                } else if let Some(ref tc) = transcription {
+                                    // Attempt to transcribe audio/voice messages
+                                    if let Some(ref audio_msg) = msg.audio_message {
+                                        let duration_secs =
+                                            audio_msg.seconds.unwrap_or(0) as u64;
+                                        if duration_secs > tc.max_duration_secs {
+                                            tracing::info!(
+                                                "WhatsApp Web: voice message too long \
+                                                 ({duration_secs}s > {}s), skipping",
+                                                tc.max_duration_secs
+                                            );
+                                            return;
+                                        }
+                                        let mime = audio_msg
+                                            .mimetype
+                                            .as_deref()
+                                            .unwrap_or("audio/ogg");
+                                        let file_name =
+                                            Self::audio_mime_to_filename(mime);
+                                        // download() decrypts the media in one step.
+                                        // audio_msg is Box<AudioMessage>; .as_ref() yields
+                                        // &AudioMessage which implements Downloadable.
+                                        match _client.download(audio_msg.as_ref()).await {
+                                            Ok(audio_bytes) => {
+                                                match super::transcription::transcribe_audio(
+                                                    audio_bytes,
+                                                    file_name,
+                                                    tc,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(t) if !t.trim().is_empty() => {
+                                                        format!("[Voice] {}", t.trim())
+                                                    }
+                                                    Ok(_) => {
+                                                        tracing::info!(
+                                                            "WhatsApp Web: voice transcription \
+                                                             returned empty text, skipping"
+                                                        );
+                                                        return;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "WhatsApp Web: voice transcription \
+                                                             failed: {e}"
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "WhatsApp Web: failed to download voice \
+                                                     audio: {e}"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring non-text/non-audio \
+                                             message from {}",
+                                            normalized
+                                        );
+                                        return;
+                                    }
+                                } else {
                                     tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message from {}",
+                                        "WhatsApp Web: ignoring empty or non-text message \
+                                         from {}",
                                         normalized
                                     );
                                     return;
-                                }
+                                };
 
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
@@ -566,7 +675,7 @@ impl Channel for WhatsAppWebChannel {
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
                                         reply_target: chat,
-                                        content: trimmed.to_string(),
+                                        content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                     })
@@ -915,5 +1024,70 @@ mod tests {
         let (text, attachments) = parse_wa_attachment_markers(msg);
         assert_eq!(text, "Check [UNKNOWN:/foo] out");
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_sets_config_when_enabled() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_skips_when_disabled() {
+        let tc = crate::config::TranscriptionConfig::default(); // enabled = false
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_mime_to_filename_maps_whatsapp_voice_note() {
+        // WhatsApp voice notes typically use this MIME type
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/ogg; codecs=opus"),
+            "voice.ogg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/ogg"),
+            "voice.ogg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/opus"),
+            "voice.opus"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/mp4"),
+            "voice.m4a"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/mpeg"),
+            "voice.mp3"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/wav"),
+            "voice.wav"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/webm"),
+            "voice.webm"
+        );
+        // Regression: webm+opus codec parameter must not match the opus branch
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/webm; codecs=opus"),
+            "voice.webm"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("audio/x-wav"),
+            "voice.wav"
+        );
+        // Unknown types default to ogg (safe default for WhatsApp voice notes)
+        assert_eq!(
+            WhatsAppWebChannel::audio_mime_to_filename("application/octet-stream"),
+            "voice.ogg"
+        );
     }
 }

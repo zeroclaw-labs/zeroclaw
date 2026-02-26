@@ -4395,12 +4395,15 @@ fn collect_configured_channels(
                 if wa.is_web_config() {
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppWebChannel::new(
-                            wa.session_path.clone().unwrap_or_default(),
-                            wa.pair_phone.clone(),
-                            wa.pair_code.clone(),
-                            wa.allowed_numbers.clone(),
-                        )),
+                        channel: Arc::new(
+                            WhatsAppWebChannel::new(
+                                wa.session_path.clone().unwrap_or_default(),
+                                wa.pair_phone.clone(),
+                                wa.pair_code.clone(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_transcription(config.transcription.clone()),
+                        ),
                     });
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
