@@ -18,6 +18,7 @@ For current runtime behavior, start here:
 - Troubleshooting: [../troubleshooting.md](../troubleshooting.md)
 - CI/Security audit event schema: [../audit-event-schema.md](../audit-event-schema.md)
 - Syscall anomaly detection: [./syscall-anomaly-detection.md](./syscall-anomaly-detection.md)
+- Perplexity suffix filter: [./perplexity-filter.md](./perplexity-filter.md)
 
 ## Proposal / Roadmap Docs
 

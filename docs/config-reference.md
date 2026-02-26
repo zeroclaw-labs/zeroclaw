@@ -209,6 +209,36 @@ log_path = "syscall-anomalies.log"
 baseline_syscalls = ["read", "write", "openat", "close", "execve", "futex"]
 ```
 
+## `[security.perplexity_filter]`
+
+Lightweight, opt-in adversarial suffix filter that runs before provider calls in channel and gateway message pipelines.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enable_perplexity_filter` | `false` | Enable pre-LLM statistical suffix anomaly blocking |
+| `perplexity_threshold` | `18.0` | Character-class bigram perplexity threshold |
+| `suffix_window_chars` | `64` | Trailing character window used for anomaly scoring |
+| `min_prompt_chars` | `32` | Minimum prompt length before filter is evaluated |
+| `symbol_ratio_threshold` | `0.20` | Minimum punctuation ratio in suffix window for blocking |
+
+Notes:
+
+- This filter is disabled by default to preserve baseline latency/behavior.
+- The detector combines character-class perplexity with GCG-like token heuristics.
+- Inputs are blocked only when anomaly conditions are met; normal natural-language prompts pass.
+- Typical per-message overhead is designed to stay under `50ms` in debug-safe local tests and substantially lower in release builds.
+
+Example:
+
+```toml
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
+```
+
 ## `[agents.<name>]`
 
 Delegate sub-agent configurations. Each key under `[agents]` defines a named sub-agent that the primary agent can delegate to.

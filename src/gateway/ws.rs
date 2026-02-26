@@ -223,6 +223,24 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         if content.is_empty() {
             continue;
         }
+        let perplexity_cfg = { state.config.lock().security.perplexity_filter.clone() };
+        if let Some(assessment) =
+            crate::security::detect_adversarial_suffix(&content, &perplexity_cfg)
+        {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!(
+                    "Input blocked by security.perplexity_filter: perplexity={:.2} (threshold {:.2}), symbol_ratio={:.2} (threshold {:.2}), suspicious_tokens={}.",
+                    assessment.perplexity,
+                    perplexity_cfg.perplexity_threshold,
+                    assessment.symbol_ratio,
+                    perplexity_cfg.symbol_ratio_threshold,
+                    assessment.suspicious_token_count
+                ),
+            });
+            let _ = socket.send(Message::Text(err.to_string().into())).await;
+            continue;
+        }
 
         // Add user message to history
         history.push(ChatMessage::user(&content));

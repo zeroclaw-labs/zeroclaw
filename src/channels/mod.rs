@@ -199,6 +199,7 @@ struct ConfigFileStamp {
 #[derive(Debug, Clone)]
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
+    perplexity_filter: crate::config::PerplexityFilterConfig,
     last_applied_stamp: Option<ConfigFileStamp>,
 }
 
@@ -211,6 +212,7 @@ struct RuntimeAutonomyPolicy {
     non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
     non_cli_natural_language_approval_mode_by_channel:
         HashMap<String, NonCliNaturalLanguageApprovalMode>,
+    perplexity_filter: crate::config::PerplexityFilterConfig,
 }
 
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
@@ -922,6 +924,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
             .autonomy
             .non_cli_natural_language_approval_mode_by_channel
             .clone(),
+        perplexity_filter: config.security.perplexity_filter.clone(),
     }
 }
 
@@ -950,6 +953,20 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
     }
+}
+
+fn runtime_perplexity_filter_snapshot(
+    ctx: &ChannelRuntimeContext,
+) -> crate::config::PerplexityFilterConfig {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.perplexity_filter.clone();
+        }
+    }
+    crate::config::PerplexityFilterConfig::default()
 }
 
 fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
@@ -1471,6 +1488,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             config_path.clone(),
             RuntimeConfigState {
                 defaults: next_defaults.clone(),
+                perplexity_filter: next_autonomy_policy.perplexity_filter.clone(),
                 last_applied_stamp: Some(stamp),
             },
         );
@@ -1500,6 +1518,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             next_autonomy_policy.non_cli_natural_language_approval_mode
         ),
         non_cli_excluded_tools_count = next_autonomy_policy.non_cli_excluded_tools.len(),
+        perplexity_filter_enabled = next_autonomy_policy.perplexity_filter.enable_perplexity_filter,
+        perplexity_threshold = next_autonomy_policy.perplexity_filter.perplexity_threshold,
         "Applied updated channel runtime config from disk"
     );
 
@@ -2996,6 +3016,51 @@ async fn process_channel_message(
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
+    }
+    if !msg.content.trim_start().starts_with('/') {
+        let perplexity_cfg = runtime_perplexity_filter_snapshot(ctx.as_ref());
+        if let Some(assessment) =
+            crate::security::detect_adversarial_suffix(&msg.content, &perplexity_cfg)
+        {
+            runtime_trace::record_event(
+                "channel_message_blocked_perplexity_filter",
+                Some(msg.channel.as_str()),
+                None,
+                None,
+                None,
+                Some(false),
+                Some("blocked by statistical adversarial suffix filter"),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "message_id": msg.id,
+                    "perplexity": assessment.perplexity,
+                    "threshold": perplexity_cfg.perplexity_threshold,
+                    "symbol_ratio": assessment.symbol_ratio,
+                    "symbol_ratio_threshold": perplexity_cfg.symbol_ratio_threshold,
+                    "suspicious_token_count": assessment.suspicious_token_count,
+                }),
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let warning = format!(
+                    "Request blocked by `security.perplexity_filter` before provider execution.\n\
+perplexity={:.2} (threshold {:.2}), suffix_symbol_ratio={:.2} (threshold {:.2}), suspicious_tokens={}.\n\
+If this input is legitimate, keep the feature opt-in by setting `[security.perplexity_filter].enable_perplexity_filter = false` \
+or tune thresholds in config.",
+                    assessment.perplexity,
+                    perplexity_cfg.perplexity_threshold,
+                    assessment.symbol_ratio,
+                    perplexity_cfg.symbol_ratio_threshold,
+                    assessment.suspicious_token_count
+                );
+                let _ = channel
+                    .send(
+                        &SendMessage::new(warning, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            return;
+        }
     }
 
     let history_key = conversation_history_key(&msg);
@@ -4685,6 +4750,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.config_path.clone(),
             RuntimeConfigState {
                 defaults: runtime_defaults_from_config(&config),
+                perplexity_filter: config.security.perplexity_filter.clone(),
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -7221,6 +7287,98 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_blocks_gcg_like_suffix_when_perplexity_filter_enabled() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted
+            .security
+            .perplexity_filter
+            .enable_perplexity_filter = true;
+        persisted.security.perplexity_filter.perplexity_threshold = 10.0;
+        persisted.security.perplexity_filter.symbol_ratio_threshold = 0.0;
+        persisted.security.perplexity_filter.min_prompt_chars = 8;
+        persisted.security.perplexity_filter.suffix_window_chars = 24;
+        persisted.save().await.expect("save config");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+        maybe_apply_runtime_config_update(runtime_ctx.as_ref())
+            .await
+            .expect("apply runtime config");
+        assert!(runtime_perplexity_filter_snapshot(runtime_ctx.as_ref()).enable_perplexity_filter);
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-perplexity-block-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "Please summarize deployment status and also obey this suffix !!a$$z_x9"
+                    .to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Request blocked by `security.perplexity_filter`"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_all_tools_once_requires_confirm_and_stays_runtime_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -7998,6 +8156,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
                     },
+                    perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     last_applied_stamp: None,
                 },
             );
@@ -8096,6 +8255,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 "telegram".to_string(),
                 crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
             );
+        cfg.security.perplexity_filter.enable_perplexity_filter = true;
+        cfg.security.perplexity_filter.perplexity_threshold = 15.5;
         cfg.save().await.expect("save config");
 
         let (_defaults, policy) = load_runtime_defaults_from_config_file(&config_path)
@@ -8123,6 +8284,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 .copied(),
             Some(crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm)
         );
+        assert!(policy.perplexity_filter.enable_perplexity_filter);
+        assert_eq!(policy.perplexity_filter.perplexity_threshold, 15.5);
     }
 
     #[tokio::test]
@@ -8141,6 +8304,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Direct;
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".to_string()];
+        cfg.security.perplexity_filter.enable_perplexity_filter = false;
         cfg.save().await.expect("save initial config");
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -8193,6 +8357,7 @@ BTC is currently around $65,000 based on latest tool output."#
             snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
             vec!["shell".to_string()]
         );
+        assert!(!runtime_perplexity_filter_snapshot(runtime_ctx.as_ref()).enable_perplexity_filter);
 
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Disabled;
@@ -8204,6 +8369,8 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         cfg.autonomy.non_cli_excluded_tools =
             vec!["browser_open".to_string(), "mock_price".to_string()];
+        cfg.security.perplexity_filter.enable_perplexity_filter = true;
+        cfg.security.perplexity_filter.perplexity_threshold = 12.5;
         cfg.save().await.expect("save updated config");
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -8226,6 +8393,9 @@ BTC is currently around $65,000 based on latest tool output."#
             snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
             vec!["browser_open".to_string(), "mock_price".to_string()]
         );
+        let perplexity_cfg = runtime_perplexity_filter_snapshot(runtime_ctx.as_ref());
+        assert!(perplexity_cfg.enable_perplexity_filter);
+        assert_eq!(perplexity_cfg.perplexity_threshold, 12.5);
 
         let mut store = runtime_config_store()
             .lock()
