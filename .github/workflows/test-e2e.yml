@@ -3,6 +3,13 @@ name: Test E2E
 on:
     push:
         branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "deny.toml"
+            - "src/**"
+            - "crates/**"
+            - "tests/**"
     workflow_dispatch:
 
 concurrency:

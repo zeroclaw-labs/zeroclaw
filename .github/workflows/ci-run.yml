@@ -122,7 +122,29 @@ jobs:
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
-                  fetch-depth: 0
+                  fetch-depth: 1
+
+            - name: Ensure diff base is available
+              shell: bash
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "${BASE_SHA}" ]; then
+                    echo "BASE_SHA is empty; docs gate will fallback to full-file lint."
+                    exit 0
+                  fi
+
+                  if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+                    echo "BASE_SHA already present: ${BASE_SHA}"
+                    exit 0
+                  fi
+
+                  echo "Fetching base commit ${BASE_SHA} for docs diff..."
+                  if ! git fetch --no-tags --depth=1 origin "${BASE_SHA}"; then
+                    echo "::warning::Unable to fetch BASE_SHA=${BASE_SHA}; docs gate will fallback to full-file lint."
+                    exit 0
+                  fi
 
             - name: Markdown lint (changed lines only)
               env:
