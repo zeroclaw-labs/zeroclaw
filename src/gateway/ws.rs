@@ -10,8 +10,10 @@
 //! ```
 
 use super::AppState;
+use crate::agent::loop_::context::build_context;
 use crate::agent::loop_::run_tool_call_loop;
 use crate::approval::ApprovalManager;
+use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
 use axum::{
     extract::{
@@ -21,6 +23,11 @@ use axum::{
     http::{header, HeaderMap},
     response::IntoResponse,
 };
+use uuid::Uuid;
+
+/// Minimum message length (in chars) to auto-save to memory.
+/// Matches the threshold used by the CLI agent loop and channel handlers.
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
     let sanitized = crate::channels::sanitize_channel_response(response, tools);
@@ -57,6 +64,12 @@ pub async fn handle_ws_chat(
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Maintain conversation history for this WebSocket session
     let mut history: Vec<ChatMessage> = Vec::new();
+
+    // Read memory config once for the session
+    let (min_relevance_score, auto_save) = {
+        let config_guard = state.config.lock();
+        (config_guard.memory.min_relevance_score, state.auto_save)
+    };
 
     // Build system prompt once for the session
     let system_prompt = {
@@ -106,8 +119,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             continue;
         }
 
-        // Add user message to history
-        history.push(ChatMessage::user(&content));
+        // ── Memory: auto-save user message ──────────────────────────
+        if auto_save && content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            let key = format!("user_msg_{}", Uuid::new_v4());
+            let _ = state
+                .mem
+                .store(&key, &content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // ── Memory: build RAG context from relevant memories ────────
+        let mem_context = build_context(state.mem.as_ref(), &content, min_relevance_score).await;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if mem_context.is_empty() {
+            format!("[{now}] {content}")
+        } else {
+            format!("{mem_context}[{now}] {content}")
+        };
+
+        // Add enriched user message to history (includes RAG context)
+        history.push(ChatMessage::user(&enriched));
 
         // Get provider info
         let provider_label = state
