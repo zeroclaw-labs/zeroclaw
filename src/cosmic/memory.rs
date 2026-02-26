@@ -195,6 +195,14 @@ impl CosmicMemoryGraph {
         self.edges.len()
     }
 
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "nodes": self.nodes.values().collect::<Vec<_>>(),
+            "edges": self.edges,
+            "max_nodes": self.max_nodes,
+        })
+    }
+
     pub fn hub_nodes(&self, top_n: usize) -> Vec<&CosmicNode> {
         let mut degree: HashMap<&str, usize> = HashMap::new();
         for edge in &self.edges {

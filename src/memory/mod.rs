@@ -6,6 +6,7 @@ pub mod lucid;
 pub mod markdown;
 pub mod none;
 pub mod postgres;
+pub mod rerank;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -155,7 +156,11 @@ pub fn create_memory_with_storage(
             config.keyword_weight as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
-        )?;
+        )?
+        .with_mmr(rerank::MmrConfig {
+            lambda: config.mmr_lambda,
+            enabled: config.mmr_enabled,
+        });
         Ok(mem)
     }
 

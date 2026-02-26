@@ -269,6 +269,16 @@ impl NormativeEngine {
         self.violations.len()
     }
 
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "norms": self.norms.values().collect::<Vec<_>>(),
+            "violations": self.violations.iter().collect::<Vec<_>>(),
+            "decisions": self.decisions.iter().collect::<Vec<_>>(),
+            "violation_capacity": self.violation_capacity,
+            "decision_capacity": self.decision_capacity,
+        })
+    }
+
     pub fn norms_by_domain(&self, domain: &str) -> Vec<&Norm> {
         self.norms.values().filter(|n| n.domain == domain).collect()
     }

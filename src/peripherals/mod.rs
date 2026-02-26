@@ -1,4 +1,4 @@
-//! Hardware peripherals — STM32, RPi GPIO, etc.
+//! Hardware peripherals — STM32, RPi GPIO, ESP32, Arduino, I2C, etc.
 //!
 //! Peripherals extend the agent with physical capabilities. See
 //! `docs/hardware-peripherals-design.md` for the full design.
@@ -9,11 +9,17 @@ pub mod traits;
 pub mod serial;
 
 #[cfg(feature = "hardware")]
+pub mod arduino;
+#[cfg(feature = "hardware")]
 pub mod arduino_flash;
 #[cfg(feature = "hardware")]
 pub mod arduino_upload;
 #[cfg(feature = "hardware")]
 pub mod capabilities_tool;
+#[cfg(feature = "hardware")]
+pub mod esp32;
+#[cfg(feature = "hardware")]
+pub mod i2c_bus;
 #[cfg(feature = "hardware")]
 pub mod nucleo_flash;
 #[cfg(feature = "hardware")]
@@ -172,7 +178,69 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
             continue;
         }
 
-        // Serial transport (STM32, ESP32, Arduino, etc.)
+        // I2C bus transport
+        if board.transport == "i2c" && (board.board == "i2c-bus" || board.board.starts_with("i2c"))
+        {
+            match i2c_bus::I2cBusPeripheral::connect(board).await {
+                Ok(mut peripheral) => {
+                    if peripheral.connect().await.is_err() {
+                        tracing::warn!(
+                            "I2C bus {} connect warning (continuing)",
+                            peripheral.name()
+                        );
+                    }
+                    tools.extend(peripheral.tools());
+                    tracing::info!(board = %board.board, "I2C bus peripheral connected");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect I2C bus {}: {}", board.board, e);
+                }
+            }
+            continue;
+        }
+
+        // ESP32 serial peripheral
+        if board.transport == "serial"
+            && (board.board == "esp32" || board.board.starts_with("esp32"))
+        {
+            match esp32::Esp32Peripheral::connect(board).await {
+                Ok(mut peripheral) => {
+                    if peripheral.connect().await.is_err() {
+                        tracing::warn!("ESP32 {} connect warning (continuing)", peripheral.name());
+                    }
+                    tools.extend(peripheral.tools());
+                    tracing::info!(board = %board.board, "ESP32 peripheral connected");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect ESP32 {}: {}", board.board, e);
+                }
+            }
+            continue;
+        }
+
+        // Arduino Nano serial peripheral
+        if board.transport == "serial"
+            && (board.board == "arduino-nano" || board.board.starts_with("arduino-nano"))
+        {
+            match arduino::ArduinoPeripheral::connect(board).await {
+                Ok(mut peripheral) => {
+                    if peripheral.connect().await.is_err() {
+                        tracing::warn!(
+                            "Arduino {} connect warning (continuing)",
+                            peripheral.name()
+                        );
+                    }
+                    tools.extend(peripheral.tools());
+                    tracing::info!(board = %board.board, "Arduino Nano peripheral connected");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect Arduino Nano {}: {}", board.board, e);
+                }
+            }
+            continue;
+        }
+
+        // Generic serial transport (STM32, etc.)
         if board.transport != "serial" {
             continue;
         }

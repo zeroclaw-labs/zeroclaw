@@ -161,6 +161,27 @@ impl ConsolidationEngine {
             .collect()
     }
 
+    pub fn full_snapshot(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(serde_json::json!({
+            "entries": self.entries,
+            "patterns": self.patterns,
+            "similarity_threshold": self.similarity_threshold,
+        }))
+    }
+
+    pub fn restore(value: &serde_json::Value) -> Option<Self> {
+        let entries: Vec<MemoryEntry> =
+            serde_json::from_value(value.get("entries")?.clone()).ok()?;
+        let patterns: Vec<MemoryPattern> =
+            serde_json::from_value(value.get("patterns")?.clone()).ok()?;
+        let similarity_threshold = value.get("similarity_threshold")?.as_f64()?;
+        Some(Self {
+            entries,
+            patterns,
+            similarity_threshold,
+        })
+    }
+
     pub fn top_patterns(&self, n: usize) -> Vec<&MemoryPattern> {
         let mut sorted: Vec<&MemoryPattern> = self.patterns.iter().collect();
         sorted.sort_by(|a, b| {

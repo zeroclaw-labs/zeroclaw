@@ -1736,9 +1736,13 @@ pub struct MemoryConfig {
     #[serde(default = "default_true")]
     pub auto_hydrate: bool,
 
+    // ── MMR (Maximal Marginal Relevance) reranking ─────────────
+    #[serde(default)]
+    pub mmr_enabled: bool,
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f64,
+
     // ── SQLite backend options ─────────────────────────────────
-    /// For sqlite backend: max seconds to wait when opening the DB (e.g. file locked).
-    /// None = wait indefinitely (default). Recommended max: 300.
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
 }
@@ -1785,6 +1789,9 @@ fn default_response_cache_ttl() -> u32 {
 fn default_response_cache_max() -> usize {
     5_000
 }
+fn default_mmr_lambda() -> f64 {
+    0.7
+}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -1809,6 +1816,8 @@ impl Default for MemoryConfig {
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
+            mmr_enabled: false,
+            mmr_lambda: default_mmr_lambda(),
             sqlite_open_timeout_secs: None,
         }
     }

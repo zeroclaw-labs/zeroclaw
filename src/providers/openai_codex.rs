@@ -1,4 +1,4 @@
-use crate::auth::openai_oauth::extract_account_id_from_jwt;
+use crate::auth::jwt_verify::extract_account_id_with_fallback;
 use crate::auth::AuthService;
 use crate::providers::traits::Provider;
 use crate::providers::ProviderRuntimeOptions;
@@ -358,7 +358,7 @@ impl Provider for OpenAiCodexProvider {
             })?;
         let account_id = profile
             .and_then(|profile| profile.account_id)
-            .or_else(|| extract_account_id_from_jwt(&access_token))
+            .or_else(|| extract_account_id_with_fallback(&access_token, None))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."

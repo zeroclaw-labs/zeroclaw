@@ -74,6 +74,14 @@ pub struct SelfState {
     pub integrity_score: f64,
     pub recent_violations: usize,
     pub active_repairs: usize,
+    #[serde(default)]
+    pub arousal: Option<f64>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub risk_level: Option<f64>,
+    #[serde(default)]
+    pub free_energy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

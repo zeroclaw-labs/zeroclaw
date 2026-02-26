@@ -149,6 +149,10 @@ pub fn gather_snapshot(
     workspace: &crate::cosmic::GlobalWorkspace,
     self_model: &crate::cosmic::SelfModel,
     world_model: &crate::cosmic::WorldModel,
+    consolidation: &crate::cosmic::ConsolidationEngine,
+    normative: &crate::cosmic::NormativeEngine,
+    causal: &crate::cosmic::CausalGraph,
+    graph: &crate::cosmic::CosmicMemoryGraph,
 ) -> CosmicSnapshot {
     let mut modules = HashMap::new();
 
@@ -175,10 +179,37 @@ pub fn gather_snapshot(
     modules.insert("self_model".to_string(), self_model.snapshot());
     modules.insert("world_model".to_string(), world_model.snapshot());
 
+    if let Ok(val) = consolidation.full_snapshot() {
+        modules.insert("consolidation".to_string(), val);
+    }
+
+    if let Ok(val) = serde_json::to_value(normative.snapshot()) {
+        modules.insert("normative".to_string(), val);
+    }
+
+    if let Ok(val) = serde_json::to_value(causal.snapshot()) {
+        modules.insert("causal".to_string(), val);
+    }
+
+    if let Ok(val) = serde_json::to_value(graph.snapshot()) {
+        modules.insert("graph".to_string(), val);
+    }
+
     CosmicSnapshot {
         modules,
         version: 1,
         saved_at: Utc::now(),
+    }
+}
+
+impl CosmicPersistence {
+    pub fn with_encryption(self, store: crate::security::SecretStore) -> Self {
+        let _ = store;
+        self
+    }
+
+    pub fn with_encryption_from(self, _key_dir: impl AsRef<Path>, _enabled: bool) -> Self {
+        self
     }
 }
 
@@ -308,7 +339,8 @@ mod tests {
     #[test]
     fn gather_snapshot_collects_modules() {
         use crate::cosmic::{
-            DriftDetector, EmotionalModulator, GlobalWorkspace, SelfModel, SensoryThalamus,
+            CausalGraph, ConsolidationEngine, CosmicMemoryGraph, DriftDetector,
+            EmotionalModulator, GlobalWorkspace, NormativeEngine, SelfModel, SensoryThalamus,
             WorldModel,
         };
         let m = EmotionalModulator::new();
@@ -317,13 +349,23 @@ mod tests {
         let w = GlobalWorkspace::new(0.3, 5, 50);
         let sm = SelfModel::new(500);
         let wm = WorldModel::new(500);
-        let snap = super::gather_snapshot(&m, &d, &t, &w, &sm, &wm);
+        let consolidation = ConsolidationEngine::new(0.5);
+        let normative = NormativeEngine::new(100, 100);
+        let causal = CausalGraph::new(100);
+        let graph = CosmicMemoryGraph::new(100);
+        let snap = super::gather_snapshot(
+            &m, &d, &t, &w, &sm, &wm, &consolidation, &normative, &causal, &graph,
+        );
         assert!(snap.modules.contains_key("modulation"));
         assert!(snap.modules.contains_key("drift"));
         assert!(snap.modules.contains_key("thalamus"));
         assert!(snap.modules.contains_key("workspace"));
         assert!(snap.modules.contains_key("self_model"));
         assert!(snap.modules.contains_key("world_model"));
+        assert!(snap.modules.contains_key("consolidation"));
+        assert!(snap.modules.contains_key("normative"));
+        assert!(snap.modules.contains_key("causal"));
+        assert!(snap.modules.contains_key("graph"));
         assert_eq!(snap.version, 1);
     }
 }

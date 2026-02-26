@@ -137,6 +137,10 @@ impl IntegrityLedger {
                         .any(|v| v.id == r.violation_id && !v.repaired)
                 })
                 .count(),
+            arousal: None,
+            confidence: None,
+            risk_level: None,
+            free_energy: None,
         }
     }
 }

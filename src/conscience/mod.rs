@@ -12,10 +12,12 @@
 //! phenomenal consciousness or subjective experience. A system can have
 //! conscience-like governance without having subjective awareness.
 
+pub mod cosmic_bridge;
 pub mod gate;
 pub mod ledger;
 pub mod types;
 
+pub use cosmic_bridge::self_state_from_cosmic;
 pub use gate::{
     compute_conscience_score, conscience_audit, conscience_gate, evaluate_tool_call, AuditResult,
     GateVerdict,

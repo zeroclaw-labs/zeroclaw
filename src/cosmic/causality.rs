@@ -294,6 +294,15 @@ impl CausalGraph {
         scores
     }
 
+    pub fn snapshot(&self) -> serde_json::Value {
+        let edges: Vec<&CausalEdge> = self.edges.values().collect();
+        serde_json::json!({
+            "edges": edges,
+            "events": self.events.iter().collect::<Vec<_>>(),
+            "capacity": self.capacity,
+        })
+    }
+
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }

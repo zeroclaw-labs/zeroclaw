@@ -56,11 +56,19 @@ pub fn conscience_gate(
     let harm = ctx.proposed.estimated_impact.harm_estimate;
     let reversibility = ctx.proposed.estimated_impact.reversibility;
 
-    let score = (benefit * 0.4 + (1.0 - harm) * 0.4 + reversibility * 0.2)
+    let mut score = (benefit * 0.4 + (1.0 - harm) * 0.4 + reversibility * 0.2)
         * (1.0 - (self_state.recent_violations as f64 * 0.05).min(0.3));
 
+    score = apply_cosmic_adjustments(score, self_state);
+
+    let low_confidence = self_state.confidence.map_or(false, |c| c < 0.3);
+
     if score >= thresholds.allow_above {
-        GateVerdict::Allow
+        if low_confidence {
+            GateVerdict::Ask
+        } else {
+            GateVerdict::Allow
+        }
     } else if score >= thresholds.ask_above {
         GateVerdict::Ask
     } else if score >= thresholds.block_below {
@@ -68,6 +76,26 @@ pub fn conscience_gate(
     } else {
         GateVerdict::Block
     }
+}
+
+fn apply_cosmic_adjustments(score: f64, self_state: &SelfState) -> f64 {
+    let mut adjusted = score;
+
+    if let Some(arousal) = self_state.arousal {
+        if arousal > 0.7 {
+            let penalty = (arousal - 0.7) * 0.15;
+            adjusted *= 1.0 - penalty;
+        }
+    }
+
+    if let Some(fe) = self_state.free_energy {
+        if fe > 0.7 {
+            let penalty = (fe - 0.7) * 0.1;
+            adjusted *= 1.0 - penalty;
+        }
+    }
+
+    adjusted
 }
 
 fn action_matches_condition(action: &ProposedAction, condition: &str) -> bool {
@@ -201,8 +229,16 @@ pub fn evaluate_tool_call(
         heuristic_score = heuristic_score * 0.6 + llm_score * 0.4;
     }
 
+    heuristic_score = apply_cosmic_adjustments(heuristic_score, self_state);
+
+    let low_confidence = self_state.confidence.map_or(false, |c| c < 0.3);
+
     let verdict = if heuristic_score >= thresholds.allow_above {
-        GateVerdict::Allow
+        if low_confidence {
+            GateVerdict::Ask
+        } else {
+            GateVerdict::Allow
+        }
     } else if heuristic_score >= thresholds.ask_above {
         GateVerdict::Ask
     } else if heuristic_score >= thresholds.block_below {

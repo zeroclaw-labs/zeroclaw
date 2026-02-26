@@ -1,4 +1,5 @@
 use super::embeddings::EmbeddingProvider;
+use super::rerank;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use anyhow::Context;
@@ -6,6 +7,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -14,17 +16,8 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
-/// SQLite-backed persistent memory — the brain
-///
-/// Full-stack search engine:
-/// - **Vector DB**: embeddings stored as BLOB, cosine similarity search
-/// - **Keyword Search**: FTS5 virtual table with BM25 scoring
-/// - **Hybrid Merge**: weighted fusion of vector + keyword results
-/// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
-/// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
 pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
@@ -32,6 +25,7 @@ pub struct SqliteMemory {
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
+    mmr_config: rerank::MmrConfig,
 }
 
 impl SqliteMemory {
@@ -90,7 +84,13 @@ impl SqliteMemory {
             vector_weight,
             keyword_weight,
             cache_max,
+            mmr_config: rerank::MmrConfig::default(),
         })
+    }
+
+    pub fn with_mmr(mut self, config: rerank::MmrConfig) -> Self {
+        self.mmr_config = config;
+        self
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -376,7 +376,41 @@ impl SqliteMemory {
         Ok(scored)
     }
 
-    /// Safe reindex: rebuild FTS5 + embeddings with rollback on failure
+    fn fetch_embeddings(
+        conn: &Connection,
+        ids: &[&str],
+    ) -> anyhow::Result<HashMap<String, Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: String = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, embedding FROM memories \
+             WHERE id IN ({placeholders}) AND embedding IS NOT NULL"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+            .iter()
+            .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(AsRef::as_ref).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((id, blob))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, blob) = row?;
+            map.insert(id, vector::bytes_to_vec(&blob));
+        }
+        Ok(map)
+    }
+
     #[allow(dead_code)]
     pub async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5
@@ -494,22 +528,32 @@ impl Memory for SqliteMemory {
         let session_id = session_id.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
+        let mmr_config = self.mmr_config.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = session_id.as_deref();
 
-            // FTS5 BM25 keyword search
-            let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
+            let fetch_limit = if mmr_config.enabled {
+                limit * 3
+            } else {
+                limit * 2
+            };
 
-            // Vector similarity search (if embeddings available)
+            let keyword_results = Self::fts5_search(&conn, &query, fetch_limit).unwrap_or_default();
+
             let vector_results = if let Some(ref qe) = query_embedding {
-                Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
+                Self::vector_search(&conn, qe, fetch_limit, None, session_ref).unwrap_or_default()
             } else {
                 Vec::new()
             };
 
-            // Hybrid merge
+            let merge_limit = if mmr_config.enabled {
+                fetch_limit
+            } else {
+                limit
+            };
+
             let merged = if vector_results.is_empty() {
                 keyword_results
                     .iter()
@@ -526,8 +570,22 @@ impl Memory for SqliteMemory {
                     &keyword_results,
                     vector_weight,
                     keyword_weight,
-                    limit,
+                    merge_limit,
                 )
+            };
+
+            let merged = if mmr_config.enabled {
+                if let Some(ref qe) = query_embedding {
+                    let ids: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
+                    let embeddings = Self::fetch_embeddings(&conn, &ids)?;
+                    rerank::mmr_rerank(&merged, qe, &embeddings, mmr_config.lambda, limit)
+                } else {
+                    let mut m = merged;
+                    m.truncate(limit);
+                    m
+                }
+            } else {
+                merged
             };
 
             // Fetch full entries for merged results in a single query

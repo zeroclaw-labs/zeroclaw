@@ -1,4 +1,5 @@
 pub mod anthropic_token;
+pub mod jwt_verify;
 pub mod openai_oauth;
 pub mod profiles;
 
@@ -209,8 +210,9 @@ impl AuthService {
                 .clone_from(&latest_tokens.refresh_token);
         }
 
-        let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
-            .or_else(|| latest_profile.account_id.clone());
+        let account_id =
+            jwt_verify::extract_account_id_with_fallback(&refreshed.access_token, None)
+                .or_else(|| latest_profile.account_id.clone());
 
         let updated = tokio::task::spawn_blocking({
             let store = self.store.clone();
