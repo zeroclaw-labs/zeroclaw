@@ -8,29 +8,31 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import manifestRaw from "./generated/docs-manifest.json";
 
 type Locale = "en" | "zh";
 type ThemeMode = "system" | "dark" | "light";
 type ResolvedTheme = "dark" | "light";
-type Category =
-  | "Core"
-  | "Setup"
-  | "Operations"
-  | "Security"
-  | "Reference"
-  | "International";
+type ReaderScale = "compact" | "comfortable" | "relaxed";
+type ReaderWidth = "normal" | "wide";
+
+type ManifestDoc = {
+  id: string;
+  path: string;
+  title: string;
+  summary: string;
+  section: string;
+  language: string;
+  sourceUrl: string;
+};
+
+type HeadingItem = {
+  id: string;
+  level: number;
+  text: string;
+};
 
 type Localized = Record<Locale, string>;
-
-type DocEntry = {
-  id: string;
-  category: Category;
-  path: string;
-  zhPath?: string;
-  title: Localized;
-  summary: Localized;
-  keywords?: string[];
-};
 
 type PaletteEntry = {
   id: string;
@@ -39,338 +41,22 @@ type PaletteEntry = {
   run: () => void;
 };
 
+const docs = [...(manifestRaw as ManifestDoc[])].sort((a, b) =>
+  a.path.localeCompare(b.path)
+);
+
 const repoBase = "https://github.com/zeroclaw-labs/zeroclaw/blob/main";
 const rawBase = "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main";
 
-const docs: DocEntry[] = [
-  {
-    id: "repo-readme",
-    category: "Core",
-    path: "README.md",
-    zhPath: "README.zh-CN.md",
-    title: { en: "Repository README", zh: "仓库 README" },
-    summary: {
-      en: "Project overview, architecture, benchmarks, setup, and operations.",
-      zh: "项目总览、架构、基准、安装与运维入口。",
-    },
-    keywords: ["overview", "architecture", "benchmark", "quick start"],
-  },
-  {
-    id: "docs-home",
-    category: "Core",
-    path: "docs/README.md",
-    zhPath: "docs/i18n/zh-CN/README.md",
-    title: { en: "Docs Hub", zh: "文档总览" },
-    summary: {
-      en: "Primary documentation hub for all ZeroClaw capabilities.",
-      zh: "ZeroClaw 全量文档的总入口。",
-    },
-    keywords: ["docs", "hub", "summary"],
-  },
-  {
-    id: "docs-summary",
-    category: "Core",
-    path: "docs/SUMMARY.md",
-    zhPath: "docs/i18n/zh-CN/SUMMARY.md",
-    title: { en: "Docs Table of Contents", zh: "文档目录" },
-    summary: {
-      en: "Structured index for all docs sections and files.",
-      zh: "结构化文档目录与索引。",
-    },
-    keywords: ["toc", "summary", "index"],
-  },
-  {
-    id: "one-click-bootstrap",
-    category: "Setup",
-    path: "docs/one-click-bootstrap.md",
-    zhPath: "docs/i18n/zh-CN/one-click-bootstrap.md",
-    title: { en: "One-Click Bootstrap", zh: "一键安装" },
-    summary: {
-      en: "Fast installer path for dependencies and ZeroClaw runtime.",
-      zh: "快速完成依赖与 ZeroClaw 运行时安装。",
-    },
-  },
-  {
-    id: "getting-started",
-    category: "Setup",
-    path: "docs/getting-started/README.md",
-    title: { en: "Getting Started", zh: "快速开始" },
-    summary: {
-      en: "Boot sequence, first commands, and onboarding flow.",
-      zh: "启动流程、首批命令与引导步骤。",
-    },
-  },
-  {
-    id: "network-deployment",
-    category: "Setup",
-    path: "docs/network-deployment.md",
-    zhPath: "docs/i18n/zh-CN/network-deployment.md",
-    title: { en: "Network Deployment", zh: "网络部署" },
-    summary: {
-      en: "Service setup, daemon/gateway, and network run modes.",
-      zh: "服务配置、daemon/gateway 与网络运行模式。",
-    },
-  },
-  {
-    id: "hardware",
-    category: "Setup",
-    path: "docs/hardware/README.md",
-    title: { en: "Hardware Guide", zh: "硬件指南" },
-    summary: {
-      en: "Board and hardware references for edge deployment.",
-      zh: "边缘部署相关板卡与硬件参考。",
-    },
-  },
-  {
-    id: "operations-runbook",
-    category: "Operations",
-    path: "docs/operations-runbook.md",
-    zhPath: "docs/i18n/zh-CN/operations-runbook.md",
-    title: { en: "Operations Runbook", zh: "运维手册" },
-    summary: {
-      en: "Operational procedures, incident handling, and checks.",
-      zh: "运维流程、故障处理与巡检实践。",
-    },
-  },
-  {
-    id: "ops-overview",
-    category: "Operations",
-    path: "docs/operations/README.md",
-    title: { en: "Operations Overview", zh: "运维概览" },
-    summary: {
-      en: "Operations section hub with runbooks and safeguards.",
-      zh: "运维章节入口，包含 runbook 与保障策略。",
-    },
-  },
-  {
-    id: "connectivity-probes",
-    category: "Operations",
-    path: "docs/operations/connectivity-probes-runbook.md",
-    title: { en: "Connectivity Probes", zh: "连通性探针" },
-    summary: {
-      en: "Probe workflow and diagnosis guidelines.",
-      zh: "探针流程与诊断指南。",
-    },
-  },
-  {
-    id: "troubleshooting",
-    category: "Operations",
-    path: "docs/troubleshooting.md",
-    zhPath: "docs/i18n/zh-CN/troubleshooting.md",
-    title: { en: "Troubleshooting", zh: "问题排查" },
-    summary: {
-      en: "Systematic recovery checklist for common failures.",
-      zh: "常见故障的系统化排查与恢复清单。",
-    },
-  },
-  {
-    id: "security-overview",
-    category: "Security",
-    path: "docs/security/README.md",
-    title: { en: "Security Overview", zh: "安全概览" },
-    summary: {
-      en: "Security architecture, controls, and policy model.",
-      zh: "安全架构、控制项与策略模型。",
-    },
-  },
-  {
-    id: "sandboxing",
-    category: "Security",
-    path: "docs/sandboxing.md",
-    zhPath: "docs/i18n/zh-CN/sandboxing.md",
-    title: { en: "Sandboxing", zh: "沙箱机制" },
-    summary: {
-      en: "Runtime sandbox boundaries and risk containment.",
-      zh: "运行时沙箱边界与风险隔离。",
-    },
-  },
-  {
-    id: "agnostic-security",
-    category: "Security",
-    path: "docs/agnostic-security.md",
-    zhPath: "docs/i18n/zh-CN/agnostic-security.md",
-    title: { en: "Agnostic Security", zh: "模型无关安全" },
-    summary: {
-      en: "Provider-agnostic security stance and operating model.",
-      zh: "面向多模型的统一安全基线与运行方式。",
-    },
-  },
-  {
-    id: "config-reference",
-    category: "Reference",
-    path: "docs/config-reference.md",
-    zhPath: "docs/i18n/zh-CN/config-reference.md",
-    title: { en: "Config Reference", zh: "配置参考" },
-    summary: {
-      en: "All runtime configuration fields and defaults.",
-      zh: "运行时配置字段与默认值。",
-    },
-  },
-  {
-    id: "commands-reference",
-    category: "Reference",
-    path: "docs/commands-reference.md",
-    zhPath: "docs/i18n/zh-CN/commands-reference.md",
-    title: { en: "Commands Reference", zh: "命令参考" },
-    summary: {
-      en: "CLI command map for onboarding, runtime, and tooling.",
-      zh: "覆盖引导、运行时与工具的 CLI 命令总览。",
-    },
-  },
-  {
-    id: "custom-providers",
-    category: "Reference",
-    path: "docs/custom-providers.md",
-    zhPath: "docs/i18n/zh-CN/custom-providers.md",
-    title: { en: "Custom Providers", zh: "自定义模型提供方" },
-    summary: {
-      en: "OpenAI-compatible and custom endpoint integration.",
-      zh: "OpenAI 兼容与自定义端点集成指南。",
-    },
-  },
-  {
-    id: "channels-reference",
-    category: "Reference",
-    path: "docs/channels-reference.md",
-    zhPath: "docs/i18n/zh-CN/channels-reference.md",
-    title: { en: "Channels Reference", zh: "渠道参考" },
-    summary: {
-      en: "Slack/Telegram/Discord/WhatsApp and channel wiring.",
-      zh: "Slack/Telegram/Discord/WhatsApp 等渠道配置。",
-    },
-  },
-  {
-    id: "reference-overview",
-    category: "Reference",
-    path: "docs/reference/README.md",
-    title: { en: "Reference Overview", zh: "参考总览" },
-    summary: {
-      en: "Reference section index across runtime internals.",
-      zh: "运行时内部参考索引。",
-    },
-  },
-  {
-    id: "resource-limits",
-    category: "Reference",
-    path: "docs/resource-limits.md",
-    zhPath: "docs/i18n/zh-CN/resource-limits.md",
-    title: { en: "Resource Limits", zh: "资源限制" },
-    summary: {
-      en: "CPU, memory, and execution constraints guide.",
-      zh: "CPU、内存与执行约束说明。",
-    },
-  },
-  {
-    id: "i18n-guide",
-    category: "International",
-    path: "docs/i18n-guide.md",
-    zhPath: "docs/i18n/zh-CN/i18n-guide.md",
-    title: { en: "i18n Guide", zh: "国际化指南" },
-    summary: {
-      en: "Localization strategy and docs translation workflow.",
-      zh: "本地化策略与文档翻译流程。",
-    },
-  },
-  {
-    id: "zh-docs-home",
-    category: "International",
-    path: "docs/i18n/zh-CN/README.md",
-    title: { en: "Chinese Docs Hub", zh: "中文文档总览" },
-    summary: {
-      en: "Chinese documentation index and translated content set.",
-      zh: "中文文档入口与翻译内容索引。",
-    },
-  },
-];
-
-const categories: Array<Category | "All"> = [
-  "All",
-  "Core",
-  "Setup",
-  "Operations",
-  "Security",
-  "Reference",
-  "International",
-];
-
-const categoryLabel: Record<Locale, Record<Category | "All", string>> = {
-  en: {
-    All: "All",
-    Core: "Core",
-    Setup: "Setup",
-    Operations: "Operations",
-    Security: "Security",
-    Reference: "Reference",
-    International: "International",
-  },
-  zh: {
-    All: "全部",
-    Core: "核心",
-    Setup: "部署",
-    Operations: "运维",
-    Security: "安全",
-    Reference: "参考",
-    International: "多语言",
-  },
+const languageNames: Record<string, Localized> = {
+  en: { en: "English", zh: "英文" },
+  "zh-CN": { en: "Chinese (Simplified)", zh: "简体中文" },
+  ja: { en: "Japanese", zh: "日文" },
+  ru: { en: "Russian", zh: "俄文" },
+  fr: { en: "French", zh: "法文" },
+  vi: { en: "Vietnamese", zh: "越南文" },
+  el: { en: "Greek", zh: "希腊文" },
 };
-
-const engineeringPillars: Array<{
-  title: Localized;
-  detail: Localized;
-}> = [
-  {
-    title: {
-      en: "Trait-driven architecture",
-      zh: "Trait 驱动架构",
-    },
-    detail: {
-      en: "Providers, channels, tools, memory, and tunnels remain swappable through interfaces.",
-      zh: "Provider、Channel、Tool、Memory、Tunnel 通过接口保持可插拔。",
-    },
-  },
-  {
-    title: {
-      en: "Secure by default runtime",
-      zh: "默认安全运行时",
-    },
-    detail: {
-      en: "Pairing, sandboxing, explicit allowlists, and workspace scoping are baseline controls.",
-      zh: "配对、沙箱、显式白名单与工作区作用域作为基线控制。",
-    },
-  },
-  {
-    title: {
-      en: "Build once, run anywhere",
-      zh: "一次构建，到处运行",
-    },
-    detail: {
-      en: "Single-binary Rust workflow across ARM, x86, and RISC-V from edge to cloud.",
-      zh: "单一 Rust 二进制工作流覆盖 ARM、x86、RISC-V，从边缘到云端。",
-    },
-  },
-];
-
-const commandLane: Array<{
-  command: string;
-  hint: Localized;
-}> = [
-  {
-    command: "zeroclaw onboard --interactive",
-    hint: { en: "Generate config and credentials", zh: "生成配置与凭据" },
-  },
-  {
-    command: "zeroclaw agent",
-    hint: { en: "Run interactive agent mode", zh: "运行交互式 Agent 模式" },
-  },
-  {
-    command: "zeroclaw gateway && zeroclaw daemon",
-    hint: { en: "Start runtime services", zh: "启动运行时服务" },
-  },
-  {
-    command: "zeroclaw doctor",
-    hint: { en: "Validate environment and runtime health", zh: "校验环境与运行时健康状态" },
-  },
-];
 
 const copy = {
   en: {
@@ -388,20 +74,16 @@ const copy = {
     ctaBootstrap: "One-click bootstrap",
     commandLaneTitle: "Runtime command lane",
     commandLaneHint: "From official setup and operations flow",
-    metrics: [
-      { label: "Runtime Memory", value: "< 5MB" },
-      { label: "Cold Start", value: "< 10ms" },
-      { label: "Edge Hardware", value: "$10-class" },
-      { label: "Language", value: "100% Rust" },
-    ],
     engineeringTitle: "Engineering foundations",
     docsWorkspace: "Documentation Workspace",
     docsLead:
-      "Browse, filter, and read project docs directly in-page. Open any item in GitHub when needed.",
+      "All repository docs are indexed and readable directly on this GitHub Pages site with engineering-first layout and typography.",
     docsIndexed: "Indexed",
     docsFiltered: "Filtered",
     docsActive: "Active",
-    search: "Search docs by topic, path, or keyword",
+    sectionFilter: "Section",
+    languageFilter: "Language",
+    search: "Search docs by title, path, summary, or keyword",
     commandPalette: "Command palette",
     sourceLabel: "Source",
     openOnGithub: "Open on GitHub",
@@ -409,7 +91,21 @@ const copy = {
     loading: "Loading document...",
     fallback:
       "Document preview is unavailable right now. You can still open the source directly:",
-    empty: "No docs matched your current filter.",
+    empty: "No docs matched your current filters.",
+    allSections: "All sections",
+    allLanguages: "All languages",
+    outline: "Outline",
+    noOutline: "No headings found in this document.",
+    reading: "Reading mode",
+    scaleLabel: "Scale",
+    widthLabel: "Width",
+    compact: "Compact",
+    comfortable: "Comfortable",
+    relaxed: "Relaxed",
+    normalWidth: "Normal",
+    wideWidth: "Wide",
+    previousDoc: "Previous",
+    nextDoc: "Next",
     paletteHint: "Type a command or document name",
     actionFocus: "Focus docs search",
     actionTop: "Back to top",
@@ -431,19 +127,16 @@ const copy = {
     ctaBootstrap: "一键安装",
     commandLaneTitle: "运行命令通道",
     commandLaneHint: "来自官方安装与运维流程",
-    metrics: [
-      { label: "运行内存", value: "< 5MB" },
-      { label: "冷启动", value: "< 10ms" },
-      { label: "边缘硬件", value: "$10 级别" },
-      { label: "语言", value: "100% Rust" },
-    ],
     engineeringTitle: "工程基础",
     docsWorkspace: "文档工作区",
-    docsLead: "在页面内直接浏览、过滤并阅读文档；需要时可一键跳转 GitHub 原文。",
+    docsLead:
+      "仓库全量文档已建立索引并支持在 GitHub Pages 页面内直接阅读，采用工程化排版与阅读体验。",
     docsIndexed: "总文档",
     docsFiltered: "筛选后",
     docsActive: "当前文档",
-    search: "按主题、路径或关键字搜索",
+    sectionFilter: "分组",
+    languageFilter: "语言",
+    search: "按标题、路径、摘要或关键字搜索",
     commandPalette: "命令面板",
     sourceLabel: "来源",
     openOnGithub: "在 GitHub 打开",
@@ -451,6 +144,20 @@ const copy = {
     loading: "文档加载中...",
     fallback: "当前无法预览文档，你仍可直接打开源文件：",
     empty: "当前筛选下没有匹配文档。",
+    allSections: "全部分组",
+    allLanguages: "全部语言",
+    outline: "目录",
+    noOutline: "当前文档没有可提取的标题。",
+    reading: "阅读模式",
+    scaleLabel: "字号",
+    widthLabel: "宽度",
+    compact: "紧凑",
+    comfortable: "舒适",
+    relaxed: "宽松",
+    normalWidth: "标准",
+    wideWidth: "加宽",
+    previousDoc: "上一篇",
+    nextDoc: "下一篇",
     paletteHint: "输入命令或文档名称",
     actionFocus: "聚焦文档搜索",
     actionTop: "回到顶部",
@@ -460,12 +167,69 @@ const copy = {
   },
 } as const;
 
+const commandLane: Array<{ command: string; hint: Localized }> = [
+  {
+    command: "zeroclaw onboard --interactive",
+    hint: { en: "Generate config and credentials", zh: "生成配置与凭据" },
+  },
+  {
+    command: "zeroclaw agent",
+    hint: { en: "Run interactive agent mode", zh: "运行交互式 Agent 模式" },
+  },
+  {
+    command: "zeroclaw gateway && zeroclaw daemon",
+    hint: { en: "Start runtime services", zh: "启动运行时服务" },
+  },
+  {
+    command: "zeroclaw doctor",
+    hint: {
+      en: "Validate environment and runtime health",
+      zh: "校验环境与运行时健康状态",
+    },
+  },
+];
+
+const engineeringPillars: Array<{ title: Localized; detail: Localized }> = [
+  {
+    title: { en: "Trait-driven architecture", zh: "Trait 驱动架构" },
+    detail: {
+      en: "Providers, channels, tools, memory, and tunnels remain swappable through interfaces.",
+      zh: "Provider、Channel、Tool、Memory、Tunnel 通过接口保持可插拔。",
+    },
+  },
+  {
+    title: { en: "Secure by default runtime", zh: "默认安全运行时" },
+    detail: {
+      en: "Pairing, sandboxing, explicit allowlists, and workspace scoping are baseline controls.",
+      zh: "配对、沙箱、显式白名单与工作区作用域作为基线控制。",
+    },
+  },
+  {
+    title: { en: "Build once, run anywhere", zh: "一次构建，到处运行" },
+    detail: {
+      en: "Single-binary Rust workflow across ARM, x86, and RISC-V from edge to cloud.",
+      zh: "单一 Rust 二进制工作流覆盖 ARM、x86、RISC-V，从边缘到云端。",
+    },
+  },
+];
+
+function normalizePath(input: string): string {
+  return input
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/^\.\//, "");
+}
+
 function slugify(text: string): string {
   return text
     .toLowerCase()
+    .replace(/<[^>]+>/g, "")
+    .replace(/\[[^\]]+\]\([^)]*\)/g, "")
     .replace(/[^\w\u4e00-\u9fa5\s-]/g, "")
     .trim()
-    .replace(/\s+/g, "-");
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
 }
 
 function nodeText(node: ReactNode): string {
@@ -481,19 +245,154 @@ function nodeText(node: ReactNode): string {
   return "";
 }
 
-function withRepo(path: string): string {
-  return `${repoBase}/${path}`;
+function encodePathSegments(filePath: string): string {
+  return normalizePath(filePath)
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
-function withRaw(path: string): string {
-  return `${rawBase}/${path}`;
+function docsContentUrl(filePath: string): string {
+  return `${import.meta.env.BASE_URL}docs-content/${encodePathSegments(filePath)}`;
 }
 
-function resolvePath(doc: DocEntry, locale: Locale): string {
-  if (locale === "zh" && doc.zhPath) {
-    return doc.zhPath;
+function withRepo(filePath: string): string {
+  return `${repoBase}/${normalizePath(filePath)}`;
+}
+
+function withRaw(filePath: string): string {
+  return `${rawBase}/${normalizePath(filePath)}`;
+}
+
+function cleanHeadingText(raw: string): string {
+  return raw
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\s+#*$/, "")
+    .trim();
+}
+
+function extractHeadings(markdown: string): HeadingItem[] {
+  const lines = markdown.split(/\r?\n/);
+  const headings: HeadingItem[] = [];
+  const slugCounts = new Map<string, number>();
+  let inCode = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (line.startsWith("```")) {
+      inCode = !inCode;
+      continue;
+    }
+
+    if (inCode) {
+      continue;
+    }
+
+    const match = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+
+    const level = match[1].length;
+    const text = cleanHeadingText(match[2]);
+    const base = slugify(text) || `section-${headings.length + 1}`;
+    const seen = (slugCounts.get(base) ?? 0) + 1;
+    slugCounts.set(base, seen);
+    const id = seen === 1 ? base : `${base}-${seen}`;
+
+    headings.push({ id, level, text });
   }
-  return doc.path;
+
+  return headings;
+}
+
+function inferSectionLabel(section: string, locale: Locale): string {
+  if (section === "root") {
+    return locale === "zh" ? "仓库根目录" : "Repository Root";
+  }
+
+  if (section === "docs") {
+    return locale === "zh" ? "文档总览" : "Docs Core";
+  }
+
+  if (section.startsWith("i18n/")) {
+    const language = section.split("/")[1] ?? "i18n";
+    return locale === "zh"
+      ? `多语言 / ${formatLanguage(language, locale)}`
+      : `i18n / ${formatLanguage(language, locale)}`;
+  }
+
+  const pretty = section.replace(/[-_]/g, " ");
+  return pretty.charAt(0).toUpperCase() + pretty.slice(1);
+}
+
+function formatLanguage(language: string, locale: Locale): string {
+  if (languageNames[language]) {
+    return languageNames[language][locale];
+  }
+
+  if (language === "en") {
+    return locale === "zh" ? "英文" : "English";
+  }
+
+  return language;
+}
+
+function canonicalDocPath(candidate: string, docSet: Set<string>): string | null {
+  const normalized = normalizePath(candidate);
+  const attempts = new Set<string>([normalized]);
+
+  if (normalized.endsWith("/")) {
+    attempts.add(`${normalized}README.md`);
+    attempts.add(`${normalized}README.mdx`);
+  }
+
+  if (!/\.[a-zA-Z0-9]+$/.test(normalized)) {
+    attempts.add(`${normalized}.md`);
+    attempts.add(`${normalized}.mdx`);
+    attempts.add(`${normalized}/README.md`);
+    attempts.add(`${normalized}/README.mdx`);
+  }
+
+  for (const attempt of attempts) {
+    if (docSet.has(attempt)) {
+      return attempt;
+    }
+  }
+
+  return null;
+}
+
+function resolveRelativePath(fromPath: string, target: string): {
+  path: string;
+  hash: string;
+} {
+  const base = new URL(`https://repo.local/${normalizePath(fromPath)}`);
+  const resolved = new URL(target, base);
+
+  return {
+    path: normalizePath(decodeURIComponent(resolved.pathname)),
+    hash: decodeURIComponent(resolved.hash.replace(/^#/, "")),
+  };
+}
+
+function getInitialDocPath(docSet: Set<string>): string {
+  if (typeof window === "undefined") {
+    return docs[0]?.path ?? "";
+  }
+
+  const url = new URL(window.location.href);
+  const requested = url.searchParams.get("doc");
+  if (requested) {
+    const decoded = normalizePath(decodeURIComponent(requested));
+    if (docSet.has(decoded)) {
+      return decoded;
+    }
+  }
+
+  return docs[0]?.path ?? "";
 }
 
 export default function App(): JSX.Element {
@@ -515,10 +414,16 @@ export default function App(): JSX.Element {
     return "system";
   });
 
+  const docSet = useMemo(() => new Set(docs.map((doc) => doc.path)), []);
+
+  const [selectedPath, setSelectedPath] = useState<string>(() =>
+    getInitialDocPath(docSet)
+  );
+
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>("dark");
-  const [category, setCategory] = useState<Category | "All">("All");
   const [query, setQuery] = useState("");
-  const [selectedId, setSelectedId] = useState<string>("docs-home");
+  const [sectionFilter, setSectionFilter] = useState("all");
+  const [languageFilter, setLanguageFilter] = useState("all");
 
   const [markdownCache, setMarkdownCache] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
@@ -526,6 +431,11 @@ export default function App(): JSX.Element {
 
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState("");
+
+  const [readerScale, setReaderScale] = useState<ReaderScale>("comfortable");
+  const [readerWidth, setReaderWidth] = useState<ReaderWidth>("normal");
+
+  const [pendingAnchor, setPendingAnchor] = useState<string>("");
 
   const docsSearchRef = useRef<HTMLInputElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement | null>(null);
@@ -558,105 +468,203 @@ export default function App(): JSX.Element {
     return undefined;
   }, [themeMode]);
 
+  const sectionOptions = useMemo(
+    () => ["all", ...new Set(docs.map((doc) => doc.section))],
+    []
+  );
+
+  const languageOptions = useMemo(
+    () => ["all", ...new Set(docs.map((doc) => doc.language))],
+    []
+  );
+
   const filteredDocs = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
+    const needle = query.trim().toLowerCase();
 
     return docs.filter((doc) => {
-      if (category !== "All" && doc.category !== category) {
+      if (sectionFilter !== "all" && doc.section !== sectionFilter) {
         return false;
       }
 
-      if (!normalized) {
+      if (languageFilter !== "all" && doc.language !== languageFilter) {
+        return false;
+      }
+
+      if (!needle) {
         return true;
       }
 
       const bag = [
-        doc.title[locale],
-        doc.title.en,
-        doc.title.zh,
-        doc.summary[locale],
+        doc.title,
+        doc.summary,
         doc.path,
-        ...(doc.keywords ?? []),
+        doc.section,
+        doc.language,
       ]
         .join(" ")
         .toLowerCase();
 
-      return bag.includes(normalized);
+      return bag.includes(needle);
     });
-  }, [category, locale, query]);
+  }, [languageFilter, query, sectionFilter]);
+
+  const docsByPath = useMemo(() => new Map(docs.map((doc) => [doc.path, doc])), []);
+
+  const selectedDoc =
+    docsByPath.get(selectedPath) ?? filteredDocs[0] ?? docs[0] ?? null;
 
   useEffect(() => {
-    if (filteredDocs.length === 0) {
+    if (!selectedDoc) {
       return;
     }
 
-    const stillVisible = filteredDocs.some((doc) => doc.id === selectedId);
-    if (!stillVisible) {
-      setSelectedId(filteredDocs[0].id);
+    if (selectedPath !== selectedDoc.path) {
+      setSelectedPath(selectedDoc.path);
     }
-  }, [filteredDocs, selectedId]);
-
-  const selectedDoc =
-    docs.find((doc) => doc.id === selectedId) ?? docs.find((doc) => doc.id === "docs-home") ?? docs[0];
-
-  const activePath = resolvePath(selectedDoc, locale);
-  const markdown = markdownCache[activePath] ?? "";
+  }, [selectedDoc, selectedPath]);
 
   useEffect(() => {
-    let cancelled = false;
-    const controller = new AbortController();
-
-    if (markdownCache[activePath]) {
-      return () => {
-        cancelled = true;
-        controller.abort();
-      };
+    if (!selectedDoc) {
+      return;
     }
 
-    async function load(): Promise<void> {
-      setLoading(true);
-      setError("");
+    const url = new URL(window.location.href);
+    const current = url.searchParams.get("doc");
 
-      try {
-        const response = await fetch(withRaw(activePath), {
-          signal: controller.signal,
-        });
+    if (current !== selectedDoc.path) {
+      url.searchParams.set("doc", selectedDoc.path);
+      window.history.replaceState({}, "", `${url.pathname}?${url.searchParams.toString()}`);
+    }
+  }, [selectedDoc]);
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
+  useEffect(() => {
+    function onPopState(): void {
+      const url = new URL(window.location.href);
+      const next = url.searchParams.get("doc");
+      if (!next) {
+        return;
+      }
 
-        const textBody = await response.text();
-
-        if (cancelled) {
-          return;
-        }
-
-        setMarkdownCache((prev) => ({
-          ...prev,
-          [activePath]: textBody,
-        }));
-      } catch (err) {
-        if (cancelled) {
-          return;
-        }
-
-        const message = err instanceof Error ? err.message : "Failed to fetch";
-        setError(message);
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+      const normalized = normalizePath(decodeURIComponent(next));
+      if (docSet.has(normalized)) {
+        setSelectedPath(normalized);
       }
     }
 
-    void load();
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [docSet]);
+
+  const activePath = selectedDoc?.path ?? "";
+  const markdown = markdownCache[activePath] ?? "";
+
+  useEffect(() => {
+    if (!selectedDoc) {
+      return;
+    }
+
+    if (markdownCache[activePath]) {
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    async function loadDoc(): Promise<void> {
+      setLoading(true);
+      setError("");
+
+      const localUrl = docsContentUrl(activePath);
+      const fallbackRawUrl = withRaw(activePath);
+
+      const tryFetch = async (url: string): Promise<string | null> => {
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          if (!response.ok) {
+            return null;
+          }
+          return await response.text();
+        } catch {
+          return null;
+        }
+      };
+
+      const localContent = await tryFetch(localUrl);
+      const content = localContent ?? (await tryFetch(fallbackRawUrl));
+
+      if (cancelled) {
+        return;
+      }
+
+      if (content === null) {
+        setError("fetch_failed");
+        setLoading(false);
+        return;
+      }
+
+      setMarkdownCache((prev) => ({
+        ...prev,
+        [activePath]: content,
+      }));
+      setLoading(false);
+    }
+
+    void loadDoc();
 
     return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [activePath, markdownCache]);
+  }, [activePath, markdownCache, selectedDoc]);
+
+  const headings = useMemo(() => extractHeadings(markdown), [markdown]);
+
+  useEffect(() => {
+    if (!pendingAnchor) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      const target = document.getElementById(pendingAnchor);
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      setPendingAnchor("");
+    }, 90);
+
+    return () => window.clearTimeout(timer);
+  }, [headings, pendingAnchor]);
+
+  const groupedDocs = useMemo(() => {
+    const grouped = new Map<string, ManifestDoc[]>();
+
+    for (const doc of filteredDocs) {
+      if (!grouped.has(doc.section)) {
+        grouped.set(doc.section, []);
+      }
+      grouped.get(doc.section)?.push(doc);
+    }
+
+    return [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [filteredDocs]);
+
+  const currentIndex = filteredDocs.findIndex((doc) => doc.path === activePath);
+  const previousDoc = currentIndex > 0 ? filteredDocs[currentIndex - 1] : null;
+  const nextDoc =
+    currentIndex >= 0 && currentIndex < filteredDocs.length - 1
+      ? filteredDocs[currentIndex + 1]
+      : null;
+
+  const openDoc = (docPath: string, anchor = ""): void => {
+    if (!docSet.has(docPath)) {
+      return;
+    }
+
+    setSelectedPath(docPath);
+    if (anchor) {
+      setPendingAnchor(anchor);
+    }
+  };
 
   const cycleTheme = (): void => {
     setThemeMode((prev) => {
@@ -674,60 +682,80 @@ export default function App(): JSX.Element {
     docsSearchRef.current?.focus();
   };
 
-  const paletteEntries = useMemo(() => {
-    const staticEntries: PaletteEntry[] = [
+  const paletteActions = useMemo(
+    () => [
       {
         id: "focus-search",
         label: text.actionFocus,
         hint: text.docsWorkspace,
         run: () => {
-          document.getElementById("docs-workspace")?.scrollIntoView({ behavior: "smooth", block: "start" });
-          setTimeout(() => docsSearchRef.current?.focus(), 300);
+          document
+            .getElementById("docs-workspace")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+          setTimeout(() => docsSearchRef.current?.focus(), 220);
         },
       },
       {
-        id: "top",
+        id: "back-top",
         label: text.actionTop,
         hint: "Home",
         run: jumpToTop,
       },
       {
-        id: "theme",
+        id: "toggle-theme",
         label: text.actionTheme,
         hint: `${text.status}: ${resolvedTheme}`,
         run: cycleTheme,
       },
       {
-        id: "locale",
+        id: "toggle-locale",
         label: text.actionLocale,
         hint: locale === "en" ? "EN -> 中文" : "中文 -> EN",
         run: () => setLocale((prev) => (prev === "en" ? "zh" : "en")),
       },
-    ];
-
-    const dynamicEntries: PaletteEntry[] = filteredDocs.slice(0, 10).map((doc) => ({
-      id: `doc-${doc.id}`,
-      label: doc.title[locale],
-      hint: doc.path,
-      run: () => {
-        setSelectedId(doc.id);
-        document.getElementById("docs-workspace")?.scrollIntoView({ behavior: "smooth", block: "start" });
-      },
-    }));
-
-    return [...staticEntries, ...dynamicEntries];
-  }, [filteredDocs, locale, resolvedTheme, text.actionFocus, text.actionLocale, text.actionTheme, text.actionTop, text.docsWorkspace, text.status]);
+    ],
+    [locale, resolvedTheme, text.actionFocus, text.actionLocale, text.actionTheme, text.actionTop, text.docsWorkspace, text.status]
+  );
 
   const paletteResults = useMemo(() => {
-    const normalized = paletteQuery.trim().toLowerCase();
-    if (!normalized) {
-      return paletteEntries;
+    const needle = paletteQuery.trim().toLowerCase();
+
+    const actionEntries: PaletteEntry[] = paletteActions;
+
+    const docEntries: PaletteEntry[] = docs
+      .filter((doc) => {
+        if (!needle) {
+          return true;
+        }
+
+        return [doc.title, doc.summary, doc.path, doc.section, doc.language]
+          .join(" ")
+          .toLowerCase()
+          .includes(needle);
+      })
+      .slice(0, 18)
+      .map((doc) => ({
+        id: `doc-${doc.id}`,
+        label: doc.title,
+        hint: doc.path,
+        run: () => {
+          openDoc(doc.path);
+          document
+            .getElementById("docs-workspace")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+        },
+      }));
+
+    if (!needle) {
+      return [...actionEntries, ...docEntries.slice(0, 10)];
     }
 
-    return paletteEntries.filter((entry) => {
-      return `${entry.label} ${entry.hint}`.toLowerCase().includes(normalized);
-    });
-  }, [paletteEntries, paletteQuery]);
+    const matchedActions = actionEntries.filter((entry) =>
+      `${entry.label} ${entry.hint}`.toLowerCase().includes(needle)
+    );
+
+    return [...matchedActions, ...docEntries];
+  }, [docs, paletteActions, paletteQuery]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
@@ -754,6 +782,12 @@ export default function App(): JSX.Element {
       setPaletteQuery("");
     }
   }, [paletteOpen]);
+
+  if (!selectedDoc) {
+    return <div className="zc-app" />;
+  }
+
+  let headingRenderIndex = 0;
 
   return (
     <div className="zc-app">
@@ -855,12 +889,22 @@ export default function App(): JSX.Element {
             </div>
 
             <div className="metrics" aria-label="Project metrics">
-              {text.metrics.map((metric) => (
-                <article key={metric.label} className="metric-card">
-                  <p className="metric-label">{metric.label}</p>
-                  <p className="metric-value">{metric.value}</p>
-                </article>
-              ))}
+              <article className="metric-card">
+                <p className="metric-label">Runtime Memory</p>
+                <p className="metric-value">&lt; 5MB</p>
+              </article>
+              <article className="metric-card">
+                <p className="metric-label">Cold Start</p>
+                <p className="metric-value">&lt; 10ms</p>
+              </article>
+              <article className="metric-card">
+                <p className="metric-label">Edge Hardware</p>
+                <p className="metric-value">$10-class</p>
+              </article>
+              <article className="metric-card">
+                <p className="metric-label">Docs Indexed</p>
+                <p className="metric-value">{docs.length}</p>
+              </article>
             </div>
 
             <section className="principles" aria-label={text.engineeringTitle}>
@@ -891,7 +935,7 @@ export default function App(): JSX.Element {
               {text.docsFiltered}: <strong>{filteredDocs.length}</strong>
             </span>
             <span>
-              {text.docsActive}: <strong>{selectedDoc.title[locale]}</strong>
+              {text.docsActive}: <strong>{selectedDoc.title}</strong>
             </span>
           </div>
 
@@ -904,24 +948,40 @@ export default function App(): JSX.Element {
               placeholder={text.search}
               aria-label={text.search}
             />
+
+            <select
+              value={sectionFilter}
+              onChange={(event) => setSectionFilter(event.target.value)}
+              aria-label={text.sectionFilter}
+            >
+              <option value="all">{text.allSections}</option>
+              {sectionOptions
+                .filter((section) => section !== "all")
+                .map((section) => (
+                  <option key={section} value={section}>
+                    {inferSectionLabel(section, locale)}
+                  </option>
+                ))}
+            </select>
+
+            <select
+              value={languageFilter}
+              onChange={(event) => setLanguageFilter(event.target.value)}
+              aria-label={text.languageFilter}
+            >
+              <option value="all">{text.allLanguages}</option>
+              {languageOptions
+                .filter((language) => language !== "all")
+                .map((language) => (
+                  <option key={language} value={language}>
+                    {formatLanguage(language, locale)}
+                  </option>
+                ))}
+            </select>
+
             <button type="button" className="btn ghost" onClick={() => setPaletteOpen(true)}>
               {text.commandPalette}
             </button>
-          </div>
-
-          <div className="category-row" role="tablist" aria-label="Doc categories">
-            {categories.map((item) => (
-              <button
-                key={item}
-                type="button"
-                role="tab"
-                aria-selected={category === item}
-                className={category === item ? "active" : ""}
-                onClick={() => setCategory(item)}
-              >
-                {categoryLabel[locale][item]}
-              </button>
-            ))}
           </div>
 
           <div className="workspace-grid">
@@ -929,22 +989,31 @@ export default function App(): JSX.Element {
               {filteredDocs.length === 0 ? (
                 <p className="empty-hint">{text.empty}</p>
               ) : (
-                filteredDocs.map((doc) => {
-                  const isActive = doc.id === selectedId;
-                  return (
-                    <button
-                      key={doc.id}
-                      type="button"
-                      className={`doc-item ${isActive ? "active" : ""}`}
-                      onClick={() => setSelectedId(doc.id)}
-                    >
-                      <span className="doc-meta">{categoryLabel[locale][doc.category]}</span>
-                      <span className="doc-title">{doc.title[locale]}</span>
-                      <span className="doc-summary">{doc.summary[locale]}</span>
-                      <span className="doc-path">{resolvePath(doc, locale)}</span>
-                    </button>
-                  );
-                })
+                groupedDocs.map(([section, sectionDocs]) => (
+                  <section key={section} className="doc-group">
+                    <h3>{inferSectionLabel(section, locale)}</h3>
+                    <div>
+                      {sectionDocs.map((doc) => {
+                        const isActive = doc.path === activePath;
+                        return (
+                          <button
+                            key={doc.id}
+                            type="button"
+                            className={`doc-item ${isActive ? "active" : ""}`}
+                            onClick={() => openDoc(doc.path)}
+                          >
+                            <span className="doc-meta">
+                              {formatLanguage(doc.language, locale)}
+                            </span>
+                            <span className="doc-title">{doc.title}</span>
+                            <span className="doc-summary">{doc.summary}</span>
+                            <span className="doc-path">{doc.path}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                ))
               )}
             </aside>
 
@@ -952,7 +1021,7 @@ export default function App(): JSX.Element {
               <header className="reader-head">
                 <div>
                   <p>{text.sourceLabel}</p>
-                  <h3>{selectedDoc.title[locale]}</h3>
+                  <h3>{selectedDoc.title}</h3>
                   <code>{activePath}</code>
                 </div>
                 <div className="reader-actions">
@@ -974,29 +1043,122 @@ export default function App(): JSX.Element {
               ) : null}
 
               {!loading && !error && markdown ? (
-                <article className="markdown-body">
+                <article className={`markdown-body size-${readerScale} width-${readerWidth}`}>
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
                       h1: ({ children }) => {
-                        const id = slugify(nodeText(children));
+                        const id = headings[headingRenderIndex]?.id ?? slugify(nodeText(children));
+                        headingRenderIndex += 1;
                         return <h1 id={id}>{children}</h1>;
                       },
                       h2: ({ children }) => {
-                        const id = slugify(nodeText(children));
+                        const id = headings[headingRenderIndex]?.id ?? slugify(nodeText(children));
+                        headingRenderIndex += 1;
                         return <h2 id={id}>{children}</h2>;
                       },
                       h3: ({ children }) => {
-                        const id = slugify(nodeText(children));
+                        const id = headings[headingRenderIndex]?.id ?? slugify(nodeText(children));
+                        headingRenderIndex += 1;
                         return <h3 id={id}>{children}</h3>;
                       },
                       a: ({ href, children }) => {
-                        const url = href ?? "#";
-                        const external = /^https?:\/\//i.test(url);
+                        const target = href ?? "";
+
+                        if (!target) {
+                          return <span>{children}</span>;
+                        }
+
+                        if (target.startsWith("#")) {
+                          const anchor = decodeURIComponent(target.replace(/^#/, ""));
+                          return (
+                            <a
+                              href={target}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                setPendingAnchor(anchor);
+                              }}
+                            >
+                              {children}
+                            </a>
+                          );
+                        }
+
+                        if (/^[a-z]+:/i.test(target)) {
+                          return (
+                            <a href={target} target="_blank" rel="noreferrer">
+                              {children}
+                            </a>
+                          );
+                        }
+
+                        const resolved = resolveRelativePath(activePath, target);
+                        const docPath = canonicalDocPath(resolved.path, docSet);
+
+                        if (docPath) {
+                          const hrefDoc = `?doc=${encodeURIComponent(docPath)}`;
+                          const hrefAnchor = resolved.hash ? `#${encodeURIComponent(resolved.hash)}` : "";
+                          return (
+                            <a
+                              href={`${hrefDoc}${hrefAnchor}`}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                openDoc(docPath, resolved.hash);
+                              }}
+                            >
+                              {children}
+                            </a>
+                          );
+                        }
+
+                        const looksLikeAsset =
+                          resolved.path.startsWith("docs/") ||
+                          /\.(png|jpe?g|gif|webp|svg|avif|txt|toml|json|yaml|yml)$/i.test(
+                            resolved.path
+                          );
+
+                        if (looksLikeAsset) {
+                          return (
+                            <a
+                              href={docsContentUrl(resolved.path)}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {children}
+                            </a>
+                          );
+                        }
+
                         return (
-                          <a href={url} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>
+                          <a href={withRepo(resolved.path)} target="_blank" rel="noreferrer">
                             {children}
                           </a>
+                        );
+                      },
+                      img: ({ src, alt }) => {
+                        const original = src ?? "";
+                        if (!original) {
+                          return null;
+                        }
+
+                        if (/^https?:\/\//i.test(original) || original.startsWith("data:")) {
+                          return <img src={original} alt={alt ?? ""} loading="lazy" />;
+                        }
+
+                        const resolved = resolveRelativePath(activePath, original);
+                        const localAsset = docsContentUrl(resolved.path);
+
+                        return (
+                          <img
+                            src={localAsset}
+                            alt={alt ?? ""}
+                            loading="lazy"
+                            onError={(event) => {
+                              (event.currentTarget as HTMLImageElement).src = withRaw(
+                                resolved.path
+                              );
+                            }}
+                          />
                         );
                       },
                     }}
@@ -1005,18 +1167,102 @@ export default function App(): JSX.Element {
                   </ReactMarkdown>
                 </article>
               ) : null}
+
+              <footer className="reader-nav">
+                <button
+                  type="button"
+                  disabled={!previousDoc}
+                  onClick={() => previousDoc && openDoc(previousDoc.path)}
+                >
+                  {text.previousDoc}
+                </button>
+                <button
+                  type="button"
+                  disabled={!nextDoc}
+                  onClick={() => nextDoc && openDoc(nextDoc.path)}
+                >
+                  {text.nextDoc}
+                </button>
+              </footer>
             </section>
+
+            <aside className="reader-side" aria-label="Reader controls">
+              <section className="side-card">
+                <h3>{text.outline}</h3>
+                {headings.length === 0 ? (
+                  <p>{text.noOutline}</p>
+                ) : (
+                  <ul className="toc-list">
+                    {headings.map((heading) => (
+                      <li key={heading.id} data-level={heading.level}>
+                        <button type="button" onClick={() => setPendingAnchor(heading.id)}>
+                          {heading.text}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              <section className="side-card">
+                <h3>{text.reading}</h3>
+
+                <div className="side-control">
+                  <p>{text.scaleLabel}</p>
+                  <div className="pill-row">
+                    {(["compact", "comfortable", "relaxed"] as ReaderScale[]).map((scale) => (
+                      <button
+                        key={scale}
+                        type="button"
+                        className={readerScale === scale ? "active" : ""}
+                        onClick={() => setReaderScale(scale)}
+                      >
+                        {scale === "compact"
+                          ? text.compact
+                          : scale === "comfortable"
+                            ? text.comfortable
+                            : text.relaxed}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="side-control">
+                  <p>{text.widthLabel}</p>
+                  <div className="pill-row">
+                    {(["normal", "wide"] as ReaderWidth[]).map((width) => (
+                      <button
+                        key={width}
+                        type="button"
+                        className={readerWidth === width ? "active" : ""}
+                        onClick={() => setReaderWidth(width)}
+                      >
+                        {width === "normal" ? text.normalWidth : text.wideWidth}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </section>
+            </aside>
           </div>
         </section>
       </main>
 
       <footer className="footer">
-        <p>ZeroClaw · Trait-driven architecture · secure-by-default runtime · pluggable everything</p>
+        <p>
+          ZeroClaw · Trait-driven architecture · secure-by-default runtime ·
+          pluggable everything
+        </p>
       </footer>
 
       {paletteOpen ? (
         <div className="palette-backdrop" onClick={() => setPaletteOpen(false)}>
-          <div className="palette" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+          <div
+            className="palette"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
             <input
               ref={paletteInputRef}
               type="search"
@@ -1032,7 +1278,7 @@ export default function App(): JSX.Element {
               aria-label={text.paletteHint}
             />
             <div className="palette-list">
-              {paletteResults.slice(0, 12).map((entry) => (
+              {paletteResults.slice(0, 16).map((entry) => (
                 <button
                   key={entry.id}
                   type="button"

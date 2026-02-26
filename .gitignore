@@ -10,6 +10,7 @@ __pycache__/
 docker-compose.override.yml
 site/node_modules/
 site/.vite/
+site/public/docs-content/
 gh-pages/
 
 # Environment files (may contain secrets)
