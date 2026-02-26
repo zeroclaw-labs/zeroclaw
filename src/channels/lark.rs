@@ -217,6 +217,8 @@ const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(300);
 const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
 /// Fallback tenant token TTL when `expire`/`expires_in` is absent.
 const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
+/// Timeout for quoted-message fetch to avoid blocking inbound handlers.
+const LARK_QUOTED_MESSAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 const LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT: &str =
@@ -553,8 +555,19 @@ impl LarkChannel {
                 .http_client()
                 .get(&url)
                 .header("Authorization", format!("Bearer {token}"))
+                .timeout(LARK_QUOTED_MESSAGE_FETCH_TIMEOUT)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        anyhow::anyhow!(
+                            "Lark quoted message fetch timed out after {}s: message_id={message_id}",
+                            LARK_QUOTED_MESSAGE_FETCH_TIMEOUT.as_secs()
+                        )
+                    } else {
+                        error.into()
+                    }
+                })?;
 
             let status = response.status();
             let body = response.bytes().await?;
@@ -1490,14 +1503,7 @@ fn parse_quoted_content(message_type: &str, content: &str) -> Option<String> {
             .map(|details| details.text)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        _ => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
+        _ => None,
     }
 }
 
@@ -2956,6 +2962,29 @@ mod tests {
         let response = serde_json::json!({
             "code": 0,
             "data": {}
+        });
+        let quoted = extract_quoted_message_from_response(&response);
+        assert_eq!(quoted, None);
+    }
+
+    #[test]
+    fn lark_parse_quoted_content_ignores_unsupported_type() {
+        let quoted = parse_quoted_content("file", r#"{"file_key":"abc"}"#);
+        assert_eq!(quoted, None);
+    }
+
+    #[test]
+    fn lark_extract_quoted_message_from_response_ignores_unsupported_type() {
+        let response = serde_json::json!({
+            "code": 0,
+            "data": {
+                "items": [{
+                    "msg_type": "file",
+                    "body": {
+                        "content": r#"{"file_key":"abc"}"#
+                    }
+                }]
+            }
         });
         let quoted = extract_quoted_message_from_response(&response);
         assert_eq!(quoted, None);
