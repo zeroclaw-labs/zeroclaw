@@ -577,7 +577,10 @@ impl LarkChannel {
 
             let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
             if code != 0 {
-                return Ok(None);
+                anyhow::bail!(
+                    "Lark quoted message fetch returned non-zero code={code}, body={}",
+                    crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
+                );
             }
 
             return Ok(extract_quoted_message_from_response(&parsed));
