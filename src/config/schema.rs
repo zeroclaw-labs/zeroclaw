@@ -2600,11 +2600,33 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
 
+    /// SQLite journal mode: "wal" (default) or "delete".
+    ///
+    /// WAL (Write-Ahead Logging) provides better concurrency and is the
+    /// recommended default. However, WAL requires shared-memory support
+    /// (mmap/shm) which is **not available** on many network and virtual
+    /// shared filesystems (NFS, SMB/CIFS, UTM/VirtioFS, VirtualBox shared
+    /// folders, etc.), causing `xShmMap` I/O errors at startup.
+    ///
+    /// Set to `"delete"` when your workspace lives on such a filesystem.
+    ///
+    /// Example:
+    /// ```toml
+    /// [memory]
+    /// sqlite_journal_mode = "delete"
+    /// ```
+    #[serde(default = "default_sqlite_journal_mode")]
+    pub sqlite_journal_mode: String,
+
     // ── Qdrant backend options ─────────────────────────────────
     /// Configuration for Qdrant vector database backend.
     /// Used when `backend = "qdrant"` or `backend = "sqlite_qdrant_hybrid"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+}
+
+fn default_sqlite_journal_mode() -> String {
+    "wal".into()
 }
 
 fn default_embedding_provider() -> String {
@@ -2674,6 +2696,7 @@ impl Default for MemoryConfig {
             snapshot_on_hygiene: false,
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
+            sqlite_journal_mode: default_sqlite_journal_mode(),
             qdrant: QdrantConfig::default(),
         }
     }

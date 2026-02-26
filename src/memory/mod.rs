@@ -262,13 +262,14 @@ pub fn create_memory_with_storage_and_routes(
             ));
 
         #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
+        let mem = SqliteMemory::with_options(
             workspace_dir,
             embedder,
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
+            &config.sqlite_journal_mode,
         )?;
         Ok(mem)
     }
