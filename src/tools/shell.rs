@@ -106,6 +106,14 @@ fn extract_command_argument(args: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn floor_char_boundary_compat(text: &str, index: usize) -> usize {
+    let mut end = index.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -212,17 +220,11 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(crate::util::floor_utf8_char_boundary(
-                        &stdout,
-                        MAX_OUTPUT_BYTES,
-                    ));
+                    stdout.truncate(floor_char_boundary_compat(&stdout, MAX_OUTPUT_BYTES));
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(crate::util::floor_utf8_char_boundary(
-                        &stderr,
-                        MAX_OUTPUT_BYTES,
-                    ));
+                    stderr.truncate(floor_char_boundary_compat(&stderr, MAX_OUTPUT_BYTES));
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 

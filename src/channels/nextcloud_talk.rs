@@ -425,8 +425,8 @@ mod tests {
             vec!["*".into()],
         );
         let payload = serde_json::json!({
-            "type": "message",
-            "object": {"token": "room-token-123"},
+                "type": "message",
+                "object": {"token": "room-token-123"},
             "message": {
                 "actorType": "users",
                 "actorId": "user_a",

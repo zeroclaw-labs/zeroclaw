@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -110,8 +109,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
-            #[allow(clippy::cast_possible_truncation)]
-            return (value % upper) as usize;
+            return usize::try_from(value % upper).expect("index must fit in usize");
         }
     }
 }
@@ -1699,6 +1697,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">
     /// This mirrors OpenClaw's markdownToTelegramHtml approach.
     fn markdown_to_telegram_html(text: &str) -> String {
+        use std::fmt::Write as _;
+
         let lines: Vec<&str> = text.split('\n').collect();
         let mut result_lines: Vec<String> = Vec::new();
 

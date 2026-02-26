@@ -726,7 +726,6 @@ async fn e2e_live_research_phase() {
     use zeroclaw::config::{ResearchPhaseConfig, ResearchTrigger};
     use zeroclaw::observability::NoopObserver;
     use zeroclaw::providers::openai_codex::OpenAiCodexProvider;
-    use zeroclaw::providers::traits::Provider;
     use zeroclaw::tools::{Tool, ToolResult};
 
     // ── Test should_trigger ──

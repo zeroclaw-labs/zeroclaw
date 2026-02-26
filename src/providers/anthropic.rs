@@ -1287,7 +1287,14 @@ mod tests {
             }),
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("Skipping test: TCP bind not permitted in this environment: {error}");
+                return;
+            }
+            Err(error) => panic!("Failed to bind test listener: {error}"),
+        };
         let addr = listener.local_addr().unwrap();
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
