@@ -5763,6 +5763,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -5984,6 +5985,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -6061,6 +6063,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -6371,6 +6374,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
         assert_eq!(
             runtime_ctx
@@ -6506,6 +6510,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
         assert_eq!(
             runtime_ctx
@@ -6616,6 +6621,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager,
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -6721,6 +6727,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager,
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -6816,6 +6823,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -6955,6 +6963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -7100,6 +7109,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -7215,6 +7225,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -7310,6 +7321,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -7424,6 +7436,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         process_channel_message(
@@ -7851,6 +7864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
+            output_guardrail: crate::config::OutputGuardrailConfig::default(),
         });
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())

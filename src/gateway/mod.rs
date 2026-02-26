@@ -964,12 +964,12 @@ async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow:
     crate::agent::process_message(config, message).await
 }
 
-fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
-    let sanitized = crate::channels::sanitize_channel_response(
-        response,
-        tools,
-        &crate::config::OutputGuardrailConfig::default(),
-    );
+fn sanitize_gateway_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    output_guardrail: &crate::config::OutputGuardrailConfig,
+) -> String {
+    let sanitized = crate::channels::sanitize_channel_response(response, tools, output_guardrail);
     if sanitized.is_empty() && !response.trim().is_empty() {
         "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
             .to_string()
@@ -1280,8 +1280,11 @@ async fn handle_api_chat(
 
     match run_gateway_chat_with_tools(&state, &chat_body.message).await {
         Ok(response) => {
-            let safe_response =
-                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+            let safe_response = sanitize_gateway_response(
+                &response,
+                state.tools_registry_exec.as_ref(),
+                &state.config.lock().security.output_guardrail,
+            );
             let body = serde_json::json!({ "reply": safe_response });
             (StatusCode::OK, Json(body))
         }
@@ -1381,8 +1384,11 @@ async fn handle_webhook(
 
     match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
-            let safe_response =
-                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+            let safe_response = sanitize_gateway_response(
+                &response,
+                state.tools_registry_exec.as_ref(),
+                &state.config.lock().security.output_guardrail,
+            );
             let duration = started_at.elapsed();
             state
                 .observer
@@ -1587,8 +1593,11 @@ async fn handle_whatsapp_message(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &state.config.lock().security.output_guardrail,
+                );
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1706,8 +1715,11 @@ async fn handle_linq_webhook(
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &state.config.lock().security.output_guardrail,
+                );
                 // Send reply via Linq
                 if let Err(e) = linq
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1800,8 +1812,11 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &state.config.lock().security.output_guardrail,
+                );
                 // Send reply via WATI
                 if let Err(e) = wati
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1906,8 +1921,11 @@ async fn handle_nextcloud_talk_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &state.config.lock().security.output_guardrail,
+                );
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
@@ -1997,8 +2015,11 @@ async fn handle_qq_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &state.config.lock().security.output_guardrail,
+                );
                 if let Err(e) = qq
                     .send(
                         &SendMessage::new(safe_response, &msg.reply_target)
@@ -2541,7 +2562,8 @@ mod tests {
 </tool_call>
 After"#;
 
-        let result = sanitize_gateway_response(input, &[]);
+        let result =
+            sanitize_gateway_response(input, &[], &crate::config::OutputGuardrailConfig::default());
         let normalized = result
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -2559,7 +2581,11 @@ After"#;
 {"result":{"status":"scheduled"}}
 Reminder set successfully."#;
 
-        let result = sanitize_gateway_response(input, &tools);
+        let result = sanitize_gateway_response(
+            input,
+            &tools,
+            &crate::config::OutputGuardrailConfig::default(),
+        );
         assert_eq!(result, "Reminder set successfully.");
         assert!(!result.contains("\"name\":\"schedule\""));
         assert!(!result.contains("\"result\""));
