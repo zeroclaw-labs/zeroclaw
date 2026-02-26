@@ -3802,6 +3802,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_approval_callback_command_trims_and_rejects_empty_ids() {
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:yes:   apr-1234   "),
+            Some("/approve-allow apr-1234".to_string())
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:no:\tapr-5678  "),
+            Some("/approve-deny apr-5678".to_string())
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:yes:   "),
+            None
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:no:"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn try_parse_approval_callback_query_builds_runtime_command_message() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
