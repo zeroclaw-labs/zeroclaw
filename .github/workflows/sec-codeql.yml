@@ -57,6 +57,16 @@ jobs:
               with:
                   toolchain: 1.92.0
 
+            - name: Ensure native build tools
+              shell: bash
+              run: |
+                  SUDO=""
+                  if command -v sudo >/dev/null 2>&1; then
+                      SUDO="sudo"
+                  fi
+                  $SUDO apt-get update
+                  $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
+
             - name: Build
               run: cargo build --workspace --all-targets --locked
 
