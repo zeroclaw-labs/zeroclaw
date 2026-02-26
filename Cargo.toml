@@ -26,7 +26,7 @@ tokio-util = { version = "0.7", default-features = false }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
 # HTTP client - minimal features
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "native-tls", "blocking", "multipart", "stream", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
@@ -46,7 +46,7 @@ schemars = "1.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "chrono"] }
 
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
@@ -58,11 +58,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML to plain text conversion (web_fetch tool)
-nanohtml2text = "0.2"
+# HTML conversion providers (web_fetch tool)
+fast_html2md = { version = "0.0.58", optional = true }
+nanohtml2text = { version = "0.2", optional = true }
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+
+# Optional in-process WASM runtime for sandboxed tool execution
+wasmi = { version = "1.0.9", optional = true, default-features = true }
 
 # Error handling
 anyhow = "1.0"
@@ -100,6 +104,7 @@ prost = { version = "0.14", default-features = false, features = ["derive"], opt
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+tokio-postgres-rustls = { version = "0.12", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -113,6 +118,9 @@ glob = "0.3"
 
 # Binary discovery (init system detection)
 which = "8.0"
+
+# Temporary directory creation (for self-update)
+tempfile = "3.14"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
@@ -161,6 +169,7 @@ probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
+tempfile = "3.14"
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
@@ -179,22 +188,23 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
-# Unix-specific dependencies (for root check, etc.)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [features]
-default = []
+default = ["channel-lark", "web-fetch-html2md"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
-memory-postgres = ["dep:postgres"]
+memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+web-fetch-html2md = ["dep:fast_html2md"]
+web-fetch-plaintext = ["dep:nanohtml2text"]
+firecrawl = []
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
 fantoccini = ["browser-native"]
+# In-process WASM runtime (capability-based sandbox)
+runtime-wasm = ["dep:wasmi"]
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")
 sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
@@ -229,10 +239,14 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tempfile = "3.14"
+tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
+
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
 
 [[bench]]
 name = "agent_benchmarks"

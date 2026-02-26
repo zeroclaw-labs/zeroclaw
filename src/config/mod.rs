@@ -5,21 +5,25 @@ pub mod traits;
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
-    AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
-    BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
-    CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig,
-    EstopConfig, FeishuConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
+    AgentConfig, AgentsIpcConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig,
+    BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
+    CoordinationConfig, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig,
+    DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
+    GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
     HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
-    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
-    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
-    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
+    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
+    NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpConfig, OtpMethod,
+    PeripheralBoardConfig, PeripheralsConfig, ProviderConfig, ProxyConfig, ProxyScope,
+    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
+    ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode,
+    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
+    SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig,
+    WasmCapabilityEscalationMode, WasmModuleHashPolicy, WasmRuntimeConfig, WasmSecurityConfig,
     WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
-pub fn name_and_presence<T: traits::ChannelConfig>(channel: &Option<T>) -> (&'static str, bool) {
+pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
 }
 
@@ -45,6 +49,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         };
 
         let discord = DiscordConfig {
@@ -53,6 +59,7 @@ mod tests {
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         };
 
         let lark = LarkConfig {
@@ -62,9 +69,13 @@ mod tests {
             verification_token: None,
             allowed_users: vec![],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -72,8 +83,12 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec![],
+            group_reply: None,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
 
         let nextcloud_talk = NextcloudTalkConfig {

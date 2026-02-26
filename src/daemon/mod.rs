@@ -404,6 +404,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -429,6 +431,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -440,6 +443,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -536,6 +540,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();
