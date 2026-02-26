@@ -707,6 +707,9 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 ];
 
 fn default_model_for_provider(provider: &str) -> String {
+    if matches!(provider, "qwen-coding-plan") {
+        return "qwen3-coder-plus".into();
+    }
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
@@ -739,6 +742,22 @@ fn default_model_for_provider(provider: &str) -> String {
 }
 
 fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+    if matches!(provider_name, "qwen-coding-plan") {
+        return vec![
+            (
+                "qwen3-coder-plus".to_string(),
+                "Qwen3 Coder Plus (recommended for coding workflows)".to_string(),
+            ),
+            (
+                "qwen3.5-plus".to_string(),
+                "Qwen3.5 Plus (reasoning + coding)".to_string(),
+            ),
+            (
+                "qwen3-max-2026-01-23".to_string(),
+                "Qwen3 Max (high-capability coding model)".to_string(),
+            ),
+        ];
+    }
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
@@ -1202,6 +1221,9 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "qwen-intl" => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models"),
         "dashscope-us" => Some("https://dashscope-us.aliyuncs.com/compatible-mode/v1/models"),
+        "qwen-coding-plan" => {
+            Some("https://coding.dashscope.aliyuncs.com/v1/models")
+        }
         "moonshot-cn" | "kimi-cn" => Some("https://api.moonshot.cn/v1/models"),
         "glm-cn" | "bigmodel" => Some("https://open.bigmodel.cn/api/paas/v4/models"),
         "zai-cn" | "z.ai-cn" => Some("https://open.bigmodel.cn/api/coding/paas/v4/models"),
@@ -2222,6 +2244,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("qwen", "Qwen — DashScope China endpoint"),
             ("qwen-intl", "Qwen — DashScope international endpoint"),
             ("qwen-us", "Qwen — DashScope US endpoint"),
+            (
+                "qwen-coding-plan",
+                "Qwen — DashScope coding plan endpoint (coding.dashscope.aliyuncs.com)",
+            ),
             ("hunyuan", "Hunyuan — Tencent large models (T1, Turbo, Pro)"),
             ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
             ("zai", "Z.AI — global coding endpoint"),
@@ -6704,6 +6730,7 @@ mod tests {
         assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
+        assert_eq!(default_model_for_provider("qwen-coding-plan"), "qwen3-coder-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
@@ -6748,6 +6775,7 @@ mod tests {
         assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
         assert_eq!(canonical_provider_name("qwen-code"), "qwen-code");
         assert_eq!(canonical_provider_name("qwen-oauth"), "qwen-code");
+        assert_eq!(canonical_provider_name("qwen-coding-plan"), "qwen");
         assert_eq!(canonical_provider_name("codex"), "openai-codex");
         assert_eq!(canonical_provider_name("openai_codex"), "openai-codex");
         assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
@@ -6878,6 +6906,18 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_qwen_coding_plan_match_qwen_code_coding_models() {
+        let ids: Vec<String> = curated_models_for_provider("qwen-coding-plan")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"qwen3-coder-plus".to_string()));
+        assert!(ids.contains(&"qwen3.5-plus".to_string()));
+        assert!(ids.contains(&"qwen3-max-2026-01-23".to_string()));
+    }
+
+    #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
@@ -6978,6 +7018,10 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("qwen-intl"),
             Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("qwen-coding-plan"),
+            Some("https://coding.dashscope.aliyuncs.com/v1/models")
         );
     }
 
@@ -7287,6 +7331,7 @@ mod tests {
         assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("qwen-code"), "QWEN_OAUTH_TOKEN");
         assert_eq!(provider_env_var("qwen-oauth"), "QWEN_OAUTH_TOKEN");
+        assert_eq!(provider_env_var("qwen-coding-plan"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
         assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("kimi-code"), "KIMI_CODE_API_KEY");

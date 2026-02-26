@@ -262,6 +262,7 @@ impl UniversalQuotaExtractor {
         extractors.insert("qwen".to_string(), Box::new(QwenQuotaExtractor));
         extractors.insert("qwen-code".to_string(), Box::new(QwenQuotaExtractor)); // OAuth alias
         extractors.insert("qwen-oauth".to_string(), Box::new(QwenQuotaExtractor)); // OAuth alias
+        extractors.insert("qwen-coding-plan".to_string(), Box::new(QwenQuotaExtractor)); // DashScope coding plan API
         extractors.insert("dashscope".to_string(), Box::new(QwenQuotaExtractor)); // DashScope API key
 
         Self { extractors }

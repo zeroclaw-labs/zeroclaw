@@ -62,6 +62,7 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+const QWEN_CODING_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
@@ -142,6 +143,10 @@ pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
     matches!(name, "qwen-us" | "dashscope-us")
 }
 
+pub(crate) fn is_qwen_coding_alias(name: &str) -> bool {
+    name == "qwen-coding-plan"
+}
+
 pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
 }
@@ -150,6 +155,7 @@ pub(crate) fn is_qwen_alias(name: &str) -> bool {
     is_qwen_cn_alias(name)
         || is_qwen_intl_alias(name)
         || is_qwen_us_alias(name)
+        || is_qwen_coding_alias(name)
         || is_qwen_oauth_alias(name)
 }
 
@@ -656,6 +662,8 @@ fn qwen_base_url(name: &str) -> Option<&'static str> {
         Some(QWEN_INTL_BASE_URL)
     } else if is_qwen_us_alias(name) {
         Some(QWEN_US_BASE_URL)
+    } else if is_qwen_coding_alias(name) {
+        Some(QWEN_CODING_BASE_URL)
     } else {
         None
     }
@@ -1705,6 +1713,7 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "dashscope-intl",
                 "qwen-us",
                 "dashscope-us",
+                "qwen-coding-plan",
                 "qwen-code",
                 "qwen-oauth",
                 "qwen_oauth",
@@ -2041,8 +2050,10 @@ mod tests {
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
         assert!(is_qwen_alias("qwen-code"));
+        assert!(is_qwen_alias("qwen-coding-plan"));
         assert!(is_qwen_oauth_alias("qwen-code"));
         assert!(is_qwen_oauth_alias("qwen_oauth"));
+        assert!(is_qwen_coding_alias("qwen-coding-plan"));
         assert!(is_zai_alias("z.ai"));
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
@@ -2071,6 +2082,7 @@ mod tests {
         assert_eq!(canonical_china_provider_name("qwen"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("dashscope-us"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("qwen-code"), Some("qwen"));
+        assert_eq!(canonical_china_provider_name("qwen-coding-plan"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("zai"), Some("zai"));
         assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
         assert_eq!(canonical_china_provider_name("qianfan"), Some("qianfan"));
@@ -2106,6 +2118,7 @@ mod tests {
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
         assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
+        assert_eq!(qwen_base_url("qwen-coding-plan"), Some(QWEN_CODING_BASE_URL));
 
         assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("z.ai"), Some(ZAI_GLOBAL_BASE_URL));
@@ -2302,6 +2315,7 @@ mod tests {
         assert!(create_provider("dashscope-international", Some("key")).is_ok());
         assert!(create_provider("qwen-us", Some("key")).is_ok());
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
+        assert!(create_provider("qwen-coding-plan", Some("key")).is_ok());
         assert!(create_provider("qwen-code", Some("key")).is_ok());
         assert!(create_provider("qwen-oauth", Some("key")).is_ok());
     }
