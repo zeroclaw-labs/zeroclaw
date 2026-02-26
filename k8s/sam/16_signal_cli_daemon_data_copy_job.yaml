@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: signal-cli-daemon-data-copy
+  namespace: zeroclaw-test
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: signal-cli-daemon-data-copy
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: copy-data
+          image: alpine:3.21.3
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              rm -rf /dst/*
+              cp -a /src/. /dst/
+              chown -R 1000:1000 /dst
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: src-data
+              mountPath: /src
+              readOnly: true
+            - name: dst-data
+              mountPath: /dst
+      volumes:
+        - name: src-data
+          persistentVolumeClaim:
+            claimName: signal-bridge-data
+        - name: dst-data
+          persistentVolumeClaim:
+            claimName: signal-cli-daemon-data

@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-config
+  namespace: zeroclaw-test
+data:
+  config.toml: |
+    log_level = "info"
+    api_key = "sk-2xz3q0bNAs7ZOB9Gwr8M1w"
+    api_url = "https://assistant-api.coffee-anon.com/v1"
+    default_provider = "custom:https://assistant-api.coffee-anon.com/v1"
+    default_model = "litellm-local-default"
+    default_temperature = 1.0
+
+    [runtime]
+    kind = "native"
+
+    [memory]
+    backend = "sqlite"
+    auto_save = true
+    embedding_provider = "none"
+
+    [gateway]
+    host = "0.0.0.0"
+    port = 3000
+    require_pairing = true
+    allow_public_bind = true
+
+    [channels_config]
+    cli = true
+    message_timeout_secs = 120
+
+    [channels_config.signal]
+    http_url = "http://127.0.0.1:8686"
+    account = "+15873986009"
+    allowed_from = ["*"]
+    ignore_attachments = false
+    ignore_stories = true
+
