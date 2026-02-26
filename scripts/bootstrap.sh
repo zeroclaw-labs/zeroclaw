@@ -685,6 +685,8 @@ is_zeroclaw_resource_name() {
 maybe_stop_running_zeroclaw_containers() {
   local -a running_ids running_rows
   local id name image command row
+  running_ids=()
+  running_rows=()
 
   while IFS=$'\t' read -r id name image command; do
     if [[ -z "$id" ]]; then
