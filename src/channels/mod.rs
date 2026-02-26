@@ -69,9 +69,9 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
-    run_tool_call_loop_with_reply_target, scrub_credentials,
+    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
 };
-use crate::approval::{ApprovalManager, PendingApprovalError};
+use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -159,6 +159,8 @@ enum ChannelRuntimeCommand {
     RequestAllToolsOnce,
     RequestToolApproval(String),
     ConfirmToolApproval(String),
+    ApprovePendingRequest(String),
+    DenyToolApproval(String),
     ListPendingApprovals,
     ApproveTool(String),
     UnapproveTool(String),
@@ -703,6 +705,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
         "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
         "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
+        "/approve-allow" => Some(ChannelRuntimeCommand::ApprovePendingRequest(tail)),
+        "/approve-deny" => Some(ChannelRuntimeCommand::DenyToolApproval(tail)),
         "/approve-pending" => Some(ChannelRuntimeCommand::ListPendingApprovals),
         "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
@@ -842,6 +846,8 @@ fn is_approval_management_command(command: &ChannelRuntimeCommand) -> bool {
         ChannelRuntimeCommand::RequestAllToolsOnce
             | ChannelRuntimeCommand::RequestToolApproval(_)
             | ChannelRuntimeCommand::ConfirmToolApproval(_)
+            | ChannelRuntimeCommand::ApprovePendingRequest(_)
+            | ChannelRuntimeCommand::DenyToolApproval(_)
             | ChannelRuntimeCommand::ListPendingApprovals
             | ChannelRuntimeCommand::ApproveTool(_)
             | ChannelRuntimeCommand::UnapproveTool(_)
@@ -1698,6 +1704,7 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
     response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
     response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
     response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
+    response.push_str("Deny approval with `/approve-deny <request-id>`.\n");
     response.push_str("List pending requests with `/approve-pending`.\n");
     response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
     response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
@@ -1741,6 +1748,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
     response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
     response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
+    response.push_str("Deny approval with `/approve-deny <request-id>`.\n");
     response.push_str("List pending requests with `/approve-pending`.\n");
     response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
     response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
@@ -1840,7 +1848,7 @@ async fn handle_runtime_command_if_needed(
             .non_cli_natural_language_approval_mode_for_channel(source_channel);
         match mode {
             NonCliNaturalLanguageApprovalMode::Disabled => {
-                let response = "Natural-language approval commands are disabled by runtime policy.\nUse explicit slash commands such as `/approve <tool-name>`, `/approve-request <tool-name>`, `/approve-all-once`, `/approve-confirm <request-id>`, `/unapprove <tool-name>`, and `/approvals`.".to_string();
+                let response = "Natural-language approval commands are disabled by runtime policy.\nUse explicit slash commands such as `/approve <tool-name>`, `/approve-request <tool-name>`, `/approve-all-once`, `/approve-allow <request-id>`, `/approve-confirm <request-id>`, `/approve-deny <request-id>`, `/unapprove <tool-name>`, and `/approvals`.".to_string();
                 runtime_trace::record_event(
                     "approval_management_natural_language_denied",
                     Some(source_channel),
@@ -2029,6 +2037,54 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
+        ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-allow <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.confirm_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
+                        runtime_trace::record_event(
+                            "approval_request_allowed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some("pending request allowed for current tool invocation"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": req.tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Approved pending request `{}` for this invocation of `{}`.",
+                            req.request_id, req.tool_name
+                        )
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        format!("Pending approval request `{request_id}` was not found.")
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        format!(
+                            "Pending approval request `{request_id}` can only be approved by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
+        }
         ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id) => {
             let request_id = raw_request_id.trim().to_string();
             if request_id.is_empty() {
@@ -2041,6 +2097,8 @@ async fn handle_runtime_command_if_needed(
                     reply_target,
                 ) {
                     Ok(req) => {
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
                         let tool_name = req.tool_name;
                         let approval_message = if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
                             let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
@@ -2143,6 +2201,96 @@ async fn handle_runtime_command_if_needed(
                         );
                         format!(
                             "Pending approval request `{request_id}` can only be confirmed by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::DenyToolApproval(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-deny <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.reject_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::No);
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some("pending request denied"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": req.tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Denied pending approval request `{}` for tool `{}`.",
+                            req.request_id, req.tool_name
+                        )
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request not found"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` was not found.")
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request expired"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request denier mismatch"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Pending approval request `{request_id}` can only be denied by the same sender in the same chat/channel that created it."
                         )
                     }
                 }
@@ -2961,11 +3109,52 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let (approval_prompt_tx, mut approval_prompt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agent::loop_::NonCliApprovalPrompt>();
+    let approval_prompt_task = if msg.channel == "cli" {
+        None
+    } else if let Some(channel_ref) = target_channel.as_ref() {
+        let channel = Arc::clone(channel_ref);
+        let reply_target = msg.reply_target.clone();
+        let thread_ts = msg.thread_ts.clone();
+        Some(tokio::spawn(async move {
+            while let Some(prompt) = approval_prompt_rx.recv().await {
+                if let Err(err) = channel
+                    .send_approval_prompt(
+                        &reply_target,
+                        &prompt.request_id,
+                        &prompt.tool_name,
+                        &prompt.arguments,
+                        thread_ts.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        channel = %channel.name(),
+                        request_id = %prompt.request_id,
+                        "Failed to send approval prompt: {err}"
+                    );
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    let non_cli_approval_context = if msg.channel == "cli" || target_channel.is_none() {
+        None
+    } else {
+        Some(NonCliApprovalContext {
+            sender: msg.sender.clone(),
+            reply_target: msg.reply_target.clone(),
+            prompt_tx: approval_prompt_tx.clone(),
+        })
+    };
+
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop_with_reply_target(
+            run_tool_call_loop_with_non_cli_approval_context(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
@@ -2976,7 +3165,7 @@ async fn process_channel_message(
                 true,
                 Some(ctx.approval_manager.as_ref()),
                 msg.channel.as_str(),
-                Some(msg.reply_target.as_str()),
+                non_cli_approval_context,
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
@@ -2986,6 +3175,11 @@ async fn process_channel_message(
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    drop(approval_prompt_tx);
+    if let Some(handle) = approval_prompt_task {
+        log_worker_join_result(handle.await);
+    }
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -4783,6 +4977,18 @@ mod tests {
         assert_eq!(
             parse_runtime_command("slack", "/approve-confirm apr-deadbeef"),
             Some(ChannelRuntimeCommand::ConfirmToolApproval(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-allow apr-deadbeef"),
+            Some(ChannelRuntimeCommand::ApprovePendingRequest(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-deny apr-deadbeef"),
+            Some(ChannelRuntimeCommand::DenyToolApproval(
                 "apr-deadbeef".to_string()
             ))
         );

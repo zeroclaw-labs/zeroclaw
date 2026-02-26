@@ -128,6 +128,27 @@ tokio::task_local! {
 
 const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "mattermost"];
 
+const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
+const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NonCliApprovalPrompt {
+    pub request_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NonCliApprovalContext {
+    pub sender: String,
+    pub reply_target: String,
+    pub prompt_tx: tokio::sync::mpsc::UnboundedSender<NonCliApprovalPrompt>,
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
+}
+
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
     let hint = match name {
@@ -217,6 +238,41 @@ fn maybe_inject_cron_add_delivery(
             "to".to_string(),
             serde_json::Value::String(reply_target.to_string()),
         );
+    }
+}
+
+async fn await_non_cli_approval_decision(
+    mgr: &ApprovalManager,
+    request_id: &str,
+    sender: &str,
+    channel_name: &str,
+    reply_target: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> ApprovalResponse {
+    let started = Instant::now();
+
+    loop {
+        if let Some(decision) = mgr.take_non_cli_pending_resolution(request_id) {
+            return decision;
+        }
+
+        if !mgr.has_non_cli_pending_request(request_id) {
+            // Fail closed when the request disappears without an explicit resolution.
+            return ApprovalResponse::No;
+        }
+
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            return ApprovalResponse::No;
+        }
+
+        if started.elapsed() >= Duration::from_secs(NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS) {
+            let _ =
+                mgr.reject_non_cli_pending_request(request_id, sender, channel_name, reply_target);
+            let _ = mgr.take_non_cli_pending_resolution(request_id);
+            return ApprovalResponse::No;
+        }
+
+        tokio::time::sleep(Duration::from_millis(NON_CLI_APPROVAL_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -446,6 +502,59 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
         .await
 }
 
+/// Run the tool loop with optional non-CLI approval context scoped to this task.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    non_cli_approval_context: Option<NonCliApprovalContext>,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+) -> Result<String> {
+    let reply_target = non_cli_approval_context
+        .as_ref()
+        .map(|ctx| ctx.reply_target.clone());
+
+    TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
+        .scope(
+            non_cli_approval_context,
+            TOOL_LOOP_REPLY_TARGET.scope(
+                reply_target,
+                run_tool_call_loop(
+                    provider,
+                    history,
+                    tools_registry,
+                    observer,
+                    provider_name,
+                    model,
+                    temperature,
+                    silent,
+                    approval,
+                    channel_name,
+                    multimodal_config,
+                    max_tool_iterations,
+                    cancellation_token,
+                    on_delta,
+                    hooks,
+                    excluded_tools,
+                ),
+            ),
+        )
+        .await
+}
+
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -479,7 +588,19 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
 ) -> Result<String> {
-    let channel_reply_target = TOOL_LOOP_REPLY_TARGET.try_with(Clone::clone).ok().flatten();
+    let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    let channel_reply_target = TOOL_LOOP_REPLY_TARGET
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            non_cli_approval_context
+                .as_ref()
+                .map(|ctx| ctx.reply_target.clone())
+        });
 
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -908,10 +1029,35 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    // Only CLI supports interactive prompts today. For non-CLI channels,
-                    // fail closed instead of silently auto-approving privileged tools.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
+                    } else if let Some(ctx) = non_cli_approval_context.as_ref() {
+                        let pending = mgr.create_non_cli_pending_request(
+                            &tool_name,
+                            &ctx.sender,
+                            channel_name,
+                            &ctx.reply_target,
+                            Some(
+                                "interactive approval required for supervised non-cli tool execution"
+                                    .to_string(),
+                            ),
+                        );
+
+                        let _ = ctx.prompt_tx.send(NonCliApprovalPrompt {
+                            request_id: pending.request_id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: tool_args.clone(),
+                        });
+
+                        await_non_cli_approval_decision(
+                            mgr,
+                            &pending.request_id,
+                            &ctx.sender,
+                            channel_name,
+                            &ctx.reply_target,
+                            cancellation_token.as_ref(),
+                        )
+                        .await
                     } else {
                         ApprovalResponse::No
                     };
@@ -2605,6 +2751,88 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             0,
             "shell tool must not execute when approval is unavailable on non-CLI channels"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_waits_for_non_cli_approval_resolution() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let approval_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            approval_mgr_for_task
+                .confirm_non_cli_pending_request(
+                    &prompt.request_id,
+                    "alice",
+                    "telegram",
+                    "chat-approval",
+                )
+                .expect("pending approval should confirm");
+            approval_mgr_for_task
+                .record_non_cli_pending_resolution(&prompt.request_id, ApprovalResponse::Yes);
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approval".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should continue after non-cli approval");
+
+        approval_task.await.expect("approval task should complete");
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "shell tool should execute after non-cli approval is resolved"
         );
     }
 
