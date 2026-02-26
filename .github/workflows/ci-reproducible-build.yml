@@ -47,7 +47,7 @@ env:
 jobs:
     reproducibility:
         name: Reproducible Build Probe
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 45
         steps:
             - name: Checkout

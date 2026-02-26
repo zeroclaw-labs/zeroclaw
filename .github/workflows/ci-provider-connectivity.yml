@@ -33,7 +33,7 @@ permissions:
 jobs:
     probe:
         name: Provider Connectivity Probe
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
         steps:
             - name: Checkout

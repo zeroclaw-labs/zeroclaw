@@ -50,7 +50,7 @@ permissions:
 jobs:
     docs-quality:
         name: Docs Quality Gate
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
         outputs:
             docs_files: ${{ steps.scope.outputs.docs_files }}
@@ -197,7 +197,7 @@ jobs:
         name: Docs Preview Artifact
         needs: [docs-quality]
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'preview')
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -296,7 +296,7 @@ jobs:
         name: Deploy Docs to GitHub Pages
         needs: [docs-quality]
         if: needs.docs-quality.outputs.deploy_target == 'production' && needs.docs-quality.outputs.ready_to_deploy == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
         permissions:
             contents: read

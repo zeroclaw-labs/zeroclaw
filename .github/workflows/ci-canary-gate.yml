@@ -83,7 +83,7 @@ permissions:
 jobs:
     canary-plan:
         name: Canary Plan
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
         outputs:
             mode: ${{ steps.inputs.outputs.mode }}
@@ -231,7 +231,7 @@ jobs:
         name: Canary Execute
         needs: [canary-plan]
         if: github.event_name == 'workflow_dispatch' && needs.canary-plan.outputs.mode == 'execute' && needs.canary-plan.outputs.ready_to_execute == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 10
         permissions:
             contents: write

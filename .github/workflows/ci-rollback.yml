@@ -58,7 +58,7 @@ permissions:
 jobs:
     rollback-plan:
         name: Rollback Guard Plan
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
         outputs:
             branch: ${{ steps.plan.outputs.branch }}
@@ -182,7 +182,7 @@ jobs:
         name: Rollback Execute Actions
         needs: [rollback-plan]
         if: github.event_name == 'workflow_dispatch' && needs.rollback-plan.outputs.mode == 'execute' && needs.rollback-plan.outputs.ready_to_execute == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 15
         permissions:
             contents: write

@@ -14,7 +14,7 @@ permissions:
 jobs:
     enforce-dev-promotion:
         name: Enforce Dev -> Main Promotion
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - name: Validate PR source branch
               shell: bash

@@ -21,7 +21,7 @@ env:
 jobs:
     changes:
         name: Detect Change Scope
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         outputs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
@@ -46,7 +46,7 @@ jobs:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 25
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -56,7 +56,7 @@ jobs:
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-lint
             - name: Run rust quality gate
@@ -70,14 +70,14 @@ jobs:
         name: Test
         needs: [changes, lint]
         if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-test
             - name: Run tests
@@ -87,7 +87,7 @@ jobs:
         name: Build (Smoke)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
 
         steps:
@@ -95,7 +95,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-build
                   cache-targets: true
@@ -108,14 +108,14 @@ jobs:
         name: Test Flake Retry Probe
         needs: [changes, lint, test]
         if: always() && needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 25
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-flake-probe
             - name: Probe flaky failure via single retry
@@ -155,7 +155,7 @@ jobs:
         name: Docs-Only Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - name: Skip heavy jobs for docs-only change
               run: echo "Docs-only change detected. Rust lint/test/build skipped."
@@ -164,7 +164,7 @@ jobs:
         name: Non-Rust Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - name: Skip Rust jobs for non-Rust change scope
               run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
@@ -173,7 +173,7 @@ jobs:
         name: Docs Quality
         needs: [changes]
         if: needs.changes.outputs.docs_changed == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -228,7 +228,7 @@ jobs:
         name: Lint Feedback
         if: github.event_name == 'pull_request'
         needs: [changes, lint, docs-quality]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         permissions:
             contents: read
             pull-requests: write
@@ -254,7 +254,7 @@ jobs:
         name: Workflow Owner Approval
         needs: [changes]
         if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         permissions:
             contents: read
             pull-requests: read
@@ -275,7 +275,7 @@ jobs:
         name: License File Owner Guard
         needs: [changes]
         if: github.event_name == 'pull_request'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         permissions:
             contents: read
             pull-requests: read
@@ -293,7 +293,7 @@ jobs:
         name: CI Required Gate
         if: always()
         needs: [changes, lint, test, build, flake-probe, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - name: Enforce required status
               shell: bash
