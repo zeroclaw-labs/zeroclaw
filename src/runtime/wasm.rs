@@ -277,7 +277,7 @@ impl WasmRuntime {
         for (module_name, digest) in &self.config.security.module_sha256 {
             Self::validate_module_name(module_name)?;
             normalized.insert(
-                module_name.clone(),
+                module_name.to_string(),
                 Self::normalize_sha256_pin(module_name, digest)?,
             );
         }
@@ -429,6 +429,39 @@ impl WasmRuntime {
 
                 effective.allowed_hosts.sort();
                 Ok(effective)
+            }
+            WasmCapabilityEscalationMode::Warn => {
+                // Log warnings but allow all requested capabilities
+                if caps.read_workspace && !self.config.allow_workspace_read {
+                    tracing::warn!("WASM capability escalation: read_workspace requested but not in config (allowing)");
+                }
+                if caps.write_workspace && !self.config.allow_workspace_write {
+                    tracing::warn!("WASM capability escalation: write_workspace requested but not in config (allowing)");
+                }
+                if caps.fuel_override > self.config.fuel_limit {
+                    tracing::warn!(
+                        requested = caps.fuel_override,
+                        allowed = self.config.fuel_limit,
+                        "WASM capability escalation: fuel_override exceeds limit (allowing)"
+                    );
+                }
+                Ok(WasmCapabilities {
+                    read_workspace: caps.read_workspace,
+                    write_workspace: caps.write_workspace,
+                    allowed_hosts: requested_hosts.into_iter().collect(),
+                    fuel_override: caps.fuel_override,
+                    memory_override_mb: caps.memory_override_mb,
+                })
+            }
+            WasmCapabilityEscalationMode::Allow => {
+                // Silently allow all requested capabilities
+                Ok(WasmCapabilities {
+                    read_workspace: caps.read_workspace,
+                    write_workspace: caps.write_workspace,
+                    allowed_hosts: requested_hosts.into_iter().collect(),
+                    fuel_override: caps.fuel_override,
+                    memory_override_mb: caps.memory_override_mb,
+                })
             }
         }
     }

@@ -7645,3 +7645,270 @@ require_otp_to_resume = true
         assert!(err.to_string().contains("token_ttl_secs"));
     }
 }
+
+// ── WASM Runtime Configuration ──────────────────────────────────
+
+/// WASM sandbox runtime configuration (`[runtime.wasm]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmRuntimeConfig {
+    /// Fuel (instruction budget) for each WASM invocation.
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+    /// Per-module memory ceiling in megabytes.
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// Maximum module file size in megabytes.
+    #[serde(default = "default_wasm_max_module_size_mb")]
+    pub max_module_size_mb: u64,
+    /// Directory containing WASM tool modules (relative to workspace).
+    #[serde(default = "default_wasm_tools_dir")]
+    pub tools_dir: String,
+    /// Allow WASM modules to read files from workspace.
+    #[serde(default)]
+    pub allow_workspace_read: bool,
+    /// Allow WASM modules to write files to workspace.
+    #[serde(default)]
+    pub allow_workspace_write: bool,
+    /// Allowlisted network hosts for WASM modules (empty = no network).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Security sub-configuration.
+    #[serde(default)]
+    pub security: WasmSecurityConfig,
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000_000
+}
+fn default_wasm_memory_limit_mb() -> u64 {
+    256
+}
+fn default_wasm_max_module_size_mb() -> u64 {
+    50
+}
+fn default_wasm_tools_dir() -> String {
+    ".zeroclaw/wasm-tools".into()
+}
+
+impl Default for WasmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            fuel_limit: default_wasm_fuel_limit(),
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            max_module_size_mb: default_wasm_max_module_size_mb(),
+            tools_dir: default_wasm_tools_dir(),
+            allow_workspace_read: false,
+            allow_workspace_write: false,
+            allowed_hosts: Vec::new(),
+            security: WasmSecurityConfig::default(),
+        }
+    }
+}
+
+/// Security settings for WASM modules.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmSecurityConfig {
+    /// Require tools_dir to be workspace-relative (no absolute paths).
+    #[serde(default = "default_true")]
+    pub require_workspace_relative_tools_dir: bool,
+    /// Fail on invalid host entries vs. silently skip them.
+    #[serde(default)]
+    pub strict_host_validation: bool,
+    /// Module hash verification policy.
+    #[serde(default)]
+    pub module_hash_policy: WasmModuleHashPolicy,
+    /// SHA-256 pins for known WASM modules. Key = module name, Value = hex digest.
+    #[serde(default)]
+    pub module_sha256: std::collections::BTreeMap<String, String>,
+    /// How to handle capability escalation requests from modules.
+    #[serde(default)]
+    pub capability_escalation_mode: WasmCapabilityEscalationMode,
+}
+
+
+impl Default for WasmSecurityConfig {
+    fn default() -> Self {
+        Self {
+            require_workspace_relative_tools_dir: true,
+            strict_host_validation: false,
+            module_hash_policy: WasmModuleHashPolicy::default(),
+            module_sha256: std::collections::BTreeMap::new(),
+            capability_escalation_mode: WasmCapabilityEscalationMode::default(),
+        }
+    }
+}
+
+/// Policy for verifying WASM module integrity via SHA-256.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WasmModuleHashPolicy {
+    /// Module hashes are not checked.
+    #[default]
+    Disabled,
+    /// Mismatches produce warnings but execution continues.
+    Warn,
+    /// Mismatches are fatal errors.
+    Enforce,
+}
+
+/// How the runtime handles WASM capability escalation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WasmCapabilityEscalationMode {
+    /// Deny any escalation beyond config defaults.
+    #[default]
+    Deny,
+    /// Log escalation attempts but allow them.
+    Warn,
+    /// Allow escalation silently.
+    Allow,
+    /// Clamp escalation values to config maximums.
+    Clamp,
+}
+
+// ── Research Phase Configuration ────────────────────────────────
+
+/// Research phase configuration (`[agent.research]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResearchPhaseConfig {
+    /// Whether the research phase is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Trigger condition for initiating the research phase.
+    #[serde(default)]
+    pub trigger: ResearchTrigger,
+    /// Keywords that trigger research when trigger is `Keywords`.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Minimum message length to trigger research when trigger is `Length`.
+    #[serde(default = "default_min_message_length")]
+    pub min_message_length: usize,
+    /// Maximum tool-call iterations during research.
+    #[serde(default = "default_research_max_iterations")]
+    pub max_iterations: usize,
+    /// Optional prefix for the research system prompt.
+    #[serde(default)]
+    pub system_prompt_prefix: String,
+    /// Whether to show progress indicators during research.
+    #[serde(default)]
+    pub show_progress: bool,
+}
+
+fn default_min_message_length() -> usize {
+    100
+}
+fn default_research_max_iterations() -> usize {
+    3
+}
+
+impl Default for ResearchPhaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: ResearchTrigger::default(),
+            keywords: Vec::new(),
+            min_message_length: default_min_message_length(),
+            max_iterations: default_research_max_iterations(),
+            system_prompt_prefix: String::new(),
+            show_progress: false,
+        }
+    }
+}
+
+/// Trigger mode for the research phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchTrigger {
+    /// Never trigger research.
+    #[default]
+    Never,
+    /// Always trigger research.
+    Always,
+    /// Trigger when message contains configured keywords.
+    Keywords,
+    /// Trigger when message exceeds a configured length.
+    Length,
+    /// Trigger when message contains a question mark.
+    Question,
+}
+
+// ── Syscall Anomaly Detection Configuration ─────────────────────
+
+/// Syscall anomaly detection configuration (`[security.syscall_anomaly]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyscallAnomalyConfig {
+    /// Whether syscall anomaly detection is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Baseline syscall names considered "normal".
+    #[serde(default = "default_baseline_syscalls")]
+    pub baseline_syscalls: Vec<String>,
+    /// Path to the anomaly log file (relative to zeroclaw directory or absolute).
+    #[serde(default = "default_anomaly_log_path")]
+    pub log_path: String,
+    /// Alert when an unknown syscall (not in baseline) is observed.
+    #[serde(default = "default_true")]
+    pub alert_on_unknown_syscall: bool,
+    /// In strict mode, any denied syscall generates an alert.
+    #[serde(default)]
+    pub strict_mode: bool,
+    /// Maximum denied events per minute before rate-exceeded alert.
+    #[serde(default = "default_max_denied_events")]
+    pub max_denied_events_per_minute: u32,
+    /// Maximum total events per minute before rate-exceeded alert.
+    #[serde(default = "default_max_total_events")]
+    pub max_total_events_per_minute: u32,
+    /// Maximum alerts emitted per minute.
+    #[serde(default = "default_max_alerts")]
+    pub max_alerts_per_minute: u32,
+    /// Cooldown between duplicate alerts in seconds.
+    #[serde(default = "default_alert_cooldown")]
+    pub alert_cooldown_secs: u64,
+}
+
+fn default_baseline_syscalls() -> Vec<String> {
+    vec![
+        "read".into(), "write".into(), "open".into(), "close".into(),
+        "mmap".into(), "mprotect".into(), "munmap".into(), "brk".into(),
+        "ioctl".into(), "dup".into(), "dup2".into(), "getpid".into(),
+        "socket".into(), "connect".into(), "accept".into(), "sendto".into(),
+        "recvfrom".into(), "recvmsg".into(), "listen".into(),
+        "getsockname".into(), "getpeername".into(), "setsockopt".into(),
+        "getsockopt".into(), "clone".into(), "fork".into(), "execve".into(),
+        "exit".into(), "wait4".into(), "fcntl".into(), "futex".into(),
+        "set_tid_address".into(), "openat".into(), "newfstatat".into(),
+        "set_robust_list".into(), "epoll_create1".into(), "getrandom".into(),
+        "statx".into(), "clone3".into(), "exit_group".into(),
+    ]
+}
+fn default_anomaly_log_path() -> String {
+    "syscall_anomalies.jsonl".into()
+}
+fn default_max_denied_events() -> u32 {
+    5
+}
+fn default_max_total_events() -> u32 {
+    50
+}
+fn default_max_alerts() -> u32 {
+    10
+}
+fn default_alert_cooldown() -> u64 {
+    30
+}
+
+impl Default for SyscallAnomalyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            baseline_syscalls: default_baseline_syscalls(),
+            log_path: default_anomaly_log_path(),
+            alert_on_unknown_syscall: true,
+            strict_mode: false,
+            max_denied_events_per_minute: default_max_denied_events(),
+            max_total_events_per_minute: default_max_total_events(),
+            max_alerts_per_minute: default_max_alerts(),
+            alert_cooldown_secs: default_alert_cooldown(),
+        }
+    }
+}

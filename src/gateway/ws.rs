@@ -58,17 +58,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Maintain conversation history for this WebSocket session
     let mut history: Vec<ChatMessage> = Vec::new();
 
-    // Build system prompt once for the session
-    let system_prompt = {
+    // Extract config values we need for the session
+    let (system_prompt, multimodal_config, max_tool_iterations) = {
         let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
+        let prompt = crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
             &[],
             &[],
             Some(&config_guard.identity),
             None,
-        )
+        );
+        let multimodal = config_guard.multimodal.clone();
+        let max_iters = config_guard.agent.max_tool_iterations;
+        (prompt, multimodal, max_iters)
     };
 
     // Add system message to history
@@ -78,6 +81,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         let config_guard = state.config.lock();
         ApprovalManager::from_config(&config_guard.autonomy)
     };
+
+    // WebSocket chat does not have executable tools; pass an empty registry.
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
 
     while let Some(msg) = socket.recv().await {
         let msg = match msg {
@@ -128,7 +134,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         let result = run_tool_call_loop(
             state.provider.as_ref(),
             &mut history,
-            state.tools_registry_exec.as_ref(),
+            tools_registry.as_ref(),
             state.observer.as_ref(),
             &provider_label,
             &state.model,
@@ -136,8 +142,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             true, // silent - no console output
             Some(&approval_manager),
             "webchat",
-            &state.multimodal,
-            state.max_tool_iterations,
+            &multimodal_config,
+            max_tool_iterations,
             None, // cancellation token
             None, // delta streaming
             None, // hooks
@@ -148,7 +154,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         match result {
             Ok(response) => {
                 let safe_response =
-                    sanitize_ws_response(&response, state.tools_registry_exec.as_ref());
+                    sanitize_ws_response(&response, tools_registry.as_ref());
                 // Add assistant response to history
                 history.push(ChatMessage::assistant(&safe_response));
 

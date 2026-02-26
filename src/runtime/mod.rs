@@ -15,7 +15,7 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
     match config.kind.as_str() {
         "native" => Ok(Box::new(NativeRuntime::new())),
         "docker" => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
-        "wasm" => Ok(Box::new(WasmRuntime::new(config.wasm.clone()))),
+        "wasm" => Ok(Box::new(WasmRuntime::new(crate::config::WasmRuntimeConfig::default()))),
         "cloudflare" => anyhow::bail!(
             "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
         ),

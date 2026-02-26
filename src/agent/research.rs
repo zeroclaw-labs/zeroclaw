@@ -55,7 +55,7 @@ pub fn should_trigger(config: &ResearchPhaseConfig, message: &str) -> bool {
             config
                 .keywords
                 .iter()
-                .any(|kw| message_lower.contains(&kw.to_lowercase()))
+                .any(|kw: &String| message_lower.contains(&kw.to_lowercase()))
         }
         ResearchTrigger::Length => message.len() >= config.min_message_length,
         ResearchTrigger::Question => message.contains('?'),

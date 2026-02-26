@@ -227,7 +227,7 @@ impl Tool for ShellTool {
                 }
 
                 if let Some(detector) = &self.syscall_detector {
-                    let _ = detector.inspect_command_output(
+                    let _: Vec<crate::security::syscall_anomaly::SyscallAnomalyAlert> = detector.inspect_command_output(
                         &command,
                         &stdout,
                         &stderr,
