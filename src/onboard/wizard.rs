@@ -2106,7 +2106,7 @@ fn resolve_interactive_onboarding_mode(
             config_path.display()
         ))
         .items(options)
-        .default(1)
+        .default(2)
         .interact()?;
 
     match mode {
@@ -2224,7 +2224,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     let tier_idx = Select::new()
         .with_prompt("  Select provider category")
         .items(&tiers)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let providers: Vec<(&str, &str)> = match tier_idx {
@@ -2353,7 +2353,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     let provider_idx = Select::new()
         .with_prompt("  Select your AI provider")
         .items(&provider_labels)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let provider_name = providers[provider_idx].0;
@@ -2879,7 +2879,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         let source_idx = Select::new()
             .with_prompt("  Model source")
             .items(&source_options)
-            .default(0)
+            .default(2)
             .interact()?;
 
         if source_idx == 0 {
@@ -2907,7 +2907,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     let model_idx = Select::new()
         .with_prompt("  Select your default model")
         .items(&model_labels)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let selected_model = model_options[model_idx].0.clone();
@@ -3059,7 +3059,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         let provider_choice = Select::new()
             .with_prompt("  web_search provider")
             .items(&provider_options)
-            .default(0)
+            .default(2)
             .interact()?;
 
         match provider_choice {
@@ -3130,7 +3130,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         let provider_choice = Select::new()
             .with_prompt("  web_fetch provider")
             .items(&provider_options)
-            .default(0)
+            .default(2)
             .interact()?;
 
         match provider_choice {
@@ -3217,7 +3217,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     let choice = Select::new()
         .with_prompt("  Select tool mode")
         .items(&options)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let composio_config = if choice == 1 {
@@ -3381,7 +3381,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             let port_idx = Select::new()
                 .with_prompt("  Multiple serial devices found — select one")
                 .items(&port_labels)
-                .default(0)
+                .default(2)
                 .interact()?;
 
             hw_config.serial_port = serial_devices[port_idx].device_path.clone();
@@ -3405,7 +3405,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
         let baud_idx = Select::new()
             .with_prompt("  Serial baud rate")
             .items(&baud_options)
-            .default(0)
+            .default(2)
             .interact()?;
 
         hw_config.baud_rate = match baud_idx {
@@ -3508,7 +3508,7 @@ fn setup_project_context() -> Result<ProjectContext> {
     let tz_idx = Select::new()
         .with_prompt("  Your timezone")
         .items(&tz_options)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let timezone = if tz_idx == tz_options.len() - 1 {
@@ -3544,7 +3544,7 @@ fn setup_project_context() -> Result<ProjectContext> {
     let style_idx = Select::new()
         .with_prompt("  Communication style")
         .items(&style_options)
-        .default(1)
+        .default(2)
         .interact()?;
 
     let communication_style = match style_idx {
@@ -3594,7 +3594,7 @@ fn setup_memory() -> Result<MemoryConfig> {
     let choice = Select::new()
         .with_prompt("  Select memory backend")
         .items(&options)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let backend = backend_key_from_choice(choice);
@@ -3632,7 +3632,7 @@ fn setup_identity_backend() -> Result<IdentityConfig> {
     let selected = Select::new()
         .with_prompt("  Select identity backend")
         .items(&options)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let backend = backends
@@ -4387,7 +4387,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let scope_choice = Select::new()
                     .with_prompt("  Message scope")
                     .items(scope_options)
-                    .default(0)
+                    .default(2)
                     .interact()?;
 
                 let group_id = match scope_choice {
@@ -4455,7 +4455,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let mode_idx = Select::new()
                     .with_prompt("  Choose WhatsApp mode")
                     .items(&mode_options)
-                    .default(0)
+                    .default(2)
                     .interact()?;
 
                 if mode_idx == 0 {
@@ -5096,7 +5096,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let receive_mode_choice = Select::new()
                     .with_prompt("  Receive mode")
                     .items(["Webhook (recommended)", "WebSocket (legacy fallback)"])
-                    .default(0)
+                    .default(2)
                     .interact()?;
                 let receive_mode = if receive_mode_choice == 0 {
                     QQReceiveMode::Webhook
@@ -5107,7 +5107,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let environment_choice = Select::new()
                     .with_prompt("  API environment")
                     .items(["Production", "Sandbox (for unpublished bot testing)"])
-                    .default(0)
+                    .default(2)
                     .interact()?;
                 let environment = if environment_choice == 0 {
                     QQEnvironment::Production
@@ -5158,7 +5158,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let use_feishu = Select::new()
                     .with_prompt("  Region")
                     .items(["Feishu (CN)", "Lark (International)"])
-                    .default(0)
+                    .default(2)
                     .interact()?
                     == 0;
 
@@ -5241,7 +5241,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "WebSocket (recommended, no public IP needed)",
                         "Webhook (requires public HTTPS endpoint)",
                     ])
-                    .default(0)
+                    .default(2)
                     .interact()?;
 
                 let receive_mode = if receive_mode_choice == 0 {
@@ -5448,7 +5448,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
     let choice = Select::new()
         .with_prompt("  Select tunnel provider")
         .items(&options)
-        .default(0)
+        .default(2)
         .interact()?;
 
     let config = match choice {
