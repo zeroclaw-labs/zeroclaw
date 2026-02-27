@@ -4081,17 +4081,21 @@ impl ChannelConfig for WatiConfig {
     }
 }
 
-/// Nextcloud Talk bot configuration (webhook receive + OCS send API).
+/// Nextcloud Talk bot configuration (webhook receive + Bot/OCS send API).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NextcloudTalkConfig {
     /// Nextcloud base URL (e.g. "https://cloud.example.com").
     pub base_url: String,
-    /// Bot app token used for OCS API bearer auth.
-    pub app_token: String,
-    /// Shared secret for webhook signature verification.
+    /// Bot app token used for legacy OCS API bearer auth.
     ///
-    /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
+    /// Optional if `webhook_secret` is provided for Bot API.
     #[serde(default)]
+    pub app_token: Option<String>,
+    /// Shared secret for webhook signature verification and Bot API sending.
+    ///
+    /// This is the "Shared secret" specified when installing a bot in Nextcloud Talk.
+    /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
+    #[serde(default, alias = "shared_secret")]
     pub webhook_secret: Option<String>,
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
     #[serde(default)]

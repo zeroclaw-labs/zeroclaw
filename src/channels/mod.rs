@@ -4509,13 +4509,12 @@ fn collect_configured_channels(
     }
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
-        let secret = nc.webhook_secret.clone()
-            .unwrap_or_else(|| nc.app_token.clone());
         channels.push(ConfiguredChannel {
             display_name: "Nextcloud Talk",
             channel: Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
-                secret,
+                nc.app_token.clone(),
+                nc.webhook_secret.clone(),
                 nc.allowed_users.clone(),
             )),
         });

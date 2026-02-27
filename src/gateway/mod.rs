@@ -560,11 +560,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
         config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            let secret = nextcloud_talk_webhook_secret_raw
-                .unwrap_or_else(|| nc.app_token.clone());
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
-                secret,
+                nc.app_token.clone(),
+                nextcloud_talk_webhook_secret_raw,
                 nc.allowed_users.clone(),
             ))
         });
