@@ -4,7 +4,7 @@ This page is the primary entry point for the documentation system.
 
 Last refreshed: **February 21, 2026**.
 
-Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md) · [Français](README.fr.md) · [Tiếng Việt](i18n/vi/README.md).
+Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/README.md) · [Русский](i18n/ru/README.md) · [Français](i18n/fr/README.md) · [Tiếng Việt](i18n/vi/README.md) · [Ελληνικά](i18n/el/README.md).
 
 ## Start Here
 
@@ -12,17 +12,22 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 |---|---|
 | Install and run ZeroClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
 | Bootstrap in one command | [one-click-bootstrap.md](one-click-bootstrap.md) |
+| Set up on Android (Termux/ADB) | [android-setup.md](android-setup.md) |
 | Update or uninstall on macOS | [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md) |
 | Find commands by task | [commands-reference.md](commands-reference.md) |
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
 | Configure custom providers/endpoints | [custom-providers.md](custom-providers.md) |
 | Configure Z.AI / GLM provider | [zai-glm-setup.md](zai-glm-setup.md) |
 | Use LangGraph integration patterns | [langgraph-integration.md](langgraph-integration.md) |
+| Apply proxy scope safely | [proxy-agent-playbook.md](proxy-agent-playbook.md) |
 | Operate runtime (day-2 runbook) | [operations-runbook.md](operations-runbook.md) |
+| Operate provider connectivity probes in CI | [operations/connectivity-probes-runbook.md](operations/connectivity-probes-runbook.md) |
 | Troubleshoot install/runtime/channel issues | [troubleshooting.md](troubleshooting.md) |
 | Run Matrix encrypted-room setup and diagnostics | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
+| Build deterministic SOP procedures | [sop/README.md](sop/README.md) |
 | Browse docs by category | [SUMMARY.md](SUMMARY.md) |
 | See project PR/issue docs snapshot | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
+| Perform i18n completion for docs changes | [i18n-guide.md](i18n-guide.md) |
 
 ## Quick Decision Tree (10 seconds)
 
@@ -33,6 +38,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 - Working on security hardening or roadmap? → [security/README.md](security/README.md)
 - Working with boards/peripherals? → [hardware/README.md](hardware/README.md)
 - Contributing/reviewing/CI workflow? → [contributing/README.md](contributing/README.md)
+- Building automated SOP workflows? → [sop/README.md](sop/README.md)
 - Want the full map? → [SUMMARY.md](SUMMARY.md)
 
 ## Collections (Recommended)
@@ -87,4 +93,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
 - i18n docs index: [i18n/README.md](i18n/README.md)
 - i18n coverage map: [i18n-coverage.md](i18n-coverage.md)
+- i18n completion guide: [i18n-guide.md](i18n-guide.md)
+- i18n gap backlog: [i18n-gap-backlog.md](i18n-gap-backlog.md)
+- Docs audit snapshot (2026-02-24): [docs-audit-2026-02-24.md](docs-audit-2026-02-24.md)
 - Project triage snapshot: [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)

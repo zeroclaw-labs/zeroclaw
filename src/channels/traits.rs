@@ -123,6 +123,30 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Send an interactive approval prompt, if supported by the channel.
+    ///
+    /// Default behavior sends a plain-text fallback with slash-command actions.
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.len() > 220 {
+            format!("{}...", &raw_args[..220])
+        } else {
+            raw_args
+        };
+        let message = format!(
+            "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`\nApprove: `/approve-allow {request_id}`\nDeny: `/approve-deny {request_id}`"
+        );
+        self.send(&SendMessage::new(message, recipient).in_thread(thread_ts))
+            .await
+    }
+
     /// Add a reaction (emoji) to a message.
     ///
     /// `channel_id` is the platform channel/conversation identifier (e.g. Discord channel ID).

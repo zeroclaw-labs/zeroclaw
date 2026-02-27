@@ -22,7 +22,7 @@ Các mẫu allowlist được chọn:
 - `rhysd/actionlint@*`
 - `softprops/action-gh-release@*`
 - `sigstore/cosign-installer@*`
-- `Swatinem/rust-cache@*`
+- `useblacksmith/*` (cơ sở hạ tầng self-hosted runner Blacksmith)
 
 ## Xuất kiểm soát thay đổi
 
@@ -74,11 +74,13 @@ Nếu gặp phải, chỉ thêm action tin cậy còn thiếu cụ thể đó, c
 
 Ghi chú quét gần đây nhất:
 
-- 2026-02-26: Chuẩn hóa runner/action cho cache Rust và Docker build
-    - Đã thêm mẫu allowlist: `Swatinem/rust-cache@*`
-    - Docker build dùng `docker/setup-buildx-action` và `docker/build-push-action`
+- 2026-02-17: Cache phụ thuộc Rust được migrate từ `Swatinem/rust-cache` sang `useblacksmith/rust-cache`
+    - Không cần mẫu allowlist mới (`useblacksmith/*` đã có trong allowlist)
 - 2026-02-16: Phụ thuộc ẩn được phát hiện trong `release.yml`: `sigstore/cosign-installer@...`
     - Đã thêm mẫu allowlist: `sigstore/cosign-installer@*`
+- 2026-02-16: Migration Blacksmith chặn thực thi workflow
+    - Đã thêm mẫu allowlist: `useblacksmith/*` cho cơ sở hạ tầng self-hosted runner
+    - Actions: `useblacksmith/setup-docker-builder@v1`, `useblacksmith/build-push-action@v2`
 - 2026-02-17: Cập nhật cân bằng tính tái tạo/độ tươi của security audit
     - Đã thêm mẫu allowlist: `rustsec/audit-check@*`
     - Thay thế thực thi nội tuyến `cargo install cargo-audit` bằng `rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998` được pin trong `security.yml`

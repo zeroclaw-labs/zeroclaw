@@ -10,6 +10,9 @@ on:
 permissions: {}
 
 env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: core.hooksPath
+  GIT_CONFIG_VALUE_0: /dev/null
   LABEL_POLICY_PATH: .github/label-policy.json
 
 jobs:
@@ -19,7 +22,7 @@ jobs:
       (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'labeled' || github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled'))
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, aws-india]
     permissions:
       contents: read
       issues: write
@@ -38,7 +41,7 @@ jobs:
             await script({ github, context, core });
   first-interaction:
     if: github.event.action == 'opened'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, aws-india]
     permissions:
       issues: write
       pull-requests: write
@@ -69,7 +72,7 @@ jobs:
 
   labeled-routes:
     if: github.event.action == 'labeled'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, aws-india]
     permissions:
       contents: read
       issues: write

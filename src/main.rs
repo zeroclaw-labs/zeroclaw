@@ -238,7 +238,8 @@ Examples:
   zeroclaw gateway                  # use config defaults
   zeroclaw gateway -p 8080          # listen on port 8080
   zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  zeroclaw gateway -p 0             # random available port
+  zeroclaw gateway --new-pairing    # clear tokens and generate fresh pairing code")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -247,6 +248,10 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Clear all paired tokens and generate a fresh pairing code
+        #[arg(long)]
+        new_pairing: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -803,7 +808,6 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
-    skills::init_skills_dir(&config.workspace_dir)?;
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
     if config.security.otp.enabled {
         let config_dir = config
@@ -866,7 +870,19 @@ async fn main() -> Result<()> {
             .map(|_| ())
         }
 
-        Commands::Gateway { port, host } => {
+        Commands::Gateway {
+            port,
+            host,
+            new_pairing,
+        } => {
+            if new_pairing {
+                // Persist token reset from raw config so env-derived overrides are not written to disk.
+                let mut persisted_config = Config::load_or_init().await?;
+                persisted_config.gateway.paired_tokens.clear();
+                persisted_config.save().await?;
+                config.gateway.paired_tokens.clear();
+                info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1999,6 +2015,45 @@ mod tests {
                 Commands::Completions { .. } => {}
                 other => panic!("expected completions command, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn gateway_help_includes_new_pairing_flag() {
+        let cmd = Cli::command();
+        let gateway = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "gateway")
+            .expect("gateway subcommand must exist");
+
+        let has_new_pairing_flag = gateway.get_arguments().any(|arg| {
+            arg.get_id().as_str() == "new_pairing" && arg.get_long() == Some("new-pairing")
+        });
+
+        assert!(
+            has_new_pairing_flag,
+            "gateway help should include --new-pairing"
+        );
+    }
+
+    #[test]
+    fn gateway_cli_accepts_new_pairing_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--new-pairing"])
+            .expect("gateway --new-pairing should parse");
+
+        match cli.command {
+            Commands::Gateway { new_pairing, .. } => assert!(new_pairing),
+            other => panic!("expected gateway command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_cli_defaults_new_pairing_to_false() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
+
+        match cli.command {
+            Commands::Gateway { new_pairing, .. } => assert!(!new_pairing),
+            other => panic!("expected gateway command, got {other:?}"),
         }
     }
 

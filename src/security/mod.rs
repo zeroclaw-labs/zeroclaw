@@ -64,16 +64,6 @@ pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 
-/// Validate shell environment variable names (`[A-Za-z_][A-Za-z0-9_]*`).
-pub fn is_valid_env_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
 pub fn redact(value: &str) -> String {

@@ -80,10 +80,16 @@ permissions:
     contents: read
     actions: read
 
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
 jobs:
     canary-plan:
         name: Canary Plan
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         outputs:
             mode: ${{ steps.inputs.outputs.mode }}
@@ -231,7 +237,7 @@ jobs:
         name: Canary Execute
         needs: [canary-plan]
         if: github.event_name == 'workflow_dispatch' && needs.canary-plan.outputs.mode == 'execute' && needs.canary-plan.outputs.ready_to_execute == 'true'
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 10
         permissions:
             contents: write

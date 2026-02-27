@@ -45,6 +45,8 @@ struct VoiceMetadata {
     voice_note: bool,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
+const TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX: &str = "zcapr:yes:";
+const TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX: &str = "zcapr:no:";
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -559,6 +561,117 @@ impl TelegramChannel {
         Some((chat_id, message_id))
     }
 
+    fn parse_approval_callback_command(data: &str) -> Option<String> {
+        if let Some(request_id) = data.strip_prefix(TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX) {
+            if !request_id.trim().is_empty() {
+                return Some(format!("/approve-allow {}", request_id.trim()));
+            }
+        }
+        if let Some(request_id) = data.strip_prefix(TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX) {
+            if !request_id.trim().is_empty() {
+                return Some(format!("/approve-deny {}", request_id.trim()));
+            }
+        }
+        None
+    }
+
+    fn answer_callback_query_nonblocking(&self, callback_id: String, text: &str) {
+        let client = self.http_client();
+        let url = self.api_url("answerCallbackQuery");
+        let text = text.to_string();
+        tokio::spawn(async move {
+            let body = serde_json::json!({
+                "callback_query_id": callback_id,
+                "text": text,
+                "show_alert": false
+            });
+            let _ = client.post(&url).json(&body).send().await;
+        });
+    }
+
+    fn clear_callback_inline_keyboard_nonblocking(
+        &self,
+        chat_id: String,
+        message_id: i64,
+        thread_id: Option<String>,
+    ) {
+        let client = self.http_client();
+        let url = self.api_url("editMessageReplyMarkup");
+        tokio::spawn(async move {
+            let mut body = serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {
+                    "inline_keyboard": []
+                }
+            });
+            if let Some(thread_id) = thread_id {
+                body["message_thread_id"] = serde_json::Value::String(thread_id);
+            }
+            let _ = client.post(&url).json(&body).send().await;
+        });
+    }
+
+    fn try_parse_approval_callback_query(
+        &self,
+        update: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
+        let callback = update.get("callback_query")?;
+        let callback_id = callback.get("id").and_then(serde_json::Value::as_str)?;
+        let data = callback.get("data").and_then(serde_json::Value::as_str)?;
+        let content = Self::parse_approval_callback_command(data)?;
+
+        let message = callback.get("message")?;
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(callback);
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+        let reply_target = if let Some(ref tid) = thread_id {
+            format!("{chat_id}:{tid}")
+        } else {
+            chat_id.clone()
+        };
+
+        self.answer_callback_query_nonblocking(callback_id.to_string(), "Decision received");
+        self.clear_callback_inline_keyboard_nonblocking(
+            chat_id.clone(),
+            message_id,
+            thread_id.clone(),
+        );
+
+        Some(ChannelMessage {
+            id: format!("telegram_cb_{chat_id}_{message_id}_{callback_id}"),
+            sender: sender_identity,
+            reply_target,
+            content,
+            channel: "telegram".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: thread_id,
+        })
+    }
+
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
@@ -824,27 +937,6 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
-    fn should_surface_unauthorized_prompt(
-        &self,
-        message: &serde_json::Value,
-        text: &str,
-        bind_code: Option<&str>,
-    ) -> bool {
-        if !self.mention_only || !Self::is_group_message(message) {
-            return true;
-        }
-
-        // Pairing commands should still be processed even without @mentions.
-        if bind_code.is_some() {
-            return true;
-        }
-
-        let bot_username = self.bot_username.lock();
-        bot_username
-            .as_ref()
-            .is_some_and(|name| Self::contains_bot_mention(text, name))
-    }
-
     fn is_user_allowed(&self, username: &str) -> bool {
         let identity = Self::normalize_identity(username);
         self.allowed_users
@@ -903,12 +995,7 @@ impl TelegramChannel {
             return;
         }
 
-        let bind_code = Self::extract_bind_code(text);
-        if !self.should_surface_unauthorized_prompt(message, text, bind_code) {
-            return;
-        }
-
-        if let Some(code) = bind_code {
+        if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
                 match pairing.try_pair(code, &chat_id).await {
                     Ok(Some(_token)) => {
@@ -2829,6 +2916,64 @@ impl Channel for TelegramChannel {
         self.send_text_chunks(&content, chat_id, thread_id).await
     }
 
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let (chat_id, parsed_thread_id) = Self::parse_reply_target(recipient);
+        let thread_id = parsed_thread_id.or(thread_ts);
+
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.len() > 260 {
+            format!("{}...", &raw_args[..260])
+        } else {
+            raw_args
+        };
+
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": format!(
+                "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`",
+            ),
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {
+                        "text": "Approve",
+                        "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX}{request_id}")
+                    },
+                    {
+                        "text": "Deny",
+                        "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX}{request_id}")
+                    }
+                ]]
+            }
+        });
+
+        if let Some(thread_id) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(thread_id);
+        }
+
+        let response = self
+            .http_client()
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let err = response.text().await.unwrap_or_default();
+            let sanitized = Self::sanitize_telegram_error(&err);
+            anyhow::bail!("Telegram approval prompt failed ({status}): {sanitized}");
+        }
+
+        Ok(())
+    }
+
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
@@ -2848,7 +2993,7 @@ impl Channel for TelegramChannel {
             let probe = serde_json::json!({
                 "offset": offset,
                 "timeout": 0,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -2923,7 +3068,7 @@ impl Channel for TelegramChannel {
             let body = serde_json::json!({
                 "offset": offset,
                 "timeout": 30,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -2987,6 +3132,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
+                        m
+                    } else if let Some(m) = self.try_parse_approval_callback_query(update) {
                         m
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
                         m
@@ -3637,6 +3784,72 @@ mod tests {
         assert_eq!(msg.reply_target, "-100200300:789");
         assert_eq!(msg.content, "hello from topic");
         assert_eq!(msg.id, "telegram_-100200300_42");
+    }
+
+    #[test]
+    fn parse_approval_callback_command_maps_approve_and_deny() {
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:yes:apr-1234"),
+            Some("/approve-allow apr-1234".to_string())
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:no:apr-5678"),
+            Some("/approve-deny apr-5678".to_string())
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("noop:data"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_approval_callback_command_trims_and_rejects_empty_ids() {
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:yes:   apr-1234   "),
+            Some("/approve-allow apr-1234".to_string())
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:no:\tapr-5678  "),
+            Some("/approve-deny apr-5678".to_string())
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:yes:   "),
+            None
+        );
+        assert_eq!(
+            TelegramChannel::parse_approval_callback_command("zcapr:no:"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn try_parse_approval_callback_query_builds_runtime_command_message() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 7,
+            "callback_query": {
+                "id": "cb-1",
+                "data": "zcapr:yes:apr-deadbeef",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "message": {
+                    "message_id": 44,
+                    "chat": { "id": -100_200_300 },
+                    "message_thread_id": 789
+                }
+            }
+        });
+
+        let msg = ch
+            .try_parse_approval_callback_query(&update)
+            .expect("callback query should parse");
+
+        assert_eq!(msg.sender, "alice");
+        assert_eq!(msg.reply_target, "-100200300:789");
+        assert_eq!(msg.content, "/approve-allow apr-deadbeef");
+        assert!(msg.id.starts_with("telegram_cb_-100200300_44_"));
     }
 
     // ── File sending API URL tests ──────────────────────────────────
@@ -4295,52 +4508,6 @@ mod tests {
             .parse_update_message(&update)
             .expect("sender override should bypass mention requirement");
         assert_eq!(parsed.content, "run daily sync");
-    }
-
-    #[test]
-    fn unauthorized_prompt_is_suppressed_for_unmentioned_group_message_when_mention_only() {
-        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true);
-        {
-            let mut cache = ch.bot_username.lock();
-            *cache = Some("mybot".to_string());
-        }
-
-        let message = serde_json::json!({
-            "chat": { "type": "group" }
-        });
-        assert!(!ch.should_surface_unauthorized_prompt(&message, "hello everyone", None));
-    }
-
-    #[test]
-    fn unauthorized_prompt_is_allowed_for_mentioned_group_message_when_mention_only() {
-        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true);
-        {
-            let mut cache = ch.bot_username.lock();
-            *cache = Some("mybot".to_string());
-        }
-
-        let message = serde_json::json!({
-            "chat": { "type": "supergroup" }
-        });
-        assert!(ch.should_surface_unauthorized_prompt(&message, "hi @mybot", None));
-    }
-
-    #[test]
-    fn unauthorized_prompt_allows_bind_command_without_mention_in_group() {
-        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true);
-        {
-            let mut cache = ch.bot_username.lock();
-            *cache = Some("mybot".to_string());
-        }
-
-        let message = serde_json::json!({
-            "chat": { "type": "group" }
-        });
-        assert!(ch.should_surface_unauthorized_prompt(
-            &message,
-            "/bind 123456",
-            Some("123456")
-        ));
     }
 
     #[test]

@@ -82,10 +82,16 @@ permissions:
     checks: write
     pull-requests: write
 
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
 jobs:
     vorpal:
         name: Vorpal Reviewdog Scan
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         steps:
             - name: Checkout

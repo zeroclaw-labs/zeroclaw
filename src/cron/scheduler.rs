@@ -1,5 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
+    TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -316,7 +317,8 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
@@ -331,7 +333,8 @@ pub(crate) async fn deliver_announcement(
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "slack" => {
@@ -361,6 +364,28 @@ pub(crate) async fn deliver_announcement(
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let channel = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "email" => {
+            let email = config
+                .channels_config
+                .email
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
+            let channel = EmailChannel::new(email.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
@@ -468,7 +493,37 @@ mod tests {
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -708,6 +763,10 @@ mod tests {
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
+        let _env = env_lock().await;
+        let _generic = EnvGuard::unset("ZEROCLAW_API_KEY");
+        let _fallback = EnvGuard::unset("API_KEY");
+        let _openrouter = EnvGuard::unset("OPENROUTER_API_KEY");
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());

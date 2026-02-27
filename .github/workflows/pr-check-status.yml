@@ -11,9 +11,14 @@ concurrency:
   group: pr-check-status
   cancel-in-progress: true
 
+env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: core.hooksPath
+  GIT_CONFIG_VALUE_0: /dev/null
+
 jobs:
   nudge-stale-prs:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, aws-india]
     permissions:
       contents: read
       pull-requests: write
@@ -23,7 +28,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
       - name: Nudge PRs that need rebase or CI refresh
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:

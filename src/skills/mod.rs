@@ -11,35 +11,6 @@ mod audit;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-const DEFAULT_ZEROCLAW_SKILL_MD: &str = r#"# zeroclaw
-
-Core ZeroClaw orientation and self-configuration guidance.
-
-Use this skill when the user asks how ZeroClaw works, how to configure it, or where to find docs.
-
-## What ZeroClaw Is
-
-ZeroClaw is an open-source AI agent runtime and CLI for autonomous workflows, tool orchestration, and multi-channel operation.
-
-## Primary References
-
-- Canonical README: https://zeroclaw-labs.github.io/zeroclaw/README.md
-- Source repository: https://github.com/zeroclaw-labs/zeroclaw
-
-## Fast Navigation
-
-- Runtime and CLI behavior: inspect `src/main.rs`, `src/lib.rs`, and `docs/commands-reference.md`.
-- Configuration schema and defaults: inspect `src/config/schema.rs`.
-- Agent loop and parsing behavior: inspect `src/agent/loop_.rs` and `src/agent/loop_/`.
-- Channels and prompt assembly: inspect `src/channels/mod.rs`.
-- Skills behavior and security audits: inspect `src/skills/mod.rs` and `src/skills/audit.rs`.
-
-## Working Rules
-
-- Prefer local repository docs first, then public docs.
-- If a behavior changed recently, verify current source code before answering.
-- Keep recommendations aligned with current defaults and security guardrails.
-"#;
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
@@ -658,13 +629,6 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
         )?;
     }
 
-    let zeroclaw_skill_dir = dir.join("zeroclaw");
-    std::fs::create_dir_all(&zeroclaw_skill_dir)?;
-    let zeroclaw_skill_md = zeroclaw_skill_dir.join("SKILL.md");
-    if !zeroclaw_skill_md.exists() {
-        std::fs::write(&zeroclaw_skill_md, DEFAULT_ZEROCLAW_SKILL_MD)?;
-    }
-
     Ok(())
 }
 
@@ -1157,7 +1121,6 @@ command = "echo hello"
         let dir = tempfile::tempdir().unwrap();
         init_skills_dir(dir.path()).unwrap();
         assert!(dir.path().join("skills").join("README.md").exists());
-        assert!(dir.path().join("skills/zeroclaw/SKILL.md").exists());
     }
 
     #[test]
@@ -1166,7 +1129,6 @@ command = "echo hello"
         init_skills_dir(dir.path()).unwrap();
         init_skills_dir(dir.path()).unwrap(); // second call should not fail
         assert!(dir.path().join("skills").join("README.md").exists());
-        assert!(dir.path().join("skills/zeroclaw/SKILL.md").exists());
     }
 
     #[test]

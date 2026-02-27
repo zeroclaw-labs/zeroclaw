@@ -1,89 +1,30 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Quick Reference — Build, Test, Lint
-
-```bash
-# Build (debug)
-cargo build
-
-# Build (release, optimized for size)
-cargo build --release
-
-# Lint
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-
-# Test (all)
-cargo test
-
-# Test (single test by name)
-cargo test test_name_substring
-
-# Test (single integration test file)
-cargo test --test agent_e2e
-
-# Benchmarks
-cargo bench
-
-# Full local CI in Docker (recommended before PR)
-./dev/ci.sh all
-```
-
-Rust edition: 2021. MSRV: 1.87. Binary name: `zeroclaw`. Unsafe code is forbidden (`#![forbid(unsafe_code)]`).
-
-## Workspace Structure
-
-Cargo workspace with two members:
-- `.` (root) — the main `zeroclaw` binary crate
-- `crates/robot-kit` — `zeroclaw-robot-kit`, a standalone robotics toolkit (drive, vision, speech, sensors, safety)
-
-## Feature Flags
-
-Default features: `channel-lark`, `web-fetch-html2md`. Notable opt-in features:
-- `hardware` — USB/serial peripheral support (nusb + tokio-serial)
-- `channel-matrix` — Matrix/Element E2EE channel
-- `memory-postgres` — PostgreSQL memory backend
-- `observability-otel` — OpenTelemetry OTLP traces/metrics
-- `browser-native` — Rust-native browser automation (fantoccini/WebDriver)
-- `runtime-wasm` — In-process WASM sandbox (wasmi)
-- `sandbox-landlock` / `sandbox-bubblewrap` — Linux kernel sandboxing
-- `peripheral-rpi` — Raspberry Pi GPIO (rppal, Linux only)
-- `whatsapp-web` — Native WhatsApp Web client (wa-rs)
-- `probe` — probe-rs for STM32/Nucleo debug probe
-- `rag-pdf` — PDF extraction for datasheet RAG
-
-## Architecture Overview
-
-ZeroClaw is a trait-driven, modular autonomous agent runtime. The core pattern: define a trait in `<subsystem>/traits.rs`, implement it in sibling modules, register implementations in a factory function in `<subsystem>/mod.rs`.
-
-Key extension points (traits):
-
-- `src/providers/traits.rs` — `Provider` (model inference backends)
-- `src/channels/traits.rs` — `Channel` (messaging platform integrations)
-- `src/tools/traits.rs` — `Tool` (agent-callable capabilities)
-- `src/memory/traits.rs` — `Memory` (persistence backends)
-- `src/observability/traits.rs` — `Observer` (telemetry/metrics)
-- `src/runtime/traits.rs` — `RuntimeAdapter` (execution environments)
-- `src/peripherals/traits.rs` — `Peripheral` (hardware boards)
-
-**Data flow**: User message arrives via a `Channel` -> `agent/loop_.rs` orchestrates the conversation -> `Provider` generates LLM responses -> `Tool` executions are dispatched -> results flow back through the channel. `SecurityPolicy` (`src/security/policy.rs`) enforces access control across all tool executions. `Config` (`src/config/schema.rs`) is the single source for all runtime configuration and is effectively a public API.
-
-**Provider resilience**: `ReliableProvider` (`src/providers/reliable.rs`) wraps providers with fallback chains and automatic retry. `router.rs` handles model routing across multiple providers.
-
-**Gateway**: `src/gateway/` is an axum-based HTTP server with webhook endpoints, SSE streaming, WebSocket support, and an OpenAI-compatible API layer.
-
-## Engineering Protocol
+# CLAUDE.md — ZeroClaw Agent Engineering Protocol
 
 This file defines the default working protocol for Claude agents in this repository.
 Scope: entire repository.
 
 ## 1) Project Snapshot (Read First)
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for high performance, efficiency, stability, extensibility, sustainability, and security.
+ZeroClaw is a Rust-first autonomous agent runtime optimized for:
+
+- high performance
+- high efficiency
+- high stability
+- high extensibility
+- high sustainability
+- high security
 
 Core architecture is trait-driven and modular. Most extension work should be done by implementing traits and registering in factory modules.
+
+Key extension points:
+
+- `src/providers/traits.rs` (`Provider`)
+- `src/channels/traits.rs` (`Channel`)
+- `src/tools/traits.rs` (`Tool`)
+- `src/memory/traits.rs` (`Memory`)
+- `src/observability/traits.rs` (`Observer`)
+- `src/runtime/traits.rs` (`RuntimeAdapter`)
+- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -202,13 +143,8 @@ Required:
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
 - `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
-- `src/runtime/` — runtime adapters (native, docker, wasm)
-- `crates/robot-kit/` — standalone robotics toolkit crate
+- `src/runtime/` — runtime adapters (currently native)
 - `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals, multilingual guides)
-- `dev/` — Docker-based dev environment (`cli.sh`) and local CI runner (`ci.sh`)
-- `scripts/ci/` — CI gate scripts (quality gate, delta lint, security regression, docs checks)
-- `tests/` — integration tests (e2e, channel routing, config, provider, webhook security)
-- `benches/` — criterion benchmarks (`agent_benchmarks.rs`)
 - `.github/` — CI, templates, automation workflows
 
 ## 4.1 Documentation System Contract (Required)
@@ -304,8 +240,8 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- Open a PR to `main`; do not push directly to `main`.
-- `main` is the integration branch for reviewed changes.
+- Open a PR to `dev`; do not push directly to `dev` or `main`.
+- `main` is reserved for release promotion PRs from `dev`.
 - Wait for required checks and review outcomes before merging.
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
 - After merge/close, clean up task branches/worktrees that are no longer needed.
@@ -315,7 +251,7 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Decide merge/close outcomes from repository-local authority in this order: `.github/workflows/**`, GitHub branch protection/rulesets, `docs/pr-workflow.md`, then this `CLAUDE.md`.
 - External agent skills/templates are execution aids only; they must not override repository-local policy.
-- A normal contributor PR targeting `main` is expected; evaluate by intent, scope, and policy compliance.
+- A normal contributor PR targeting `main` is a routing defect, not by itself a closure reason; if intent and content are legitimate, retarget to `dev`.
 - Direct-close the PR (do not supersede/replay) when high-confidence integrity-risk signals exist:
   - unapproved or unrelated repository rebranding attempts (for example replacing project logo/identity assets)
   - unauthorized platform-surface expansion (for example introducing `web` apps, dashboards, frontend stacks, or UI surfaces not requested by maintainers)

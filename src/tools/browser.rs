@@ -11,7 +11,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -704,6 +706,75 @@ impl BrowserTool {
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
     }
 
+    fn validate_output_path(&self, key: &str, path: &str) -> anyhow::Result<()> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("'{key}' path cannot be empty");
+        }
+        if trimmed.contains('\0') {
+            anyhow::bail!("'{key}' path contains invalid null byte");
+        }
+        if !self.security.is_path_allowed(trimmed) {
+            anyhow::bail!("'{key}' path blocked by security policy: {trimmed}");
+        }
+        Ok(())
+    }
+
+    async fn resolve_output_path_for_write(
+        &self,
+        key: &str,
+        path: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let trimmed = path.trim();
+        self.validate_output_path(key, trimmed)?;
+
+        tokio::fs::create_dir_all(&self.security.workspace_dir).await?;
+        let workspace_root = tokio::fs::canonicalize(&self.security.workspace_dir)
+            .await
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+
+        let raw_path = Path::new(trimmed);
+        let output_path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            workspace_root.join(raw_path)
+        };
+
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("'{key}' path has no parent directory"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let resolved_parent = tokio::fs::canonicalize(parent).await?;
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+            anyhow::bail!(
+                "{}",
+                self.security
+                    .resolved_path_violation_message(&resolved_parent)
+            );
+        }
+
+        match tokio::fs::symlink_metadata(&output_path).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "Refusing to write browser output through symlink: {}",
+                        output_path.display()
+                    );
+                }
+                if !meta.is_file() {
+                    anyhow::bail!(
+                        "Browser output path is not a regular file: {}",
+                        output_path.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        Ok(output_path)
+    }
+
     fn validate_computer_use_action(
         &self,
         action: &str,
@@ -733,6 +804,37 @@ impl BrowserTool {
                 self.validate_coordinate("from_y", from_y, self.computer_use.max_coordinate_y)?;
                 self.validate_coordinate("to_y", to_y, self.computer_use.max_coordinate_y)?;
             }
+            "key_type" => {
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'text' for key_type action"))?;
+                if text.trim().is_empty() {
+                    anyhow::bail!("'text' for key_type must not be empty");
+                }
+                if text.len() > 4096 {
+                    anyhow::bail!("'text' for key_type exceeds maximum length (4096 chars)");
+                }
+            }
+            "key_press" => {
+                let key = params
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'key' for key_press action"))?;
+                let valid = !key.trim().is_empty()
+                    && key.len() <= 32
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'));
+                if !valid {
+                    anyhow::bail!("'key' for key_press must be 1-32 chars of [A-Za-z0-9_+-]");
+                }
+            }
+            "screen_capture" => {
+                if let Some(path) = params.get("path").and_then(Value::as_str) {
+                    self.validate_output_path("path", path)?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -752,6 +854,15 @@ impl BrowserTool {
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
+        if action == "screen_capture" {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                let resolved = self.resolve_output_path_for_write("path", path).await?;
+                params.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
+            }
+        }
 
         let payload = json!({
             "action": action,
@@ -1082,6 +1193,19 @@ impl Tool for BrowserTool {
             }
         };
 
+        if let BrowserAction::Screenshot {
+            path: Some(path), ..
+        } = &action
+        {
+            if let Err(err) = self.validate_output_path("path", path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+
         self.execute_action(action, backend).await
     }
 }
@@ -1092,6 +1216,7 @@ mod native_backend {
     use anyhow::{Context, Result};
     use base64::Engine;
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
+    use fantoccini::error::CmdError;
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
     use serde_json::{json, Map, Value};
@@ -1162,7 +1287,7 @@ mod native_backend {
                 }
                 BrowserAction::Click { selector } => {
                     let client = self.active_client()?;
-                    find_element(client, &selector).await?.click().await?;
+                    click_with_recovery(client, &selector).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1172,9 +1297,7 @@ mod native_backend {
                 }
                 BrowserAction::Fill { selector, value } => {
                     let client = self.active_client()?;
-                    let element = find_element(client, &selector).await?;
-                    let _ = element.clear().await;
-                    element.send_keys(&value).await?;
+                    fill_with_recovery(client, &selector, &value).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1184,10 +1307,7 @@ mod native_backend {
                 }
                 BrowserAction::Type { selector, text } => {
                     let client = self.active_client()?;
-                    find_element(client, &selector)
-                        .await?
-                        .send_keys(&text)
-                        .await?;
+                    type_with_recovery(client, &selector, &text).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1384,35 +1504,37 @@ mod native_backend {
                 } => {
                     let client = self.active_client()?;
                     let selector = selector_for_find(&by, &value);
-                    let element = find_element(client, &selector).await?;
 
                     let payload = match action.as_str() {
                         "click" => {
-                            element.click().await?;
+                            click_with_recovery(client, &selector).await?;
                             json!({"result": "clicked"})
                         }
                         "fill" => {
                             let fill = fill_value.ok_or_else(|| {
                                 anyhow::anyhow!("find_action='fill' requires fill_value")
                             })?;
-                            let _ = element.clear().await;
-                            element.send_keys(&fill).await?;
+                            fill_with_recovery(client, &selector, &fill).await?;
                             json!({"result": "filled", "typed": fill.len()})
                         }
                         "text" => {
+                            let element = find_element(client, &selector).await?;
                             let text = element.text().await?;
                             json!({"result": "text", "text": text})
                         }
                         "hover" => {
+                            let element = prepare_interactable_element(client, &selector).await?;
                             hover_element(client, &element).await?;
                             json!({"result": "hovered"})
                         }
                         "check" => {
+                            let element = prepare_interactable_element(client, &selector).await?;
                             let checked_before = element_checked(&element).await?;
                             if !checked_before {
-                                element.click().await?;
+                                click_with_recovery(client, &selector).await?;
                             }
-                            let checked_after = element_checked(&element).await?;
+                            let refreshed = find_element(client, &selector).await?;
+                            let checked_after = element_checked(&refreshed).await?;
                             json!({
                                 "result": "checked",
                                 "checked_before": checked_before,
@@ -1545,6 +1667,10 @@ mod native_backend {
         }
     }
 
+    const INTERACTABLE_TIMEOUT_MS: u64 = 5_000;
+    const INTERACTABLE_POLL_MS: u64 = 120;
+    const INTERACTABLE_RETRY_DELAY_MS: u64 = 180;
+
     async fn wait_for_selector(client: &Client, selector: &str) -> Result<()> {
         match parse_selector(selector) {
             SelectorKind::Css(css) => {
@@ -1565,6 +1691,46 @@ mod native_backend {
         Ok(())
     }
 
+    async fn prepare_interactable_element(
+        client: &Client,
+        selector: &str,
+    ) -> Result<fantoccini::elements::Element> {
+        wait_for_selector(client, selector).await?;
+        wait_for_interactable_element(
+            client,
+            selector,
+            Duration::from_millis(INTERACTABLE_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    async fn wait_for_interactable_element(
+        client: &Client,
+        selector: &str,
+        timeout: Duration,
+    ) -> Result<fantoccini::elements::Element> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(element) = find_element(client, selector).await {
+                let _ = scroll_element_into_view(client, &element).await;
+                let visible = element.is_displayed().await.unwrap_or(false);
+                let disabled = element_disabled(&element).await.unwrap_or(false);
+                if visible && !disabled {
+                    return Ok(element);
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Element '{selector}' became visible in DOM but stayed non-interactable for {}ms",
+                    timeout.as_millis()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_POLL_MS)).await;
+        }
+    }
+
     async fn find_element(
         client: &Client,
         selector: &str,
@@ -1580,6 +1746,125 @@ mod native_backend {
                 .with_context(|| format!("Failed to find element by XPath '{xpath}'"))?,
         };
         Ok(element)
+    }
+
+    async fn scroll_element_into_view(
+        client: &Client,
+        element: &fantoccini::elements::Element,
+    ) -> Result<()> {
+        let element_arg = serde_json::to_value(element)
+            .context("Failed to serialize element for scrollIntoView")?;
+        client
+            .execute(
+                r#"const el = arguments[0];
+if (!el || typeof el.scrollIntoView !== "function") return false;
+try {
+  el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+} catch (_) {
+  el.scrollIntoView(true);
+}
+return true;"#,
+                vec![element_arg],
+            )
+            .await
+            .context("Failed to execute scrollIntoView for element")?;
+        Ok(())
+    }
+
+    async fn element_disabled(element: &fantoccini::elements::Element) -> Result<bool> {
+        let disabled = element
+            .prop("disabled")
+            .await
+            .context("Failed to read disabled property")?
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(disabled.as_str(), "true" | "disabled" | "1") {
+            return Ok(true);
+        }
+
+        let aria_disabled = element
+            .attr("aria-disabled")
+            .await
+            .context("Failed to read aria-disabled attribute")?
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Ok(matches!(aria_disabled.as_str(), "true" | "1"))
+    }
+
+    async fn javascript_click(
+        client: &Client,
+        element: &fantoccini::elements::Element,
+    ) -> Result<()> {
+        let element_arg =
+            serde_json::to_value(element).context("Failed to serialize element for JS click")?;
+        client
+            .execute(
+                r#"const el = arguments[0];
+if (!el) return false;
+el.click();
+return true;"#,
+                vec![element_arg],
+            )
+            .await
+            .context("Failed JavaScript click fallback")?;
+        Ok(())
+    }
+
+    fn is_non_interactable_cmd_error(err: &CmdError) -> bool {
+        let message = format!("{err:#}").to_ascii_lowercase();
+        message.contains("element not interactable")
+            || message.contains("element click intercepted")
+            || message.contains("not clickable")
+    }
+
+    async fn click_with_recovery(client: &Client, selector: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        if let Err(err) = element.click().await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            match retry_element.click().await {
+                Ok(()) => {}
+                Err(retry_err) if is_non_interactable_cmd_error(&retry_err) => {
+                    javascript_click(client, &retry_element).await?;
+                }
+                Err(retry_err) => return Err(retry_err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn fill_with_recovery(client: &Client, selector: &str, value: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        let _ = element.clear().await;
+        if let Err(err) = element.send_keys(value).await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            let _ = retry_element.clear().await;
+            retry_element.send_keys(value).await?;
+        }
+        Ok(())
+    }
+
+    async fn type_with_recovery(client: &Client, selector: &str, text: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        if let Err(err) = element.send_keys(text).await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            retry_element.send_keys(text).await?;
+        }
+        Ok(())
     }
 
     async fn hover_element(client: &Client, element: &fantoccini::elements::Element) -> Result<()> {
@@ -2131,6 +2416,16 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_dir(src, dst).expect("symlink should be created");
+    }
+
     #[test]
     fn normalize_domains_works() {
         let domains = vec![
@@ -2392,6 +2687,50 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_path_validation_blocks_escaped_paths() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        assert!(tool.validate_output_path("path", "/etc/passwd").is_err());
+        assert!(tool.validate_output_path("path", "../outside.png").is_err());
+        assert!(tool
+            .validate_output_path("path", "captures/page.png")
+            .is_ok());
+    }
+
+    #[test]
+    fn computer_use_key_actions_validate_params() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        let key_type_args = serde_json::json!({"text": "hello"});
+        assert!(tool
+            .validate_computer_use_action("key_type", key_type_args.as_object().unwrap())
+            .is_ok());
+        let missing_key_type = serde_json::json!({});
+        assert!(tool
+            .validate_computer_use_action("key_type", missing_key_type.as_object().unwrap())
+            .is_err());
+
+        let key_press_args = serde_json::json!({"key": "Enter"});
+        assert!(tool
+            .validate_computer_use_action("key_press", key_press_args.as_object().unwrap())
+            .is_ok());
+        let bad_key_press_args = serde_json::json!({"key": "Ctrl+Shift+Enter!!"});
+        assert!(tool
+            .validate_computer_use_action("key_press", bad_key_press_args.as_object().unwrap())
+            .is_err());
+    }
+
+    #[test]
     fn browser_tool_name() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new(security, vec!["example.com".into()], None);
@@ -2486,7 +2825,11 @@ mod tests {
     #[cfg(feature = "browser-native")]
     #[test]
     fn reset_session_is_idempotent_without_client() {
-        tokio_test::block_on(async {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread tokio runtime should build for browser test");
+        runtime.block_on(async {
             let mut state = native_backend::NativeBrowserState::default();
             state.reset_session().await;
             state.reset_session().await;

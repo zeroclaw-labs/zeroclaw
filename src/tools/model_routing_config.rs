@@ -216,10 +216,10 @@ impl ModelRoutingConfigTool {
             "hint": route.hint,
             "provider": route.provider,
             "model": route.model,
-            "api_key_configured": crate::providers::has_provider_credential(
-                &route.provider,
-                route.api_key.as_deref(),
-            ),
+            "api_key_configured": route
+                .api_key
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty()),
             "classification": classification,
         })
     }
@@ -264,10 +264,10 @@ impl ModelRoutingConfigTool {
                     "provider": agent.provider,
                     "model": agent.model,
                     "system_prompt": agent.system_prompt,
-                    "api_key_configured": crate::providers::has_provider_credential(
-                        &agent.provider,
-                        agent.api_key.as_deref(),
-                    ),
+                    "api_key_configured": agent
+                        .api_key
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty()),
                     "temperature": agent.temperature,
                     "max_depth": agent.max_depth,
                     "agentic": agent.agentic,
