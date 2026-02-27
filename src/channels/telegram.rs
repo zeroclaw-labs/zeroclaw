@@ -706,7 +706,48 @@ impl TelegramChannel {
     }
 
     fn sanitize_telegram_error(input: &str) -> String {
-        crate::providers::sanitize_api_error(input)
+        let mut sanitized = crate::providers::sanitize_api_error(input);
+        let mut search_from = 0usize;
+
+        while let Some(rel) = sanitized[search_from..].find("/bot") {
+            let marker_start = search_from + rel;
+            let token_start = marker_start + "/bot".len();
+
+            let Some(next_slash_rel) = sanitized[token_start..].find('/') else {
+                break;
+            };
+            let token_end = token_start + next_slash_rel;
+
+            let should_redact = sanitized[token_start..token_end].contains(':')
+                && sanitized[token_start..token_end]
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-'));
+
+            if should_redact {
+                sanitized.replace_range(token_start..token_end, "[REDACTED]");
+                search_from = token_start + "[REDACTED]".len();
+            } else {
+                search_from = token_start;
+            }
+        }
+
+        sanitized
+    }
+
+    fn log_poll_transport_error(sanitized: &str, consecutive_failures: u32) {
+        if consecutive_failures >= 6 && consecutive_failures % 6 == 0 {
+            tracing::warn!(
+                "Telegram poll transport error persists (consecutive={}): {}",
+                consecutive_failures,
+                sanitized
+            );
+        } else {
+            tracing::debug!(
+                "Telegram poll transport error (consecutive={}): {}",
+                consecutive_failures,
+                sanitized
+            );
+        }
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -3002,6 +3043,7 @@ impl Channel for TelegramChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
+        let mut consecutive_poll_transport_failures = 0u32;
 
         if self.mention_only {
             let _ = self.get_bot_username().await;
@@ -3101,11 +3143,15 @@ impl Channel for TelegramChannel {
                 Ok(r) => r,
                 Err(e) => {
                     let sanitized = Self::sanitize_telegram_error(&e.to_string());
-                    tracing::warn!("Telegram poll error: {sanitized}");
+                    consecutive_poll_transport_failures =
+                        consecutive_poll_transport_failures.saturating_add(1);
+                    Self::log_poll_transport_error(&sanitized, consecutive_poll_transport_failures);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
             };
+
+            consecutive_poll_transport_failures = 0;
 
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
@@ -3439,6 +3485,23 @@ mod tests {
             ch.api_url("sendMessage"),
             "https://tapi.bale.ai/bot123:ABC/sendMessage"
         );
+    }
+
+    #[test]
+    fn sanitize_telegram_error_redacts_bot_token_in_url() {
+        let input =
+            "error sending request for url (https://api.telegram.org/bot123456:ABCdef/getUpdates)";
+        let sanitized = TelegramChannel::sanitize_telegram_error(input);
+
+        assert!(!sanitized.contains("123456:ABCdef"));
+        assert!(sanitized.contains("/bot[REDACTED]/getUpdates"));
+    }
+
+    #[test]
+    fn sanitize_telegram_error_does_not_redact_non_token_bot_path() {
+        let input = "error sending request for url (https://example.com/bot/getUpdates)";
+        let sanitized = TelegramChannel::sanitize_telegram_error(input);
+        assert_eq!(sanitized, input);
     }
 
     #[test]
