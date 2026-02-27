@@ -3,7 +3,8 @@ use crate::agent::dispatcher::{
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::config::Config;
+use crate::agent::research;
+use crate::config::{Config, ResearchPhaseConfig};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -37,6 +38,7 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
+    research_config: ResearchPhaseConfig,
 }
 
 pub struct AgentBuilder {
@@ -58,6 +60,7 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
+    research_config: Option<ResearchPhaseConfig>,
 }
 
 impl AgentBuilder {
@@ -81,6 +84,7 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
+            research_config: None,
         }
     }
 
@@ -180,6 +184,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn research_config(mut self, research_config: ResearchPhaseConfig) -> Self {
+        self.research_config = Some(research_config);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -223,6 +232,7 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            research_config: self.research_config.unwrap_or_default(),
         })
     }
 }
@@ -342,6 +352,7 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .research_config(config.research.clone())
             .build()
     }
 
@@ -486,11 +497,60 @@ impl Agent {
             .await
             .unwrap_or_default();
 
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
+        // ── Research Phase ──────────────────────────────────────────────
+        // If enabled and triggered, run a focused research turn to gather
+        // information before the main response.
+        let research_context = if research::should_trigger(&self.research_config, user_message) {
+            if self.research_config.show_progress {
+                println!("[Research] Gathering information...");
+            }
+
+            match research::run_research_phase(
+                &self.research_config,
+                self.provider.as_ref(),
+                &self.tools,
+                user_message,
+                &self.model_name,
+                self.temperature,
+                self.observer.clone(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if self.research_config.show_progress {
+                        println!(
+                            "[Research] Complete: {} tool calls, {} chars context",
+                            result.tool_call_count,
+                            result.context.len()
+                        );
+                        for summary in &result.tool_summaries {
+                            println!("  - {}: {}", summary.tool_name, summary.result_preview);
+                        }
+                    }
+                    if result.context.is_empty() {
+                        None
+                    } else {
+                        Some(result.context)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Research phase failed: {}", e);
+                    None
+                }
+            }
         } else {
-            format!("{context}[{now}] {user_message}")
+            None
+        };
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let stamped_user_message = format!("[{now}] {user_message}");
+        let enriched = match (&context, &research_context) {
+            (c, Some(r)) if !c.is_empty() => {
+                format!("{c}\n\n{r}\n\n{stamped_user_message}")
+            }
+            (_, Some(r)) => format!("{r}\n\n{stamped_user_message}"),
+            (c, None) if !c.is_empty() => format!("{c}{stamped_user_message}"),
+            _ => stamped_user_message,
         };
 
         self.history

@@ -56,6 +56,9 @@ pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
+// Intentionally unused re-export — public API surface for plugin authors.
+#[allow(unused_imports)]
+pub(crate) mod plugins;
 pub(crate) mod integrations;
 pub mod memory;
 pub(crate) mod migration;
@@ -147,14 +150,33 @@ Examples:
 pub enum SkillCommands {
     /// List all installed skills
     List,
+    /// Scaffold a new skill project from a template
+    New {
+        /// Skill name (snake_case recommended, e.g. my_weather_tool)
+        name: String,
+        /// Template language: typescript, rust, go, python
+        #[arg(long, short, default_value = "typescript")]
+        template: String,
+    },
+    /// Run a skill tool locally for testing (reads args from --args or stdin)
+    Test {
+        /// Path to the skill directory or installed skill name
+        path: String,
+        /// Optional tool name inside the skill (defaults to first tool found)
+        #[arg(long)]
+        tool: Option<String>,
+        /// JSON arguments to pass to the tool, e.g. '{"city":"Hanoi"}'
+        #[arg(long, short)]
+        args: Option<String>,
+    },
     /// Audit a skill source directory or installed skill name
     Audit {
         /// Skill path or installed skill name
         source: String,
     },
-    /// Install a new skill from a URL or local path
+    /// Install a new skill from a local path, git URL, or registry (namespace/name)
     Install {
-        /// Source URL or local path
+        /// Source: local path, git URL, or registry package (e.g. acme/my-tool)
         source: String,
     },
     /// Remove an installed skill
@@ -162,6 +184,8 @@ pub enum SkillCommands {
         /// Skill name to remove
         name: String,
     },
+    /// List all available skill templates
+    Templates,
 }
 
 /// Migration subcommands

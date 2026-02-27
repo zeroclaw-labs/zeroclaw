@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use regex::Regex;
+use reqwest::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,18 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
+    fn duckduckgo_status_hint(status: StatusCode) -> &'static str {
+        match status {
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => {
+                " DuckDuckGo may be blocking this network. Try [web_search].provider = \"brave\" with [web_search].brave_api_key, or set provider = \"firecrawl\"."
+            }
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => {
+                " DuckDuckGo may be temporarily unavailable. Retry later or switch providers."
+            }
+            _ => "",
+        }
+    }
+
     pub fn new(
         security: Arc<SecurityPolicy>,
         provider: String,
@@ -48,12 +61,18 @@ impl WebSearchTool {
             .user_agent(self.user_agent.as_str())
             .build()?;
 
-        let response = client.get(&search_url).send().await?;
+        let response = client.get(&search_url).send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "DuckDuckGo search request failed: {e}. Check outbound network/proxy settings, or switch [web_search].provider to \"brave\"/\"firecrawl\"."
+            )
+        })?;
 
         if !response.status().is_success() {
+            let status = response.status();
             anyhow::bail!(
-                "DuckDuckGo search failed with status: {}",
-                response.status()
+                "DuckDuckGo search failed with status: {}.{}",
+                status,
+                Self::duckduckgo_status_hint(status)
             );
         }
 
@@ -482,6 +501,20 @@ mod tests {
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("https://example.com/path?a=1"));
         assert!(!result.contains("rut=test"));
+    }
+
+    #[test]
+    fn duckduckgo_status_hint_for_403_mentions_provider_switch() {
+        let hint = WebSearchTool::duckduckgo_status_hint(StatusCode::FORBIDDEN);
+        assert!(hint.contains("provider"));
+        assert!(hint.contains("brave"));
+    }
+
+    #[test]
+    fn duckduckgo_status_hint_for_500_is_empty() {
+        assert!(
+            WebSearchTool::duckduckgo_status_hint(StatusCode::INTERNAL_SERVER_ERROR).is_empty()
+        );
     }
 
     #[test]

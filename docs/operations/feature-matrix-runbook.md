@@ -66,7 +66,7 @@ Verification commands:
 1. Open `feature-matrix-summary.md` and identify failed lane(s), owner, and failing command.
 2. Download lane artifact (`nightly-result-<lane>.json`) for exact command + exit code.
 3. Reproduce locally with the exact command and toolchain lock (`--locked`).
-4. Attach local reproduction logs + fix PR link to the active tracking thread (issue/PR discussion).
+4. Attach local reproduction logs + fix PR link to the active Linear execution issue.
 
 ## High-Frequency Failure Classes
 

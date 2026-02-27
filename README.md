@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
   <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
@@ -25,7 +25,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
+  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="docs/i18n/zh-CN/README.md">简体中文</a> · <a href="docs/i18n/ja/README.md">日本語</a> · <a href="docs/i18n/ru/README.md">Русский</a> · <a href="docs/i18n/fr/README.md">Français</a> · <a href="docs/i18n/vi/README.md">Tiếng Việt</a> · <a href="docs/i18n/el/README.md">Ελληνικά</a>
 </p>
 
 <p align="center">
@@ -72,6 +72,7 @@ Use this board for important notices (breaking changes, security advisories, mai
 - 💰 **Cost-Efficient Deployment:** Designed for low-cost boards and small cloud instances without heavyweight runtime dependencies.
 - ⚡ **Fast Cold Starts:** Single-binary Rust runtime keeps command and daemon startup near-instant for daily operations.
 - 🌍 **Portable Architecture:** One binary-first workflow across ARM, x86, and RISC-V with swappable providers/channels/tools.
+- 🔍 **Research Phase:** Proactive information gathering through tools before response generation — reduces hallucinations by fact-checking first.
 
 ### Why teams pick ZeroClaw
 
@@ -218,6 +219,32 @@ To require binary-only install with no source fallback:
 
 ```bash
 brew install zeroclaw
+```
+
+### Linux pre-built installer (beginner-friendly)
+
+For Linux hosts that prefer a pre-built binary (no local Rust build), use the
+repository-maintained release installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash
+```
+
+What it does:
+
+- Detects your Linux CPU architecture (`x86_64`, `aarch64`, `armv7`)
+- Downloads the matching asset from the latest official GitHub release
+- Installs `zeroclaw` into a local bin directory (or `/usr/local/bin` if needed)
+- Starts `zeroclaw onboard` (skip with `--no-onboard`)
+
+Examples:
+
+```bash
+# Install and start onboarding (default)
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash
+
+# Install only (no onboarding)
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash -s -- --no-onboard
 ```
 
 ### One-click bootstrap
@@ -406,7 +433,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **AI Models**     | `Provider`       | Provider catalog via `zeroclaw providers` (built-ins + aliases, plus custom endpoints)                                                                                     | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
 | **Channels**      | `Channel`        | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Nostr, Webhook                                        | Any messaging API                                                                            |
 | **Memory**        | `Memory`         | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend                                                                      |
-| **Tools**         | `Tool`           | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools                                 | Any capability                                                                               |
+| **Tools**         | `Tool`           | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools, **WASM skills** (opt-in)       | Any capability                                                                               |
 | **Observability** | `Observer`       | Noop, Log, Multi                                                                                                                                                           | Prometheus, OTel                                                                             |
 | **Runtime**       | `RuntimeAdapter` | Native, Docker (sandboxed)                                                                                                                                                 | Additional runtimes can be added via adapter; unsupported kinds fail fast                    |
 | **Security**      | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets                                                                                   | —                                                                                            |
@@ -657,6 +684,7 @@ keyword_weight = 0.3
 # schema = "public"
 # table = "memories"
 # connect_timeout_secs = 15
+# tls = true                  # true = TLS (cert not verified), false = plain TCP (default)
 
 [gateway]
 port = 42617                    # default
@@ -974,7 +1002,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `providers`                                   | List supported providers and aliases                                                 |
 | `channel`                                     | List/start/doctor channels and bind Telegram identities                              |
 | `integrations`                                | Inspect integration setup details                                                    |
-| `skills`                                      | List/install/remove skills                                                           |
+| `skills`                                      | List/install/remove skills; supports ClawhHub URLs, local zip files, ZeroMarket registry, git remotes |
 | `migrate`                                     | Import data from other runtimes (`migrate openclaw`)                                 |
 | `completions`                                 | Generate shell completion scripts (`bash`, `fish`, `zsh`, `powershell`, `elvish`)    |
 | `hardware`                                    | USB discover/introspect/info commands                                                |
@@ -1020,6 +1048,45 @@ open_skills_enabled = true
 You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED`, `ZEROCLAW_OPEN_SKILLS_DIR`, and `ZEROCLAW_SKILLS_PROMPT_MODE` (`full` or `compact`).
 
 Skill installs are now gated by a built-in static security audit. `zeroclaw skills install <source>` blocks symlinks, script-like files, unsafe markdown link patterns, and high-risk shell payload snippets before accepting a skill. You can run `zeroclaw skills audit <source_or_name>` to validate a local directory or an installed skill manually.
+
+### WASM Skills
+
+ZeroClaw supports WASM-compiled skills installable from the [ZeroMarket](https://zeromarket.vercel.app) registry and zip-based registries like [ClawhHub](https://clawhub.ai):
+
+```bash
+# Install from ZeroMarket registry
+zeroclaw skill install namespace/name
+
+# Install from ClawhHub (auto-detected by domain)
+zeroclaw skill install https://clawhub.ai/steipete/summarize
+
+# Install using ClawhHub short prefix
+zeroclaw skill install clawhub:summarize
+
+# Install from a zip file already downloaded locally
+zeroclaw skill install ~/Downloads/summarize-1.0.0.zip
+
+# Install from any direct zip URL
+zeroclaw skill install zip:https://example.com/my-skill.zip
+```
+
+If ClawhHub returns 429 (rate limit) or requires authentication, add to `~/.zeroclaw/config.toml`:
+
+```toml
+[skills]
+clawhub_token = "your-clawhub-token"
+```
+
+Skills are installed to `~/.zeroclaw/workspace/skills/<name>/` and loaded automatically as tools at agent runtime. No system `unzip` binary required — zip extraction is handled in-process.
+
+Build with WASM tool support (enabled by default):
+
+```bash
+cargo build --release                         # wasm-tools enabled by default
+cargo build --release --no-default-features   # disable wasm-tools for smaller binary
+```
+
+Publish your own skill to ZeroMarket: compile to WASM, upload `tool.wasm`, `manifest.json`, and `SKILL.md` via the ZeroMarket upload page. Use `zeroclaw skill new <name>` to scaffold a new skill project.
 
 ## Development
 
@@ -1069,6 +1136,7 @@ Start from the docs hub for a task-oriented map:
 - Unified docs TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
 - Commands reference: [`docs/commands-reference.md`](docs/commands-reference.md)
 - Config reference: [`docs/config-reference.md`](docs/config-reference.md)
+- WASM skills guide: [`docs/wasm-tools-guide.md`](docs/wasm-tools-guide.md)
 - Providers reference: [`docs/providers-reference.md`](docs/providers-reference.md)
 - Channels reference: [`docs/channels-reference.md`](docs/channels-reference.md)
 - Operations runbook: [`docs/operations-runbook.md`](docs/operations-runbook.md)

@@ -117,7 +117,7 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 
 - Giữ các kiểm tra chặn merge mang tính quyết định và tái tạo được (`--locked` khi áp dụng được).
 - Đảm bảo tương thích merge queue bằng cách hỗ trợ `merge_group` cho các workflow bắt buộc (`ci-run`, `sec-audit`, `sec-codeql`).
-- PR intake checks không bắt buộc liên kết với hệ thống ticket bên ngoài.
+- Bắt buộc PR liên kết với Linear issue key (`RMN-*`/`CDV-*`/`COM-*`) qua PR intake checks.
 - Bắt buộc entry `advisories.ignore` trong `deny.toml` dùng object có `id` + `reason` (được kiểm tra bởi `deny_policy_guard.py`).
 - Giữ metadata governance cho deny ignore trong `.github/security/deny-ignore-governance.json` luôn cập nhật (owner/reason/expiry/ticket được kiểm tra bởi `deny_policy_guard.py`).
 - Giữ metadata quản trị allowlist gitleaks trong `.github/security/gitleaks-allowlist-governance.json` luôn cập nhật (owner/reason/expiry/ticket được kiểm tra bởi `secrets_governance_guard.py`).

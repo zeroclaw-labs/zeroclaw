@@ -5,35 +5,35 @@
       "pattern": "src/security/leak_detector\\.rs",
       "owner": "repo-maintainers",
       "reason": "Fixture patterns are intentionally embedded for regression tests in leak detector logic.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     },
     {
       "pattern": "src/agent/loop_\\.rs",
       "owner": "repo-maintainers",
       "reason": "Contains escaped template snippets used for command orchestration and parser coverage.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     },
     {
       "pattern": "src/security/secrets\\.rs",
       "owner": "repo-maintainers",
       "reason": "Contains detector test vectors and redaction examples required for secret scanning tests.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     },
     {
       "pattern": "docs/(i18n/vi/|vi/)?zai-glm-setup\\.md",
       "owner": "repo-maintainers",
       "reason": "Documentation contains literal environment variable placeholders for onboarding commands.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     },
     {
       "pattern": "\\.github/workflows/pub-release\\.yml",
       "owner": "repo-maintainers",
       "reason": "Release workflow emits masked authorization header examples during registry smoke checks.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     }
   ],
@@ -42,14 +42,14 @@
       "pattern": "Authorization: Bearer \\$\\{[^}]+\\}",
       "owner": "repo-maintainers",
       "reason": "Intentional placeholder used in docs/workflow snippets for safe header examples.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     },
     {
       "pattern": "curl -sS -o /tmp/ghcr-release-manifest\\.json -w \"%\\{http_code\\}\"",
       "owner": "repo-maintainers",
       "reason": "Release smoke command string is non-secret telemetry and should not be flagged as credential leakage.",
-      "ticket": "SEC-13",
+      "ticket": "RMN-13",
       "expires_on": "2026-12-31"
     }
   ]

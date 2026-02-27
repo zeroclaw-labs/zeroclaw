@@ -37,15 +37,29 @@ cli = true
 
 Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
 
-## In-Chat Runtime Model Switching (Telegram / Discord)
+One ZeroClaw runtime can serve multiple channels at once: if you configure several
+channel sub-tables, `zeroclaw channel start` launches all of them in the same process.
+Channel startup is best-effort: a single channel init failure is reported and skipped,
+while remaining channels continue running.
 
-When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+## In-Chat Runtime Commands
 
+When running `zeroclaw channel start` (or daemon mode), runtime commands include:
+
+Telegram/Discord sender-scoped model routing:
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
 - `/new` — clear conversation history and start a fresh session
+
+Supervised tool approvals (all non-CLI channels):
+- `/approve-request <tool-name>` — create a pending approval request
+- `/approve-confirm <request-id>` — confirm pending request (same sender + same chat/channel only)
+- `/approve-pending` — list pending requests for your current sender+chat/channel scope
+- `/approve <tool-name>` — direct one-step approve + persist (`autonomy.auto_approve`, compatibility path)
+- `/unapprove <tool-name>` — revoke and remove persisted approval
+- `/approvals` — inspect runtime grants, persisted approval lists, and excluded tools
 
 Notes:
 
@@ -53,6 +67,16 @@ Notes:
 - `/new` clears the sender's conversation history without changing provider or model selection.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
+- Natural-language approval intents are supported with strict parsing and policy control:
+  - `direct` mode (default): `授权工具 shell` grants immediately.
+  - `request_confirm` mode: `授权工具 shell` creates pending request, then confirm with request ID.
+  - `disabled` mode: approval-management must use slash commands.
+- You can override natural-language approval mode per channel via `[autonomy].non_cli_natural_language_approval_mode_by_channel`.
+- Approval commands are intercepted before LLM execution, so the model cannot self-escalate permissions through tool calls.
+- You can restrict who can use approval-management commands via `[autonomy].non_cli_approval_approvers`.
+- Configure natural-language approval mode via `[autonomy].non_cli_natural_language_approval_mode`.
+- `autonomy.non_cli_excluded_tools` is reloaded from `config.toml` at runtime; `/approvals` shows the currently effective list.
+- Each incoming message injects a runtime tool-availability snapshot into the system prompt, derived from the same exclusion policy used by execution.
 
 ## Inbound Image Marker Protocol
 
@@ -76,23 +100,23 @@ Operational notes:
 
 Matrix and Lark support are controlled at compile time.
 
-- Default builds are lean (`default = []`) and do not include Matrix/Lark.
-- Typical local check with only hardware support:
+- Default builds include Lark/Feishu (`default = ["channel-lark"]`), while Matrix remains opt-in.
+- For a lean local build without Matrix/Lark:
 
 ```bash
-cargo check --features hardware
+cargo check --no-default-features --features hardware
 ```
 
-- Enable Matrix explicitly when needed:
+- Enable Matrix explicitly in a custom feature set:
 
 ```bash
-cargo check --features hardware,channel-matrix
+cargo check --no-default-features --features hardware,channel-matrix
 ```
 
-- Enable Lark explicitly when needed:
+- Enable Lark explicitly in a custom feature set:
 
 ```bash
-cargo check --features hardware,channel-lark
+cargo check --no-default-features --features hardware,channel-lark
 ```
 
 If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
@@ -142,6 +166,27 @@ Field names differ by channel:
 - `allowed_contacts` (iMessage)
 - `allowed_pubkeys` (Nostr)
 
+### Group-Chat Trigger Policy (Telegram/Discord/Slack/Mattermost/Lark/Feishu)
+
+These channels support an explicit `group_reply` policy:
+
+- `mode = "all_messages"`: reply to all group messages (subject to channel allowlist checks).
+- `mode = "mention_only"`: in groups, require explicit bot mention.
+- `allowed_sender_ids`: sender IDs that bypass mention gating in groups.
+
+Important behavior:
+
+- `allowed_sender_ids` only bypasses mention gating.
+- Sender allowlists (`allowed_users`) are still enforced first.
+
+Example shape:
+
+```toml
+[channels_config.telegram.group_reply]
+mode = "mention_only"                      # all_messages | mention_only
+allowed_sender_ids = ["123456789", "987"] # optional; "*" allowed
+```
+
 ---
 
 ## 4. Per-Channel Config Examples
@@ -154,8 +199,12 @@ bot_token = "123456:telegram-token"
 allowed_users = ["*"]
 stream_mode = "off"               # optional: off | partial
 draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
-mention_only = false              # optional: require @mention in groups
+mention_only = false              # legacy fallback; used when group_reply.mode is not set
 interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
+
+[channels_config.telegram.group_reply]
+mode = "all_messages"             # optional: all_messages | mention_only
+allowed_sender_ids = []           # optional: sender IDs that bypass mention gate
 ```
 
 Telegram notes:
@@ -171,7 +220,11 @@ bot_token = "discord-bot-token"
 guild_id = "123456789012345678"   # optional
 allowed_users = ["*"]
 listen_to_bots = false
-mention_only = false
+mention_only = false              # legacy fallback; used when group_reply.mode is not set
+
+[channels_config.discord.group_reply]
+mode = "all_messages"             # optional: all_messages | mention_only
+allowed_sender_ids = []           # optional: sender IDs that bypass mention gate
 ```
 
 ### 4.3 Slack
@@ -182,6 +235,10 @@ bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
 channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
 allowed_users = ["*"]
+
+[channels_config.slack.group_reply]
+mode = "all_messages"              # optional: all_messages | mention_only
+allowed_sender_ids = []            # optional: sender IDs that bypass mention gate
 ```
 
 Slack listen behavior:
@@ -197,6 +254,11 @@ url = "https://mm.example.com"
 bot_token = "mattermost-token"
 channel_id = "channel-id"          # required for listening
 allowed_users = ["*"]
+mention_only = false               # legacy fallback; used when group_reply.mode is not set
+
+[channels_config.mattermost.group_reply]
+mode = "all_messages"              # optional: all_messages | mention_only
+allowed_sender_ids = []            # optional: sender IDs that bypass mention gate
 ```
 
 ### 4.5 Matrix
@@ -209,6 +271,7 @@ user_id = "@zeroclaw:matrix.example.com"   # optional, recommended for E2EE
 device_id = "DEVICEID123"                  # optional, recommended for E2EE
 room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.com)
 allowed_users = ["*"]
+mention_only = false                       # optional: when true, only DM / @mention / reply-to-bot
 ```
 
 See [Matrix E2EE Guide](./matrix-e2ee-guide.md) for encrypted-room troubleshooting.
@@ -308,34 +371,44 @@ verify_tls = true
 
 ```toml
 [channels_config.lark]
-app_id = "cli_xxx"
-app_secret = "xxx"
+app_id = "your_lark_app_id"
+app_secret = "your_lark_app_secret"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
-mention_only = false              # optional: require @mention in groups (DMs always allowed)
+mention_only = false                # legacy fallback; used when group_reply.mode is not set
 use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+
+[channels_config.lark.group_reply]
+mode = "all_messages"               # optional: all_messages | mention_only
+allowed_sender_ids = []             # optional: sender open_ids that bypass mention gate
 ```
 
 ### 4.12 Feishu
 
 ```toml
 [channels_config.feishu]
-app_id = "cli_xxx"
-app_secret = "xxx"
+app_id = "your_lark_app_id"
+app_secret = "your_lark_app_secret"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+
+[channels_config.feishu.group_reply]
+mode = "all_messages"               # optional: all_messages | mention_only
+allowed_sender_ids = []             # optional: sender open_ids that bypass mention gate
 ```
 
 Migration note:
 
 - Legacy config `[channels_config.lark] use_feishu = true` is still supported for backward compatibility.
 - Prefer `[channels_config.feishu]` for new setups.
+- Inbound `image` messages are converted to multimodal markers (`[IMAGE:data:image/...;base64,...]`).
+- If image download fails, ZeroClaw forwards fallback text instead of silently dropping the message.
 
 ### 4.13 Nostr
 
@@ -385,7 +458,17 @@ allowed_users = ["*"]
 app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
+receive_mode = "webhook" # webhook (default) or websocket (legacy fallback)
+environment = "production" # production (default) or sandbox
 ```
+
+Notes:
+
+- `webhook` mode is now the default and serves inbound callbacks at `POST /qq`.
+- Set `environment = "sandbox"` to target `https://sandbox.api.sgroup.qq.com` for unpublished bot testing.
+- QQ validation challenge payloads (`op = 13`) are auto-signed using `app_secret`.
+- `X-Bot-Appid` is checked when present and must match `app_id`.
+- Set `receive_mode = "websocket"` to keep the legacy gateway WS receive path.
 
 ### 4.16 Nextcloud Talk
 

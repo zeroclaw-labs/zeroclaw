@@ -1,87 +1,90 @@
 # ZeroClaw Docs Structure Map
 
-This page defines the documentation structure across three axes:
+This page defines the canonical documentation layout and compatibility layers.
 
-1. Language
-2. Part (category)
-3. Function (document intent)
+Last refreshed: **February 24, 2026**.
 
-Last refreshed: **February 22, 2026**.
+Companion indexes:
+- Function-oriented map: [by-function.md](by-function.md)
+- Hub entry point: [../README.md](../README.md)
+- Unified TOC: [../SUMMARY.md](../SUMMARY.md)
 
-## 1) By Language
+## 1) Directory Spine (Canonical)
 
-| Language | Entry point | Canonical tree | Notes |
-|---|---|---|---|
-| English | `docs/README.md` | `docs/` | Source-of-truth runtime behavior docs are authored in English first. |
-| Chinese (`zh-CN`) | `docs/README.zh-CN.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| Japanese (`ja`) | `docs/README.ja.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| Russian (`ru`) | `docs/README.ru.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| French (`fr`) | `docs/README.fr.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| Vietnamese (`vi`) | `docs/i18n/vi/README.md` | `docs/i18n/vi/` | Full Vietnamese tree is canonical under `docs/i18n/vi/`; `docs/vi/` and `docs/*.vi.md` are compatibility paths. |
+### Layer A: global entry points
 
-## 2) By Part (Category)
+- Root product landing: `README.md` (language switch links into `docs/i18n/<locale>/README.md`)
+- Docs hub: `docs/README.md`
+- Unified TOC: `docs/SUMMARY.md`
 
-These directories are the primary navigation modules by product area.
+### Layer B: category collections (English source-of-truth)
 
-- `docs/getting-started/` for initial setup and first-run flows
-- `docs/reference/` for command/config/provider/channel reference indexes
-- `docs/operations/` for day-2 operations, deployment, and troubleshooting entry points
-- `docs/security/` for security guidance and security-oriented navigation
-- `docs/hardware/` for board/peripheral implementation and hardware workflows
-- `docs/contributing/` for contribution and CI/review processes
-- `docs/project/` for project snapshots, planning context, and status-oriented docs
+- `docs/getting-started/`
+- `docs/reference/`
+- `docs/operations/`
+- `docs/security/`
+- `docs/hardware/`
+- `docs/contributing/`
+- `docs/project/`
+- `docs/sop/`
 
-## 3) By Function (Document Intent)
+### Layer C: canonical locale trees
 
-Use this grouping to decide where new docs belong.
+- `docs/i18n/zh-CN/`
+- `docs/i18n/ja/`
+- `docs/i18n/ru/`
+- `docs/i18n/fr/`
+- `docs/i18n/vi/`
+- `docs/i18n/el/`
 
-### Runtime Contract (current behavior)
+### Layer D: compatibility shims (non-canonical)
 
-- `docs/commands-reference.md`
-- `docs/providers-reference.md`
-- `docs/channels-reference.md`
-- `docs/config-reference.md`
-- `docs/operations-runbook.md`
-- `docs/troubleshooting.md`
-- `docs/one-click-bootstrap.md`
+- `docs/SUMMARY.<locale>.md` (if retained)
+- `docs/vi/**`
+- legacy localized docs-root files where present
 
-### Setup / Integration Guides
+Use compatibility paths for backward links only. New localized edits should target `docs/i18n/<locale>/**`.
 
-- `docs/custom-providers.md`
-- `docs/zai-glm-setup.md`
-- `docs/langgraph-integration.md`
-- `docs/network-deployment.md`
-- `docs/matrix-e2ee-guide.md`
-- `docs/mattermost-setup.md`
-- `docs/nextcloud-talk-setup.md`
+## 2) Language Topology
 
-### Policy / Process
+| Locale | Root landing | Canonical docs hub | Coverage level | Notes |
+|---|---|---|---|---|
+| `en` | `README.md` | `docs/README.md` | Full source | Authoritative runtime-contract wording |
+| `zh-CN` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `ja` | `docs/i18n/ja/README.md` | `docs/i18n/ja/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `ru` | `docs/i18n/ru/README.md` | `docs/i18n/ru/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `fr` | `docs/i18n/fr/README.md` | `docs/i18n/fr/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `vi` | `docs/i18n/vi/README.md` | `docs/i18n/vi/README.md` | Full localized tree | `docs/vi/**` kept as compatibility layer |
+| `el` | `docs/i18n/el/README.md` | `docs/i18n/el/README.md` | Full localized tree | Greek full tree is canonical in `docs/i18n/el/**` |
 
-- `docs/pr-workflow.md`
-- `docs/reviewer-playbook.md`
-- `docs/ci-map.md`
-- `docs/actions-source-policy.md`
+## 3) Category Intent Map
 
-### Proposals / Roadmaps
+| Category | Canonical index | Intent |
+|---|---|---|
+| Getting Started | `docs/getting-started/README.md` | first-run and install flows |
+| Reference | `docs/reference/README.md` | commands/config/providers/channels and integration references |
+| Operations | `docs/operations/README.md` | day-2 operations, release, troubleshooting runbooks |
+| Security | `docs/security/README.md` | current hardening guidance + proposal boundary |
+| Hardware | `docs/hardware/README.md` | boards, peripherals, datasheets navigation |
+| Contributing | `docs/contributing/README.md` | PR/review/CI policy and process |
+| Project | `docs/project/README.md` | time-bound snapshots and planning audit history |
+| SOP | `docs/sop/README.md` | SOP runtime contract and procedure docs |
 
-- `docs/sandboxing.md`
-- `docs/resource-limits.md`
-- `docs/audit-logging.md`
-- `docs/agnostic-security.md`
-- `docs/frictionless-security.md`
-- `docs/security-roadmap.md`
+## 4) Placement Rules
 
-### Snapshots / Time-Bound Reports
+1. Runtime behavior docs go in English canonical paths first.
+2. Every new major doc must be linked from:
+- the nearest category index (`docs/<category>/README.md`)
+- `docs/SUMMARY.md`
+- `docs/docs-inventory.md`
+3. Locale navigation changes must update all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`).
+4. For localized hubs/summaries, canonical path is always `docs/i18n/<locale>/`.
+5. Keep compatibility shims aligned when touched; do not introduce new primary content under compatibility-only paths.
 
-- `docs/project-triage-snapshot-2026-02-18.md`
+## 5) Governance Links
 
-### Assets / Templates
-
-- `docs/datasheets/`
-- `docs/doc-template.md`
-
-## Placement Rules (Quick)
-
-- New runtime behavior docs must be linked from the appropriate category index and `docs/SUMMARY.md`.
-- Navigation changes must preserve locale parity across `docs/README*.md` and `docs/SUMMARY*.md`.
-- Vietnamese full localization lives in `docs/i18n/vi/`; compatibility files should point to canonical paths.
+- i18n docs index: [../i18n/README.md](../i18n/README.md)
+- i18n coverage matrix: [../i18n-coverage.md](../i18n-coverage.md)
+- i18n completion checklist: [../i18n-guide.md](../i18n-guide.md)
+- i18n gap backlog: [../i18n-gap-backlog.md](../i18n-gap-backlog.md)
+- docs inventory/classification: [../docs-inventory.md](../docs-inventory.md)

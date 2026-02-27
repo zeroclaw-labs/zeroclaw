@@ -39,6 +39,7 @@ Options:
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
   --prebuilt-only            Install only from latest release binary (no source build fallback)
   --force-source-build       Disable prebuilt flow and always build from source
+  --cargo-features <list>    Extra Cargo features for local source build/install (comma-separated)
   --onboard                  Run onboarding after install
   --interactive-onboard      Run interactive onboarding (implies --onboard)
   --api-key <key>            API key for non-interactive onboarding
@@ -78,6 +79,8 @@ Environment:
   ZEROCLAW_DOCKER_NETWORK    Docker network for ZeroClaw + sidecars (default: zeroclaw-bootstrap-net)
   ZEROCLAW_DOCKER_CARGO_FEATURES
                             Extra Cargo features for Docker builds (comma-separated)
+  ZEROCLAW_CARGO_FEATURES    Extra Cargo features for local source builds (comma-separated)
+  ZEROCLAW_CONFIG_PATH       Config path used for channel feature auto-detection (default: ~/.zeroclaw/config.toml)
   ZEROCLAW_DOCKER_DAEMON_NAME
                             Daemon container name for --docker-daemon (default: zeroclaw-daemon)
   ZEROCLAW_DOCKER_DAEMON_BIND_HOST
@@ -149,6 +152,9 @@ detect_release_target() {
     Darwin:arm64|Darwin:aarch64)
       echo "aarch64-apple-darwin"
       ;;
+    FreeBSD:amd64|FreeBSD:x86_64)
+      echo "x86_64-unknown-freebsd"
+      ;;
     *)
       return 1
       ;;
@@ -188,6 +194,71 @@ should_attempt_prebuilt_for_resources() {
   fi
 
   return 1
+}
+
+append_csv_feature() {
+  local csv="${1:-}"
+  local feature="${2:-}"
+  local normalized
+  local -a entries=()
+  local existing_feature
+
+  normalized="$(printf '%s' "$feature" | tr -d '[:space:]')"
+  if [[ -z "$normalized" ]]; then
+    echo "$csv"
+    return 0
+  fi
+
+  if [[ -n "$csv" ]]; then
+    IFS=',' read -r -a entries <<< "$csv"
+  fi
+  for existing_feature in "${entries[@]:-}"; do
+    if [[ "$(printf '%s' "$existing_feature" | tr -d '[:space:]')" == "$normalized" ]]; then
+      echo "$csv"
+      return 0
+    fi
+  done
+
+  if [[ -n "$csv" ]]; then
+    echo "$csv,$normalized"
+  else
+    echo "$normalized"
+  fi
+}
+
+merge_csv_features() {
+  local base="${1:-}"
+  local incoming="${2:-}"
+  local merged="$base"
+  local -a incoming_features=()
+  local feature
+
+  if [[ -n "$incoming" ]]; then
+    IFS=',' read -r -a incoming_features <<< "$incoming"
+  fi
+  for feature in "${incoming_features[@]:-}"; do
+    merged="$(append_csv_feature "$merged" "$feature")"
+  done
+  echo "$merged"
+}
+
+detect_config_channel_features() {
+  local config_path="${1:-}"
+  local features=""
+
+  if [[ -z "$config_path" || ! -f "$config_path" ]]; then
+    echo ""
+    return 0
+  fi
+
+  if grep -Eq '^[[:space:]]*\[channels_config\.(lark|feishu)\][[:space:]]*$' "$config_path"; then
+    features="$(append_csv_feature "$features" "channel-lark")"
+  fi
+  if grep -Eq '^[[:space:]]*\[channels_config\.matrix\][[:space:]]*$' "$config_path"; then
+    features="$(append_csv_feature "$features" "channel-matrix")"
+  fi
+
+  echo "$features"
 }
 
 install_prebuilt_binary() {
@@ -683,7 +754,7 @@ is_zeroclaw_resource_name() {
 }
 
 maybe_stop_running_zeroclaw_containers() {
-  local -a running_ids running_rows
+  local -a running_ids=() running_rows=()
   local id name image command row
 
   while IFS=$'\t' read -r id name image command; do
@@ -1241,6 +1312,9 @@ CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
+LOCAL_CARGO_FEATURES="${ZEROCLAW_CARGO_FEATURES:-}"
+LOCAL_CONFIG_PATH="${ZEROCLAW_CONFIG_PATH:-$HOME/.zeroclaw/config.toml}"
+AUTO_CONFIG_FEATURES=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1299,6 +1373,14 @@ while [[ $# -gt 0 ]]; do
     --force-source-build)
       FORCE_SOURCE_BUILD=true
       shift
+      ;;
+    --cargo-features)
+      LOCAL_CARGO_FEATURES="${2:-}"
+      [[ -n "$LOCAL_CARGO_FEATURES" ]] || {
+        error "--cargo-features requires a comma-separated value"
+        exit 1
+      }
+      shift 2
       ;;
     --onboard)
       RUN_ONBOARD=true
@@ -1482,6 +1564,9 @@ if [[ "$PREBUILT_ONLY" == true ]]; then
 fi
 
 if [[ "$DOCKER_MODE" == true ]]; then
+  if [[ -n "$LOCAL_CARGO_FEATURES" ]]; then
+    warn "--cargo-features / ZEROCLAW_CARGO_FEATURES are ignored with --docker (use ZEROCLAW_DOCKER_CARGO_FEATURES)."
+  fi
   ensure_docker_ready
   if [[ "$RUN_ONBOARD" == false ]]; then
     if [[ -n "$DOCKER_CONFIG_FILE" || "$DOCKER_DAEMON_MODE" == true ]]; then
@@ -1527,6 +1612,19 @@ DONE
   exit 0
 fi
 
+AUTO_CONFIG_FEATURES="$(detect_config_channel_features "$LOCAL_CONFIG_PATH")"
+if [[ -n "$AUTO_CONFIG_FEATURES" ]]; then
+  info "Detected channel features in config ($LOCAL_CONFIG_PATH): $AUTO_CONFIG_FEATURES"
+  LOCAL_CARGO_FEATURES="$(merge_csv_features "$LOCAL_CARGO_FEATURES" "$AUTO_CONFIG_FEATURES")"
+  if [[ "$PREBUILT_ONLY" == true ]]; then
+    warn "prebuilt-only mode may omit configured channel features: $AUTO_CONFIG_FEATURES"
+  elif [[ "$FORCE_SOURCE_BUILD" == false ]]; then
+    info "Using source build to satisfy configured channel feature requirements."
+    FORCE_SOURCE_BUILD=true
+    PREFER_PREBUILT=false
+  fi
+fi
+
 if [[ "$FORCE_SOURCE_BUILD" == false ]]; then
   if [[ "$PREFER_PREBUILT" == false && "$PREBUILT_ONLY" == false ]]; then
     if should_attempt_prebuilt_for_resources "$WORK_DIR"; then
@@ -1562,14 +1660,24 @@ fi
 
 if [[ "$SKIP_BUILD" == false ]]; then
   info "Building release binary"
-  cargo build --release --locked
+  BUILD_CMD=(cargo build --release --locked)
+  if [[ -n "$LOCAL_CARGO_FEATURES" ]]; then
+    info "Applying local Cargo features for build: $LOCAL_CARGO_FEATURES"
+    BUILD_CMD+=(--features "$LOCAL_CARGO_FEATURES")
+  fi
+  "${BUILD_CMD[@]}"
 else
   info "Skipping build"
 fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
   info "Installing zeroclaw to cargo bin"
-  cargo install --path "$WORK_DIR" --force --locked
+  INSTALL_CMD=(cargo install --path "$WORK_DIR" --force --locked)
+  if [[ -n "$LOCAL_CARGO_FEATURES" ]]; then
+    info "Applying local Cargo features for install: $LOCAL_CARGO_FEATURES"
+    INSTALL_CMD+=(--features "$LOCAL_CARGO_FEATURES")
+  fi
+  "${INSTALL_CMD[@]}"
 else
   info "Skipping install"
 fi

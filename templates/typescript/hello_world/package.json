@@ -1,0 +1,14 @@
+{
+  "name": "__SKILL_NAME__",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "npm run compile && javy compile dist/index.js -o tool.wasm",
+    "compile": "esbuild src/index.ts --bundle --platform=node --outfile=dist/index.js --format=cjs",
+    "test": "zeroclaw skill test . --args '{\"name\":\"ZeroClaw\"}'"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -107,9 +107,12 @@ impl PromptSection for IdentitySection {
             "USER.md",
             "HEARTBEAT.md",
             "BOOTSTRAP.md",
-            "MEMORY.md",
         ] {
             inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
+        }
+        let memory_path = ctx.workspace_dir.join("MEMORY.md");
+        if memory_path.exists() {
+            inject_workspace_file(&mut prompt, ctx.workspace_dir, "MEMORY.md");
         }
 
         Ok(prompt)

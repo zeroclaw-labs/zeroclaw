@@ -42,7 +42,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -67,14 +67,18 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
-use crate::config::Config;
+use crate::agent::loop_::{
+    build_shell_policy_instructions, build_tool_instructions_from_specs,
+    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
+};
+use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
+use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -152,7 +156,18 @@ enum ChannelRuntimeCommand {
     ShowModel,
     SetModel(String),
     NewSession,
+    RequestAllToolsOnce,
+    RequestToolApproval(String),
+    ConfirmToolApproval(String),
+    ApprovePendingRequest(String),
+    DenyToolApproval(String),
+    ListPendingApprovals,
+    ApproveTool(String),
+    UnapproveTool(String),
+    ListApprovals,
 }
+
+const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ModelCacheState {
@@ -184,7 +199,20 @@ struct ConfigFileStamp {
 #[derive(Debug, Clone)]
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
+    perplexity_filter: crate::config::PerplexityFilterConfig,
     last_applied_stamp: Option<ConfigFileStamp>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeAutonomyPolicy {
+    auto_approve: Vec<String>,
+    always_ask: Vec<String>,
+    non_cli_excluded_tools: Vec<String>,
+    non_cli_approval_approvers: Vec<String>,
+    non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
+    non_cli_natural_language_approval_mode_by_channel:
+        HashMap<String, NonCliNaturalLanguageApprovalMode>,
+    perplexity_filter: crate::config::PerplexityFilterConfig,
 }
 
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
@@ -223,7 +251,10 @@ struct ChannelRuntimeContext {
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
-    non_cli_excluded_tools: Arc<Vec<String>>,
+    non_cli_excluded_tools: Arc<Mutex<Vec<String>>>,
+    query_classification: crate::config::QueryClassificationConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
+    approval_manager: Arc<ApprovalManager>,
 }
 
 #[derive(Clone)]
@@ -411,7 +442,160 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "whatsapp" => Some(
+            "When responding on WhatsApp:\n\
+             - Use *bold* for emphasis (WhatsApp uses single asterisks).\n\
+             - Be concise. No markdown headers (## etc.) — they don't render.\n\
+             - No markdown tables — use bullet lists instead.\n\
+             - For sending images, documents, videos, or audio files use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>]\n\
+             - The path MUST be an absolute filesystem path to a local file (e.g. [IMAGE:/home/nicolas/.zeroclaw/workspace/images/chart.png]).\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - You can combine text and media in one response — text is sent first, then each attachment.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
         _ => None,
+    }
+}
+
+fn should_expose_internal_tool_details(user_message: &str) -> bool {
+    let trimmed = user_message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mentions_internal_details_en = lower.contains("command")
+        || lower.contains("tool call")
+        || lower.contains("function call")
+        || lower.contains("execution trace")
+        || lower.contains("internal step");
+    let mentions_internal_details_cjk = trimmed.contains("命令")
+        || trimmed.contains("工具调用")
+        || trimmed.contains("函数调用")
+        || trimmed.contains("执行过程");
+
+    // Fail closed for negated phrasing ("don't show commands", "不要显示命令").
+    const ENGLISH_NEGATIVE_HINTS: [&str; 18] = [
+        "don't show command",
+        "don't show commands",
+        "do not show command",
+        "do not show commands",
+        "don't output command",
+        "do not output command",
+        "without command",
+        "without commands",
+        "no command output",
+        "hide command",
+        "hide commands",
+        "omit command",
+        "omit commands",
+        "skip command",
+        "skip commands",
+        "don't show tool call",
+        "do not show tool call",
+        "do not show function call",
+    ];
+    if mentions_internal_details_en
+        && ENGLISH_NEGATIVE_HINTS
+            .iter()
+            .any(|hint| lower.contains(hint))
+    {
+        return false;
+    }
+
+    const CJK_NEGATIVE_HINTS: [&str; 22] = [
+        "不要输出命令",
+        "不要显示命令",
+        "不要展示命令",
+        "不要带上命令",
+        "不要附上命令",
+        "别输出命令",
+        "别显示命令",
+        "别展示命令",
+        "不要输出工具调用",
+        "不要显示工具调用",
+        "不要展示工具调用",
+        "别输出工具调用",
+        "别显示工具调用",
+        "不要输出函数调用",
+        "不要显示函数调用",
+        "不要展示函数调用",
+        "别输出函数调用",
+        "别显示函数调用",
+        "不要执行过程",
+        "不要过程",
+        "不要内部步骤",
+        "别把命令",
+    ];
+    if mentions_internal_details_cjk && CJK_NEGATIVE_HINTS.iter().any(|hint| trimmed.contains(hint))
+    {
+        return false;
+    }
+
+    const ENGLISH_HINTS: [&str; 20] = [
+        "show command",
+        "show commands",
+        "output command",
+        "output commands",
+        "print command",
+        "print commands",
+        "include command",
+        "include commands",
+        "with command",
+        "with commands",
+        "show tool call",
+        "show tool calls",
+        "show function call",
+        "show function calls",
+        "reveal tool call",
+        "reveal function call",
+        "tool call json",
+        "function call json",
+        "execution trace",
+        "internal steps",
+    ];
+    if ENGLISH_HINTS.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    const ENGLISH_VERBS: [&str; 7] = [
+        "show", "output", "print", "include", "reveal", "display", "share",
+    ];
+    if mentions_internal_details_en && ENGLISH_VERBS.iter().any(|verb| lower.contains(verb)) {
+        return true;
+    }
+
+    const CJK_HINTS: [&str; 14] = [
+        "输出命令",
+        "显示命令",
+        "展示命令",
+        "命令发给我",
+        "带上命令",
+        "输出工具调用",
+        "显示工具调用",
+        "展示工具调用",
+        "输出函数调用",
+        "显示函数调用",
+        "展示函数调用",
+        "函数指令",
+        "工具指令",
+        "执行过程",
+    ];
+    if CJK_HINTS.iter().any(|hint| trimmed.contains(hint)) {
+        return true;
+    }
+
+    const CJK_VERBS: [&str; 9] = [
+        "输出", "显示", "展示", "发我", "给我", "带上", "附上", "贴出", "列出",
+    ];
+    mentions_internal_details_cjk && CJK_VERBS.iter().any(|verb| trimmed.contains(verb))
+}
+
+fn split_internal_progress_delta(delta: &str) -> (bool, &str) {
+    if let Some(rest) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_SENTINEL) {
+        (true, rest)
+    } else {
+        (false, delta)
     }
 }
 
@@ -419,6 +603,7 @@ fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
+    expose_internal_tool_details: bool,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -427,6 +612,25 @@ fn build_channel_system_prompt(
             prompt = instructions.to_string();
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
+        }
+    }
+
+    if channel_name != "cli" {
+        let visibility_instruction = if expose_internal_tool_details {
+            "Execution visibility: the user explicitly requested command/tool details. \
+             You may include command lines or tool-step traces when directly relevant, \
+             but keep credentials and secrets redacted."
+        } else {
+            "Execution visibility: run tools/functions in the background and return an \
+             integrated final result. Do not reveal raw tool names, tool-call syntax, \
+             function arguments, shell commands, or internal execution traces unless the \
+             user explicitly asks for those details."
+        };
+
+        if prompt.is_empty() {
+            prompt = visibility_instruction.to_string();
+        } else {
+            prompt = format!("{prompt}\n\n{visibility_instruction}");
         }
     }
 
@@ -482,13 +686,9 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
-        return None;
-    }
-
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
-        return None;
+        return parse_natural_language_runtime_command(trimmed);
     }
 
     let mut parts = trimmed.split_whitespace();
@@ -498,10 +698,24 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .next()
         .unwrap_or(command_token)
         .to_ascii_lowercase();
+    let args: Vec<&str> = parts.collect();
+    let tail = args.join(" ").trim().to_string();
 
     match base_command.as_str() {
-        "/models" => {
-            if let Some(provider) = parts.next() {
+        // History reset commands are safe for all channels.
+        "/new" | "/clear" => Some(ChannelRuntimeCommand::NewSession),
+        "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
+        "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
+        "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
+        "/approve-allow" => Some(ChannelRuntimeCommand::ApprovePendingRequest(tail)),
+        "/approve-deny" => Some(ChannelRuntimeCommand::DenyToolApproval(tail)),
+        "/approve-pending" => Some(ChannelRuntimeCommand::ListPendingApprovals),
+        "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
+        "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
+        "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
+        // Provider/model switching remains limited to channels with session routing.
+        "/models" if supports_runtime_model_switch(channel_name) => {
+            if let Some(provider) = args.first() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
                 ))
@@ -509,16 +723,145 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" => {
-            let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+        "/model" if supports_runtime_model_switch(channel_name) => {
+            let model = tail;
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
             } else {
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
+    }
+}
+
+fn is_runtime_token(value: &str) -> bool {
+    let token = value.trim();
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+}
+
+fn extract_runtime_tail_token(text: &str, prefixes: &[&str]) -> Option<String> {
+    prefixes.iter().find_map(|prefix| {
+        text.strip_prefix(prefix).and_then(|rest| {
+            let token = rest.trim();
+            if is_runtime_token(token) {
+                Some(token.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn contains_any_fragment(haystack: &str, fragments: &[&str]) -> bool {
+    fragments.iter().any(|fragment| haystack.contains(fragment))
+}
+
+fn is_natural_language_all_tools_once_intent(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_allow_verb = contains_any_fragment(&lower, &["approve", "allow"])
+        || contains_any_fragment(trimmed, &["授权", "放开", "允许"]);
+    let has_all_tools_scope = contains_any_fragment(&lower, &["all tools", "all commands"])
+        || contains_any_fragment(trimmed, &["所有工具", "全部工具", "所有命令", "全部命令"]);
+    let has_one_time_scope = contains_any_fragment(&lower, &["once", "one-time", "one time"])
+        || contains_any_fragment(trimmed, &["一次", "这次"]);
+
+    has_allow_verb && has_all_tools_scope && has_one_time_scope
+}
+
+fn approval_target_label(tool_name: &str) -> String {
+    if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+        "all tools/commands (one-time bypass token)".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
+fn parse_natural_language_runtime_command(content: &str) -> Option<ChannelRuntimeCommand> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "show pending approvals" | "list pending approvals" | "pending approvals"
+    ) {
+        return Some(ChannelRuntimeCommand::ListPendingApprovals);
+    }
+    if trimmed == "查看授权"
+        || matches!(
+            lower.as_str(),
+            "show approvals" | "list approvals" | "approvals"
+        )
+    {
+        return Some(ChannelRuntimeCommand::ListApprovals);
+    }
+    if is_natural_language_all_tools_once_intent(trimmed)
+        || matches!(
+            lower.as_str(),
+            "approve all tools once" | "allow all tools once" | "approve all once"
+        )
+    {
+        return Some(ChannelRuntimeCommand::RequestAllToolsOnce);
+    }
+
+    if let Some(request_id) = extract_runtime_tail_token(&lower, &["confirm "]) {
+        return Some(ChannelRuntimeCommand::ConfirmToolApproval(request_id));
+    }
+    if let Some(request_id) = extract_runtime_tail_token(trimmed, &["确认授权 "]) {
+        return Some(ChannelRuntimeCommand::ConfirmToolApproval(request_id));
+    }
+
+    if let Some(tool) =
+        extract_runtime_tail_token(&lower, &["revoke tool ", "unapprove ", "revoke "])
+    {
+        return Some(ChannelRuntimeCommand::UnapproveTool(tool));
+    }
+    if let Some(tool) = extract_runtime_tail_token(trimmed, &["撤销工具 ", "取消授权 "]) {
+        return Some(ChannelRuntimeCommand::UnapproveTool(tool));
+    }
+
+    if let Some(tool) = extract_runtime_tail_token(&lower, &["approve tool ", "approve "]) {
+        return Some(ChannelRuntimeCommand::RequestToolApproval(tool));
+    }
+    if let Some(tool) = extract_runtime_tail_token(trimmed, &["授权工具 ", "请放开 ", "放开 "])
+    {
+        return Some(ChannelRuntimeCommand::RequestToolApproval(tool));
+    }
+
+    None
+}
+
+fn is_approval_management_command(command: &ChannelRuntimeCommand) -> bool {
+    matches!(
+        command,
+        ChannelRuntimeCommand::RequestAllToolsOnce
+            | ChannelRuntimeCommand::RequestToolApproval(_)
+            | ChannelRuntimeCommand::ConfirmToolApproval(_)
+            | ChannelRuntimeCommand::ApprovePendingRequest(_)
+            | ChannelRuntimeCommand::DenyToolApproval(_)
+            | ChannelRuntimeCommand::ListPendingApprovals
+            | ChannelRuntimeCommand::ApproveTool(_)
+            | ChannelRuntimeCommand::UnapproveTool(_)
+            | ChannelRuntimeCommand::ListApprovals
+    )
+}
+
+fn non_cli_natural_language_mode_label(mode: NonCliNaturalLanguageApprovalMode) -> &'static str {
+    match mode {
+        NonCliNaturalLanguageApprovalMode::Disabled => "disabled",
+        NonCliNaturalLanguageApprovalMode::RequestConfirm => "request_confirm",
+        NonCliNaturalLanguageApprovalMode::Direct => "direct",
     }
 }
 
@@ -568,6 +911,23 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
     }
 }
 
+fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy {
+    RuntimeAutonomyPolicy {
+        auto_approve: config.autonomy.auto_approve.clone(),
+        always_ask: config.autonomy.always_ask.clone(),
+        non_cli_excluded_tools: config.autonomy.non_cli_excluded_tools.clone(),
+        non_cli_approval_approvers: config.autonomy.non_cli_approval_approvers.clone(),
+        non_cli_natural_language_approval_mode: config
+            .autonomy
+            .non_cli_natural_language_approval_mode,
+        non_cli_natural_language_approval_mode_by_channel: config
+            .autonomy
+            .non_cli_natural_language_approval_mode_by_channel
+            .clone(),
+        perplexity_filter: config.security.perplexity_filter.clone(),
+    }
+}
+
 fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
     ctx.provider_runtime_options
         .zeroclaw_dir
@@ -593,6 +953,91 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
     }
+}
+
+fn runtime_perplexity_filter_snapshot(
+    ctx: &ChannelRuntimeContext,
+) -> crate::config::PerplexityFilterConfig {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.perplexity_filter.clone();
+        }
+    }
+    crate::config::PerplexityFilterConfig::default()
+}
+
+fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
+    ctx.non_cli_excluded_tools
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn filtered_tool_specs_for_runtime(
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+) -> Vec<crate::tools::ToolSpec> {
+    tools_registry
+        .iter()
+        .map(|tool| tool.spec())
+        .filter(|spec| !excluded_tools.iter().any(|excluded| excluded == &spec.name))
+        .collect()
+}
+
+fn build_runtime_tool_visibility_prompt(
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    native_tools: bool,
+) -> String {
+    let mut prompt = String::new();
+    let mut specs = filtered_tool_specs_for_runtime(tools_registry, excluded_tools);
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    use std::fmt::Write;
+    prompt.push_str("\n## Runtime Tool Availability (Authoritative)\n\n");
+    prompt.push_str(
+        "This section is generated from current runtime policy for this message. \
+         Only the listed tools may be called in this turn.\n\n",
+    );
+
+    if specs.is_empty() {
+        prompt.push_str("- Allowed tools: (none)\n");
+    } else {
+        let _ = writeln!(prompt, "- Allowed tools ({}):", specs.len());
+        for spec in &specs {
+            let _ = writeln!(prompt, "  - `{}`", spec.name);
+        }
+    }
+
+    if excluded_tools.is_empty() {
+        prompt.push_str("- Excluded by runtime policy: (none)\n\n");
+    } else {
+        let mut excluded_sorted = excluded_tools.to_vec();
+        excluded_sorted.sort();
+        let _ = writeln!(
+            prompt,
+            "- Excluded by runtime policy: {}\n",
+            excluded_sorted.join(", ")
+        );
+    }
+
+    if native_tools {
+        prompt.push_str(
+            "Tool calling for this turn uses native provider function-calling. \
+             Do not emit `<tool_call>` XML tags.\n",
+        );
+    } else {
+        prompt.push_str(
+            "Tool calling for this turn uses XML tool protocol below. \
+             This protocol block is generated from the same runtime policy snapshot.\n",
+        );
+        prompt.push_str(&build_tool_instructions_from_specs(&specs));
+    }
+
+    prompt
 }
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
@@ -621,7 +1066,9 @@ fn decrypt_optional_secret_for_runtime_reload(
     Ok(())
 }
 
-async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+async fn load_runtime_defaults_from_config_file(
+    path: &Path,
+) -> Result<(ChannelRuntimeDefaults, RuntimeAutonomyPolicy)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -635,7 +1082,355 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     }
 
     parsed.apply_env_overrides();
-    Ok(runtime_defaults_from_config(&parsed))
+    Ok((
+        runtime_defaults_from_config(&parsed),
+        runtime_autonomy_policy_from_config(&parsed),
+    ))
+}
+
+async fn persist_non_cli_approval_to_config(
+    ctx: &ChannelRuntimeContext,
+    tool_name: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(config_path) = runtime_config_path(ctx) else {
+        return Ok(None);
+    };
+
+    let contents = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let mut parsed: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+    parsed.config_path = config_path.clone();
+
+    let mut changed = false;
+    if !parsed
+        .autonomy
+        .auto_approve
+        .iter()
+        .any(|entry| entry == tool_name)
+    {
+        parsed.autonomy.auto_approve.push(tool_name.to_string());
+        changed = true;
+    }
+
+    let before_always_ask = parsed.autonomy.always_ask.len();
+    parsed
+        .autonomy
+        .always_ask
+        .retain(|entry| entry != tool_name);
+    if parsed.autonomy.always_ask.len() != before_always_ask {
+        changed = true;
+    }
+
+    if changed {
+        parsed.save().await?;
+    }
+
+    Ok(Some(config_path))
+}
+
+async fn remove_non_cli_approval_from_config(
+    ctx: &ChannelRuntimeContext,
+    tool_name: &str,
+) -> Result<Option<(PathBuf, bool)>> {
+    let Some(config_path) = runtime_config_path(ctx) else {
+        return Ok(None);
+    };
+
+    let contents = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let mut parsed: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+    parsed.config_path = config_path.clone();
+
+    let before_auto_approve = parsed.autonomy.auto_approve.len();
+    parsed
+        .autonomy
+        .auto_approve
+        .retain(|entry| entry != tool_name);
+    let removed = parsed.autonomy.auto_approve.len() != before_auto_approve;
+    if removed {
+        parsed.save().await?;
+    }
+
+    Ok(Some((config_path, removed)))
+}
+
+fn remove_non_cli_tool_exclusion_from_runtime(
+    ctx: &ChannelRuntimeContext,
+    tool_name: &str,
+) -> bool {
+    let mut excluded = ctx
+        .non_cli_excluded_tools
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let before_len = excluded.len();
+    excluded.retain(|entry| entry != tool_name);
+    excluded.len() != before_len
+}
+
+async fn remove_non_cli_excluded_tool_from_config(
+    ctx: &ChannelRuntimeContext,
+    tool_name: &str,
+) -> Result<Option<(PathBuf, bool)>> {
+    let Some(config_path) = runtime_config_path(ctx) else {
+        return Ok(None);
+    };
+
+    let contents = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let mut parsed: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+    parsed.config_path = config_path.clone();
+
+    let before_len = parsed.autonomy.non_cli_excluded_tools.len();
+    parsed
+        .autonomy
+        .non_cli_excluded_tools
+        .retain(|entry| entry != tool_name);
+    let removed = parsed.autonomy.non_cli_excluded_tools.len() != before_len;
+    if removed {
+        parsed.save().await?;
+    }
+
+    Ok(Some((config_path, removed)))
+}
+
+async fn clear_non_cli_exclusion_after_approval(
+    ctx: &ChannelRuntimeContext,
+    tool_name: &str,
+) -> Option<String> {
+    let runtime_removed = remove_non_cli_tool_exclusion_from_runtime(ctx, tool_name);
+    match remove_non_cli_excluded_tool_from_config(ctx, tool_name).await {
+        Ok(Some((path, persisted_removed))) => match (runtime_removed, persisted_removed) {
+            (true, true) => Some(format!(
+                "Removed `{tool_name}` from `autonomy.non_cli_excluded_tools` in runtime and persisted config (`{}`).",
+                path.display()
+            )),
+            (true, false) => Some(format!(
+                "Removed `{tool_name}` from runtime `autonomy.non_cli_excluded_tools` (it was already absent from persisted config `{}`).",
+                path.display()
+            )),
+            (false, true) => Some(format!(
+                "Removed `{tool_name}` from persisted `autonomy.non_cli_excluded_tools` in `{}`.",
+                path.display()
+            )),
+            (false, false) => None,
+        },
+        Ok(None) => runtime_removed.then(|| {
+            format!(
+                "Removed `{tool_name}` from runtime `autonomy.non_cli_excluded_tools`."
+            )
+        }),
+        Err(err) => {
+            if runtime_removed {
+                Some(format!(
+                    "Removed `{tool_name}` from runtime `autonomy.non_cli_excluded_tools`, but failed to persist config update: {err}"
+                ))
+            } else {
+                Some(format!(
+                    "Failed to update persisted `autonomy.non_cli_excluded_tools` for `{tool_name}`: {err}"
+                ))
+            }
+        }
+    }
+}
+
+async fn describe_non_cli_approvals(
+    ctx: &ChannelRuntimeContext,
+    sender: &str,
+    channel: &str,
+    reply_target: &str,
+) -> Result<String> {
+    let mut response = String::new();
+    response.push_str("Supervised non-CLI tool approvals:\n");
+
+    let mut runtime_auto = ctx
+        .approval_manager
+        .auto_approve_tools()
+        .into_iter()
+        .collect::<Vec<_>>();
+    runtime_auto.sort();
+    if runtime_auto.is_empty() {
+        response.push_str("- Runtime auto_approve (effective): (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Runtime auto_approve (effective): {}",
+            runtime_auto.join(", ")
+        );
+    }
+
+    let mut runtime_always = ctx
+        .approval_manager
+        .always_ask_tools()
+        .into_iter()
+        .collect::<Vec<_>>();
+    runtime_always.sort();
+    if runtime_always.is_empty() {
+        response.push_str("- Runtime always_ask (effective): (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Runtime always_ask (effective): {}",
+            runtime_always.join(", ")
+        );
+    }
+
+    let mut session_grants = ctx
+        .approval_manager
+        .non_cli_session_allowlist()
+        .into_iter()
+        .collect::<Vec<_>>();
+    session_grants.sort();
+    if session_grants.is_empty() {
+        response.push_str("- Runtime session grants: (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Runtime session grants: {}",
+            session_grants.join(", ")
+        );
+    }
+    let one_time_all_tools_tokens = ctx.approval_manager.non_cli_allow_all_once_remaining();
+    let _ = writeln!(
+        response,
+        "- Runtime one-time all-tools bypass tokens: {}",
+        one_time_all_tools_tokens
+    );
+
+    let mut approval_approvers = ctx
+        .approval_manager
+        .non_cli_approval_approvers()
+        .into_iter()
+        .collect::<Vec<_>>();
+    approval_approvers.sort();
+    if approval_approvers.is_empty() {
+        response.push_str("- Runtime non_cli_approval_approvers: (any channel-allowed sender)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Runtime non_cli_approval_approvers: {}",
+            approval_approvers.join(", ")
+        );
+    }
+
+    let default_mode = non_cli_natural_language_mode_label(
+        ctx.approval_manager
+            .non_cli_natural_language_approval_mode(),
+    );
+    let effective_mode = non_cli_natural_language_mode_label(
+        ctx.approval_manager
+            .non_cli_natural_language_approval_mode_for_channel(channel),
+    );
+    let _ = writeln!(
+        response,
+        "- Runtime non_cli_natural_language_approval_mode: {}",
+        default_mode
+    );
+    let _ = writeln!(
+        response,
+        "- Runtime non_cli_natural_language_approval_mode (current channel `{channel}`): {}",
+        effective_mode
+    );
+    let mut mode_overrides = ctx
+        .approval_manager
+        .non_cli_natural_language_approval_mode_by_channel()
+        .into_iter()
+        .map(|(ch, mode)| format!("{ch}={}", non_cli_natural_language_mode_label(mode)))
+        .collect::<Vec<_>>();
+    mode_overrides.sort();
+    if mode_overrides.is_empty() {
+        response.push_str("- Runtime non_cli_natural_language_approval_mode_by_channel: (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Runtime non_cli_natural_language_approval_mode_by_channel: {}",
+            mode_overrides.join(", ")
+        );
+    }
+
+    let mut pending_requests = ctx.approval_manager.list_non_cli_pending_requests(
+        Some(sender),
+        Some(channel),
+        Some(reply_target),
+    );
+    pending_requests.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    if pending_requests.is_empty() {
+        response.push_str("- Pending approvals (sender+chat/channel scoped): (none)\n");
+    } else {
+        response.push_str("- Pending approvals (sender+chat/channel scoped):\n");
+        for req in pending_requests {
+            let reason = req
+                .reason
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("n/a");
+            let _ = writeln!(
+                response,
+                "  - {}: tool={}, expires_at={}, reason={}",
+                req.request_id,
+                approval_target_label(&req.tool_name),
+                req.expires_at,
+                reason
+            );
+        }
+    }
+
+    let mut excluded = snapshot_non_cli_excluded_tools(ctx);
+    excluded.sort();
+    if excluded.is_empty() {
+        response.push_str("- Runtime non_cli_excluded_tools: (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Runtime non_cli_excluded_tools: {}",
+            excluded.join(", ")
+        );
+    }
+
+    let Some(config_path) = runtime_config_path(ctx) else {
+        response.push_str(
+            "- Persisted config approvals: unavailable (runtime config path not resolved)\n",
+        );
+        return Ok(response);
+    };
+
+    let contents = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let parsed: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+
+    let mut auto_approve = parsed.autonomy.auto_approve;
+    auto_approve.sort();
+    if auto_approve.is_empty() {
+        response.push_str("- Persisted autonomy.auto_approve: (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Persisted autonomy.auto_approve: {}",
+            auto_approve.join(", ")
+        );
+    }
+
+    let mut always_ask = parsed.autonomy.always_ask;
+    always_ask.sort();
+    if always_ask.is_empty() {
+        response.push_str("- Persisted autonomy.always_ask: (none)\n");
+    } else {
+        let _ = writeln!(
+            response,
+            "- Persisted autonomy.always_ask: {}",
+            always_ask.join(", ")
+        );
+    }
+
+    let _ = writeln!(response, "- Config path: {}", config_path.display());
+    Ok(response)
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -658,7 +1453,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let (next_defaults, next_autonomy_policy) =
+        load_runtime_defaults_from_config_file(&config_path).await?;
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -692,9 +1488,25 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             config_path.clone(),
             RuntimeConfigState {
                 defaults: next_defaults.clone(),
+                perplexity_filter: next_autonomy_policy.perplexity_filter.clone(),
                 last_applied_stamp: Some(stamp),
             },
         );
+    }
+
+    ctx.approval_manager.replace_runtime_non_cli_policy(
+        &next_autonomy_policy.auto_approve,
+        &next_autonomy_policy.always_ask,
+        &next_autonomy_policy.non_cli_approval_approvers,
+        next_autonomy_policy.non_cli_natural_language_approval_mode,
+        &next_autonomy_policy.non_cli_natural_language_approval_mode_by_channel,
+    );
+    {
+        let mut excluded = ctx
+            .non_cli_excluded_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *excluded = next_autonomy_policy.non_cli_excluded_tools.clone();
     }
 
     tracing::info!(
@@ -702,6 +1514,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         provider = %next_defaults.default_provider,
         model = %next_defaults.model,
         temperature = next_defaults.temperature,
+        non_cli_approval_mode = %non_cli_natural_language_mode_label(
+            next_autonomy_policy.non_cli_natural_language_approval_mode
+        ),
+        non_cli_excluded_tools_count = next_autonomy_policy.non_cli_excluded_tools.len(),
+        perplexity_filter_enabled = next_autonomy_policy.perplexity_filter.enable_perplexity_filter,
+        perplexity_threshold = next_autonomy_policy.perplexity_filter.perplexity_threshold,
         "Applied updated channel runtime config from disk"
     );
 
@@ -723,6 +1541,33 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
         .get(sender_key)
         .cloned()
         .unwrap_or_else(|| default_route_selection(ctx))
+}
+
+/// Classify a user message and return the appropriate route selection with logging.
+/// Returns None if classification is disabled or no rules match.
+fn classify_message_route(
+    ctx: &ChannelRuntimeContext,
+    message: &str,
+) -> Option<ChannelRouteSelection> {
+    let decision =
+        crate::agent::classifier::classify_with_decision(&ctx.query_classification, message)?;
+
+    // Find the matching model route
+    let route = ctx.model_routes.iter().find(|r| r.hint == decision.hint)?;
+
+    tracing::info!(
+        target: "query_classification",
+        hint = %decision.hint,
+        model = %route.model,
+        rule_priority = decision.priority,
+        message_length = message.len(),
+        "Classified message route"
+    );
+
+    Some(ChannelRouteSelection {
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+    })
 }
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
@@ -847,6 +1692,10 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
+fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
+    crate::agent::loop_::is_tool_iteration_limit_error(err)
+}
+
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -945,6 +1794,19 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
         current.provider, current.model
     );
     response.push_str("\nSwitch model with `/model <model-id>`.\n");
+    response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
+    response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
+    response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
+    response.push_str("Deny approval with `/approve-deny <request-id>`.\n");
+    response.push_str("List pending requests with `/approve-pending`.\n");
+    response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
+    response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
+    response.push_str("List approval state with `/approvals`.\n");
+    response.push_str(
+        "Natural language also works (policy controlled).\n\
+         - `direct` mode (default): `授权工具 shell` grants immediately.\n\
+         - `request_confirm` mode: `授权工具 shell` then `确认授权 apr-xxxxxx`.\n",
+    );
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
@@ -976,6 +1838,19 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     );
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
     response.push_str("Switch model with `/model <model-id>`.\n\n");
+    response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
+    response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
+    response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
+    response.push_str("Deny approval with `/approve-deny <request-id>`.\n");
+    response.push_str("List pending requests with `/approve-pending`.\n");
+    response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
+    response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
+    response.push_str("List approval state with `/approvals`.\n");
+    response.push_str(
+        "Natural language also works (policy controlled).\n\
+         - `direct` mode (default): `授权工具 shell` grants immediately.\n\
+         - `request_confirm` mode: `授权工具 shell` then `确认授权 apr-xxxxxx`.\n\n",
+    );
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
         if provider.aliases.is_empty() {
@@ -997,7 +1872,8 @@ async fn handle_runtime_command_if_needed(
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
-    let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
+    let is_slash_command = msg.content.trim_start().starts_with('/');
+    let Some(mut command) = parse_runtime_command(&msg.channel, &msg.content) else {
         return false;
     };
 
@@ -1007,6 +1883,115 @@ async fn handle_runtime_command_if_needed(
 
     let sender_key = conversation_history_key(msg);
     let mut current = get_route_selection(ctx, &sender_key);
+    let sender = msg.sender.as_str();
+    let source_channel = msg.channel.as_str();
+    let reply_target = msg.reply_target.as_str();
+    let is_natural_language_approval_command =
+        !is_slash_command && is_approval_management_command(&command);
+
+    if is_approval_management_command(&command)
+        && !ctx
+            .approval_manager
+            .is_non_cli_approval_actor_allowed(source_channel, sender)
+    {
+        let mut approvers = ctx
+            .approval_manager
+            .non_cli_approval_approvers()
+            .into_iter()
+            .collect::<Vec<_>>();
+        approvers.sort();
+        let allowed = if approvers.is_empty() {
+            "(any channel-allowed sender)".to_string()
+        } else {
+            approvers.join(", ")
+        };
+        let response = format!(
+            "Approval-management command denied for sender `{sender}` on channel `{source_channel}`.\nAllowed approvers: {allowed}\nConfigure `[autonomy].non_cli_approval_approvers` to adjust this policy."
+        );
+        runtime_trace::record_event(
+            "approval_management_denied",
+            Some(source_channel),
+            None,
+            None,
+            None,
+            Some(false),
+            Some("sender not allowed to manage non-cli approvals"),
+            serde_json::json!({
+                "sender": sender,
+                "channel": source_channel,
+                "allowed_approvers": approvers,
+            }),
+        );
+
+        if let Err(err) = channel
+            .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .await
+        {
+            tracing::warn!(
+                "Failed to send runtime command response on {}: {err}",
+                channel.name()
+            );
+        }
+        return true;
+    }
+
+    if is_natural_language_approval_command {
+        let mode = ctx
+            .approval_manager
+            .non_cli_natural_language_approval_mode_for_channel(source_channel);
+        match mode {
+            NonCliNaturalLanguageApprovalMode::Disabled => {
+                let response = "Natural-language approval commands are disabled by runtime policy.\nUse explicit slash commands such as `/approve <tool-name>`, `/approve-request <tool-name>`, `/approve-all-once`, `/approve-allow <request-id>`, `/approve-confirm <request-id>`, `/approve-deny <request-id>`, `/unapprove <tool-name>`, and `/approvals`.".to_string();
+                runtime_trace::record_event(
+                    "approval_management_natural_language_denied",
+                    Some(source_channel),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    Some("natural-language approval commands disabled by policy"),
+                    serde_json::json!({
+                        "sender": sender,
+                        "channel": source_channel,
+                        "mode": non_cli_natural_language_mode_label(mode),
+                    }),
+                );
+                if let Err(err) = channel
+                    .send(
+                        &SendMessage::new(response, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to send runtime command response on {}: {err}",
+                        channel.name()
+                    );
+                }
+                return true;
+            }
+            NonCliNaturalLanguageApprovalMode::RequestConfirm => {}
+            NonCliNaturalLanguageApprovalMode::Direct => {
+                if let ChannelRuntimeCommand::RequestToolApproval(tool_name) = &command {
+                    command = ChannelRuntimeCommand::ApproveTool(tool_name.clone());
+                    runtime_trace::record_event(
+                        "approval_management_natural_language_promoted_to_direct",
+                        Some(source_channel),
+                        None,
+                        None,
+                        None,
+                        Some(true),
+                        Some("natural-language request promoted to direct approval"),
+                        serde_json::json!({
+                            "sender": sender,
+                            "channel": source_channel,
+                            "mode": non_cli_natural_language_mode_label(mode),
+                        }),
+                    );
+                }
+            }
+        }
+    }
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
@@ -1058,6 +2043,472 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
+        }
+        ChannelRuntimeCommand::RequestAllToolsOnce => {
+            let req = ctx.approval_manager.create_non_cli_pending_request(
+                APPROVAL_ALL_TOOLS_ONCE_TOKEN,
+                sender,
+                source_channel,
+                reply_target,
+                Some("human-confirmed one-time bypass request for all tools/commands".to_string()),
+            );
+            runtime_trace::record_event(
+                "approval_request_created",
+                Some(source_channel),
+                None,
+                None,
+                None,
+                Some(true),
+                Some("pending one-time all-tools request created"),
+                serde_json::json!({
+                    "request_id": req.request_id,
+                    "tool_name": req.tool_name,
+                    "sender": sender,
+                    "channel": source_channel,
+                    "expires_at": req.expires_at,
+                }),
+            );
+            format!(
+                "One-time all-tools approval request created.\nRequest ID: `{}`\nScope: next non-CLI agent tool-execution turn may run without per-tool approval prompts.\nExpires: `{}`\nConfirm with `/approve-confirm {}` (must be the same sender in this chat/channel).",
+                req.request_id, req.expires_at, req.request_id
+            )
+        }
+        ChannelRuntimeCommand::RequestToolApproval(raw_tool_name) => {
+            let tool_name = raw_tool_name.trim().to_string();
+            if tool_name.is_empty() {
+                "Usage: `/approve-request <tool-name>`".to_string()
+            } else if !ctx
+                .tools_registry
+                .iter()
+                .any(|tool| tool.name() == tool_name)
+            {
+                let mut available_tools = ctx
+                    .tools_registry
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>();
+                available_tools.sort();
+                let preview = available_tools
+                    .into_iter()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Unknown tool `{tool_name}`.\nKnown tools (top 12): {preview}\nUse `/approve-request <tool-name>` with an exact tool name."
+                )
+            } else if !ctx.approval_manager.needs_approval(&tool_name) {
+                format!(
+                    "`{tool_name}` is already approved in the current runtime policy. You can use it directly."
+                )
+            } else {
+                let req = ctx.approval_manager.create_non_cli_pending_request(
+                    &tool_name,
+                    sender,
+                    source_channel,
+                    reply_target,
+                    None,
+                );
+                runtime_trace::record_event(
+                    "approval_request_created",
+                    Some(source_channel),
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    Some("pending request created"),
+                    serde_json::json!({
+                        "request_id": req.request_id,
+                        "tool_name": req.tool_name,
+                        "sender": sender,
+                        "channel": source_channel,
+                        "expires_at": req.expires_at,
+                    }),
+                );
+                format!(
+                    "Approval request created.\nRequest ID: `{}`\nTool: `{}`\nExpires: `{}`\nConfirm with `/approve-confirm {}` (must be the same sender in this chat/channel).",
+                    req.request_id, req.tool_name, req.expires_at, req.request_id
+                )
+            }
+        }
+        ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-allow <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.confirm_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
+                        runtime_trace::record_event(
+                            "approval_request_allowed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some("pending request allowed for current tool invocation"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": req.tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Approved pending request `{}` for this invocation of `{}`.",
+                            req.request_id, req.tool_name
+                        )
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        format!("Pending approval request `{request_id}` was not found.")
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        format!(
+                            "Pending approval request `{request_id}` can only be approved by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-confirm <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.confirm_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
+                        let tool_name = req.tool_name;
+                        let mut approval_message = if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+                            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
+                            format!(
+                                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
+                            )
+                        } else {
+                            ctx.approval_manager.grant_non_cli_session(&tool_name);
+                            ctx.approval_manager
+                                .apply_persistent_runtime_grant(&tool_name);
+                            match persist_non_cli_approval_to_config(ctx, &tool_name).await {
+                                Ok(Some(path)) => format!(
+                                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nPersisted to `{}` so future channel sessions (including after restart) remain approved.",
+                                    path.display()
+                                ),
+                                Ok(None) => format!(
+                                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nNo runtime config path was found, so this approval is active for the current daemon runtime only."
+                                ),
+                                Err(err) => format!(
+                                    "Approved supervised execution for `{tool_name}` from request `{request_id}` in-memory.\nFailed to persist this approval to config: {err}"
+                                ),
+                            }
+                        };
+                        if tool_name != APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+                            if let Some(exclusion_note) =
+                                clear_non_cli_exclusion_after_approval(ctx, &tool_name).await
+                            {
+                                approval_message.push('\n');
+                                approval_message.push_str(&exclusion_note);
+                            }
+                        }
+                        runtime_trace::record_event(
+                            "approval_request_confirmed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some("pending request confirmed"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        approval_message
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        runtime_trace::record_event(
+                            "approval_request_confirmed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request not found"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Pending approval request `{request_id}` was not found. Create one with `/approve-request <tool-name>` or `/approve-all-once`."
+                        )
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        runtime_trace::record_event(
+                            "approval_request_confirmed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request expired"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        runtime_trace::record_event(
+                            "approval_request_confirmed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request confirmer mismatch"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Pending approval request `{request_id}` can only be confirmed by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::DenyToolApproval(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-deny <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.reject_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::No);
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some("pending request denied"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": req.tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Denied pending approval request `{}` for tool `{}`.",
+                            req.request_id, req.tool_name
+                        )
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request not found"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` was not found.")
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request expired"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request denier mismatch"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Pending approval request `{request_id}` can only be denied by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::ListPendingApprovals => {
+            let rows = ctx.approval_manager.list_non_cli_pending_requests(
+                Some(sender),
+                Some(source_channel),
+                Some(reply_target),
+            );
+            if rows.is_empty() {
+                "No pending approval requests for your current sender+chat/channel scope."
+                    .to_string()
+            } else {
+                let mut response = String::new();
+                response.push_str("Pending approval requests (sender+chat/channel scoped):\n");
+                for req in rows {
+                    let reason = req
+                        .reason
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or("n/a");
+                    let _ = writeln!(
+                        response,
+                        "- {}: tool={}, expires_at={}, reason={}",
+                        req.request_id,
+                        approval_target_label(&req.tool_name),
+                        req.expires_at,
+                        reason
+                    );
+                }
+                response
+            }
+        }
+        ChannelRuntimeCommand::ApproveTool(raw_tool_name) => {
+            let tool_name = raw_tool_name.trim().to_string();
+            if tool_name.is_empty() {
+                "Usage: `/approve <tool-name>`".to_string()
+            } else if !ctx
+                .tools_registry
+                .iter()
+                .any(|tool| tool.name() == tool_name)
+            {
+                let mut available_tools = ctx
+                    .tools_registry
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>();
+                available_tools.sort();
+                let preview = available_tools
+                    .into_iter()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Unknown tool `{tool_name}`.\nKnown tools (top 12): {preview}\nUse `/approve <tool-name>` with an exact tool name."
+                )
+            } else {
+                let cleared_pending = ctx
+                    .approval_manager
+                    .clear_non_cli_pending_requests_for_tool(&tool_name);
+                ctx.approval_manager.grant_non_cli_session(&tool_name);
+                ctx.approval_manager
+                    .apply_persistent_runtime_grant(&tool_name);
+                let persistence_message = match persist_non_cli_approval_to_config(ctx, &tool_name).await {
+                    Ok(Some(path)) => format!(
+                        "Approved supervised execution for `{tool_name}`.\nPersisted to `{}` so future channel sessions (including after restart) remain approved.",
+                        path.display()
+                    ),
+                    Ok(None) => format!(
+                        "Approved supervised execution for `{tool_name}`.\nNo runtime config path was found, so this approval is active for the current daemon runtime only."
+                    ),
+                    Err(err) => format!(
+                        "Approved supervised execution for `{tool_name}` in-memory.\nFailed to persist this approval to config: {err}"
+                    ),
+                };
+                let mut response = format!(
+                    "{persistence_message}\nRuntime pending requests cleared: {cleared_pending}."
+                );
+                if let Some(exclusion_note) =
+                    clear_non_cli_exclusion_after_approval(ctx, &tool_name).await
+                {
+                    response.push('\n');
+                    response.push_str(&exclusion_note);
+                }
+                response
+            }
+        }
+        ChannelRuntimeCommand::UnapproveTool(raw_tool_name) => {
+            let tool_name = raw_tool_name.trim().to_string();
+            if tool_name.is_empty() {
+                "Usage: `/unapprove <tool-name>`".to_string()
+            } else {
+                let removed_session = ctx.approval_manager.revoke_non_cli_session(&tool_name);
+                let removed_runtime_persistent = ctx
+                    .approval_manager
+                    .apply_persistent_runtime_revoke(&tool_name);
+                let removed_pending = ctx
+                    .approval_manager
+                    .clear_non_cli_pending_requests_for_tool(&tool_name);
+                match remove_non_cli_approval_from_config(ctx, &tool_name).await {
+                    Ok(Some((path, removed_persistent))) => format!(
+                        "Persistent approval removed for `{tool_name}`: {}.\nRuntime effective auto_approve removed: {}.\nRuntime pending requests cleared: {}.\nConfig path: `{}`.\nRuntime session grant removed: {}.",
+                        if removed_persistent { "yes" } else { "no (not present)" },
+                        if removed_runtime_persistent { "yes" } else { "no (not present)" },
+                        removed_pending,
+                        path.display(),
+                        if removed_session { "yes" } else { "no" }
+                    ),
+                    Ok(None) => format!(
+                        "Runtime config path was not found.\nRuntime session grant removed for `{tool_name}`: {}.",
+                        if removed_session { "yes" } else { "no" }
+                    ),
+                    Err(err) => format!(
+                        "Removed runtime session grant for `{tool_name}`: {}.\nFailed to persist removal to config: {err}",
+                        if removed_session { "yes" } else { "no" }
+                    ),
+                }
+            }
+        }
+        ChannelRuntimeCommand::ListApprovals => {
+            match describe_non_cli_approvals(ctx, sender, source_channel, reply_target).await {
+                Ok(summary) => summary,
+                Err(err) => format!("Failed to read approval state: {err}"),
+            }
         }
     };
 
@@ -1220,12 +2671,24 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    let without_tool_tags = strip_tool_call_tags(response);
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    let sanitized = strip_isolated_tool_json_artifacts(&without_tool_tags, &known_tool_names);
+
+    match LeakDetector::new().scan(&sanitized) {
+        LeakResult::Clean => sanitized,
+        LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                patterns = ?patterns,
+                "output guardrail: credential leak detected in outbound channel response"
+            );
+            redacted
+        }
+    }
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -1295,9 +2758,7 @@ fn sanitize_tool_json_value(
         return None;
     }
 
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
         if !tool_calls.is_empty()
@@ -1337,7 +2798,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -1556,9 +3017,56 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if !msg.content.trim_start().starts_with('/') {
+        let perplexity_cfg = runtime_perplexity_filter_snapshot(ctx.as_ref());
+        if let Some(assessment) =
+            crate::security::detect_adversarial_suffix(&msg.content, &perplexity_cfg)
+        {
+            runtime_trace::record_event(
+                "channel_message_blocked_perplexity_filter",
+                Some(msg.channel.as_str()),
+                None,
+                None,
+                None,
+                Some(false),
+                Some("blocked by statistical adversarial suffix filter"),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "message_id": msg.id,
+                    "perplexity": assessment.perplexity,
+                    "threshold": perplexity_cfg.perplexity_threshold,
+                    "symbol_ratio": assessment.symbol_ratio,
+                    "symbol_ratio_threshold": perplexity_cfg.symbol_ratio_threshold,
+                    "suspicious_token_count": assessment.suspicious_token_count,
+                }),
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let warning = format!(
+                    "Request blocked by `security.perplexity_filter` before provider execution.\n\
+perplexity={:.2} (threshold {:.2}), suffix_symbol_ratio={:.2} (threshold {:.2}), suspicious_tokens={}.\n\
+If this input is legitimate, keep the feature opt-in by setting `[security.perplexity_filter].enable_perplexity_filter = false` \
+or tune thresholds in config.",
+                    assessment.perplexity,
+                    perplexity_cfg.perplexity_threshold,
+                    assessment.symbol_ratio,
+                    perplexity_cfg.symbol_ratio_threshold,
+                    assessment.suspicious_token_count
+                );
+                let _ = channel
+                    .send(
+                        &SendMessage::new(warning, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            return;
+        }
+    }
 
     let history_key = conversation_history_key(&msg);
-    let route = get_route_selection(ctx.as_ref(), &history_key);
+    // Try classification first, fall back to sender/default route
+    let route = classify_message_route(ctx.as_ref(), &msg.content)
+        .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
@@ -1602,8 +3110,17 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    // Inject per-message timestamp so the LLM always knows the current time,
+    // even in multi-turn conversations where the system prompt may be stale.
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let timestamped_content = format!("[{now}] {}", msg.content);
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&timestamped_content),
+    );
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1622,13 +3139,29 @@ async fn process_channel_message(
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+                last_turn.content = format!("{memory_context}{timestamped_content}");
             }
         }
     }
 
-    let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+    let expose_internal_tool_details =
+        msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
+    let excluded_tools_snapshot = if msg.channel == "cli" {
+        Vec::new()
+    } else {
+        snapshot_non_cli_excluded_tools(ctx.as_ref())
+    };
+    let mut system_prompt = build_channel_system_prompt(
+        ctx.system_prompt.as_str(),
+        &msg.channel,
+        &msg.reply_target,
+        expose_internal_tool_details,
+    );
+    system_prompt.push_str(&build_runtime_tool_visibility_prompt(
+        ctx.tools_registry.as_ref(),
+        &excluded_tools_snapshot,
+        active_provider.supports_native_tools(),
+    ));
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -1679,6 +3212,7 @@ async fn process_channel_message(
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
+        let suppress_internal_progress = !expose_internal_tool_details;
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -1686,7 +3220,12 @@ async fn process_channel_message(
                     accumulated.clear();
                     continue;
                 }
-                accumulated.push_str(&delta);
+                let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
+                if suppress_internal_progress && is_internal_progress {
+                    continue;
+                }
+
+                accumulated.push_str(visible_delta);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
@@ -1729,11 +3268,52 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let (approval_prompt_tx, mut approval_prompt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agent::loop_::NonCliApprovalPrompt>();
+    let approval_prompt_task = if msg.channel == "cli" {
+        None
+    } else if let Some(channel_ref) = target_channel.as_ref() {
+        let channel = Arc::clone(channel_ref);
+        let reply_target = msg.reply_target.clone();
+        let thread_ts = msg.thread_ts.clone();
+        Some(tokio::spawn(async move {
+            while let Some(prompt) = approval_prompt_rx.recv().await {
+                if let Err(err) = channel
+                    .send_approval_prompt(
+                        &reply_target,
+                        &prompt.request_id,
+                        &prompt.tool_name,
+                        &prompt.arguments,
+                        thread_ts.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        channel = %channel.name(),
+                        request_id = %prompt.request_id,
+                        "Failed to send approval prompt: {err}"
+                    );
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    let non_cli_approval_context = if msg.channel == "cli" || target_channel.is_none() {
+        None
+    } else {
+        Some(NonCliApprovalContext {
+            sender: msg.sender.clone(),
+            reply_target: msg.reply_target.clone(),
+            prompt_tx: approval_prompt_tx.clone(),
+        })
+    };
+
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
+            run_tool_call_loop_with_non_cli_approval_context(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
@@ -1742,21 +3322,23 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                None,
+                Some(ctx.approval_manager.as_ref()),
                 msg.channel.as_str(),
+                non_cli_approval_context,
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
+                &excluded_tools_snapshot,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    drop(approval_prompt_tx);
+    if let Some(handle) = approval_prompt_task {
+        log_worker_join_result(handle.await);
+    }
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -1998,6 +3580,46 @@ async fn process_channel_message(
                             .await;
                     }
                 }
+            } else if is_tool_iteration_limit_error(&e) {
+                let limit = ctx.max_tool_iterations.max(1);
+                let pause_text = format!(
+                    "⚠️ Reached tool-iteration limit ({limit}) for this turn. Context and progress were preserved. Reply \"continue\" to resume, or increase `agent.max_tool_iterations`."
+                );
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("tool iteration limit reached"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "max_tool_iterations": limit,
+                    }),
+                );
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(
+                        "[Task paused at tool-iteration limit — context preserved. Ask to continue.]",
+                    ),
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &pause_text)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(pause_text, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
             } else {
                 eprintln!(
                     "  ❌ LLM error after {}ms: {e}",
@@ -2021,7 +3643,7 @@ async fn process_channel_message(
                     .downcast_ref::<providers::ProviderCapabilityError>()
                     .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -2210,8 +3832,11 @@ fn load_openclaw_bootstrap_files(
         inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
 
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    // MEMORY.md — curated long-term memory (main session only, when present)
+    let memory_path = workspace_dir.join("MEMORY.md");
+    if memory_path.exists() {
+        inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    }
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -2221,7 +3846,7 @@ fn load_openclaw_bootstrap_files(
 /// 2. Safety — guardrail reminder
 /// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
+/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY (when present)
 /// 6. Date & Time — timezone for cache stability
 /// 7. Runtime — host, OS, model
 ///
@@ -2682,61 +4307,82 @@ struct ConfiguredChannel {
 
 fn collect_configured_channels(
     config: &Config,
-    _matrix_skip_context: &str,
+    matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
+    // Keep this symbol used even when Matrix support is compiled in and
+    // `#[cfg(not(feature = "channel-matrix"))]` blocks are removed.
+    let _ = matrix_skip_context;
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let mut telegram = TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.effective_group_reply_mode().requires_mention(),
+        )
+        .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
+        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_transcription(config.transcription.clone())
+        .with_workspace_dir(config.workspace_dir.clone());
+
+        if let Some(ref base_url) = tg.base_url {
+            telegram = telegram.with_api_base(base_url.clone());
+        }
+
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ),
+            channel: Arc::new(telegram),
         });
     }
 
     if let Some(ref dc) = config.channels_config.discord {
         channels.push(ConfiguredChannel {
             display_name: "Discord",
-            channel: Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
+            channel: Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.effective_group_reply_mode().requires_mention(),
+                )
+                .with_group_reply_allowed_senders(dc.group_reply_allowed_sender_ids())
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
             display_name: "Slack",
-            channel: Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.channel_id.clone(),
+                    sl.allowed_users.clone(),
+                )
+                .with_group_reply_policy(
+                    sl.effective_group_reply_mode().requires_mention(),
+                    sl.group_reply_allowed_sender_ids(),
+                ),
+            ),
         });
     }
 
     if let Some(ref mm) = config.channels_config.mattermost {
         channels.push(ConfiguredChannel {
             display_name: "Mattermost",
-            channel: Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )),
+            channel: Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.channel_id.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.effective_group_reply_mode().requires_mention(),
+                )
+                .with_group_reply_allowed_senders(mm.group_reply_allowed_sender_ids()),
+            ),
         });
     }
 
@@ -2751,15 +4397,18 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_mention_only(mx.mention_only),
+            ),
         });
     }
 
@@ -2767,7 +4416,7 @@ fn collect_configured_channels(
     if config.channels_config.matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            _matrix_skip_context
+            matrix_skip_context
         );
     }
 
@@ -2946,14 +4595,21 @@ fn collect_configured_channels(
     }
 
     if let Some(ref qq) = config.channels_config.qq {
-        channels.push(ConfiguredChannel {
-            display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
-        });
+        if qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook {
+            tracing::info!(
+                "QQ channel configured with receive_mode=webhook; websocket listener startup skipped."
+            );
+        } else {
+            channels.push(ConfiguredChannel {
+                display_name: "QQ",
+                channel: Arc::new(QQChannel::new_with_environment(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                    qq.environment.clone(),
+                )),
+            });
+        }
     }
 
     if let Some(ref ct) = config.channels_config.clawdtalk {
@@ -2966,20 +4622,40 @@ fn collect_configured_channels(
     channels
 }
 
+async fn append_nostr_channel_if_available(
+    config: &Config,
+    channels: &mut Vec<ConfiguredChannel>,
+    startup_context: &str,
+) -> Option<String> {
+    let ns = config.channels_config.nostr.as_ref()?;
+    match NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await {
+        Ok(channel) => {
+            channels.push(ConfiguredChannel {
+                display_name: "Nostr",
+                channel: Arc::new(channel),
+            });
+            None
+        }
+        Err(err) => {
+            let reason = format!("Nostr init failed during {startup_context}: {err}");
+            tracing::warn!("{reason}");
+            Some(reason)
+        }
+    }
+}
+
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let mut channels = collect_configured_channels(&config, "health check");
+    let mut init_failures = Vec::new();
 
-    if let Some(ref ns) = config.channels_config.nostr {
-        channels.push(ConfiguredChannel {
-            display_name: "Nostr",
-            channel: Arc::new(
-                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
-            ),
-        });
+    if let Some(reason) =
+        append_nostr_channel_if_available(&config, &mut channels, "health check").await
+    {
+        init_failures.push(reason);
     }
 
-    if channels.is_empty() {
+    if channels.is_empty() && init_failures.is_empty() {
         println!("No real-time channels configured. Run `zeroclaw onboard` first.");
         return Ok(());
     }
@@ -2988,8 +4664,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     println!();
 
     let mut healthy = 0_u32;
-    let mut unhealthy = 0_u32;
+    let mut unhealthy = u32::try_from(init_failures.len()).unwrap_or(u32::MAX);
     let mut timeout = 0_u32;
+    let has_runtime_channels = !channels.is_empty();
+
+    for failure in &init_failures {
+        println!("  ❌ {:<9} {failure}", "Nostr");
+    }
 
     for configured in channels {
         let result =
@@ -3019,6 +4700,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
     }
 
+    if !has_runtime_channels && !init_failures.is_empty() {
+        println!();
+        anyhow::bail!("All configured channels failed during initialization.");
+    }
+
     println!();
     println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
     Ok(())
@@ -3034,6 +4720,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: config.effective_provider_reasoning_level(),
+        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -3061,6 +4751,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.config_path.clone(),
             RuntimeConfigState {
                 defaults: runtime_defaults_from_config(&config),
+                perplexity_filter: config.security.perplexity_filter.clone(),
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -3092,7 +4783,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut built_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3106,7 +4797,44 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+
+    // Wire MCP tools into the registry before freezing — non-fatal.
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let names = registry.tool_names();
+                let mut registered = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let wrapper = crate::tools::McpToolWrapper::new(
+                            name,
+                            def,
+                            std::sync::Arc::clone(&registry),
+                        );
+                        built_tools.push(Box::new(wrapper));
+                        registered += 1;
+                    }
+                }
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registered,
+                    registry.server_count()
+                );
+            }
+            Err(e) => {
+                // Non-fatal — daemon continues with the tools registered above.
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
+    let tools_registry = Arc::new(built_tools);
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
@@ -3143,6 +4871,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
+        tool_descs.push((
+            "browser",
+            "Automate browser actions (open/click/type/scroll/screenshot) with backend-aware safety checks.",
+        ));
     }
     if config.composio.enabled {
         tool_descs.push((
@@ -3162,6 +4894,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tool_descs.push((
             "delegate",
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
+        ));
+        tool_descs.push((
+            "subagent_spawn",
+            "Spawn a delegate agent in the background. Returns immediately with a session_id. Use for long-running tasks that should not block.",
+        ));
+        tool_descs.push((
+            "subagent_list",
+            "List running and completed background sub-agents. Filter by status: running, completed, failed, killed, or all.",
+        ));
+        tool_descs.push((
+            "subagent_manage",
+            "Manage a background sub-agent: 'status' to check progress/output, 'kill' to cancel a running session.",
         ));
     }
 
@@ -3189,8 +4933,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+        let filtered_specs = filtered_tool_specs_for_runtime(tools_registry.as_ref(), excluded);
+        system_prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));
     }
+    system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
     if !skills.is_empty() {
         println!(
@@ -3204,21 +4950,38 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
-            .into_iter()
-            .map(|configured| configured.channel)
-            .collect();
-
-    if let Some(ref ns) = config.channels_config.nostr {
-        channels.push(Arc::new(
-            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
-        ));
+    let mut configured_channels = collect_configured_channels(&config, "runtime startup");
+    let mut init_failures = Vec::new();
+    if let Some(reason) =
+        append_nostr_channel_if_available(&config, &mut configured_channels, "runtime startup")
+            .await
+    {
+        init_failures.push(reason);
     }
-    if channels.is_empty() {
+
+    if configured_channels.is_empty() && init_failures.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
     }
+
+    if configured_channels.is_empty() && !init_failures.is_empty() {
+        for failure in &init_failures {
+            println!("  ❌ {failure}");
+        }
+        anyhow::bail!("All configured channels failed during initialization.");
+    }
+
+    if !init_failures.is_empty() {
+        for failure in &init_failures {
+            println!("  ⚠️  {failure}");
+        }
+        println!();
+    }
+
+    let channels: Vec<Arc<dyn Channel>> = configured_channels
+        .into_iter()
+        .map(|configured| configured.channel)
+        .collect();
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
@@ -3322,7 +5085,24 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
-        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        non_cli_excluded_tools: Arc::new(Mutex::new(
+            config.autonomy.non_cli_excluded_tools.clone(),
+        )),
+        query_classification: config.query_classification.clone(),
+        model_routes: config.model_routes.clone(),
+        // WASM skill tools are sandboxed by the WASM engine and cannot access the
+        // host filesystem, network, or shell. Pre-approve them so they are not
+        // denied on non-CLI channels (which have no interactive stdin to prompt).
+        approval_manager: {
+            let mut autonomy = config.autonomy.clone();
+            let skills_dir = workspace.join("skills");
+            for name in tools::wasm_tool::wasm_tool_names_from_skills(&skills_dir) {
+                if !autonomy.auto_approve.contains(&name) {
+                    autonomy.auto_approve.push(name);
+                }
+            }
+            Arc::new(ApprovalManager::from_config(&autonomy))
+        },
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3397,6 +5177,114 @@ mod tests {
             channel_message_timeout_budget_secs(300, 10),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_approval_commands_on_non_model_channels() {
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-request shell"),
+            Some(ChannelRuntimeCommand::RequestToolApproval(
+                "shell".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-all-once"),
+            Some(ChannelRuntimeCommand::RequestAllToolsOnce)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-confirm apr-deadbeef"),
+            Some(ChannelRuntimeCommand::ConfirmToolApproval(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-allow apr-deadbeef"),
+            Some(ChannelRuntimeCommand::ApprovePendingRequest(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-deny apr-deadbeef"),
+            Some(ChannelRuntimeCommand::DenyToolApproval(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve-pending"),
+            Some(ChannelRuntimeCommand::ListPendingApprovals)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approve shell"),
+            Some(ChannelRuntimeCommand::ApproveTool("shell".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/unapprove shell"),
+            Some(ChannelRuntimeCommand::UnapproveTool("shell".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/approvals"),
+            Some(ChannelRuntimeCommand::ListApprovals)
+        );
+        assert_eq!(parse_runtime_command("slack", "/models"), None);
+    }
+
+    #[test]
+    fn parse_runtime_command_supports_natural_language_approval_intents() {
+        assert_eq!(
+            parse_runtime_command("telegram", "授权工具 shell"),
+            Some(ChannelRuntimeCommand::RequestToolApproval(
+                "shell".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "请放开 shell"),
+            Some(ChannelRuntimeCommand::RequestToolApproval(
+                "shell".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "approve tool shell"),
+            Some(ChannelRuntimeCommand::RequestToolApproval(
+                "shell".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "请一次性允许所有工具和命令"),
+            Some(ChannelRuntimeCommand::RequestAllToolsOnce)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "确认授权 apr-deadbeef"),
+            Some(ChannelRuntimeCommand::ConfirmToolApproval(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "confirm apr-deadbeef"),
+            Some(ChannelRuntimeCommand::ConfirmToolApproval(
+                "apr-deadbeef".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "撤销工具 shell"),
+            Some(ChannelRuntimeCommand::UnapproveTool("shell".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "revoke tool shell"),
+            Some(ChannelRuntimeCommand::UnapproveTool("shell".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "查看授权"),
+            Some(ChannelRuntimeCommand::ListApprovals)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "show approvals"),
+            Some(ChannelRuntimeCommand::ListApprovals)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "show pending approvals"),
+            Some(ChannelRuntimeCommand::ListPendingApprovals)
+        );
+        assert_eq!(parse_runtime_command("telegram", "请帮我执行shell"), None);
     }
 
     #[test]
@@ -3535,7 +5423,12 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3584,7 +5477,12 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3636,7 +5534,12 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -3682,6 +5585,13 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct DraftStreamingRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        draft_updates: tokio::sync::Mutex<Vec<String>>,
+        finalized_drafts: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -3708,6 +5618,60 @@ mod tests {
         }
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DraftStreamingRecordingChannel {
+        fn name(&self) -> &str {
+            "draft-streaming-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("draft:{}:{}", message.recipient, message.content));
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn update_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            self.draft_updates.lock().await.push(text.to_string());
+            Ok(None)
+        }
+
+        async fn finalize_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push(text.to_string());
             Ok(())
         }
     }
@@ -4078,6 +6042,140 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    struct MockEchoTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MockEchoTool {
+        fn name(&self) -> &str {
+            "mock_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echo back the input text"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: args
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn build_runtime_tool_visibility_prompt_respects_excluded_snapshot() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool), Box::new(MockEchoTool)];
+        let excluded = vec!["mock_price".to_string()];
+
+        let non_native = build_runtime_tool_visibility_prompt(&tools, &excluded, false);
+        assert!(non_native.contains("Runtime Tool Availability (Authoritative)"));
+        assert!(non_native.contains("Excluded by runtime policy: mock_price"));
+        assert!(non_native.contains("`mock_echo`"));
+        assert!(!non_native.contains("**mock_price**:"));
+        assert!(non_native.contains("## Tool Use Protocol"));
+
+        let native = build_runtime_tool_visibility_prompt(&tools, &excluded, true);
+        assert!(native.contains("Runtime Tool Availability (Authoritative)"));
+        assert!(native.contains("native provider function-calling"));
+        assert!(!native.contains("## Tool Use Protocol"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_injects_runtime_tool_visibility_prompt() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool), Box::new(MockEchoTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(vec!["mock_price".to_string()])),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-runtime-visibility-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-runtime-visibility".to_string(),
+                content: "hello tool visibility".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 1);
+            let first_call = &calls[0];
+            assert!(!first_call.is_empty());
+            assert_eq!(first_call[0].0, "system");
+            let system_prompt = &first_call[0].1;
+            assert!(system_prompt.contains("Runtime Tool Availability (Authoritative)"));
+            assert!(system_prompt.contains("Excluded by runtime policy: mock_price"));
+            assert!(system_prompt.contains("`mock_echo`"));
+            assert!(!system_prompt.contains("**mock_price**:"));
+        }
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("response-1"));
+    }
+
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -4109,7 +6207,12 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4168,7 +6271,12 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4211,6 +6319,152 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_streaming_hides_internal_progress_by_default() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-hide".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            !updates.is_empty(),
+            "draft updates should still include streamed final answer"
+        );
+        assert!(
+            !updates.iter().any(|entry| {
+                entry.contains("Thinking")
+                    || entry.contains("Got 1 tool call(s)")
+                    || entry.contains("mock_price")
+                    || entry.contains("⏳")
+            }),
+            "internal tool progress should stay hidden by default, got updates: {updates:?}"
+        );
+        drop(updates);
+
+        let finalized = channel_impl.finalized_drafts.lock().await;
+        assert_eq!(finalized.len(), 1);
+        assert!(finalized[0].contains("BTC is currently around"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_shows_internal_progress_on_explicit_request() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-show".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "Please show commands and tool calls you used.".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("Got 1 tool call(s)")),
+            "explicit requests should expose internal progress details, got updates: {updates:?}"
+        );
+        assert!(
+            updates.iter().any(|entry| entry.contains("Thinking")),
+            "explicit requests should expose internal thinking/progress text, got updates: {updates:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -4243,7 +6497,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4302,7 +6561,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4370,7 +6634,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4405,6 +6674,1301 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_approve_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_excluded_tools = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm;
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            non_cli_natural_language_approval_mode:
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(vec!["mock_price".to_string()])),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_natural_language_approval_mode_for_channel("telegram"),
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_natural_language_approval_mode_for_channel("telegram"),
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-approve-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/approve mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Approved supervised execution for `mock_price`"));
+        assert!(sent[0].contains("including after restart"));
+        assert!(sent[0].contains("Removed `mock_price` from `autonomy.non_cli_excluded_tools`"));
+
+        assert!(runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(!runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(
+            saved
+                .autonomy
+                .auto_approve
+                .iter()
+                .any(|tool| tool == "mock_price"),
+            "persisted config should include mock_price in autonomy.auto_approve"
+        );
+        assert!(
+            saved
+                .autonomy
+                .always_ask
+                .iter()
+                .all(|tool| tool != "mock_price"),
+            "persisted config should remove mock_price from autonomy.always_ask"
+        );
+        assert!(
+            saved
+                .autonomy
+                .non_cli_excluded_tools
+                .iter()
+                .all(|tool| tool != "mock_price"),
+            "persisted config should remove mock_price from autonomy.non_cli_excluded_tools"
+        );
+        assert!(
+            snapshot_non_cli_excluded_tools(runtime_ctx.as_ref())
+                .iter()
+                .all(|tool| tool != "mock_price"),
+            "runtime exclusions should remove mock_price immediately after approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_denies_approval_management_for_unlisted_sender() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_approval_approvers = vec!["alice".to_string()];
+        persisted
+            .autonomy
+            .non_cli_natural_language_approval_mode_by_channel
+            .insert(
+                "telegram".to_string(),
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            );
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            non_cli_approval_approvers: vec!["alice".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_natural_language_approval_mode_for_channel("telegram"),
+            crate::config::NonCliNaturalLanguageApprovalMode::Direct
+        );
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-approve-denied-1".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/approve mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Approval-management command denied"));
+        assert!(sent[0].contains("Allowed approvers: alice"));
+        assert!(!runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(
+            saved
+                .autonomy
+                .auto_approve
+                .iter()
+                .all(|tool| tool != "mock_price"),
+            "persisted config should not include unauthorized approval changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_unapprove_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.auto_approve = vec!["mock_price".to_string()];
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["mock_price".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        approval_manager.grant_non_cli_session("mock_price");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-unapprove-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/unapprove mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Persistent approval removed for `mock_price`: yes."));
+        assert!(sent[0].contains("Runtime session grant removed: yes"));
+        assert!(!runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(
+            saved
+                .autonomy
+                .auto_approve
+                .iter()
+                .all(|tool| tool != "mock_price"),
+            "persisted config should remove mock_price from autonomy.auto_approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_approvals_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.auto_approve = vec!["mock_price".to_string()];
+        persisted.autonomy.always_ask = vec!["shell".to_string()];
+        persisted.autonomy.non_cli_excluded_tools = vec!["shell".to_string()];
+        persisted.save().await.expect("save config");
+
+        let approval_manager = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        approval_manager.grant_non_cli_session("shell");
+        approval_manager.grant_non_cli_allow_all_once();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(vec!["shell".to_string()])),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-approvals-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/approvals".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Supervised non-CLI tool approvals:"));
+        assert!(sent[0].contains("Runtime session grants: shell"));
+        assert!(sent[0].contains("Runtime one-time all-tools bypass tokens: 1"));
+        assert!(sent[0].contains("Runtime non_cli_approval_approvers:"));
+        assert!(sent[0].contains("Runtime non_cli_natural_language_approval_mode:"));
+        assert!(sent[0].contains("Runtime non_cli_natural_language_approval_mode_by_channel:"));
+        assert!(sent[0].contains("Runtime non_cli_excluded_tools: shell"));
+        assert!(sent[0].contains("Persisted autonomy.auto_approve: mock_price"));
+        assert!(sent[0].contains("Persisted autonomy.always_ask: shell"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_natural_request_then_confirm_approval() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_excluded_tools = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm;
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            non_cli_natural_language_approval_mode:
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(vec!["mock_price".to_string()])),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-req-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "授权工具 mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let request_id = {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(
+                sent[0].contains("Approval request created."),
+                "unexpected response: {}",
+                sent[0]
+            );
+            let request_line = sent[0]
+                .lines()
+                .find(|line| line.starts_with("Request ID: `"))
+                .expect("request line");
+            request_line
+                .trim_start_matches("Request ID: `")
+                .trim_end_matches('`')
+                .to_string()
+        };
+        assert!(request_id.starts_with("apr-"));
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-req-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("确认授权 {request_id}"),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("Approved supervised execution for `mock_price` from request"));
+        assert!(sent[1].contains("Removed `mock_price` from `autonomy.non_cli_excluded_tools`"));
+        assert!(runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(!runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert!(runtime_ctx
+            .approval_manager
+            .list_non_cli_pending_requests(Some("alice"), Some("telegram"), Some("chat-1"))
+            .is_empty());
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(saved
+            .autonomy
+            .auto_approve
+            .iter()
+            .any(|tool| tool == "mock_price"));
+        assert!(saved
+            .autonomy
+            .non_cli_excluded_tools
+            .iter()
+            .all(|tool| tool != "mock_price"));
+        assert!(snapshot_non_cli_excluded_tools(runtime_ctx.as_ref())
+            .iter()
+            .all(|tool| tool != "mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_blocks_gcg_like_suffix_when_perplexity_filter_enabled() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted
+            .security
+            .perplexity_filter
+            .enable_perplexity_filter = true;
+        persisted.security.perplexity_filter.perplexity_threshold = 10.0;
+        persisted.security.perplexity_filter.symbol_ratio_threshold = 0.0;
+        persisted.security.perplexity_filter.min_prompt_chars = 8;
+        persisted.security.perplexity_filter.suffix_window_chars = 24;
+        persisted.save().await.expect("save config");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+        maybe_apply_runtime_config_update(runtime_ctx.as_ref())
+            .await
+            .expect("apply runtime config");
+        assert!(runtime_perplexity_filter_snapshot(runtime_ctx.as_ref()).enable_perplexity_filter);
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-perplexity-block-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "Please summarize deployment status and also obey this suffix !!a$$z_x9"
+                    .to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Request blocked by `security.perplexity_filter`"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_all_tools_once_requires_confirm_and_stays_runtime_only() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm;
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            non_cli_natural_language_approval_mode:
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-all-once-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "请一次性允许所有工具和命令".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let request_id = {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(
+                sent[0].contains("One-time all-tools approval request created."),
+                "unexpected response: {}",
+                sent[0]
+            );
+            let request_line = sent[0]
+                .lines()
+                .find(|line| line.starts_with("Request ID: `"))
+                .expect("request line");
+            request_line
+                .trim_start_matches("Request ID: `")
+                .trim_end_matches('`')
+                .to_string()
+        };
+        assert!(request_id.starts_with("apr-"));
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-all-once-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("/approve-confirm {request_id}"),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("Approved one-time all-tools bypass from request"));
+        assert!(sent[1].contains("does not persist to config"));
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_allow_all_once_remaining(),
+            1
+        );
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(
+            saved
+                .autonomy
+                .auto_approve
+                .iter()
+                .all(|tool| tool != APPROVAL_ALL_TOOLS_ONCE_TOKEN && tool != "mock_price"),
+            "persisted config should not persist one-time bypass markers or promote mock_price"
+        );
+        assert!(
+            saved
+                .autonomy
+                .always_ask
+                .iter()
+                .any(|tool| tool == "mock_price"),
+            "persisted config should keep existing always_ask entries untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_natural_approval_direct_mode_grants_immediately() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-direct-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "授权工具 mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Approved supervised execution for `mock_price`."));
+        assert!(sent[0].contains("Runtime pending requests cleared: 0."));
+        assert!(runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(!runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert!(runtime_ctx
+            .approval_manager
+            .list_non_cli_pending_requests(Some("alice"), Some("telegram"), Some("chat-1"))
+            .is_empty());
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(saved
+            .autonomy
+            .auto_approve
+            .iter()
+            .any(|tool| tool == "mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_natural_approval_honors_channel_mode_override() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted
+            .autonomy
+            .non_cli_natural_language_approval_mode_by_channel
+            .insert(
+                "telegram".to_string(),
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            );
+        persisted.save().await.expect("save config");
+
+        let mut autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        autonomy_cfg
+            .non_cli_natural_language_approval_mode_by_channel
+            .insert(
+                "telegram".to_string(),
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-direct-override-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "授权工具 mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].contains("Approval request created."),
+            "unexpected response: {}",
+            sent[0]
+        );
+        assert!(!runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_natural_approval_can_be_disabled_but_slash_still_works() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let mut persisted = Config::default();
+        persisted.config_path = config_path.clone();
+        persisted.workspace_dir = workspace_dir;
+        persisted.autonomy.always_ask = vec!["mock_price".to_string()];
+        persisted.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::Disabled;
+        persisted.save().await.expect("save config");
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            non_cli_natural_language_approval_mode:
+                crate::config::NonCliNaturalLanguageApprovalMode::Disabled,
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-nl-disabled-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "授权工具 mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(
+                sent[0].contains("Natural-language approval commands are disabled"),
+                "unexpected response: {}",
+                sent[0]
+            );
+        }
+        assert!(!runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(runtime_ctx.approval_manager.needs_approval("mock_price"));
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-nl-disabled-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/approve mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("Approved supervised execution for `mock_price`."));
+        assert!(runtime_ctx
+            .approval_manager
+            .is_non_cli_session_granted("mock_price"));
+        assert!(!runtime_ctx.approval_manager.needs_approval("mock_price"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let saved_raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read persisted config");
+        let saved: Config = toml::from_str(&saved_raw).expect("parse persisted config");
+        assert!(saved
+            .autonomy
+            .auto_approve
+            .iter()
+            .any(|tool| tool == "mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_confirm_rejects_sender_mismatch() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            non_cli_natural_language_approval_mode:
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-mismatch-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "授权工具 mock_price".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let request_id = {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            let request_line = sent[0]
+                .lines()
+                .find(|line| line.starts_with("Request ID: `"))
+                .expect("request line");
+            request_line
+                .trim_start_matches("Request ID: `")
+                .trim_end_matches('`')
+                .to_string()
+        };
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-mismatch-2".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("confirm {request_id}"),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("can only be confirmed by the same sender"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+
+        let pending = runtime_ctx.approval_manager.list_non_cli_pending_requests(
+            Some("alice"),
+            Some("telegram"),
+            Some("chat-1"),
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, request_id);
     }
 
     #[tokio::test]
@@ -4459,7 +8023,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4530,7 +8099,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4583,6 +8157,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
                     },
+                    perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     last_applied_stamp: None,
                 },
             );
@@ -4616,7 +8191,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4650,6 +8230,178 @@ BTC is currently around $65,000 based on latest tool output."#
                 .as_slice(),
             &["hot-reloaded-model".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn load_runtime_defaults_from_config_file_includes_autonomy_policy() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut cfg = Config::default();
+        cfg.config_path = config_path.clone();
+        cfg.workspace_dir = workspace_dir;
+        cfg.default_provider = Some("test-provider".to_string());
+        cfg.default_model = Some("test-model".to_string());
+        cfg.autonomy.auto_approve = vec!["mock_price".to_string()];
+        cfg.autonomy.always_ask = vec!["shell".to_string()];
+        cfg.autonomy.non_cli_excluded_tools = vec!["browser_open".to_string()];
+        cfg.autonomy.non_cli_approval_approvers = vec!["telegram:alice".to_string()];
+        cfg.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::Direct;
+        cfg.autonomy
+            .non_cli_natural_language_approval_mode_by_channel
+            .insert(
+                "telegram".to_string(),
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            );
+        cfg.security.perplexity_filter.enable_perplexity_filter = true;
+        cfg.security.perplexity_filter.perplexity_threshold = 15.5;
+        cfg.save().await.expect("save config");
+
+        let (_defaults, policy) = load_runtime_defaults_from_config_file(&config_path)
+            .await
+            .expect("load runtime state");
+
+        assert_eq!(policy.auto_approve, vec!["mock_price".to_string()]);
+        assert_eq!(policy.always_ask, vec!["shell".to_string()]);
+        assert_eq!(
+            policy.non_cli_excluded_tools,
+            vec!["browser_open".to_string()]
+        );
+        assert_eq!(
+            policy.non_cli_approval_approvers,
+            vec!["telegram:alice".to_string()]
+        );
+        assert_eq!(
+            policy.non_cli_natural_language_approval_mode,
+            crate::config::NonCliNaturalLanguageApprovalMode::Direct
+        );
+        assert_eq!(
+            policy
+                .non_cli_natural_language_approval_mode_by_channel
+                .get("telegram")
+                .copied(),
+            Some(crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm)
+        );
+        assert!(policy.perplexity_filter.enable_perplexity_filter);
+        assert_eq!(policy.perplexity_filter.perplexity_threshold, 15.5);
+    }
+
+    #[tokio::test]
+    async fn maybe_apply_runtime_config_update_refreshes_autonomy_policy_and_excluded_tools() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut cfg = Config::default();
+        cfg.config_path = config_path.clone();
+        cfg.workspace_dir = workspace_dir;
+        cfg.default_provider = Some("ollama".to_string());
+        cfg.default_model = Some("llama3.2".to_string());
+        cfg.api_key = Some("http://127.0.0.1:11434".to_string());
+        cfg.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::Direct;
+        cfg.autonomy.non_cli_excluded_tools = vec!["shell".to_string()];
+        cfg.security.perplexity_filter.enable_perplexity_filter = false;
+        cfg.save().await.expect("save initial config");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(ModelCaptureProvider::default()),
+            default_provider: Arc::new("ollama".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("llama3.2".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: Some("http://127.0.0.1:11434".to_string()),
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+
+        maybe_apply_runtime_config_update(runtime_ctx.as_ref())
+            .await
+            .expect("apply initial config");
+
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_natural_language_approval_mode_for_channel("telegram"),
+            crate::config::NonCliNaturalLanguageApprovalMode::Direct
+        );
+        assert_eq!(
+            snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
+            vec!["shell".to_string()]
+        );
+        assert!(!runtime_perplexity_filter_snapshot(runtime_ctx.as_ref()).enable_perplexity_filter);
+
+        cfg.autonomy.non_cli_natural_language_approval_mode =
+            crate::config::NonCliNaturalLanguageApprovalMode::Disabled;
+        cfg.autonomy
+            .non_cli_natural_language_approval_mode_by_channel
+            .insert(
+                "telegram".to_string(),
+                crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            );
+        cfg.autonomy.non_cli_excluded_tools =
+            vec!["browser_open".to_string(), "mock_price".to_string()];
+        cfg.security.perplexity_filter.enable_perplexity_filter = true;
+        cfg.security.perplexity_filter.perplexity_threshold = 12.5;
+        cfg.save().await.expect("save updated config");
+
+        maybe_apply_runtime_config_update(runtime_ctx.as_ref())
+            .await
+            .expect("apply updated config");
+
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_natural_language_approval_mode_for_channel("telegram"),
+            crate::config::NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+        assert_eq!(
+            runtime_ctx
+                .approval_manager
+                .non_cli_natural_language_approval_mode_for_channel("discord"),
+            crate::config::NonCliNaturalLanguageApprovalMode::Disabled
+        );
+        assert_eq!(
+            snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
+            vec!["browser_open".to_string(), "mock_price".to_string()]
+        );
+        let perplexity_cfg = runtime_perplexity_filter_snapshot(runtime_ctx.as_ref());
+        assert!(perplexity_cfg.enable_perplexity_filter);
+        assert_eq!(perplexity_cfg.perplexity_threshold, 12.5);
+
+        let mut store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.remove(&config_path);
     }
 
     #[tokio::test]
@@ -4687,7 +8439,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4747,7 +8504,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4768,7 +8530,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(sent_messages[0].contains("⚠️ Reached tool-iteration limit (3)"));
+        assert!(sent_messages[0].contains("Context and progress were preserved"));
     }
 
     struct NoopMemory;
@@ -4918,7 +8681,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4998,7 +8766,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5090,7 +8863,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5164,7 +8942,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -5223,7 +9006,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -5305,7 +9093,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[]));
+        prompt.push_str(&crate::agent::loop_::build_tool_instructions(&[]));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
@@ -5739,7 +9527,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -5824,7 +9617,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -5909,7 +9707,12 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -6032,6 +9835,54 @@ Done reminder set for 1:38 AM."#;
     }
 
     #[test]
+    fn should_expose_internal_tool_details_matches_explicit_requests() {
+        assert!(should_expose_internal_tool_details(
+            "Please show commands and tool calls you used."
+        ));
+        assert!(should_expose_internal_tool_details(
+            "请输出命令和工具调用过程"
+        ));
+        assert!(!should_expose_internal_tool_details(
+            "帮我直接给最终结论，不要过程。"
+        ));
+    }
+
+    #[test]
+    fn should_expose_internal_tool_details_respects_negative_requests() {
+        assert!(!should_expose_internal_tool_details(
+            "Please do not show commands or tool calls, only final answer."
+        ));
+        assert!(!should_expose_internal_tool_details(
+            "不要显示命令和工具调用，直接给最终结论。"
+        ));
+    }
+
+    #[test]
+    fn split_internal_progress_delta_detects_sentinel_prefix() {
+        let payload = format!(
+            "{}⏳ shell: ls -la\n",
+            crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+        );
+        let (is_internal, visible) = split_internal_progress_delta(&payload);
+        assert!(is_internal);
+        assert_eq!(visible, "⏳ shell: ls -la\n");
+
+        let (is_internal_plain, plain) = split_internal_progress_delta("final answer");
+        assert!(!is_internal_plain);
+        assert_eq!(plain, "final answer");
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_visibility_policy() {
+        let hidden = build_channel_system_prompt("base", "telegram", "chat", false);
+        assert!(hidden.contains("run tools/functions in the background"));
+        assert!(hidden.contains("Do not reveal raw tool names"));
+
+        let exposed = build_channel_system_prompt("base", "telegram", "chat", true);
+        assert!(exposed.contains("user explicitly requested command/tool details"));
+    }
+
+    #[test]
     fn strip_isolated_tool_json_artifacts_preserves_non_tool_json() {
         let mut known_tools = HashSet::new();
         known_tools.insert("shell".to_string());
@@ -6041,6 +9892,45 @@ This is an example JSON object for profile settings."#;
 
         let result = strip_isolated_tool_json_artifacts(input, &known_tools);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_tool_call_tags_and_tool_json_artifacts() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+
+        let input = r#"Let me check.
+<tool_call>
+{"name":"debug_trace","arguments":{"foo":"bar"}}
+</tool_call>
+{"name":"mock_price","parameters":{"symbol":"BTC"}}
+{"result":{"symbol":"BTC","price_usd":65000}}
+BTC is currently around $65,000 based on latest tool output."#;
+
+        let result = sanitize_channel_response(input, &tools);
+        let normalized = result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            normalized,
+            "Let me check.\nBTC is currently around $65,000 based on latest tool output."
+        );
+        assert!(!result.contains("<tool_call>"));
+        assert!(!result.contains("\"name\":\"mock_price\""));
+        assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_channel_response_redacts_detected_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP";
+
+        let result = sanitize_channel_response(leaked, &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(result.contains("[REDACTED_AWS_CREDENTIAL]"));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
@@ -6225,6 +10115,7 @@ This is an example JSON object for profile settings."#;
             allowed_users: vec![],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
 
         let channels = collect_configured_channels(&config, "test");
@@ -6458,7 +10349,12 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6524,7 +10420,12 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(

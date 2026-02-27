@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,6 +9,22 @@ use tokio::time::Duration;
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Pre-flight: check if port is already in use by another zeroclaw daemon
+    if let Err(_e) = check_port_available(&host, port).await {
+        // Port is in use - check if it's our daemon
+        if is_zeroclaw_daemon_running(&host, port).await {
+            tracing::info!("ZeroClaw daemon already running on {host}:{port}");
+            println!("✓ ZeroClaw daemon already running on http://{host}:{port}");
+            println!("  Use 'zeroclaw restart' to restart, or 'zeroclaw status' to check health.");
+            return Ok(());
+        }
+        // Something else is using the port
+        bail!(
+            "Port {port} is already in use by another process. \
+             Run 'lsof -i :{port}' to identify it, or use a different port."
+        );
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -326,6 +342,49 @@ fn has_supervised_channels(config: &Config) -> bool {
         .any(|(_, ok)| *ok)
 }
 
+/// Check if a port is available for binding
+async fn check_port_available(host: &str, port: u16) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            // Successfully bound - close it and return Ok
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            bail!("Port {} is already in use", port)
+        }
+        Err(e) => bail!("Failed to check port {}: {}", port, e),
+    }
+}
+
+/// Check if a running daemon on this port is our zeroclaw daemon
+async fn is_zeroclaw_daemon_running(host: &str, port: u16) -> bool {
+    let url = format!("http://{}:{}/health", host, port);
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    // Check if response looks like our health endpoint
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        // Our health endpoint has "status" and "runtime.components"
+                        json.get("status").is_some() && json.get("runtime").is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +463,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -429,6 +490,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -440,6 +502,8 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -536,6 +600,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();

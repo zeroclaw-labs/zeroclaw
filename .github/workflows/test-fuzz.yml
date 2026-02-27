@@ -19,12 +19,15 @@ permissions:
     issues: write
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
     fuzz:
         name: Fuzz (${{ matrix.target }})
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 60
         strategy:
             fail-fast: false

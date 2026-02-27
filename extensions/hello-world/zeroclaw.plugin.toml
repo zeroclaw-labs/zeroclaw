@@ -1,0 +1,4 @@
+id = "hello-world"
+name = "Hello World"
+description = "Example plugin demonstrating the ZeroClaw plugin API."
+version = "0.1.0"

@@ -34,9 +34,12 @@ pub mod landlock;
 pub mod leak_detector;
 pub mod otp;
 pub mod pairing;
+pub mod perplexity;
 pub mod policy;
 pub mod prompt_guard;
+pub mod roles;
 pub mod secrets;
+pub mod syscall_anomaly;
 pub mod traits;
 
 #[allow(unused_imports)]
@@ -50,9 +53,15 @@ pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 pub use otp::OtpValidator;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
+#[allow(unused_imports)]
+pub use perplexity::{detect_adversarial_suffix, PerplexityAssessment};
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
+pub use roles::{RoleRegistry, ToolAccess};
+#[allow(unused_imports)]
 pub use secrets::SecretStore;
+#[allow(unused_imports)]
+pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Prompt injection defense exports
@@ -60,16 +69,6 @@ pub use traits::{NoopSandbox, Sandbox};
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
-
-/// Validate shell environment variable names (`[A-Za-z_][A-Za-z0-9_]*`).
-pub fn is_valid_env_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.

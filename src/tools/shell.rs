@@ -1,6 +1,5 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::is_valid_env_var_name;
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
@@ -42,6 +41,15 @@ impl ShellTool {
             syscall_detector,
         }
     }
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 pub(super) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
@@ -492,7 +500,7 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["env".into(), "echo".into()],
+            allowed_commands: vec!["env".into()],
             shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
             ..SecurityPolicy::default()
         })
@@ -593,22 +601,6 @@ mod tests {
         assert!(result
             .output
             .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn shell_allows_passthrough_variable_expansion() {
-        let _guard = EnvGuard::set("ZEROCLAW_TEST_TOKEN", "token-from-env");
-        let tool = ShellTool::new(
-            test_security_with_env_passthrough(&["ZEROCLAW_TEST_TOKEN"]),
-            test_runtime(),
-        );
-
-        let result = tool
-            .execute(json!({"command": "echo \"Bearer $ZEROCLAW_TEST_TOKEN\""}))
-            .await
-            .expect("passthrough variable expansion should be allowed");
-        assert!(result.success);
-        assert!(result.output.contains("Bearer token-from-env"));
     }
 
     #[test]

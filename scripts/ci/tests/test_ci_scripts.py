@@ -229,14 +229,14 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "id": "RUSTSEC-2025-0001",
                             "owner": "repo-maintainers",
                             "reason": "Tracked with mitigation plan while waiting upstream patch.",
-                            "ticket": "SEC-21",
+                            "ticket": "RMN-21",
                             "expires_on": "2027-01-01",
                         },
                         {
                             "id": "RUSTSEC-2025-0002",
                             "owner": "repo-maintainers",
                             "reason": "Accepted transiently due to transitive dependency under migration.",
-                            "ticket": "SEC-21",
+                            "ticket": "RMN-21",
                             "expires_on": "2027-01-01",
                         },
                     ],
@@ -294,7 +294,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "id": "RUSTSEC-2025-1111",
                             "owner": "repo-maintainers",
                             "reason": "Temporary ignore while upstream patch is under review.",
-                            "ticket": "SEC-21",
+                            "ticket": "RMN-21",
                             "expires_on": "2020-01-01",
                         }
                     ],
@@ -352,7 +352,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "pattern": r"src/security/leak_detector\.rs",
                             "owner": "repo-maintainers",
                             "reason": "Fixture pattern used in secret scanning regression tests.",
-                            "ticket": "SEC-13",
+                            "ticket": "RMN-13",
                             "expires_on": "2027-01-01",
                         }
                     ],
@@ -361,7 +361,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "pattern": r"Authorization: Bearer \$\{[^}]+\}",
                             "owner": "repo-maintainers",
                             "reason": "Placeholder token pattern used in docs and snippets.",
-                            "ticket": "SEC-13",
+                            "ticket": "RMN-13",
                             "expires_on": "2027-01-01",
                         }
                     ],
@@ -416,7 +416,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "pattern": r"src/security/leak_detector\.rs",
                             "owner": "repo-maintainers",
                             "reason": "Fixture pattern used in secret scanning regression tests.",
-                            "ticket": "SEC-13",
+                            "ticket": "RMN-13",
                             "expires_on": "2020-01-01",
                         }
                     ],
@@ -425,7 +425,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "pattern": r"Authorization: Bearer \$\{[^}]+\}",
                             "owner": "repo-maintainers",
                             "reason": "Placeholder token pattern used in docs and snippets.",
-                            "ticket": "SEC-13",
+                            "ticket": "RMN-13",
                             "expires_on": "2027-01-01",
                         }
                     ],
@@ -1554,7 +1554,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "path": "legacy/vendor",
                             "owner": "repo-maintainers",
                             "reason": "Temporary vendor mirror while upstream replaces unsafe bindings.",
-                            "ticket": "SEC-32",
+                            "ticket": "RMN-32",
                             "expires_on": "2027-01-01",
                         }
                     ],
@@ -1563,7 +1563,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "pattern_id": "ffi_libc_call",
                             "owner": "repo-maintainers",
                             "reason": "Allowlisted for libc shim crate pending migration to safer wrappers.",
-                            "ticket": "SEC-32",
+                            "ticket": "RMN-32",
                             "expires_on": "2027-01-01",
                         }
                     ],
@@ -1620,7 +1620,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "path": "legacy/vendor",
                             "owner": "repo-maintainers",
                             "reason": "Temporary vendor mirror while upstream replaces unsafe bindings.",
-                            "ticket": "SEC-32",
+                            "ticket": "RMN-32",
                             "expires_on": "2020-01-01",
                         }
                     ],
@@ -1629,7 +1629,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "pattern_id": "ffi_libc_call",
                             "owner": "repo-maintainers",
                             "reason": "Allowlisted for libc shim crate pending migration to safer wrappers.",
-                            "ticket": "SEC-32",
+                            "ticket": "RMN-32",
                             "expires_on": "2027-01-01",
                         }
                     ],
