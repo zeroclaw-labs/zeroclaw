@@ -7,6 +7,7 @@ Last refreshed: **February 25, 2026**.
 ## Language Entry
 
 - Docs Structure Map (language/part/function): [structure/README.md](structure/README.md)
+- Docs Map (by function): [structure/by-function.md](structure/by-function.md)
 - English README: [../README.md](../README.md)
 - Chinese README: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - Japanese README: [docs/i18n/ja/README.md](i18n/ja/README.md)

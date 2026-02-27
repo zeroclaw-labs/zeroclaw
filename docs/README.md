@@ -90,6 +90,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 
 - Unified TOC: [SUMMARY.md](SUMMARY.md)
 - Docs structure map (language/part/function): [structure/README.md](structure/README.md)
+- Docs map by function: [structure/by-function.md](structure/by-function.md)
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
 - i18n docs index: [i18n/README.md](i18n/README.md)
 - i18n coverage map: [i18n-coverage.md](i18n-coverage.md)
