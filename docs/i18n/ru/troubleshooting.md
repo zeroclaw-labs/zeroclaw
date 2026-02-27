@@ -19,6 +19,86 @@
 
 ## Обновление
 
-- Для сценария `web_search_tool` с `403/429` добавлены варианты провайдеров `exa` и `tavily` (см. английский оригинал).
-- Если `curl`/`wget` заблокированы в shell tool политикой, используйте `http_request` или `web_fetch` вместо них (см. раздел «Web Access Issues» в английском оригинале).
-- При ошибке host not allowed в `web_fetch`/`http_request` добавьте нужный домен или задайте `allowed_domains = ["*"]` в конфигурации (см. английский оригинал).
+### Ошибка `403`/`429` в `web_search_tool`
+
+**Симптом**: Появляется сообщение типа `DuckDuckGo search failed with status: 403` (или `429`).
+
+**Причина**: Некоторые сети/прокси блокируют HTML-эндпоинт DuckDuckGo.
+
+**Варианты исправления**:
+
+1. Переключиться на Brave:
+```toml
+[web_search]
+enabled = true
+provider = "brave"
+brave_api_key = "<SECRET>"
+```
+
+2. Переключиться на Exa:
+```toml
+[web_search]
+enabled = true
+provider = "exa"
+api_key = "<SECRET>"
+# опционально
+# api_url = "https://api.exa.ai/search"
+```
+
+3. Переключиться на Tavily:
+```toml
+[web_search]
+enabled = true
+provider = "tavily"
+api_key = "<SECRET>"
+# опционально
+# api_url = "https://api.tavily.com/search"
+```
+
+4. Переключиться на Firecrawl (если поддерживается в сборке):
+```toml
+[web_search]
+enabled = true
+provider = "firecrawl"
+api_key = "<SECRET>"
+```
+
+### `curl`/`wget` заблокированы в shell tool
+
+**Симптом**: В выводе содержится `Command blocked: high-risk command is disallowed by policy`.
+
+**Причина**: `curl`/`wget` блокируются политикой автономии как высокорисковые команды.
+
+**Решение**: Используйте специализированные инструменты вместо shell fetch:
+- `http_request` — прямые API/HTTP-запросы
+- `web_fetch` — извлечение и обработка содержимого страниц
+
+Минимальная конфигурация:
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+provider = "fast_html2md"
+allowed_domains = ["*"]
+```
+
+### `web_fetch`/`http_request` — Host not allowed
+
+**Симптом**: Появляется ошибка типа `Host '<domain>' is not in http_request.allowed_domains`.
+
+**Решение**: Добавьте домен в список или используйте `"*"` для публичного доступа:
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+```
+
+**Примечание по безопасности**: Локальные/приватные сети остаются заблокированными даже при `"*"`.

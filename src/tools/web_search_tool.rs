@@ -223,11 +223,10 @@ impl WebSearchTool {
             .map_err(|e| anyhow::anyhow!("Exa search failed: {e}"))?;
 
         let status = response.status();
-        let body = response.text().await?;
-
         if !status.is_success() {
             anyhow::bail!("Exa search failed with status: {}", status.as_u16());
         }
+        let body = response.text().await?;
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("Invalid Exa response JSON: {e}"))?;
@@ -334,11 +333,10 @@ impl WebSearchTool {
             .map_err(|e| anyhow::anyhow!("Tavily search failed: {e}"))?;
 
         let status = response.status();
-        let body = response.text().await?;
-
         if !status.is_success() {
             anyhow::bail!("Tavily search failed with status: {}", status.as_u16());
         }
+        let body = response.text().await?;
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("Invalid Tavily response JSON: {e}"))?;
@@ -431,15 +429,10 @@ impl WebSearchTool {
             .await
             .map_err(|e| anyhow::anyhow!("Firecrawl search failed: {e}"))?;
         let status = response.status();
-        let body = response.text().await?;
-
         if !status.is_success() {
-            anyhow::bail!(
-                "Firecrawl search failed with status {}: {}",
-                status.as_u16(),
-                body
-            );
+            anyhow::bail!("Firecrawl search failed with status: {}", status.as_u16());
         }
+        let body = response.text().await?;
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("Invalid Firecrawl response JSON: {e}"))?;
