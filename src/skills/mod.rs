@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 mod audit;
 mod market;
 
+#[allow(unused_imports)]
 pub use market::{SkillIndex, SkillIndexEntry, SkillMarket, UpdateAvailable};
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
@@ -992,6 +993,75 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 console::style("✓").green().bold(),
                 name
             );
+            Ok(())
+        }
+        crate::SkillCommands::Search { query } => {
+            let Some(market) = SkillMarket::from_config(&config.skills) else {
+                anyhow::bail!("Skill market not configured. Set skills.market_url in config.");
+            };
+
+            println!("Searching market for: {query}");
+            let rt = tokio::runtime::Runtime::new()?;
+            let results = rt.block_on(market.search(&query))?;
+
+            if results.is_empty() {
+                println!("No skills found matching '{query}'.");
+            } else {
+                println!("\nFound {} skill(s):\n", results.len());
+                for entry in &results {
+                    println!(
+                        "  {} {} — {}",
+                        console::style(&entry.name).white().bold(),
+                        console::style(format!("v{}", entry.version)).dim(),
+                        entry.description
+                    );
+                    println!("    Author: {}", entry.author);
+                }
+            }
+            Ok(())
+        }
+        crate::SkillCommands::Update { name } => {
+            match name {
+                Some(n) => {
+                    println!("Updating skill: {n}");
+                    println!("  {} Skill update not yet implemented.", 
+                        console::style("!").yellow().bold());
+                }
+                None => {
+                    println!("Updating all installed skills...");
+                    println!("  {} Bulk update not yet implemented.", 
+                        console::style("!").yellow().bold());
+                }
+            }
+            Ok(())
+        }
+        crate::SkillCommands::Info { name } => {
+            let skills = load_skills_with_config(workspace_dir, config);
+            let skill = skills.iter().find(|s| s.name == name);
+
+            match skill {
+                Some(s) => {
+                    println!("{}", console::style(&s.name).white().bold());
+                    println!("  Version: {}", s.version);
+                    println!("  Description: {}", s.description);
+                    if let Some(author) = &s.author {
+                        println!("  Author: {}", author);
+                    }
+                    if !s.tags.is_empty() {
+                        println!("  Tags: {}", s.tags.join(", "));
+                    }
+                    if !s.tools.is_empty() {
+                        println!(
+                            "  Tools: {}",
+                            s.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                    if let Some(loc) = &s.location {
+                        println!("  Location: {}", loc.display());
+                    }
+                }
+                None => anyhow::bail!("Skill not found: {name}"),
+            }
             Ok(())
         }
     }

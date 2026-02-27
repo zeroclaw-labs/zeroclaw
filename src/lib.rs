@@ -162,6 +162,21 @@ pub enum SkillCommands {
         /// Skill name to remove
         name: String,
     },
+    /// Search skill market for skills
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// Update installed skills
+    Update {
+        /// Optional specific skill name to update
+        name: Option<String>,
+    },
+    /// Show skill details
+    Info {
+        /// Skill name
+        name: String,
+    },
 }
 
 /// Migration subcommands
