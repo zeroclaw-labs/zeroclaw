@@ -170,6 +170,34 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Send an image message.
+    ///
+    /// Default implementation converts to a text marker.
+    /// Channels supporting rich media should override this method.
+    async fn send_image(
+        &self,
+        recipient: &str,
+        image_data: &[u8],
+        _filename: &str,
+    ) -> anyhow::Result<()> {
+        let marker = format!("[IMAGE: {} bytes]", image_data.len());
+        self.send(&SendMessage::new(marker, recipient)).await
+    }
+
+    /// Send a file message.
+    ///
+    /// Default implementation converts to a text marker.
+    /// Channels supporting rich media should override this method.
+    async fn send_file(
+        &self,
+        recipient: &str,
+        file_data: &[u8],
+        filename: &str,
+    ) -> anyhow::Result<()> {
+        let marker = format!("[FILE: {} ({} bytes)]", filename, file_data.len());
+        self.send(&SendMessage::new(marker, recipient)).await
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +266,8 @@ mod tests {
             .send(&SendMessage::new("hello", "bob"))
             .await
             .is_ok());
+        assert!(channel.send_image("bob", b"png", "a.png").await.is_ok());
+        assert!(channel.send_file("bob", b"txt", "a.txt").await.is_ok());
     }
 
     #[tokio::test]

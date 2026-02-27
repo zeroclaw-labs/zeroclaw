@@ -709,7 +709,7 @@ pub struct SkillsConfig {
     /// Default: `true`.
     #[serde(default = "default_bundled_enabled")]
     pub bundled_enabled: bool,
-    /// Optional skill market API URL (e.g., "https://clawhub.ai/api/v1").
+    /// Optional skill market API URL (e.g., "https://clawhub.com/api/v1").
     #[serde(default)]
     pub market_url: Option<String>,
     /// Allow installing skills from remote market.

@@ -62,10 +62,7 @@ impl SkillMarket {
         let response = self.client.get(&url).send().await?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Market search failed: status {}",
-                response.status()
-            );
+            anyhow::bail!("Market search failed: status {}", response.status());
         }
 
         let skills: Vec<SkillIndexEntry> = response.json().await?;
@@ -78,10 +75,7 @@ impl SkillMarket {
         let response = self.client.get(&url).send().await?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Market index fetch failed: status {}",
-                response.status()
-            );
+            anyhow::bail!("Market index fetch failed: status {}", response.status());
         }
 
         let skills: Vec<SkillIndexEntry> = response.json().await?;
@@ -111,10 +105,7 @@ impl SkillMarket {
 
         let response = self.client.get(&entry.download_url).send().await?;
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Skill download failed: status {}",
-                response.status()
-            );
+            anyhow::bail!("Skill download failed: status {}", response.status());
         }
 
         let bytes = response.bytes().await?;
@@ -124,7 +115,9 @@ impl SkillMarket {
         if actual_checksum != expected_checksum {
             anyhow::bail!(
                 "Checksum mismatch for skill {}: expected {}, got {}",
-                name, expected_checksum, actual_checksum
+                name,
+                expected_checksum,
+                actual_checksum
             );
         }
 
@@ -150,10 +143,7 @@ impl SkillMarket {
         Ok(dest)
     }
 
-    pub async fn check_updates(
-        &self,
-        installed: &[super::Skill],
-    ) -> Result<Vec<UpdateAvailable>> {
+    pub async fn check_updates(&self, installed: &[super::Skill]) -> Result<Vec<UpdateAvailable>> {
         let index = self.get_index().await?;
         let mut updates = Vec::new();
 
@@ -192,7 +182,7 @@ mod tests {
     #[test]
     fn skill_market_from_config_returns_some_when_url_set() {
         let mut config = crate::config::SkillsConfig::default();
-        config.market_url = Some("https://clawhub.ai/api/v1".to_string());
+        config.market_url = Some("https://clawhub.com/api/v1".to_string());
         assert!(SkillMarket::from_config(&config).is_some());
     }
 

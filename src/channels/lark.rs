@@ -219,6 +219,8 @@ const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 const LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT: &str =
     "[Image message received but could not be downloaded]";
+const LARK_FILE_DOWNLOAD_FALLBACK_TEXT: &str =
+    "[File message received but could not be downloaded]";
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -250,6 +252,17 @@ fn parse_image_key(content: &str) -> Option<String> {
         .and_then(|value| {
             value
                 .get("image_key")
+                .and_then(|key| key.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn parse_file_key(content: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("file_key")
                 .and_then(|key| key.as_str())
                 .map(str::to_string)
         })
@@ -462,6 +475,14 @@ impl LarkChannel {
         format!("{}/im/v1/images/{image_key}", self.api_base())
     }
 
+    fn image_upload_url(&self) -> String {
+        format!("{}/im/v1/images", self.api_base())
+    }
+
+    fn file_upload_url(&self) -> String {
+        format!("{}/im/v1/files", self.api_base())
+    }
+
     fn resolved_bot_open_id(&self) -> Option<String> {
         self.resolved_bot_open_id
             .read()
@@ -528,6 +549,107 @@ impl LarkChannel {
                 crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
             );
         }
+    }
+
+    async fn upload_image_key(&self, image_data: &[u8], filename: &str) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let part = reqwest::multipart::Part::bytes(image_data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str("image/png")?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let response = self
+            .http_client()
+            .post(self.image_upload_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if !status.is_success() {
+            anyhow::bail!(
+                "Lark image upload failed: status={status}, body={}",
+                sanitize_lark_body(&body)
+            );
+        }
+        let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            anyhow::bail!("Lark image upload failed: {}", sanitize_lark_body(&body));
+        }
+        body.pointer("/data/image_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("missing image_key in Lark upload response"))
+    }
+
+    async fn upload_file_key(&self, file_data: &[u8], filename: &str) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let part = reqwest::multipart::Part::bytes(file_data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "stream")
+            .part("file", part);
+
+        let response = self
+            .http_client()
+            .post(self.file_upload_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if !status.is_success() {
+            anyhow::bail!(
+                "Lark file upload failed: status={status}, body={}",
+                sanitize_lark_body(&body)
+            );
+        }
+        let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            anyhow::bail!("Lark file upload failed: {}", sanitize_lark_body(&body));
+        }
+        body.pointer("/data/file_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("missing file_key in Lark upload response"))
+    }
+
+    async fn send_media_message(
+        &self,
+        recipient: &str,
+        msg_type: &str,
+        content: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": msg_type,
+            "content": content.to_string(),
+        });
+
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, &body).await?;
+            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            return Ok(());
+        }
+        ensure_lark_send_success(status, &response, "without token refresh")?;
+        Ok(())
     }
 
     async fn post_message_reaction_with_token(
@@ -883,6 +1005,17 @@ impl LarkChannel {
                             };
                             (text, Vec::new())
                         }
+                        "file" => {
+                            let text = if let Some(file_key) = parse_file_key(&lark_msg.content) {
+                                format!("[FILE:key:{file_key}]")
+                            } else {
+                                tracing::warn!(
+                                    "Lark WS: file content missing file_key; using fallback text"
+                                );
+                                LARK_FILE_DOWNLOAD_FALLBACK_TEXT.to_string()
+                            };
+                            (text, Vec::new())
+                        }
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -1189,6 +1322,7 @@ impl LarkChannel {
                 None => return messages,
             },
             "image" => (LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string(), Vec::new()),
+            "file" => (LARK_FILE_DOWNLOAD_FALLBACK_TEXT.to_string(), Vec::new()),
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1328,6 +1462,15 @@ impl LarkChannel {
                 };
                 (text, Vec::new())
             }
+            "file" => {
+                let text = if let Some(file_key) = parse_file_key(content_str) {
+                    format!("[FILE:key:{file_key}]")
+                } else {
+                    tracing::warn!("Lark webhook: file message missing file_key");
+                    LARK_FILE_DOWNLOAD_FALLBACK_TEXT.to_string()
+                };
+                (text, Vec::new())
+            }
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1418,6 +1561,52 @@ impl Channel for LarkChannel {
 
         ensure_lark_send_success(status, &response, "without token refresh")?;
         Ok(())
+    }
+
+    async fn send_image(
+        &self,
+        recipient: &str,
+        image_data: &[u8],
+        filename: &str,
+    ) -> anyhow::Result<()> {
+        if image_data.is_empty() {
+            anyhow::bail!("image payload is empty");
+        }
+        const MAX_IMAGE_SIZE: usize = 30 * 1024 * 1024;
+        if image_data.len() > MAX_IMAGE_SIZE {
+            anyhow::bail!("image payload exceeds 30MB limit");
+        }
+
+        let image_key = self.upload_image_key(image_data, filename).await?;
+        self.send_media_message(
+            recipient,
+            "image",
+            serde_json::json!({ "image_key": image_key }),
+        )
+        .await
+    }
+
+    async fn send_file(
+        &self,
+        recipient: &str,
+        file_data: &[u8],
+        filename: &str,
+    ) -> anyhow::Result<()> {
+        if file_data.is_empty() {
+            anyhow::bail!("file payload is empty");
+        }
+        const MAX_FILE_SIZE: usize = 20 * 1024 * 1024;
+        if file_data.len() > MAX_FILE_SIZE {
+            anyhow::bail!("file payload exceeds 20MB limit");
+        }
+
+        let file_key = self.upload_file_key(file_data, filename).await?;
+        self.send_media_message(
+            recipient,
+            "file",
+            serde_json::json!({ "file_key": file_key }),
+        )
+        .await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -2230,6 +2419,60 @@ mod tests {
         let msgs = ch.parse_event_payload_async(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT);
+    }
+
+    #[test]
+    fn lark_parse_file_message_uses_fallback_text() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "file",
+                    "content": "{}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, LARK_FILE_DOWNLOAD_FALLBACK_TEXT);
+    }
+
+    #[tokio::test]
+    async fn lark_parse_event_payload_async_file_with_key_returns_marker() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "file",
+                    "content": "{\"file_key\":\"file_v2_123\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[FILE:key:file_v2_123]");
     }
 
     #[test]

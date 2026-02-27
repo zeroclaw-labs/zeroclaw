@@ -59,6 +59,7 @@ pub mod subagent_list;
 pub mod subagent_manage;
 pub mod subagent_registry;
 pub mod subagent_spawn;
+pub mod swarm_orchestrate;
 pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
@@ -109,6 +110,7 @@ pub use subagent_list::SubAgentListTool;
 pub use subagent_manage::SubAgentManageTool;
 pub use subagent_registry::SubAgentRegistry;
 pub use subagent_spawn::SubAgentSpawnTool;
+pub use swarm_orchestrate::SwarmOrchestrateTool;
 pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -470,31 +472,56 @@ pub fn all_tools_with_runtime(
 
             delegate_tool = delegate_tool
                 .with_coordination_bus(coordination_bus.clone(), coordination_lead_agent);
-            tool_arcs.push(Arc::new(delegate_tool));
+            let delegate_tool_arc: Arc<dyn Tool> = Arc::new(delegate_tool);
+            tool_arcs.push(delegate_tool_arc.clone());
             tool_arcs.push(Arc::new(DelegateCoordinationStatusTool::new(
                 coordination_bus,
                 security.clone(),
             )));
+            let subagent_registry = Arc::new(SubAgentRegistry::new());
+            tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
+                delegate_agents.clone(),
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+                subagent_registry.clone(),
+                parent_tools,
+                root_config.multimodal.clone(),
+            )));
+            tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
+            tool_arcs.push(Arc::new(SubAgentManageTool::new(
+                subagent_registry,
+                security.clone(),
+            )));
+            tool_arcs.push(Arc::new(SwarmOrchestrateTool::new(
+                delegate_agents,
+                Some(delegate_tool_arc),
+            )));
         } else {
             delegate_tool = delegate_tool.with_coordination_disabled();
-            tool_arcs.push(Arc::new(delegate_tool));
-        }
+            let delegate_tool_arc: Arc<dyn Tool> = Arc::new(delegate_tool);
+            tool_arcs.push(delegate_tool_arc.clone());
 
-        let subagent_registry = Arc::new(SubAgentRegistry::new());
-        tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
-            delegate_agents,
-            delegate_fallback_credential,
-            security.clone(),
-            provider_runtime_options,
-            subagent_registry.clone(),
-            parent_tools,
-            root_config.multimodal.clone(),
-        )));
-        tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
-        tool_arcs.push(Arc::new(SubAgentManageTool::new(
-            subagent_registry,
-            security.clone(),
-        )));
+            let subagent_registry = Arc::new(SubAgentRegistry::new());
+            tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
+                delegate_agents.clone(),
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+                subagent_registry.clone(),
+                parent_tools,
+                root_config.multimodal.clone(),
+            )));
+            tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
+            tool_arcs.push(Arc::new(SubAgentManageTool::new(
+                subagent_registry,
+                security.clone(),
+            )));
+            tool_arcs.push(Arc::new(SwarmOrchestrateTool::new(
+                delegate_agents,
+                Some(delegate_tool_arc),
+            )));
+        }
     }
 
     // Inter-process agent communication (opt-in)
