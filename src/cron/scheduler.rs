@@ -393,6 +393,8 @@ pub(crate) async fn deliver_announcement(
         #[cfg(feature = "channel-matrix")]
         // Deliver to Matrix room via matrix-sdk with E2EE support.
         // Reuses MatrixChannel which handles session restore and room resolution.
+        // Note: target (room_id or room_alias) is fixed at MatrixChannel construction.
+        // SendMessage.recipient is ignored; use target to specify the Matrix room.
         "matrix" => {
             let mx = config
                 .channels_config

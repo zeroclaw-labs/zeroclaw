@@ -54,11 +54,26 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+        const DESC_WITHOUT_MATRIX: &str = "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
          To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Email), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
-         This is the preferred tool for sending scheduled/delayed messages to users via channels."
+         This is the preferred tool for sending scheduled/delayed messages to users via channels.";
+
+        const DESC_WITH_MATRIX: &str = "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+         Use job_type='agent' with a prompt to run the AI agent on schedule. \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Email, Matrix), set \
+         delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
+         This is the preferred tool for sending scheduled/delayed messages to users via channels.";
+
+        #[cfg(feature = "channel-matrix")]
+        {
+            DESC_WITH_MATRIX
+        }
+        #[cfg(not(feature = "channel-matrix"))]
+        {
+            DESC_WITHOUT_MATRIX
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
