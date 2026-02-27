@@ -252,6 +252,10 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// Plugin system configuration (discovery, loading, per-plugin config).
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -2242,6 +2246,87 @@ pub struct BuiltinHooksConfig {
     pub command_logger: bool,
 }
 
+// ── Plugin system ─────────────────────────────────────────────────────────────
+
+/// Plugin system configuration (`[plugins]` section).
+///
+/// Controls plugin discovery, loading, and per-plugin settings.
+/// Mirrors OpenClaw's `plugins` config block.
+///
+/// Example:
+/// ```toml
+/// [plugins]
+/// enabled = true
+/// allow = ["hello-world"]
+///
+/// [plugins.entries.hello-world]
+/// enabled = true
+///
+/// [plugins.entries.hello-world.config]
+/// greeting = "Howdy"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Master switch — set to `false` to disable all plugin loading. Default: `true`.
+    #[serde(default = "default_plugins_enabled")]
+    pub enabled: bool,
+
+    /// Allowlist — if non-empty, only plugins with these IDs are loaded.
+    /// An empty list means all discovered plugins are eligible.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Denylist — plugins with these IDs are never loaded, even if in the allowlist.
+    #[serde(default)]
+    pub deny: Vec<String>,
+
+    /// Extra directories to scan for plugins (in addition to the standard locations).
+    /// Standard locations: `<binary_dir>/extensions/`, `~/.zeroclaw/extensions/`,
+    /// `<workspace>/.zeroclaw/extensions/`.
+    #[serde(default)]
+    pub load_paths: Vec<String>,
+
+    /// Per-plugin configuration entries.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, PluginEntryConfig>,
+}
+
+fn default_plugins_enabled() -> bool {
+    true
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            load_paths: Vec::new(),
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Per-plugin configuration entry (`[plugins.entries.<id>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginEntryConfig {
+    /// Override the plugin's enabled state. If absent, the plugin is enabled
+    /// unless it is bundled-and-disabled-by-default.
+    pub enabled: Option<bool>,
+
+    /// Plugin-specific configuration table, passed to `PluginApi::plugin_config()`.
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+impl Default for PluginEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Natural-language behavior for non-CLI approval-management commands.
@@ -4722,6 +4807,7 @@ impl Default for Config {
             agents: HashMap::new(),
             coordination: CoordinationConfig::default(),
             hooks: HooksConfig::default(),
+            plugins: PluginsConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
