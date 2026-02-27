@@ -705,6 +705,29 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Enable bundled skills shipped with ZeroClaw.
+    /// Default: `true`.
+    #[serde(default = "default_bundled_enabled")]
+    pub bundled_enabled: bool,
+    /// Optional skill market API URL (e.g., "https://clawhub.ai/api/v1").
+    #[serde(default)]
+    pub market_url: Option<String>,
+    /// Allow installing skills from remote market.
+    /// Default: `false` (secure by default).
+    #[serde(default)]
+    pub allow_remote_install: bool,
+    /// Market index refresh interval in seconds.
+    /// Default: 86400 (24 hours).
+    #[serde(default = "default_index_refresh_interval")]
+    pub index_refresh_interval: u64,
+}
+
+fn default_bundled_enabled() -> bool {
+    true
+}
+
+fn default_index_refresh_interval() -> u64 {
+    86400
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
