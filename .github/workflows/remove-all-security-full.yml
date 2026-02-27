@@ -1,0 +1,107 @@
+name: Remove ALL Security From ZeroClaw
+
+on:
+  workflow_dispatch:
+
+jobs:
+  remove-security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: 1. Auto-approve all actions
+      run: |
+        # Find approval module and make it auto-approve
+        if [ -f src/approval/mod.rs ]; then
+          # Replace approval check with auto-approve
+          sed -i 's/ApprovalResult::Pending/ApprovalResult::Approved/g' src/approval/mod.rs || true
+          sed -i 's/ApprovalResult::Denied/ApprovalResult::Approved/g' src/approval/mod.rs || true
+          sed -i 's/needs_approval.*true/needs_approval: false/g' src/approval/mod.rs || true
+        fi
+        
+        # If approval is in security/policy.rs
+        if [ -f src/security/policy.rs ]; then
+          sed -i 's/ActionResult::NeedsApproval/ActionResult::Allowed/g' src/security/policy.rs || true
+          sed -i 's/ActionResult::Denied/ActionResult::Allowed/g' src/security/policy.rs || true
+        fi
+    
+    - name: 2. Remove shell command restrictions
+      run: |
+        if [ -f src/tools/shell.rs ]; then
+          # Make all commands valid
+          sed -i 's/is_command_allowed.*false/is_command_allowed: true/g' src/tools/shell.rs || true
+          # Remove blocked commands check
+          sed -i 's/block_high_risk_commands: true/block_high_risk_commands: false/g' src/tools/shell.rs || true
+        fi
+    
+    - name: 3. Remove path restrictions
+      run: |
+        if [ -f src/security/policy.rs ]; then
+          # Allow any path
+          sed -i 's/is_path_allowed.*false/is_path_allowed: true/g' src/security/policy.rs || true
+          sed -i 's/validate_path.*Err/validate_path: Ok/g' src/security/policy.rs || true
+        fi
+        
+        if [ -f src/config/schema.rs ]; then
+          # Clear forbidden paths
+          sed -i 's|forbidden_paths: vec!\[|forbidden_paths: vec![] // was: vec![|g' src/config/schema.rs || true
+        fi
+    
+    - name: 4. Set maximum freedom defaults in schema
+      run: |
+        if [ -f src/config/schema.rs ]; then
+          # Max out all limits
+          sed -i 's/max_actions_per_hour: 100/max_actions_per_hour: 999999/g' src/config/schema.rs || true
+          sed -i 's/max_cost_per_day_cents: 500/max_cost_per_day_cents: 99999999/g' src/config/schema.rs || true
+          # Remove workspace restriction
+          sed -i 's/workspace_only: true/workspace_only: false/g' src/config/schema.rs || true
+          # Remove approval requirements
+          sed -i 's/require_approval_for_medium_risk: true/require_approval_for_medium_risk: false/g' src/config/schema.rs || true
+          sed -i 's/block_high_risk_commands: true/block_high_risk_commands: false/g' src/config/schema.rs || true
+          # Full autonomy level
+          sed -i 's/level: AutonomyLevel::Supervised/level: AutonomyLevel::Full/g' src/config/schema.rs || true
+          sed -i 's/level: AutonomyLevel::Locked/level: AutonomyLevel::Full/g' src/config/schema.rs || true
+        fi
+    
+    - name: 5. Remove confirmation prompts in wizard
+      run: |
+        if [ -f src/onboard/wizard.rs ]; then
+          # Default to Freedom
+          sed -i 's/autonomy_config_for_mode(SecurityMode::Casual)/autonomy_config_for_mode(SecurityMode::Freedom)/g' src/onboard/wizard.rs || true
+          sed -i 's/autonomy_config_for_mode(SecurityMode::Safety)/autonomy_config_for_mode(SecurityMode::Freedom)/g' src/onboard/wizard.rs || true
+          # Interactive default to Freedom
+          sed -i 's/.default(0)/.default(2)/g' src/onboard/wizard.rs || true
+          sed -i 's/.default(1)/.default(2)/g' src/onboard/wizard.rs || true
+          # Remove FREEDOM confirmation
+          sed -i 's/if confirm.trim() != "FREEDOM"/if false \/\/ if confirm.trim() != "FREEDOM"/g' src/onboard/wizard.rs || true
+        fi
+    
+    - name: 6. Add warning comment
+      run: |
+        cat > SECURITY_REMOVED.md << 'EOF'
+        # ⚠️ SECURITY DISABLED
+        
+        All security restrictions have been removed from this build.
+        
+        - No approval prompts
+        - No path restrictions
+        - No command blocking
+        - Unlimited actions
+        - Full filesystem access
+        
+        **DANGER:** This agent can execute ANY command without confirmation.
+        Use at your own risk.
+        EOF
+    
+    - name: Commit changes
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add -A
+        git commit -m "Remove all security restrictions - unrestricted mode" || echo "No changes"
+        git push
