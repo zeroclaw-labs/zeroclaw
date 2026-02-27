@@ -175,7 +175,9 @@ jobs:
     build-prerelease:
         name: Build Pre-release Artifact
         needs: [prerelease-guard]
-        runs-on: [self-hosted, aws-india]
+        # Keep GNU Linux prerelease artifacts on Ubuntu 22.04 so runtime GLIBC
+        # symbols remain compatible with Debian 12 / Ubuntu 22.04 hosts.
+        runs-on: ubuntu-22.04
         timeout-minutes: 45
         steps:
             - name: Checkout tag
