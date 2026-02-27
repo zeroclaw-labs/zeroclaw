@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::fs;
 
@@ -18,6 +18,8 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+const TELEGRAM_BOT_PATH_TOKEN_PATTERN: &str = r"/bot\d{8,10}:[A-Za-z0-9_-]{35}";
+static TELEGRAM_BOT_PATH_TOKEN_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,7 +708,13 @@ impl TelegramChannel {
     }
 
     fn sanitize_telegram_error(input: &str) -> String {
-        crate::providers::sanitize_api_error(input)
+        let redacted = TELEGRAM_BOT_PATH_TOKEN_RE
+            .get_or_init(|| {
+                regex::Regex::new(TELEGRAM_BOT_PATH_TOKEN_PATTERN)
+                    .expect("telegram token regex pattern must compile")
+            })
+            .replace_all(input, "/bot[REDACTED]");
+        crate::providers::sanitize_api_error(redacted.as_ref())
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -3315,6 +3323,40 @@ mod tests {
 
         let target = TelegramChannel::extract_update_message_target(&update);
         assert_eq!(target, Some(("-100123456".to_string(), 99)));
+    }
+
+    #[test]
+    fn sanitize_telegram_error_redacts_bot_path_token_and_keeps_method_suffix() {
+        let raw = "poll failed for url (https://api.telegram.org/bot1234567890:A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r/getUpdates?timeout=30)";
+        let sanitized = TelegramChannel::sanitize_telegram_error(raw);
+        assert!(sanitized.contains("/bot[REDACTED]/getUpdates?timeout=30"));
+        assert!(!sanitized.contains("1234567890:A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"));
+    }
+
+    #[test]
+    fn sanitize_telegram_error_redacts_file_api_path_token() {
+        let raw = "download failed: https://api.telegram.org/file/bot12345678:Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i/photos/file_123.jpg";
+        let sanitized = TelegramChannel::sanitize_telegram_error(raw);
+        assert!(sanitized.contains("/file/bot[REDACTED]/photos/file_123.jpg"));
+        assert!(!sanitized.contains("12345678:Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i"));
+    }
+
+    #[test]
+    fn sanitize_telegram_error_ignores_non_matching_bot_fragment() {
+        let raw = "unexpected path /bot123:short/getUpdates";
+        let sanitized = TelegramChannel::sanitize_telegram_error(raw);
+        assert_eq!(sanitized, raw);
+    }
+
+    #[test]
+    fn sanitize_telegram_error_redacts_multiple_bot_tokens_in_single_string() {
+        let raw = "poll a: https://api.telegram.org/bot1234567890:A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r/getUpdates | poll b: https://api.telegram.org/bot2345678901:Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i/getMe";
+        let sanitized = TelegramChannel::sanitize_telegram_error(raw);
+        assert_eq!(sanitized.matches("/bot[REDACTED]").count(), 2);
+        assert!(sanitized.contains("/bot[REDACTED]/getUpdates"));
+        assert!(sanitized.contains("/bot[REDACTED]/getMe"));
+        assert!(!sanitized.contains("1234567890:A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"));
+        assert!(!sanitized.contains("2345678901:Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i"));
     }
 
     #[test]
