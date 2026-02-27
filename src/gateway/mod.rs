@@ -3250,7 +3250,8 @@ Reminder set successfully."#;
 
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            Some("app-token".into()),
+            None,
             vec!["*".into()],
         ));
 

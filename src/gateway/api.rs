@@ -655,7 +655,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut wati.api_token);
     }
     if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
-        mask_required_secret(&mut nextcloud.app_token);
+        mask_optional_secret(&mut nextcloud.app_token);
         mask_optional_secret(&mut nextcloud.webhook_secret);
     }
     if let Some(email) = masked.channels_config.email.as_mut() {
@@ -803,7 +803,7 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.nextcloud_talk.as_mut(),
         current.channels_config.nextcloud_talk.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.app_token, &current_ch.app_token);
+        restore_optional_secret(&mut incoming_ch.app_token, &current_ch.app_token);
         restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (

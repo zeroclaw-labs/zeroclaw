@@ -5495,7 +5495,7 @@ fn decrypt_channel_secrets(
         )?;
     }
     if let Some(ref mut nextcloud) = channels.nextcloud_talk {
-        decrypt_secret(
+        decrypt_optional_secret(
             store,
             &mut nextcloud.app_token,
             "config.channels_config.nextcloud_talk.app_token",
@@ -5657,7 +5657,7 @@ fn encrypt_channel_secrets(
         )?;
     }
     if let Some(ref mut nextcloud) = channels.nextcloud_talk {
-        encrypt_secret(
+        encrypt_optional_secret(
             store,
             &mut nextcloud.app_token,
             "config.channels_config.nextcloud_talk.app_token",
@@ -10496,7 +10496,7 @@ default_model = "legacy-model"
     async fn nextcloud_talk_config_serde() {
         let nc = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
+            app_token: Some("app-token".into()),
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
         };
@@ -10504,7 +10504,7 @@ default_model = "legacy-model"
         let json = serde_json::to_string(&nc).unwrap();
         let parsed: NextcloudTalkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.base_url, "https://cloud.example.com");
-        assert_eq!(parsed.app_token, "app-token");
+        assert_eq!(parsed.app_token.as_deref(), Some("app-token"));
         assert_eq!(parsed.webhook_secret.as_deref(), Some("webhook-secret"));
         assert_eq!(parsed.allowed_users, vec!["user_a", "*"]);
     }

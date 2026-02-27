@@ -4942,7 +4942,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 config.nextcloud_talk = Some(NextcloudTalkConfig {
                     base_url,
-                    app_token: app_token.trim().to_string(),
+                    app_token: Some(app_token.trim().to_string()),
                     webhook_secret: if webhook_secret.trim().is_empty() {
                         None
                     } else {
@@ -7997,7 +7997,7 @@ mod tests {
         channels.qq = None;
         channels.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
-            app_token: "token".into(),
+            app_token: Some("token".into()),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
         });
