@@ -136,7 +136,8 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         let raw_args = arguments.to_string();
         let args_preview = if raw_args.len() > 220 {
-            format!("{}...", &raw_args[..220])
+            let end = crate::util::floor_utf8_char_boundary(&raw_args, 220);
+            format!("{}...", &raw_args[..end])
         } else {
             raw_args
         };
@@ -283,5 +284,27 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_truncates_safely_for_multibyte_utf8() {
+        let channel = DummyChannel;
+        let long_chinese = "測".repeat(100); // 300 bytes, over 220
+        let args = serde_json::json!({"cmd": long_chinese});
+        let result = channel
+            .send_approval_prompt("tester", "req-1", "shell", &args, None)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_short_args_not_truncated() {
+        let channel = DummyChannel;
+        let short_chinese = "測".repeat(10);
+        let args = serde_json::json!({"cmd": short_chinese});
+        let result = channel
+            .send_approval_prompt("tester", "req-1", "shell", &args, None)
+            .await;
+        assert!(result.is_ok());
     }
 }
