@@ -675,7 +675,14 @@ impl Channel for MatrixChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
-        let target_room_id = self.target_room_id().await?;
+
+        // Use SendMessage.recipient if provided and non-empty, otherwise fall back to self.target_room_id()
+        let target_room_id = if !message.recipient.is_empty() {
+            message.recipient.clone()
+        } else {
+            self.target_room_id().await?
+        };
+
         let target_room: OwnedRoomId = target_room_id.parse()?;
 
         let mut room = client.get_room(&target_room);
