@@ -5,11 +5,14 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, HttpRequestConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig,
+    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
+    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
+    TelegramConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
+use crate::identity::{
+    default_aieos_identity_path, generate_default_aieos_json, selectable_identity_backends,
+};
 use crate::memory::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind,
@@ -91,7 +94,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     );
     println!();
 
-    print_step(1, 10, "Workspace Setup");
+    print_step(1, 11, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
@@ -100,32 +103,41 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         }
     }
 
-    print_step(2, 10, "AI Provider & API Key");
+    print_step(2, 11, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
-    print_step(3, 10, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 11, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 10, "Tunnel (Expose to Internet)");
+    print_step(4, 11, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 10, "Tool Mode & Security");
+    print_step(5, 11, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 10, "Web & Internet Tools");
+    print_step(6, 11, "Web & Internet Tools");
     let (web_search_config, web_fetch_config, http_request_config) = setup_web_tools()?;
 
-    print_step(7, 10, "Hardware (Physical World)");
+    print_step(7, 11, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(8, 10, "Memory Configuration");
+    print_step(8, 11, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(9, 10, "Project Context (Personalize Your Agent)");
+    print_step(9, 11, "Identity Backend");
+    let identity_config = setup_identity_backend()?;
+
+    print_step(10, 11, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(10, 10, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx, &memory_config.backend).await?;
+    print_step(11, 11, "Workspace Files");
+    scaffold_workspace(
+        &workspace_dir,
+        &project_ctx,
+        &memory_config.backend,
+        &identity_config,
+    )
+    .await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -172,7 +184,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         web_fetch: web_fetch_config,
         web_search: web_search_config,
         proxy: crate::config::ProxyConfig::default(),
-        identity: crate::config::IdentityConfig::default(),
+        identity: identity_config,
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
@@ -566,7 +578,13 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx, &config.memory.backend).await?;
+    scaffold_workspace(
+        &workspace_dir,
+        &default_ctx,
+        &config.memory.backend,
+        &config.identity,
+    )
+    .await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -3574,6 +3592,56 @@ fn setup_memory() -> Result<MemoryConfig> {
     Ok(config)
 }
 
+fn setup_identity_backend() -> Result<IdentityConfig> {
+    print_bullet("Choose the identity format ZeroClaw should scaffold for this workspace.");
+    print_bullet("You can switch later in config.toml under [identity].");
+    println!();
+
+    let backends = selectable_identity_backends();
+    let options: Vec<String> = backends
+        .iter()
+        .map(|profile| format!("{} — {}", profile.label, profile.description))
+        .collect();
+
+    let selected = Select::new()
+        .with_prompt("  Select identity backend")
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    let backend = backends
+        .get(selected)
+        .context("invalid identity backend selection")?;
+
+    let config = if backend.key == "aieos" {
+        let default_path = default_aieos_identity_path().to_string();
+        println!(
+            "  {} Identity: {} ({})",
+            style("✓").green().bold(),
+            style("aieos").green(),
+            style(&default_path).dim()
+        );
+        IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some(default_path),
+            aieos_inline: None,
+        }
+    } else {
+        println!(
+            "  {} Identity: {}",
+            style("✓").green().bold(),
+            style("openclaw").green()
+        );
+        IdentityConfig {
+            format: "openclaw".into(),
+            aieos_path: None,
+            aieos_inline: None,
+        }
+    };
+
+    Ok(config)
+}
+
 // ── Step 3: Channels ────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5480,6 +5548,7 @@ async fn scaffold_workspace(
     workspace_dir: &Path,
     ctx: &ProjectContext,
     memory_backend: &str,
+    identity_config: &IdentityConfig,
 ) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
@@ -5762,6 +5831,18 @@ async fn scaffold_workspace(
         files.push(("MEMORY.md", memory.to_string()));
     }
 
+    let mut aieos_identity_file: Option<(String, String)> = None;
+    if identity_config.format == "aieos" {
+        let path = identity_config
+            .aieos_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or(default_aieos_identity_path())
+            .to_string();
+        let content = generate_default_aieos_json(agent, user);
+        aieos_identity_file = Some((path, content));
+    }
+
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
     for dir in &subdirs {
@@ -5776,6 +5857,19 @@ async fn scaffold_workspace(
         if path.exists() {
             skipped += 1;
         } else {
+            fs::write(&path, content).await?;
+            created += 1;
+        }
+    }
+
+    if let Some((relative_path, content)) = aieos_identity_file {
+        let path = workspace_dir.join(&relative_path);
+        if path.exists() {
+            skipped += 1;
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
             fs::write(&path, content).await?;
             created += 1;
         }
@@ -6361,9 +6455,14 @@ mod tests {
     async fn scaffold_creates_markdown_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "markdown")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -6384,9 +6483,14 @@ mod tests {
     async fn scaffold_skips_memory_md_for_sqlite() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -6410,13 +6514,76 @@ mod tests {
     async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
         }
+    }
+
+    #[tokio::test]
+    async fn scaffold_creates_default_aieos_identity_file_when_selected() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext {
+            user_name: "Argenis".into(),
+            agent_name: "Crabby".into(),
+            ..Default::default()
+        };
+        let identity_config = crate::config::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.aieos.json".into()),
+            aieos_inline: None,
+        };
+
+        scaffold_workspace(tmp.path(), &ctx, "sqlite", &identity_config)
+            .await
+            .unwrap();
+
+        let identity_path = tmp.path().join("identity.aieos.json");
+        assert!(
+            identity_path.exists(),
+            "AIEOS identity file should be scaffolded"
+        );
+
+        let raw = tokio::fs::read_to_string(identity_path).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["identity"]["names"]["first"], "Crabby");
+        assert_eq!(
+            payload["motivations"]["core_drive"],
+            "Help Argenis ship high-quality work."
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_does_not_overwrite_existing_aieos_identity_file() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        let identity_config = crate::config::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.aieos.json".into()),
+            aieos_inline: None,
+        };
+
+        let custom = r#"{"identity":{"names":{"first":"Custom"}}}"#;
+        tokio::fs::write(tmp.path().join("identity.aieos.json"), custom)
+            .await
+            .unwrap();
+
+        scaffold_workspace(tmp.path(), &ctx, "sqlite", &identity_config)
+            .await
+            .unwrap();
+
+        let raw = tokio::fs::read_to_string(tmp.path().join("identity.aieos.json"))
+            .await
+            .unwrap();
+        assert_eq!(raw, custom);
     }
 
     // ── scaffold_workspace: personalization ─────────────────────
@@ -6428,9 +6595,14 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6456,9 +6628,14 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6484,9 +6661,14 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6536,9 +6718,14 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6571,9 +6758,14 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6620,9 +6812,14 @@ mod tests {
             .await
             .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -6653,17 +6850,27 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -6677,9 +6884,14 @@ mod tests {
     async fn scaffold_files_are_non_empty_sqlite() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -6699,9 +6911,14 @@ mod tests {
     async fn scaffold_files_are_non_empty_markdown() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "markdown")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -6724,9 +6941,14 @@ mod tests {
     async fn agents_md_references_on_demand_memory_markdown() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "markdown")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -6745,9 +6967,14 @@ mod tests {
     async fn agents_md_uses_backend_memory_for_sqlite() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -6780,9 +7007,14 @@ mod tests {
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "markdown")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -6803,9 +7035,14 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -6837,9 +7074,14 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6865,9 +7107,14 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6893,9 +7140,14 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx, "sqlite")
-            .await
-            .unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))

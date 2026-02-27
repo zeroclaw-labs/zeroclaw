@@ -11,6 +11,85 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityBackendProfile {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+const IDENTITY_BACKENDS: [IdentityBackendProfile; 2] = [
+    IdentityBackendProfile {
+        key: "openclaw",
+        label: "OpenClaw (Markdown workspace identity files)",
+        description: "Classic ZeroClaw layout with IDENTITY.md, SOUL.md, USER.md, and friends.",
+    },
+    IdentityBackendProfile {
+        key: "aieos",
+        label: "AIEOS (JSON identity document)",
+        description: "Portable AIEOS identity with automatic identity JSON scaffolding.",
+    },
+];
+
+pub fn selectable_identity_backends() -> &'static [IdentityBackendProfile] {
+    &IDENTITY_BACKENDS
+}
+
+pub fn default_aieos_identity_path() -> &'static str {
+    "identity.aieos.json"
+}
+
+pub fn generate_default_aieos_json(agent_name: &str, user_name: &str) -> String {
+    let resolved_agent_name = if agent_name.trim().is_empty() {
+        "ZeroClaw"
+    } else {
+        agent_name.trim()
+    };
+    let resolved_user_name = if user_name.trim().is_empty() {
+        "User"
+    } else {
+        user_name.trim()
+    };
+
+    serde_json::json!({
+        "identity": {
+            "names": {
+                "first": resolved_agent_name,
+                "full": resolved_agent_name
+            },
+            "bio": format!(
+                "{resolved_agent_name} is a ZeroClaw assistant focused on helping {resolved_user_name} get work done efficiently."
+            ),
+            "origin": "ZeroClaw",
+            "residence": "Workspace"
+        },
+        "linguistics": {
+            "style": "clear, direct, and practical",
+            "formality": "balanced"
+        },
+        "motivations": {
+            "core_drive": format!("Help {resolved_user_name} ship high-quality work."),
+            "short_term_goals": [
+                "Resolve the current task with minimal risk",
+                "Keep context accurate and up to date"
+            ]
+        },
+        "capabilities": {
+            "skills": [
+                "code changes",
+                "debugging",
+                "documentation"
+            ],
+            "tools": [
+                "shell",
+                "file_read",
+                "file_write"
+            ]
+        }
+    })
+    .to_string()
+}
+
 /// AIEOS v1.1 identity structure.
 ///
 /// This follows the AIEOS schema for defining AI agent identity, personality,
@@ -1484,5 +1563,30 @@ mod tests {
         let book_pos = prompt.find("- book: rust").unwrap();
         let snack_pos = prompt.find("- snack: tea").unwrap();
         assert!(book_pos < snack_pos);
+    }
+
+    #[test]
+    fn selectable_identity_backends_contains_openclaw_and_aieos() {
+        let profiles = selectable_identity_backends();
+        assert!(profiles.iter().any(|profile| profile.key == "openclaw"));
+        assert!(profiles.iter().any(|profile| profile.key == "aieos"));
+    }
+
+    #[test]
+    fn default_aieos_identity_path_is_stable() {
+        assert_eq!(default_aieos_identity_path(), "identity.aieos.json");
+    }
+
+    #[test]
+    fn generate_default_aieos_json_creates_valid_payload() {
+        let content = generate_default_aieos_json("Crabby", "Argenis");
+        let payload: Value = serde_json::from_str(&content).expect("generator must produce JSON");
+
+        assert_eq!(payload["identity"]["names"]["first"], "Crabby");
+        assert_eq!(
+            payload["motivations"]["core_drive"],
+            "Help Argenis ship high-quality work."
+        );
+        assert_eq!(payload["capabilities"]["tools"][0], "shell");
     }
 }
