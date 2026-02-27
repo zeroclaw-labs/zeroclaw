@@ -937,6 +937,28 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
+    fn should_skip_unauthorized_prompt(
+        &self,
+        message: &serde_json::Value,
+        text: &str,
+        sender_id: Option<&str>,
+    ) -> bool {
+        if !self.mention_only || !Self::is_group_message(message) {
+            return false;
+        }
+
+        if self.is_group_sender_trigger_enabled(sender_id) {
+            return false;
+        }
+
+        let bot_username = self.bot_username.lock();
+        match bot_username.as_deref() {
+            Some(bot_username) => !Self::contains_bot_mention(text, bot_username),
+            // Without bot username, we cannot reliably decide mention intent.
+            None => true,
+        }
+    }
+
     fn is_user_allowed(&self, username: &str) -> bool {
         let identity = Self::normalize_identity(username);
         self.allowed_users
@@ -974,6 +996,10 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_i64);
         let sender_id_str = sender_id.map(|id| id.to_string());
         let normalized_sender_id = sender_id_str.as_deref().map(Self::normalize_identity);
+
+        if self.should_skip_unauthorized_prompt(message, text, sender_id_str.as_deref()) {
+            return;
+        }
 
         let chat_id = message
             .get("chat")
@@ -4535,6 +4561,75 @@ mod tests {
 
         let ch_disabled = TelegramChannel::new("token".into(), vec!["*".into()], false);
         assert!(!ch_disabled.mention_only);
+    }
+
+    #[test]
+    fn should_skip_unauthorized_prompt_for_non_mentioned_group_message() {
+        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let message = serde_json::json!({
+            "chat": { "type": "group" }
+        });
+
+        assert!(ch.should_skip_unauthorized_prompt(&message, "hello everyone", Some("999")));
+    }
+
+    #[test]
+    fn should_not_skip_unauthorized_prompt_for_mentioned_group_message() {
+        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let message = serde_json::json!({
+            "chat": { "type": "group" }
+        });
+
+        assert!(!ch.should_skip_unauthorized_prompt(&message, "@mybot please help", Some("999")));
+    }
+
+    #[test]
+    fn should_not_skip_unauthorized_prompt_outside_group_mention_only() {
+        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let private_message = serde_json::json!({
+            "chat": { "type": "private" }
+        });
+        assert!(!ch.should_skip_unauthorized_prompt(&private_message, "hello", Some("999")));
+
+        let group_message = serde_json::json!({
+            "chat": { "type": "group" }
+        });
+        let mention_disabled = TelegramChannel::new("token".into(), vec!["alice".into()], false);
+        assert!(!mention_disabled.should_skip_unauthorized_prompt(
+            &group_message,
+            "hello",
+            Some("999")
+        ));
+    }
+
+    #[test]
+    fn should_not_skip_unauthorized_prompt_for_group_sender_trigger_override() {
+        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], true)
+            .with_group_reply_allowed_senders(vec!["999".into()]);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let message = serde_json::json!({
+            "chat": { "type": "group" }
+        });
+        assert!(!ch.should_skip_unauthorized_prompt(&message, "hello everyone", Some("999")));
     }
 
     #[test]
