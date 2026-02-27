@@ -68,10 +68,9 @@ impl WebSearchTool {
         })?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "DuckDuckGo search failed with status: {}",
-                response.status()
-            );
+            let status = response.status();
+            let hint = Self::duckduckgo_status_hint(status);
+            anyhow::bail!("DuckDuckGo search failed with status: {}{}", status, hint);
         }
 
         let html = response.text().await?;
@@ -762,6 +761,8 @@ mod tests {
         let hint = WebSearchTool::duckduckgo_status_hint(StatusCode::FORBIDDEN);
         assert!(hint.contains("provider"));
         assert!(hint.contains("brave"));
+        assert!(hint.contains("exa"));
+        assert!(hint.contains("tavily"));
     }
 
     #[test]
