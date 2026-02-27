@@ -36,6 +36,26 @@
 - Αν το DuckDuckGo γυρίζει `403`/`429`, αλλάξτε provider σε `brave`, `exa`, `tavily` ή `firecrawl`.
 - Το `web_search` βρίσκει URLs· χρησιμοποιήστε `web_fetch` για ανάγνωση περιεχομένου σελίδας.
 
+## Ρυθμίσεις Web Fetch (`[web_fetch]`)
+
+| Ρύθμιση | Τι ορίζει |
+|---|---|
+| `enabled` | Ενεργοποιεί το `web_fetch` για εξαγωγή περιεχομένου σελίδας. |
+| `provider` | Backend λήψης/render: `fast_html2md`, `nanohtml2text`, `firecrawl`. |
+| `api_key` | API key για backend που το απαιτεί (π.χ. `firecrawl`). |
+| `api_url` | Προαιρετικό override του API endpoint. |
+| `allowed_domains` | Λίστα επιτρεπόμενων domains (`"*"` = όλα τα δημόσια). |
+| `blocked_domains` | Denylist που εφαρμόζεται πριν το allowlist. |
+| `max_response_size` | Μέγιστο μέγεθος απόκρισης σε bytes (προεπιλογή: 500000). |
+| `timeout_secs` | Timeout αιτήματος σε δευτερόλεπτα (προεπιλογή: 30). |
+| `user_agent` | User-Agent header για αιτήματα λήψης σελίδας. |
+
+Σημειώσεις:
+
+- Χρησιμοποιήστε `web_fetch` για ανάγνωση/εξαγωγή περιεχομένου από URL που βρήκατε με `web_search`.
+- Οι ανακατευθύνσεις (redirects) επαληθεύονται ξανά με βάση τις πολιτικές allow/deny.
+- Τοπικά/ιδιωτικά δίκτυα παραμένουν αποκλεισμένα ακόμα και με `allowed_domains = ["*"]`.
+
 ## 1. Συμπεριφορά της AI (Agent)
 
 - `max_tool_iterations`: Πόσες φορές μπορεί η AI να χρησιμοποιήσει εργαλεία για να απαντήσει σε 1 μήνυμα (προεπιλογή: 10).

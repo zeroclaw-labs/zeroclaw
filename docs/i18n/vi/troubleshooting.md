@@ -205,6 +205,63 @@ api_key = "<SECRET>"
 
 1. Giữ DuckDuckGo để tìm URL, sau đó dùng `web_fetch` để đọc nội dung trang.
 
+### `curl`/`wget` bị chặn trong shell tool
+
+Triệu chứng:
+
+- Output tool chứa `Command blocked: high-risk command is disallowed by policy`
+- Model báo `curl`/`wget` bị chặn
+
+Nguyên nhân:
+
+- `curl`/`wget` là lệnh shell rủi ro cao, có thể bị chặn bởi chính sách autonomy.
+
+Khắc phục:
+
+- Dùng tool chuyên dụng thay vì fetch bằng shell:
+  - `http_request` cho API/HTTP call trực tiếp
+  - `web_fetch` để trích xuất/tóm tắt nội dung trang
+
+Cấu hình tối thiểu:
+
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+provider = "fast_html2md"
+allowed_domains = ["*"]
+```
+
+### `web_fetch`/`http_request` báo host not allowed
+
+Triệu chứng:
+
+- Lỗi như `Host '<domain>' is not in http_request.allowed_domains`
+- Hoặc `web_fetch tool is enabled but no allowed_domains are configured`
+
+Khắc phục:
+
+- Thêm tên miền cụ thể hoặc dùng `"*"` để mở truy cập internet công khai:
+
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+```
+
+Lưu ý bảo mật:
+
+- Mạng nội bộ/riêng tư vẫn bị chặn kể cả khi dùng `"*"`
+- Trong môi trường production, nên dùng danh sách domain tường minh khi có thể
+
 ### Lỗi ghép nối / xác thực webhook
 
 Kiểm tra:

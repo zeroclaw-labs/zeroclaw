@@ -20,3 +20,4 @@
 ## 更新メモ
 
 - `web_search.provider` に `exa` と `tavily` が追加されました（詳細は英語版の `[web_search]` セクションを参照）。
+- `[web_fetch]` セクションが追加されました（ページ内容取得用。`fast_html2md`/`nanohtml2text`/`firecrawl` バックエンド、ドメイン許可/拒否リストに対応）。詳細は英語版の `[web_fetch]` セクションを参照。

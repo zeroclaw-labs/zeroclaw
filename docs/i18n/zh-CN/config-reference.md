@@ -20,3 +20,4 @@
 ## 更新说明
 
 - `web_search.provider` 新增 `exa` 与 `tavily`，详见英文原文的 `[web_search]` 小节。
+- 新增 `[web_fetch]` 配置节（页面内容抓取），支持 `fast_html2md`、`nanohtml2text`、`firecrawl` 后端及域名允许/拒绝列表，详见英文原文的 `[web_fetch]` 小节。

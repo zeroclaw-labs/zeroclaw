@@ -288,6 +288,26 @@ Lưu ý:
 - Nếu DuckDuckGo trả `403`/`429` trên mạng/proxy của bạn, hãy chuyển sang `brave`, `exa`, `tavily` hoặc `firecrawl`.
 - `web_search` dùng để tìm URL nguồn; kết hợp thêm `web_fetch` để đọc nội dung trang.
 
+## `[web_fetch]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật `web_fetch` để trích xuất và tóm tắt nội dung trang web |
+| `provider` | `fast_html2md` | Backend tải/render: `fast_html2md`, `nanohtml2text`, `firecrawl` |
+| `api_key` | chưa đặt | API key cho backend yêu cầu xác thực (ví dụ `firecrawl`) |
+| `api_url` | chưa đặt | Ghi đè URL API tùy chọn (self-hosted hoặc endpoint thay thế) |
+| `allowed_domains` | `["*"]` | Allowlist tên miền (`"*"` cho phép mọi tên miền public) |
+| `blocked_domains` | `[]` | Denylist áp dụng trước allowlist |
+| `max_response_size` | `500000` | Kích thước payload tối đa trả về (byte) |
+| `timeout_secs` | `30` | Thời gian chờ request (giây) |
+| `user_agent` | `ZeroClaw/1.0` | Header User-Agent cho các request tải trang |
+
+Lưu ý:
+
+- `web_fetch` được tối ưu cho tóm tắt và trích xuất dữ liệu từ trang web.
+- Các redirect được kiểm tra lại theo chính sách allow/deny domain.
+- Các địa chỉ mạng nội bộ/riêng tư luôn bị chặn, kể cả khi `allowed_domains = ["*"]`.
+
 ## `[gateway]`
 
 | Khóa | Mặc định | Mục đích |

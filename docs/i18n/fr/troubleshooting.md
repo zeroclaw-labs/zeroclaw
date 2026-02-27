@@ -20,3 +20,5 @@ Source anglaise:
 ## Notes de mise à jour
 
 - Le scénario `web_search_tool` avec erreurs `403`/`429` inclut désormais les providers `exa` et `tavily` (voir la page anglaise).
+- Si `curl`/`wget` sont bloqués par la politique dans le shell tool, utilisez `http_request` ou `web_fetch` à la place (voir la section «Web Access Issues» de la page anglaise).
+- En cas d'erreur host not allowed dans `web_fetch`/`http_request`, ajoutez le domaine concerné ou définissez `allowed_domains = ["*"]` dans la configuration (voir la page anglaise).

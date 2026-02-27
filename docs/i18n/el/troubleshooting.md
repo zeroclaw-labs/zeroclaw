@@ -111,6 +111,46 @@ provider = "firecrawl"
 api_key = "<SECRET>"
 ```
 
+### `curl`/`wget` αποκλεισμένα στο shell tool
+
+**Σύμπτωμα**: Το output περιέχει `Command blocked: high-risk command is disallowed by policy`.
+
+**Αιτία**: Το `curl`/`wget` αποκλείεται από την πολιτική αυτονομίας ως εντολή υψηλού κινδύνου.
+
+**Λύση**: Χρησιμοποιήστε εξειδικευμένα tools αντί για shell fetch:
+- `http_request` για απευθείας API/HTTP calls
+- `web_fetch` για εξαγωγή/περίληψη περιεχομένου σελίδας
+
+Ελάχιστη ρύθμιση:
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+provider = "fast_html2md"
+allowed_domains = ["*"]
+```
+
+### `web_fetch`/`http_request` — Host not allowed
+
+**Σύμπτωμα**: Εμφανίζεται σφάλμα όπως `Host '<domain>' is not in http_request.allowed_domains`.
+
+**Λύση**: Προσθέστε το domain στη λίστα ή χρησιμοποιήστε `"*"` για δημόσια πρόσβαση:
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+```
+
+**Σημείωση ασφαλείας**: Τοπικά/ιδιωτικά δίκτυα παραμένουν αποκλεισμένα ακόμα και με `"*"`.
+
 ---
 
 ## 3. Κανάλια Επικοινωνίας (Channels)

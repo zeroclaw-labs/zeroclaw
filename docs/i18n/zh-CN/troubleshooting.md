@@ -20,3 +20,5 @@
 ## 更新说明
 
 - `web_search_tool` 的 `403/429` 处理建议新增了 `exa` 与 `tavily` provider 选项，详见英文原文。
+- `curl`/`wget` 在 shell tool 中被策略拦截时，建议改用 `http_request` 或 `web_fetch` 工具，详见英文原文"Web Access Issues"章节。
+- `web_fetch`/`http_request` 报 host not allowed 时，需在配置中添加对应域名或设置 `allowed_domains = ["*"]`，详见英文原文。

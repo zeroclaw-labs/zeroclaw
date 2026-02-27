@@ -20,3 +20,5 @@
 ## 更新メモ
 
 - `web_search_tool` の `403/429` 回避策に `exa` と `tavily` プロバイダが追加されました（英語版参照）。
+- shell tool 内で `curl`/`wget` がポリシーによりブロックされた場合は `http_request` または `web_fetch` ツールを使用してください（英語版「Web Access Issues」セクション参照）。
+- `web_fetch`/`http_request` で host not allowed が発生した場合は、config に対象ドメインを追加するか `allowed_domains = ["*"]` を設定してください（英語版参照）。

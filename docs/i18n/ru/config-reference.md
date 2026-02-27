@@ -20,3 +20,4 @@
 ## Обновление
 
 - В `web_search.provider` добавлены `exa` и `tavily` (подробности в английском разделе `[web_search]`).
+- Добавлен раздел `[web_fetch]` (извлечение содержимого страниц; бэкенды `fast_html2md`, `nanohtml2text`, `firecrawl`; allowlist/denylist доменов). Подробности в английском разделе `[web_fetch]`.
