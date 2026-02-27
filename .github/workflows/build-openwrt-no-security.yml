@@ -13,56 +13,53 @@ jobs:
       contents: write
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
     
     - name: Safely remove security restrictions with Python
       run: |
         python3 << 'EOF'
         import re
+        import os
+
+        def patch_file(filepath, replacements):
+            if not os.path.exists(filepath):
+                print(f"Error: {filepath} not found!")
+                return
+            
+            with open(filepath, 'r') as f:
+                content = f.read()
+            
+            new_content = content
+            for pattern, subst in replacements.items():
+                new_content = re.sub(pattern, subst, new_content)
+            
+            if new_content != content:
+                with open(filepath, 'w') as f:
+                    f.write(new_content)
+                print(f"Successfully patched: {filepath}")
+            else:
+                print(f"No changes made to: {filepath} (Check if patterns match)")
+
+        # Konfigurasi Patch untuk schema.rs
+        # Menggunakan regex \s* agar toleran terhadap spasi/indentasi
+        schema_changes = {
+            r'workspace_only:\s*true,': 'workspace_only: false,',
+            r'block_high_risk_commands:\s*true,': 'block_high_risk_commands: false,',
+            r'require_approval_for_medium_risk:\s*true,': 'require_approval_for_medium_risk: false,',
+            r'max_actions_per_hour:\s*\d+,': 'max_actions_per_hour: 999999,',
+            r'max_cost_per_day_cents:\s*\d+,': 'max_cost_per_day_cents: 99999999,',
+            r'level:\s*AutonomyLevel::Supervised,': 'level: AutonomyLevel::Full,'
+        }
         
-        # Fix schema.rs - only change default values, not structure
-        with open('src/config/schema.rs', 'r') as f:
-            lines = f.readlines()
-        
-        new_lines = []
-        for line in lines:
-            # Only change simple boolean/number defaults
-            if 'workspace_only: true,' in line and 'autonomy' not in line.lower():
-                line = line.replace('workspace_only: true,', 'workspace_only: false,')
-            elif 'block_high_risk_commands: true,' in line:
-                line = line.replace('block_high_risk_commands: true,', 'block_high_risk_commands: false,')
-            elif 'require_approval_for_medium_risk: true,' in line:
-                line = line.replace('require_approval_for_medium_risk: true,', 'require_approval_for_medium_risk: false,')
-            elif 'max_actions_per_hour: 100,' in line:
-                line = line.replace('max_actions_per_hour: 100,', 'max_actions_per_hour: 999999,')
-            elif 'max_cost_per_day_cents: 500,' in line:
-                line = line.replace('max_cost_per_day_cents: 500,', 'max_cost_per_day_cents: 99999999,')
-            elif 'level: AutonomyLevel::Supervised,' in line:
-                line = line.replace('level: AutonomyLevel::Supervised,', 'level: AutonomyLevel::Full,')
-            new_lines.append(line)
-        
-        with open('src/config/schema.rs', 'w') as f:
-            f.writelines(new_lines)
-        
-        print("schema.rs fixed")
-        
-        # Fix wizard.rs - only change mode selection
-        with open('src/onboard/wizard.rs', 'r') as f:
-            content = f.read()
-        
-        # Only replace the specific function call, not elsewhere
-        content = content.replace(
-            'autonomy_config_for_mode(SecurityMode::Casual)',
-            'autonomy_config_for_mode(SecurityMode::Freedom)'
-        )
-        
-        # Change default selection from 0 (Safety) to 2 (Freedom)
-        content = content.replace('.default(0)', '.default(2)')
-        
-        with open('src/onboard/wizard.rs', 'w') as f:
-            f.write(content)
-        
-        print("wizard.rs fixed")
+        # Konfigurasi Patch untuk wizard.rs
+        wizard_changes = {
+            r'autonomy_config_for_mode\(SecurityMode::Casual\)': 'autonomy_config_for_mode(SecurityMode::Freedom)',
+            r'\.default\(0\)': '.default(2)'
+        }
+
+        patch_file('src/config/schema.rs', schema_changes)
+        patch_file('src/onboard/wizard.rs', wizard_changes)
         EOF
     
     - name: Install Rust
@@ -71,24 +68,35 @@ jobs:
         targets: aarch64-unknown-linux-musl
     
     - name: Install cross
-      run: cargo install cross --git https://github.com/cross-rs/cross
+      run: |
+        # Mengunduh binary langsung lebih cepat daripada 'cargo install'
+        LATEST=$(curl -s https://api.github.com/repos/cross-rs/cross/releases/latest | grep tag_name | cut -d '"' -f 4)
+        curl -L "https://github.com/cross-rs/cross/releases/download/$LATEST/cross-x86_64-unknown-linux-musl.tar.gz" | tar xz -C /usr/local/bin
     
-    - name: Cache
+    - name: Cache Cargo dependencies
       uses: actions/cache@v3
       with:
-        path: ~/.cargo/registry ~/.cargo/git target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-aarch64-
     
-    - name: Build
+    - name: Build (Release)
       run: cross build --release --target aarch64-unknown-linux-musl
     
-    - name: Package
+    - name: Package Artifacts
       run: |
         mkdir -p dist
+        # Pastikan path target sesuai dengan output cross
         cp target/aarch64-unknown-linux-musl/release/zeroclaw dist/zeroclaw-openwrt-aarch64
         tar -czf dist/zeroclaw-openwrt-aarch64.tar.gz -C dist zeroclaw-openwrt-aarch64
     
-    - name: Upload
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: zeroclaw-openwrt-aarch64
