@@ -36,7 +36,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: `ghcr_vulnerability_gate.py` enforces policy-driven Trivy gate + parity checks from `.github/release/ghcr-vulnerability-policy.json` and emits `ghcr-vulnerability-gate` audit evidence
 - `.github/workflows/feature-matrix.yml` (`Feature Matrix`)
     - Purpose: compile-time matrix validation for `default`, `whatsapp-web`, `browser-native`, and `nightly-all-features` lanes
-    - Additional behavior: on PRs, lanes only run when `ci:full` or `ci:feature-matrix` label is applied (push-to-dev/main and schedules run unconditionally)
+    - Additional behavior: push-triggered matrix runs are limited to `dev` branch Rust/workflow-path changes to avoid duplicate post-merge fan-out on `main`
+    - Additional behavior: on PRs, lanes only run when `ci:full` or `ci:feature-matrix` label is applied (push-to-dev and schedules run unconditionally)
     - Additional behavior: each lane emits machine-readable result artifacts; summary lane aggregates owner routing from `.github/release/nightly-owner-routing.json`
     - Additional behavior: supports `compile` (merge-gate) and `nightly` (integration-oriented) profiles with bounded retry policy and trend snapshot artifact (`nightly-history.json`)
     - Additional behavior: required-check mapping is anchored to stable job name `Feature Matrix Summary`; lane jobs stay informational
@@ -98,7 +99,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `CI`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`
 - `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
-- `Feature Matrix`: push on Rust + workflow paths, merge queue, weekly schedule, manual dispatch; PRs only when `ci:full` or `ci:feature-matrix` label is applied
+- `Feature Matrix`: push on Rust + workflow paths to `dev`, merge queue, weekly schedule, manual dispatch; PRs only when `ci:full` or `ci:feature-matrix` label is applied
 - `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
 - `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
@@ -153,6 +154,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
 - Use path filters for expensive workflows when practical.
 - Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
+- Use `scripts/ci/queue_hygiene.py` for controlled cleanup of obsolete or superseded queued runs during runner-pressure incidents.
 - Keep dependency update volume controlled (grouping + PR limits).
 - Install third-party CI tooling through repository-managed pinned installers with checksum verification (for example `scripts/ci/install_gitleaks.sh`, `scripts/ci/install_syft.sh`); avoid remote `curl | sh` patterns.
 - Avoid mixing onboarding/community automation with merge-gating logic.

@@ -133,7 +133,7 @@ Notes:
 
 1. Commit reaches `dev` or `main` (usually from a merged PR), or merge queue creates a `merge_group` validation commit.
 2. `ci-run.yml` runs on `push` and `merge_group`.
-3. `feature-matrix.yml` runs on `push` for Rust/workflow paths and on `merge_group`.
+3. `feature-matrix.yml` runs on `push` to `dev` for Rust/workflow paths and on `merge_group`.
 4. `sec-audit.yml` runs on `push` and `merge_group`.
 5. `sec-codeql.yml` runs on `push`/`merge_group` when Rust/codeql paths change (path-scoped on push).
 6. `ci-supply-chain-provenance.yml` runs on push when Rust/build provenance paths change.

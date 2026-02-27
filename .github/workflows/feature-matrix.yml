@@ -2,13 +2,12 @@ name: Feature Matrix
 
 on:
     push:
-        branches: [dev, main]
+        branches: [dev]
         paths:
             - "Cargo.toml"
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
-            - "tests/**"
             - "scripts/ci/nightly_matrix_report.py"
             - ".github/release/nightly-owner-routing.json"
             - ".github/workflows/feature-matrix.yml"

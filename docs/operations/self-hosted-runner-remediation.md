@@ -14,6 +14,9 @@ Use this when CI jobs remain queued, runner availability drops, or runner hosts 
 - `scripts/ci/runner_disk_cleanup.sh`
   - Reclaims stale runner workspace/temp/diag files.
   - Defaults to dry-run mode and requires explicit `--apply`.
+- `scripts/ci/queue_hygiene.py`
+  - Removes queued-run backlog from obsolete workflows and stale duplicate runs.
+  - Defaults to dry-run mode; use `--apply` to execute cancellations.
 
 ## 1) Health Check
 
@@ -79,6 +82,37 @@ Safety behavior:
 3. Run disk cleanup in dry-run mode, review candidate list.
 4. Drain runners, then apply cleanup.
 5. Re-run health report and confirm queue/availability recovery.
+
+## 4) Queue Hygiene (Dry-Run First)
+
+Dry-run example:
+
+```bash
+python3 scripts/ci/queue_hygiene.py \
+  --repo zeroclaw-labs/zeroclaw \
+  --obsolete-workflow "CI Build (Fast)" \
+  --dedupe-workflow "CI Run" \
+  --output-json artifacts/queue-hygiene.json
+```
+
+Apply mode:
+
+```bash
+python3 scripts/ci/queue_hygiene.py \
+  --repo zeroclaw-labs/zeroclaw \
+  --obsolete-workflow "CI Build (Fast)" \
+  --dedupe-workflow "CI Run" \
+  --max-cancel 200 \
+  --apply \
+  --output-json artifacts/queue-hygiene-applied.json
+```
+
+Safety behavior:
+
+- At least one policy is required (`--obsolete-workflow` or `--dedupe-workflow`).
+- `--apply` is opt-in; default is non-destructive preview.
+- Deduplication is PR-only by default; use `--dedupe-include-non-pr` only when explicitly handling push/manual backlog.
+- Cancellations are bounded by `--max-cancel`.
 
 ## Notes
 
