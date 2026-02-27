@@ -51,8 +51,8 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
-pub mod traits;
 pub mod task_plan;
+pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
 

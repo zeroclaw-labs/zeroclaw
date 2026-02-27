@@ -7725,7 +7725,6 @@ pub struct WasmSecurityConfig {
     pub capability_escalation_mode: WasmCapabilityEscalationMode,
 }
 
-
 impl Default for WasmSecurityConfig {
     fn default() -> Self {
         Self {
@@ -7868,17 +7867,45 @@ pub struct SyscallAnomalyConfig {
 
 fn default_baseline_syscalls() -> Vec<String> {
     vec![
-        "read".into(), "write".into(), "open".into(), "close".into(),
-        "mmap".into(), "mprotect".into(), "munmap".into(), "brk".into(),
-        "ioctl".into(), "dup".into(), "dup2".into(), "getpid".into(),
-        "socket".into(), "connect".into(), "accept".into(), "sendto".into(),
-        "recvfrom".into(), "recvmsg".into(), "listen".into(),
-        "getsockname".into(), "getpeername".into(), "setsockopt".into(),
-        "getsockopt".into(), "clone".into(), "fork".into(), "execve".into(),
-        "exit".into(), "wait4".into(), "fcntl".into(), "futex".into(),
-        "set_tid_address".into(), "openat".into(), "newfstatat".into(),
-        "set_robust_list".into(), "epoll_create1".into(), "getrandom".into(),
-        "statx".into(), "clone3".into(), "exit_group".into(),
+        "read".into(),
+        "write".into(),
+        "open".into(),
+        "close".into(),
+        "mmap".into(),
+        "mprotect".into(),
+        "munmap".into(),
+        "brk".into(),
+        "ioctl".into(),
+        "dup".into(),
+        "dup2".into(),
+        "getpid".into(),
+        "socket".into(),
+        "connect".into(),
+        "accept".into(),
+        "sendto".into(),
+        "recvfrom".into(),
+        "recvmsg".into(),
+        "listen".into(),
+        "getsockname".into(),
+        "getpeername".into(),
+        "setsockopt".into(),
+        "getsockopt".into(),
+        "clone".into(),
+        "fork".into(),
+        "execve".into(),
+        "exit".into(),
+        "wait4".into(),
+        "fcntl".into(),
+        "futex".into(),
+        "set_tid_address".into(),
+        "openat".into(),
+        "newfstatat".into(),
+        "set_robust_list".into(),
+        "epoll_create1".into(),
+        "getrandom".into(),
+        "statx".into(),
+        "clone3".into(),
+        "exit_group".into(),
     ]
 }
 fn default_anomaly_log_path() -> String {
