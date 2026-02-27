@@ -130,6 +130,36 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
+fn live_channels_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) {
+    let mut guard = live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.clear();
+    for (name, channel) in channels_by_name {
+        guard.insert(name.to_ascii_lowercase(), Arc::clone(channel));
+    }
+}
+
+fn clear_live_channels() {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&name.to_ascii_lowercase())
+        .cloned()
+}
+
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
@@ -4768,6 +4798,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    // Ensure stale channel handles are never reused across restarts.
+    clear_live_channels();
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -5093,6 +5126,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    register_live_channels(channels_by_name.as_ref());
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -5166,6 +5200,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     for h in handles {
         let _ = h.await;
     }
+
+    clear_live_channels();
 
     Ok(())
 }

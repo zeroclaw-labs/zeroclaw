@@ -299,7 +299,8 @@ fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
+    let normalized = channel.to_ascii_lowercase();
+    match normalized.as_str() {
         "telegram" => {
             if config.channels_config.telegram.is_none() {
                 anyhow::bail!(
@@ -325,6 +326,19 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
             if config.channels_config.mattermost.is_none() {
                 anyhow::bail!(
                     "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
+                );
+            }
+        }
+        "whatsapp" | "whatsapp_web" => {
+            let wa = config.channels_config.whatsapp.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "heartbeat.target is set to {channel} but channels_config.whatsapp is not configured"
+                )
+            })?;
+
+            if normalized == "whatsapp_web" && wa.is_cloud_config() && !wa.is_web_config() {
+                anyhow::bail!(
+                    "heartbeat.target is set to whatsapp_web but channels_config.whatsapp is configured for cloud mode (set session_path for web mode)"
                 );
             }
         }
@@ -606,5 +620,48 @@ mod tests {
 
         let target = heartbeat_delivery_target(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_whatsapp_web_target_in_web_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("whatsapp_web".to_string(), "+15551234567".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_whatsapp_web_target_in_cloud_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("token".into()),
+            phone_number_id: Some("123456".into()),
+            verify_token: Some("verify".into()),
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err.to_string().contains("configured for cloud mode"));
     }
 }
