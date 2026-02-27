@@ -39,8 +39,31 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command).current_dir(workspace_dir);
+        let mut process = if std::env::consts::OS == "windows" {
+            // Use PowerShell on Windows with UTF-8 encoding support for Chinese characters
+            let mut cmd = tokio::process::Command::new("powershell");
+            
+            // Use simplified PowerShell startup to avoid configuration file issues
+            let safe_command = format!(
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}",
+                command
+            );
+            
+            cmd.arg("-NoProfile");           // Do not load profile
+            cmd.arg("-NonInteractive");       // Non-interactive mode
+            cmd.arg("-ExecutionPolicy").arg("Bypass");  // Bypass execution policy
+            cmd.arg("-Command").arg(safe_command);
+            cmd
+        } else {
+            // Use bash/sh on Linux/macOS
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(command);
+            cmd
+        };
+        
+        process.current_dir(workspace_dir);
+
+        println!("\n{:?}\n", process);
         Ok(process)
     }
 }
@@ -87,6 +110,41 @@ mod tests {
             .build_shell_command("echo hello", &cwd)
             .unwrap();
         let debug = format!("{command:?}");
-        assert!(debug.contains("echo hello"));
+        
+        if std::env::consts::OS == "windows" {
+            // Should use PowerShell on Windows
+            assert!(debug.contains("powershell"));
+            assert!(debug.contains("OutputEncoding"));
+            assert!(debug.contains("UTF8"));
+            assert!(debug.contains("echo hello"));
+        } else {
+            // Should use sh on Linux/macOS
+            assert!(debug.contains("sh"));
+            assert!(debug.contains("-c"));
+            assert!(debug.contains("echo hello"));
+        }
+    }
+
+    #[test]
+    fn native_builds_powershell_command_with_encoding() {
+        if std::env::consts::OS != "windows" {
+            return; // Test only on Windows
+        }
+        
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command("Get-ChildItem", &cwd)
+            .unwrap();
+        let debug = format!("{command:?}");
+        
+        // Verify PowerShell encoding settings
+        assert!(debug.contains("powershell"));
+        assert!(debug.contains("OutputEncoding"));
+        assert!(debug.contains("UTF8"));
+        assert!(debug.contains("Get-ChildItem"));
+        assert!(debug.contains("-NoProfile"));
+        assert!(debug.contains("-NonInteractive"));
+        assert!(debug.contains("-ExecutionPolicy"));
+        assert!(debug.contains("Bypass"));
     }
 }
