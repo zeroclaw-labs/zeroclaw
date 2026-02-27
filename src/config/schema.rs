@@ -6,6 +6,7 @@ use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -1738,6 +1739,29 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_cidr_notation(raw: &str) -> Result<(IpAddr, u8)> {
+    let (ip_raw, prefix_raw) = raw
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("missing '/' separator"))?;
+    let ip: IpAddr = ip_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid IP address '{ip_raw}'"))?;
+    let prefix: u8 = prefix_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid prefix '{prefix_raw}'"))?;
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        anyhow::bail!("prefix {prefix} exceeds max {max_prefix} for {ip}");
+    }
+    Ok((ip, prefix))
 }
 
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
@@ -4214,6 +4238,43 @@ pub struct SecurityConfig {
     /// Syscall anomaly detection profile for daemon shell/process execution.
     #[serde(default)]
     pub syscall_anomaly: SyscallAnomalyConfig,
+
+    /// Shared URL access policy for network-enabled tools.
+    #[serde(default)]
+    pub url_access: UrlAccessConfig,
+}
+
+/// Shared URL validation configuration used by network tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UrlAccessConfig {
+    /// Block private/local IPs and hostnames by default.
+    #[serde(default = "default_true")]
+    pub block_private_ip: bool,
+
+    /// Explicit CIDR ranges that bypass private/local-IP blocking.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+
+    /// Explicit domain patterns that bypass private/local-IP blocking.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+
+    /// Allow loopback host/IP access (`localhost`, `127.0.0.1`, `::1`).
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
+impl Default for UrlAccessConfig {
+    fn default() -> Self {
+        Self {
+            block_private_ip: true,
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+            allow_loopback: false,
+        }
+    }
 }
 
 /// OTP validation strategy.
@@ -5922,6 +5983,20 @@ impl Config {
         .with_context(|| {
             "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
         })?;
+        for (i, cidr) in self.security.url_access.allow_cidrs.iter().enumerate() {
+            parse_cidr_notation(cidr).with_context(|| {
+                format!("security.url_access.allow_cidrs[{i}] is invalid CIDR notation: {cidr}")
+            })?;
+        }
+        for (i, domain) in self.security.url_access.allow_domains.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not contain whitespace");
+            }
+        }
         let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
         let mut custom_role_names = std::collections::HashSet::new();
         for (i, role) in self.security.roles.iter().enumerate() {
@@ -10218,6 +10293,10 @@ default_temperature = 0.7
         assert!(parsed.security.syscall_anomaly.enabled);
         assert!(parsed.security.syscall_anomaly.alert_on_unknown_syscall);
         assert!(!parsed.security.syscall_anomaly.baseline_syscalls.is_empty());
+        assert!(parsed.security.url_access.block_private_ip);
+        assert!(parsed.security.url_access.allow_cidrs.is_empty());
+        assert!(parsed.security.url_access.allow_domains.is_empty());
+        assert!(!parsed.security.url_access.allow_loopback);
     }
 
     #[test]
@@ -10303,6 +10382,26 @@ baseline_syscalls = ["read", "write", "openat", "close"]
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_url_access_cidr() {
+        let mut config = Config::default();
+        config.security.url_access.allow_cidrs = vec!["10.0.0.0".into()];
+        let err = config.validate().expect_err("expected invalid CIDR");
+        assert!(err.to_string().contains("security.url_access.allow_cidrs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_domain() {
+        let mut config = Config::default();
+        config.security.url_access.allow_domains = vec!["   ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL allow domain");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.allow_domains"));
     }
 
     #[test]

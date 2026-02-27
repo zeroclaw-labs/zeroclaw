@@ -148,6 +148,31 @@ Notes:
 - Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
 - Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
+## `[security.url_access]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `block_private_ip` | `true` | Block local/private/link-local/multicast addresses by default |
+| `allow_cidrs` | `[]` | CIDR ranges allowed to bypass private-IP blocking (`100.64.0.0/10`, `198.18.0.0/15`) |
+| `allow_domains` | `[]` | Domain patterns that bypass private-IP blocking before DNS checks (`internal.example`, `*.svc.local`) |
+| `allow_loopback` | `false` | Permit loopback targets (`localhost`, `127.0.0.1`, `::1`) |
+
+Notes:
+
+- This policy is shared by `browser_open`, `http_request`, and `web_fetch`.
+- Tool-level allowlists still apply. `allow_domains` / `allow_cidrs` only override private/local blocking.
+- DNS rebinding protection remains enabled: resolved local/private IPs are denied unless explicitly allowlisted.
+
+Example:
+
+```toml
+[security.url_access]
+block_private_ip = true
+allow_cidrs = ["100.64.0.0/10", "198.18.0.0/15"]
+allow_domains = ["internal.example", "*.svc.local"]
+allow_loopback = false
+```
+
 ## `[security.syscall_anomaly]`
 
 | Key | Default | Purpose |

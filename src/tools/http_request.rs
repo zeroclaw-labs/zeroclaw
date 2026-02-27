@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
+use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -13,6 +14,7 @@ use std::time::Duration;
 pub struct HttpRequestTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    url_access: UrlAccessConfig,
     max_response_size: usize,
     timeout_secs: u64,
     user_agent: String,
@@ -22,6 +24,7 @@ impl HttpRequestTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
+        url_access: UrlAccessConfig,
         max_response_size: usize,
         timeout_secs: u64,
         user_agent: String,
@@ -29,6 +32,7 @@ impl HttpRequestTool {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
+            url_access,
             max_response_size,
             timeout_secs,
             user_agent,
@@ -46,6 +50,7 @@ impl HttpRequestTool {
                 empty_allowed_message: "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml",
                 scheme_policy: UrlSchemePolicy::HttpOrHttps,
                 ipv6_error_context: "http_request",
+                url_access: Some(&self.url_access),
             },
         )
     }
@@ -299,6 +304,7 @@ mod tests {
         HttpRequestTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
+            UrlAccessConfig::default(),
             1_000_000,
             30,
             "test".to_string(),
@@ -417,7 +423,14 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, "test".to_string());
+        let tool = HttpRequestTool::new(
+            security,
+            vec![],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+        );
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -536,6 +549,7 @@ mod tests {
         let tool = HttpRequestTool::new(
             security,
             vec!["example.com".into()],
+            UrlAccessConfig::default(),
             1_000_000,
             30,
             "test".to_string(),
@@ -557,6 +571,7 @@ mod tests {
         let tool = HttpRequestTool::new(
             security,
             vec!["example.com".into()],
+            UrlAccessConfig::default(),
             1_000_000,
             30,
             "test".to_string(),
@@ -581,6 +596,7 @@ mod tests {
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            UrlAccessConfig::default(),
             10,
             30,
             "test".to_string(),

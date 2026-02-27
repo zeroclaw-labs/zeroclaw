@@ -314,6 +314,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
             security.clone(),
             browser_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
         )));
         // Add full browser automation tool (pluggable backend)
         tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
@@ -340,6 +341,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
             http_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.user_agent.clone(),
@@ -354,6 +356,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.api_url.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
+            root_config.security.url_access.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
             web_fetch_config.user_agent.clone(),

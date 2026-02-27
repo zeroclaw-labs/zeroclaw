@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
+use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -11,13 +12,19 @@ use std::sync::Arc;
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    url_access: UrlAccessConfig,
 }
 
 impl BrowserOpenTool {
-    pub fn new(security: Arc<SecurityPolicy>, allowed_domains: Vec<String>) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        url_access: UrlAccessConfig,
+    ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
+            url_access,
         }
     }
 
@@ -32,6 +39,7 @@ impl BrowserOpenTool {
                 empty_allowed_message: "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml",
                 scheme_policy: UrlSchemePolicy::HttpsOnly,
                 ipv6_error_context: "browser_open",
+                url_access: Some(&self.url_access),
             },
         )
     }
@@ -182,6 +190,7 @@ mod tests {
         BrowserOpenTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
+            UrlAccessConfig::default(),
         )
     }
 
@@ -301,7 +310,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserOpenTool::new(security, vec![]);
+        let tool = BrowserOpenTool::new(security, vec![], UrlAccessConfig::default());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -315,7 +324,11 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(
+            security,
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -330,7 +343,11 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(
+            security,
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
