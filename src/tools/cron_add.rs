@@ -62,6 +62,17 @@ impl Tool for CronAddTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let mut delivery_channels = vec![
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost",
+            "qq",
+            "email",
+        ];
+        #[cfg(feature = "channel-matrix")]
+        delivery_channels.push("matrix");
+
         json!({
             "type": "object",
             "properties": {
@@ -80,7 +91,7 @@ impl Tool for CronAddTool {
                     "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "email"], "description": "Channel type to deliver to" },
+                        "channel": { "type": "string", "enum": delivery_channels, "description": "Channel type to deliver to" },
                         "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }

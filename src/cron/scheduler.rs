@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-matrix")]
+use crate::channels::MatrixChannel;
 use crate::channels::{
     Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
     TelegramChannel,
@@ -388,6 +390,27 @@ pub(crate) async fn deliver_announcement(
             let channel = EmailChannel::new(email.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        #[cfg(feature = "channel-matrix")]
+        "matrix" => {
+            let mx = config
+                .channels_config
+                .matrix
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+            let channel = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                mx.homeserver.clone(),
+                mx.access_token.clone(),
+                target.to_string(),
+                mx.allowed_users.clone(),
+                mx.user_id.clone(),
+                mx.device_id.clone(),
+                config.config_path.parent().map(|path| path.to_path_buf()),
+            )
+            .with_mention_only(mx.mention_only);
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        #[cfg(not(feature = "channel-matrix"))]
+        "matrix" => anyhow::bail!("unsupported delivery channel: matrix"),
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
