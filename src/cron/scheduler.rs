@@ -346,6 +346,7 @@ pub(crate) async fn deliver_announcement(
             let channel = SlackChannel::new(
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
+                sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;

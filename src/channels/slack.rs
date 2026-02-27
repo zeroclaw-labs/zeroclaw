@@ -7,16 +7,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
+    channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
 }
 
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bot_token: String,
+        channel_id: Option<String>,
+        channel_ids: Vec<String>,
+        allowed_users: Vec<String>,
+    ) -> Self {
         Self {
             bot_token,
             channel_id,
+            channel_ids,
             allowed_users,
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
@@ -73,6 +80,21 @@ impl SlackChannel {
         resp.get("user_id")
             .and_then(|u| u.as_str())
             .map(String::from)
+    }
+
+    /// Resolve the effective list of channel IDs to listen on.
+    /// `channel_ids` (explicit list) takes precedence over `channel_id` (single).
+    /// Returns `None` when neither is set, signaling wildcard auto-discovery.
+    fn scoped_channel_ids(&self) -> Option<Vec<String>> {
+        let ids: Vec<String> = self
+            .channel_ids
+            .iter()
+            .filter_map(|s| Self::normalized_channel_id(Some(s)))
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+        self.configured_channel_id().map(|id| vec![id])
     }
 
     /// Resolve the thread identifier for inbound Slack messages.
@@ -311,13 +333,16 @@ impl Channel for SlackChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
-        let scoped_channel = self.configured_channel_id();
+        let scoped_channels = self.scoped_channel_ids();
         let mut discovered_channels: Vec<String> = Vec::new();
         let mut last_discovery = Instant::now();
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
 
-        if let Some(ref channel_id) = scoped_channel {
-            tracing::info!("Slack channel listening on #{channel_id}...");
+        if let Some(ref ids) = scoped_channels {
+            tracing::info!("Slack channel listening on {} channel(s): {}",
+                ids.len(),
+                ids.join(", "),
+            );
         } else {
             tracing::info!(
                 "Slack channel_id not set (or '*'); listening across all accessible channels."
@@ -327,8 +352,8 @@ impl Channel for SlackChannel {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            let target_channels = if let Some(ref channel_id) = scoped_channel {
-                vec![channel_id.clone()]
+            let target_channels = if let Some(ref ids) = scoped_channels {
+                ids.clone()
             } else {
                 if discovered_channels.is_empty()
                     || last_discovery.elapsed() >= Duration::from_secs(60)
@@ -492,26 +517,26 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]);
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_channel_with_channel_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![], vec![]);
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
     }
 
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["*".into()]);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
     }
 
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()])
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["*".into()])
             .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
 
         assert!(ch.mention_only);
@@ -534,6 +559,40 @@ mod tests {
             SlackChannel::normalized_channel_id(Some(" C12345 ")),
             Some("C12345".to_string())
         );
+    }
+
+    #[test]
+    fn scoped_channel_ids_prefers_explicit_list() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            Some("C_SINGLE".into()),
+            vec!["C_LIST1".into(), "D_DM1".into()],
+            vec![],
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_LIST1".to_string(), "D_DM1".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_falls_back_to_single() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            Some("C_SINGLE".into()),
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_SINGLE".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_none_for_wildcard() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]);
+        assert_eq!(ch.scoped_channel_ids(), None);
     }
 
     #[test]
@@ -561,14 +620,14 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]);
         assert!(!ch.is_user_allowed("U12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
     }
 
@@ -591,7 +650,7 @@ mod tests {
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "U222".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into(), "U222".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("U222"));
         assert!(!ch.is_user_allowed("U333"));
@@ -599,27 +658,27 @@ mod tests {
 
     #[test]
     fn allowlist_exact_match_not_substring() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into()]);
         assert!(!ch.is_user_allowed("U1111"));
         assert!(!ch.is_user_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into()]);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(!ch.is_user_allowed("u111"));
     }
 
     #[test]
     fn allowlist_wildcard_and_specific() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into(), "*".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("anyone"));
     }

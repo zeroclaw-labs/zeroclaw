@@ -3576,7 +3576,12 @@ pub struct SlackConfig {
     pub app_token: Option<String>,
     /// Optional channel ID to restrict the bot to a single channel.
     /// Omit (or set `"*"`) to listen across all accessible channels.
+    /// Ignored when `channel_ids` is non-empty.
     pub channel_id: Option<String>,
+    /// Explicit list of channel/DM IDs to listen on simultaneously.
+    /// Takes precedence over `channel_id`. Empty = fall back to `channel_id`.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
