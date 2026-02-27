@@ -910,14 +910,6 @@ pub(super) fn parse_glm_style_tool_calls(
             }
         }
 
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({ "command": command }),
-                Some(line.to_string()),
-            ));
-        }
     }
 
     calls

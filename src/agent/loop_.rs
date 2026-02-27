@@ -1096,14 +1096,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
             }
         }
 
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({ "command": command }),
-                Some(line.to_string()),
-            ));
-        }
     }
 
     calls
@@ -5067,9 +5059,21 @@ Done."#;
     fn parse_glm_style_plain_url() {
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_glm_style_ignores_urls_in_text() {
+        let response = "Google homepage:\nhttps://www.google.com";
+        let calls = parse_glm_style_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_does_not_convert_plain_url_to_shell() {
+        let response = "Google homepage:\nhttps://www.google.com";
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
     }
 
     #[test]
