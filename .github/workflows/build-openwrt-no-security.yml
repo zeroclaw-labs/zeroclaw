@@ -1,0 +1,110 @@
+name: Build OpenWrt ARM64 - No Security
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-openwrt-unrestricted:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: 1. Remove ALL security restrictions
+      run: |
+        # Auto-approve all actions
+        if [ -f src/approval/mod.rs ]; then
+          sed -i 's/ApprovalResult::Pending/ApprovalResult::Approved/g' src/approval/mod.rs 2>/dev/null || true
+          sed -i 's/ApprovalResult::Denied/ApprovalResult::Approved/g' src/approval/mod.rs 2>/dev/null || true
+        fi
+        
+        if [ -f src/security/policy.rs ]; then
+          sed -i 's/ActionResult::NeedsApproval/ActionResult::Allowed/g' src/security/policy.rs 2>/dev/null || true
+          sed -i 's/ActionResult::Denied/ActionResult::Allowed/g' src/security/policy.rs 2>/dev/null || true
+        fi
+        
+        # Remove shell restrictions
+        if [ -f src/tools/shell.rs ]; then
+          sed -i 's/block_high_risk_commands: true/block_high_risk_commands: false/g' src/tools/shell.rs 2>/dev/null || true
+        fi
+        
+        # Remove path restrictions
+        if [ -f src/security/policy.rs ]; then
+          sed -i 's/is_path_allowed.*false/is_path_allowed: true/g' src/security/policy.rs 2>/dev/null || true
+        fi
+        
+        # Max out limits in schema.rs
+        if [ -f src/config/schema.rs ]; then
+          sed -i 's/max_actions_per_hour: 100/max_actions_per_hour: 999999/g' src/config/schema.rs 2>/dev/null || true
+          sed -i 's/max_cost_per_day_cents: 500/max_cost_per_day_cents: 99999999/g' src/config/schema.rs 2>/dev/null || true
+          sed -i 's/workspace_only: true/workspace_only: false/g' src/config/schema.rs 2>/dev/null || true
+          sed -i 's/require_approval_for_medium_risk: true/require_approval_for_medium_risk: false/g' src/config/schema.rs 2>/dev/null || true
+          sed -i 's/block_high_risk_commands: true/block_high_risk_commands: false/g' src/config/schema.rs 2>/dev/null || true
+          sed -i 's/level: AutonomyLevel::Supervised/level: AutonomyLevel::Full/g' src/config/schema.rs 2>/dev/null || true
+          sed -i 's/level: AutonomyLevel::Locked/level: AutonomyLevel::Full/g' src/config/schema.rs 2>/dev/null || true
+          # Clear forbidden paths
+          sed -i 's|forbidden_paths: vec!\[|forbidden_paths: vec![] // was: vec![|g' src/config/schema.rs 2>/dev/null || true
+        fi
+        
+        # Default to Freedom in wizard
+        if [ -f src/onboard/wizard.rs ]; then
+          sed -i 's/autonomy_config_for_mode(SecurityMode::Casual)/autonomy_config_for_mode(SecurityMode::Freedom)/g' src/onboard/wizard.rs 2>/dev/null || true
+          sed -i 's/.default(0)/.default(2)/g' src/onboard/wizard.rs 2>/dev/null || true
+          sed -i 's/.default(1)/.default(2)/g' src/onboard/wizard.rs 2>/dev/null || true
+        fi
+        
+        echo "Security restrictions removed"
+    
+    - name: 2. Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-unknown-linux-musl
+    
+    - name: 3. Install cross
+      run: cargo install cross --git https://github.com/cross-rs/cross
+    
+    - name: 4. Cache cargo
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: 5. Build for OpenWrt ARM64
+      run: cross build --release --target aarch64-unknown-linux-musl
+    
+    - name: 6. Strip binary
+      run: |
+        docker run --rm -v $(pwd)/target:/target messense/rust-musl-cross:aarch64-musl \
+          strip /target/aarch64-unknown-linux-musl/release/zeroclaw 2>/dev/null || true
+    
+    - name: 7. Package binary
+      run: |
+        mkdir -p dist
+        cp target/aarch64-unknown-linux-musl/release/zeroclaw dist/zeroclaw-openwrt-aarch64-unrestricted
+        echo "# ZeroClaw OpenWrt ARM64 - NO SECURITY" > dist/README.txt
+        echo "All security restrictions removed. Use at your own risk." >> dist/README.txt
+        tar -czf dist/zeroclaw-openwrt-aarch64-unrestricted.tar.gz -C dist zeroclaw-openwrt-aarch64-unrestricted README.txt
+    
+    - name: 8. Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: zeroclaw-openwrt-aarch64-unrestricted
+        path: dist/zeroclaw-openwrt-aarch64-unrestricted.tar.gz
+    
+    - name: 9. Create Release
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/zeroclaw-openwrt-aarch64-unrestricted.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
