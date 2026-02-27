@@ -1,7 +1,7 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, QQReceiveMode, SignalConfig, StreamMode,
-    WhatsAppConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, QQEnvironment, QQReceiveMode, SignalConfig,
+    StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -5010,11 +5010,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     QQReceiveMode::Websocket
                 };
 
+                let environment_choice = Select::new()
+                    .with_prompt("  API environment")
+                    .items(["Production", "Sandbox (for unpublished bot testing)"])
+                    .default(0)
+                    .interact()?;
+                let environment = if environment_choice == 0 {
+                    QQEnvironment::Production
+                } else {
+                    QQEnvironment::Sandbox
+                };
+
                 config.qq = Some(QQConfig {
                     app_id,
                     app_secret,
                     allowed_users,
                     receive_mode,
+                    environment,
                 });
             }
             ChannelMenuChoice::LarkFeishu => {
@@ -7673,6 +7685,7 @@ mod tests {
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_launchable_channels(&channels));
 

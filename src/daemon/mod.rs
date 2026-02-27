@@ -503,6 +503,7 @@ mod tests {
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_supervised_channels(&config));
     }

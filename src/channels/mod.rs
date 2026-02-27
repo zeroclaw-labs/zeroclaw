@@ -4463,10 +4463,11 @@ fn collect_configured_channels(
         } else {
             channels.push(ConfiguredChannel {
                 display_name: "QQ",
-                channel: Arc::new(QQChannel::new(
+                channel: Arc::new(QQChannel::new_with_environment(
                     qq.app_id.clone(),
                     qq.app_secret.clone(),
                     qq.allowed_users.clone(),
+                    qq.environment.clone(),
                 )),
             });
         }

@@ -372,10 +372,11 @@ pub(crate) async fn deliver_announcement(
                 .qq
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
-            let channel = QQChannel::new(
+            let channel = QQChannel::new_with_environment(
                 qq.app_id.clone(),
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
+                qq.environment.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }

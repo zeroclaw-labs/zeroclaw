@@ -516,10 +516,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // QQ channel (if configured)
     let qq_channel: Option<Arc<QQChannel>> = config.channels_config.qq.as_ref().map(|qq_cfg| {
-        Arc::new(QQChannel::new(
+        Arc::new(QQChannel::new_with_environment(
             qq_cfg.app_id.clone(),
             qq_cfg.app_secret.clone(),
             qq_cfg.allowed_users.clone(),
+            qq_cfg.environment.clone(),
         ))
     });
     let qq_webhook_enabled = config

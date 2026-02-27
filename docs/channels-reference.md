@@ -459,11 +459,13 @@ app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
 receive_mode = "webhook" # webhook (default) or websocket (legacy fallback)
+environment = "production" # production (default) or sandbox
 ```
 
 Notes:
 
 - `webhook` mode is now the default and serves inbound callbacks at `POST /qq`.
+- Set `environment = "sandbox"` to target `https://sandbox.api.sgroup.qq.com` for unpublished bot testing.
 - QQ validation challenge payloads (`op = 13`) are auto-signed using `app_secret`.
 - `X-Bot-Appid` is checked when present and must match `app_id`.
 - Set `receive_mode = "websocket"` to keep the legacy gateway WS receive path.

@@ -4879,6 +4879,15 @@ pub enum QQReceiveMode {
     Webhook,
 }
 
+/// QQ API environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QQEnvironment {
+    #[default]
+    Production,
+    Sandbox,
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -4892,6 +4901,9 @@ pub struct QQConfig {
     /// Event receive mode: "webhook" (default) or "websocket".
     #[serde(default)]
     pub receive_mode: QQReceiveMode,
+    /// API environment: "production" (default) or "sandbox".
+    #[serde(default)]
+    pub environment: QQEnvironment,
 }
 
 impl ChannelConfig for QQConfig {
@@ -10382,6 +10394,7 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"123","app_secret":"secret"}"#;
         let parsed: QQConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
+        assert_eq!(parsed.environment, QQEnvironment::Production);
         assert!(parsed.allowed_users.is_empty());
     }
 
@@ -10392,10 +10405,12 @@ default_model = "legacy-model"
             app_secret: "secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: QQReceiveMode::Websocket,
+            environment: QQEnvironment::Sandbox,
         };
         let toml_str = toml::to_string(&qc).unwrap();
         let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
+        assert_eq!(parsed.environment, QQEnvironment::Sandbox);
         assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
