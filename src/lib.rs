@@ -56,6 +56,9 @@ pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
+// Intentionally unused re-export — public API surface for plugin authors.
+#[allow(unused_imports)]
+pub(crate) mod plugins;
 pub(crate) mod integrations;
 pub mod memory;
 pub(crate) mod migration;
