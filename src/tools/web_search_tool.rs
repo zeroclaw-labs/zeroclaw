@@ -4,19 +4,21 @@ use async_trait::async_trait;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports providers: DuckDuckGo (free), Brave, Firecrawl.
+/// Supports providers: DuckDuckGo (free), Brave, Firecrawl, Tavily.
 pub struct WebSearchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
-    api_key: Option<String>,
+    api_keys: Vec<String>,
     api_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     user_agent: String,
+    key_index: Arc<AtomicUsize>,
 }
 
 impl WebSearchTool {
@@ -41,15 +43,34 @@ impl WebSearchTool {
         timeout_secs: u64,
         user_agent: String,
     ) -> Self {
+        let api_keys = api_key
+            .as_ref()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             security,
             provider: provider.trim().to_lowercase(),
-            api_key,
+            api_keys,
             api_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             user_agent,
+            key_index: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn get_next_api_key(&self) -> Option<String> {
+        if self.api_keys.is_empty() {
+            return None;
+        }
+        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+        Some(self.api_keys[idx].clone())
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
@@ -129,10 +150,9 @@ impl WebSearchTool {
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
-        let auth_token = match self.api_key.as_ref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim(),
-            _ => anyhow::bail!("Brave API key not configured"),
-        };
+        let auth_token = self
+            .get_next_api_key()
+            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
 
         let encoded_query = urlencoding::encode(query);
         let search_url = format!(
@@ -196,14 +216,11 @@ impl WebSearchTool {
 
     #[cfg(feature = "firecrawl")]
     async fn search_firecrawl(&self, query: &str) -> anyhow::Result<String> {
-        let auth_token = match self.api_key.as_ref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim(),
-            _ => {
-                anyhow::bail!(
-                    "web_search provider 'firecrawl' requires [web_search].api_key in config.toml"
-                );
-            }
-        };
+        let auth_token = self.get_next_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_search provider 'firecrawl' requires [web_search].api_key in config.toml"
+            )
+        })?;
 
         let api_url = self
             .api_url
@@ -221,7 +238,7 @@ impl WebSearchTool {
             .post(endpoint)
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {auth_token}"),
+                format!("Bearer {}", auth_token),
             )
             .json(&json!({
                 "query": query,
@@ -295,6 +312,89 @@ impl WebSearchTool {
     #[allow(clippy::unused_async)]
     async fn search_firecrawl(&self, _query: &str) -> anyhow::Result<String> {
         anyhow::bail!("web_search provider 'firecrawl' requires Cargo feature 'firecrawl'")
+    }
+
+    async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
+        let api_key = self.get_next_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_search provider 'tavily' requires [web_search].api_key in config.toml"
+            )
+        })?;
+
+        let api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.tavily.com");
+        let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
+            .build()?;
+        let response = client
+            .post(&endpoint)
+            .json(&json!({
+                "api_key": api_key,
+                "query": query,
+                "max_results": self.max_results,
+                "search_depth": "basic",
+                "include_answer": false,
+                "include_raw_content": false,
+                "include_images": false
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Tavily search failed: {e}"))?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "Tavily search failed with status {}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid Tavily response JSON: {e}"))?;
+        if let Some(error) = parsed.get("error").and_then(serde_json::Value::as_str) {
+            anyhow::bail!("Tavily API error: {error}");
+        }
+
+        let results = parsed
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Tavily response missing results array"))?;
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Tavily)", query)];
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("No title");
+            let url = result
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let content = result
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !content.is_empty() {
+                lines.push(format!("   {}", content));
+            }
+        }
+
+        Ok(lines.join("\n"))
     }
 }
 
@@ -370,8 +470,9 @@ impl Tool for WebSearchTool {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
             "firecrawl" => self.search_firecrawl(query).await?,
+            "tavily" => self.search_tavily(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo', 'brave', or 'firecrawl' in config.toml",
+                "Unknown search provider: '{}'. Set [web_search].provider to 'duckduckgo', 'brave', 'firecrawl', or 'tavily' in config.toml",
                 self.provider
             ),
         };
@@ -601,6 +702,52 @@ mod tests {
         } else {
             assert!(error.contains("requires Cargo feature 'firecrawl'"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_tavily_without_api_key() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn test_parses_multiple_api_keys() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("key1,key2,key3".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert_eq!(tool.api_keys, vec!["key1", "key2", "key3"]);
+    }
+
+    #[test]
+    fn test_round_robin_api_key_selection_cycles() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("k1,k2".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert_eq!(tool.get_next_api_key().as_deref(), Some("k1"));
+        assert_eq!(tool.get_next_api_key().as_deref(), Some("k2"));
+        assert_eq!(tool.get_next_api_key().as_deref(), Some("k1"));
     }
 
     #[tokio::test]

@@ -1429,10 +1429,11 @@ pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
     pub enabled: bool,
-    /// Provider: "fast_html2md", "nanohtml2text", or "firecrawl"
+    /// Provider: "fast_html2md", "nanohtml2text", "firecrawl", or "tavily"
     #[serde(default = "default_web_fetch_provider")]
     pub provider: String,
-    /// Optional provider API key (required for provider = "firecrawl")
+    /// Optional provider API key (required for provider = "firecrawl" or "tavily").
+    /// Multiple keys can be comma-separated for round-robin load balancing.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
@@ -1491,10 +1492,11 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave", "firecrawl", or "tavily"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
-    /// Generic provider API key (used by firecrawl and as fallback for brave)
+    /// Generic provider API key (used by firecrawl, tavily, and as fallback for brave).
+    /// Multiple keys can be comma-separated for round-robin load balancing.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
