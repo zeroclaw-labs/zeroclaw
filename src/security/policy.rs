@@ -700,6 +700,13 @@ impl SecurityPolicy {
 
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands {
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("curl") || lower.contains("wget") {
+                    return Err(
+                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains."
+                            .into(),
+                    );
+                }
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {

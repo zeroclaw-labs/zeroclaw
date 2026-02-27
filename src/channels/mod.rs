@@ -78,7 +78,7 @@ use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -2583,7 +2583,18 @@ pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>])
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(&without_tool_tags, &known_tool_names)
+    let sanitized = strip_isolated_tool_json_artifacts(&without_tool_tags, &known_tool_names);
+
+    match LeakDetector::new().scan(&sanitized) {
+        LeakResult::Clean => sanitized,
+        LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                patterns = ?patterns,
+                "output guardrail: credential leak detected in outbound channel response"
+            );
+            redacted
+        }
+    }
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -4678,6 +4689,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tool_descs.push((
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
+        ));
+        tool_descs.push((
+            "browser",
+            "Automate browser actions (open/click/type/scroll/screenshot) with backend-aware safety checks.",
         ));
     }
     if config.composio.enabled {
@@ -9582,6 +9597,17 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(!result.contains("<tool_call>"));
         assert!(!result.contains("\"name\":\"mock_price\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_channel_response_redacts_detected_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP";
+
+        let result = sanitize_channel_response(leaked, &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(result.contains("[REDACTED_AWS_CREDENTIAL]"));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

@@ -6,6 +6,11 @@ use std::sync::OnceLock;
 
 const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkillAuditOptions {
+    pub allow_scripts: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SkillAuditReport {
     pub files_scanned: usize,
@@ -23,6 +28,13 @@ impl SkillAuditReport {
 }
 
 pub fn audit_skill_directory(skill_dir: &Path) -> Result<SkillAuditReport> {
+    audit_skill_directory_with_options(skill_dir, SkillAuditOptions::default())
+}
+
+pub fn audit_skill_directory_with_options(
+    skill_dir: &Path,
+    options: SkillAuditOptions,
+) -> Result<SkillAuditReport> {
     if !skill_dir.exists() {
         bail!("Skill source does not exist: {}", skill_dir.display());
     }
@@ -46,7 +58,7 @@ pub fn audit_skill_directory(skill_dir: &Path) -> Result<SkillAuditReport> {
 
     for path in collect_paths_depth_first(&canonical_root)? {
         report.files_scanned += 1;
-        audit_path(&canonical_root, &path, &mut report)?;
+        audit_path(&canonical_root, &path, &mut report, options)?;
     }
 
     Ok(report)
@@ -105,7 +117,12 @@ fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn audit_path(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
+fn audit_path(
+    root: &Path,
+    path: &Path,
+    report: &mut SkillAuditReport,
+    options: SkillAuditOptions,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     let rel = relative_display(root, path);
@@ -121,7 +138,7 @@ fn audit_path(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result
         return Ok(());
     }
 
-    if is_unsupported_script_file(path) {
+    if !options.allow_scripts && is_unsupported_script_file(path) {
         report.findings.push(format!(
             "{rel}: script-like files are blocked by skill security policy."
         ));
@@ -550,6 +567,31 @@ mod tests {
         let report = audit_skill_directory(&skill_dir).unwrap();
         assert!(
             report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("script-like files are blocked")),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn audit_allows_shell_script_files_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("allowed-scripts");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Skill\n").unwrap();
+        std::fs::write(skill_dir.join("install.sh"), "echo allowed\n").unwrap();
+
+        let report = audit_skill_directory_with_options(
+            &skill_dir,
+            SkillAuditOptions {
+                allow_scripts: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !report
                 .findings
                 .iter()
                 .any(|finding| finding.contains("script-like files are blocked")),
