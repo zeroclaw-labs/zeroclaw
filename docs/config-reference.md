@@ -342,6 +342,7 @@ Notes:
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
+| `clawhub_token` | unset | Optional Bearer token for authenticated ClawhHub skill downloads |
 
 Notes:
 
@@ -353,6 +354,14 @@ Notes:
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 - Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
+- `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawhHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
+
+**ClawhHub token example:**
+
+```toml
+[skills]
+clawhub_token = "your-token-here"
+```
 
 ## `[composio]`
 

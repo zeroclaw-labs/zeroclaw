@@ -183,6 +183,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         transcription: crate::config::TranscriptionConfig::default(),
         agents_ipc: crate::config::AgentsIpcConfig::default(),
         model_support_vision: None,
+        wasm: crate::config::WasmConfig::default(),
     };
 
     println!(
@@ -542,6 +543,7 @@ async fn run_quick_setup_with_home(
         transcription: crate::config::TranscriptionConfig::default(),
         agents_ipc: crate::config::AgentsIpcConfig::default(),
         model_support_vision: None,
+        wasm: crate::config::WasmConfig::default(),
     };
 
     config.save().await?;

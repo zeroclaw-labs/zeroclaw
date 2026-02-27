@@ -8516,6 +8516,7 @@ dependencies = [
  "webpki-roots 1.0.6",
  "which",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -8653,6 +8654,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.116",
+]
+
+[[package]]
+name = "zip"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "760394e246e4c28189f19d488c058bf16f564016aefac5d32bb1f3b51d5e9261"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "crossbeam-utils",
+ "flate2",
 ]
 
 [[package]]

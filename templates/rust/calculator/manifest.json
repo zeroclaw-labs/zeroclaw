@@ -1,0 +1,23 @@
+{
+  "name": "__SKILL_NAME__",
+  "version": "1",
+  "description": "Arithmetic calculator — add, subtract, multiply, divide",
+  "parameters": {
+    "type": "object",
+    "required": ["op", "a", "b"],
+    "properties": {
+      "op": {
+        "type": "string",
+        "description": "Operation: add, sub, mul, div (aliases: +, -, x/*, /)"
+      },
+      "a": {
+        "type": "number",
+        "description": "First operand"
+      },
+      "b": {
+        "type": "number",
+        "description": "Second operand"
+      }
+    }
+  }
+}

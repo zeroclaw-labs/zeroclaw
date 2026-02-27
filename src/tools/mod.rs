@@ -63,6 +63,7 @@ pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
 pub mod wasm_module;
+pub mod wasm_tool;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -520,7 +521,15 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    // Load WASM plugin tools from the skills directory.
+    // Each installed skill package may ship one or more WASM tools under
+    // `<skill-dir>/tools/<tool-name>/{tool.wasm, manifest.json}`.
+    // Failures are logged and skipped — a broken plugin must not block startup.
+    let skills_dir = workspace_dir.join("skills");
+    let mut boxed = boxed_registry_from_arcs(tool_arcs);
+    let wasm_tools = wasm_tool::load_wasm_tools_from_skills(&skills_dir);
+    boxed.extend(wasm_tools);
+    boxed
 }
 
 #[cfg(test)]

@@ -274,6 +274,10 @@ pub struct Config {
     /// - `Some(false)`: force vision support off
     #[serde(default)]
     pub model_support_vision: Option<bool>,
+
+    /// WASM plugin engine configuration (`[wasm]` section).
+    #[serde(default)]
+    pub wasm: WasmConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -709,6 +713,58 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Optional ClawhHub API token for authenticated skill downloads.
+    /// Obtain from https://clawhub.ai after signing in.
+    /// Set via config: `clawhub_token = "..."` under `[skills]`.
+    #[serde(default)]
+    pub clawhub_token: Option<String>,
+}
+
+/// WASM plugin engine configuration (`[wasm]` section).
+///
+/// Controls limits applied to every WASM tool invocation.
+/// Requires the `wasm-tools` compile-time feature to have any effect.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmConfig {
+    /// Enable loading WASM tools from installed skill packages.
+    /// Default: `true` (auto-discovers plugins in the skills directory).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum linear memory per WASM invocation in MiB.
+    /// Valid range: 1..=256. Default: `64`.
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// CPU fuel budget per invocation (roughly one unit ≈ one WASM instruction).
+    /// Default: 1_000_000_000.
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+    /// URL of the ZeroMarket (or compatible) registry used by `zeroclaw skill install`.
+    /// Default: the public ZeroMarket registry.
+    #[serde(default = "default_registry_url")]
+    pub registry_url: String,
+}
+
+fn default_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000_000
+}
+
+fn default_registry_url() -> String {
+    "https://zeromarket.vercel.app/api".to_string()
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_wasm_fuel_limit(),
+            registry_url: default_registry_url(),
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -4813,6 +4869,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -6204,6 +6261,34 @@ impl Config {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
         }
 
+        // WASM config
+        if self.wasm.memory_limit_mb == 0 || self.wasm.memory_limit_mb > 256 {
+            anyhow::bail!(
+                "wasm.memory_limit_mb must be between 1 and 256, got {}",
+                self.wasm.memory_limit_mb
+            );
+        }
+        if self.wasm.fuel_limit == 0 {
+            anyhow::bail!("wasm.fuel_limit must be greater than 0");
+        }
+        {
+            let url = &self.wasm.registry_url;
+            // Extract what comes after "https://" and check that the host part
+            // (up to the first '/', '?', '#', or ':') is non-empty.
+            let has_valid_host = url
+                .strip_prefix("https://")
+                .map(|rest| {
+                    let host = rest.split(&['/', '?', '#', ':'][..]).next().unwrap_or("");
+                    !host.is_empty()
+                })
+                .unwrap_or(false);
+            if !has_valid_host {
+                anyhow::bail!(
+                    "wasm.registry_url must be a valid HTTPS URL with a non-empty host, got '{url}'"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -6769,6 +6854,59 @@ mod tests {
     }
 
     #[test]
+    async fn wasm_config_default_has_correct_values() {
+        let cfg = WasmConfig::default();
+        assert!(cfg.enabled, "WASM tools should be enabled by default");
+        assert_eq!(cfg.memory_limit_mb, 64);
+        assert_eq!(cfg.fuel_limit, 1_000_000_000);
+        assert_eq!(cfg.registry_url, "https://zeromarket.vercel.app/api");
+    }
+
+    #[test]
+    async fn wasm_config_invalid_values_rejected() {
+        let mut c = Config::default();
+
+        // memory_limit_mb = 0
+        c.wasm.memory_limit_mb = 0;
+        assert!(c.validate().is_err(), "memory_limit_mb=0 should fail");
+
+        // memory_limit_mb = 257
+        c.wasm = WasmConfig::default();
+        c.wasm.memory_limit_mb = 257;
+        assert!(c.validate().is_err(), "memory_limit_mb=257 should fail");
+
+        // fuel_limit = 0
+        c.wasm = WasmConfig::default();
+        c.wasm.fuel_limit = 0;
+        assert!(c.validate().is_err(), "fuel_limit=0 should fail");
+
+        // empty registry_url
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = String::new();
+        assert!(c.validate().is_err(), "empty registry_url should fail");
+
+        // http:// instead of https://
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "http://example.com".to_string();
+        assert!(c.validate().is_err(), "http registry_url should fail");
+
+        // bare "https://"
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://".to_string();
+        assert!(c.validate().is_err(), "https:// without host should fail");
+
+        // port-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://:443".to_string();
+        assert!(c.validate().is_err(), "https://:443 should fail");
+
+        // query-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://?q=1".to_string();
+        assert!(c.validate().is_err(), "https://?q=1 should fail");
+    }
+
+    #[test]
     async fn config_debug_redacts_sensitive_values() {
         let mut config = Config::default();
         config.workspace_dir = PathBuf::from("/tmp/workspace");
@@ -7185,6 +7323,7 @@ default_temperature = 0.7
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -7554,6 +7693,7 @@ tool_dispatcher = "xml"
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         config.save().await.unwrap();

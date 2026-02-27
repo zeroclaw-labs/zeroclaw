@@ -242,28 +242,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             "model": state.model,
         }));
 
-        // Run the agent loop with tool execution
-        let result = run_tool_call_loop(
-            state.provider.as_ref(),
-            &mut history,
-            state.tools_registry_exec.as_ref(),
-            state.observer.as_ref(),
-            &provider_label,
-            &state.model,
-            state.temperature,
-            true, // silent - no console output
-            Some(&approval_manager),
-            "webchat",
-            &state.multimodal,
-            state.max_tool_iterations,
-            None, // cancellation token
-            None, // delta streaming
-            None, // hooks
-            &[],  // excluded tools
-        )
-        .await;
-
-        match result {
+        // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
+        match super::run_gateway_chat_with_tools(&state, &content).await {
             Ok(response) => {
                 let safe_response =
                     finalize_ws_response(&response, &history, state.tools_registry_exec.as_ref());

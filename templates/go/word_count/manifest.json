@@ -1,0 +1,15 @@
+{
+  "name": "__SKILL_NAME__",
+  "version": "1",
+  "description": "Count words, lines, and characters in text",
+  "parameters": {
+    "type": "object",
+    "required": ["text"],
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Text to analyze"
+      }
+    }
+  }
+}

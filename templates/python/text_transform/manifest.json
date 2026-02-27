@@ -1,0 +1,20 @@
+{
+  "name": "__SKILL_NAME__",
+  "version": "1",
+  "description": "Transform text: uppercase, lowercase, reverse, title case",
+  "parameters": {
+    "type": "object",
+    "required": ["text", "transform"],
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Input text"
+      },
+      "transform": {
+        "type": "string",
+        "description": "Transformation: uppercase, lowercase, reverse, title",
+        "enum": ["uppercase", "lowercase", "reverse", "title"]
+      }
+    }
+  }
+}

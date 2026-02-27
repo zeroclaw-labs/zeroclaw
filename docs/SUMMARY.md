@@ -2,7 +2,7 @@
 
 This file is the canonical table of contents for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **February 25, 2026**.
 
 ## Language Entry
 
@@ -44,6 +44,7 @@ Last refreshed: **February 18, 2026**.
 - [channels-reference.md](channels-reference.md)
 - [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
 - [config-reference.md](config-reference.md)
+- [wasm-tools-guide.md](wasm-tools-guide.md)
 - [custom-providers.md](custom-providers.md)
 - [zai-glm-setup.md](zai-glm-setup.md)
 - [langgraph-integration.md](langgraph-integration.md)

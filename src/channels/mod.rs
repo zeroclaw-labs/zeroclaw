@@ -4912,7 +4912,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )),
         query_classification: config.query_classification.clone(),
         model_routes: config.model_routes.clone(),
-        approval_manager: Arc::new(ApprovalManager::from_config(&config.autonomy)),
+        // WASM skill tools are sandboxed by the WASM engine and cannot access the
+        // host filesystem, network, or shell. Pre-approve them so they are not
+        // denied on non-CLI channels (which have no interactive stdin to prompt).
+        approval_manager: {
+            let mut autonomy = config.autonomy.clone();
+            let skills_dir = workspace.join("skills");
+            for name in tools::wasm_tool::wasm_tool_names_from_skills(&skills_dir) {
+                if !autonomy.auto_approve.contains(&name) {
+                    autonomy.auto_approve.push(name);
+                }
+            }
+            Arc::new(ApprovalManager::from_config(&autonomy))
+        },
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
