@@ -2,7 +2,7 @@
 use crate::channels::LarkChannel;
 use crate::channels::{
     Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
-    TelegramChannel,
+    TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -308,7 +308,8 @@ pub(crate) async fn deliver_announcement(
     target: &str,
     output: &str,
 ) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
+    let normalized = channel.to_ascii_lowercase();
+    match normalized.as_str() {
         "telegram" => {
             let tg = config
                 .channels_config
@@ -382,6 +383,31 @@ pub(crate) async fn deliver_announcement(
                 qq.environment.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "whatsapp_web" | "whatsapp" => {
+            let wa = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+
+            // WhatsApp Web requires the connected channel instance from the
+            // channel runtime. Fall back to cloud mode if configured.
+            if let Some(live_channel) = crate::channels::get_live_channel("whatsapp") {
+                live_channel.send(&SendMessage::new(output, target)).await?;
+            } else if wa.is_cloud_config() {
+                let channel = WhatsAppChannel::new(
+                    wa.access_token.clone().unwrap_or_default(),
+                    wa.phone_number_id.clone().unwrap_or_default(),
+                    wa.verify_token.clone().unwrap_or_default(),
+                    wa.allowed_numbers.clone(),
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            } else {
+                anyhow::bail!(
+                    "whatsapp_web delivery requires an active channels runtime session; start daemon/channels with whatsapp web enabled"
+                );
+            }
         }
         "lark" => {
             #[cfg(feature = "channel-lark")]
@@ -1105,5 +1131,34 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_whatsapp_web_requires_live_session_in_web_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("whatsapp_web".into()),
+            to: Some("+15551234567".into()),
+            best_effort: true,
+        };
+
+        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires an active channels runtime session"));
     }
 }

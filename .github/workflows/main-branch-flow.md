@@ -151,7 +151,7 @@ Workflow: `.github/workflows/pub-docker-img.yml`
 
 1. Triggered on `pull_request` to `dev` or `main` when Docker build-input paths change.
 2. Runs `PR Docker Smoke` job:
-   - Builds local smoke image with Blacksmith builder.
+   - Builds local smoke image with Buildx builder.
    - Verifies container with `docker run ... --version`.
 3. Typical runtime in recent sample: ~240.4s.
 4. No registry push happens on PR events.

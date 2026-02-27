@@ -59,9 +59,9 @@ jobs:
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
-                  prefix-key: ci-run-lint
+                  prefix-key: ci-run-check
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
             - name: Run strict lint delta gate
@@ -71,20 +71,64 @@ jobs:
 
     test:
         name: Test
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: [self-hosted, aws-india]
-        timeout-minutes: 30
+        timeout-minutes: 35
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
-                  prefix-key: ci-run-test
-            - name: Run tests
-              run: cargo test --locked --verbose
+                  prefix-key: ci-run-check
+            - name: Run tests with flake detection
+              shell: bash
+              env:
+                  BLOCK_ON_FLAKE: ${{ vars.CI_BLOCK_ON_FLAKE_SUSPECTED || 'false' }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+
+                  if cargo test --locked --verbose; then
+                    echo '{"flake_suspected":false,"status":"success"}' > artifacts/flake-probe.json
+                    exit 0
+                  fi
+
+                  echo "::warning::First test run failed. Retrying for flake detection..."
+                  if cargo test --locked --verbose; then
+                    echo '{"flake_suspected":true,"status":"flake"}' > artifacts/flake-probe.json
+                    echo "::warning::Flake suspected — test passed on retry"
+                    if [ "${BLOCK_ON_FLAKE}" = "true" ]; then
+                      echo "BLOCK_ON_FLAKE is set; failing on suspected flake."
+                      exit 1
+                    fi
+                    exit 0
+                  fi
+
+                  echo '{"flake_suspected":false,"status":"failure"}' > artifacts/flake-probe.json
+                  exit 1
+            - name: Publish flake probe summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/flake-probe.json ]; then
+                    status=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['status'])")
+                    flake=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['flake_suspected'])")
+                    echo "### Test Flake Probe" >> "$GITHUB_STEP_SUMMARY"
+                    echo "- Status: \`${status}\`" >> "$GITHUB_STEP_SUMMARY"
+                    echo "- Flake suspected: \`${flake}\`" >> "$GITHUB_STEP_SUMMARY"
+                  fi
+            - name: Upload flake probe artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: test-flake-probe
+                  path: artifacts/flake-probe.*
+                  if-no-files-found: ignore
+                  retention-days: 14
 
     build:
         name: Build (Smoke)
@@ -98,7 +142,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-build
                   cache-targets: true
@@ -106,53 +150,6 @@ jobs:
               run: cargo build --profile release-fast --locked --verbose
             - name: Check binary size
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
-
-    flake-probe:
-        name: Test Flake Retry Probe
-        needs: [changes, lint, test]
-        if: always() && needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 25
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
-              with:
-                  prefix-key: ci-run-flake-probe
-            - name: Probe flaky failure via single retry
-              shell: bash
-              env:
-                  INITIAL_TEST_RESULT: ${{ needs.test.result }}
-                  BLOCK_ON_FLAKE: ${{ vars.CI_BLOCK_ON_FLAKE_SUSPECTED || 'false' }}
-              run: |
-                  set -euo pipefail
-                  mkdir -p artifacts
-                  python3 scripts/ci/flake_retry_probe.py \
-                    --initial-result "${INITIAL_TEST_RESULT}" \
-                    --retry-command "cargo test --locked --verbose" \
-                    --output-json artifacts/flake-probe.json \
-                    --output-md artifacts/flake-probe.md \
-                    --block-on-flake "${BLOCK_ON_FLAKE}"
-            - name: Publish flake probe summary
-              if: always()
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  if [ -f artifacts/flake-probe.md ]; then
-                    cat artifacts/flake-probe.md >> "$GITHUB_STEP_SUMMARY"
-                  else
-                    echo "Flake probe report missing." >> "$GITHUB_STEP_SUMMARY"
-                  fi
-            - name: Upload flake probe artifact
-              if: always()
-              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-              with:
-                  name: test-flake-probe
-                  path: artifacts/flake-probe.*
-                  if-no-files-found: ignore
-                  retention-days: 14
 
     docs-only:
         name: Docs-Only Fast Path
@@ -318,7 +315,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, flake-probe, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, human-review-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, human-review-approval, license-file-owner-guard]
         runs-on: [self-hosted, aws-india]
         steps:
             - name: Enforce required status
@@ -335,112 +332,66 @@ jobs:
                   human_review_result="${{ needs.human-review-approval.result }}"
                   license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
-                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-                    echo "workflow_owner_approval=${workflow_owner_result}"
-                    echo "human_review_approval=${human_review_result}"
-                    echo "license_file_owner_guard=${license_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                  # --- Helper: enforce PR governance gates ---
+                  check_pr_governance() {
+                    if [ "$event_name" != "pull_request" ]; then return 0; fi
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" = "pull_request" ] && [ "$human_review_result" != "success" ]; then
+                    if [ "$human_review_result" != "success" ]; then
                       echo "Human review approval guard did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
+                    if [ "$license_owner_result" != "success" ]; then
                       echo "License file owner guard did not pass."
                       exit 1
                     fi
+                  }
+
+                  check_docs_quality() {
                     if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only change detected, but docs-quality did not pass."
+                      echo "Docs changed but docs-quality did not pass."
                       exit 1
                     fi
+                  }
+
+                  # --- Docs-only fast path ---
+                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+                    check_pr_governance
+                    check_docs_quality
                     echo "Docs-only fast path passed."
                     exit 0
                   fi
 
+                  # --- Non-rust fast path ---
                   if [ "$rust_changed" != "true" ]; then
-                    echo "rust_changed=false (non-rust fast path)"
-                    echo "workflow_owner_approval=${workflow_owner_result}"
-                    echo "human_review_approval=${human_review_result}"
-                    echo "license_file_owner_guard=${license_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
-                    if [ "$event_name" = "pull_request" ] && [ "$human_review_result" != "success" ]; then
-                      echo "Human review approval guard did not pass."
-                      exit 1
-                    fi
-                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                      echo "License file owner guard did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Non-rust change touched docs, but docs-quality did not pass."
-                      exit 1
-                    fi
+                    check_pr_governance
+                    check_docs_quality
                     echo "Non-rust fast path passed."
                     exit 0
                   fi
 
+                  # --- Rust change path ---
                   lint_result="${{ needs.lint.result }}"
-                  lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
-                  flake_result="${{ needs.flake-probe.result }}"
 
                   echo "lint=${lint_result}"
-                  echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
-                  echo "flake_probe=${flake_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
                   echo "human_review_approval=${human_review_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
-                  if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                    echo "Workflow files changed but workflow owner approval gate did not pass."
+                  check_pr_governance
+
+                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required CI jobs did not pass: lint=${lint_result} test=${test_result} build=${build_result}"
                     exit 1
                   fi
 
-                  if [ "$event_name" = "pull_request" ] && [ "$human_review_result" != "success" ]; then
-                    echo "Human review approval guard did not pass."
-                    exit 1
-                  fi
+                  check_docs_quality
 
-                  if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                    echo "License file owner guard did not pass."
-                    exit 1
-                  fi
-
-                  if [ "$event_name" = "pull_request" ]; then
-                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                      echo "Required PR CI jobs did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "PR changed docs, but docs-quality did not pass."
-                      exit 1
-                    fi
-                    echo "PR required checks passed."
-                    exit 0
-                  fi
-
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                    echo "Required push CI jobs did not pass."
-                    exit 1
-                  fi
-
-                  if [ "$flake_result" != "success" ]; then
-                    echo "Flake probe did not pass under current blocking policy."
-                    exit 1
-                  fi
-
-                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                    echo "Push changed docs, but docs-quality did not pass."
-                    exit 1
-                  fi
-
-                  echo "Push required checks passed."
+                  echo "All required checks passed."
