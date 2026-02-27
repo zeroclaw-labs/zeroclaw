@@ -79,7 +79,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: final label set is priority-sorted (`risk:*` first, then `size:*`, then contributor tier, then module/path labels)
     - Additional behavior: managed label colors follow display order to produce a smooth left-to-right gradient when many labels are present
     - Manual governance: supports `workflow_dispatch` with `mode=audit|repair` to inspect/fix managed label metadata drift across the whole repository
-    - Additional behavior: risk + size labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
+    - Additional behavior: risk + size labels are recomputed on PR lifecycle events (`opened`/`reopened`/`synchronize`/`ready_for_review`); maintainers can use manual `workflow_dispatch` (`mode=repair`) to re-sync managed label metadata after exceptional manual edits
     - High-risk heuristic paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`
     - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
 - `.github/workflows/pr-auto-response.yml` (`PR Auto Responder`)
@@ -106,10 +106,11 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `Main Promotion Gate`: PRs to `main` only; requires PR author `willsarg`/`theonlyhennygod` and head branch `dev` in the same repository
 - `Dependabot`: all update PRs target `dev` (not `main`)
-- `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review
+- `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/ready_for_review
 - `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/pr-labeler.yml`, or `.github/workflows/pr-auto-response.yml` changes
-- `PR Labeler`: `pull_request_target` lifecycle events
+- `PR Labeler`: `pull_request_target` on opened/reopened/synchronize/ready_for_review
 - `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
+- `Test E2E`: push to `dev`/`main` for Rust-impacting paths (`Cargo*`, `src/**`, `crates/**`, `tests/**`, `scripts/**`) and manual dispatch
 - `Stale PR Check`: daily schedule, manual dispatch
 - `PR Hygiene`: every 12 hours schedule, manual dispatch
 

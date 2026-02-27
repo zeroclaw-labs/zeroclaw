@@ -101,8 +101,8 @@ Notes:
 4. Approval gate possibility:
    - if Actions settings require maintainer approval for fork workflows, the `pull_request` run stays in `action_required`/waiting state until approved.
 5. Event fan-out after labeling:
-   - `pr-labeler.yml` and manual label changes emit `labeled`/`unlabeled` events.
-   - those events retrigger `pull_request_target` automation (`pr-labeler.yml` and `pr-auto-response.yml`), creating extra run volume/noise.
+   - manual label changes emit `labeled`/`unlabeled` events.
+   - those events retrigger only label-driven `pull_request_target` automation (`pr-auto-response.yml`); `pr-labeler.yml` now runs only on PR lifecycle events (`opened`/`reopened`/`synchronize`/`ready_for_review`) to reduce churn.
 6. When contributor pushes new commits to fork branch (`synchronize`):
    - reruns: `pr-intake-checks.yml`, `pr-labeler.yml`, `ci-run.yml`, `sec-audit.yml`, and matching path-scoped PR workflows.
    - does not rerun `pr-auto-response.yml` unless label/open events occur.

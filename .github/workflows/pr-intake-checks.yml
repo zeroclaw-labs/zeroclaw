@@ -3,7 +3,7 @@ name: PR Intake Checks
 on:
     pull_request_target:
         branches: [dev, main]
-        types: [opened, reopened, synchronize, edited, ready_for_review]
+        types: [opened, reopened, synchronize, ready_for_review]
 
 concurrency:
     group: pr-intake-checks-${{ github.event.pull_request.number || github.run_id }}

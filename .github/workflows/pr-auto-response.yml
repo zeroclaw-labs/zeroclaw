@@ -7,6 +7,10 @@ on:
     branches: [dev, main]
     types: [opened, labeled, unlabeled]
 
+concurrency:
+  group: pr-auto-response-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions: {}
 
 env:
