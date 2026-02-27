@@ -354,28 +354,30 @@ impl CopilotProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No response from GitHub Copilot"))?;
-
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tool_call| ProviderToolCall {
-                id: tool_call
-                    .id
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                name: tool_call.function.name,
-                arguments: tool_call.function.arguments,
-            })
-            .collect();
+        // Merge all choices — the Copilot proxy for Claude models may split
+        // text content and tool_calls into separate choices.
+        if api_response.choices.is_empty() {
+            return Err(anyhow::anyhow!("No response from GitHub Copilot"));
+        }
+        let mut text: Option<String> = None;
+        let mut tool_calls = Vec::new();
+        for choice in api_response.choices {
+            if let Some(content) = choice.message.content {
+                if !content.is_empty() {
+                    text = Some(content);
+                }
+            }
+            for tc in choice.message.tool_calls.unwrap_or_default() {
+                tool_calls.push(ProviderToolCall {
+                    id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name: tc.function.name,
+                    arguments: tc.function.arguments,
+                });
+            }
+        }
 
         Ok(ProviderChatResponse {
-            text: choice.message.content,
+            text,
             tool_calls,
             usage,
             reasoning_content: None,
