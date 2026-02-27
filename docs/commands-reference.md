@@ -194,13 +194,46 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 - `zeroclaw skills install <source>`
 - `zeroclaw skills remove <name>`
 
-`<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
+`<source>` accepts:
+
+| Format | Example | Notes |
+|---|---|---|
+| **ClawhHub profile URL** | `https://clawhub.ai/steipete/summarize` | Auto-detected by domain; downloads zip from ClawhHub API |
+| **ClawhHub short prefix** | `clawhub:summarize` | Short form; slug is the skill name on ClawhHub |
+| **Direct zip URL** | `zip:https://example.com/skill.zip` | Any HTTPS URL returning a zip archive |
+| **Local zip file** | `/path/to/skill.zip` | Zip file already downloaded to local disk |
+| **Registry packages** | `namespace/name` or `namespace/name@version` | Fetched from the configured registry (default: ZeroMarket) |
+| **Git remotes** | `https://github.com/…`, `git@host:owner/repo.git` | Cloned with `git clone --depth 1` |
+| **Local filesystem paths** | `./my-skill` or `/abs/path/skill` | Directory copied and audited |
+
+**ClawhHub install examples:**
+
+```bash
+# Install by profile URL (slug extracted from last path segment)
+zeroclaw skill install https://clawhub.ai/steipete/summarize
+
+# Install using short prefix
+zeroclaw skill install clawhub:summarize
+
+# Install from a zip already downloaded locally
+zeroclaw skill install ~/Downloads/summarize-1.0.0.zip
+```
+
+If the ClawhHub API returns 429 (rate limit) or requires authentication, set `clawhub_token` in `[skills]` config (see [config reference](config-reference.md#skills)).
+
+**Zip-based install behavior:**
+- If the zip contains `_meta.json` (OpenClaw convention), name/version/author are read from it.
+- A minimal `SKILL.toml` is written automatically if neither `SKILL.toml` nor `SKILL.md` is present in the zip.
+
+Registry packages are installed to `~/.zeroclaw/workspace/skills/<name>/`.
 
 `skills install` always runs a built-in static security audit before the skill is accepted. The audit blocks:
 - symlinks inside the skill package
 - script-like files (`.sh`, `.bash`, `.zsh`, `.ps1`, `.bat`, `.cmd`)
 - high-risk command snippets (for example pipe-to-shell payloads)
 - markdown links that escape the skill root, point to remote markdown, or target script files
+
+> **Note:** The security audit applies to directory-based installs (local paths, git remotes). Zip-based installs (ClawhHub, direct zip URLs, local zip files) perform path-traversal safety checks during extraction but do not run the full static audit — review zip contents manually for untrusted sources.
 
 Use `skills audit` to manually validate a candidate skill directory (or an installed skill by name) before sharing it.
 

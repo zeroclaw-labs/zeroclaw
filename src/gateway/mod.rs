@@ -9,6 +9,7 @@
 
 pub mod api;
 mod openai_compat;
+mod openclaw_compat;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -516,10 +517,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // QQ channel (if configured)
     let qq_channel: Option<Arc<QQChannel>> = config.channels_config.qq.as_ref().map(|qq_cfg| {
-        Arc::new(QQChannel::new(
+        Arc::new(QQChannel::new_with_environment(
             qq_cfg.app_id.clone(),
             qq_cfg.app_secret.clone(),
             qq_cfg.allowed_users.clone(),
+            qq_cfg.environment.clone(),
         ))
     });
     let qq_webhook_enabled = config
@@ -610,6 +612,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
@@ -630,7 +633,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if config.gateway.node_control.enabled {
         println!("  POST /api/node-control — experimental node-control RPC scaffold");
     }
-    println!("  POST /v1/chat/completions — OpenAI-compatible chat");
+    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
     println!("  GET  /v1/models — list available models");
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
@@ -702,10 +705,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // The OpenAI-compatible endpoints use a larger body limit (512KB) because
     // chat histories can be much bigger than the default 64KB webhook limit.
     // They get their own nested router with a separate body limit layer.
+    //
+    // NOTE: The /v1/chat/completions handler routes through the full agent loop
+    // (run_gateway_chat_with_tools) via openclaw_compat, giving OpenClaw callers
+    // tools + memory support. The original simple-chat handler is preserved in
+    // openai_compat.rs for reference.
     let openai_compat_routes = Router::new()
         .route(
             "/v1/chat/completions",
-            post(openai_compat::handle_v1_chat_completions),
+            post(openclaw_compat::handle_v1_chat_completions_with_tools),
         )
         .layer(RequestBodyLimitLayer::new(
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
@@ -717,7 +725,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
-        .route("/webhook", post(handle_webhook))
+        .route("/webhook", get(handle_webhook_usage).post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -725,6 +733,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
+        // ── OpenClaw migration: tools-enabled chat endpoint ──
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
         // ── OpenAI-compatible endpoints ──
         .route("/v1/models", get(openai_compat::handle_v1_models))
         .merge(openai_compat_routes)
@@ -953,7 +963,10 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
-async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+pub(super) async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
     crate::agent::process_message(config, message).await
 }
@@ -1158,6 +1171,21 @@ async fn handle_node_control(
 }
 
 /// POST /webhook — main webhook endpoint
+async fn handle_webhook_usage() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(serde_json::json!({
+            "error": "Use POST /webhook with a JSON body: {\"message\":\"...\"}",
+            "method": "POST",
+            "path": "/webhook",
+            "example": {
+                "message": "Hello from webhook"
+            }
+        })),
+    )
+}
+
+/// POST /webhook — main webhook endpoint
 async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -1253,7 +1281,13 @@ async fn handle_webhook(
         }
     }
 
-    let message = &webhook_body.message;
+    let message = webhook_body.message.trim();
+    if message.is_empty() {
+        let err = serde_json::json!({
+            "error": "The `message` field is required and must be a non-empty string."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
 
     if state.auto_save {
         let key = webhook_memory_key();
@@ -1973,6 +2007,18 @@ mod tests {
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_get_usage_returns_explicit_method_hint() {
+        let response = handle_webhook_usage().await.into_response();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["path"], "/webhook");
+        assert_eq!(parsed["example"]["message"], "Hello from webhook");
     }
 
     #[test]
@@ -2724,6 +2770,57 @@ Reminder set successfully."#;
         .into_response();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_empty_message() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "   ".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -89,7 +89,7 @@ Operational note for container users:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
+| `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
 | `max_tool_iterations` | `20` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
@@ -148,6 +148,31 @@ Notes:
 - Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
 - Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
+## `[security.url_access]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `block_private_ip` | `true` | Block local/private/link-local/multicast addresses by default |
+| `allow_cidrs` | `[]` | CIDR ranges allowed to bypass private-IP blocking (`100.64.0.0/10`, `198.18.0.0/15`) |
+| `allow_domains` | `[]` | Domain patterns that bypass private-IP blocking before DNS checks (`internal.example`, `*.svc.local`) |
+| `allow_loopback` | `false` | Permit loopback targets (`localhost`, `127.0.0.1`, `::1`) |
+
+Notes:
+
+- This policy is shared by `browser_open`, `http_request`, and `web_fetch`.
+- Tool-level allowlists still apply. `allow_domains` / `allow_cidrs` only override private/local blocking.
+- DNS rebinding protection remains enabled: resolved local/private IPs are denied unless explicitly allowlisted.
+
+Example:
+
+```toml
+[security.url_access]
+block_private_ip = true
+allow_cidrs = ["100.64.0.0/10", "198.18.0.0/15"]
+allow_domains = ["internal.example", "*.svc.local"]
+allow_loopback = false
+```
+
 ## `[security.syscall_anomaly]`
 
 | Key | Default | Purpose |
@@ -182,6 +207,36 @@ max_alerts_per_minute = 30
 alert_cooldown_secs = 20
 log_path = "syscall-anomalies.log"
 baseline_syscalls = ["read", "write", "openat", "close", "execve", "futex"]
+```
+
+## `[security.perplexity_filter]`
+
+Lightweight, opt-in adversarial suffix filter that runs before provider calls in channel and gateway message pipelines.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enable_perplexity_filter` | `false` | Enable pre-LLM statistical suffix anomaly blocking |
+| `perplexity_threshold` | `18.0` | Character-class bigram perplexity threshold |
+| `suffix_window_chars` | `64` | Trailing character window used for anomaly scoring |
+| `min_prompt_chars` | `32` | Minimum prompt length before filter is evaluated |
+| `symbol_ratio_threshold` | `0.20` | Minimum punctuation ratio in suffix window for blocking |
+
+Notes:
+
+- This filter is disabled by default to preserve baseline latency/behavior.
+- The detector combines character-class perplexity with GCG-like token heuristics.
+- Inputs are blocked only when anomaly conditions are met; normal natural-language prompts pass.
+- Typical per-message overhead is designed to stay under `50ms` in debug-safe local tests and substantially lower in release builds.
+
+Example:
+
+```toml
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
 ```
 
 ## `[agents.<name>]`
@@ -342,6 +397,7 @@ Notes:
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
+| `clawhub_token` | unset | Optional Bearer token for authenticated ClawhHub skill downloads |
 
 Notes:
 
@@ -353,6 +409,14 @@ Notes:
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 - Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
+- `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawhHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
+
+**ClawhHub token example:**
+
+```toml
+[skills]
+clawhub_token = "your-token-here"
+```
 
 ## `[composio]`
 

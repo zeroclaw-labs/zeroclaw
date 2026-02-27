@@ -132,8 +132,9 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// `text/*` MIME types are fetched and inlined, while `image/*` MIME types are
+/// forwarded as `[IMAGE:<url>]` markers. Other types are skipped. Fetch errors
+/// are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -166,6 +167,8 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
+        } else if ct.starts_with("image/") {
+            parts.push(format!("[IMAGE:{url}]"));
         } else {
             tracing::debug!(
                 name,
@@ -1561,6 +1564,43 @@ mod tests {
         })];
         let result = process_attachments(&attachments, &client).await;
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_emits_single_image_marker() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/photo.png",
+            "filename": "photo.png",
+            "content_type": "image/png"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.png]"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_attachments_emits_multiple_image_markers() {
+        let client = reqwest::Client::new();
+        let attachments = vec![
+            serde_json::json!({
+                "url": "https://cdn.discordapp.com/attachments/123/456/one.jpg",
+                "filename": "one.jpg",
+                "content_type": "image/jpeg"
+            }),
+            serde_json::json!({
+                "url": "https://cdn.discordapp.com/attachments/123/456/two.webp",
+                "filename": "two.webp",
+                "content_type": "image/webp"
+            }),
+        ];
+        let result = process_attachments(&attachments, &client).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/one.jpg]\n---\n[IMAGE:https://cdn.discordapp.com/attachments/123/456/two.webp]"
+        );
     }
 
     #[test]

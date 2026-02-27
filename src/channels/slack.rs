@@ -1,5 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use chrono::Utc;
+use reqwest::header::HeaderMap;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +13,11 @@ pub struct SlackChannel {
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
 }
+
+const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
+const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
+const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
+const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
 
 impl SlackChannel {
     pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
@@ -259,6 +266,150 @@ impl SlackChannel {
             .or_insert_with(|| now_ts.to_string())
             .clone()
     }
+
+    fn parse_retry_after_secs(headers: &HeaderMap) -> Option<u64> {
+        let value = headers
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim();
+        Self::parse_retry_after_value(value)
+    }
+
+    fn parse_retry_after_value(value: &str) -> Option<u64> {
+        if value.is_empty() {
+            return None;
+        }
+
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(seconds);
+        }
+
+        let truncated = value
+            .split_once('.')
+            .map(|(whole, _)| whole)
+            .unwrap_or(value);
+        truncated.parse::<u64>().ok()
+    }
+
+    fn jitter_ms_from_clock(max_jitter_ms: u64) -> u64 {
+        if max_jitter_ms == 0 {
+            return 0;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()))
+            .unwrap_or(0);
+        nanos % (max_jitter_ms + 1)
+    }
+
+    fn compute_retry_delay(base_retry_after_secs: u64, attempt: u32, jitter_ms: u64) -> Duration {
+        let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
+        let backoff_secs = base_retry_after_secs
+            .saturating_mul(multiplier)
+            .min(SLACK_HISTORY_MAX_BACKOFF_SECS);
+        Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms)
+    }
+
+    fn next_retry_timestamp(wait: Duration) -> String {
+        match chrono::Duration::from_std(wait) {
+            Ok(delta) => (Utc::now() + delta).to_rfc3339(),
+            Err(_) => Utc::now().to_rfc3339(),
+        }
+    }
+
+    async fn fetch_history_with_retry(
+        &self,
+        channel_id: &str,
+        params: &[(&str, String)],
+    ) -> Option<serde_json::Value> {
+        let mut total_wait = Duration::from_secs(0);
+
+        for attempt in 0..=SLACK_HISTORY_MAX_RETRIES {
+            let resp = match self
+                .http_client()
+                .get("https://slack.com/api/conversations.history")
+                .bearer_auth(&self.bot_token)
+                .query(params)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Slack poll error for channel {channel_id}: {e}");
+                    return None;
+                }
+            };
+
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+            let is_ratelimited_http = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let is_ratelimited_payload = payload.get("ok") == Some(&serde_json::Value::Bool(false))
+                && payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|err| err == "ratelimited");
+
+            if is_ratelimited_http || is_ratelimited_payload {
+                if attempt >= SLACK_HISTORY_MAX_RETRIES {
+                    tracing::error!(
+                        "Slack rate limit retries exhausted for conversations.history on channel {}. Total wait: {}s across {} attempts. Proceeding without channel history.",
+                        channel_id,
+                        total_wait.as_secs(),
+                        SLACK_HISTORY_MAX_RETRIES
+                    );
+                    return None;
+                }
+
+                let retry_after_secs = Self::parse_retry_after_secs(&headers)
+                    .unwrap_or(SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS);
+                let jitter_ms = Self::jitter_ms_from_clock(SLACK_HISTORY_MAX_JITTER_MS);
+                let wait = Self::compute_retry_delay(retry_after_secs, attempt, jitter_ms);
+                total_wait += wait;
+                let next_retry_at = Self::next_retry_timestamp(wait);
+                tracing::warn!(
+                    "Slack conversations.history rate limited for channel {}. Retry-After: {}s. Attempt {}/{}. Next retry at {}.",
+                    channel_id,
+                    retry_after_secs,
+                    attempt + 1,
+                    SLACK_HISTORY_MAX_RETRIES,
+                    next_retry_at
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let sanitized = crate::providers::sanitize_api_error(&body);
+                tracing::warn!(
+                    "Slack history request failed for channel {} ({}): {}",
+                    channel_id,
+                    status,
+                    sanitized
+                );
+                return None;
+            }
+
+            if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                let err = payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown");
+                tracing::warn!("Slack history error for channel {channel_id}: {err}");
+                return None;
+            }
+
+            return Some(payload);
+        }
+
+        None
+    }
 }
 
 #[async_trait]
@@ -376,37 +527,9 @@ impl Channel for SlackChannel {
                     ("oldest", cursor_ts),
                 ];
 
-                let resp = match self
-                    .http_client()
-                    .get("https://slack.com/api/conversations.history")
-                    .bearer_auth(&self.bot_token)
-                    .query(&params)
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Slack poll error for channel {channel_id}: {e}");
-                        continue;
-                    }
-                };
-
-                let data: serde_json::Value = match resp.json().await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!("Slack parse error for channel {channel_id}: {e}");
-                        continue;
-                    }
-                };
-
-                if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
-                    let err = data
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("unknown");
-                    tracing::warn!("Slack history error for channel {channel_id}: {err}");
+                let Some(data) = self.fetch_history_with_retry(&channel_id, &params).await else {
                     continue;
-                }
+                };
 
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                     // Messages come newest-first, reverse to process oldest first
@@ -722,5 +845,34 @@ mod tests {
             cursors.get("C123").map(String::as_str),
             Some("1700000000.000001")
         );
+    }
+
+    #[test]
+    fn parse_retry_after_value_accepts_integer_seconds() {
+        assert_eq!(SlackChannel::parse_retry_after_value("30"), Some(30));
+    }
+
+    #[test]
+    fn parse_retry_after_value_accepts_decimal_seconds() {
+        assert_eq!(SlackChannel::parse_retry_after_value("2.9"), Some(2));
+    }
+
+    #[test]
+    fn parse_retry_after_value_rejects_non_numeric_values() {
+        assert_eq!(SlackChannel::parse_retry_after_value("later"), None);
+        assert_eq!(SlackChannel::parse_retry_after_value(""), None);
+    }
+
+    #[test]
+    fn parse_retry_after_secs_reads_header_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "45".parse().unwrap());
+        assert_eq!(SlackChannel::parse_retry_after_secs(&headers), Some(45));
+    }
+
+    #[test]
+    fn compute_retry_delay_applies_backoff_and_jitter_with_cap() {
+        let delay = SlackChannel::compute_retry_delay(30, 3, 250);
+        assert_eq!(delay, Duration::from_secs(120) + Duration::from_millis(250));
     }
 }

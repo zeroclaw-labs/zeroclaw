@@ -43,6 +43,10 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod mcp_client;
+pub mod mcp_protocol;
+pub mod mcp_tool;
+pub mod mcp_transport;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -63,6 +67,7 @@ pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
 pub mod wasm_module;
+pub mod wasm_tool;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -92,6 +97,8 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use mcp_client::McpRegistry;
+pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -314,6 +321,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
             security.clone(),
             browser_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
         )));
         // Add full browser automation tool (pluggable backend)
         tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
@@ -340,6 +348,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
             http_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.user_agent.clone(),
@@ -354,6 +363,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.api_url.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
+            root_config.security.url_access.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
             web_fetch_config.user_agent.clone(),
@@ -520,7 +530,15 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    // Load WASM plugin tools from the skills directory.
+    // Each installed skill package may ship one or more WASM tools under
+    // `<skill-dir>/tools/<tool-name>/{tool.wasm, manifest.json}`.
+    // Failures are logged and skipped — a broken plugin must not block startup.
+    let skills_dir = workspace_dir.join("skills");
+    let mut boxed = boxed_registry_from_arcs(tool_arcs);
+    let wasm_tools = wasm_tool::load_wasm_tools_from_skills(&skills_dir);
+    boxed.extend(wasm_tools);
+    boxed
 }
 
 #[cfg(test)]

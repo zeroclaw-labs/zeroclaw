@@ -2,11 +2,12 @@
 
 This file is the canonical table of contents for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **February 25, 2026**.
 
 ## Language Entry
 
 - Docs Structure Map (language/part/function): [structure/README.md](structure/README.md)
+- Docs Map (by function): [structure/by-function.md](structure/by-function.md)
 - English README: [../README.md](../README.md)
 - Chinese README: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - Japanese README: [docs/i18n/ja/README.md](i18n/ja/README.md)
@@ -44,6 +45,7 @@ Last refreshed: **February 18, 2026**.
 - [channels-reference.md](channels-reference.md)
 - [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
 - [config-reference.md](config-reference.md)
+- [wasm-tools-guide.md](wasm-tools-guide.md)
 - [custom-providers.md](custom-providers.md)
 - [zai-glm-setup.md](zai-glm-setup.md)
 - [langgraph-integration.md](langgraph-integration.md)
@@ -62,6 +64,7 @@ Last refreshed: **February 18, 2026**.
 ### 4) Security Design & Proposals
 
 - [security/README.md](security/README.md)
+- [security/official-channels-and-fraud-prevention.md](security/official-channels-and-fraud-prevention.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)

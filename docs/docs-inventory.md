@@ -33,6 +33,7 @@ Last reviewed: **February 24, 2026**.
 | `docs/README.md` | Current Guide (hub) | all readers |
 | `docs/SUMMARY.md` | Current Guide (unified TOC) | all readers |
 | `docs/structure/README.md` | Current Guide (structure map) | maintainers |
+| `docs/structure/by-function.md` | Current Guide (function map) | maintainers/operators |
 | `docs/i18n-guide.md` | Current Guide (i18n completion contract) | contributors/agents |
 | `docs/i18n/README.md` | Current Guide (locale index) | maintainers/translators |
 | `docs/i18n-coverage.md` | Current Guide (coverage matrix) | maintainers/translators |
@@ -93,6 +94,7 @@ Compatibility shims such as `docs/SUMMARY.<locale>.md` and `docs/vi/**` remain v
 | `docs/datasheets/arduino-uno.md` | Current Hardware Reference | hardware builders |
 | `docs/datasheets/esp32.md` | Current Hardware Reference | hardware builders |
 | `docs/audit-event-schema.md` | Current CI/Security Reference | maintainers/security reviewers |
+| `docs/security/official-channels-and-fraud-prevention.md` | Current Security Guide | users/operators |
 
 ## Policy / Process Docs
 

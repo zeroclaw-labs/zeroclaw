@@ -6,6 +6,7 @@ use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -268,12 +269,20 @@ pub struct Config {
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
 
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
+
     /// Vision support override for the active provider/model.
     /// - `None` (default): use provider's built-in default
     /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
     /// - `Some(false)`: force vision support off
     #[serde(default)]
     pub model_support_vision: Option<bool>,
+
+    /// WASM plugin engine configuration (`[wasm]` section).
+    #[serde(default)]
+    pub wasm: WasmConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -525,6 +534,60 @@ impl Default for TranscriptionConfig {
     }
 }
 
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
+}
+
 // ── Agents IPC ──────────────────────────────────────────────────
 
 fn default_agents_ipc_db_path() -> String {
@@ -662,7 +725,7 @@ fn default_agent_tool_dispatcher() -> String {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            compact_context: false,
+            compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
@@ -709,6 +772,58 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Optional ClawhHub API token for authenticated skill downloads.
+    /// Obtain from https://clawhub.ai after signing in.
+    /// Set via config: `clawhub_token = "..."` under `[skills]`.
+    #[serde(default)]
+    pub clawhub_token: Option<String>,
+}
+
+/// WASM plugin engine configuration (`[wasm]` section).
+///
+/// Controls limits applied to every WASM tool invocation.
+/// Requires the `wasm-tools` compile-time feature to have any effect.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmConfig {
+    /// Enable loading WASM tools from installed skill packages.
+    /// Default: `true` (auto-discovers plugins in the skills directory).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum linear memory per WASM invocation in MiB.
+    /// Valid range: 1..=256. Default: `64`.
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// CPU fuel budget per invocation (roughly one unit ≈ one WASM instruction).
+    /// Default: 1_000_000_000.
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+    /// URL of the ZeroMarket (or compatible) registry used by `zeroclaw skill install`.
+    /// Default: the public ZeroMarket registry.
+    #[serde(default = "default_registry_url")]
+    pub registry_url: String,
+}
+
+fn default_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000_000
+}
+
+fn default_registry_url() -> String {
+    "https://zeromarket.vercel.app/api".to_string()
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_wasm_fuel_limit(),
+            registry_url: default_registry_url(),
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -1740,6 +1855,29 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_cidr_notation(raw: &str) -> Result<(IpAddr, u8)> {
+    let (ip_raw, prefix_raw) = raw
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("missing '/' separator"))?;
+    let ip: IpAddr = ip_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid IP address '{ip_raw}'"))?;
+    let prefix: u8 = prefix_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid prefix '{prefix_raw}'"))?;
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        anyhow::bail!("prefix {prefix} exceeds max {max_prefix} for {ip}");
+    }
+    Ok((ip, prefix))
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -2613,11 +2751,11 @@ pub struct WasmRuntimeConfig {
     pub tools_dir: String,
 
     /// Fuel limit per invocation (instruction budget).
-    #[serde(default = "default_wasm_fuel_limit")]
+    #[serde(default = "default_runtime_wasm_fuel_limit")]
     pub fuel_limit: u64,
 
     /// Memory limit per invocation in MB.
-    #[serde(default = "default_wasm_memory_limit_mb")]
+    #[serde(default = "default_runtime_wasm_memory_limit_mb")]
     pub memory_limit_mb: u64,
 
     /// Maximum `.wasm` module size in MB.
@@ -2722,11 +2860,11 @@ fn default_wasm_tools_dir() -> String {
     "tools/wasm".into()
 }
 
-fn default_wasm_fuel_limit() -> u64 {
+fn default_runtime_wasm_fuel_limit() -> u64 {
     1_000_000
 }
 
-fn default_wasm_memory_limit_mb() -> u64 {
+fn default_runtime_wasm_memory_limit_mb() -> u64 {
     64
 }
 
@@ -2752,8 +2890,8 @@ impl Default for WasmRuntimeConfig {
     fn default() -> Self {
         Self {
             tools_dir: default_wasm_tools_dir(),
-            fuel_limit: default_wasm_fuel_limit(),
-            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_runtime_wasm_fuel_limit(),
+            memory_limit_mb: default_runtime_wasm_memory_limit_mb(),
             max_module_size_mb: default_wasm_max_module_size_mb(),
             allow_workspace_read: false,
             allow_workspace_write: false,
@@ -4214,6 +4352,99 @@ pub struct SecurityConfig {
     /// Syscall anomaly detection profile for daemon shell/process execution.
     #[serde(default)]
     pub syscall_anomaly: SyscallAnomalyConfig,
+
+    /// Lightweight statistical filter for adversarial suffixes (opt-in).
+    #[serde(default)]
+    pub perplexity_filter: PerplexityFilterConfig,
+
+    /// Shared URL access policy for network-enabled tools.
+    #[serde(default)]
+    pub url_access: UrlAccessConfig,
+}
+
+/// Lightweight perplexity-style filter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerplexityFilterConfig {
+    /// Enable probabilistic adversarial suffix filtering before provider calls.
+    #[serde(default)]
+    pub enable_perplexity_filter: bool,
+
+    /// Character-class bigram perplexity threshold for anomaly blocking.
+    #[serde(default = "default_perplexity_threshold")]
+    pub perplexity_threshold: f64,
+
+    /// Number of trailing characters sampled for suffix anomaly scoring.
+    #[serde(default = "default_perplexity_suffix_window_chars")]
+    pub suffix_window_chars: usize,
+
+    /// Minimum input length before running the perplexity filter.
+    #[serde(default = "default_perplexity_min_prompt_chars")]
+    pub min_prompt_chars: usize,
+
+    /// Minimum punctuation ratio in the sampled suffix required to block.
+    #[serde(default = "default_perplexity_symbol_ratio_threshold")]
+    pub symbol_ratio_threshold: f64,
+}
+
+fn default_perplexity_threshold() -> f64 {
+    18.0
+}
+
+fn default_perplexity_suffix_window_chars() -> usize {
+    64
+}
+
+fn default_perplexity_min_prompt_chars() -> usize {
+    32
+}
+
+fn default_perplexity_symbol_ratio_threshold() -> f64 {
+    0.20
+}
+
+impl Default for PerplexityFilterConfig {
+    fn default() -> Self {
+        Self {
+            enable_perplexity_filter: false,
+            perplexity_threshold: default_perplexity_threshold(),
+            suffix_window_chars: default_perplexity_suffix_window_chars(),
+            min_prompt_chars: default_perplexity_min_prompt_chars(),
+            symbol_ratio_threshold: default_perplexity_symbol_ratio_threshold(),
+        }
+    }
+}
+
+/// Shared URL validation configuration used by network tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UrlAccessConfig {
+    /// Block private/local IPs and hostnames by default.
+    #[serde(default = "default_true")]
+    pub block_private_ip: bool,
+
+    /// Explicit CIDR ranges that bypass private/local-IP blocking.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+
+    /// Explicit domain patterns that bypass private/local-IP blocking.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+
+    /// Allow loopback host/IP access (`localhost`, `127.0.0.1`, `::1`).
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
+impl Default for UrlAccessConfig {
+    fn default() -> Self {
+        Self {
+            block_private_ip: true,
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+            allow_loopback: false,
+        }
+    }
 }
 
 /// OTP validation strategy.
@@ -4246,8 +4477,8 @@ pub enum OtpChallengeDelivery {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OtpConfig {
-    /// Enable OTP gating. Defaults to disabled for backward compatibility.
-    #[serde(default)]
+    /// Enable OTP gating. Defaults to enabled.
+    #[serde(default = "default_otp_enabled")]
     pub enabled: bool,
 
     /// OTP method.
@@ -4323,6 +4554,10 @@ pub struct SecurityRoleConfig {
     pub gated_domain_categories: Vec<String>,
 }
 
+fn default_otp_enabled() -> bool {
+    true
+}
+
 fn default_otp_token_ttl_secs() -> u64 {
     30
 }
@@ -4352,7 +4587,7 @@ fn default_otp_gated_actions() -> Vec<String> {
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_otp_enabled(),
             method: OtpMethod::Totp,
             token_ttl_secs: default_otp_token_ttl_secs(),
             cache_valid_secs: default_otp_cache_valid_secs(),
@@ -4700,6 +4935,15 @@ pub enum QQReceiveMode {
     Webhook,
 }
 
+/// QQ API environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QQEnvironment {
+    #[default]
+    Production,
+    Sandbox,
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -4713,6 +4957,9 @@ pub struct QQConfig {
     /// Event receive mode: "webhook" (default) or "websocket".
     #[serde(default)]
     pub receive_mode: QQReceiveMode,
+    /// API environment: "production" (default) or "sandbox".
+    #[serde(default)]
+    pub environment: QQEnvironment,
 }
 
 impl ChannelConfig for QQConfig {
@@ -4812,7 +5059,9 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -5543,6 +5792,65 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -5922,6 +6230,20 @@ impl Config {
         .with_context(|| {
             "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
         })?;
+        for (i, cidr) in self.security.url_access.allow_cidrs.iter().enumerate() {
+            parse_cidr_notation(cidr).with_context(|| {
+                format!("security.url_access.allow_cidrs[{i}] is invalid CIDR notation: {cidr}")
+            })?;
+        }
+        for (i, domain) in self.security.url_access.allow_domains.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not contain whitespace");
+            }
+        }
         let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
         let mut custom_role_names = std::collections::HashSet::new();
         for (i, role) in self.security.roles.iter().enumerate() {
@@ -6067,6 +6389,22 @@ impl Config {
                 );
             }
         }
+        if self.security.perplexity_filter.perplexity_threshold <= 1.0 {
+            anyhow::bail!(
+                "security.perplexity_filter.perplexity_threshold must be greater than 1.0"
+            );
+        }
+        if self.security.perplexity_filter.suffix_window_chars < 8 {
+            anyhow::bail!("security.perplexity_filter.suffix_window_chars must be at least 8");
+        }
+        if self.security.perplexity_filter.min_prompt_chars < 8 {
+            anyhow::bail!("security.perplexity_filter.min_prompt_chars must be at least 8");
+        }
+        if !(0.0..=1.0).contains(&self.security.perplexity_filter.symbol_ratio_threshold) {
+            anyhow::bail!(
+                "security.perplexity_filter.symbol_ratio_threshold must be between 0.0 and 1.0"
+            );
+        }
 
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
@@ -6184,6 +6522,11 @@ impl Config {
             }
         }
 
+        // MCP
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -6202,6 +6545,34 @@ impl Config {
         }
         if self.coordination.max_seen_message_ids == 0 {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
+        }
+
+        // WASM config
+        if self.wasm.memory_limit_mb == 0 || self.wasm.memory_limit_mb > 256 {
+            anyhow::bail!(
+                "wasm.memory_limit_mb must be between 1 and 256, got {}",
+                self.wasm.memory_limit_mb
+            );
+        }
+        if self.wasm.fuel_limit == 0 {
+            anyhow::bail!("wasm.fuel_limit must be greater than 0");
+        }
+        {
+            let url = &self.wasm.registry_url;
+            // Extract what comes after "https://" and check that the host part
+            // (up to the first '/', '?', '#', or ':') is non-empty.
+            let has_valid_host = url
+                .strip_prefix("https://")
+                .map(|rest| {
+                    let host = rest.split(&['/', '?', '#', ':'][..]).next().unwrap_or("");
+                    !host.is_empty()
+                })
+                .unwrap_or(false);
+            if !has_valid_host {
+                anyhow::bail!(
+                    "wasm.registry_url must be a valid HTTPS URL with a non-empty host, got '{url}'"
+                );
+            }
         }
 
         Ok(())
@@ -6769,6 +7140,59 @@ mod tests {
     }
 
     #[test]
+    async fn wasm_config_default_has_correct_values() {
+        let cfg = WasmConfig::default();
+        assert!(cfg.enabled, "WASM tools should be enabled by default");
+        assert_eq!(cfg.memory_limit_mb, 64);
+        assert_eq!(cfg.fuel_limit, 1_000_000_000);
+        assert_eq!(cfg.registry_url, "https://zeromarket.vercel.app/api");
+    }
+
+    #[test]
+    async fn wasm_config_invalid_values_rejected() {
+        let mut c = Config::default();
+
+        // memory_limit_mb = 0
+        c.wasm.memory_limit_mb = 0;
+        assert!(c.validate().is_err(), "memory_limit_mb=0 should fail");
+
+        // memory_limit_mb = 257
+        c.wasm = WasmConfig::default();
+        c.wasm.memory_limit_mb = 257;
+        assert!(c.validate().is_err(), "memory_limit_mb=257 should fail");
+
+        // fuel_limit = 0
+        c.wasm = WasmConfig::default();
+        c.wasm.fuel_limit = 0;
+        assert!(c.validate().is_err(), "fuel_limit=0 should fail");
+
+        // empty registry_url
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = String::new();
+        assert!(c.validate().is_err(), "empty registry_url should fail");
+
+        // http:// instead of https://
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "http://example.com".to_string();
+        assert!(c.validate().is_err(), "http registry_url should fail");
+
+        // bare "https://"
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://".to_string();
+        assert!(c.validate().is_err(), "https:// without host should fail");
+
+        // port-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://:443".to_string();
+        assert!(c.validate().is_err(), "https://:443 should fail");
+
+        // query-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://?q=1".to_string();
+        assert!(c.validate().is_err(), "https://?q=1 should fail");
+    }
+
+    #[test]
     async fn config_debug_redacts_sensitive_values() {
         let mut config = Config::default();
         config.workspace_dir = PathBuf::from("/tmp/workspace");
@@ -7184,7 +7608,9 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -7458,7 +7884,7 @@ reasoning_level = "high"
     #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
-        assert!(!cfg.compact_context);
+        assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 20);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
@@ -7553,7 +7979,9 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -10038,6 +10466,7 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"123","app_secret":"secret"}"#;
         let parsed: QQConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
+        assert_eq!(parsed.environment, QQEnvironment::Production);
         assert!(parsed.allowed_users.is_empty());
     }
 
@@ -10048,10 +10477,12 @@ default_model = "legacy-model"
             app_secret: "secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: QQReceiveMode::Websocket,
+            environment: QQEnvironment::Sandbox,
         };
         let toml_str = toml::to_string(&qc).unwrap();
         let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
+        assert_eq!(parsed.environment, QQEnvironment::Sandbox);
         assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
@@ -10204,7 +10635,7 @@ default_temperature = 0.7
         )
         .unwrap();
 
-        assert!(!parsed.security.otp.enabled);
+        assert!(parsed.security.otp.enabled);
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
         assert_eq!(
             parsed.security.otp.challenge_delivery,
@@ -10218,6 +10649,11 @@ default_temperature = 0.7
         assert!(parsed.security.syscall_anomaly.enabled);
         assert!(parsed.security.syscall_anomaly.alert_on_unknown_syscall);
         assert!(!parsed.security.syscall_anomaly.baseline_syscalls.is_empty());
+        assert!(parsed.security.url_access.block_private_ip);
+        assert!(parsed.security.url_access.allow_cidrs.is_empty());
+        assert!(parsed.security.url_access.allow_domains.is_empty());
+        assert!(!parsed.security.url_access.allow_loopback);
+        assert!(!parsed.security.perplexity_filter.enable_perplexity_filter);
     }
 
     #[test]
@@ -10265,6 +10701,13 @@ max_alerts_per_minute = 10
 alert_cooldown_secs = 15
 log_path = "syscall-anomalies.log"
 baseline_syscalls = ["read", "write", "openat", "close"]
+
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
 "#,
         )
         .unwrap();
@@ -10283,6 +10726,14 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert_eq!(parsed.security.syscall_anomaly.max_alerts_per_minute, 10);
         assert_eq!(parsed.security.syscall_anomaly.alert_cooldown_secs, 15);
         assert_eq!(parsed.security.syscall_anomaly.baseline_syscalls.len(), 4);
+        assert!(parsed.security.perplexity_filter.enable_perplexity_filter);
+        assert_eq!(parsed.security.perplexity_filter.perplexity_threshold, 16.5);
+        assert_eq!(parsed.security.perplexity_filter.suffix_window_chars, 72);
+        assert_eq!(parsed.security.perplexity_filter.min_prompt_chars, 40);
+        assert_eq!(
+            parsed.security.perplexity_filter.symbol_ratio_threshold,
+            0.25
+        );
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         assert_eq!(
@@ -10303,6 +10754,26 @@ baseline_syscalls = ["read", "write", "openat", "close"]
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_url_access_cidr() {
+        let mut config = Config::default();
+        config.security.url_access.allow_cidrs = vec!["10.0.0.0".into()];
+        let err = config.validate().expect_err("expected invalid CIDR");
+        assert!(err.to_string().contains("security.url_access.allow_cidrs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_domain() {
+        let mut config = Config::default();
+        config.security.url_access.allow_domains = vec!["   ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL allow domain");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.allow_domains"));
     }
 
     #[test]
@@ -10441,6 +10912,28 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert!(err
             .to_string()
             .contains("max_denied_events_per_minute must be less than or equal"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_perplexity_threshold() {
+        let mut config = Config::default();
+        config.security.perplexity_filter.perplexity_threshold = 1.0;
+
+        let err = config
+            .validate()
+            .expect_err("expected perplexity threshold validation failure");
+        assert!(err.to_string().contains("perplexity_threshold"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_perplexity_symbol_ratio_threshold() {
+        let mut config = Config::default();
+        config.security.perplexity_filter.symbol_ratio_threshold = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected perplexity symbol ratio validation failure");
+        assert!(err.to_string().contains("symbol_ratio_threshold"));
     }
 
     #[test]

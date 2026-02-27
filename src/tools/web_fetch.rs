@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
+use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -21,6 +22,7 @@ pub struct WebFetchTool {
     api_url: Option<String>,
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
+    url_access: UrlAccessConfig,
     max_response_size: usize,
     timeout_secs: u64,
     user_agent: String,
@@ -35,6 +37,7 @@ impl WebFetchTool {
         api_url: Option<String>,
         allowed_domains: Vec<String>,
         blocked_domains: Vec<String>,
+        url_access: UrlAccessConfig,
         max_response_size: usize,
         timeout_secs: u64,
         user_agent: String,
@@ -51,6 +54,7 @@ impl WebFetchTool {
             api_url,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             blocked_domains: normalize_allowed_domains(blocked_domains),
+            url_access,
             max_response_size,
             timeout_secs,
             user_agent,
@@ -68,6 +72,7 @@ impl WebFetchTool {
                 empty_allowed_message: "web_fetch tool is enabled but no allowed_domains are configured. Add [web_fetch].allowed_domains in config.toml",
                 scheme_policy: UrlSchemePolicy::HttpOrHttps,
                 ipv6_error_context: "web_fetch",
+                url_access: Some(&self.url_access),
             },
         )
     }
@@ -393,6 +398,7 @@ mod tests {
             api_url.map(ToOwned::to_owned),
             allowed_domains.into_iter().map(String::from).collect(),
             blocked_domains.into_iter().map(String::from).collect(),
+            UrlAccessConfig::default(),
             500_000,
             30,
             "ZeroClaw/1.0".to_string(),
@@ -500,6 +506,7 @@ mod tests {
             None,
             vec![],
             vec![],
+            UrlAccessConfig::default(),
             500_000,
             30,
             "test".to_string(),
@@ -567,6 +574,7 @@ mod tests {
             None,
             vec!["example.com".into()],
             vec![],
+            UrlAccessConfig::default(),
             500_000,
             30,
             "test".to_string(),
@@ -592,6 +600,7 @@ mod tests {
             None,
             vec!["example.com".into()],
             vec![],
+            UrlAccessConfig::default(),
             500_000,
             30,
             "test".to_string(),
@@ -620,6 +629,7 @@ mod tests {
             None,
             vec!["example.com".into()],
             vec![],
+            UrlAccessConfig::default(),
             10,
             30,
             "test".to_string(),

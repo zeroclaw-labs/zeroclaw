@@ -34,6 +34,7 @@ pub mod landlock;
 pub mod leak_detector;
 pub mod otp;
 pub mod pairing;
+pub mod perplexity;
 pub mod policy;
 pub mod prompt_guard;
 pub mod roles;
@@ -52,6 +53,8 @@ pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 pub use otp::OtpValidator;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
+#[allow(unused_imports)]
+pub use perplexity::{detect_adversarial_suffix, PerplexityAssessment};
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use roles::{RoleRegistry, ToolAccess};

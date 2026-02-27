@@ -1,0 +1,25 @@
+[package]
+name = "zeroclaw-android-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Android JNI bridge for ZeroClaw"
+
+[lib]
+crate-type = ["cdylib"]
+name = "zeroclaw_android"
+
+[dependencies]
+# Note: zeroclaw dep commented out until we integrate properly
+# zeroclaw = { path = "../.." }
+uniffi = { version = "0.27" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"

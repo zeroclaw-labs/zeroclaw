@@ -73,7 +73,7 @@ Lưu ý cho người dùng container:
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `compact_context` | `false` | Khi bật: bootstrap_max_chars=6000, rag_chunk_limit=2. Dùng cho model 13B trở xuống |
+| `compact_context` | `true` | Khi bật: bootstrap_max_chars=6000, rag_chunk_limit=2. Dùng cho model 13B trở xuống |
 | `max_tool_iterations` | `20` | Số vòng lặp tool-call tối đa mỗi tin nhắn trên CLI, gateway và channels |
 | `max_history_messages` | `50` | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên |
 | `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
