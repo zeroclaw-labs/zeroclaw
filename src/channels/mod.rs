@@ -4690,6 +4690,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
+        tool_descs.push((
+            "browser",
+            "Automate browser actions (open/click/type/scroll/screenshot) with backend-aware safety checks.",
+        ));
     }
     if config.composio.enabled {
         tool_descs.push((

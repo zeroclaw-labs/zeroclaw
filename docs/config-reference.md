@@ -421,8 +421,8 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs in the system browser without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
+| `enabled` | `false` | Enable browser tools (`browser_open` and `browser`) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` and `browser` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -443,6 +443,7 @@ Notes:
 
 Notes:
 
+- `browser_open` is a simple URL opener; `browser` is full browser automation (open/click/type/scroll/screenshot).
 - When `backend = "computer_use"`, the agent delegates browser actions to the sidecar at `computer_use.endpoint`.
 - `allow_remote_endpoint = false` (default) rejects any non-loopback endpoint to prevent accidental public exposure.
 - Use `window_allowlist` to restrict which OS windows the sidecar can interact with.

@@ -1599,6 +1599,10 @@ pub async fn run(
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
+        tool_descs.push((
+            "browser",
+            "Automate browser actions (open/click/type/scroll/screenshot) with backend-aware safety checks.",
+        ));
     }
     if config.composio.enabled {
         tool_descs.push((
@@ -2017,6 +2021,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     ];
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
+        tool_descs.push(("browser", "Automate browser interactions."));
     }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
