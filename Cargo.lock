@@ -8430,6 +8430,7 @@ dependencies = [
 name = "zeroclaw"
 version = "0.1.7"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "async-imap",
  "async-trait",

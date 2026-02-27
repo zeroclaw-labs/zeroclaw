@@ -73,6 +73,7 @@ wasmi = { version = "1.0.9", optional = true, default-features = true }
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+aho-corasick = "1.1"
 
 # UUID generation
 uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
