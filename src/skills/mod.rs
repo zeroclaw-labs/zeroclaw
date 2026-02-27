@@ -2105,10 +2105,12 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     );
                     println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
                 } else {
-                    let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                        .with_context(|| {
-                        format!("failed to install local skill source: {source}")
-                    })?;
+                    let (dest, files_scanned) = install_local_skill_source(
+                        &source,
+                        &skills_path,
+                        config.skills.allow_scripts,
+                    )
+                    .with_context(|| format!("failed to install local skill source: {source}"))?;
                     println!(
                         "  {} Skill installed and audited: {} ({} files scanned)",
                         console::style("✓").green().bold(),

@@ -2751,11 +2751,11 @@ pub struct WasmRuntimeConfig {
     pub tools_dir: String,
 
     /// Fuel limit per invocation (instruction budget).
-    #[serde(default = "default_wasm_fuel_limit")]
+    #[serde(default = "default_runtime_wasm_fuel_limit")]
     pub fuel_limit: u64,
 
     /// Memory limit per invocation in MB.
-    #[serde(default = "default_wasm_memory_limit_mb")]
+    #[serde(default = "default_runtime_wasm_memory_limit_mb")]
     pub memory_limit_mb: u64,
 
     /// Maximum `.wasm` module size in MB.
@@ -2860,11 +2860,11 @@ fn default_wasm_tools_dir() -> String {
     "tools/wasm".into()
 }
 
-fn default_wasm_fuel_limit() -> u64 {
+fn default_runtime_wasm_fuel_limit() -> u64 {
     1_000_000
 }
 
-fn default_wasm_memory_limit_mb() -> u64 {
+fn default_runtime_wasm_memory_limit_mb() -> u64 {
     64
 }
 
@@ -2890,8 +2890,8 @@ impl Default for WasmRuntimeConfig {
     fn default() -> Self {
         Self {
             tools_dir: default_wasm_tools_dir(),
-            fuel_limit: default_wasm_fuel_limit(),
-            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_runtime_wasm_fuel_limit(),
+            memory_limit_mb: default_runtime_wasm_memory_limit_mb(),
             max_module_size_mb: default_wasm_max_module_size_mb(),
             allow_workspace_read: false,
             allow_workspace_write: false,
