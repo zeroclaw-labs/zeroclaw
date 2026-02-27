@@ -825,6 +825,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
+        "avian" => "deepseek/deepseek-v3.2".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -1163,6 +1164,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GLM-5 (high reasoning)".to_string(),
             ),
         ],
+        "avian" => vec![
+            (
+                "deepseek/deepseek-v3.2".to_string(),
+                "DeepSeek V3.2 (164K context, recommended)".to_string(),
+            ),
+            (
+                "moonshotai/kimi-k2.5".to_string(),
+                "Kimi K2.5 (131K context)".to_string(),
+            ),
+            (
+                "z-ai/glm-5".to_string(),
+                "GLM-5 (131K context)".to_string(),
+            ),
+            (
+                "minimax/minimax-m2.5".to_string(),
+                "MiniMax M2.5 (1M context)".to_string(),
+            ),
+        ],
         "ollama" => vec![
             (
                 "llama3.2".to_string(),
@@ -1277,6 +1296,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "vllm"
             | "osaurus"
             | "astrai"
+            | "avian"
             | "venice"
             | "fireworks"
             | "novita"
@@ -1314,6 +1334,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
+            "avian" => Some("https://api.avian.io/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
             "sglang" => Some("http://localhost:30000/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
@@ -2300,6 +2321,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "astrai",
                 "Astrai — compliant AI routing (PII stripping, cost optimization)",
             ),
+            (
+                "avian",
+                "Avian — OpenAI-compatible inference (DeepSeek, Kimi, GLM, MiniMax)",
+            ),
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
@@ -2724,6 +2749,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "bedrock" => "https://console.aws.amazon.com/iam",
                 "gemini" => "https://aistudio.google.com/app/apikey",
                 "astrai" => "https://as-trai.com",
+                "avian" => "https://avian.io",
                 _ => "",
             }
         };
@@ -3023,6 +3049,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "gemini" => "GEMINI_API_KEY",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
+        "avian" => "AVIAN_API_KEY",
         _ => "API_KEY",
     }
 }
