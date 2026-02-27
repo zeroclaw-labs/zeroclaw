@@ -127,7 +127,14 @@ tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
 }
 
-const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "mattermost"];
+const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "lark",
+    "feishu",
+];
 
 const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
 const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
@@ -2179,6 +2186,25 @@ mod tests {
         maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
 
         assert!(args.get("delivery").is_none());
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_supports_lark_and_feishu_channels() {
+        let mut lark_args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "daily summary"
+        });
+        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
+        assert_eq!(lark_args["delivery"]["channel"], "lark");
+        assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
+
+        let mut feishu_args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "daily summary"
+        });
+        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
+        assert_eq!(feishu_args["delivery"]["channel"], "feishu");
+        assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
