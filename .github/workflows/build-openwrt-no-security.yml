@@ -1,4 +1,4 @@
-name: Build OpenWrt ARM64 - Safe Security Removal
+name: Build OpenWrt ARM64 (No Security Restrictions)
 
 on:
   workflow_dispatch:
@@ -10,72 +10,75 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    
+      contents: read
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-    
-    - name: Safely remove security restrictions with Python
+
+    - name: Patch autonomy defaults for unrestricted mode
       run: |
         python3 << 'EOF'
         import re
         import os
+        import sys
 
         def patch_file(filepath, replacements):
             if not os.path.exists(filepath):
-                print(f"Error: {filepath} not found!")
-                return
-            
+                print(f"Warning: {filepath} not found, skipping.")
+                return False
+
             with open(filepath, 'r') as f:
                 content = f.read()
-            
+
             new_content = content
             for pattern, subst in replacements.items():
-                # re.MULTILINE digunakan agar regex bisa bekerja dengan baik pada file besar
-                new_content = re.sub(pattern, subst, new_content)
-            
+                new_content = re.sub(pattern, subst, new_content, flags=re.MULTILINE | re.DOTALL)
+
             if new_content != content:
                 with open(filepath, 'w') as f:
                     f.write(new_content)
-                print(f"Successfully patched: {filepath}")
+                print(f"Patched: {filepath}")
+                return True
             else:
-                print(f"No changes made to: {filepath}. Check if patterns match.")
+                print(f"No changes in: {filepath} (patterns may already match or not found)")
+                return False
 
-        # Patch untuk src/config/schema.rs
-        # Menggunakan regex agar hanya mengganti nilai boolean/angka tanpa merusak kurung di akhir baris
+        # Patch src/config/schema.rs — set unrestricted autonomy defaults
         schema_changes = {
-            r'(workspace_only:\s*)true': r'\1false',
-            r'(block_high_risk_commands:\s*)true': r'\1false',
+            r'(level:\s*)AutonomyLevel::Supervised': r'\1AutonomyLevel::Full',
+            r'(level:\s*)AutonomyLevel::Locked':     r'\1AutonomyLevel::Full',
+            r'(workspace_only:\s*)true':              r'\1false',
+            r'(block_high_risk_commands:\s*)true':    r'\1false',
             r'(require_approval_for_medium_risk:\s*)true': r'\1false',
-            r'(max_actions_per_hour:\s*)\d+': r'\1 999999',
-            r'(max_cost_per_day_cents:\s*)\d+': r'\1 99999999',
-            r'(level:\s*)AutonomyLevel::Supervised': r'\1AutonomyLevel::Full'
+            r'(max_actions_per_hour:\s*)\d+':         r'\199999',
+            r'(max_cost_per_day_cents:\s*)500\b':     r'\199999999',
+            r'forbidden_paths:\s*vec!\[(?:[^\]]*)\]': r'forbidden_paths: vec![]',
         }
-        
-        # Patch untuk src/onboard/wizard.rs
-        wizard_changes = {
-            r'autonomy_config_for_mode\(SecurityMode::Casual\)': 'autonomy_config_for_mode(SecurityMode::Freedom)',
-            r'\.default\(0\)': '.default(2)'
-        }
-
         patch_file('src/config/schema.rs', schema_changes)
-        patch_file('src/onboard/wizard.rs', wizard_changes)
+
+        print("Patch step complete.")
         EOF
-    
-    - name: Install Rust
+
+    - name: Verify schema compiles (syntax check via grep)
+      run: |
+        # Quick sanity: ensure no broken vec![] // was: pattern remains
+        if grep -n 'vec!\[\] // was:' src/config/schema.rs; then
+          echo "ERROR: broken vec![] comment pattern found in schema.rs"
+          exit 1
+        fi
+        echo "Syntax sanity check passed."
+
+    - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: aarch64-unknown-linux-musl
-    
+
     - name: Install cross
-      run: |
-        # Mengunduh binary langsung jauh lebih cepat daripada 'cargo install'
-        LATEST=$(curl -s https://api.github.com/repos/cross-rs/cross/releases/latest | grep tag_name | cut -d '"' -f 4)
-        curl -L "https://github.com/cross-rs/cross/releases/download/$LATEST/cross-x86_64-unknown-linux-musl.tar.gz" | tar xz -C /usr/local/bin
-    
+      run: cargo install cross --git https://github.com/cross-rs/cross
+
     - name: Cache Cargo dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
@@ -83,27 +86,34 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           target/
-        key: ${{ runner.os }}-cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-aarch64-musl-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-aarch64-
-    
-    - name: Build (Release)
-      run: cross build --release --target aarch64-unknown-linux-musl
-    
-    - name: Package Artifacts
+          ${{ runner.os }}-cargo-aarch64-musl-
+
+    - name: Build release (aarch64-unknown-linux-musl, no wasm-tools)
+      # wasm-tools (wasmtime/cranelift) does not support musl targets reliably.
+      # Build without it for OpenWrt compatibility.
+      run: |
+        cross build --release --locked \
+          --target aarch64-unknown-linux-musl \
+          --no-default-features
+
+    - name: Package artifact
       run: |
         mkdir -p dist
-        # Copy binary hasil build ke folder dist
-        if [ -f target/aarch64-unknown-linux-musl/release/zeroclaw ]; then
-          cp target/aarch64-unknown-linux-musl/release/zeroclaw dist/zeroclaw-openwrt-aarch64
+        BINARY="target/aarch64-unknown-linux-musl/release/zeroclaw"
+        if [ -f "$BINARY" ]; then
+          cp "$BINARY" dist/zeroclaw-openwrt-aarch64
           tar -czf dist/zeroclaw-openwrt-aarch64.tar.gz -C dist zeroclaw-openwrt-aarch64
+          echo "Binary size: $(du -sh dist/zeroclaw-openwrt-aarch64 | cut -f1)"
         else
-          echo "Binary not found! Build might have failed."
+          echo "ERROR: binary not found at $BINARY"
           exit 1
         fi
-    
-    - name: Upload Artifact
+
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: zeroclaw-openwrt-aarch64
         path: dist/zeroclaw-openwrt-aarch64.tar.gz
+        retention-days: 30
