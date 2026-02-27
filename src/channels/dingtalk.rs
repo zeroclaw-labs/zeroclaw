@@ -121,6 +121,102 @@ impl DingTalkChannel {
         }
     }
 
+    fn extract_text_content(data: &serde_json::Value) -> Option<String> {
+        fn normalize_text(raw: &str) -> Option<String> {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+
+        fn text_content_from_value(value: &serde_json::Value) -> Option<String> {
+            match value {
+                serde_json::Value::String(s) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                        // Some DingTalk events encode nested text payloads as JSON strings.
+                        if let Some(content) = parsed
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .and_then(normalize_text)
+                        {
+                            return Some(content);
+                        }
+                    }
+                    normalize_text(s)
+                }
+                serde_json::Value::Object(map) => map
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .and_then(normalize_text),
+                _ => None,
+            }
+        }
+
+        fn collect_rich_text_fragments(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(s) => {
+                    if let Some(normalized) = normalize_text(s) {
+                        out.push(normalized);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_rich_text_fragments(item, out);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for key in ["text", "content"] {
+                        if let Some(value) = map.get(key).and_then(|v| v.as_str()) {
+                            if let Some(normalized) = normalize_text(value) {
+                                out.push(normalized);
+                            }
+                        }
+                    }
+                    for key in ["children", "elements", "richText", "rich_text"] {
+                        if let Some(child) = map.get(key) {
+                            collect_rich_text_fragments(child, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Canonical text payload.
+        if let Some(content) = data.get("text").and_then(text_content_from_value) {
+            return Some(content);
+        }
+
+        // Some events include top-level content directly.
+        if let Some(content) = data
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(normalize_text)
+        {
+            return Some(content);
+        }
+
+        // Rich text payload fallback.
+        if let Some(rich) = data.get("richText").or_else(|| data.get("rich_text")) {
+            let mut fragments = Vec::new();
+            collect_rich_text_fragments(rich, &mut fragments);
+            if !fragments.is_empty() {
+                let merged = fragments.join(" ");
+                if let Some(content) = normalize_text(&merged) {
+                    return Some(content);
+                }
+            }
+        }
+
+        // Markdown payload fallback.
+        data.get("markdown")
+            .and_then(|v| v.get("text"))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_text)
+    }
+
     fn resolve_chat_id(data: &serde_json::Value, sender_id: &str) -> String {
         let is_private_chat = data
             .get("conversationType")
@@ -313,16 +409,19 @@ impl Channel for DingTalkChannel {
                     };
 
                     // Extract message content
-                    let content = data
-                        .get("text")
-                        .and_then(|t| t.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .trim();
-
-                    if content.is_empty() {
+                    let Some(content) = Self::extract_text_content(&data) else {
+                        let keys = data
+                            .as_object()
+                            .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let msg_type = data.get("msgtype").and_then(|v| v.as_str()).unwrap_or("");
+                        tracing::warn!(
+                            msg_type = %msg_type,
+                            keys = ?keys,
+                            "DingTalk: dropped callback without extractable text content"
+                        );
                         continue;
-                    }
+                    };
 
                     let sender_id = data
                         .get("senderStaffId")
@@ -370,7 +469,7 @@ impl Channel for DingTalkChannel {
                         id: Uuid::new_v4().to_string(),
                         sender: sender_id.to_string(),
                         reply_target: chat_id,
-                        content: content.to_string(),
+                        content,
                         channel: "dingtalk".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -480,5 +579,61 @@ client_secret = "secret"
         });
         let chat_id = DingTalkChannel::resolve_chat_id(&data, "staff-1");
         assert_eq!(chat_id, "cid-group");
+    }
+
+    #[test]
+    fn extract_text_content_prefers_nested_text_content() {
+        let data = serde_json::json!({
+            "text": {"content": "  你好，世界  "},
+            "content": "fallback",
+        });
+        assert_eq!(
+            DingTalkChannel::extract_text_content(&data).as_deref(),
+            Some("你好，世界")
+        );
+    }
+
+    #[test]
+    fn extract_text_content_supports_json_encoded_text_string() {
+        let data = serde_json::json!({
+            "text": "{\"content\":\"中文消息\"}"
+        });
+        assert_eq!(
+            DingTalkChannel::extract_text_content(&data).as_deref(),
+            Some("中文消息")
+        );
+    }
+
+    #[test]
+    fn extract_text_content_falls_back_to_content_and_markdown() {
+        let direct = serde_json::json!({
+            "content": "  direct payload  "
+        });
+        assert_eq!(
+            DingTalkChannel::extract_text_content(&direct).as_deref(),
+            Some("direct payload")
+        );
+
+        let markdown = serde_json::json!({
+            "markdown": {"text": "  markdown body  "}
+        });
+        assert_eq!(
+            DingTalkChannel::extract_text_content(&markdown).as_deref(),
+            Some("markdown body")
+        );
+    }
+
+    #[test]
+    fn extract_text_content_supports_rich_text_payload() {
+        let data = serde_json::json!({
+            "richText": [
+                {"text": "现在"},
+                {"content": "呢？"}
+            ]
+        });
+        assert_eq!(
+            DingTalkChannel::extract_text_content(&data).as_deref(),
+            Some("现在 呢？")
+        );
     }
 }
