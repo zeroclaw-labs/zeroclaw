@@ -1079,6 +1079,11 @@ async fn load_runtime_defaults_from_config_file(
     if let Some(zeroclaw_dir) = path.parent() {
         let store = crate::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
+        decrypt_optional_secret_for_runtime_reload(
+            &store,
+            &mut parsed.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
     }
 
     parsed.apply_env_overrides();
