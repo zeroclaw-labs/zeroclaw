@@ -62,14 +62,10 @@ impl Tool for CronAddTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let mut delivery_channels = vec![
-            "telegram",
-            "discord",
-            "slack",
-            "mattermost",
-            "qq",
-            "email",
-        ];
+        // Build list of available delivery channels.
+        // Matrix is conditionally included when channel-matrix feature is enabled.
+        let mut delivery_channels =
+            vec!["telegram", "discord", "slack", "mattermost", "qq", "email"];
         #[cfg(feature = "channel-matrix")]
         delivery_channels.push("matrix");
 

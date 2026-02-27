@@ -391,6 +391,8 @@ pub(crate) async fn deliver_announcement(
             channel.send(&SendMessage::new(output, target)).await?;
         }
         #[cfg(feature = "channel-matrix")]
+        // Deliver to Matrix room via matrix-sdk with E2EE support.
+        // Reuses MatrixChannel which handles session restore and room resolution.
         "matrix" => {
             let mx = config
                 .channels_config
