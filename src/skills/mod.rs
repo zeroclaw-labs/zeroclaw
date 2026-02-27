@@ -77,27 +77,34 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None)
+    load_skills_full(workspace_dir, true, None, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
 pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Config) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    load_skills_full(
         workspace_dir,
+        config.skills.bundled_enabled,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
     )
 }
 
-fn load_skills_with_open_skills_config(
+fn load_skills_full(
     workspace_dir: &Path,
+    bundled_enabled: bool,
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
     config_allow_scripts: Option<bool>,
 ) -> Vec<Skill> {
     let mut skills = Vec::new();
     let allow_scripts = config_allow_scripts.unwrap_or(false);
+
+    // Load bundled skills first (system-level, always available)
+    if bundled_enabled {
+        skills.extend(load_bundled_skills());
+    }
 
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
@@ -106,6 +113,68 @@ fn load_skills_with_open_skills_config(
     }
 
     skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
+    skills
+}
+
+/// Load bundled skills shipped with ZeroClaw binary.
+pub fn load_bundled_skills() -> Vec<Skill> {
+    let mut skills = Vec::new();
+
+    // Bundled skills are in the bundled_skills/ directory:
+    // - During development: current_dir()/bundled_skills
+    // - At runtime: executable_dir()/bundled_skills
+    let bundled_paths = vec![
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("bundled_skills"))
+            .filter(|p| p.exists()),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("bundled_skills")))
+            .filter(|p| p.exists()),
+    ];
+
+    for bundled_dir in bundled_paths.into_iter().flatten() {
+        if bundled_dir.is_dir() {
+            // Bundled skills are trusted, skip security audit
+            skills.extend(load_skills_from_directory_no_audit(&bundled_dir));
+        }
+    }
+
+    skills
+}
+
+fn load_skills_from_directory_no_audit(skills_dir: &Path) -> Vec<Skill> {
+    if !skills_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut skills = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
+        return skills;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let manifest_path = path.join("SKILL.toml");
+        let md_path = path.join("SKILL.md");
+
+        if manifest_path.exists() {
+            if let Ok(skill) = load_skill_toml(&manifest_path) {
+                skills.push(skill);
+            }
+        } else if md_path.exists() {
+            if let Ok(skill) = load_skill_md(&md_path, &path) {
+                skills.push(skill);
+            }
+        }
+    }
+
     skills
 }
 
@@ -1024,13 +1093,17 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             match name {
                 Some(n) => {
                     println!("Updating skill: {n}");
-                    println!("  {} Skill update not yet implemented.", 
-                        console::style("!").yellow().bold());
+                    println!(
+                        "  {} Skill update not yet implemented.",
+                        console::style("!").yellow().bold()
+                    );
                 }
                 None => {
                     println!("Updating all installed skills...");
-                    println!("  {} Bulk update not yet implemented.", 
-                        console::style("!").yellow().bold());
+                    println!(
+                        "  {} Bulk update not yet implemented.",
+                        console::style("!").yellow().bold()
+                    );
                 }
             }
             Ok(())
@@ -1053,7 +1126,11 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     if !s.tools.is_empty() {
                         println!(
                             "  Tools: {}",
-                            s.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                            s.tools
+                                .iter()
+                                .map(|t| t.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                     }
                     if let Some(loc) = &s.location {
