@@ -12,7 +12,13 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config as RlConfig, Context, Editor, Helper};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -52,6 +58,79 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Slash-command definitions for interactive-mode completion.
+/// Each entry: (trigger aliases, display label, description).
+const SLASH_COMMANDS: &[(&[&str], &str, &str)] = &[
+    (&["/help"], "/help", "Show this help message"),
+    (
+        &["/clear", "/new"],
+        "/clear /new",
+        "Clear conversation history",
+    ),
+    (&["/quit", "/exit"], "/quit /exit", "Exit interactive mode"),
+];
+
+struct SlashCommandCompleter;
+
+impl Completer for SlashCommandCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if !line.starts_with('/') {
+            return Ok((0, vec![]));
+        }
+
+        let prefix = &line[..pos];
+        let matches: Vec<Pair> = SLASH_COMMANDS
+            .iter()
+            .filter(|(triggers, _, _)| triggers.iter().any(|trigger| trigger.starts_with(prefix)))
+            .map(|(triggers, label, desc)| {
+                let replacement = triggers
+                    .iter()
+                    .find(|trigger| trigger.starts_with(prefix))
+                    .unwrap_or(&triggers[0]);
+                Pair {
+                    display: format!("  {:<14}{desc:<64}", label),
+                    replacement: replacement.to_string(),
+                }
+            })
+            .collect();
+
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for SlashCommandCompleter {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        if !line.starts_with('/') || pos == 0 {
+            return None;
+        }
+
+        let prefix = &line[..pos];
+        SLASH_COMMANDS
+            .iter()
+            .flat_map(|(triggers, _, _)| triggers.iter())
+            .find(|trigger| trigger.starts_with(prefix) && **trigger != prefix)
+            .map(|trigger| trigger[pos..].to_string())
+    }
+}
+
+impl Highlighter for SlashCommandCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
+    }
+}
+
+impl Validator for SlashCommandCompleter {}
+impl Helper for SlashCommandCompleter {}
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -1757,7 +1836,12 @@ pub async fn run(
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
         // Reusable readline editor for UTF-8 input support
-        let mut rl = rustyline::DefaultEditor::new()?;
+        let mut rl = Editor::with_config(
+            RlConfig::builder()
+                .completion_type(CompletionType::List)
+                .build(),
+        )?;
+        rl.set_helper(Some(SlashCommandCompleter));
 
         loop {
             let input = match rl.readline("> ") {
