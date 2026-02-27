@@ -23,7 +23,7 @@ Last verified: **February 25, 2026**.
 | `integrations` | Inspect integration details |
 | `skills` | List/install/remove skills |
 | `migrate` | Import from external runtimes (currently OpenClaw) |
-| `config` | Export machine-readable config schema |
+| `config` | Inspect, query, and modify runtime configuration |
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
@@ -212,7 +212,16 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 
 ### `config`
 
+- `zeroclaw config show`
+- `zeroclaw config get <key>`
+- `zeroclaw config set <key> <value>`
 - `zeroclaw config schema`
+
+`config show` prints the full effective configuration as pretty JSON with secrets masked as `***REDACTED***`. Environment variable overrides are already applied.
+
+`config get <key>` queries a single value by dot-separated path (e.g. `gateway.port`, `security.estop.enabled`). Scalars print raw values; objects and arrays print pretty JSON. Sensitive fields are masked.
+
+`config set <key> <value>` updates a configuration value and persists it atomically to `config.toml`. Types are inferred automatically (`true`/`false` → bool, integers, floats, JSON syntax → object/array, otherwise string). Type mismatches are rejected before writing.
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 

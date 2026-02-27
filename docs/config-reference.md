@@ -14,9 +14,12 @@ ZeroClaw logs the resolved config on startup at `INFO` level:
 
 - `Config loaded` with fields: `path`, `workspace`, `source`, `initialized`
 
-Schema export command:
+CLI commands for config inspection and modification:
 
-- `zeroclaw config schema` (prints JSON Schema draft 2020-12 to stdout)
+- `zeroclaw config show` — print effective config as JSON (secrets masked)
+- `zeroclaw config get <key>` — query a value by dot-path (e.g. `zeroclaw config get gateway.port`)
+- `zeroclaw config set <key> <value>` — update a value and save to `config.toml`
+- `zeroclaw config schema` — print JSON Schema (draft 2020-12) to stdout
 
 ## Core Keys
 
