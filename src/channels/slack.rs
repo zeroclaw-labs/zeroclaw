@@ -298,7 +298,7 @@ impl SlackChannel {
         }
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
+            .map(|d| u64::from(d.subsec_nanos()))
             .unwrap_or(0);
         nanos % (max_jitter_ms + 1)
     }
