@@ -3491,6 +3491,49 @@ I will now call the tool with this payload:
     }
 
     #[test]
+    fn parse_tool_calls_handles_direct_xml_tool_tags_without_wrapper() {
+        let response = r#"<shell>dir "C:\Users\u\Desktop" /b</shell>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            r#"dir "C:\Users\u\Desktop" /b"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_mixed_direct_xml_blocks_with_guidance_text() {
+        let response = r#"
+// check desktop images
+<shell>dir "C:\Users\u\Desktop" /b | findstr /i "\.jpg$ \.png$"</shell>
+
+// create a file
+<file_write>
+<path>C:\Users\u\Desktop\new_file.txt</path>
+<content></content>
+</file_write>
+"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            r#"dir "C:\Users\u\Desktop" /b | findstr /i "\.jpg$ \.png$""#
+        );
+        assert_eq!(calls[1].name, "file_write");
+        assert_eq!(
+            calls[1].arguments.get("path").unwrap().as_str().unwrap(),
+            r#"C:\Users\u\Desktop\new_file.txt"#
+        );
+        assert!(text.contains("check desktop images"));
+        assert!(text.contains("create a file"));
+    }
+
+    #[test]
     fn parse_tool_calls_handles_markdown_tool_call_fence() {
         let response = r#"I'll check that.
 ```tool_call
