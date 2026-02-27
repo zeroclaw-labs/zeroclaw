@@ -34,6 +34,7 @@ Use this when you know what you need to do, but not where the doc lives.
 ## Security And Trust
 
 - Security collection: [../security/README.md](../security/README.md)
+- Official channels and fraud prevention: [../security/official-channels-and-fraud-prevention.md](../security/official-channels-and-fraud-prevention.md)
 - Security roadmap: [../security-roadmap.md](../security-roadmap.md)
 - Sandboxing: [../sandboxing.md](../sandboxing.md)
 - Audit logging: [../audit-logging.md](../audit-logging.md)

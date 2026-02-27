@@ -79,6 +79,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 > Note: this area includes proposal/roadmap docs. For current behavior, start with [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
 
 - [security/README.md](security/README.md)
+- [security/official-channels-and-fraud-prevention.md](security/official-channels-and-fraud-prevention.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)

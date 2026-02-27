@@ -32,6 +32,20 @@ Preferred reporting paths:
 - Suggested mitigation or patch direction (if known)
 - Any known workaround
 
+## Official Channels and Anti-Fraud Notice
+
+Impersonation scams are a real risk in open communities.
+
+Security-critical rule:
+
+- ZeroClaw maintainers will not ask for cryptocurrency, wallet seed phrases, or private financial credentials.
+- Treat direct-message payment requests as fraudulent unless independently verified in the repository.
+- Verify announcements using repository sources first.
+
+Canonical statement and reporting guidance:
+
+- [docs/security/official-channels-and-fraud-prevention.md](docs/security/official-channels-and-fraud-prevention.md)
+
 ## Maintainer Handling Workflow (GitHub-Native)
 
 ### 1. Intake and triage (private)

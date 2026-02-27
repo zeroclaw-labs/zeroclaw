@@ -94,6 +94,7 @@ Compatibility shims such as `docs/SUMMARY.<locale>.md` and `docs/vi/**` remain v
 | `docs/datasheets/arduino-uno.md` | Current Hardware Reference | hardware builders |
 | `docs/datasheets/esp32.md` | Current Hardware Reference | hardware builders |
 | `docs/audit-event-schema.md` | Current CI/Security Reference | maintainers/security reviewers |
+| `docs/security/official-channels-and-fraud-prevention.md` | Current Security Guide | users/operators |
 
 ## Policy / Process Docs
 

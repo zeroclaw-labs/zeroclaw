@@ -64,6 +64,7 @@ Last refreshed: **February 25, 2026**.
 ### 4) Security Design & Proposals
 
 - [security/README.md](security/README.md)
+- [security/official-channels-and-fraud-prevention.md](security/official-channels-and-fraud-prevention.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)
