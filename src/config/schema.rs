@@ -4114,6 +4114,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub otp: OtpConfig,
 
+    /// Custom security role definitions used for user-level tool authorization.
+    #[serde(default)]
+    pub roles: Vec<SecurityRoleConfig>,
+
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
@@ -4134,6 +4138,19 @@ pub enum OtpMethod {
     Pairing,
     /// Future method for local CLI challenge prompts.
     CliPrompt,
+}
+
+/// Channel delivery mode for OTP challenges.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtpChallengeDelivery {
+    /// Send OTP challenge in direct message/private channel.
+    #[default]
+    Dm,
+    /// Send OTP challenge in thread where supported.
+    Thread,
+    /// Send OTP challenge as ephemeral message where supported.
+    Ephemeral,
 }
 
 /// Security OTP configuration.
@@ -4167,6 +4184,54 @@ pub struct OtpConfig {
     /// Domain-category presets expanded into `gated_domains`.
     #[serde(default)]
     pub gated_domain_categories: Vec<String>,
+
+    /// Delivery mode for OTP challenge prompts in chat channels.
+    #[serde(default)]
+    pub challenge_delivery: OtpChallengeDelivery,
+
+    /// Maximum time a challenge remains valid, in seconds.
+    #[serde(default = "default_otp_challenge_timeout_secs")]
+    pub challenge_timeout_secs: u64,
+
+    /// Maximum OTP attempts allowed per challenge.
+    #[serde(default = "default_otp_challenge_max_attempts")]
+    pub challenge_max_attempts: u8,
+}
+
+/// Custom role definition for user-level authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityRoleConfig {
+    /// Stable role name used by user records.
+    pub name: String,
+
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: String,
+
+    /// Explicit allowlist of tools for this role.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+
+    /// Explicit denylist of tools for this role.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+
+    /// Tool names requiring OTP for this role.
+    #[serde(default)]
+    pub totp_gated: Vec<String>,
+
+    /// Optional parent role name used for inheritance.
+    #[serde(default)]
+    pub inherits: Option<String>,
+
+    /// Role-scoped domain patterns requiring OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Role-scoped domain categories requiring OTP.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -4175,6 +4240,14 @@ fn default_otp_token_ttl_secs() -> u64 {
 
 fn default_otp_cache_valid_secs() -> u64 {
     300
+}
+
+fn default_otp_challenge_timeout_secs() -> u64 {
+    120
+}
+
+fn default_otp_challenge_max_attempts() -> u8 {
+    3
 }
 
 fn default_otp_gated_actions() -> Vec<String> {
@@ -4197,6 +4270,9 @@ impl Default for OtpConfig {
             gated_actions: default_otp_gated_actions(),
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
+            challenge_delivery: OtpChallengeDelivery::Dm,
+            challenge_timeout_secs: default_otp_challenge_timeout_secs(),
+            challenge_max_attempts: default_otp_challenge_max_attempts(),
         }
     }
 }
@@ -5729,6 +5805,12 @@ impl Config {
                 "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
             );
         }
+        if self.security.otp.challenge_timeout_secs == 0 {
+            anyhow::bail!("security.otp.challenge_timeout_secs must be greater than 0");
+        }
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+        }
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
             if normalized.is_empty() {
@@ -5750,6 +5832,102 @@ impl Config {
         .with_context(|| {
             "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
         })?;
+        let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
+        let mut custom_role_names = std::collections::HashSet::new();
+        for (i, role) in self.security.roles.iter().enumerate() {
+            let name = role.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("security.roles[{i}].name must not be empty");
+            }
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!("security.roles[{i}].name contains invalid characters: {name}");
+            }
+            let normalized_name = name.to_ascii_lowercase();
+            if built_in_roles
+                .iter()
+                .any(|built_in| built_in == &normalized_name.as_str())
+            {
+                anyhow::bail!(
+                    "security.roles[{i}].name conflicts with built-in role: {normalized_name}"
+                );
+            }
+            if !custom_role_names.insert(normalized_name.clone()) {
+                anyhow::bail!("security.roles contains duplicate role: {normalized_name}");
+            }
+
+            for (tool_idx, tool_name) in role.allowed_tools.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "security.roles[{i}].allowed_tools[{tool_idx}] must not be empty"
+                    );
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].allowed_tools[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            for (tool_idx, tool_name) in role.denied_tools.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!("security.roles[{i}].denied_tools[{tool_idx}] must not be empty");
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].denied_tools[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            for (tool_idx, tool_name) in role.totp_gated.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!("security.roles[{i}].totp_gated[{tool_idx}] must not be empty");
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].totp_gated[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            DomainMatcher::new(&role.gated_domains, &role.gated_domain_categories)
+                .with_context(|| format!("Invalid security.roles[{i}] domain settings"))?;
+            if let Some(parent) = role.inherits.as_deref() {
+                let normalized_parent = parent.trim().to_ascii_lowercase();
+                if normalized_parent.is_empty() {
+                    anyhow::bail!("security.roles[{i}].inherits must not be empty");
+                }
+                if normalized_parent == normalized_name {
+                    anyhow::bail!("security.roles[{i}].inherits must not reference itself");
+                }
+            }
+        }
+        for (i, role) in self.security.roles.iter().enumerate() {
+            if let Some(parent) = role.inherits.as_deref() {
+                let normalized_parent = parent.trim().to_ascii_lowercase();
+                let built_in_exists = built_in_roles
+                    .iter()
+                    .any(|built_in| built_in == &normalized_parent.as_str());
+                let custom_exists = custom_role_names.contains(&normalized_parent);
+                if !built_in_exists && !custom_exists {
+                    anyhow::bail!(
+                        "security.roles[{i}].inherits references unknown role: {normalized_parent}"
+                    );
+                }
+            }
+        }
         if self.security.estop.state_file.trim().is_empty() {
             anyhow::bail!("security.estop.state_file must not be empty");
         }
@@ -9914,6 +10092,13 @@ default_temperature = 0.7
 
         assert!(!parsed.security.otp.enabled);
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Dm
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 120);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 3);
+        assert!(parsed.security.roles.is_empty());
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
         assert!(parsed.security.syscall_anomaly.enabled);
@@ -9936,6 +10121,19 @@ token_ttl_secs = 30
 cache_valid_secs = 120
 gated_actions = ["shell", "browser_open"]
 gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+challenge_delivery = "thread"
+challenge_timeout_secs = 180
+challenge_max_attempts = 4
+
+[[security.roles]]
+name = "developer"
+description = "Developer role"
+allowed_tools = ["shell", "file_read", "file_write"]
+denied_tools = ["memory_forget"]
+totp_gated = ["shell", "file_write"]
+inherits = "operator"
+gated_domains = ["*.chase.com"]
 gated_domain_categories = ["banking"]
 
 [security.estop]
@@ -9973,6 +10171,14 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert_eq!(parsed.security.syscall_anomaly.baseline_syscalls.len(), 4);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Thread
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 180);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 4);
+        assert_eq!(parsed.security.roles.len(), 1);
+        assert_eq!(parsed.security.roles[0].name, "developer");
         parsed.validate().unwrap();
     }
 
@@ -10005,6 +10211,63 @@ baseline_syscalls = ["read", "write", "openat", "close"]
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_challenge_timeout() {
+        let mut config = Config::default();
+        config.security.otp.challenge_timeout_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected challenge timeout validation failure");
+        assert!(err.to_string().contains("challenge_timeout_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_challenge_attempts() {
+        let mut config = Config::default();
+        config.security.otp.challenge_max_attempts = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected challenge attempts validation failure");
+        assert!(err.to_string().contains("challenge_max_attempts"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_unknown_role_parent() {
+        let mut config = Config::default();
+        config.security.roles = vec![SecurityRoleConfig {
+            name: "developer".to_string(),
+            inherits: Some("missing-parent".to_string()),
+            ..SecurityRoleConfig::default()
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("expected unknown role parent validation failure");
+        assert!(err.to_string().contains("inherits references unknown role"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_duplicate_role_name() {
+        let mut config = Config::default();
+        config.security.roles = vec![
+            SecurityRoleConfig {
+                name: "developer".to_string(),
+                ..SecurityRoleConfig::default()
+            },
+            SecurityRoleConfig {
+                name: "Developer".to_string(),
+                ..SecurityRoleConfig::default()
+            },
+        ];
+
+        let err = config
+            .validate()
+            .expect_err("expected duplicate role validation failure");
+        assert!(err.to_string().contains("duplicate role"));
     }
 
     #[test]

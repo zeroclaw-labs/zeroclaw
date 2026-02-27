@@ -25,7 +25,7 @@
 - `softprops/action-gh-release@*`
 - `sigstore/cosign-installer@*`
 - `Checkmarx/vorpal-reviewdog-github-action@*`
-- `Swatinem/rust-cache@*`
+- `useblacksmith/*` (Υποδομή Blacksmith)
 
 ## Διαδικασία Ελέγχου Αλλαγών
 
@@ -74,7 +74,7 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
 ## Ιστορικό Αλλαγών
 
 - **2026-02-21**: Προσθήκη `Checkmarx/vorpal-reviewdog-github-action@*` για στοχευμένους ελέγχους ασφαλείας.
-- **2026-02-26**: Τυποποίηση runner/action για Rust cache και Docker builds με `Swatinem/rust-cache`, `docker/setup-buildx-action`, `docker/build-push-action`.
+- **2026-02-17**: Μετάβαση στο `useblacksmith/rust-cache` για τη διαχείριση προσωρινής μνήμης Rust.
 - **2026-02-16**: Προσθήκη `sigstore/cosign-installer@*` για την υπογραφή εκδόσεων.
 - **2026-02-17**: Αντικατάσταση του `cargo install cargo-audit` με την ενέργεια `rustsec/audit-check@*`.
 

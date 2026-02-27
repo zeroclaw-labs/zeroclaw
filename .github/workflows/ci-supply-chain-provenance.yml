@@ -23,12 +23,15 @@ permissions:
     id-token: write
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
     provenance:
         name: Build + Provenance Bundle
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 35
         steps:
             - name: Checkout

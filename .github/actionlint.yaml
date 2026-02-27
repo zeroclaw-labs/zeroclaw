@@ -1,5 +1,4 @@
 self-hosted-runner:
     labels:
-        - Linux
-        - X64
-        - racknerd
+        - blacksmith-2vcpu-ubuntu-2404
+        - aws-india

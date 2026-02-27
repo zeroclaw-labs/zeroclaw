@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
   <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
@@ -25,7 +25,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
+  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="docs/i18n/zh-CN/README.md">简体中文</a> · <a href="docs/i18n/ja/README.md">日本語</a> · <a href="docs/i18n/ru/README.md">Русский</a> · <a href="docs/i18n/fr/README.md">Français</a> · <a href="docs/i18n/vi/README.md">Tiếng Việt</a> · <a href="docs/i18n/el/README.md">Ελληνικά</a>
 </p>
 
 <p align="center">
@@ -72,6 +72,7 @@ Use this board for important notices (breaking changes, security advisories, mai
 - 💰 **Cost-Efficient Deployment:** Designed for low-cost boards and small cloud instances without heavyweight runtime dependencies.
 - ⚡ **Fast Cold Starts:** Single-binary Rust runtime keeps command and daemon startup near-instant for daily operations.
 - 🌍 **Portable Architecture:** One binary-first workflow across ARM, x86, and RISC-V with swappable providers/channels/tools.
+- 🔍 **Research Phase:** Proactive information gathering through tools before response generation — reduces hallucinations by fact-checking first.
 
 ### Why teams pick ZeroClaw
 
@@ -218,6 +219,32 @@ To require binary-only install with no source fallback:
 
 ```bash
 brew install zeroclaw
+```
+
+### Linux pre-built installer (beginner-friendly)
+
+For Linux hosts that prefer a pre-built binary (no local Rust build), use the
+repository-maintained release installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash
+```
+
+What it does:
+
+- Detects your Linux CPU architecture (`x86_64`, `aarch64`, `armv7`)
+- Downloads the matching asset from the latest official GitHub release
+- Installs `zeroclaw` into a local bin directory (or `/usr/local/bin` if needed)
+- Starts `zeroclaw onboard` (skip with `--no-onboard`)
+
+Examples:
+
+```bash
+# Install and start onboarding (default)
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash
+
+# Install only (no onboarding)
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install-release.sh | bash -s -- --no-onboard
 ```
 
 ### One-click bootstrap
@@ -657,6 +684,7 @@ keyword_weight = 0.3
 # schema = "public"
 # table = "memories"
 # connect_timeout_secs = 15
+# tls = true                  # true = TLS (cert not verified), false = plain TCP (default)
 
 [gateway]
 port = 42617                    # default

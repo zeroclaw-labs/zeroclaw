@@ -78,49 +78,15 @@ permissions:
     checks: write
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
-    security-scope:
-        name: Security Scope
-        runs-on: [self-hosted, Linux, X64]
-        outputs:
-            run_heavy: ${{ steps.detect.outputs.run_heavy }}
-        steps:
-            - name: Detect heavy security scope
-              id: detect
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              with:
-                  script: |
-                    if (context.eventName !== "pull_request") {
-                      core.setOutput("run_heavy", "true");
-                      return;
-                    }
-
-                    const files = await github.paginate(
-                      github.rest.pulls.listFiles,
-                      {
-                        owner: context.repo.owner,
-                        repo: context.repo.repo,
-                        pull_number: context.payload.pull_request.number,
-                        per_page: 100,
-                      },
-                    );
-
-                    const isRustSurface = (path) =>
-                      path === "Cargo.toml" ||
-                      path === "Cargo.lock" ||
-                      path.startsWith("src/") ||
-                      path.startsWith("crates/") ||
-                      path.startsWith("tests/");
-
-                    const runHeavy = files.some((file) => isRustSurface(file.filename));
-                    core.info(`Heavy security jobs enabled: ${runHeavy}`);
-                    core.setOutput("run_heavy", runHeavy ? "true" : "false");
-
     audit:
         name: Security Audit
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -135,7 +101,7 @@ jobs:
 
     deny:
         name: License & Supply Chain
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -190,16 +156,14 @@ jobs:
 
     security-regressions:
         name: Security Regression Tests
-        needs: [security-scope]
-        if: needs.security-scope.outputs.run_heavy == 'true'
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
               with:
                   prefix-key: sec-audit-security-regressions
             - name: Run security regression suite
@@ -208,7 +172,7 @@ jobs:
 
     secrets:
         name: Secrets Governance (Gitleaks)
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -403,7 +367,7 @@ jobs:
 
     sbom:
         name: SBOM Snapshot
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -468,9 +432,7 @@ jobs:
 
     unsafe-debt:
         name: Unsafe Debt Audit
-        needs: [security-scope]
-        if: needs.security-scope.outputs.run_heavy == 'true'
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -609,7 +571,7 @@ jobs:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
         needs: [audit, deny, security-regressions, secrets, sbom, unsafe-debt]
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         steps:
             - name: Enforce security gate
               shell: bash
@@ -627,17 +589,7 @@ jobs:
                     echo "$item"
                   done
                   for item in "${results[@]}"; do
-                    key="${item%%=*}"
                     result="${item#*=}"
-
-                    if [ "$key" = "security-regressions" ] || [ "$key" = "unsafe-debt" ]; then
-                      if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-                        echo "Security gate failed: $item"
-                        exit 1
-                      fi
-                      continue
-                    fi
-
                     if [ "$result" != "success" ]; then
                       echo "Security gate failed: $item"
                       exit 1

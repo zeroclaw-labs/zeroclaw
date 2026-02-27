@@ -240,6 +240,27 @@ pub(super) fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec
         }
     }
 
+    if let Some(message) = value.get("message") {
+        let nested = parse_tool_calls_from_json_value(message);
+        if !nested.is_empty() {
+            return nested;
+        }
+    }
+
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(message) = choice.get("message") {
+                let nested = parse_tool_calls_from_json_value(message);
+                if !nested.is_empty() {
+                    calls.extend(nested);
+                }
+            }
+        }
+        if !calls.is_empty() {
+            return calls;
+        }
+    }
+
     if let Some(array) = value.as_array() {
         for item in array {
             if let Some(parsed) = parse_tool_call_value(item) {
@@ -254,6 +275,33 @@ pub(super) fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec
     }
 
     calls
+}
+
+fn extract_tool_text_from_json_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(content) = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(content.to_string());
+    }
+
+    if let Some(message) = value.get("message") {
+        if let Some(content) = extract_tool_text_from_json_value(message) {
+            return Some(content);
+        }
+    }
+
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(content) = extract_tool_text_from_json_value(choice) {
+                return Some(content);
+            }
+        }
+    }
+
+    None
 }
 
 pub(super) fn is_xml_meta_tag(tag: &str) -> bool {
@@ -1135,11 +1183,10 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
         calls = parse_tool_calls_from_json_value(&json_value);
         if !calls.is_empty() {
-            // If we found tool_calls, extract any content field as text
-            if let Some(content) = json_value.get("content").and_then(|v| v.as_str()) {
-                if !content.trim().is_empty() {
-                    text_parts.push(content.trim().to_string());
-                }
+            // If we found tool_calls, extract any content field as text.
+            // Some providers wrap tool calls under `message` or `choices[*].message`.
+            if let Some(content) = extract_tool_text_from_json_value(&json_value) {
+                text_parts.push(content);
             }
             return (text_parts.join("\n"), calls);
         }

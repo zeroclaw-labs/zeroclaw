@@ -5,21 +5,21 @@
       "id": "RUSTSEC-2025-0141",
       "owner": "repo-maintainers",
       "reason": "Transitive via probe-rs in current release path; tracked for replacement when probe-rs updates.",
-      "ticket": "SEC-21",
+      "ticket": "RMN-21",
       "expires_on": "2026-12-31"
     },
     {
       "id": "RUSTSEC-2024-0384",
       "owner": "repo-maintainers",
       "reason": "Upstream rust-nostr advisory mitigation is still in progress; monitor until released fix lands.",
-      "ticket": "SEC-21",
+      "ticket": "RMN-21",
       "expires_on": "2026-12-31"
     },
     {
       "id": "RUSTSEC-2024-0388",
       "owner": "repo-maintainers",
       "reason": "Transitive via matrix-sdk indexeddb dependency chain in current matrix release line; track removal when upstream drops derivative.",
-      "ticket": "SEC-21",
+      "ticket": "RMN-21",
       "expires_on": "2026-12-31"
     }
   ]

@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 21, 2026**.
+Last verified: **February 25, 2026**.
 
 ## Top-Level Commands
 
@@ -61,8 +61,10 @@ Tip:
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
+- `zeroclaw gateway [--host <HOST>] [--port <PORT>] [--new-pairing]`
 - `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+
+`--new-pairing` clears all stored paired tokens and forces generation of a fresh pairing code on gateway startup.
 
 ### `estop`
 
@@ -123,6 +125,10 @@ Notes:
 - `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
 - `zeroclaw doctor traces --id <TRACE_ID>`
 
+Provider connectivity matrix CI/local helper:
+
+- `python3 scripts/ci/provider_connectivity_matrix.py --binary target/release-fast/zeroclaw --contract .github/connectivity/probe-contract.json`
+
 `doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
@@ -134,13 +140,39 @@ Notes:
 - `zeroclaw channel add <type> <json>`
 - `zeroclaw channel remove <name>`
 
-Runtime in-chat commands (Telegram/Discord while channel server is running):
+Runtime in-chat commands while channel server is running:
 
-- `/models`
-- `/models <provider>`
-- `/model`
-- `/model <model-id>`
-- `/new`
+- Telegram/Discord sender-session routing:
+  - `/models`
+  - `/models <provider>`
+  - `/model`
+  - `/model <model-id>`
+  - `/new`
+- Supervised tool approvals (all non-CLI channels):
+  - `/approve-request <tool-name>` (create pending approval request)
+  - `/approve-confirm <request-id>` (confirm pending request; same sender + same chat/channel only)
+  - `/approve-pending` (list pending requests in current sender+chat/channel scope)
+  - `/approve <tool-name>` (direct one-step grant + persist to `autonomy.auto_approve`, compatibility path)
+  - `/unapprove <tool-name>` (revoke + remove from `autonomy.auto_approve`)
+  - `/approvals` (show runtime + persisted approval state)
+  - Natural-language approval behavior is controlled by `[autonomy].non_cli_natural_language_approval_mode`:
+    - `direct` (default): `授权工具 shell` / `approve tool shell` immediately grants
+    - `request_confirm`: natural-language approval creates pending request, then confirm with request ID
+    - `disabled`: natural-language approval commands are ignored (slash commands only)
+  - Optional per-channel override: `[autonomy].non_cli_natural_language_approval_mode_by_channel`
+
+Approval safety behavior:
+
+- Runtime approval commands are parsed and executed **before** LLM inference in the channel loop.
+- Pending requests are sender+chat/channel scoped and expire automatically.
+- Confirmation requires the same sender in the same chat/channel that created the request.
+- Once approved and persisted, the tool remains approved across restarts until revoked.
+- Optional policy gate: `[autonomy].non_cli_approval_approvers` can restrict who may execute approval-management commands.
+
+Startup behavior for multiple channels:
+- `zeroclaw channel start` starts all configured channels in one process.
+- If one channel fails initialization, other channels continue to start.
+- If all configured channels fail initialization, startup exits with an error.
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`

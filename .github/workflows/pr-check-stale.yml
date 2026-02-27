@@ -7,12 +7,17 @@ on:
 
 permissions: {}
 
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
 jobs:
     stale:
         permissions:
             issues: write
             pull-requests: write
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         steps:
             - name: Mark stale issues and pull requests
               uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0

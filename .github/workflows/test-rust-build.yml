@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   run:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, aws-india]
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout repository
@@ -53,7 +53,7 @@ jobs:
 
       - name: Restore Rust cache
         if: inputs.use_cache
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
 
       - name: Run command
         shell: bash

@@ -52,12 +52,15 @@ permissions:
     contents: read
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
     resolve-profile:
         name: Resolve Matrix Profile
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         outputs:
             profile: ${{ steps.resolve.outputs.profile }}
             lane_job_prefix: ${{ steps.resolve.outputs.lane_job_prefix }}
@@ -129,7 +132,7 @@ jobs:
     feature-check:
         name: ${{ needs.resolve-profile.outputs.lane_job_prefix }} (${{ matrix.name }})
         needs: [resolve-profile]
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: ${{ fromJSON(needs.resolve-profile.outputs.lane_timeout_minutes) }}
         strategy:
             fail-fast: false
@@ -160,15 +163,35 @@ jobs:
               with:
                   toolchain: 1.92.0
 
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
               with:
                   prefix-key: feature-matrix-${{ matrix.name }}
 
-            - name: Install Linux deps for all-features lane
+            - name: Ensure Linux deps for all-features lane
               if: matrix.install_libudev
+              shell: bash
               run: |
-                  sudo apt-get update -qq
-                  sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+                  set -euo pipefail
+
+                  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libudev; then
+                    echo "libudev development headers already available; skipping apt install."
+                    exit 0
+                  fi
+
+                  echo "Installing missing libudev build dependencies..."
+                  for attempt in 1 2 3; do
+                    if sudo apt-get update -qq -o DPkg::Lock::Timeout=300 && \
+                       sudo apt-get install -y --no-install-recommends --no-upgrade -o DPkg::Lock::Timeout=300 libudev-dev pkg-config; then
+                      echo "Dependency installation succeeded on attempt ${attempt}."
+                      exit 0
+                    fi
+                    if [ "$attempt" -eq 3 ]; then
+                      echo "Failed to install libudev-dev/pkg-config after ${attempt} attempts." >&2
+                      exit 1
+                    fi
+                    echo "Dependency installation failed on attempt ${attempt}; retrying in 10s..."
+                    sleep 10
+                  done
 
             - name: Run matrix lane command
               id: lane
@@ -262,7 +285,7 @@ jobs:
         name: ${{ needs.resolve-profile.outputs.summary_job_name }}
         needs: [resolve-profile, feature-check]
         if: always()
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

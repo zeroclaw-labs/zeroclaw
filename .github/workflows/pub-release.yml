@@ -39,12 +39,15 @@ permissions:
     id-token: write # Required for cosign keyless signing via OIDC
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
     prepare:
         name: Prepare Release Context
-        runs-on: self-hosted
+        runs-on: [self-hosted, aws-india]
         outputs:
             release_ref: ${{ steps.vars.outputs.release_ref }}
             release_tag: ${{ steps.vars.outputs.release_tag }}
@@ -60,7 +63,6 @@ jobs:
                   event_name="${GITHUB_EVENT_NAME}"
                   publish_release="false"
                   draft_release="false"
-                  semver_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
 
                   if [[ "$event_name" == "push" ]]; then
                     release_ref="${GITHUB_REF_NAME}"
@@ -87,41 +89,6 @@ jobs:
                     release_tag="verify-${GITHUB_SHA::12}"
                   fi
 
-                  if [[ "$publish_release" == "true" ]]; then
-                    if [[ ! "$release_tag" =~ $semver_pattern ]]; then
-                      echo "::error::release_tag must match semver-like format (vX.Y.Z[-suffix])"
-                      exit 1
-                    fi
-                    if ! git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${release_tag}" >/dev/null; then
-                      echo "::error::Tag ${release_tag} does not exist on origin. Push the tag first, then rerun manual publish."
-                      exit 1
-                    fi
-
-                    # Guardrail: release tags must resolve to commits already reachable from main.
-                    tmp_repo="$(mktemp -d)"
-                    trap 'rm -rf "$tmp_repo"' EXIT
-                    git -C "$tmp_repo" init -q
-                    git -C "$tmp_repo" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-                    git -C "$tmp_repo" fetch --quiet --filter=blob:none origin main "refs/tags/${release_tag}:refs/tags/${release_tag}"
-                    if ! git -C "$tmp_repo" merge-base --is-ancestor "refs/tags/${release_tag}" "origin/main"; then
-                      echo "::error::Tag ${release_tag} is not reachable from origin/main. Release tags must be cut from main."
-                      exit 1
-                    fi
-
-                    # Guardrail: release tag and Cargo package version must stay aligned.
-                    tag_version="${release_tag#v}"
-                    cargo_version="$(git -C "$tmp_repo" show "refs/tags/${release_tag}:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n1)"
-                    if [[ -z "$cargo_version" ]]; then
-                      echo "::error::Unable to read Cargo package version from ${release_tag}:Cargo.toml"
-                      exit 1
-                    fi
-                    if [[ "$cargo_version" != "$tag_version" ]]; then
-                      echo "::error::Tag ${release_tag} does not match Cargo.toml version (${cargo_version})."
-                      echo "::error::Bump Cargo.toml version first, then create/publish the matching tag."
-                      exit 1
-                    fi
-                  fi
-
                   {
                     echo "release_ref=${release_ref}"
                     echo "release_tag=${release_tag}"
@@ -138,6 +105,60 @@ jobs:
                     echo "- draft_release: ${draft_release}"
                   } >> "$GITHUB_STEP_SUMMARY"
 
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Validate release trigger and authorization guard
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/release_trigger_guard.py \
+                    --repo-root . \
+                    --repository "${GITHUB_REPOSITORY}" \
+                    --event-name "${GITHUB_EVENT_NAME}" \
+                    --actor "${GITHUB_ACTOR}" \
+                    --release-ref "${{ steps.vars.outputs.release_ref }}" \
+                    --release-tag "${{ steps.vars.outputs.release_tag }}" \
+                    --publish-release "${{ steps.vars.outputs.publish_release }}" \
+                    --authorized-actors "${{ vars.RELEASE_AUTHORIZED_ACTORS || 'willsarg,theonlyhennygod,chumyin' }}" \
+                    --authorized-tagger-emails "${{ vars.RELEASE_AUTHORIZED_TAGGER_EMAILS || '' }}" \
+                    --require-annotated-tag true \
+                    --output-json artifacts/release-trigger-guard.json \
+                    --output-md artifacts/release-trigger-guard.md \
+                    --fail-on-violation
+
+            - name: Emit release trigger audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type release_trigger_guard \
+                    --input-json artifacts/release-trigger-guard.json \
+                    --output-json artifacts/audit-event-release-trigger-guard.json \
+                    --artifact-name release-trigger-guard \
+                    --retention-days 30
+
+            - name: Publish release trigger guard summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-trigger-guard.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload release trigger guard artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: release-trigger-guard
+                  path: |
+                      artifacts/release-trigger-guard.json
+                      artifacts/release-trigger-guard.md
+                      artifacts/audit-event-release-trigger-guard.json
+                  if-no-files-found: error
+                  retention-days: 30
+
     build-release:
         name: Build ${{ matrix.target }}
         needs: [prepare]
@@ -147,28 +168,46 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - os: ubuntu-latest
+                    # Keep GNU Linux release artifacts on Ubuntu 22.04 to preserve
+                    # a broadly compatible GLIBC baseline for user distributions.
+                    - os: ubuntu-22.04
                       target: x86_64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: ubuntu-latest
+                    - os: self-hosted
+                      target: x86_64-unknown-linux-musl
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      cross_compiler: ""
+                      linker_env: ""
+                      linker: ""
+                      use_cross: true
+                    - os: ubuntu-22.04
                       target: aarch64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-aarch64-linux-gnu
                       linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
                       linker: aarch64-linux-gnu-gcc
-                    - os: ubuntu-latest
+                    - os: self-hosted
+                      target: aarch64-unknown-linux-musl
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      cross_compiler: ""
+                      linker_env: ""
+                      linker: ""
+                      use_cross: true
+                    - os: ubuntu-22.04
                       target: armv7-unknown-linux-gnueabihf
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-arm-linux-gnueabihf
                       linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
                       linker: arm-linux-gnueabihf-gcc
-                    - os: ubuntu-latest
+                    - os: self-hosted
                       target: armv7-linux-androideabi
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -177,7 +216,7 @@ jobs:
                       linker: ""
                       android_ndk: true
                       android_api: 21
-                    - os: ubuntu-latest
+                    - os: self-hosted
                       target: aarch64-linux-android
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -186,6 +225,14 @@ jobs:
                       linker: ""
                       android_ndk: true
                       android_api: 21
+                    - os: self-hosted
+                      target: x86_64-unknown-freebsd
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      cross_compiler: ""
+                      linker_env: ""
+                      linker: ""
+                      use_cross: true
                     - os: macos-15-intel
                       target: x86_64-apple-darwin
                       artifact: zeroclaw
@@ -221,16 +268,16 @@ jobs:
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
               if: runner.os != 'Windows'
 
+            - name: Install cross for cross-built targets
+              if: matrix.use_cross
+              run: |
+                  cargo install cross --git https://github.com/cross-rs/cross
+
             - name: Install cross-compilation toolchain (Linux)
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
               run: |
-                  if command -v sudo >/dev/null 2>&1; then
-                    sudo apt-get update -qq
-                    sudo apt-get install -y ${{ matrix.cross_compiler }}
-                  else
-                    apt-get update -qq
-                    apt-get install -y ${{ matrix.cross_compiler }}
-                  fi
+                  sudo apt-get update -qq
+                  sudo apt-get install -y "${{ matrix.cross_compiler }}"
 
             - name: Setup Android NDK
               if: matrix.android_ndk
@@ -243,13 +290,8 @@ jobs:
                   NDK_ROOT="${RUNNER_TEMP}/android-ndk"
                   NDK_HOME="${NDK_ROOT}/android-ndk-${NDK_VERSION}"
 
-                  if command -v sudo >/dev/null 2>&1; then
-                    sudo apt-get update -qq
-                    sudo apt-get install -y unzip
-                  else
-                    apt-get update -qq
-                    apt-get install -y unzip
-                  fi
+                  sudo apt-get update -qq
+                  sudo apt-get install -y unzip
 
                   mkdir -p "${NDK_ROOT}"
                   curl -fsSL "${NDK_URL}" -o "${RUNNER_TEMP}/${NDK_ZIP}"
@@ -305,12 +347,18 @@ jobs:
               env:
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
+                  USE_CROSS: ${{ matrix.use_cross }}
               run: |
                   if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
                   fi
-                  cargo build --profile release-fast --locked --target ${{ matrix.target }}
+                  if [ "$USE_CROSS" = "true" ]; then
+                    echo "Using cross for MUSL target"
+                    cross build --profile release-fast --locked --target ${{ matrix.target }}
+                  else
+                    cargo build --profile release-fast --locked --target ${{ matrix.target }}
+                  fi
 
             - name: Check binary size (Unix)
               if: runner.os != 'Windows'
@@ -338,47 +386,68 @@ jobs:
     verify-artifacts:
         name: Verify Artifact Set
         needs: [prepare, build-release]
-        runs-on: self-hosted
+        runs-on: [self-hosted, aws-india]
         steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ needs.prepare.outputs.release_ref }}
+
             - name: Download all artifacts
               uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
               with:
                   path: artifacts
 
-            - name: Validate expected archives
+            - name: Validate release archive contract (verify stage)
               shell: bash
               run: |
                   set -euo pipefail
-                  expected=(
-                    "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
-                    "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
-                    "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
-                    "zeroclaw-armv7-linux-androideabi.tar.gz"
-                    "zeroclaw-aarch64-linux-android.tar.gz"
-                    "zeroclaw-x86_64-apple-darwin.tar.gz"
-                    "zeroclaw-aarch64-apple-darwin.tar.gz"
-                    "zeroclaw-x86_64-pc-windows-msvc.zip"
-                  )
+                  python3 scripts/ci/release_artifact_guard.py \
+                    --artifacts-dir artifacts \
+                    --contract-file .github/release/release-artifact-contract.json \
+                    --output-json artifacts/release-artifact-guard.verify.json \
+                    --output-md artifacts/release-artifact-guard.verify.md \
+                    --allow-extra-archives \
+                    --skip-manifest-files \
+                    --skip-sbom-files \
+                    --skip-notice-files \
+                    --fail-on-violation
 
-                  missing=0
-                  for file in "${expected[@]}"; do
-                    if ! find artifacts -type f -name "$file" -print -quit | grep -q .; then
-                      echo "::error::Missing release archive: $file"
-                      missing=1
-                    fi
-                  done
+            - name: Emit verify-stage artifact guard audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type release_artifact_guard_verify \
+                    --input-json artifacts/release-artifact-guard.verify.json \
+                    --output-json artifacts/audit-event-release-artifact-guard-verify.json \
+                    --artifact-name release-artifact-guard-verify \
+                    --retention-days 21
 
-                  if [ "$missing" -ne 0 ]; then
-                    exit 1
-                  fi
+            - name: Publish verify-stage artifact guard summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-artifact-guard.verify.md >> "$GITHUB_STEP_SUMMARY"
 
-                  echo "All expected release archives are present."
+            - name: Upload verify-stage artifact guard reports
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: release-artifact-guard-verify
+                  path: |
+                      artifacts/release-artifact-guard.verify.json
+                      artifacts/release-artifact-guard.verify.md
+                      artifacts/audit-event-release-artifact-guard-verify.json
+                  if-no-files-found: error
+                  retention-days: 21
 
     publish:
         name: Publish Release
         if: needs.prepare.outputs.publish_release == 'true'
         needs: [prepare, verify-artifacts]
-        runs-on: self-hosted
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -391,8 +460,12 @@ jobs:
                   path: artifacts
 
             - name: Install syft
+              shell: bash
               run: |
-                  curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+                  set -euo pipefail
+                  mkdir -p "${RUNNER_TEMP}/bin"
+                  ./scripts/ci/install_syft.sh "${RUNNER_TEMP}/bin"
+                  echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
             - name: Generate SBOM (CycloneDX)
               run: |
@@ -409,12 +482,80 @@ jobs:
                   cp LICENSE-MIT artifacts/LICENSE-MIT
                   cp NOTICE artifacts/NOTICE
 
-            - name: Generate SHA256 checksums
+            - name: Generate release manifest + checksums
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
               run: |
-                  cd artifacts
-                  find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.cdx.json' -o -name '*.spdx.json' -o -name 'LICENSE-APACHE' -o -name 'LICENSE-MIT' -o -name 'NOTICE' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
-                  echo "Generated checksums:"
-                  cat SHA256SUMS
+                  set -euo pipefail
+                  python3 scripts/ci/release_manifest.py \
+                    --artifacts-dir artifacts \
+                    --release-tag "${RELEASE_TAG}" \
+                    --output-json artifacts/release-manifest.json \
+                    --output-md artifacts/release-manifest.md \
+                    --checksums-path artifacts/SHA256SUMS \
+                    --fail-empty
+
+            - name: Generate SHA256SUMS provenance statement
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/generate_provenance.py \
+                    --artifact artifacts/SHA256SUMS \
+                    --subject-name "zeroclaw-${RELEASE_TAG}-sha256sums" \
+                    --output artifacts/zeroclaw.sha256sums.intoto.json
+
+            - name: Emit SHA256SUMS provenance audit event
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type release_sha256sums_provenance \
+                    --input-json artifacts/zeroclaw.sha256sums.intoto.json \
+                    --output-json artifacts/audit-event-release-sha256sums-provenance.json \
+                    --artifact-name release-sha256sums-provenance \
+                    --retention-days 30
+
+            - name: Validate release artifact contract (publish stage)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/release_artifact_guard.py \
+                    --artifacts-dir artifacts \
+                    --contract-file .github/release/release-artifact-contract.json \
+                    --output-json artifacts/release-artifact-guard.publish.json \
+                    --output-md artifacts/release-artifact-guard.publish.md \
+                    --allow-extra-archives \
+                    --allow-extra-manifest-files \
+                    --allow-extra-sbom-files \
+                    --allow-extra-notice-files \
+                    --fail-on-violation
+
+            - name: Emit publish-stage artifact guard audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type release_artifact_guard_publish \
+                    --input-json artifacts/release-artifact-guard.publish.json \
+                    --output-json artifacts/audit-event-release-artifact-guard-publish.json \
+                    --artifact-name release-artifact-guard-publish \
+                    --retention-days 30
+
+            - name: Publish artifact guard summary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-artifact-guard.publish.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Publish release manifest summary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-manifest.md >> "$GITHUB_STEP_SUMMARY"
 
             - name: Install cosign
               uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
@@ -430,6 +571,26 @@ jobs:
                       --output-certificate="${file}.pem" \
                       "$file"
                   done < <(find artifacts -type f ! -name '*.sig' ! -name '*.pem' ! -name '*.sigstore.json' -print0)
+
+            - name: Compose release-notes supply-chain references
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/release_notes_with_supply_chain_refs.py \
+                    --artifacts-dir artifacts \
+                    --repository "${GITHUB_REPOSITORY}" \
+                    --release-tag "${RELEASE_TAG}" \
+                    --output-json artifacts/release-notes-supply-chain.json \
+                    --output-md artifacts/release-notes-supply-chain.md \
+                    --fail-on-missing
+
+            - name: Publish release-notes supply-chain summary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/release-notes-supply-chain.md >> "$GITHUB_STEP_SUMMARY"
 
             - name: Verify GHCR release tag availability
               shell: bash
@@ -476,6 +637,7 @@ jobs:
               with:
                   tag_name: ${{ needs.prepare.outputs.release_tag }}
                   draft: ${{ needs.prepare.outputs.draft_release == 'true' }}
+                  body_path: artifacts/release-notes-supply-chain.md
                   generate_release_notes: true
                   files: |
                       artifacts/**/*

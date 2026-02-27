@@ -41,10 +41,16 @@ concurrency:
 permissions:
     contents: read
 
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
 jobs:
     audit:
         name: CI Change Audit
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 15
         steps:
             - name: Checkout
@@ -59,7 +65,13 @@ jobs:
                   set -euo pipefail
                   head_sha="$(git rev-parse HEAD)"
                   if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-                    base_sha="${{ github.event.pull_request.base.sha }}"
+                    # For pull_request events, checkout uses refs/pull/*/merge; HEAD^1 is the
+                    # effective base commit for this synthesized merge and avoids stale base.sha.
+                    if git rev-parse --verify HEAD^1 >/dev/null 2>&1; then
+                      base_sha="$(git rev-parse HEAD^1)"
+                    else
+                      base_sha="${{ github.event.pull_request.base.sha }}"
+                    fi
                   elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
                     base_sha="${{ github.event.before }}"
                   else
