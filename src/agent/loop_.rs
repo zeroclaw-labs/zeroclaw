@@ -59,6 +59,20 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
+    if provider.supports_vision() {
+        return true;
+    }
+
+    // Guardrail for issue #2107: some anthropic setups have reported false
+    // negatives from provider capability probing even though Claude models
+    // accept image inputs. Keep the preflight permissive for anthropic routes
+    // and rely on upstream API validation if a specific model cannot handle
+    // vision.
+    let normalized = provider_name.trim().to_ascii_lowercase();
+    normalized == "anthropic" || normalized.starts_with("anthropic-custom:")
+}
+
 /// Slash-command definitions for interactive-mode completion.
 /// Each entry: (trigger aliases, display label, description).
 const SLASH_COMMANDS: &[(&[&str], &str, &str)] = &[
@@ -726,7 +740,9 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
+        let provider_supports_vision =
+            should_treat_provider_as_vision_capable(provider_name, provider);
+        if image_marker_count > 0 && !provider_supports_vision {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
                 capability: "vision".to_string(),
@@ -2579,6 +2595,39 @@ mod tests {
         assert!(err.to_string().contains("provider_capability_error"));
         assert!(err.to_string().contains("capability=vision"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_anthropic_route_on_vision_probe_false_negative() {
+        let provider = ScriptedProvider::from_text_responses(vec!["vision-ok"]);
+        let mut history = vec![ChatMessage::user(
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "anthropic",
+            "opus-4-6",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("anthropic route should not fail on a false-negative vision capability probe");
+
+        assert_eq!(result, "vision-ok");
     }
 
     #[tokio::test]
