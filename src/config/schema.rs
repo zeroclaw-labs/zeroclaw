@@ -697,6 +697,10 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).
+    /// Default: `false` (secure by default).
+    #[serde(default)]
+    pub allow_scripts: bool,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -6207,6 +6211,19 @@ impl Config {
             }
         }
 
+        // Skills script-file audit override: ZEROCLAW_SKILLS_ALLOW_SCRIPTS
+        if let Ok(flag) = std::env::var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") {
+            if !flag.trim().is_empty() {
+                match flag.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.skills.allow_scripts = true,
+                    "0" | "false" | "no" | "off" => self.skills.allow_scripts = false,
+                    _ => tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_SKILLS_ALLOW_SCRIPTS (valid: 1|0|true|false|yes|no|on|off)"
+                    ),
+                }
+            }
+        }
+
         // Skills prompt mode override: ZEROCLAW_SKILLS_PROMPT_MODE
         if let Ok(mode) = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE") {
             if !mode.trim().is_empty() {
@@ -6656,6 +6673,7 @@ mod tests {
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
+        assert!(!c.skills.allow_scripts);
         assert_eq!(
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
@@ -8667,6 +8685,7 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         assert!(!config.skills.open_skills_enabled);
+        assert!(!config.skills.allow_scripts);
         assert!(config.skills.open_skills_dir.is_none());
         assert_eq!(
             config.skills.prompt_injection_mode,
@@ -8675,10 +8694,12 @@ requires_openai_auth = true
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "yes");
         std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert!(config.skills.allow_scripts);
         assert_eq!(
             config.skills.open_skills_dir.as_deref(),
             Some("/tmp/open-skills")
@@ -8690,6 +8711,7 @@ requires_openai_auth = true
 
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
         std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
@@ -8698,18 +8720,22 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
+        config.skills.allow_scripts = true;
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "maybe");
         std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert!(config.skills.allow_scripts);
         assert_eq!(
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
         std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
