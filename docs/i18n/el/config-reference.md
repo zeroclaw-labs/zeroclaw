@@ -18,6 +18,24 @@
 | `default_model` | Ποιο συγκεκριμένο μοντέλο AI χρησιμοποιείτε (π.χ. `gpt-4o`). |
 | `default_temperature` | Πόσο "δημιουργική" θα είναι η AI (τιμή από 0 έως 2). |
 
+## Ρυθμίσεις Web Search (`[web_search]`)
+
+| Ρύθμιση | Τι ορίζει |
+|---|---|
+| `enabled` | Ενεργοποιεί το `web_search_tool`. |
+| `provider` | Backend αναζήτησης: `duckduckgo`, `brave`, `exa`, `tavily`, `firecrawl`. |
+| `api_key` | Κοινό API key για `exa`, `tavily`, `firecrawl` (fallback για `brave`). |
+| `api_url` | Προαιρετικό override του API endpoint. |
+| `brave_api_key` | Ξεχωριστό key για Brave όταν `provider = "brave"`. |
+| `max_results` | Μέγιστος αριθμός αποτελεσμάτων (1-10). |
+| `timeout_secs` | Timeout αιτήματος σε δευτερόλεπτα. |
+| `user_agent` | User-Agent για outbound αναζητήσεις. |
+
+Σημειώσεις:
+
+- Αν το DuckDuckGo γυρίζει `403`/`429`, αλλάξτε provider σε `brave`, `exa`, `tavily` ή `firecrawl`.
+- Το `web_search` βρίσκει URLs· χρησιμοποιήστε `web_fetch` για ανάγνωση περιεχομένου σελίδας.
+
 ## 1. Συμπεριφορά της AI (Agent)
 
 - `max_tool_iterations`: Πόσες φορές μπορεί η AI να χρησιμοποιήσει εργαλεία για να απαντήσει σε 1 μήνυμα (προεπιλογή: 10).

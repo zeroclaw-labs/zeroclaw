@@ -270,6 +270,24 @@ Lưu ý:
 - Mặc định từ chối tất cả: nếu `allowed_domains` rỗng, mọi yêu cầu HTTP bị từ chối.
 - Dùng khớp tên miền chính xác hoặc subdomain (ví dụ `"api.example.com"`, `"example.com"`).
 
+## `[web_search]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật `web_search_tool` |
+| `provider` | `duckduckgo` | Backend tìm kiếm: `duckduckgo`, `brave`, `exa`, `tavily`, `firecrawl` |
+| `api_key` | chưa đặt | API key dùng chung (bắt buộc cho `exa`, `tavily`, `firecrawl`; dự phòng cho `brave`) |
+| `api_url` | chưa đặt | Ghi đè URL API (tùy chọn) |
+| `brave_api_key` | chưa đặt | API key riêng cho Brave (bắt buộc khi `provider = "brave"` nếu không đặt `api_key`) |
+| `max_results` | `5` | Số kết quả trả về tối đa (giới hạn 1-10) |
+| `timeout_secs` | `15` | Thời gian chờ request (giây) |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent gửi kèm request tìm kiếm |
+
+Lưu ý:
+
+- Nếu DuckDuckGo trả `403`/`429` trên mạng/proxy của bạn, hãy chuyển sang `brave`, `exa`, `tavily` hoặc `firecrawl`.
+- `web_search` dùng để tìm URL nguồn; kết hợp thêm `web_fetch` để đọc nội dung trang.
+
 ## `[gateway]`
 
 | Khóa | Mặc định | Mục đích |

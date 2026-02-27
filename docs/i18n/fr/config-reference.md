@@ -21,3 +21,4 @@ Source anglaise:
 
 - Ajout de `provider.reasoning_level` (OpenAI Codex `/responses`). Voir la source anglaise pour les détails.
 - Valeur par défaut de `agent.max_tool_iterations` augmentée à `20` (fallback sûr si `0`).
+- `web_search.provider` prend aussi en charge `exa` et `tavily` (voir la section anglaise `[web_search]`).

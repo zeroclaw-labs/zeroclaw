@@ -67,6 +67,50 @@ zeroclaw doctor
 - `[gateway].host` (Προεπιλογή: `127.0.0.1`)
 - `[gateway].port` (Προεπιλογή: `42617`)
 
+### Σφάλμα `web_search_tool` με `403`/`429`
+
+**Σύμπτωμα**: Εμφανίζεται μήνυμα όπως `DuckDuckGo search failed with status: 403` (ή `429`).
+
+**Αιτία**: Κάποια δίκτυα/proxy μπλοκάρουν το DuckDuckGo HTML endpoint.
+
+**Λύσεις**:
+
+1. Χρήση Brave:
+```toml
+[web_search]
+enabled = true
+provider = "brave"
+brave_api_key = "<SECRET>"
+```
+
+1. Χρήση Exa:
+```toml
+[web_search]
+enabled = true
+provider = "exa"
+api_key = "<SECRET>"
+# προαιρετικό
+# api_url = "https://api.exa.ai/search"
+```
+
+1. Χρήση Tavily:
+```toml
+[web_search]
+enabled = true
+provider = "tavily"
+api_key = "<SECRET>"
+# προαιρετικό
+# api_url = "https://api.tavily.com/search"
+```
+
+1. Χρήση Firecrawl (αν υποστηρίζεται στο build):
+```toml
+[web_search]
+enabled = true
+provider = "firecrawl"
+api_key = "<SECRET>"
+```
+
 ---
 
 ## 3. Κανάλια Επικοινωνίας (Channels)

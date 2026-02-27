@@ -151,6 +151,60 @@ Xác minh `~/.zeroclaw/config.toml`:
 - `[gateway].port` (mặc định `3000`)
 - `allow_public_bind` chỉ bật khi cố ý mở truy cập LAN/public
 
+### `web_search_tool` lỗi `403`/`429`
+
+Triệu chứng:
+
+- Tool trả về lỗi `DuckDuckGo search failed with status: 403` (hoặc `429`)
+
+Nguyên nhân:
+
+- Một số mạng/proxy/rate-limit chặn endpoint HTML của DuckDuckGo.
+
+Cách khắc phục:
+
+1. Dùng Brave (phù hợp khi đã dùng `brave_api_key`):
+
+```toml
+[web_search]
+enabled = true
+provider = "brave"
+brave_api_key = "<SECRET>"
+```
+
+1. Dùng Exa:
+
+```toml
+[web_search]
+enabled = true
+provider = "exa"
+api_key = "<SECRET>"
+# tùy chọn
+# api_url = "https://api.exa.ai/search"
+```
+
+1. Dùng Tavily:
+
+```toml
+[web_search]
+enabled = true
+provider = "tavily"
+api_key = "<SECRET>"
+# tùy chọn
+# api_url = "https://api.tavily.com/search"
+```
+
+1. Dùng Firecrawl (nếu bản build có hỗ trợ):
+
+```toml
+[web_search]
+enabled = true
+provider = "firecrawl"
+api_key = "<SECRET>"
+```
+
+1. Giữ DuckDuckGo để tìm URL, sau đó dùng `web_fetch` để đọc nội dung trang.
+
 ### Lỗi ghép nối / xác thực webhook
 
 Kiểm tra:

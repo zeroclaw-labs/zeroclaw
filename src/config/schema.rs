@@ -1368,10 +1368,10 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo", "brave", "exa", "tavily", or "firecrawl"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
-    /// Generic provider API key (used by firecrawl and as fallback for brave)
+    /// Generic provider API key (used by exa/tavily/firecrawl and as fallback for brave)
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
@@ -5467,6 +5467,12 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
+                &mut config.web_search.api_key,
+                "config.web_search.api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
@@ -6297,6 +6303,12 @@ impl Config {
             &store,
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.api_key,
+            "config.web_search.api_key",
         )?;
 
         encrypt_optional_secret(
@@ -7307,6 +7319,7 @@ tool_dispatcher = "xml"
         config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
         config.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
+        config.web_search.api_key = Some("web-search-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
@@ -7390,6 +7403,15 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
+        );
+
+        let web_search_api_key_encrypted = stored.web_search.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            web_search_api_key_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(web_search_api_key_encrypted).unwrap(),
+            "web-search-credential"
         );
 
         let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();

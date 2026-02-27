@@ -2,12 +2,13 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use regex::Regex;
+use reqwest::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports providers: DuckDuckGo (free), Brave, Firecrawl.
+/// Supports providers: DuckDuckGo (free), Brave, Exa, Tavily, Firecrawl.
 pub struct WebSearchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
@@ -19,6 +20,18 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
+    fn duckduckgo_status_hint(status: StatusCode) -> &'static str {
+        match status {
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => {
+                " DuckDuckGo may be blocking this network. Try [web_search].provider = \"brave\", \"exa\", \"tavily\", or \"firecrawl\"."
+            }
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => {
+                " DuckDuckGo may be temporarily unavailable. Retry later or switch providers."
+            }
+            _ => "",
+        }
+    }
+
     pub fn new(
         security: Arc<SecurityPolicy>,
         provider: String,
@@ -48,7 +61,11 @@ impl WebSearchTool {
             .user_agent(self.user_agent.as_str())
             .build()?;
 
-        let response = client.get(&search_url).send().await?;
+        let response = client.get(&search_url).send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "DuckDuckGo search request failed: {e}. Check outbound network/proxy settings, or switch [web_search].provider to \"brave\"/\"exa\"/\"tavily\"/\"firecrawl\"."
+            )
+        })?;
 
         if !response.status().is_success() {
             anyhow::bail!(
@@ -163,6 +180,208 @@ impl WebSearchTool {
             let description = result
                 .get("description")
                 .and_then(|d| d.as_str())
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !description.is_empty() {
+                lines.push(format!("   {}", description));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn search_exa(&self, query: &str) -> anyhow::Result<String> {
+        let auth_token = match self.api_key.as_ref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim(),
+            _ => anyhow::bail!(
+                "web_search provider 'exa' requires [web_search].api_key in config.toml"
+            ),
+        };
+
+        let endpoint = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.exa.ai/search");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
+            .build()?;
+
+        let response = client
+            .post(endpoint)
+            .header("x-api-key", auth_token)
+            .json(&json!({
+                "query": query,
+                "numResults": self.max_results,
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Exa search failed: {e}"))?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Exa search failed with status: {}", status.as_u16());
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid Exa response JSON: {e}"))?;
+        self.parse_exa_results(&parsed, query)
+    }
+
+    fn parse_exa_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Exa API response"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Exa)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("No title");
+            let url = result
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let description = result
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    result
+                        .get("snippet")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .or_else(|| {
+                    result
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .or_else(|| {
+                    result
+                        .get("highlights")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|values| {
+                            values.iter().find_map(|value| {
+                                value
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|entry| !entry.is_empty())
+                            })
+                        })
+                })
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !description.is_empty() {
+                lines.push(format!("   {}", description));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
+        let auth_token = match self.api_key.as_ref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim(),
+            _ => {
+                anyhow::bail!(
+                    "web_search provider 'tavily' requires [web_search].api_key in config.toml"
+                );
+            }
+        };
+
+        let endpoint = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.tavily.com/search");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
+            .build()?;
+
+        let response = client
+            .post(endpoint)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {auth_token}"),
+            )
+            .json(&json!({
+                "query": query,
+                "max_results": self.max_results,
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Tavily search failed: {e}"))?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Tavily search failed with status: {}", status.as_u16());
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid Tavily response JSON: {e}"))?;
+        self.parse_tavily_results(&parsed, query)
+    }
+
+    fn parse_tavily_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Tavily API response"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Tavily)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("No title");
+            let url = result
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let description = result
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    result
+                        .get("raw_content")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                })
                 .unwrap_or("");
 
             lines.push(format!("{}. {}", i + 1, title));
@@ -350,9 +569,11 @@ impl Tool for WebSearchTool {
         let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
+            "exa" => self.search_exa(query).await?,
+            "tavily" => self.search_tavily(query).await?,
             "firecrawl" => self.search_firecrawl(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo', 'brave', or 'firecrawl' in config.toml",
+                "Unknown search provider: '{}'. Set [web_search].provider to 'duckduckgo', 'brave', 'exa', 'tavily', or 'firecrawl' in config.toml",
                 self.provider
             ),
         };
@@ -485,6 +706,72 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_exa_results_with_data() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "exa".to_string(),
+            Some("test-key".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = json!({
+            "results": [
+                {
+                    "title": "Exa Result",
+                    "url": "https://example.com/exa",
+                    "text": "Exa summary"
+                }
+            ]
+        });
+        let result = tool.parse_exa_results(&json, "test").unwrap();
+        assert!(result.contains("Exa Result"));
+        assert!(result.contains("https://example.com/exa"));
+        assert!(result.contains("Exa summary"));
+    }
+
+    #[test]
+    fn test_parse_tavily_results_with_data() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("test-key".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = json!({
+            "results": [
+                {
+                    "title": "Tavily Result",
+                    "url": "https://example.com/tavily",
+                    "content": "Tavily snippet"
+                }
+            ]
+        });
+        let result = tool.parse_tavily_results(&json, "test").unwrap();
+        assert!(result.contains("Tavily Result"));
+        assert!(result.contains("https://example.com/tavily"));
+        assert!(result.contains("Tavily snippet"));
+    }
+
+    #[test]
+    fn duckduckgo_status_hint_for_403_mentions_provider_switch() {
+        let hint = WebSearchTool::duckduckgo_status_hint(StatusCode::FORBIDDEN);
+        assert!(hint.contains("provider"));
+        assert!(hint.contains("brave"));
+    }
+
+    #[test]
+    fn duckduckgo_status_hint_for_500_is_empty() {
+        assert!(
+            WebSearchTool::duckduckgo_status_hint(StatusCode::INTERNAL_SERVER_ERROR).is_empty()
+        );
+    }
+
+    #[test]
     fn test_constructor_clamps_web_search_limits() {
         let tool = WebSearchTool::new(
             test_security(),
@@ -547,6 +834,38 @@ mod tests {
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_exa_without_api_key() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "exa".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("api_key"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tavily_without_api_key() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("api_key"));
     }
 
     #[tokio::test]

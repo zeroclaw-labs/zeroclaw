@@ -2982,6 +2982,8 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         let provider_options = vec![
             "DuckDuckGo (free, no API key)",
             "Brave Search (requires API key)",
+            "Exa Search (requires API key)",
+            "Tavily Search (requires API key)",
             #[cfg(feature = "firecrawl")]
             "Firecrawl (requires API key + firecrawl feature)",
         ];
@@ -3001,8 +3003,38 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
                     web_search_config.brave_api_key = Some(key.trim().to_string());
                 }
             }
-            #[cfg(feature = "firecrawl")]
             2 => {
+                web_search_config.provider = "exa".to_string();
+                let key: String = Input::new().with_prompt("  Exa API key").interact_text()?;
+                if !key.trim().is_empty() {
+                    web_search_config.api_key = Some(key.trim().to_string());
+                }
+                let url: String = Input::new()
+                    .with_prompt("  Exa API URL (leave blank for https://api.exa.ai/search)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                if !url.trim().is_empty() {
+                    web_search_config.api_url = Some(url.trim().to_string());
+                }
+            }
+            3 => {
+                web_search_config.provider = "tavily".to_string();
+                let key: String = Input::new()
+                    .with_prompt("  Tavily API key")
+                    .interact_text()?;
+                if !key.trim().is_empty() {
+                    web_search_config.api_key = Some(key.trim().to_string());
+                }
+                let url: String = Input::new()
+                    .with_prompt("  Tavily API URL (leave blank for https://api.tavily.com/search)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                if !url.trim().is_empty() {
+                    web_search_config.api_url = Some(url.trim().to_string());
+                }
+            }
+            #[cfg(feature = "firecrawl")]
+            4 => {
                 web_search_config.provider = "firecrawl".to_string();
                 let key: String = Input::new()
                     .with_prompt("  Firecrawl API key")
