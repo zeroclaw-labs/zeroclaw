@@ -530,19 +530,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|qq| qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook);
 
-    // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            ))
-        });
-
     // Nextcloud Talk webhook secret for signature verification
     // Priority: environment variable > config file
-    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
+    let nextcloud_talk_webhook_secret_raw: Option<String> =
         std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
             .ok()
             .and_then(|secret| {
@@ -561,8 +551,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                             .filter(|secret| !secret.is_empty())
                             .map(ToOwned::to_owned)
                     })
-            })
-            .map(Arc::from);
+            });
+
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> = nextcloud_talk_webhook_secret_raw
+        .clone()
+        .map(Arc::from);
+
+    // Nextcloud Talk channel (if configured)
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            let secret = nextcloud_talk_webhook_secret_raw
+                .unwrap_or_else(|| nc.app_token.clone());
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                secret,
+                nc.allowed_users.clone(),
+            ))
+        });
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -1781,6 +1786,7 @@ async fn handle_nextcloud_talk_webhook(
     };
 
     let body_str = String::from_utf8_lossy(&body);
+    tracing::debug!("Nextcloud Talk webhook received - Headers: {:?}, Body: {}", headers, body_str);
 
     // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
     if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
