@@ -411,6 +411,9 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Research phase settings (`[agent.research]`).
+    #[serde(default)]
+    pub research: ResearchPhaseConfig,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -433,6 +436,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            research: ResearchPhaseConfig::default(),
         }
     }
 }
@@ -2096,6 +2100,10 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
 
+    /// WASM runtime settings (`[runtime.wasm]`).
+    #[serde(default)]
+    pub wasm: WasmRuntimeConfig,
+
     /// Global reasoning override for providers that expose explicit controls.
     /// - `None`: provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
@@ -2175,6 +2183,7 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            wasm: WasmRuntimeConfig::default(),
             reasoning_enabled: None,
         }
     }
@@ -3260,6 +3269,10 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Syscall anomaly detection settings (`[security.syscall_anomaly]`).
+    #[serde(default)]
+    pub syscall_anomaly: SyscallAnomalyConfig,
 }
 
 /// OTP validation strategy.

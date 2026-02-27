@@ -7,6 +7,10 @@
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
+//!
+//! Note: tool execution is currently disabled for WebSocket sessions (no
+//! interactive approval mechanism). tool_call/tool_result frames are reserved
+//! for future use.
 //! ```
 
 use super::AppState;
