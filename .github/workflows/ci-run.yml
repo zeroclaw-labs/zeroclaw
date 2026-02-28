@@ -24,7 +24,7 @@ env:
 jobs:
     changes:
         name: Detect Change Scope
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         outputs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}

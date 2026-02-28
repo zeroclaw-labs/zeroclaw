@@ -50,7 +50,7 @@ env:
 jobs:
     audit:
         name: CI Change Audit
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 15
         steps:
             - name: Checkout
