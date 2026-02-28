@@ -22,6 +22,7 @@ use crate::providers::{
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
     is_zai_cn_alias,
 };
+use crate::security::AutonomyLevel;
 use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -113,7 +114,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let tunnel_config = setup_tunnel()?;
 
     print_step(5, 11, "Tool Mode & Security");
-    let (composio_config, secrets_config) = setup_tool_mode()?;
+    let (composio_config, secrets_config, unrestricted) = setup_tool_mode()?;
 
     print_step(6, 11, "Web & Internet Tools");
     let (web_search_config, web_fetch_config, http_request_config) = setup_web_tools()?;
@@ -141,7 +142,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: if api_key.is_empty() {
@@ -199,10 +200,18 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         wasm: crate::config::WasmConfig::default(),
     };
 
+    if unrestricted {
+        apply_unrestricted_profile(&mut config);
+    }
+
     println!(
-        "  {} Security: {} | workspace-scoped",
+        "  {} Security: {}",
         style("✓").green().bold(),
-        style("Supervised").green()
+        if unrestricted {
+            style("Unrestricted (full autonomy, no blocks, TOTP disabled)").yellow()
+        } else {
+            style("Supervised | workspace-scoped").green()
+        }
     );
     println!(
         "  {} Memory: {} (auto-save: {})",
@@ -428,6 +437,7 @@ pub async fn run_quick_setup(
     memory_backend: Option<&str>,
     force: bool,
     no_totp: bool,
+    unrestricted: bool,
 ) -> Result<Config> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
@@ -440,9 +450,29 @@ pub async fn run_quick_setup(
         memory_backend,
         force,
         no_totp,
+        unrestricted,
         &home,
     )
     .await
+}
+
+/// Apply unrestricted security profile: full autonomy, no command/path blocks, large limits.
+fn apply_unrestricted_profile(config: &mut Config) {
+    config.autonomy = AutonomyConfig {
+        level: AutonomyLevel::Full,
+        workspace_only: false,
+        allowed_commands: vec!["*".into()],
+        forbidden_paths: vec![],
+        max_actions_per_hour: 10_000,
+        max_cost_per_day_cents: 100_000,
+        require_approval_for_medium_risk: false,
+        block_high_risk_commands: false,
+        non_cli_excluded_tools: vec![],
+        ..AutonomyConfig::default()
+    };
+    config.agent.max_tool_iterations = 200;
+    config.security.otp.enabled = false;
+    config.security.syscall_anomaly.enabled = false;
 }
 
 fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
@@ -475,6 +505,7 @@ async fn run_quick_setup_with_home(
     memory_backend: Option<&str>,
     force: bool,
     no_totp: bool,
+    unrestricted: bool,
     home: &Path,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -485,6 +516,41 @@ async fn run_quick_setup_with_home(
             .bold()
     );
     println!();
+
+    if unrestricted {
+        println!(
+            "  {} {}",
+            style("⚠ WARNING:").yellow().bold(),
+            style("--unrestricted mode disables all security guardrails:").yellow()
+        );
+        println!(
+            "    {}",
+            style("• Full autonomy — agent acts without approval").yellow()
+        );
+        println!(
+            "    {}",
+            style("• No command allowlist — any command can be executed").yellow()
+        );
+        println!(
+            "    {}",
+            style("• No forbidden paths — entire filesystem is accessible").yellow()
+        );
+        println!(
+            "    {}",
+            style("• TOTP disabled — no one-time-password protection").yellow()
+        );
+        println!(
+            "    {}",
+            style("• High limits — 10k actions/hour, 200 tool iterations").yellow()
+        );
+        println!(
+            "    {}",
+            style("Only use this for trusted dev/hacking setups. Not recommended for production.")
+                .yellow()
+                .bold()
+        );
+        println!();
+    }
 
     let (zeroclaw_dir, workspace_dir) = resolve_quick_setup_dirs_with_home(home);
     let config_path = zeroclaw_dir.join("config.toml");
@@ -565,6 +631,9 @@ async fn run_quick_setup_with_home(
     if no_totp {
         config.security.otp.enabled = false;
     }
+    if unrestricted {
+        apply_unrestricted_profile(&mut config);
+    }
 
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
@@ -613,7 +682,9 @@ async fn run_quick_setup_with_home(
     println!(
         "  {} Security:   {}",
         style("✓").green().bold(),
-        if no_totp {
+        if unrestricted {
+            style("Unrestricted (full autonomy, no blocks, TOTP disabled)").yellow()
+        } else if no_totp {
             style("Supervised (workspace-scoped), TOTP disabled (--no-totp)").yellow()
         } else {
             style("Supervised (workspace-scoped), TOTP enabled").green()
@@ -3204,7 +3275,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
 
-fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
+fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig, bool)> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
     println!();
@@ -3289,7 +3360,88 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         );
     }
 
-    Ok((composio_config, secrets_config))
+    // ── Security profile ──
+    println!();
+    print_bullet("Choose a security profile for autonomy and risk controls.");
+
+    let profile_options = vec![
+        "Supervised (default) — workspace-scoped, command allowlist, risk gates",
+        "Unrestricted — full autonomy, no command/path blocks, large tool limit",
+    ];
+
+    let profile_choice = Select::new()
+        .with_prompt("  Security profile")
+        .items(&profile_options)
+        .default(0)
+        .interact()?;
+
+    let unrestricted = if profile_choice == 1 {
+        println!();
+        println!(
+            "  {} {}",
+            style("⚠ WARNING:").yellow().bold(),
+            style("Unrestricted mode disables all security guardrails:").yellow()
+        );
+        println!(
+            "    {}",
+            style("• Full autonomy — agent acts without approval").yellow()
+        );
+        println!(
+            "    {}",
+            style("• No command allowlist — any command can be executed").yellow()
+        );
+        println!(
+            "    {}",
+            style("• No forbidden paths — entire filesystem is accessible").yellow()
+        );
+        println!(
+            "    {}",
+            style("• TOTP disabled — no one-time-password protection").yellow()
+        );
+        println!(
+            "    {}",
+            style("• High limits — 10k actions/hour, 200 tool iterations").yellow()
+        );
+        println!(
+            "    {}",
+            style("Only use this for trusted dev/hacking setups. Not recommended for production.")
+                .yellow()
+                .bold()
+        );
+        println!();
+
+        let confirm = Confirm::new()
+            .with_prompt("  Are you sure you want unrestricted mode?")
+            .default(false)
+            .interact()?;
+
+        if !confirm {
+            println!(
+                "  {} Falling back to {} profile",
+                style("→").dim(),
+                style("Supervised").green()
+            );
+        }
+        confirm
+    } else {
+        false
+    };
+
+    if unrestricted {
+        println!(
+            "  {} Security profile: {} — full autonomy, no restrictions",
+            style("✓").green().bold(),
+            style("Unrestricted").yellow()
+        );
+    } else {
+        println!(
+            "  {} Security profile: {} — workspace-scoped with risk gates",
+            style("✓").green().bold(),
+            style("Supervised").green()
+        );
+    }
+
+    Ok((composio_config, secrets_config, unrestricted))
 }
 
 // ── Step 6: Hardware (Physical World) ───────────────────────────
@@ -6232,6 +6384,7 @@ mod tests {
         memory_backend: Option<&str>,
         force: bool,
         no_totp: bool,
+        unrestricted: bool,
         home: &Path,
     ) -> Result<Config> {
         let _env_guard = env_lock().lock().await;
@@ -6245,6 +6398,7 @@ mod tests {
             memory_backend,
             force,
             no_totp,
+            unrestricted,
             home,
         )
         .await
@@ -6323,6 +6477,7 @@ mod tests {
             Some("sqlite"),
             false,
             false,
+            false,
             tmp.path(),
         )
         .await
@@ -6348,6 +6503,7 @@ mod tests {
             Some("sqlite"),
             false,
             false,
+            false,
             tmp.path(),
         )
         .await
@@ -6369,6 +6525,7 @@ mod tests {
             Some("sqlite"),
             false,
             false,
+            false,
             tmp.path(),
         )
         .await
@@ -6388,11 +6545,42 @@ mod tests {
             Some("sqlite"),
             false,
             true,
+            false,
             tmp.path(),
         )
         .await
         .expect("quick setup should succeed with --no-totp behavior");
 
+        assert!(!config.security.otp.enabled);
+    }
+
+    #[tokio::test]
+    async fn quick_setup_unrestricted_sets_full_autonomy() {
+        let tmp = TempDir::new().unwrap();
+
+        let config = run_quick_setup_with_clean_env(
+            Some("sk-unrestricted"),
+            Some("openrouter"),
+            None,
+            Some("sqlite"),
+            false,
+            false,
+            true,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should succeed with --unrestricted");
+
+        assert_eq!(config.autonomy.level, AutonomyLevel::Full);
+        assert_eq!(config.autonomy.allowed_commands, vec!["*".to_string()]);
+        assert!(config.autonomy.forbidden_paths.is_empty());
+        assert!(!config.autonomy.block_high_risk_commands);
+        assert!(!config.autonomy.require_approval_for_medium_risk);
+        assert!(!config.autonomy.workspace_only);
+        assert!(config.autonomy.non_cli_excluded_tools.is_empty());
+        assert_eq!(config.autonomy.max_actions_per_hour, 10_000);
+        assert_eq!(config.autonomy.max_cost_per_day_cents, 100_000);
+        assert_eq!(config.agent.max_tool_iterations, 200);
         assert!(!config.security.otp.enabled);
     }
 
@@ -6412,6 +6600,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
+            false,
             false,
             false,
             tmp.path(),
@@ -6444,6 +6633,7 @@ mod tests {
             Some("custom-model-fresh"),
             Some("sqlite"),
             true,
+            false,
             false,
             tmp.path(),
         )
@@ -6478,6 +6668,7 @@ mod tests {
             Some("openrouter"),
             Some("model-env"),
             Some("sqlite"),
+            false,
             false,
             false,
             tmp.path(),

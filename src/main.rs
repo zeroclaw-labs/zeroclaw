@@ -168,6 +168,10 @@ enum Commands {
         /// Disable OTP in quick setup (not recommended)
         #[arg(long)]
         no_totp: bool,
+
+        /// Unrestricted mode: full autonomy, no command/path blocks, large tool limit
+        #[arg(long)]
+        unrestricted: bool,
     },
 
     /// Start the AI agent loop
@@ -769,6 +773,7 @@ async fn main() -> Result<()> {
         model,
         memory,
         no_totp,
+        unrestricted,
     } = &cli.command
     {
         let interactive = *interactive;
@@ -779,6 +784,7 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
         let no_totp = *no_totp;
+        let unrestricted = *unrestricted;
 
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
@@ -788,10 +794,11 @@ async fn main() -> Result<()> {
                 || provider.is_some()
                 || model.is_some()
                 || memory.is_some()
-                || no_totp)
+                || no_totp
+                || unrestricted)
         {
             bail!(
-                "--channels-only does not accept --api-key, --provider, --model, --memory, or --no-totp"
+                "--channels-only does not accept --api-key, --provider, --model, --memory, --no-totp, or --unrestricted"
             );
         }
         if channels_only && force {
@@ -809,6 +816,7 @@ async fn main() -> Result<()> {
                 memory.as_deref(),
                 force,
                 no_totp,
+                unrestricted,
             )
             .await
         }?;
@@ -2105,6 +2113,35 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { no_totp, .. } => assert!(no_totp),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_unrestricted_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--unrestricted"])
+            .expect("onboard --unrestricted should parse");
+
+        match cli.command {
+            Commands::Onboard { unrestricted, .. } => assert!(unrestricted),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_unrestricted_conflicts_with_channels_only() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--channels-only", "--unrestricted"])
+            .expect("both flags should parse at CLI level");
+
+        match cli.command {
+            Commands::Onboard {
+                channels_only,
+                unrestricted,
+                ..
+            } => {
+                assert!(channels_only);
+                assert!(unrestricted);
+            }
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
