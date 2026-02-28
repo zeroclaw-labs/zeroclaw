@@ -6,8 +6,8 @@ use crate::config::schema::{
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, HttpRequestConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, SopConfig, StorageConfig,
+    TelegramConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
