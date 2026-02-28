@@ -71,7 +71,7 @@ use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
     run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
 };
-use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
+use crate::approval::{ApprovalManager, PendingApprovalError};
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
