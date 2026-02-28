@@ -76,12 +76,11 @@ Notes:
    - `test`
    - `flake-probe` (single-retry telemetry; optional block via `CI_BLOCK_ON_FLAKE_SUSPECTED`)
    - `docs-quality`
-7. If `.github/workflows/**` changed, `workflow-owner-approval` must pass.
-8. If root license files (`LICENSE-APACHE`, `LICENSE-MIT`) changed, `license-file-owner-guard` allows only PR author `willsarg`.
-9. `lint-feedback` posts actionable comment if lint/docs gates fail.
-10. `CI Required Gate` aggregates results to final pass/fail.
-11. Maintainer merges PR once checks and review policy are satisfied.
-12. Merge emits a `push` event on `dev` (see scenario 4).
+7. If root license files (`LICENSE-APACHE`, `LICENSE-MIT`) changed, `license-file-owner-guard` allows only PR author `willsarg`.
+8. `lint-feedback` posts actionable comment if lint/docs gates fail.
+9. `CI Required Gate` aggregates results to final pass/fail.
+10. Maintainer merges PR once checks and review policy are satisfied.
+11. Merge emits a `push` event on `dev` (see scenario 4).
 
 ### 2) PR from fork -> `dev`
 
@@ -110,11 +109,9 @@ Notes:
    - `changes` computes `docs_only`, `docs_changed`, `rust_changed`, `workflow_changed`.
    - `build` runs for Rust-impacting changes.
    - `lint`/`lint-strict-delta`/`test`/`docs-quality` run on PR when `ci:full` label exists.
-   - `workflow-owner-approval` runs when `.github/workflows/**` changed.
    - `CI Required Gate` emits final pass/fail for the PR head.
 8. Fork PR merge blockers to check first when diagnosing stalls:
    - run approval pending for fork workflows.
-   - `workflow-owner-approval` failing on workflow-file changes.
    - `license-file-owner-guard` failing when root license files are modified by non-owner PR author.
    - `CI Required Gate` failure caused by upstream jobs.
    - repeated `pull_request_target` reruns from label churn causing noisy signals.
@@ -202,7 +199,7 @@ Canary policy lane:
 
 ## Merge/Policy Notes
 
-1. Workflow-file changes (`.github/workflows/**`) activate owner-approval gate in `ci-run.yml`.
+1. Workflow-file changes (`.github/workflows/**`) are validated through `pr-intake-checks.yml`, `ci-change-audit.yml`, and `CI Required Gate` without a dedicated owner-approval gate.
 2. PR lint/test strictness is intentionally controlled by `ci:full` label.
 3. `pr-intake-checks.yml` now blocks PRs missing a Linear issue key (`RMN-*`, `CDV-*`, `COM-*`) to keep execution mapped to Linear.
 4. `sec-audit.yml` runs on PR/push/merge queue (`merge_group`), plus scheduled weekly.

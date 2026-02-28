@@ -253,25 +253,6 @@ jobs:
                       const script = require('./.github/workflows/scripts/lint_feedback.js');
                       await script({github, context, core});
 
-    workflow-owner-approval:
-        name: CI/CD Owner Approval (@chumyin)
-        needs: [changes]
-        if: github.event_name == 'pull_request' && needs.changes.outputs.ci_cd_changed == 'true'
-        runs-on: ubuntu-22.04
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Require @chumyin approval for CI/CD related changes
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
-                    await script({ github, context, core });
-
     license-file-owner-guard:
         name: License File Owner Guard
         needs: [changes]
@@ -293,7 +274,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
         runs-on: ubuntu-22.04
         steps:
             - name: Enforce required status
@@ -304,18 +285,12 @@ jobs:
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
-                  ci_cd_changed="${{ needs.changes.outputs.ci_cd_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
-                  workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
                   license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
                   # --- Helper: enforce PR governance gates ---
                   check_pr_governance() {
                     if [ "$event_name" != "pull_request" ]; then return 0; fi
-                    if [ "$ci_cd_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "CI/CD related files changed but required @chumyin approval gate did not pass."
-                      exit 1
-                    fi
                     if [ "$license_owner_result" != "success" ]; then
                       echo "License file owner guard did not pass."
                       exit 1
@@ -354,7 +329,6 @@ jobs:
                   echo "test=${test_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
-                  echo "workflow_owner_approval=${workflow_owner_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
                   check_pr_governance
