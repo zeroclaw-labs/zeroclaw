@@ -5,9 +5,10 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
-    TelegramConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    HeartbeatConfig, HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig,
+    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig,
+    SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebFetchConfig, WebSearchConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::identity::{
@@ -3084,7 +3085,64 @@ fn provider_supports_device_flow(provider_name: &str) -> bool {
     )
 }
 
+fn http_request_productivity_allowed_domains() -> Vec<String> {
+    vec![
+        "api.github.com".to_string(),
+        "github.com".to_string(),
+        "api.linear.app".to_string(),
+        "linear.app".to_string(),
+        "calendar.googleapis.com".to_string(),
+        "tasks.googleapis.com".to_string(),
+        "www.googleapis.com".to_string(),
+        "oauth2.googleapis.com".to_string(),
+        "api.notion.com".to_string(),
+        "api.trello.com".to_string(),
+        "api.atlassian.com".to_string(),
+    ]
+}
+
+fn parse_allowed_domains_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
+    if tool_name == "http_request" {
+        let options = vec![
+            "Productivity starter allowlist (GitHub, Linear, Google, Notion, Trello, Atlassian)",
+            "Allow all public domains (*)",
+            "Custom domain list (comma-separated)",
+        ];
+        let choice = Select::new()
+            .with_prompt("  HTTP domain policy")
+            .items(&options)
+            .default(0)
+            .interact()?;
+
+        return match choice {
+            0 => Ok(http_request_productivity_allowed_domains()),
+            1 => Ok(vec!["*".to_string()]),
+            _ => {
+                let raw: String = Input::new()
+                    .with_prompt("  http_request.allowed_domains (comma-separated, '*' allows all)")
+                    .allow_empty(true)
+                    .default("api.github.com,api.linear.app,calendar.googleapis.com".to_string())
+                    .interact_text()?;
+                let domains = parse_allowed_domains_csv(&raw);
+                if domains.is_empty() {
+                    anyhow::bail!(
+                        "Custom domain list cannot be empty. Use 'Allow all public domains (*)' if that is intended."
+                    )
+                } else {
+                    Ok(domains)
+                }
+            }
+        };
+    }
+
     let prompt = format!(
         "  {}.allowed_domains (comma-separated, '*' allows all)",
         tool_name
@@ -3095,18 +3153,156 @@ fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
         .default("*".to_string())
         .interact_text()?;
 
-    let domains: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let domains = parse_allowed_domains_csv(&raw);
 
     if domains.is_empty() {
         Ok(vec!["*".to_string()])
     } else {
         Ok(domains)
     }
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn normalize_http_request_profile_name(name: &str) -> String {
+    let normalized = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized.trim_matches('-').to_string()
+}
+
+fn default_env_var_for_profile(profile_name: &str) -> String {
+    match profile_name {
+        "github" => "GITHUB_TOKEN".to_string(),
+        "linear" => "LINEAR_API_KEY".to_string(),
+        "google" => "GOOGLE_API_KEY".to_string(),
+        _ => format!(
+            "{}_TOKEN",
+            profile_name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        ),
+    }
+}
+
+fn setup_http_request_credential_profiles(
+    http_request_config: &mut HttpRequestConfig,
+) -> Result<()> {
+    println!();
+    print_bullet("Optional: configure env-backed credential profiles for http_request.");
+    print_bullet(
+        "This avoids passing raw tokens in tool arguments (use credential_profile instead).",
+    );
+
+    let configure_profiles = Confirm::new()
+        .with_prompt("  Configure HTTP credential profiles now?")
+        .default(false)
+        .interact()?;
+    if !configure_profiles {
+        return Ok(());
+    }
+
+    loop {
+        let default_name = if http_request_config.credential_profiles.is_empty() {
+            "github".to_string()
+        } else {
+            format!(
+                "profile-{}",
+                http_request_config.credential_profiles.len() + 1
+            )
+        };
+        let raw_name: String = Input::new()
+            .with_prompt("  Profile name (e.g., github, linear)")
+            .default(default_name)
+            .interact_text()?;
+        let profile_name = normalize_http_request_profile_name(&raw_name);
+        if profile_name.is_empty() {
+            anyhow::bail!("Credential profile name must contain letters, numbers, '_' or '-'");
+        }
+        if http_request_config
+            .credential_profiles
+            .contains_key(&profile_name)
+        {
+            anyhow::bail!(
+                "Credential profile '{}' normalizes to '{}' which already exists. Choose a different profile name.",
+                raw_name,
+                profile_name
+            );
+        }
+
+        let env_var_default = default_env_var_for_profile(&profile_name);
+        let env_var_raw: String = Input::new()
+            .with_prompt("  Environment variable containing token/secret")
+            .default(env_var_default)
+            .interact_text()?;
+        let env_var = env_var_raw.trim().to_string();
+        if !is_valid_env_var_name(&env_var) {
+            anyhow::bail!(
+                "Invalid environment variable name: {env_var}. Expected [A-Za-z_][A-Za-z0-9_]*"
+            );
+        }
+
+        let header_name: String = Input::new()
+            .with_prompt("  Header name")
+            .default("Authorization".to_string())
+            .interact_text()?;
+        let header_name = header_name.trim().to_string();
+        if header_name.is_empty() {
+            anyhow::bail!("Header name must not be empty");
+        }
+
+        let value_prefix: String = Input::new()
+            .with_prompt("  Header value prefix (e.g., 'Bearer ', empty for raw token)")
+            .allow_empty(true)
+            .default("Bearer ".to_string())
+            .interact_text()?;
+
+        http_request_config.credential_profiles.insert(
+            profile_name.clone(),
+            HttpRequestCredentialProfile {
+                header_name,
+                env_var,
+                value_prefix,
+            },
+        );
+
+        println!(
+            "  {} Added credential profile: {}",
+            style("✓").green().bold(),
+            style(profile_name).green()
+        );
+
+        let add_another = Confirm::new()
+            .with_prompt("  Add another credential profile?")
+            .default(false)
+            .interact()?;
+        if !add_another {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 // ── Step 6: Web & Internet Tools ────────────────────────────────
@@ -3262,11 +3458,28 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
     if enable_http_request {
         http_request_config.enabled = true;
         http_request_config.allowed_domains = prompt_allowed_domains_for_tool("http_request")?;
+        setup_http_request_credential_profiles(&mut http_request_config)?;
         println!(
             "  {} http_request.allowed_domains = [{}]",
             style("✓").green().bold(),
             style(http_request_config.allowed_domains.join(", ")).green()
         );
+        if !http_request_config.credential_profiles.is_empty() {
+            let mut names: Vec<String> = http_request_config
+                .credential_profiles
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            println!(
+                "  {} http_request.credential_profiles = [{}]",
+                style("✓").green().bold(),
+                style(names.join(", ")).green()
+            );
+            print_bullet(
+                "Use tool arg `credential_profile` (for example `github`) instead of raw Authorization headers.",
+            );
+        }
     } else {
         println!(
             "  {} http_request: {}",
@@ -8066,6 +8279,36 @@ mod tests {
         assert!(provider_supports_device_flow("openai-codex"));
         assert!(!provider_supports_device_flow("openai"));
         assert!(!provider_supports_device_flow("openrouter"));
+    }
+
+    #[test]
+    fn http_request_productivity_allowed_domains_include_common_integrations() {
+        let domains = http_request_productivity_allowed_domains();
+        assert!(domains.iter().any(|d| d == "api.github.com"));
+        assert!(domains.iter().any(|d| d == "api.linear.app"));
+        assert!(domains.iter().any(|d| d == "calendar.googleapis.com"));
+    }
+
+    #[test]
+    fn normalize_http_request_profile_name_sanitizes_input() {
+        assert_eq!(
+            normalize_http_request_profile_name(" GitHub Main "),
+            "github-main"
+        );
+        assert_eq!(
+            normalize_http_request_profile_name("LINEAR_API"),
+            "linear_api"
+        );
+        assert_eq!(normalize_http_request_profile_name("!!!"), "");
+    }
+
+    #[test]
+    fn is_valid_env_var_name_accepts_and_rejects_expected_patterns() {
+        assert!(is_valid_env_var_name("GITHUB_TOKEN"));
+        assert!(is_valid_env_var_name("_PRIVATE_KEY"));
+        assert!(!is_valid_env_var_name("1BAD"));
+        assert!(!is_valid_env_var_name("BAD-NAME"));
+        assert!(!is_valid_env_var_name("BAD NAME"));
     }
 
     #[test]

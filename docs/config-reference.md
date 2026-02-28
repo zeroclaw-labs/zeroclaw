@@ -605,6 +605,7 @@ Notes:
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 | `user_agent` | `ZeroClaw/1.0` | User-Agent header for outbound HTTP requests |
+| `credential_profiles` | `{}` | Optional named env-backed auth profiles used by tool arg `credential_profile` |
 
 Notes:
 
@@ -612,6 +613,36 @@ Notes:
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
 - Shell `curl`/`wget` are classified as high-risk and may be blocked by autonomy policy. Prefer `http_request` for direct HTTP calls.
+- `credential_profiles` lets the harness inject auth headers from environment variables, so agents can call authenticated APIs without raw tokens in tool arguments.
+
+Example:
+
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["api.github.com", "api.linear.app"]
+
+[http_request.credential_profiles.github]
+header_name = "Authorization"
+env_var = "GITHUB_TOKEN"
+value_prefix = "Bearer "
+
+[http_request.credential_profiles.linear]
+header_name = "Authorization"
+env_var = "LINEAR_API_KEY"
+value_prefix = ""
+```
+
+Then call `http_request` with:
+
+```json
+{
+  "url": "https://api.github.com/user",
+  "credential_profile": "github"
+}
+```
+
+When using `credential_profile`, do not also set the same header key in `args.headers` (case-insensitive), or the request will be rejected as a header conflict.
 
 ## `[web_fetch]`
 

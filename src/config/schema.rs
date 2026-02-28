@@ -1549,6 +1549,40 @@ impl Default for BrowserConfig {
 ///
 /// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HttpRequestCredentialProfile {
+    /// Header name to inject (for example `Authorization` or `X-API-Key`)
+    #[serde(default = "default_http_request_credential_header_name")]
+    pub header_name: String,
+    /// Environment variable containing the secret/token value
+    #[serde(default)]
+    pub env_var: String,
+    /// Optional prefix prepended to the secret (for example `Bearer `)
+    #[serde(default)]
+    pub value_prefix: String,
+}
+
+impl Default for HttpRequestCredentialProfile {
+    fn default() -> Self {
+        Self {
+            header_name: default_http_request_credential_header_name(),
+            env_var: String::new(),
+            value_prefix: default_http_request_credential_value_prefix(),
+        }
+    }
+}
+
+fn default_http_request_credential_header_name() -> String {
+    "Authorization".into()
+}
+
+fn default_http_request_credential_value_prefix() -> String {
+    "Bearer ".into()
+}
+
+/// HTTP request tool configuration (`[http_request]` section).
+///
+/// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
     #[serde(default)]
@@ -1565,6 +1599,15 @@ pub struct HttpRequestConfig {
     /// User-Agent string sent with HTTP requests (env: ZEROCLAW_HTTP_REQUEST_USER_AGENT)
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+    /// Optional named credential profiles for env-backed auth injection.
+    ///
+    /// Example:
+    /// `[http_request.credential_profiles.github]`
+    /// `env_var = "GITHUB_TOKEN"`
+    /// `header_name = "Authorization"`
+    /// `value_prefix = "Bearer "`
+    #[serde(default)]
+    pub credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
 }
 
 impl Default for HttpRequestConfig {
@@ -1575,6 +1618,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             user_agent: default_user_agent(),
+            credential_profiles: HashMap::new(),
         }
     }
 }
@@ -6687,6 +6731,46 @@ impl Config {
                 "security.url_access.enforce_domain_allowlist=true requires non-empty security.url_access.domain_allowlist"
             );
         }
+        let mut seen_http_credential_profiles = std::collections::HashSet::new();
+        for (profile_name, profile) in &self.http_request.credential_profiles {
+            let normalized_name = profile_name.trim();
+            if normalized_name.is_empty() {
+                anyhow::bail!("http_request.credential_profiles keys must not be empty");
+            }
+            if !normalized_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "http_request.credential_profiles.{profile_name} contains invalid characters"
+                );
+            }
+            let canonical_name = normalized_name.to_ascii_lowercase();
+            if !seen_http_credential_profiles.insert(canonical_name) {
+                anyhow::bail!(
+                    "http_request.credential_profiles contains duplicate profile name: {normalized_name}"
+                );
+            }
+
+            let header_name = profile.header_name.trim();
+            if header_name.is_empty() {
+                anyhow::bail!(
+                    "http_request.credential_profiles.{profile_name}.header_name must not be empty"
+                );
+            }
+            if let Err(e) = reqwest::header::HeaderName::from_bytes(header_name.as_bytes()) {
+                anyhow::bail!(
+                    "http_request.credential_profiles.{profile_name}.header_name is invalid: {e}"
+                );
+            }
+
+            let env_var = profile.env_var.trim();
+            if !is_valid_env_var_name(env_var) {
+                anyhow::bail!(
+                    "http_request.credential_profiles.{profile_name}.env_var is invalid ({env_var}); expected [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+        }
         let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
         let mut custom_role_names = std::collections::HashSet::new();
         for (i, role) in self.security.roles.iter().enumerate() {
@@ -7947,6 +8031,7 @@ mod tests {
         assert_eq!(cfg.max_response_size, 1_000_000);
         assert!(!cfg.enabled);
         assert!(cfg.allowed_domains.is_empty());
+        assert!(cfg.credential_profiles.is_empty());
     }
 
     #[test]
@@ -12073,6 +12158,45 @@ symbol_ratio_threshold = 0.25
         assert!(err
             .to_string()
             .contains("security.url_access.enforce_domain_allowlist"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_http_credential_profile_env_var() {
+        let mut config = Config::default();
+        config.http_request.credential_profiles.insert(
+            "github".to_string(),
+            HttpRequestCredentialProfile {
+                env_var: "NOT VALID".to_string(),
+                ..HttpRequestCredentialProfile::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid http credential env var");
+        assert!(err
+            .to_string()
+            .contains("http_request.credential_profiles.github.env_var"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_empty_http_credential_profile_header_name() {
+        let mut config = Config::default();
+        config.http_request.credential_profiles.insert(
+            "linear".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "   ".to_string(),
+                env_var: "LINEAR_API_KEY".to_string(),
+                ..HttpRequestCredentialProfile::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("expected empty header_name validation failure");
+        assert!(err
+            .to_string()
+            .contains("http_request.credential_profiles.linear.header_name"));
     }
 
     #[test]

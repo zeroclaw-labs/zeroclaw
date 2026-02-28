@@ -11,18 +11,18 @@ pub use schema::{
     EconomicConfig, EconomicTokenPricing,
     DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
     GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
-    NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpChallengeDelivery, OtpConfig,
-    OtpMethod, PeripheralBoardConfig, PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig,
-    PluginsConfig, ProviderConfig, ProxyConfig, ProxyScope, QdrantConfig,
-    QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SecurityRoleConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig, UrlAccessConfig,
-    WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy, WasmRuntimeConfig,
-    WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    HooksConfig, HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig, IdentityConfig,
+    LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
+    NextcloudTalkConfig, NonCliNaturalLanguageApprovalMode, ObservabilityConfig,
+    OtpChallengeDelivery, OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig,
+    PerplexityFilterConfig, PluginEntryConfig, PluginsConfig, ProviderConfig, ProxyConfig,
+    ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
+    ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SecurityRoleConfig, SkillsConfig,
+    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig,
+    TunnelConfig, UrlAccessConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy,
+    WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -105,5 +105,18 @@ mod tests {
         assert_eq!(lark.app_id, "app-id");
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
+    }
+
+    #[test]
+    fn reexported_http_request_credential_profile_is_constructible() {
+        let profile = HttpRequestCredentialProfile {
+            header_name: "Authorization".into(),
+            env_var: "OPENROUTER_API_KEY".into(),
+            value_prefix: "Bearer ".into(),
+        };
+
+        assert_eq!(profile.header_name, "Authorization");
+        assert_eq!(profile.env_var, "OPENROUTER_API_KEY");
+        assert_eq!(profile.value_prefix, "Bearer ");
     }
 }
