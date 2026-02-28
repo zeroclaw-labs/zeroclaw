@@ -184,6 +184,22 @@ static DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(
     .unwrap()
 });
 
+/// Detect common CJK deferred-action phrases (e.g., Chinese "让我…查看")
+/// that imply a follow-up tool call should occur.
+static CJK_DEFERRED_ACTION_CUE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(让我|我来|我会|我们来|我们会|我先|先让我|马上)").unwrap());
+
+/// Action verbs commonly used when promising to perform tool-backed work in CJK text.
+static CJK_DEFERRED_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|试试|继续|处理|修复|看看|看一看|看一下)").unwrap()
+});
+
+/// Fast check for CJK scripts (Han/Hiragana/Katakana/Hangul) so we only run
+/// additional regexes when non-Latin text is present.
+static CJK_SCRIPT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]").unwrap()
+});
+
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
@@ -290,7 +306,17 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
 
 fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
     let trimmed = text.trim();
-    !trimmed.is_empty() && DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX.is_match(trimmed)
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX.is_match(trimmed) {
+        return true;
+    }
+
+    CJK_SCRIPT_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_CUE_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
 }
 
 fn maybe_inject_cron_add_delivery(
@@ -4276,12 +4302,21 @@ Done."#;
         assert!(looks_like_deferred_action_without_tool_call(
             "It seems absolute paths are blocked. Let me try using a relative path."
         ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "看起来绝对路径不可用，让我尝试使用当前目录的相对路径。"
+        ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "页面已打开，让我获取快照查看详细信息。"
+        ));
     }
 
     #[test]
     fn looks_like_deferred_action_without_tool_call_ignores_final_answers() {
         assert!(!looks_like_deferred_action_without_tool_call(
             "The latest update is already shown above."
+        ));
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "最新结果已经在上面整理完成。"
         ));
     }
 
