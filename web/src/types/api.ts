@@ -93,6 +93,14 @@ export interface MemoryEntry {
   score: number | null;
 }
 
+export interface PairedDevice {
+  id: string;
+  token_fingerprint: string;
+  created_at: string | null;
+  last_seen_at: string | null;
+  paired_by: string | null;
+}
+
 export interface CostSummary {
   session_cost_usd: number;
   daily_cost_usd: number;

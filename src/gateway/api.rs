@@ -529,6 +529,48 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/pairing/devices — list paired devices
+pub async fn handle_api_pairing_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let devices = state.pairing.paired_devices();
+    Json(serde_json::json!({ "devices": devices })).into_response()
+}
+
+/// DELETE /api/pairing/devices/:id — revoke paired device
+pub async fn handle_api_pairing_device_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if !state.pairing.revoke_device(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Paired device not found"})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to persist pairing state: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "revoked": true, "id": id})).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn normalize_dashboard_config_toml(root: &mut toml::Value) {
