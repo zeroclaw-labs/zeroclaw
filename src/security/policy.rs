@@ -2117,7 +2117,7 @@ mod tests {
         };
         for dir in [
             "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
+            "/proc", "/sys", "/var", "/tmp", "/mnt",
         ] {
             assert!(
                 !p.is_path_allowed(dir),

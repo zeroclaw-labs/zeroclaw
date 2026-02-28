@@ -9755,6 +9755,8 @@ default_temperature = 0.7
     #[test]
     async fn checklist_autonomy_default_is_workspace_scoped() {
         let a = AutonomyConfig::default();
+        // Public contract: `/mnt` is blocked by default for safer host isolation.
+        // Rollback path remains explicit user override via `autonomy.forbidden_paths`.
         assert!(a.workspace_only, "Default autonomy must be workspace_only");
         assert!(
             a.forbidden_paths.contains(&"/etc".to_string()),
@@ -9763,6 +9765,10 @@ default_temperature = 0.7
         assert!(
             a.forbidden_paths.contains(&"/proc".to_string()),
             "Must block /proc"
+        );
+        assert!(
+            a.forbidden_paths.contains(&"/mnt".to_string()),
+            "Must block /mnt"
         );
         assert!(
             a.forbidden_paths.contains(&"~/.ssh".to_string()),
