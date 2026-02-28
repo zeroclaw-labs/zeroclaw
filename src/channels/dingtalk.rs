@@ -154,7 +154,16 @@ impl DingTalkChannel {
             }
         }
 
-        fn collect_rich_text_fragments(value: &serde_json::Value, out: &mut Vec<String>) {
+        fn collect_rich_text_fragments(
+            value: &serde_json::Value,
+            out: &mut Vec<String>,
+            depth: usize,
+        ) {
+            const MAX_RICH_TEXT_DEPTH: usize = 16;
+            if depth >= MAX_RICH_TEXT_DEPTH {
+                return;
+            }
+
             match value {
                 serde_json::Value::String(s) => {
                     if let Some(normalized) = normalize_text(s) {
@@ -163,20 +172,20 @@ impl DingTalkChannel {
                 }
                 serde_json::Value::Array(items) => {
                     for item in items {
-                        collect_rich_text_fragments(item, out);
+                        collect_rich_text_fragments(item, out, depth + 1);
                     }
                 }
                 serde_json::Value::Object(map) => {
                     for key in ["text", "content"] {
-                        if let Some(value) = map.get(key).and_then(|v| v.as_str()) {
-                            if let Some(normalized) = normalize_text(value) {
+                        if let Some(text_val) = map.get(key).and_then(|v| v.as_str()) {
+                            if let Some(normalized) = normalize_text(text_val) {
                                 out.push(normalized);
                             }
                         }
                     }
                     for key in ["children", "elements", "richText", "rich_text"] {
                         if let Some(child) = map.get(key) {
-                            collect_rich_text_fragments(child, out);
+                            collect_rich_text_fragments(child, out, depth + 1);
                         }
                     }
                 }
@@ -201,7 +210,7 @@ impl DingTalkChannel {
         // Rich text payload fallback.
         if let Some(rich) = data.get("richText").or_else(|| data.get("rich_text")) {
             let mut fragments = Vec::new();
-            collect_rich_text_fragments(rich, &mut fragments);
+            collect_rich_text_fragments(rich, &mut fragments, 0);
             if !fragments.is_empty() {
                 let merged = fragments.join(" ");
                 if let Some(content) = normalize_text(&merged) {
@@ -635,5 +644,16 @@ client_secret = "secret"
             DingTalkChannel::extract_text_content(&data).as_deref(),
             Some("现在 呢？")
         );
+    }
+
+    #[test]
+    fn extract_text_content_bounds_rich_text_recursion_depth() {
+        let mut deep = serde_json::json!({"text": "deep-content"});
+        for _ in 0..24 {
+            deep = serde_json::json!({"children": [deep]});
+        }
+        let data = serde_json::json!({"richText": deep});
+
+        assert_eq!(DingTalkChannel::extract_text_content(&data), None);
     }
 }
