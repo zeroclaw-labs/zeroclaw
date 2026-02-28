@@ -3203,6 +3203,7 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
         "web_search_config",
         "web_access_config",
         "model_routing_config",
+        "channel_ack_config",
         "pushover",
         "composio",
         "delegate",
@@ -4101,6 +4102,12 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    /// ACK emoji reaction policy overrides for channels that support message reactions.
+    ///
+    /// Use this table to control reaction enable/disable, emoji pools, and conditional rules
+    /// without hardcoding behavior in channel implementations.
+    #[serde(default)]
+    pub ack_reaction: AckReactionChannelsConfig,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -4254,6 +4261,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             clawdtalk: None,
+            ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -4309,6 +4317,116 @@ pub struct GroupReplyConfig {
     /// channel-level inbound allowlist (`allowed_users` / equivalents).
     #[serde(default)]
     pub allowed_sender_ids: Vec<String>,
+}
+
+/// Reaction selection strategy for ACK emoji pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AckReactionStrategy {
+    /// Select uniformly from the available emoji pool.
+    #[default]
+    Random,
+    /// Always select the first emoji in the available pool.
+    First,
+}
+
+/// Chat context selector for ACK emoji reaction rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AckReactionChatType {
+    /// Direct/private chat context.
+    Direct,
+    /// Group/channel chat context.
+    Group,
+}
+
+/// Conditional ACK emoji reaction rule.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AckReactionRuleConfig {
+    /// Rule enable switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Match when message contains any keyword (case-insensitive).
+    #[serde(default)]
+    pub contains_any: Vec<String>,
+    /// Match only when message contains all keywords (case-insensitive).
+    #[serde(default)]
+    pub contains_all: Vec<String>,
+    /// Match only for these sender IDs. `*` matches any sender.
+    #[serde(default)]
+    pub sender_ids: Vec<String>,
+    /// Match only for selected chat types; empty means no chat-type constraint.
+    #[serde(default)]
+    pub chat_types: Vec<AckReactionChatType>,
+    /// Match only for selected locale tags; supports prefix matching (`zh`, `zh_cn`).
+    #[serde(default)]
+    pub locale_any: Vec<String>,
+    /// Per-rule strategy override (falls back to parent strategy when omitted).
+    #[serde(default)]
+    pub strategy: Option<AckReactionStrategy>,
+    /// Emoji pool used when this rule matches.
+    #[serde(default)]
+    pub emojis: Vec<String>,
+}
+
+impl Default for AckReactionRuleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            contains_any: Vec::new(),
+            contains_all: Vec::new(),
+            sender_ids: Vec::new(),
+            chat_types: Vec::new(),
+            locale_any: Vec::new(),
+            strategy: None,
+            emojis: Vec::new(),
+        }
+    }
+}
+
+/// Per-channel ACK emoji reaction policy.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AckReactionConfig {
+    /// Global enable switch for ACK reactions on this channel.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Default emoji selection strategy.
+    #[serde(default)]
+    pub strategy: AckReactionStrategy,
+    /// Default emoji pool. When empty, channel built-in defaults are used.
+    #[serde(default)]
+    pub emojis: Vec<String>,
+    /// Conditional rules evaluated in order.
+    #[serde(default)]
+    pub rules: Vec<AckReactionRuleConfig>,
+}
+
+impl Default for AckReactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strategy: AckReactionStrategy::Random,
+            emojis: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// ACK reaction policy table under `[channels_config.ack_reaction]`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct AckReactionChannelsConfig {
+    /// Telegram ACK reaction policy.
+    #[serde(default)]
+    pub telegram: Option<AckReactionConfig>,
+    /// Discord ACK reaction policy.
+    #[serde(default)]
+    pub discord: Option<AckReactionConfig>,
+    /// Lark ACK reaction policy.
+    #[serde(default)]
+    pub lark: Option<AckReactionConfig>,
+    /// Feishu ACK reaction policy.
+    #[serde(default)]
+    pub feishu: Option<AckReactionConfig>,
 }
 
 fn resolve_group_reply_mode(
@@ -9251,6 +9369,7 @@ ws_url = "ws://127.0.0.1:3002"
                 qq: None,
                 nostr: None,
                 clawdtalk: None,
+                ack_reaction: AckReactionChannelsConfig::default(),
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -10186,6 +10305,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -10201,6 +10321,53 @@ allowed_users = ["@ops:matrix.org"]
         let c = ChannelsConfig::default();
         assert!(c.imessage.is_none());
         assert!(c.matrix.is_none());
+    }
+
+    #[test]
+    async fn channels_ack_reaction_config_roundtrip() {
+        let c = ChannelsConfig {
+            ack_reaction: AckReactionChannelsConfig {
+                telegram: Some(AckReactionConfig {
+                    enabled: true,
+                    strategy: AckReactionStrategy::First,
+                    emojis: vec!["✅".into(), "👍".into()],
+                    rules: vec![AckReactionRuleConfig {
+                        enabled: true,
+                        contains_any: vec!["deploy".into()],
+                        contains_all: vec!["ok".into()],
+                        sender_ids: vec!["u123".into()],
+                        chat_types: vec![AckReactionChatType::Group],
+                        locale_any: vec!["en".into()],
+                        strategy: Some(AckReactionStrategy::Random),
+                        emojis: vec!["🚀".into()],
+                    }],
+                }),
+                discord: None,
+                lark: None,
+                feishu: None,
+            },
+            ..ChannelsConfig::default()
+        };
+
+        let toml_str = toml::to_string_pretty(&c).unwrap();
+        let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        let telegram = parsed.ack_reaction.telegram.expect("telegram ack config");
+        assert!(telegram.enabled);
+        assert_eq!(telegram.strategy, AckReactionStrategy::First);
+        assert_eq!(telegram.emojis, vec!["✅", "👍"]);
+        assert_eq!(telegram.rules.len(), 1);
+        let first_rule = &telegram.rules[0];
+        assert_eq!(first_rule.contains_any, vec!["deploy"]);
+        assert_eq!(first_rule.chat_types, vec![AckReactionChatType::Group]);
+    }
+
+    #[test]
+    async fn channels_ack_reaction_defaults_empty() {
+        let parsed: ChannelsConfig = toml::from_str("cli = true").unwrap();
+        assert!(parsed.ack_reaction.telegram.is_none());
+        assert!(parsed.ack_reaction.discord.is_none());
+        assert!(parsed.ack_reaction.lark.is_none());
+        assert!(parsed.ack_reaction.feishu.is_none());
     }
 
     // ── Edge cases: serde(default) for allowed_users ─────────
@@ -10471,6 +10638,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();

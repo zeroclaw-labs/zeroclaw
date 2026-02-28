@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub(crate) mod ack_reaction;
 pub mod bluebubbles;
 pub mod clawdtalk;
 pub mod acp;
@@ -4696,6 +4697,7 @@ fn collect_configured_channels(
             tg.ack_enabled,
         )
         .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
+        .with_ack_reaction(config.channels_config.ack_reaction.telegram.clone())
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
         .with_transcription(config.transcription.clone())
         .with_workspace_dir(config.workspace_dir.clone());
@@ -4722,6 +4724,7 @@ fn collect_configured_channels(
                     dc.effective_group_reply_mode().requires_mention(),
                 )
                 .with_group_reply_allowed_senders(dc.group_reply_allowed_sender_ids())
+                .with_ack_reaction(config.channels_config.ack_reaction.discord.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
@@ -4948,13 +4951,19 @@ fn collect_configured_channels(
                 );
                 channels.push(ConfiguredChannel {
                     display_name: "Feishu",
-                    channel: Arc::new(LarkChannel::from_config(lk)),
+                    channel: Arc::new(
+                        LarkChannel::from_config(lk)
+                            .with_ack_reaction(config.channels_config.ack_reaction.feishu.clone()),
+                    ),
                 });
             }
         } else {
             channels.push(ConfiguredChannel {
                 display_name: "Lark",
-                channel: Arc::new(LarkChannel::from_lark_config(lk)),
+                channel: Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_ack_reaction(config.channels_config.ack_reaction.lark.clone()),
+                ),
             });
         }
     }
@@ -4963,7 +4972,10 @@ fn collect_configured_channels(
     if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
             display_name: "Feishu",
-            channel: Arc::new(LarkChannel::from_feishu_config(fs)),
+            channel: Arc::new(
+                LarkChannel::from_feishu_config(fs)
+                    .with_ack_reaction(config.channels_config.ack_reaction.feishu.clone()),
+            ),
         });
     }
 
@@ -7378,6 +7390,174 @@ BTC is currently around $65,000 based on latest tool output."#
                 .all(|tool| tool != "mock_price"),
             "runtime exclusions should remove mock_price immediately after approval"
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_approve_allow_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let approval_manager = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let pending = approval_manager.create_non_cli_pending_request(
+            "mock_price",
+            "alice",
+            "telegram",
+            "chat-1",
+            None,
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::clone(&approval_manager),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-approve-allow-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("/approve-allow {}", pending.request_id),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Approved pending request"));
+        assert!(sent[0].contains("mock_price"));
+        drop(sent);
+
+        assert_eq!(
+            approval_manager.take_non_cli_pending_resolution(&pending.request_id),
+            Some(ApprovalResponse::Yes)
+        );
+        assert!(!approval_manager.has_non_cli_pending_request(&pending.request_id));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_approve_deny_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let approval_manager = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let pending = approval_manager.create_non_cli_pending_request(
+            "mock_price",
+            "alice",
+            "telegram",
+            "chat-1",
+            None,
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::clone(&approval_manager),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-approve-deny-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("/approve-deny {}", pending.request_id),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Denied pending request"));
+        assert!(sent[0].contains("mock_price"));
+        drop(sent);
+
+        assert_eq!(
+            approval_manager.take_non_cli_pending_resolution(&pending.request_id),
+            Some(ApprovalResponse::No)
+        );
+        assert!(!approval_manager.has_non_cli_pending_request(&pending.request_id));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

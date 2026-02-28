@@ -1,4 +1,6 @@
+use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::AckReactionConfig;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +20,7 @@ pub struct DiscordChannel {
     listen_to_bots: bool,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
+    ack_reaction: Option<AckReactionConfig>,
     workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
@@ -37,6 +40,7 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             group_reply_allowed_sender_ids: Vec::new(),
+            ack_reaction: None,
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
@@ -45,6 +49,12 @@ impl DiscordChannel {
     /// Configure sender IDs that bypass mention gating in guild channels.
     pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
         self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+        self
+    }
+
+    /// Configure ACK reaction policy.
+    pub fn with_ack_reaction(mut self, ack_reaction: Option<AckReactionConfig>) -> Self {
+        self.ack_reaction = ack_reaction;
         self
     }
 
@@ -885,21 +895,36 @@ impl Channel for DiscordChannel {
                         );
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
-                        let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
-                            if let Err(err) = reaction_channel
-                                .add_reaction(
-                                    &reaction_channel_id,
-                                    &reaction_message_id,
-                                    &reaction_emoji,
-                                )
-                                .await
-                            {
-                                tracing::debug!(
-                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
-                                );
-                            }
-                        });
+                        let reaction_ctx = AckReactionContext {
+                            text: &final_content,
+                            sender_id: Some(author_id),
+                            chat_type: if is_group_message {
+                                AckReactionContextChatType::Group
+                            } else {
+                                AckReactionContextChatType::Direct
+                            },
+                            locale_hint: None,
+                        };
+                        if let Some(reaction_emoji) = select_ack_reaction(
+                            self.ack_reaction.as_ref(),
+                            DISCORD_ACK_REACTIONS,
+                            &reaction_ctx,
+                        ) {
+                            tokio::spawn(async move {
+                                if let Err(err) = reaction_channel
+                                    .add_reaction(
+                                        &reaction_channel_id,
+                                        &reaction_message_id,
+                                        &reaction_emoji,
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                    );
+                                }
+                            });
+                        }
                     }
 
                     let channel_msg = ChannelMessage {

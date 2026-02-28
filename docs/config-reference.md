@@ -1063,9 +1063,55 @@ Notes:
   - `mode = "all_messages"` or `mode = "mention_only"`
   - `allowed_sender_ids = ["..."]` to bypass mention gating in groups
   - `allowed_users` allowlist checks still run first
+- Telegram/Discord/Lark/Feishu ACK emoji reactions are configurable under
+  `[channels_config.ack_reaction.<channel>]` with switchable enable state,
+  custom emoji pools, and conditional rules.
 - Legacy `mention_only` flags (Telegram/Discord/Mattermost/Lark) remain supported as fallback only.
   If `group_reply.mode` is set, it takes precedence over legacy `mention_only`.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+
+### `[channels_config.ack_reaction.<channel>]`
+
+Per-channel ACK reaction policy (`<channel>`: `telegram`, `discord`, `lark`, `feishu`).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Master switch for ACK reactions on this channel |
+| `strategy` | `random` | Pool selection strategy: `random` or `first` |
+| `emojis` | `[]` | Channel-level custom fallback pool (uses built-in pool when empty) |
+| `rules` | `[]` | Ordered conditional rules; first matching rule with emojis is used |
+
+Rule object fields (`[[channels_config.ack_reaction.<channel>.rules]]`):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable/disable this single rule |
+| `contains_any` | `[]` | Match when message contains any keyword (case-insensitive) |
+| `contains_all` | `[]` | Match when message contains all keywords (case-insensitive) |
+| `sender_ids` | `[]` | Match only these sender IDs (`"*"` matches all) |
+| `chat_types` | `[]` | Restrict to `group` and/or `direct` |
+| `locale_any` | `[]` | Restrict by locale tag (prefix supported, e.g. `zh`) |
+| `strategy` | unset | Optional per-rule strategy override |
+| `emojis` | `[]` | Emoji pool used when this rule matches |
+
+Example:
+
+```toml
+[channels_config.ack_reaction.telegram]
+enabled = true
+strategy = "random"
+emojis = ["✅", "👌", "🔥"]
+
+[[channels_config.ack_reaction.telegram.rules]]
+contains_any = ["deploy", "release"]
+chat_types = ["group"]
+strategy = "first"
+emojis = ["🚀"]
+
+[[channels_config.ack_reaction.telegram.rules]]
+contains_any = ["error", "failed"]
+emojis = ["👀", "🛠️"]
+```
 
 ### `[channels_config.nostr]`
 
