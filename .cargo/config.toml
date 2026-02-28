@@ -4,6 +4,10 @@ rustflags = ["-C", "link-arg=-static"]
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
 
+# ARMv6 musl (Raspberry Pi Zero W)
+[target.armv6l-unknown-linux-musleabihf]
+rustflags = ["-C", "link-arg=-static"]
+
 # Android targets (Termux-native defaults).
 # CI/NDK cross builds can override these via CARGO_TARGET_*_LINKER.
 [target.armv7-linux-androideabi]
