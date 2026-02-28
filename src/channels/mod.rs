@@ -4694,10 +4694,10 @@ fn collect_configured_channels(
             tg.bot_token.clone(),
             tg.allowed_users.clone(),
             tg.effective_group_reply_mode().requires_mention(),
+            tg.ack_enabled,
         )
         .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
         .with_ack_reaction(config.channels_config.ack_reaction.telegram.clone())
-        .with_ack_enabled(tg.ack_enabled)
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
         .with_transcription(config.transcription.clone())
         .with_workspace_dir(config.workspace_dir.clone());
