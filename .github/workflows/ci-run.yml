@@ -118,9 +118,11 @@ jobs:
                   if [ -f artifacts/flake-probe.json ]; then
                     status=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['status'])")
                     flake=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['flake_suspected'])")
-                    echo "### Test Flake Probe" >> "$GITHUB_STEP_SUMMARY"
-                    echo "- Status: \`${status}\`" >> "$GITHUB_STEP_SUMMARY"
-                    echo "- Flake suspected: \`${flake}\`" >> "$GITHUB_STEP_SUMMARY"
+                    {
+                      echo "### Test Flake Probe"
+                      echo "- Status: \`${status}\`"
+                      echo "- Flake suspected: \`${flake}\`"
+                    } >> "$GITHUB_STEP_SUMMARY"
                   fi
             - name: Upload flake probe artifact
               if: always()
