@@ -888,6 +888,17 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+- Observation memory is available via tool `memory_observe`, which stores entries under category `observation` by default (override with `category` when needed).
+
+Example (tool-call payload):
+
+```json
+{
+  "observation": "User asks for brief release notes when CI is green.",
+  "source": "chat",
+  "confidence": 0.9
+}
+```
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 

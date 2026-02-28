@@ -1889,6 +1889,10 @@ pub async fn run(
             "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
         ),
         (
+            "memory_observe",
+            "Store observation memory. Use when: capturing patterns/signals that should remain searchable over long horizons.",
+        ),
+        (
             "memory_recall",
             "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
         ),
@@ -2418,6 +2422,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
         ("memory_store", "Save to memory."),
+        ("memory_observe", "Store observation memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
         (

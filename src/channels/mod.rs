@@ -5087,6 +5087,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Save to memory to preserve durable preferences, decisions, and key context.",
         ),
         (
+            "memory_observe",
+            "Store observation memory for long-horizon patterns, signals, and evolving context.",
+        ),
+        (
             "memory_recall",
             "Search memory to retrieve prior decisions, user preferences, and historical context.",
         ),
