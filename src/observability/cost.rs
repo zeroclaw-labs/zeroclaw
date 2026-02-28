@@ -100,13 +100,7 @@ impl Observer for CostObserver {
             let (input_price, output_price) = self.get_pricing(provider, model);
             let full_model_name = format!("{provider}/{model}");
 
-            let usage = TokenUsage::new(
-                full_model_name,
-                input,
-                output,
-                input_price,
-                output_price,
-            );
+            let usage = TokenUsage::new(full_model_name, input, output, input_price, output_price);
 
             if let Err(e) = self.tracker.record_usage(usage) {
                 tracing::warn!("Failed to record cost usage: {e}");

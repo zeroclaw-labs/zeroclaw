@@ -73,6 +73,7 @@ pub mod status;
 pub mod tracker;
 
 // Re-exports for convenient access
+pub use classifier::{ClassificationResult, Occupation, OccupationCategory, TaskClassifier};
 pub use costs::{
     ApiCallRecord, ApiUsageSummary, BalanceRecord, CostBreakdown, DateCostSummary,
     EconomicAnalytics, LlmCallRecord, LlmUsageSummary, PricingModel, TaskCompletionRecord,
@@ -80,6 +81,3 @@ pub use costs::{
 };
 pub use status::SurvivalStatus;
 pub use tracker::{EconomicConfig, EconomicSummary, EconomicTracker};
-pub use classifier::{
-    ClassificationResult, Occupation, OccupationCategory, TaskClassifier,
-};

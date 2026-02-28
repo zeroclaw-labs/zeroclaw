@@ -192,7 +192,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Add system message to history
     history.push(ChatMessage::system(&system_prompt));
 
-    let approval_manager = {
+    let _approval_manager = {
         let config_guard = state.config.lock();
         ApprovalManager::from_config(&config_guard.autonomy)
     };
