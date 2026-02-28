@@ -179,6 +179,8 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// Allowed group JIDs, "dm" for DMs only, "*" for all groups, or empty for all chats
+    allowed_groups: Vec<String>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -202,12 +204,14 @@ impl WhatsAppWebChannel {
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        allowed_groups: Vec<String>,
     ) -> Self {
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            allowed_groups,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -519,6 +523,7 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let allowed_groups = self.allowed_groups.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
@@ -527,6 +532,7 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, _client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let allowed_groups = allowed_groups.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -550,6 +556,35 @@ impl Channel for WhatsAppWebChannel {
                             };
 
                             if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
+                                // Group filtering: check if chat is allowed
+                                // DMs use @s.whatsapp.net or sender@lid; groups use @g.us or groupid@lid
+                                let chat_prefix = chat.split('@').next().unwrap_or("");
+                                let is_dm = chat.ends_with("@s.whatsapp.net")
+                                    || chat_prefix == &sender;
+                                if !allowed_groups.is_empty() {
+                                    let group_allowed = if allowed_groups.iter().any(|g| g == "*") {
+                                        // Wildcard: allow all groups (and DMs)
+                                        true
+                                    } else if allowed_groups.iter().any(|g| g == "dm") {
+                                        // "dm" mode: only allow DMs (non-group chats)
+                                        is_dm
+                                    } else {
+                                        // Explicit list: allow listed group JIDs + all DMs
+                                        // Match by numeric prefix to handle both @g.us and @lid suffixes
+                                        is_dm || allowed_groups.iter().any(|g| {
+                                            let g_id = g.split('@').next().unwrap_or("");
+                                            g_id == chat_prefix || g == &chat
+                                        })
+                                    };
+                                    if !group_allowed {
+                                        tracing::warn!(
+                                            "WhatsApp Web: chat {} not in allowed_groups, ignoring message from {}",
+                                            chat, normalized
+                                        );
+                                        return;
+                                    }
+                                }
+
                                 let trimmed = text.trim();
                                 if trimmed.is_empty() {
                                     tracing::debug!(
@@ -739,6 +774,7 @@ impl WhatsAppWebChannel {
         _pair_phone: Option<String>,
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
+        _allowed_groups: Vec<String>,
     ) -> Self {
         Self { _private: () }
     }
@@ -795,6 +831,7 @@ mod tests {
             None,
             None,
             vec!["+1234567890".into()],
+            vec![],
         )
     }
 
@@ -816,7 +853,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
+        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()], vec![]);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -824,7 +861,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
+        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![], vec![]);
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
