@@ -1,0 +1,261 @@
+name: Pub Pre-release
+
+on:
+    push:
+        tags:
+            - "v*-alpha.*"
+            - "v*-beta.*"
+            - "v*-rc.*"
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: "Existing pre-release tag (e.g. v0.1.8-rc.1)"
+                required: true
+                default: ""
+                type: string
+            mode:
+                description: "dry-run validates/builds only; publish creates prerelease"
+                required: true
+                default: dry-run
+                type: choice
+                options:
+                    - dry-run
+                    - publish
+            draft:
+                description: "Create prerelease as draft"
+                required: true
+                default: true
+                type: boolean
+
+concurrency:
+    group: prerelease-${{ github.ref || github.run_id }}
+    cancel-in-progress: false
+
+permissions:
+    contents: write
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+    CARGO_TERM_COLOR: always
+
+jobs:
+    prerelease-guard:
+        name: Pre-release Guard
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 20
+        outputs:
+            release_tag: ${{ steps.vars.outputs.release_tag }}
+            mode: ${{ steps.vars.outputs.mode }}
+            draft: ${{ steps.vars.outputs.draft }}
+            ready_to_publish: ${{ steps.extract.outputs.ready_to_publish }}
+            stage: ${{ steps.extract.outputs.stage }}
+            transition_outcome: ${{ steps.extract.outputs.transition_outcome }}
+            latest_stage: ${{ steps.extract.outputs.latest_stage }}
+            latest_stage_tag: ${{ steps.extract.outputs.latest_stage_tag }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Resolve prerelease inputs
+              id: vars
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+                    release_tag="${GITHUB_REF_NAME}"
+                    mode="publish"
+                    draft="false"
+                  else
+                    release_tag="${{ inputs.tag }}"
+                    mode="${{ inputs.mode }}"
+                    draft="${{ inputs.draft }}"
+                  fi
+
+                  {
+                    echo "release_tag=${release_tag}"
+                    echo "mode=${mode}"
+                    echo "draft=${draft}"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Validate prerelease stage gate
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/prerelease_guard.py \
+                    --repo-root . \
+                    --tag "${{ steps.vars.outputs.release_tag }}" \
+                    --stage-config-file .github/release/prerelease-stage-gates.json \
+                    --mode "${{ steps.vars.outputs.mode }}" \
+                    --output-json artifacts/prerelease-guard.json \
+                    --output-md artifacts/prerelease-guard.md \
+                    --fail-on-violation
+
+            - name: Extract prerelease outputs
+              id: extract
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  ready_to_publish="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/prerelease-guard.json', encoding='utf-8'))
+                  print(str(bool(data.get('ready_to_publish', False))).lower())
+                  PY
+                  )"
+                  stage="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/prerelease-guard.json', encoding='utf-8'))
+                  print(data.get('stage', 'unknown'))
+                  PY
+                  )"
+                  transition_outcome="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/prerelease-guard.json', encoding='utf-8'))
+                  transition = data.get('transition') or {}
+                  print(transition.get('outcome', 'unknown'))
+                  PY
+                  )"
+                  latest_stage="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/prerelease-guard.json', encoding='utf-8'))
+                  history = data.get('stage_history') or {}
+                  print(history.get('latest_stage', 'unknown'))
+                  PY
+                  )"
+                  latest_stage_tag="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/prerelease-guard.json', encoding='utf-8'))
+                  history = data.get('stage_history') or {}
+                  print(history.get('latest_tag', 'unknown'))
+                  PY
+                  )"
+                  {
+                    echo "ready_to_publish=${ready_to_publish}"
+                    echo "stage=${stage}"
+                    echo "transition_outcome=${transition_outcome}"
+                    echo "latest_stage=${latest_stage}"
+                    echo "latest_stage_tag=${latest_stage_tag}"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Emit prerelease audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type prerelease_guard \
+                    --input-json artifacts/prerelease-guard.json \
+                    --output-json artifacts/audit-event-prerelease-guard.json \
+                    --artifact-name prerelease-guard \
+                    --retention-days 21
+
+            - name: Publish prerelease summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/prerelease-guard.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload prerelease guard artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: prerelease-guard
+                  path: |
+                      artifacts/prerelease-guard.json
+                      artifacts/prerelease-guard.md
+                      artifacts/audit-event-prerelease-guard.json
+                  if-no-files-found: error
+                  retention-days: 21
+
+    build-prerelease:
+        name: Build Pre-release Artifact
+        needs: [prerelease-guard]
+        # Keep GNU Linux prerelease artifacts on Ubuntu 22.04 so runtime GLIBC
+        # symbols remain compatible with Debian 12 / Ubuntu 22.04 hosts.
+        runs-on: ubuntu-22.04
+        timeout-minutes: 45
+        steps:
+            - name: Checkout tag
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ needs.prerelease-guard.outputs.release_tag }}
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: prerelease-${{ needs.prerelease-guard.outputs.release_tag }}
+                  cache-targets: true
+
+            - name: Build release-fast binary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cargo build --profile release-fast --locked --target x86_64-unknown-linux-gnu
+
+            - name: Package prerelease artifact
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  cp target/x86_64-unknown-linux-gnu/release-fast/zeroclaw artifacts/zeroclaw
+                  tar czf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C artifacts zeroclaw
+                  rm artifacts/zeroclaw
+
+            - name: Generate manifest + checksums
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/release_manifest.py \
+                    --artifacts-dir artifacts \
+                    --release-tag "${{ needs.prerelease-guard.outputs.release_tag }}" \
+                    --output-json artifacts/prerelease-manifest.json \
+                    --output-md artifacts/prerelease-manifest.md \
+                    --checksums-path artifacts/SHA256SUMS \
+                    --fail-empty
+
+            - name: Publish prerelease build summary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/prerelease-manifest.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload prerelease build artifacts
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: prerelease-artifacts
+                  path: artifacts/*
+                  if-no-files-found: error
+                  retention-days: 14
+
+    publish-prerelease:
+        name: Publish GitHub Pre-release
+        needs: [prerelease-guard, build-prerelease]
+        if: needs.prerelease-guard.outputs.ready_to_publish == 'true'
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 15
+        steps:
+            - name: Download prerelease artifacts
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: prerelease-artifacts
+                  path: artifacts
+
+            - name: Create or update GitHub pre-release
+              uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+              with:
+                  tag_name: ${{ needs.prerelease-guard.outputs.release_tag }}
+                  prerelease: true
+                  draft: ${{ needs.prerelease-guard.outputs.draft == 'true' }}
+                  generate_release_notes: true
+                  files: |
+                      artifacts/**/*
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

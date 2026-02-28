@@ -46,7 +46,7 @@ schemars = "1.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "chrono"] }
 
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
@@ -61,12 +61,22 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
+# Zip archive extraction
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# XML parsing (DOCX text extraction)
+quick-xml = "0.37"
+
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+
+# Optional in-process WASM runtime for sandboxed tool execution
+wasmi = { version = "1.0.9", optional = true, default-features = true }
 
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+aho-corasick = "1.1"
 
 # UUID generation
 uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
@@ -100,12 +110,14 @@ prost = { version = "0.14", default-features = false, features = ["derive"], opt
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+tokio-postgres-rustls = { version = "0.12", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+rustyline = "17.0"
 console = "0.16"
 
 # Hardware discovery (device path globbing)
@@ -113,6 +125,9 @@ glob = "0.3"
 
 # Binary discovery (init system detection)
 which = "8.0"
+
+# Temporary directory creation (for self-update)
+tempfile = "3.14"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
@@ -161,6 +176,12 @@ probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
+tempfile = "3.14"
+
+# WASM plugin runtime (optional, enable with --features wasm-tools)
+# Uses WASI stdio protocol — tools read JSON from stdin, write JSON to stdout.
+wasmtime = { version = "28", optional = true, default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = { version = "28", optional = true, default-features = false, features = ["preview1"] }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
@@ -184,17 +205,19 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = []
+default = ["wasm-tools"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
-memory-postgres = ["dep:postgres"]
+memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
 fantoccini = ["browser-native"]
+# In-process WASM runtime (capability-based sandbox)
+runtime-wasm = ["dep:wasmi"]
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")
 sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
@@ -204,6 +227,8 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# wasm-tools = WASM plugin engine for dynamically-loaded tool packages (WASI stdio protocol)
+wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 

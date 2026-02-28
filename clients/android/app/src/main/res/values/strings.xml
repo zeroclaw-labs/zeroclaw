@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ZeroClaw</string>
+    <string name="notification_channel_service">ZeroClaw Service</string>
+    <string name="notification_channel_agent">Agent Messages</string>
+    <string name="service_notification_title">ZeroClaw is running</string>
+    <string name="service_notification_text">Your AI assistant is active</string>
+</resources>

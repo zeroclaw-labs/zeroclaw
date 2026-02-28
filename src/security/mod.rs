@@ -34,9 +34,12 @@ pub mod landlock;
 pub mod leak_detector;
 pub mod otp;
 pub mod pairing;
+pub mod perplexity;
 pub mod policy;
 pub mod prompt_guard;
+pub mod roles;
 pub mod secrets;
+pub mod syscall_anomaly;
 pub mod traits;
 
 #[allow(unused_imports)]
@@ -50,9 +53,15 @@ pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 pub use otp::OtpValidator;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
+#[allow(unused_imports)]
+pub use perplexity::{detect_adversarial_suffix, PerplexityAssessment};
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
+pub use roles::{RoleRegistry, ToolAccess};
+#[allow(unused_imports)]
 pub use secrets::SecretStore;
+#[allow(unused_imports)]
+pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Prompt injection defense exports

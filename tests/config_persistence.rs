@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! TG2: Config Load/Save Round-Trip Tests
 //!
 //! Prevents: Pattern 2 — Config persistence & workspace discovery bugs (13% of user bugs).
@@ -48,8 +49,8 @@ fn config_default_temperature_positive() {
 fn agent_config_default_max_tool_iterations() {
     let agent = AgentConfig::default();
     assert_eq!(
-        agent.max_tool_iterations, 10,
-        "default max_tool_iterations should be 10"
+        agent.max_tool_iterations, 20,
+        "default max_tool_iterations should be 20"
     );
 }
 
@@ -72,11 +73,11 @@ fn agent_config_default_tool_dispatcher() {
 }
 
 #[test]
-fn agent_config_default_compact_context_off() {
+fn agent_config_default_compact_context_on() {
     let agent = AgentConfig::default();
     assert!(
-        !agent.compact_context,
-        "compact_context should default to false"
+        agent.compact_context,
+        "compact_context should default to true"
     );
 }
 
@@ -198,9 +199,9 @@ default_temperature = 0.7
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
     // Agent config should use defaults
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
+    assert_eq!(parsed.agent.max_tool_iterations, 20);
     assert_eq!(parsed.agent.max_history_messages, 50);
-    assert!(!parsed.agent.compact_context);
+    assert!(parsed.agent.compact_context);
 }
 
 #[test]

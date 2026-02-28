@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MemoryBackendKind {
     Sqlite,
+    SqliteQdrantHybrid,
     Lucid,
     Postgres,
     Qdrant,
@@ -65,6 +66,15 @@ const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const SQLITE_QDRANT_HYBRID_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "sqlite_qdrant_hybrid",
+    label: "SQLite + Qdrant hybrid — SQLite metadata/FTS with Qdrant semantic ranking",
+    auto_save_default: true,
+    uses_sqlite_hygiene: true,
+    sqlite_based: true,
+    optional_dependency: false,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -101,6 +111,7 @@ pub fn default_memory_backend_key() -> &'static str {
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
+        "sqlite_qdrant_hybrid" | "hybrid" => MemoryBackendKind::SqliteQdrantHybrid,
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
@@ -113,6 +124,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
 pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
+        MemoryBackendKind::SqliteQdrantHybrid => SQLITE_QDRANT_HYBRID_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
@@ -129,6 +141,10 @@ mod tests {
     #[test]
     fn classify_known_backends() {
         assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
+        assert_eq!(
+            classify_memory_backend("sqlite_qdrant_hybrid"),
+            MemoryBackendKind::SqliteQdrantHybrid
+        );
         assert_eq!(classify_memory_backend("lucid"), MemoryBackendKind::Lucid);
         assert_eq!(
             classify_memory_backend("postgres"),
@@ -139,6 +155,14 @@ mod tests {
             MemoryBackendKind::Markdown
         );
         assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
+    }
+
+    #[test]
+    fn hybrid_profile_is_sqlite_based() {
+        let profile = memory_backend_profile("sqlite_qdrant_hybrid");
+        assert_eq!(profile.key, "sqlite_qdrant_hybrid");
+        assert!(profile.sqlite_based);
+        assert!(profile.uses_sqlite_hygiene);
     }
 
     #[test]

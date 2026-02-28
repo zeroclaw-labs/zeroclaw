@@ -3,13 +3,14 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
-use crate::config::AutonomyConfig;
+use crate::config::{AutonomyConfig, NonCliNaturalLanguageApprovalMode};
 use crate::security::AutonomyLevel;
-use chrono::Utc;
-use parking_lot::Mutex;
+use chrono::{Duration, Utc};
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
+use uuid::Uuid;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -42,6 +43,26 @@ pub struct ApprovalLogEntry {
     pub channel: String,
 }
 
+/// A pending non-CLI approval request that still requires explicit confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingNonCliApprovalRequest {
+    pub request_id: String,
+    pub tool_name: String,
+    pub requested_by: String,
+    pub requested_channel: String,
+    pub requested_reply_target: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingApprovalError {
+    NotFound,
+    Expired,
+    RequesterMismatch,
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
 /// Manages the interactive approval workflow.
@@ -50,26 +71,81 @@ pub struct ApprovalLogEntry {
 /// - Maintains a session-scoped "always" allowlist
 /// - Records an audit trail of all decisions
 pub struct ApprovalManager {
-    /// Tools that never need approval (from config).
-    auto_approve: HashSet<String>,
-    /// Tools that always need approval, ignoring session allowlist.
-    always_ask: HashSet<String>,
+    /// Tools that never need approval (config + runtime updates).
+    auto_approve: RwLock<HashSet<String>>,
+    /// Tools that always need approval, ignoring session allowlist (config + runtime updates).
+    always_ask: RwLock<HashSet<String>>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
+    /// Session-scoped allowlist for non-CLI channels after explicit human approval.
+    non_cli_allowlist: Mutex<HashSet<String>>,
+    /// One-time non-CLI bypass tokens that allow a full tool loop turn without prompts.
+    non_cli_allow_all_once_remaining: Mutex<u32>,
+    /// Optional allowlist of senders allowed to manage non-CLI approvals.
+    non_cli_approval_approvers: RwLock<HashSet<String>>,
+    /// Default natural-language handling mode for non-CLI approval-management commands.
+    non_cli_natural_language_approval_mode: RwLock<NonCliNaturalLanguageApprovalMode>,
+    /// Optional per-channel overrides for natural-language approval mode.
+    non_cli_natural_language_approval_mode_by_channel:
+        RwLock<HashMap<String, NonCliNaturalLanguageApprovalMode>>,
+    /// Pending non-CLI approval requests awaiting explicit human confirmation.
+    pending_non_cli_requests: Mutex<HashMap<String, PendingNonCliApprovalRequest>>,
+    /// Resolved decision snapshots for pending non-CLI requests, consumed by
+    /// waiting tool loops.
+    resolved_non_cli_requests: Mutex<HashMap<String, ApprovalResponse>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
 }
 
 impl ApprovalManager {
+    fn normalize_non_cli_approvers(entries: &[String]) -> HashSet<String> {
+        entries
+            .iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect()
+    }
+
+    fn normalize_non_cli_natural_language_mode_by_channel(
+        entries: &HashMap<String, NonCliNaturalLanguageApprovalMode>,
+    ) -> HashMap<String, NonCliNaturalLanguageApprovalMode> {
+        entries
+            .iter()
+            .filter_map(|(channel, mode)| {
+                let normalized = channel.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    None
+                } else {
+                    Some((normalized, *mode))
+                }
+            })
+            .collect()
+    }
+
     /// Create from autonomy config.
     pub fn from_config(config: &AutonomyConfig) -> Self {
         Self {
-            auto_approve: config.auto_approve.iter().cloned().collect(),
-            always_ask: config.always_ask.iter().cloned().collect(),
+            auto_approve: RwLock::new(config.auto_approve.iter().cloned().collect()),
+            always_ask: RwLock::new(config.always_ask.iter().cloned().collect()),
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
+            non_cli_allowlist: Mutex::new(HashSet::new()),
+            non_cli_allow_all_once_remaining: Mutex::new(0),
+            non_cli_approval_approvers: RwLock::new(Self::normalize_non_cli_approvers(
+                &config.non_cli_approval_approvers,
+            )),
+            non_cli_natural_language_approval_mode: RwLock::new(
+                config.non_cli_natural_language_approval_mode,
+            ),
+            non_cli_natural_language_approval_mode_by_channel: RwLock::new(
+                Self::normalize_non_cli_natural_language_mode_by_channel(
+                    &config.non_cli_natural_language_approval_mode_by_channel,
+                ),
+            ),
+            pending_non_cli_requests: Mutex::new(HashMap::new()),
+            resolved_non_cli_requests: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -89,12 +165,12 @@ impl ApprovalManager {
         }
 
         // always_ask overrides everything.
-        if self.always_ask.contains(tool_name) {
+        if self.always_ask.read().contains(tool_name) {
             return true;
         }
 
         // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
+        if self.auto_approve.read().contains(tool_name) {
             return false;
         }
 
@@ -143,6 +219,364 @@ impl ApprovalManager {
     /// Get the current session allowlist.
     pub fn session_allowlist(&self) -> HashSet<String> {
         self.session_allowlist.lock().clone()
+    }
+
+    /// Grant session-scoped non-CLI approval for a specific tool.
+    pub fn grant_non_cli_session(&self, tool_name: &str) {
+        let mut allowlist = self.non_cli_allowlist.lock();
+        allowlist.insert(tool_name.to_string());
+    }
+
+    /// Revoke session-scoped non-CLI approval for a specific tool.
+    pub fn revoke_non_cli_session(&self, tool_name: &str) -> bool {
+        let mut allowlist = self.non_cli_allowlist.lock();
+        allowlist.remove(tool_name)
+    }
+
+    /// Check whether non-CLI session approval exists for a tool.
+    pub fn is_non_cli_session_granted(&self, tool_name: &str) -> bool {
+        let allowlist = self.non_cli_allowlist.lock();
+        allowlist.contains(tool_name)
+    }
+
+    /// Get the current non-CLI session allowlist.
+    pub fn non_cli_session_allowlist(&self) -> HashSet<String> {
+        self.non_cli_allowlist.lock().clone()
+    }
+
+    /// Grant one non-CLI "allow all tools/commands for one turn" token.
+    ///
+    /// Returns the remaining token count after increment.
+    pub fn grant_non_cli_allow_all_once(&self) -> u32 {
+        let mut remaining = self.non_cli_allow_all_once_remaining.lock();
+        *remaining = remaining.saturating_add(1);
+        *remaining
+    }
+
+    /// Consume one non-CLI "allow all tools/commands for one turn" token.
+    ///
+    /// Returns `true` when a token was consumed, `false` when none existed.
+    pub fn consume_non_cli_allow_all_once(&self) -> bool {
+        let mut remaining = self.non_cli_allow_all_once_remaining.lock();
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        true
+    }
+
+    /// Remaining one-time non-CLI "allow all tools/commands" tokens.
+    pub fn non_cli_allow_all_once_remaining(&self) -> u32 {
+        *self.non_cli_allow_all_once_remaining.lock()
+    }
+
+    /// Snapshot configured non-CLI approval approver entries.
+    pub fn non_cli_approval_approvers(&self) -> HashSet<String> {
+        self.non_cli_approval_approvers.read().clone()
+    }
+
+    /// Natural-language handling mode for non-CLI approval-management commands.
+    pub fn non_cli_natural_language_approval_mode(&self) -> NonCliNaturalLanguageApprovalMode {
+        *self.non_cli_natural_language_approval_mode.read()
+    }
+
+    /// Snapshot per-channel natural-language approval mode overrides.
+    pub fn non_cli_natural_language_approval_mode_by_channel(
+        &self,
+    ) -> HashMap<String, NonCliNaturalLanguageApprovalMode> {
+        self.non_cli_natural_language_approval_mode_by_channel
+            .read()
+            .clone()
+    }
+
+    /// Effective natural-language approval mode for a specific channel.
+    pub fn non_cli_natural_language_approval_mode_for_channel(
+        &self,
+        channel: &str,
+    ) -> NonCliNaturalLanguageApprovalMode {
+        let normalized = channel.trim().to_ascii_lowercase();
+        self.non_cli_natural_language_approval_mode_by_channel
+            .read()
+            .get(&normalized)
+            .copied()
+            .unwrap_or_else(|| self.non_cli_natural_language_approval_mode())
+    }
+
+    /// Check whether `sender` on `channel` may manage non-CLI approvals.
+    ///
+    /// If no approver entries are configured, this defaults to `true` so
+    /// existing setups continue to behave as before.
+    pub fn is_non_cli_approval_actor_allowed(&self, channel: &str, sender: &str) -> bool {
+        let approvers = self.non_cli_approval_approvers.read();
+        if approvers.is_empty() {
+            return true;
+        }
+
+        if approvers.contains("*") || approvers.contains(sender) {
+            return true;
+        }
+
+        let exact = format!("{channel}:{sender}");
+        if approvers.contains(&exact) {
+            return true;
+        }
+
+        let any_on_channel = format!("{channel}:*");
+        if approvers.contains(&any_on_channel) {
+            return true;
+        }
+
+        let sender_any_channel = format!("*:{sender}");
+        approvers.contains(&sender_any_channel)
+    }
+
+    /// Apply runtime + persisted approval grant semantics:
+    /// add to auto_approve and remove from always_ask.
+    pub fn apply_persistent_runtime_grant(&self, tool_name: &str) {
+        {
+            let mut auto = self.auto_approve.write();
+            auto.insert(tool_name.to_string());
+        }
+        let mut always = self.always_ask.write();
+        always.remove(tool_name);
+    }
+
+    /// Apply runtime + persisted approval revoke semantics:
+    /// remove from auto_approve.
+    pub fn apply_persistent_runtime_revoke(&self, tool_name: &str) -> bool {
+        let mut auto = self.auto_approve.write();
+        auto.remove(tool_name)
+    }
+
+    /// Replace runtime-persistent non-CLI policy from config hot-reload.
+    ///
+    /// This updates the effective policy sets used by non-CLI approval commands
+    /// without restarting the daemon.
+    pub fn replace_runtime_non_cli_policy(
+        &self,
+        auto_approve: &[String],
+        always_ask: &[String],
+        non_cli_approval_approvers: &[String],
+        non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
+        non_cli_natural_language_approval_mode_by_channel: &HashMap<
+            String,
+            NonCliNaturalLanguageApprovalMode,
+        >,
+    ) {
+        {
+            let mut auto = self.auto_approve.write();
+            *auto = auto_approve.iter().cloned().collect();
+        }
+        {
+            let mut always = self.always_ask.write();
+            *always = always_ask.iter().cloned().collect();
+        }
+        {
+            let mut approvers = self.non_cli_approval_approvers.write();
+            *approvers = Self::normalize_non_cli_approvers(non_cli_approval_approvers);
+        }
+        {
+            let mut mode = self.non_cli_natural_language_approval_mode.write();
+            *mode = non_cli_natural_language_approval_mode;
+        }
+        {
+            let mut mode_by_channel = self
+                .non_cli_natural_language_approval_mode_by_channel
+                .write();
+            *mode_by_channel = Self::normalize_non_cli_natural_language_mode_by_channel(
+                non_cli_natural_language_approval_mode_by_channel,
+            );
+        }
+    }
+
+    /// Snapshot runtime auto_approve entries.
+    pub fn auto_approve_tools(&self) -> HashSet<String> {
+        self.auto_approve.read().clone()
+    }
+
+    /// Snapshot runtime always_ask entries.
+    pub fn always_ask_tools(&self) -> HashSet<String> {
+        self.always_ask.read().clone()
+    }
+
+    /// Create a pending non-CLI approval request. If a matching active request
+    /// already exists for (tool, requester, channel), returns that existing request.
+    pub fn create_non_cli_pending_request(
+        &self,
+        tool_name: &str,
+        requested_by: &str,
+        requested_channel: &str,
+        requested_reply_target: &str,
+        reason: Option<String>,
+    ) -> PendingNonCliApprovalRequest {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+
+        if let Some(existing) = pending
+            .values()
+            .find(|req| {
+                req.tool_name == tool_name
+                    && req.requested_by == requested_by
+                    && req.requested_channel == requested_channel
+                    && req.requested_reply_target == requested_reply_target
+            })
+            .cloned()
+        {
+            return existing;
+        }
+
+        let now = Utc::now();
+        let expires = now + Duration::minutes(30);
+        let mut request_id = format!("apr-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        while pending.contains_key(&request_id) {
+            request_id = format!("apr-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        }
+
+        let req = PendingNonCliApprovalRequest {
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_string(),
+            requested_by: requested_by.to_string(),
+            requested_channel: requested_channel.to_string(),
+            requested_reply_target: requested_reply_target.to_string(),
+            reason,
+            created_at: now.to_rfc3339(),
+            expires_at: expires.to_rfc3339(),
+        };
+        pending.insert(request_id, req.clone());
+        self.resolved_non_cli_requests
+            .lock()
+            .remove(&req.request_id);
+        req
+    }
+
+    /// Confirm a pending non-CLI approval request.
+    /// Confirmation must come from the same sender in the same channel.
+    pub fn confirm_non_cli_pending_request(
+        &self,
+        request_id: &str,
+        confirmed_by: &str,
+        confirmed_channel: &str,
+        confirmed_reply_target: &str,
+    ) -> Result<PendingNonCliApprovalRequest, PendingApprovalError> {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+
+        let Some(req) = pending.remove(request_id) else {
+            return Err(PendingApprovalError::NotFound);
+        };
+
+        if is_pending_request_expired(&req) {
+            return Err(PendingApprovalError::Expired);
+        }
+
+        if req.requested_by != confirmed_by
+            || req.requested_channel != confirmed_channel
+            || req.requested_reply_target != confirmed_reply_target
+        {
+            pending.insert(req.request_id.clone(), req);
+            return Err(PendingApprovalError::RequesterMismatch);
+        }
+
+        Ok(req)
+    }
+
+    /// Reject a pending non-CLI approval request.
+    /// Rejection must come from the same sender in the same channel.
+    pub fn reject_non_cli_pending_request(
+        &self,
+        request_id: &str,
+        rejected_by: &str,
+        rejected_channel: &str,
+        rejected_reply_target: &str,
+    ) -> Result<PendingNonCliApprovalRequest, PendingApprovalError> {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+
+        let Some(req) = pending.remove(request_id) else {
+            return Err(PendingApprovalError::NotFound);
+        };
+
+        if is_pending_request_expired(&req) {
+            return Err(PendingApprovalError::Expired);
+        }
+
+        if req.requested_by != rejected_by
+            || req.requested_channel != rejected_channel
+            || req.requested_reply_target != rejected_reply_target
+        {
+            pending.insert(req.request_id.clone(), req);
+            return Err(PendingApprovalError::RequesterMismatch);
+        }
+
+        Ok(req)
+    }
+
+    /// Return whether a pending non-CLI request still exists.
+    pub fn has_non_cli_pending_request(&self, request_id: &str) -> bool {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+        pending.contains_key(request_id)
+    }
+
+    /// Record a yes/no resolution for a pending non-CLI request.
+    pub fn record_non_cli_pending_resolution(&self, request_id: &str, decision: ApprovalResponse) {
+        if !matches!(decision, ApprovalResponse::Yes | ApprovalResponse::No) {
+            return;
+        }
+
+        let mut resolved = self.resolved_non_cli_requests.lock();
+        if resolved.len() >= 1024 {
+            if let Some(first_key) = resolved.keys().next().cloned() {
+                resolved.remove(&first_key);
+            }
+        }
+        resolved.insert(request_id.to_string(), decision);
+    }
+
+    /// Consume a resolved pending-request decision if present.
+    pub fn take_non_cli_pending_resolution(&self, request_id: &str) -> Option<ApprovalResponse> {
+        self.resolved_non_cli_requests.lock().remove(request_id)
+    }
+
+    /// List active pending non-CLI approval requests.
+    pub fn list_non_cli_pending_requests(
+        &self,
+        requested_by: Option<&str>,
+        requested_channel: Option<&str>,
+        requested_reply_target: Option<&str>,
+    ) -> Vec<PendingNonCliApprovalRequest> {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+
+        let mut rows = pending
+            .values()
+            .filter(|req| {
+                requested_by.map_or(true, |by| req.requested_by == by)
+                    && requested_channel.map_or(true, |channel| req.requested_channel == channel)
+                    && requested_reply_target.map_or(true, |reply_target| {
+                        req.requested_reply_target == reply_target
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        rows
+    }
+
+    /// Remove all pending requests for a tool.
+    pub fn clear_non_cli_pending_requests_for_tool(&self, tool_name: &str) -> usize {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+        let mut resolved = self.resolved_non_cli_requests.lock();
+        let before = pending.len();
+        pending.retain(|request_id, req| {
+            let keep = req.tool_name != tool_name;
+            if !keep {
+                resolved.remove(request_id);
+            }
+            keep
+        });
+        before.saturating_sub(pending.len())
     }
 
     /// Prompt the user on the CLI and return their decision.
@@ -212,6 +646,20 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
     } else {
         input.to_string()
     }
+}
+
+fn is_pending_request_expired(req: &PendingNonCliApprovalRequest) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&req.expires_at)
+        .map(|dt| dt.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(true)
+}
+
+fn prune_expired_pending_requests(
+    pending: &mut HashMap<String, PendingNonCliApprovalRequest>,
+) -> usize {
+    let before = pending.len();
+    pending.retain(|_, req| !is_pending_request_expired(req));
+    before.saturating_sub(pending.len())
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -321,6 +769,290 @@ mod tests {
             "cli",
         );
         assert!(mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn non_cli_session_approval_persists_across_checks() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(!mgr.is_non_cli_session_granted("shell"));
+
+        mgr.grant_non_cli_session("shell");
+        assert!(mgr.is_non_cli_session_granted("shell"));
+        assert!(mgr.is_non_cli_session_granted("shell"));
+    }
+
+    #[test]
+    fn non_cli_session_approval_can_be_revoked() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.grant_non_cli_session("shell");
+        assert!(mgr.is_non_cli_session_granted("shell"));
+
+        assert!(mgr.revoke_non_cli_session("shell"));
+        assert!(!mgr.is_non_cli_session_granted("shell"));
+        assert!(!mgr.revoke_non_cli_session("shell"));
+    }
+
+    #[test]
+    fn non_cli_session_allowlist_snapshot_lists_granted_tools() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.grant_non_cli_session("shell");
+        mgr.grant_non_cli_session("file_write");
+
+        let allowlist = mgr.non_cli_session_allowlist();
+        assert!(allowlist.contains("shell"));
+        assert!(allowlist.contains("file_write"));
+    }
+
+    #[test]
+    fn non_cli_allow_all_once_tokens_are_counted_and_consumed() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 0);
+        assert!(!mgr.consume_non_cli_allow_all_once());
+
+        assert_eq!(mgr.grant_non_cli_allow_all_once(), 1);
+        assert_eq!(mgr.grant_non_cli_allow_all_once(), 2);
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 2);
+
+        assert!(mgr.consume_non_cli_allow_all_once());
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 1);
+        assert!(mgr.consume_non_cli_allow_all_once());
+        assert_eq!(mgr.non_cli_allow_all_once_remaining(), 0);
+        assert!(!mgr.consume_non_cli_allow_all_once());
+    }
+
+    #[test]
+    fn persistent_runtime_grant_updates_policy_immediately() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(mgr.needs_approval("shell"));
+
+        mgr.apply_persistent_runtime_grant("shell");
+        assert!(!mgr.needs_approval("shell"));
+        assert!(mgr.auto_approve_tools().contains("shell"));
+        assert!(!mgr.always_ask_tools().contains("shell"));
+    }
+
+    #[test]
+    fn persistent_runtime_revoke_updates_policy_immediately() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(!mgr.needs_approval("file_read"));
+
+        assert!(mgr.apply_persistent_runtime_revoke("file_read"));
+        assert!(mgr.needs_approval("file_read"));
+        assert!(!mgr.apply_persistent_runtime_revoke("file_read"));
+    }
+
+    #[test]
+    fn create_and_confirm_pending_non_cli_approval_request() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+        assert_eq!(req.tool_name, "shell");
+        assert!(req.request_id.starts_with("apr-"));
+
+        let confirmed = mgr
+            .confirm_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-1")
+            .expect("request should confirm");
+        assert_eq!(confirmed.request_id, req.request_id);
+        assert!(mgr
+            .confirm_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-1")
+            .is_err());
+    }
+
+    #[test]
+    fn create_and_reject_pending_non_cli_approval_request() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+
+        let rejected = mgr
+            .reject_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-1")
+            .expect("request should reject");
+        assert_eq!(rejected.request_id, req.request_id);
+        assert!(!mgr.has_non_cli_pending_request(&req.request_id));
+    }
+
+    #[test]
+    fn pending_non_cli_resolution_is_recorded_and_consumed() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+
+        mgr.record_non_cli_pending_resolution(&req.request_id, ApprovalResponse::Yes);
+        assert_eq!(
+            mgr.take_non_cli_pending_resolution(&req.request_id),
+            Some(ApprovalResponse::Yes)
+        );
+        assert_eq!(mgr.take_non_cli_pending_resolution(&req.request_id), None);
+    }
+
+    #[test]
+    fn pending_non_cli_approval_requires_same_sender_and_channel() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+
+        let err = mgr
+            .confirm_non_cli_pending_request(&req.request_id, "bob", "telegram", "chat-1")
+            .expect_err("mismatched sender should fail");
+        assert_eq!(err, PendingApprovalError::RequesterMismatch);
+
+        // Request remains pending after mismatch.
+        let pending =
+            mgr.list_non_cli_pending_requests(Some("alice"), Some("telegram"), Some("chat-1"));
+        assert_eq!(pending.len(), 1);
+
+        let err = mgr
+            .confirm_non_cli_pending_request(&req.request_id, "alice", "discord", "chat-1")
+            .expect_err("mismatched channel should fail");
+        assert_eq!(err, PendingApprovalError::RequesterMismatch);
+
+        let err = mgr
+            .confirm_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-2")
+            .expect_err("mismatched reply target should fail");
+        assert_eq!(err, PendingApprovalError::RequesterMismatch);
+    }
+
+    #[test]
+    fn list_pending_non_cli_approvals_filters_scope() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+        mgr.create_non_cli_pending_request("file_write", "bob", "telegram", "chat-1", None);
+        mgr.create_non_cli_pending_request("browser_open", "alice", "discord", "chat-9", None);
+        mgr.create_non_cli_pending_request("schedule", "alice", "telegram", "chat-2", None);
+
+        let alice_telegram =
+            mgr.list_non_cli_pending_requests(Some("alice"), Some("telegram"), Some("chat-1"));
+        assert_eq!(alice_telegram.len(), 1);
+        assert_eq!(alice_telegram[0].tool_name, "shell");
+
+        let telegram_chat1 =
+            mgr.list_non_cli_pending_requests(None, Some("telegram"), Some("chat-1"));
+        assert_eq!(telegram_chat1.len(), 2);
+    }
+
+    #[test]
+    fn pending_non_cli_approval_expiry_is_pruned() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+
+        {
+            let mut pending = mgr.pending_non_cli_requests.lock();
+            let row = pending.get_mut(&req.request_id).expect("request row");
+            row.expires_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+        }
+
+        let rows = mgr.list_non_cli_pending_requests(None, None, None);
+        assert!(rows.is_empty());
+        let err = mgr
+            .confirm_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-1")
+            .expect_err("expired request should not confirm");
+        assert_eq!(err, PendingApprovalError::NotFound);
+    }
+
+    #[test]
+    fn non_cli_approval_actor_defaults_to_allow_when_not_configured() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(mgr.is_non_cli_approval_actor_allowed("telegram", "alice"));
+        assert!(mgr.is_non_cli_approval_actor_allowed("discord", "bob"));
+    }
+
+    #[test]
+    fn non_cli_natural_language_approval_mode_defaults_to_direct() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode(),
+            NonCliNaturalLanguageApprovalMode::Direct
+        );
+    }
+
+    #[test]
+    fn non_cli_approval_actor_allowlist_supports_exact_and_wildcards() {
+        let mut cfg = supervised_config();
+        cfg.non_cli_approval_approvers = vec![
+            "alice".to_string(),
+            "telegram:bob".to_string(),
+            "discord:*".to_string(),
+            "*:carol".to_string(),
+        ];
+        let mgr = ApprovalManager::from_config(&cfg);
+
+        assert!(mgr.is_non_cli_approval_actor_allowed("telegram", "alice"));
+        assert!(mgr.is_non_cli_approval_actor_allowed("telegram", "bob"));
+        assert!(mgr.is_non_cli_approval_actor_allowed("discord", "anyone"));
+        assert!(mgr.is_non_cli_approval_actor_allowed("matrix", "carol"));
+
+        assert!(!mgr.is_non_cli_approval_actor_allowed("telegram", "mallory"));
+        assert!(!mgr.is_non_cli_approval_actor_allowed("matrix", "bob"));
+    }
+
+    #[test]
+    fn non_cli_natural_language_approval_mode_honors_config_override() {
+        let mut cfg = supervised_config();
+        cfg.non_cli_natural_language_approval_mode =
+            NonCliNaturalLanguageApprovalMode::RequestConfirm;
+        let mgr = ApprovalManager::from_config(&cfg);
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode(),
+            NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+    }
+
+    #[test]
+    fn non_cli_natural_language_approval_mode_supports_per_channel_override() {
+        let mut cfg = supervised_config();
+        cfg.non_cli_natural_language_approval_mode = NonCliNaturalLanguageApprovalMode::Direct;
+        cfg.non_cli_natural_language_approval_mode_by_channel
+            .insert(
+                "discord".to_string(),
+                NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            );
+        let mgr = ApprovalManager::from_config(&cfg);
+
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode_for_channel("telegram"),
+            NonCliNaturalLanguageApprovalMode::Direct
+        );
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode_for_channel("discord"),
+            NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+    }
+
+    #[test]
+    fn replace_runtime_non_cli_policy_updates_modes_and_approvers() {
+        let cfg = supervised_config();
+        let mgr = ApprovalManager::from_config(&cfg);
+
+        let mut mode_overrides = HashMap::new();
+        mode_overrides.insert(
+            "telegram".to_string(),
+            NonCliNaturalLanguageApprovalMode::Disabled,
+        );
+        mode_overrides.insert(
+            "discord".to_string(),
+            NonCliNaturalLanguageApprovalMode::RequestConfirm,
+        );
+
+        mgr.replace_runtime_non_cli_policy(
+            &["mock_price".to_string()],
+            &["shell".to_string()],
+            &["telegram:alice".to_string()],
+            NonCliNaturalLanguageApprovalMode::Direct,
+            &mode_overrides,
+        );
+
+        assert!(!mgr.needs_approval("mock_price"));
+        assert!(mgr.needs_approval("shell"));
+        assert!(mgr.is_non_cli_approval_actor_allowed("telegram", "alice"));
+        assert!(!mgr.is_non_cli_approval_actor_allowed("telegram", "bob"));
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode_for_channel("telegram"),
+            NonCliNaturalLanguageApprovalMode::Disabled
+        );
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode_for_channel("discord"),
+            NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+        assert_eq!(
+            mgr.non_cli_natural_language_approval_mode_for_channel("slack"),
+            NonCliNaturalLanguageApprovalMode::Direct
+        );
     }
 
     // ── audit log ────────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 25, 2026**.
 
 ## Release Goals
 
@@ -22,21 +22,28 @@ Last verified: **February 21, 2026**.
 Release automation lives in:
 
 - `.github/workflows/pub-release.yml`
-- `.github/workflows/pub-homebrew-core.yml` (manual Homebrew formula PR, bot-owned)
 
 Modes:
 
 - Tag push `v*`: publish mode.
 - Manual dispatch: verification-only or publish mode.
 - Weekly schedule: verification-only mode.
+- Pre-release tags (`vX.Y.Z-alpha.N`, `vX.Y.Z-beta.N`, `vX.Y.Z-rc.N`): prerelease publish path.
+- Canary gate (weekly/manual): promote/hold/abort decision path.
 
 Publish-mode guardrails:
 
-- Tag must match semver-like format `vX.Y.Z[-suffix]`.
+- Tag must match stable format `vX.Y.Z` (pre-release tags are handled by `Pub Pre-release`).
 - Tag must already exist on origin.
+- Tag must be annotated (lightweight tags are rejected).
 - Tag commit must be reachable from `origin/main`.
+- Publish trigger actor must be in `RELEASE_AUTHORIZED_ACTORS` allowlist.
+- Optional tagger-email allowlist can be enforced via `RELEASE_AUTHORIZED_TAGGER_EMAILS`.
 - Matching GHCR image tag (`ghcr.io/<owner>/<repo>:<tag>`) must be available before GitHub Release publish completes.
 - Artifacts are verified before publish.
+- Trigger provenance is recorded in `release-trigger-guard.json` and `audit-event-release-trigger-guard.json`.
+- Multi-arch artifact contract is enforced by `.github/release/release-artifact-contract.json` through `release_artifact_guard.py`.
+- Release notes include a generated supply-chain evidence preface (`release-notes-supply-chain.md`) plus GitHub-generated commit-window notes.
 
 ## Maintainer Procedure
 
@@ -56,8 +63,10 @@ Run `Pub Release` manually:
 Expected outcome:
 
 - Full target matrix builds successfully.
-- `verify-artifacts` confirms all expected archives exist.
+- `verify-artifacts` enforces archive completeness against `.github/release/release-artifact-contract.json`.
 - No GitHub Release is published.
+- `release-trigger-guard` artifact is emitted with authorization/provenance evidence.
+- `release-artifact-guard-verify` artifact is emitted with `release-artifact-guard.verify.json`, `release-artifact-guard.verify.md`, and `audit-event-release-artifact-guard-verify.json`.
 
 ### 3) Cut release tag
 
@@ -72,7 +81,7 @@ This script enforces:
 - clean working tree
 - `HEAD == origin/main`
 - non-duplicate tag
-- semver-like tag format
+- stable semver tag format (`vX.Y.Z`)
 
 ### 4) Monitor publish run
 
@@ -88,32 +97,62 @@ Expected publish outputs:
 - `CycloneDX` and `SPDX` SBOMs
 - cosign signatures/certificates
 - GitHub Release notes + assets
+- `release-artifact-guard.publish.json` + `release-artifact-guard.publish.md`
+- `audit-event-release-artifact-guard-publish.json` proving publish-stage artifact contract completeness
+- `zeroclaw.sha256sums.intoto.json` + `audit-event-release-sha256sums-provenance.json` for checksum provenance linkage
+- `release-notes-supply-chain.md` / `release-notes-supply-chain.json` with release-asset references (manifest, SBOM, provenance, guard audit artifacts)
+- Docker publish evidence from `Pub Docker Img`: `ghcr-publish-contract.json` + `audit-event-ghcr-publish-contract.json` + `ghcr-vulnerability-gate.json` + `audit-event-ghcr-vulnerability-gate.json` + Trivy reports
 
 ### 5) Post-release validation
 
 1. Verify GitHub Release assets are downloadable.
-2. Verify GHCR tags for the released version (`vX.Y.Z`) and release commit SHA tag (`sha-<12>`).
-3. Verify install paths that rely on release assets (for example bootstrap binary download).
+2. Verify GHCR tags for the released version (`vX.Y.Z`), release commit SHA tag (`sha-<12>`), and `latest`.
+3. Verify GHCR digest parity evidence confirms:
+   - `digest(vX.Y.Z) == digest(sha-<12>)`
+   - `digest(latest) == digest(vX.Y.Z)`
+4. Verify GHCR vulnerability gate evidence (`ghcr-vulnerability-gate.json`) reports `ready=true` and that `audit-event-ghcr-vulnerability-gate.json` is present.
+5. Verify install paths that rely on release assets (for example bootstrap binary download).
 
-### 6) Publish Homebrew Core formula (bot-owned)
+### 5.1) Canary gate before broad rollout
 
-Run `Pub Homebrew Core` manually:
+Run `CI Canary Gate` (`.github/workflows/ci-canary-gate.yml`) in `dry-run` first, then `execute` when metrics are complete.
 
-- `release_tag`: `vX.Y.Z`
-- `dry_run`: `true` first, then `false`
+Required inputs:
 
-Required repository settings for non-dry-run:
+- candidate tag/SHA
+- observed error rate
+- observed crash rate
+- observed p95 latency
+- observed sample size
 
-- secret: `HOMEBREW_CORE_BOT_TOKEN` (token from a dedicated bot account, not a personal maintainer account)
-- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `zeroclaw-release-bot/homebrew-core`)
-- optional variable: `HOMEBREW_CORE_BOT_EMAIL`
+Decision output:
 
-Workflow guardrails:
+- `promote`: thresholds satisfied
+- `hold`: insufficient evidence or soft breach
+- `abort`: hard threshold breach
 
-- release tag must match `Cargo.toml` version
-- formula source URL and SHA256 are updated from the tagged tarball
-- formula license is normalized to `Apache-2.0 OR MIT`
-- PR is opened from the bot fork into `Homebrew/homebrew-core:master`
+Abort integration:
+
+- In `execute` mode, if decision is `abort` and `trigger_rollback_on_abort=true`, canary gate dispatches `CI Rollback Guard` automatically.
+- Default rollback branch is `dev` (override with `rollback_branch`).
+- Optional explicit rollback target can be passed via `rollback_target_ref`.
+
+### 5.2) Pre-release stage progression (alpha/beta/rc/stable policy)
+
+For staged release confidence:
+
+1. Cut and push stage tag (`vX.Y.Z-alpha.N`, then beta, then rc).
+2. `Pub Pre-release` validates:
+   - stage progression
+   - stage matrix completeness (`alpha|beta|rc|stable` policy coverage)
+   - monotonic same-stage numbering
+   - origin/main ancestry
+   - Cargo version/tag alignment
+3. Guard artifacts publish transition audit evidence and stage history:
+   - `transition.type` / `transition.outcome`
+   - `transition.previous_highest_stage` and `transition.required_previous_tag`
+   - `stage_history.per_stage` and `stage_history.latest_stage`
+4. Publish prerelease assets only after guard passes.
 
 ## Emergency / Recovery Path
 
@@ -125,6 +164,13 @@ If tag-push release fails after artifacts are validated:
    - `release_tag=<existing tag>`
    - `release_ref` is automatically pinned to `release_tag` in publish mode
 3. Re-validate released assets.
+
+If prerelease/canary lanes fail:
+
+1. Inspect guard artifacts (`prerelease-guard.json`, `canary-guard.json`).
+2. For prerelease failures, inspect `transition` + `stage_history` fields first to classify promotion, stage iteration, or demotion-blocked attempts.
+3. Fix stage-policy or quality regressions.
+4. Re-run guard in `dry-run` before any execute/publish action.
 
 ## Operational Notes
 

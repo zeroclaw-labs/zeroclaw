@@ -43,6 +43,22 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Return the greatest valid UTF-8 char boundary at or below `index`.
+///
+/// This mirrors `str::floor_char_boundary` behavior while remaining compatible
+/// with stable toolchains where that API is not available.
+pub fn floor_utf8_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),
@@ -141,5 +157,22 @@ mod tests {
     fn test_truncate_zero_max_chars() {
         // Edge case: max_chars = 0
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
+    }
+
+    #[test]
+    fn test_floor_utf8_char_boundary_ascii() {
+        assert_eq!(floor_utf8_char_boundary("hello", 0), 0);
+        assert_eq!(floor_utf8_char_boundary("hello", 3), 3);
+        assert_eq!(floor_utf8_char_boundary("hello", 99), 5);
+    }
+
+    #[test]
+    fn test_floor_utf8_char_boundary_multibyte() {
+        let s = "aé你🦀";
+        assert_eq!(floor_utf8_char_boundary(s, 1), 1);
+        // Index 2 is inside "é" (2-byte char), floor should move back to 1.
+        assert_eq!(floor_utf8_char_boundary(s, 2), 1);
+        // Index 5 is inside "你" (3-byte char), floor should move back to 3.
+        assert_eq!(floor_utf8_char_boundary(s, 5), 3);
     }
 }

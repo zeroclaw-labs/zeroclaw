@@ -11,6 +11,61 @@ use uuid::Uuid;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// A no-op TLS certificate verifier used for `tls = "require"` mode.
+///
+/// This accepts any server certificate without verification — equivalent to
+/// PostgreSQL's `sslmode=require`. Use `tls = "verify-full"` for production
+/// environments where cert authenticity matters.
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// PostgreSQL-backed persistent memory.
 ///
 /// This backend focuses on reliable CRUD and keyword recall using SQL, without
@@ -26,6 +81,7 @@ impl PostgresMemory {
         schema: &str,
         table: &str,
         connect_timeout_secs: Option<u64>,
+        tls_mode: bool,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -37,6 +93,7 @@ impl PostgresMemory {
         let client = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
+            tls_mode,
             schema_ident.clone(),
             qualified_table.clone(),
         )?;
@@ -50,6 +107,7 @@ impl PostgresMemory {
     fn initialize_client(
         db_url: String,
         connect_timeout_secs: Option<u64>,
+        tls_mode: bool,
         schema_ident: String,
         qualified_table: String,
     ) -> Result<Client> {
@@ -65,9 +123,28 @@ impl PostgresMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect to PostgreSQL memory backend")?;
+                let mut client = if tls_mode {
+                    // TLS enabled: encrypt the connection but skip certificate
+                    // verification (suitable for self-signed certs and most
+                    // managed cloud databases whose CA is not in webpki-roots).
+                    let tls_config = rustls::ClientConfig::builder()
+                        .with_root_certificates(rustls::RootCertStore::empty())
+                        .with_no_client_auth();
+                    let tls_config = {
+                        let mut cfg = tls_config;
+                        cfg.dangerous()
+                            .set_certificate_verifier(std::sync::Arc::new(NoCertVerifier));
+                        cfg
+                    };
+                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
+                    config
+                        .connect(tls)
+                        .context("failed to connect to PostgreSQL memory backend (TLS)")?
+                } else {
+                    config
+                        .connect(NoTls)
+                        .context("failed to connect to PostgreSQL memory backend")?
+                };
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
                 Ok(client)
@@ -381,6 +458,7 @@ mod tests {
                 "public",
                 "memories",
                 Some(1),
+                false,
             )
         });
 

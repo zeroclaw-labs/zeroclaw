@@ -26,6 +26,8 @@ pub mod rpi;
 
 use crate::config::{Config, PeripheralBoardConfig, PeripheralsConfig};
 #[cfg(feature = "hardware")]
+use crate::peripherals::traits::Peripheral;
+#[cfg(feature = "hardware")]
 use crate::tools::HardwareMemoryMapTool;
 use crate::tools::Tool;
 use anyhow::Result;
@@ -226,6 +228,7 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
 }
 
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
 pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
     Ok(Vec::new())
 }

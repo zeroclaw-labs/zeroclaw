@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::path::{Path, PathBuf};
 
 /// Runtime adapter that abstracts platform differences for the agent.
@@ -12,6 +13,9 @@ use std::path::{Path, PathBuf};
 /// Implementations must be `Send + Sync` because the adapter is shared
 /// across async tasks on the Tokio runtime.
 pub trait RuntimeAdapter: Send + Sync {
+    /// Downcast support for runtime-specific capabilities.
+    fn as_any(&self) -> &dyn Any;
+
     /// Return the human-readable name of this runtime environment.
     ///
     /// Used in logs and diagnostics (e.g., `"native"`, `"docker"`,
@@ -77,6 +81,10 @@ mod tests {
     struct DummyRuntime;
 
     impl RuntimeAdapter for DummyRuntime {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn name(&self) -> &str {
             "dummy-runtime"
         }

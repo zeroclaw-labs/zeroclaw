@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 mod audit;
+mod templates;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -73,7 +74,7 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -82,6 +83,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
+        Some(config.skills.allow_scripts),
     )
 }
 
@@ -89,25 +91,27 @@ fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
+    config_allow_scripts: Option<bool>,
 ) -> Vec<Skill> {
     let mut skills = Vec::new();
+    let allow_scripts = config_allow_scripts.unwrap_or(false);
 
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
     {
-        skills.extend(load_open_skills(&open_skills_dir));
+        skills.extend(load_open_skills(&open_skills_dir, allow_scripts));
     }
 
-    skills.extend(load_workspace_skills(workspace_dir));
+    skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
     skills
 }
 
-fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
+fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     let skills_dir = workspace_dir.join("skills");
-    load_skills_from_directory(&skills_dir)
+    load_skills_from_directory(&skills_dir, allow_scripts)
 }
 
-fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
+fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -124,7 +128,10 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
             continue;
         }
 
-        match audit::audit_skill_directory(&path) {
+        match audit::audit_skill_directory_with_options(
+            &path,
+            audit::SkillAuditOptions { allow_scripts },
+        ) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 tracing::warn!(
@@ -161,13 +168,13 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
     skills
 }
 
-fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
+fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
     // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
     // as executable skills.
     let nested_skills_dir = repo_dir.join("skills");
     if nested_skills_dir.is_dir() {
-        return load_skills_from_directory(&nested_skills_dir);
+        return load_skills_from_directory(&nested_skills_dir, allow_scripts);
     }
 
     let mut skills = Vec::new();
@@ -238,7 +245,7 @@ fn open_skills_enabled_from_sources(
     env_override: Option<&str>,
 ) -> bool {
     if let Some(raw) = env_override {
-        if let Some(enabled) = parse_open_skills_enabled(&raw) {
+        if let Some(enabled) = parse_open_skills_enabled(raw) {
             return enabled;
         }
         if !raw.trim().is_empty() {
@@ -300,13 +307,23 @@ fn ensure_open_skills_repo(
     let repo_dir = resolve_open_skills_dir(config_open_skills_dir)?;
 
     if !repo_dir.exists() {
-        if !clone_open_skills_repo(&repo_dir) {
-            return None;
+        // Never clone from the network during tests — tests that need a local
+        // open-skills directory must provide one via config.skills.open_skills_dir.
+        #[cfg(test)]
+        return None;
+
+        #[cfg(not(test))]
+        {
+            if !clone_open_skills_repo(&repo_dir) {
+                return None;
+            }
+            let _ = mark_open_skills_synced(&repo_dir);
+            return Some(repo_dir);
         }
-        let _ = mark_open_skills_synced(&repo_dir);
-        return Some(repo_dir);
     }
 
+    // Never pull from the network during tests.
+    #[cfg(not(test))]
     if should_sync_open_skills(&repo_dir) {
         if pull_open_skills_repo(&repo_dir) {
             let _ = mark_open_skills_synced(&repo_dir);
@@ -420,17 +437,41 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let name = dir
+    let mut name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let mut version = "0.1.0".to_string();
+    let mut author: Option<String> = None;
+
+    // If _meta.json exists alongside SKILL.md, use it for name/version/author.
+    // This covers skills installed from zip-based registries (e.g. any zip source).
+    let meta_path = dir.join("_meta.json");
+    if meta_path.exists() {
+        if let Ok(raw) = std::fs::read(&meta_path) {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(slug) = meta.get("slug").and_then(|v| v.as_str()) {
+                    let normalized = normalize_skill_name(slug.split('/').last().unwrap_or(slug));
+                    if !normalized.is_empty() {
+                        name = normalized;
+                    }
+                }
+                if let Some(v) = meta.get("version").and_then(|v| v.as_str()) {
+                    version = v.to_string();
+                }
+                if let Some(owner) = meta.get("ownerId").and_then(|v| v.as_str()) {
+                    author = Some(owner.to_string());
+                }
+            }
+        }
+    }
 
     Ok(Skill {
         name,
         description: extract_description(&content),
-        version: "0.1.0".to_string(),
-        author: None,
+        version,
+        author,
         tags: Vec::new(),
         tools: Vec::new(),
         prompts: vec![content],
@@ -709,8 +750,14 @@ fn detect_newly_installed_directory(
     }
 }
 
-fn enforce_skill_security_audit(skill_path: &Path) -> Result<audit::SkillAuditReport> {
-    let report = audit::audit_skill_directory(skill_path)?;
+fn enforce_skill_security_audit(
+    skill_path: &Path,
+    allow_scripts: bool,
+) -> Result<audit::SkillAuditReport> {
+    let report = audit::audit_skill_directory_with_options(
+        skill_path,
+        audit::SkillAuditOptions { allow_scripts },
+    )?;
     if report.is_clean() {
         return Ok(report);
     }
@@ -772,7 +819,11 @@ fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+fn install_local_skill_source(
+    source: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+) -> Result<(PathBuf, usize)> {
     let source_path = PathBuf::from(source);
     if !source_path.exists() {
         anyhow::bail!("Source path does not exist: {source}");
@@ -781,7 +832,7 @@ fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathB
     let source_path = source_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize source path {source}"))?;
-    let _ = enforce_skill_security_audit(&source_path)?;
+    let _ = enforce_skill_security_audit(&source_path, allow_scripts)?;
 
     let name = source_path
         .file_name()
@@ -796,7 +847,7 @@ fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathB
         return Err(err);
     }
 
-    match enforce_skill_security_audit(&dest) {
+    match enforce_skill_security_audit(&dest, allow_scripts) {
         Ok(report) => Ok((dest, report.files_scanned)),
         Err(err) => {
             let _ = std::fs::remove_dir_all(&dest);
@@ -805,7 +856,11 @@ fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathB
     }
 }
 
-fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+fn install_git_skill_source(
+    source: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+) -> Result<(PathBuf, usize)> {
     let before = snapshot_skill_children(skills_path)?;
     let output = std::process::Command::new("git")
         .args(["clone", "--depth", "1", source])
@@ -818,7 +873,7 @@ fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf
 
     let installed_dir = detect_newly_installed_directory(skills_path, &before)?;
     remove_git_metadata(&installed_dir)?;
-    match enforce_skill_security_audit(&installed_dir) {
+    match enforce_skill_security_audit(&installed_dir, allow_scripts) {
         Ok(report) => Ok((installed_dir, report.files_scanned)),
         Err(err) => {
             let _ = std::fs::remove_dir_all(&installed_dir);
@@ -827,11 +882,1076 @@ fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf
     }
 }
 
+// ─── Scaffold (zeroclaw skill new) ───────────────────────────────────────────
+
+/// Create a new skill project from a named template.
+///
+/// Protocol: the generated WASM tool reads JSON from **stdin** and writes a
+/// `{"success":bool,"output":"...","error":null|"..."}` JSON to **stdout**.
+/// No custom SDK or ABI boilerplate needed — just standard WASI stdio.
+pub fn scaffold_skill(
+    name: &str,
+    template_name: &str,
+    dest_parent: &std::path::Path,
+) -> Result<()> {
+    // Validate name: allowlist only ASCII alphanumeric, '_', '-'; no path traversal.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "Invalid skill name '{}': use only letters, digits, '_', or '-' (snake_case or kebab-case)",
+            name
+        );
+    }
+
+    let tmpl = templates::find(template_name).ok_or_else(|| {
+        let names: Vec<&str> = templates::ALL.iter().map(|t| t.name).collect();
+        anyhow::anyhow!(
+            "Unknown template '{template_name}'. Run 'zeroclaw skill templates' to list available templates.\nAvailable: {}",
+            names.join(", ")
+        )
+    })?;
+
+    let skill_dir = dest_parent.join(name);
+    if skill_dir.exists() {
+        anyhow::bail!("Directory already exists: {}", skill_dir.display());
+    }
+    std::fs::create_dir_all(&skill_dir)?;
+
+    let bin_name = name.replace('-', "_");
+
+    // Run all file writes in a closure; remove skill_dir on any error to avoid
+    // leaving a partial scaffold behind (mirrors install_registry_skill_source).
+    let result = (|| -> Result<()> {
+        for file in tmpl.files {
+            let path = skill_dir.join(file.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = templates::apply(file.content, name, &bin_name);
+            std::fs::write(&path, content)?;
+        }
+
+        // Common files not in templates
+        std::fs::write(
+            skill_dir.join(".gitignore"),
+            "tool.wasm\nnode_modules/\ntarget/\n*.js.map\n",
+        )?;
+        write_skill_md(&skill_dir, name, tmpl.description, tmpl.test_args)?;
+        write_readme(&skill_dir, name, tmpl.language, tmpl.test_args)?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            Err(e)
+        }
+    }
+}
+
+fn write_skill_md(
+    dir: &std::path::Path,
+    name: &str,
+    description: &str,
+    test_args: &str,
+) -> Result<()> {
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "# {name}\n\n\
+             {description}\n\n\
+             ## Tools\n\n\
+             ### {name}\n\n\
+             {description}\n\n\
+             **Example:**\n\
+             ```json\n\
+             {test_args}\n\
+             ```\n\n\
+             ## Test\n\n\
+             ```bash\n\
+             zeroclaw skill test . --args '{test_args}'\n\
+             ```\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_readme(dir: &std::path::Path, name: &str, language: &str, test_args: &str) -> Result<()> {
+    let (build_cmd, test_note) = match language {
+        "typescript" => (
+            "npm install && npm run build",
+            "Requires: node, npm, javy (https://github.com/bytecodealliance/javy)",
+        ),
+        "rust" => (
+            "cargo build --target wasm32-wasip1 --release\ncp target/wasm32-wasip1/release/*.wasm tool.wasm",
+            "Requires: rustup target add wasm32-wasip1  # one-time setup",
+        ),
+        "go" => (
+            "tinygo build -o tool.wasm -target wasi .",
+            "Requires: tinygo (https://tinygo.org)",
+        ),
+        "python" => (
+            "componentize-py -d wit/ -w zeroclaw-skill componentize main -o tool.wasm",
+            "Requires: componentize-py (pip install componentize-py)",
+        ),
+        _ => ("make", ""),
+    };
+
+    std::fs::write(
+        dir.join("README.md"),
+        format!(
+            "# {name}\n\n\
+             A ZeroClaw skill ({language}).\n\n\
+             ## Protocol\n\n\
+             Reads a JSON object from **stdin**, writes JSON to **stdout**:\n\n\
+             ```json\n\
+             // stdin  → args\n\
+             {test_args}\n\n\
+             // stdout ← result\n\
+             {{\"success\": true, \"output\": \"...\"}}\n\
+             ```\n\n\
+             ## Build\n\n\
+             {test_note}\n\n\
+             ```bash\n\
+             {build_cmd}\n\
+             ```\n\n\
+             ## Test\n\n\
+             ```bash\n\
+             zeroclaw skill test . --args '{test_args}'\n\
+             ```\n\n\
+             ## Publish\n\n\
+             ```bash\n\
+             zeroclaw skill install .\n\
+             ```\n"
+        ),
+    )?;
+    Ok(())
+}
+
+// ─── Local test (zeroclaw skill test) ────────────────────────────────────────
+
+/// Run a WASM tool locally using the system `wasmtime` CLI binary.
+///
+/// Looks for `tool.wasm` inside `skill_path/tools/<tool_name>/` (installed layout)
+/// OR directly as `skill_path/tool.wasm` (dev layout — right after build).
+pub fn test_skill_locally(
+    skill_path: &std::path::Path,
+    tool_name: Option<&str>,
+    args_json: &str,
+) -> Result<()> {
+    // Resolve .wasm path
+    let wasm_path = resolve_wasm_path(skill_path, tool_name)?;
+
+    // Validate JSON args
+    let _: serde_json::Value = serde_json::from_str(args_json)
+        .with_context(|| format!("--args is not valid JSON: {args_json}"))?;
+
+    println!(
+        "  Running: {} {}",
+        console::style("wasmtime").cyan(),
+        wasm_path.display()
+    );
+    println!("  Input:   {args_json}");
+    println!();
+
+    // Run via wasmtime CLI (captures stdout as tool output)
+    let output = std::process::Command::new("wasmtime")
+        .arg("run")
+        .arg(&wasm_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context(
+            "wasmtime not found — install it first:\n\n\
+             \x20 macOS (Homebrew):  brew install wasmtime\n\
+             \x20 macOS/Linux:       curl https://wasmtime.dev/install.sh -sSf | bash\n\
+             \x20 Cargo (slow):      cargo install wasmtime-cli\n\n\
+             After installing, restart your terminal and run this command again.\n\
+             Docs: https://wasmtime.dev",
+        )
+        .and_then(|mut child| {
+            use std::io::Write;
+            // take() moves stdin out so it is dropped (closed) at end of block,
+            // sending EOF to the child process — required for read_to_string to return.
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(args_json.as_bytes())?;
+                // stdin dropped here → EOF sent
+            }
+            child.wait_with_output().map_err(anyhow::Error::from)
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("wasmtime exited with error:\n{stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{}", stdout);
+
+    // Pretty-print if valid JSON
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(v) => {
+            println!();
+            let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+            if success {
+                println!(
+                    "  {} Tool returned success",
+                    console::style("✓").green().bold()
+                );
+            } else {
+                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                println!(
+                    "  {} Tool returned failure: {err}",
+                    console::style("✗").red().bold()
+                );
+            }
+        }
+        Err(_) => {
+            // stdout is not JSON — show as-is (maybe the tool printed plain text)
+        }
+    }
+
+    Ok(())
+}
+
+/// Find the `.wasm` file for a skill directory.
+///
+/// Search order:
+/// 1. `<path>/tool.wasm`                                   — dev build output
+/// 2. `<path>/tools/<tool_name>/tool.wasm`                 — installed layout
+/// 3. First `<path>/tools/*/tool.wasm` found               — installed, no name given
+fn resolve_wasm_path(
+    skill_path: &std::path::Path,
+    tool_name: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    // 1. Direct dev layout
+    let direct = skill_path.join("tool.wasm");
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    // 2. Named tool inside installed layout
+    if let Some(name) = tool_name {
+        // Validate: must be a single normal path component (no traversal or separators).
+        use std::path::Component;
+        let name_path = std::path::Path::new(name);
+        let is_single_normal = {
+            let mut comps = name_path.components();
+            matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+        };
+        if !is_single_normal || name != name_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        {
+            anyhow::bail!("invalid tool name '{}': must be a simple filename", name);
+        }
+        let named = skill_path.join("tools").join(name).join("tool.wasm");
+        if named.exists() {
+            return Ok(named);
+        }
+        anyhow::bail!(
+            "tool.wasm not found for tool '{}' in {}",
+            name,
+            skill_path.display()
+        );
+    }
+
+    // 3. First tool found
+    let tools_dir = skill_path.join("tools");
+    if let Ok(entries) = std::fs::read_dir(&tools_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("tool.wasm");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "No tool.wasm found in {}.\n\
+         Run the build command for your template first (e.g. 'npm run build', 'cargo build').",
+        skill_path.display()
+    )
+}
+
+// ─── Registry (ZeroMarket) source ────────────────────────────────────────────
+
+/// Package reference format: `<namespace>/<name>[@<version>]`
+/// Example: `zeromarket/github-pr-summary` or `acme/my-tool@0.2.1`
+fn is_registry_source(source: &str) -> bool {
+    // Filesystem paths are never registry sources
+    if source.starts_with('.') || source.starts_with('/') || source.starts_with('~') {
+        return false;
+    }
+    // Must be `namespace/name` (no scheme, no .git suffix, no slashes in name)
+    let parts: Vec<&str> = source.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let (ns, name_ver) = (parts[0], parts[1]);
+    // Reject empty segments or path-traversal
+    if ns.is_empty() || name_ver.is_empty() || ns.contains("..") || name_ver.contains("..") {
+        return false;
+    }
+    // Must be identifier-safe characters only ('.' and '@' only in version segment)
+    let is_safe_id = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    };
+    // name_ver may be `name` or `name@version`; '@' is only allowed once as separator
+    let (base_name, version_part) = match name_ver.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (name_ver, None),
+    };
+    if base_name.is_empty() {
+        return false;
+    }
+    if let Some(v) = version_part {
+        if v.is_empty() || v.contains('@') {
+            return false;
+        }
+        if !is_safe_id(v) {
+            return false;
+        }
+    }
+    is_safe_id(ns) && is_safe_id(base_name)
+}
+
+/// Download a skill package (WASM tools + SKILL.toml) from the ZeroMarket registry.
+///
+/// Package layout on the registry:
+/// ```text
+/// GET <registry_url>/v1/packages/<namespace>/<name>[/<version>]
+/// -> 200 JSON: { "name": "...", "version": "...", "tools": [{ "name": "...", "wasm_url": "...", "manifest_url": "..." }] }
+/// ```
+///
+/// The function:
+/// 1. Fetches the package index JSON
+/// 2. Creates `skills_path/<name>/tools/<tool-name>/`
+/// 3. Downloads `tool.wasm` and `manifest.json` for each tool
+/// 4. Creates a minimal `SKILL.toml` so the skill shows up in `skill list`
+fn install_registry_skill_source(
+    source: &str,
+    skills_path: &Path,
+    registry_url: &str,
+) -> Result<(PathBuf, usize)> {
+    // Parse `namespace/name[@version]`
+    let (ns_name, version) = match source.split_once('@') {
+        Some((base, ver)) => (base, Some(ver)),
+        None => (source, None),
+    };
+    let parts: Vec<&str> = ns_name.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        anyhow::bail!(
+            "invalid registry source '{}': expected namespace/name[@version]",
+            source
+        );
+    }
+    if let Some(v) = version {
+        if v.is_empty() || v.contains('/') {
+            anyhow::bail!(
+                "invalid version in '{}': version must be non-empty and contain no '/'",
+                source
+            );
+        }
+    }
+    let (namespace, pkg_name) = (parts[0], parts[1]);
+
+    // Build registry API URL
+    let api_path = match version {
+        Some(v) => format!("v1/packages/{namespace}/{pkg_name}/{v}"),
+        None => format!("v1/packages/{namespace}/{pkg_name}"),
+    };
+    let api_url = format!("{}/{}", registry_url.trim_end_matches('/'), api_path);
+
+    println!("  Fetching package index: {api_url}");
+
+    // HTTP GET (synchronous via ureq-like reqwest blocking or std)
+    // We use std::process + curl/wget to avoid pulling reqwest into this sync path.
+    // At runtime the agent loop uses reqwest; here we keep it minimal.
+    let index_bytes = fetch_url_blocking(&api_url, None)
+        .with_context(|| format!("failed to fetch package index from {api_url}"))?;
+
+    let index: RegistryPackageIndex = serde_json::from_slice(&index_bytes)
+        .context("registry returned invalid package index JSON")?;
+
+    // Destination skill directory: `skills/<pkg_name>/`
+    let skill_dir_name = pkg_name.to_string();
+    let skill_dir = skills_path.join(&skill_dir_name);
+    if skill_dir.exists() {
+        anyhow::bail!(
+            "skill '{}' is already installed at {}; remove it first to reinstall",
+            pkg_name,
+            skill_dir.display()
+        );
+    }
+    std::fs::create_dir_all(&skill_dir)?;
+
+    // Run the actual work in a closure so we can clean up skill_dir on any error.
+    let result = (|| -> Result<usize> {
+        let mut files_written = 0usize;
+
+        // Download each tool
+        for tool in &index.tools {
+            // Validate tool name: must be a single normal path component (no traversal).
+            let tool_name_path = std::path::Path::new(&tool.name);
+            let is_single_normal = {
+                use std::path::Component;
+                let mut comps = tool_name_path.components();
+                matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+            };
+            if !is_single_normal
+                || !tool
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!("registry returned unsafe tool name: '{}'", tool.name);
+            }
+
+            let tool_dir = skill_dir.join("tools").join(&tool.name);
+            std::fs::create_dir_all(&tool_dir)?;
+
+            // Validate artifact URLs: must be HTTPS and on an allowed host
+            // (registry host or registry-declared artifact CDN host).
+            let artifact_base = index.artifact_base_url.as_deref();
+            validate_artifact_url(&tool.wasm_url, registry_url, artifact_base)
+                .with_context(|| format!("unsafe wasm_url for tool '{}'", tool.name))?;
+            validate_artifact_url(&tool.manifest_url, registry_url, artifact_base)
+                .with_context(|| format!("unsafe manifest_url for tool '{}'", tool.name))?;
+
+            // Download tool.wasm
+            println!("  Downloading tool: {}", tool.name);
+            let wasm_bytes = fetch_url_blocking(&tool.wasm_url, None)
+                .with_context(|| format!("failed to download WASM for tool '{}'", tool.name))?;
+            std::fs::write(tool_dir.join("tool.wasm"), &wasm_bytes)?;
+            files_written += 1;
+
+            // Download manifest.json
+            let manifest_bytes = fetch_url_blocking(&tool.manifest_url, None)
+                .with_context(|| format!("failed to download manifest for tool '{}'", tool.name))?;
+
+            // Validate manifest before writing (ensures it parses as WasmManifest)
+            let _manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                .with_context(|| format!("invalid manifest JSON for tool '{}'", tool.name))?;
+            std::fs::write(tool_dir.join("manifest.json"), &manifest_bytes)?;
+            files_written += 1;
+        }
+
+        // Write minimal SKILL.toml using safe TOML serialization to avoid
+        // injection via description strings containing quotes or special chars.
+        #[derive(serde::Serialize)]
+        struct SkillMeta<'a> {
+            name: &'a str,
+            description: &'a str,
+            version: &'a str,
+            author: &'a str,
+            tags: &'a [&'a str],
+        }
+        #[derive(serde::Serialize)]
+        struct SkillToml<'a> {
+            skill: SkillMeta<'a>,
+        }
+        let description = index
+            .description
+            .as_deref()
+            .unwrap_or("Installed from ZeroMarket registry");
+        let skill_toml_value = SkillToml {
+            skill: SkillMeta {
+                name: &skill_dir_name,
+                description,
+                version: &index.version,
+                author: namespace,
+                tags: &["wasm", "zeromarket"],
+            },
+        };
+        let skill_toml_str =
+            toml::to_string(&skill_toml_value).context("failed to serialize SKILL.toml")?;
+        std::fs::write(skill_dir.join("SKILL.toml"), skill_toml_str)?;
+        files_written += 1;
+
+        Ok(files_written)
+    })();
+
+    match result {
+        Ok(files_written) => Ok((skill_dir, files_written)),
+        Err(e) => {
+            // Remove partially-written skill_dir to avoid leaving broken state.
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            Err(e)
+        }
+    }
+}
+
+/// Minimal JSON shape returned by the ZeroMarket registry package index endpoint.
+#[derive(Debug, serde::Deserialize)]
+struct RegistryPackageIndex {
+    version: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    tools: Vec<RegistryToolEntry>,
+    /// Optional CDN base URL where WASM artifacts are hosted.
+    ///
+    /// When present, artifact URLs may use this host instead of (or in addition
+    /// to) the registry host.  The declared host must itself be HTTPS; the client
+    /// validates that each artifact URL's host matches either the registry host or
+    /// this declared base host.  This lets the registry operator store binaries on
+    /// a separate CDN (e.g. Cloudflare R2) without client changes.
+    #[serde(default)]
+    artifact_base_url: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegistryToolEntry {
+    name: String,
+    wasm_url: String,
+    manifest_url: String,
+}
+
+/// Blocking HTTP GET using the system `curl` binary (avoids adding a sync HTTP
+/// Extract the hostname from an `https://` URL (the part before the first
+/// `'/'`, `'?'`, `'#'`, or `':'` after the scheme).
+fn extract_url_host(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .unwrap_or("")
+        .split(&['/', '?', '#', ':'][..])
+        .next()
+        .unwrap_or("")
+}
+
+/// Validate that an artifact URL (wasm_url / manifest_url from the registry index)
+/// is HTTPS and served from an allowed host, preventing SSRF via a malicious
+/// registry response redirecting downloads to internal hosts.
+///
+/// Allowed hosts:
+/// 1. The registry host itself (e.g. `zeromarket.vercel.app`).
+/// 2. The declared `artifact_base_url` host from the package index — lets the
+///    registry operator store binaries on a separate CDN (e.g. Cloudflare R2)
+///    without hardcoding CDN domains in the client.  The declared base URL must
+///    also use HTTPS; otherwise it is ignored.
+fn validate_artifact_url(
+    artifact_url: &str,
+    registry_url: &str,
+    artifact_base_url: Option<&str>,
+) -> Result<()> {
+    if !artifact_url.starts_with("https://") {
+        anyhow::bail!("artifact URL must use HTTPS: {artifact_url}");
+    }
+    let registry_host = extract_url_host(registry_url);
+    let artifact_host = extract_url_host(artifact_url);
+
+    if registry_host.is_empty() || artifact_host.is_empty() {
+        anyhow::bail!(
+            "could not determine host from artifact URL '{}' or registry URL '{}'",
+            artifact_url,
+            registry_url
+        );
+    }
+
+    if artifact_host == registry_host {
+        return Ok(());
+    }
+
+    // Allow host declared by the registry as its artifact CDN, if that
+    // declaration is itself a valid HTTPS URL.
+    if let Some(base) = artifact_base_url {
+        if base.starts_with("https://") {
+            let base_host = extract_url_host(base);
+            if !base_host.is_empty() && artifact_host == base_host {
+                return Ok(());
+            }
+        }
+    }
+
+    // Allow Cloudflare R2 public bucket hostnames (`*.r2.dev`) as a trusted CDN
+    // fallback.  R2 is a hosted object-storage service with no access to private
+    // networks, so allowing artifacts from any R2 bucket does not create SSRF risk.
+    // Registries that store binaries on R2 without declaring `artifact_base_url`
+    // still work out of the box.
+    if artifact_host.ends_with(".r2.dev") {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "artifact host '{}' is not allowed (registry host: '{}'; declared artifact host: '{}')",
+        artifact_host,
+        registry_host,
+        artifact_base_url
+            .and_then(|u| {
+                if u.starts_with("https://") {
+                    Some(extract_url_host(u))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("none")
+    );
+}
+
+// ─── ClawhHub skill installer ────────────────────────────────────────────────
+//
+// ClawhHub (https://clawhub.ai) is the OpenClaw skill registry.
+// Supported source formats:
+//   - `https://clawhub.ai/<owner>/<slug>`  (profile URL, auto-detected by domain)
+//   - `clawhub:<slug>`                     (short prefix)
+//
+// The download URL is: https://clawhub.ai/api/v1/download?slug=<slug>
+// Zip contents follow the OpenClaw convention: `_meta.json` + `SKILL.md` + scripts.
+
+const CLAWHUB_DOMAIN: &str = "clawhub.ai";
+const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
+
+/// Returns true if `source` is a ClawhHub skill reference.
+fn is_clawhub_source(source: &str) -> bool {
+    if source.starts_with("clawhub:") {
+        return true;
+    }
+    // Auto-detect from domain: https://clawhub.ai/...
+    if let Some(rest) = source.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        return host == CLAWHUB_DOMAIN;
+    }
+    false
+}
+
+/// Convert a ClawhHub source string into the zip download URL.
+///
+/// - `clawhub:gog`                       → `https://clawhub.ai/api/v1/download?slug=gog`
+/// - `https://clawhub.ai/steipete/gog`   → `https://clawhub.ai/api/v1/download?slug=steipete/gog`
+/// - `https://clawhub.ai/gog`            → `https://clawhub.ai/api/v1/download?slug=gog`
+///
+/// For profile URLs the full path (owner/slug) is forwarded verbatim as the slug query
+/// parameter so the ClawhHub API can resolve owner-namespaced skills correctly.
+fn clawhub_download_url(source: &str) -> Result<String> {
+    // Short prefix: clawhub:<slug>
+    if let Some(slug) = source.strip_prefix("clawhub:") {
+        let slug = slug.trim().trim_end_matches('/');
+        if slug.is_empty() || slug.contains('/') {
+            anyhow::bail!(
+                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
+                source
+            );
+        }
+        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
+    }
+    // Profile URL: https://clawhub.ai/<owner>/<slug>  or  https://clawhub.ai/<slug>
+    // Forward the full path as the slug so the API can resolve owner-namespaced skills.
+    if let Some(rest) = source.strip_prefix("https://") {
+        let path = rest
+            .strip_prefix(CLAWHUB_DOMAIN)
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
+        }
+        // Keep the literal slash so the API receives `slug=owner/name`
+        // (some backends do not decode %2F in query parameters).
+        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
+    }
+    anyhow::bail!("unrecognised ClawhHub source format: {source}")
+}
+
+// ─── Generic zip-URL skill installer ─────────────────────────────────────────
+//
+// Installs a skill from any HTTPS URL that returns a zip archive.
+// Supports two source formats:
+//   - `zip:https://example.com/path/to/skill.zip`  (explicit prefix)
+//   - `https://example.com/skill.zip`              (`.zip` suffix auto-detection)
+//
+// No system-level `unzip` binary is required; extraction is done in-process
+// using the `zip` crate. This makes the feature portable and dependency-free.
+//
+// If the zip contains a `_meta.json` at its root (OpenClaw registry convention),
+// the name, version, and author fields are read from it. Otherwise the skill
+// name is derived from the URL's last path segment.
+
+/// Returns true if `source` should be handled as a zip-URL download.
+fn is_zip_url_source(source: &str) -> bool {
+    // Explicit `zip:https://...` prefix
+    if let Some(rest) = source.strip_prefix("zip:") {
+        return rest.starts_with("https://");
+    }
+    // Direct HTTPS URL ending in `.zip`
+    let path_part = source.split('?').next().unwrap_or(source);
+    source.starts_with("https://") && path_part.ends_with(".zip")
+}
+
+/// Strips the `zip:` prefix if present, returning the bare HTTPS URL.
+fn zip_url_from_source(source: &str) -> &str {
+    source.strip_prefix("zip:").unwrap_or(source)
+}
+
+/// Normalize a raw slug or filename into a valid skill directory name.
+/// Lowercases, replaces hyphens with underscores, strips everything else.
+fn normalize_skill_name(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Read skill metadata (name, version, author) from a zip archive.
+///
+/// Checks for `_meta.json` at the root of the archive first (OpenClaw/ClawhHub
+/// convention). Falls back to the URL-derived name passed via `url_hint`.
+fn extract_zip_skill_meta(
+    bytes: &[u8],
+    url_hint: &str,
+) -> Result<(String, String, Option<String>)> {
+    use std::io::Read as _;
+
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).context("downloaded content is not a valid zip archive")?;
+
+    if let Ok(mut f) = archive.by_name("_meta.json") {
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok();
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&buf) {
+            let slug_raw = meta.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            let base = slug_raw.split('/').last().unwrap_or(slug_raw);
+            let name = normalize_skill_name(base);
+            if !name.is_empty() {
+                let version = meta
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0.1.0")
+                    .to_string();
+                let author = meta
+                    .get("ownerId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                return Ok((name, version, author));
+            }
+        }
+    }
+
+    // Fallback: derive name from the URL path (strip query string and .zip suffix)
+    let url_path = url_hint.split('?').next().unwrap_or(url_hint);
+    let last_seg = url_path.rsplit('/').next().unwrap_or("skill");
+    let base = last_seg.strip_suffix(".zip").unwrap_or(last_seg);
+    let name = normalize_skill_name(base);
+    let name = if name.is_empty() {
+        "skill".to_string()
+    } else {
+        name
+    };
+    Ok((name, "0.1.0".to_string(), None))
+}
+
+/// Install a skill from a local `.zip` file (e.g. downloaded manually from ClawhHub).
+///
+/// Usage: `zeroclaw skill install /path/to/skill.zip`
+fn install_local_zip_source(zip_path: &Path, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let bytes = std::fs::read(zip_path)
+        .with_context(|| format!("failed to read zip file: {}", zip_path.display()))?;
+    let hint = zip_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("skill.zip");
+    extract_zip_bytes_to_skills(&bytes, hint, skills_path)
+}
+
+/// Download a zip archive from `url` and install it as a skill under `skills_path`.
+///
+/// `auth_token` is an optional Bearer token added as `Authorization: Bearer <token>`.
+/// Extraction is done in-process (no `unzip` binary required).
+/// Returns the installed skill directory path and the number of files written.
+fn install_zip_url_source(
+    url: &str,
+    skills_path: &Path,
+    auth_token: Option<&str>,
+) -> Result<(PathBuf, usize)> {
+    let bytes = fetch_url_blocking(url, auth_token)
+        .with_context(|| format!("failed to fetch zip from {url}"))?;
+    extract_zip_bytes_to_skills(&bytes, url, skills_path)
+}
+
+/// Core zip extraction logic shared by local and remote zip installers.
+///
+/// Runs a full security audit on the zip contents before extracting a single byte.
+/// `name_hint` is used as a fallback for skill name detection (URL or filename).
+fn extract_zip_bytes_to_skills(
+    bytes: &[u8],
+    name_hint: &str,
+    skills_path: &Path,
+) -> Result<(PathBuf, usize)> {
+    // ── Security audit BEFORE extraction ────────────────────────────────────
+    // Runs zip-specific checks: entry count, path traversal, native binaries,
+    // per-file and total decompressed size limits, compression ratio (zip bomb),
+    // and high-risk shell pattern detection in text files.
+    let audit_report =
+        audit::audit_zip_bytes(bytes).context("zip pre-extraction security check failed")?;
+    if !audit_report.is_clean() {
+        let findings = audit_report
+            .findings
+            .iter()
+            .map(|f| format!("  - {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "zip skill rejected by security audit ({} finding{}):\n{findings}",
+            audit_report.findings.len(),
+            if audit_report.findings.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+
+    let (skill_name, skill_version, skill_author) = extract_zip_skill_meta(bytes, name_hint)
+        .with_context(|| format!("could not determine skill name from zip: {name_hint}"))?;
+
+    let skill_dir = skills_path.join(&skill_name);
+    if skill_dir.exists() {
+        anyhow::bail!(
+            "skill '{}' already exists at {}; run 'zeroclaw skill remove {}' first",
+            skill_name,
+            skill_dir.display(),
+            skill_name
+        );
+    }
+    std::fs::create_dir_all(&skill_dir)?;
+
+    // Extract zip entries
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).context("failed to re-open zip archive for extraction")?;
+
+    let mut files_written = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+
+        // Security: reject path traversal attempts
+        if raw_name.contains("..") || raw_name.starts_with('/') {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let out_path = skill_dir.join(&raw_name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out_file = std::fs::File::create(&out_path)
+                .with_context(|| format!("failed to create {}", out_path.display()))?;
+            std::io::copy(&mut entry, &mut out_file)?;
+            files_written += 1;
+        }
+    }
+
+    // Write a minimal SKILL.toml so the skill appears in `zeroclaw skill list`
+    // (only if neither SKILL.toml nor SKILL.md was included in the zip)
+    let toml_path = skill_dir.join("SKILL.toml");
+    if !toml_path.exists() && !skill_dir.join("SKILL.md").exists() {
+        let author_line = skill_author
+            .map(|a| format!("author = \"{a}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            &toml_path,
+            format!(
+                "[skill]\nname = \"{skill_name}\"\ndescription = \"Zip-installed skill\"\nversion = \"{skill_version}\"\n{author_line}"
+            ),
+        )?;
+        files_written += 1;
+    }
+
+    Ok((skill_dir, files_written))
+}
+
+/// crate to this sync code path). Falls back to a basic TCP approach is not needed
+/// because `curl` is universally available on target platforms.
+///
+/// `auth_token` — if `Some`, adds `Authorization: Bearer <token>` to the request.
+fn fetch_url_blocking(url: &str, auth_token: Option<&str>) -> Result<Vec<u8>> {
+    // Validate URL scheme — only https:// allowed to prevent SSRF
+    if !url.starts_with("https://") {
+        anyhow::bail!("registry URL must use HTTPS: {url}");
+    }
+
+    // Use --write-out to append the HTTP status code on a separate line so we
+    // can give actionable error messages (e.g. 429 rate-limit guidance) without
+    // needing a separate HEAD request.
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        "=https",
+        "--max-redirs",
+        "5",
+        "--max-time",
+        "30",
+        "--write-out",
+        "\n%{http_code}",
+    ]);
+    if let Some(token) = auth_token {
+        cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+    }
+    cmd.arg(url);
+
+    let output = cmd
+        .output()
+        .context("failed to run 'curl' — ensure curl is installed")?;
+
+    // Parse the HTTP status code appended by --write-out.
+    let stdout = output.stdout;
+    let (body, http_status) = if let Some(nl) = stdout.iter().rposition(|&b| b == b'\n') {
+        let code_bytes = stdout[nl + 1..]
+            .iter()
+            .copied()
+            .take_while(|b| b.is_ascii_digit())
+            .collect::<Vec<_>>();
+        let status: u16 = String::from_utf8_lossy(&code_bytes).parse().unwrap_or(0);
+        (stdout[..nl].to_vec(), status)
+    } else {
+        (stdout, 0)
+    };
+
+    if http_status == 429 {
+        anyhow::bail!(
+            "ClawhHub rate limit reached (HTTP 429). \
+             Wait a moment and retry, or set `clawhub_token` in the `[skills]` section \
+             of your config.toml to use authenticated requests."
+        );
+    }
+
+    if !output.status.success() || (http_status != 0 && http_status >= 400) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if http_status != 0 {
+            anyhow::bail!("HTTP {http_status} from {url}: {stderr}");
+        }
+        anyhow::bail!("curl failed for {url}: {stderr}");
+    }
+
+    Ok(body)
+}
+
+// ─── Handle command ───────────────────────────────────────────────────────────
+
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
 pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
     let workspace_dir = &config.workspace_dir;
     match command {
+        crate::SkillCommands::New { name, template } => {
+            let dest = std::env::current_dir().unwrap_or_else(|_| workspace_dir.clone());
+
+            scaffold_skill(&name, &template, &dest)
+                .with_context(|| format!("failed to scaffold skill '{name}'"))?;
+
+            // Resolve template again for display (find is cheap; scaffold_skill already
+            // validated that the template exists, so this should never be None).
+            let tmpl = templates::find(&template).ok_or_else(|| {
+                anyhow::anyhow!("template '{}' not found after scaffold", template)
+            })?;
+
+            let skill_dir = dest.join(&name);
+            println!(
+                "  {} Skill '{}' created at {}",
+                console::style("✓").green().bold(),
+                name,
+                skill_dir.display()
+            );
+            println!(
+                "  Template: {} ({})",
+                console::style(tmpl.name).cyan(),
+                tmpl.language
+            );
+            println!();
+            println!("  Next steps:");
+            println!("    cd {name}");
+            match tmpl.language {
+                "typescript" => {
+                    println!("    npm install && npm run build   # → tool.wasm");
+                }
+                "rust" => {
+                    println!(
+                        "    {}  # one-time setup",
+                        console::style("rustup target add wasm32-wasip1").yellow()
+                    );
+                    println!("    cargo build --target wasm32-wasip1 --release");
+                    println!("    cp target/wasm32-wasip1/release/*.wasm tool.wasm");
+                }
+                "go" => {
+                    println!("    tinygo build -o tool.wasm -target wasi .");
+                }
+                "python" => {
+                    println!("    pip install componentize-py");
+                    println!("    componentize-py -d wit/ -w zeroclaw-skill componentize main -o tool.wasm");
+                }
+                _ => {}
+            }
+            println!("    zeroclaw skill test . --args '{}'", tmpl.test_args);
+            println!();
+            println!(
+                "  {} 'zeroclaw skill test' requires the {} CLI:",
+                console::style("Note:").dim(),
+                console::style("wasmtime").cyan()
+            );
+            println!(
+                "    macOS:       {}",
+                console::style("brew install wasmtime").yellow()
+            );
+            println!(
+                "    Linux/macOS: {}",
+                console::style("curl https://wasmtime.dev/install.sh -sSf | bash").yellow()
+            );
+            println!();
+            println!(
+                "  To publish: upload this folder to {}",
+                console::style("https://zeromarket.dev/upload").underlined()
+            );
+
+            Ok(())
+        }
+
+        crate::SkillCommands::Test { path, tool, args } => {
+            let skill_path = std::path::Path::new(&path);
+            let skill_path = if skill_path.is_absolute() {
+                skill_path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| workspace_dir.clone())
+                    .join(skill_path)
+            };
+
+            // If `path` is just a skill name, resolve from installed skills dir
+            let skill_path = if !skill_path.exists() && !path.contains('/') && !path.contains('\\')
+            {
+                skills_dir(workspace_dir).join(&path)
+            } else {
+                skill_path
+            };
+
+            if !skill_path.exists() {
+                anyhow::bail!(
+                    "Skill path not found: {}\n\
+                     Tip: run from the skill directory or pass an absolute path.",
+                    skill_path.display()
+                );
+            }
+
+            let args_json = args.as_deref().unwrap_or("{\"input\":\"test\"}");
+
+            test_skill_locally(&skill_path, tool.as_deref(), args_json)
+                .with_context(|| format!("skill test failed for {}", skill_path.display()))?;
+
+            Ok(())
+        }
+
         crate::SkillCommands::List => {
             let skills = load_skills_with_config(workspace_dir, config);
             if skills.is_empty() {
@@ -882,7 +2002,12 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 anyhow::bail!("Skill source or installed skill not found: {source}");
             }
 
-            let report = audit::audit_skill_directory(&target)?;
+            let report = audit::audit_skill_directory_with_options(
+                &target,
+                audit::SkillAuditOptions {
+                    allow_scripts: config.skills.allow_scripts,
+                },
+            )?;
             if report.is_clean() {
                 println!(
                     "  {} Skill audit passed for {} ({} files scanned).",
@@ -909,9 +2034,37 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
-            if is_git_source(&source) {
+            if is_clawhub_source(&source) {
+                let download_url = clawhub_download_url(&source)
+                    .with_context(|| format!("invalid ClawhHub source: {source}"))?;
+                let token = config.skills.clawhub_token.as_deref();
+                let (installed_dir, files_written) =
+                    install_zip_url_source(&download_url, &skills_path, token)
+                        .with_context(|| format!("failed to install ClawhHub skill: {source}"))?;
+                println!(
+                    "  {} ClawhHub skill installed: {} ({} files written)",
+                    console::style("✓").green().bold(),
+                    installed_dir.display(),
+                    files_written
+                );
+                println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+            } else if is_zip_url_source(&source) {
+                // Generic zip-URL install: supports `zip:https://...` prefix and
+                // direct `.zip` URLs.  No system `unzip` binary required.
+                let url = zip_url_from_source(&source);
+                let (installed_dir, files_written) =
+                    install_zip_url_source(url, &skills_path, None)
+                        .with_context(|| format!("failed to install zip skill from: {url}"))?;
+                println!(
+                    "  {} Skill installed from zip: {} ({} files written)",
+                    console::style("✓").green().bold(),
+                    installed_dir.display(),
+                    files_written
+                );
+                println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+            } else if is_git_source(&source) {
                 let (installed_dir, files_scanned) =
-                    install_git_skill_source(&source, &skills_path)
+                    install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
                         .with_context(|| format!("failed to install git skill source: {source}"))?;
                 println!(
                     "  {} Skill installed and audited: {} ({} files scanned)",
@@ -919,18 +2072,55 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     installed_dir.display(),
                     files_scanned
                 );
-            } else {
-                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?;
+                println!("  Security audit completed successfully.");
+            } else if is_registry_source(&source) {
+                // ZeroMarket (or compatible) registry: `namespace/name[@version]`
+                let registry_url = &config.wasm.registry_url;
+                let (installed_dir, files_written) =
+                    install_registry_skill_source(&source, &skills_path, registry_url)
+                        .with_context(|| format!("failed to install registry package: {source}"))?;
                 println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
+                    "  {} WASM skill package installed: {} ({} files written)",
                     console::style("✓").green().bold(),
-                    dest.display(),
-                    files_scanned
+                    installed_dir.display(),
+                    files_written
                 );
+                println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+            } else {
+                // Check if source is a local .zip file before falling back to directory install
+                let source_path = std::path::Path::new(&source);
+                let is_local_zip = source_path
+                    .extension()
+                    .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
+                    && source_path.is_file();
+
+                if is_local_zip {
+                    let (dest, files_written) = install_local_zip_source(source_path, &skills_path)
+                        .with_context(|| format!("failed to install zip skill from: {source}"))?;
+                    println!(
+                        "  {} Skill installed from zip: {} ({} files written)",
+                        console::style("✓").green().bold(),
+                        dest.display(),
+                        files_written
+                    );
+                    println!("  Run 'zeroclaw skill list' to verify the new tools are available.");
+                } else {
+                    let (dest, files_scanned) = install_local_skill_source(
+                        &source,
+                        &skills_path,
+                        config.skills.allow_scripts,
+                    )
+                    .with_context(|| format!("failed to install local skill source: {source}"))?;
+                    println!(
+                        "  {} Skill installed and audited: {} ({} files scanned)",
+                        console::style("✓").green().bold(),
+                        dest.display(),
+                        files_scanned
+                    );
+                    println!("  Security audit completed successfully.");
+                }
             }
 
-            println!("  Security audit completed successfully.");
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
@@ -960,6 +2150,35 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 "  {} Skill '{}' removed.",
                 console::style("✓").green().bold(),
                 name
+            );
+            Ok(())
+        }
+
+        crate::SkillCommands::Templates => {
+            println!("  Available skill templates:\n");
+            println!(
+                "  {:<20} {:<12} {}",
+                console::style("NAME").bold(),
+                console::style("LANGUAGE").bold(),
+                console::style("DESCRIPTION").bold(),
+            );
+            println!("  {}", "─".repeat(72));
+            for tmpl in templates::ALL {
+                println!(
+                    "  {:<20} {:<12} {}",
+                    console::style(tmpl.name).cyan(),
+                    tmpl.language,
+                    tmpl.description,
+                );
+            }
+            println!();
+            println!("  Usage:");
+            println!("    zeroclaw skill new <name> --template <template-name>");
+            println!();
+            println!("  Example:");
+            println!(
+                "    zeroclaw skill new my_weather --template {}",
+                console::style("weather_lookup").cyan()
             );
             Ok(())
         }
@@ -1470,6 +2689,303 @@ description = "Bare minimum"
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
         assert_ne!(skills[0].name, "CONTRIBUTING");
+    }
+
+    // ── is_registry_source ────────────────────────────────────────────────────
+
+    // ── registry install: directory naming ───────────────────────────────────
+
+    /// The installed skill directory must be named after the package name only,
+    /// not prefixed with the namespace. This keeps skill directories short and
+    /// predictable regardless of who published the package.
+    #[test]
+    fn registry_install_dir_name_is_package_name_only() {
+        // Simulate the naming logic from install_registry_skill_source.
+        for (source, expected_dir) in [
+            ("zeroclaw-org/weather-lookup", "weather-lookup"),
+            ("zeroclaw-org/calculator", "calculator"),
+            ("zeroclaw-user/my_tool", "my_tool"),
+        ] {
+            let parts: Vec<&str> = source.splitn(3, '/').collect();
+            let pkg_name = parts[1];
+            // strip optional @version suffix
+            let pkg_name = pkg_name.split('@').next().unwrap_or(pkg_name);
+            let skill_dir_name = pkg_name.to_string();
+            assert_eq!(
+                skill_dir_name, expected_dir,
+                "registry source '{source}' should install to dir '{expected_dir}', got '{skill_dir_name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_registry_source_accepts_valid_namespace_name() {
+        assert!(is_registry_source("zeroclaw/weather-lookup"));
+        assert!(is_registry_source("community/my_tool"));
+        assert!(is_registry_source("org-name/tool_name"));
+        assert!(is_registry_source("ns/name@1.0.0")); // version suffix
+    }
+
+    #[test]
+    fn is_registry_source_rejects_local_path_prefixes() {
+        assert!(!is_registry_source("./weather_lookup"));
+        assert!(!is_registry_source("../parent/skill"));
+        assert!(!is_registry_source("/absolute/path/skill"));
+        assert!(!is_registry_source("~/home/skill"));
+    }
+
+    #[test]
+    fn is_registry_source_rejects_git_urls_and_http_schemes() {
+        assert!(!is_registry_source("https://github.com/org/skill"));
+        assert!(!is_registry_source("http://example.com/skill"));
+        assert!(!is_registry_source("git@github.com:org/skill.git"));
+        assert!(!is_registry_source("ssh://git@github.com/org/skill"));
+    }
+
+    #[test]
+    fn is_registry_source_rejects_invalid_formats() {
+        assert!(!is_registry_source("just-a-name")); // no slash
+        assert!(!is_registry_source("a/b/c")); // too many slashes
+        assert!(!is_registry_source("ns/..")); // path traversal in name
+        assert!(!is_registry_source("../ns/name")); // path traversal prefix
+        assert!(!is_registry_source("")); // empty
+        assert!(!is_registry_source("/")); // empty segments
+    }
+
+    // ── scaffold_skill: validation ────────────────────────────────────────────
+
+    #[test]
+    fn scaffold_skill_rejects_traversal_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = scaffold_skill("../escape", "typescript", dir.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Invalid skill name"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn scaffold_skill_rejects_slash_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = scaffold_skill("ns/name", "typescript", dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scaffold_skill_rejects_space_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = scaffold_skill("my tool", "typescript", dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scaffold_skill_rejects_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = scaffold_skill("", "typescript", dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scaffold_skill_rejects_unknown_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = scaffold_skill("zeroclaw_test_tool", "cobol", dir.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Unknown template"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn scaffold_skill_rejects_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("zeroclaw_test_tool")).unwrap();
+        let result = scaffold_skill("zeroclaw_test_tool", "typescript", dir.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("already exists"), "unexpected: {msg}");
+    }
+
+    // ── scaffold_skill: output correctness ───────────────────────────────────
+
+    #[test]
+    fn scaffold_skill_typescript_creates_required_files() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_skill("zeroclaw_test_ts", "typescript", dir.path()).unwrap();
+        let skill_dir = dir.path().join("zeroclaw_test_ts");
+        assert!(skill_dir.join("SKILL.md").exists(), "SKILL.md missing");
+        assert!(skill_dir.join("README.md").exists(), "README.md missing");
+        assert!(skill_dir.join(".gitignore").exists(), ".gitignore missing");
+        assert!(
+            skill_dir.join("manifest.json").exists(),
+            "manifest.json missing"
+        );
+    }
+
+    #[test]
+    fn scaffold_skill_rust_creates_required_files() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_skill("zeroclaw_test_rs", "rust", dir.path()).unwrap();
+        let skill_dir = dir.path().join("zeroclaw_test_rs");
+        assert!(skill_dir.join("Cargo.toml").exists(), "Cargo.toml missing");
+        assert!(
+            skill_dir.join("src").join("main.rs").exists(),
+            "src/main.rs missing"
+        );
+        assert!(skill_dir.join("SKILL.md").exists(), "SKILL.md missing");
+    }
+
+    #[test]
+    fn scaffold_skill_substitutes_name_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_skill("zeroclaw_subst_test", "rust", dir.path()).unwrap();
+        let cargo_toml =
+            fs::read_to_string(dir.path().join("zeroclaw_subst_test").join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_toml.contains("zeroclaw_subst_test"),
+            "Cargo.toml should contain skill name, got:\n{cargo_toml}"
+        );
+        assert!(
+            !cargo_toml.contains("__SKILL_NAME__"),
+            "__SKILL_NAME__ placeholder was not substituted"
+        );
+    }
+
+    #[test]
+    fn scaffold_skill_go_creates_required_files() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_skill("zeroclaw_test_go", "go", dir.path()).unwrap();
+        let skill_dir = dir.path().join("zeroclaw_test_go");
+        assert!(
+            skill_dir.join("manifest.json").exists(),
+            "manifest.json missing"
+        );
+        assert!(skill_dir.join("SKILL.md").exists(), "SKILL.md missing");
+    }
+
+    #[test]
+    fn scaffold_skill_gitignore_always_created() {
+        for template in ["rust", "typescript", "go", "python"] {
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("zeroclaw_test_{template}");
+            scaffold_skill(&name, template, dir.path()).unwrap();
+            assert!(
+                dir.path().join(&name).join(".gitignore").exists(),
+                ".gitignore missing for template {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_skill_skill_md_contains_name() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_skill("zeroclaw_md_check", "typescript", dir.path()).unwrap();
+        let skill_md =
+            fs::read_to_string(dir.path().join("zeroclaw_md_check").join("SKILL.md")).unwrap();
+        assert!(
+            skill_md.contains("zeroclaw_md_check"),
+            "SKILL.md should reference skill name, got:\n{skill_md}"
+        );
+    }
+
+    // ── ClawhHub source detection and URL building ────────────────────────────
+
+    #[test]
+    fn is_clawhub_source_accepts_profile_url() {
+        assert!(is_clawhub_source("https://clawhub.ai/steipete/gog"));
+        assert!(is_clawhub_source("https://clawhub.ai/gog"));
+        assert!(is_clawhub_source("https://clawhub.ai/user/my-skill"));
+    }
+
+    #[test]
+    fn is_clawhub_source_accepts_short_prefix() {
+        assert!(is_clawhub_source("clawhub:gog"));
+        assert!(is_clawhub_source("clawhub:weather-lookup"));
+    }
+
+    #[test]
+    fn is_clawhub_source_rejects_other_domains() {
+        assert!(!is_clawhub_source("https://github.com/org/skill"));
+        assert!(!is_clawhub_source("https://example.com/skill.zip"));
+        assert!(!is_clawhub_source("zeroclaw/skill"));
+    }
+
+    #[test]
+    fn clawhub_download_url_from_profile_url() {
+        // Owner-namespaced URL: full path forwarded as slug with literal slash
+        let url = clawhub_download_url("https://clawhub.ai/steipete/gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=steipete/gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_from_single_path_url() {
+        // Single-segment URL: path is just the skill name
+        let url = clawhub_download_url("https://clawhub.ai/gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_from_short_prefix() {
+        let url = clawhub_download_url("clawhub:gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_rejects_slash_in_prefix_slug() {
+        assert!(clawhub_download_url("clawhub:owner/gog").is_err());
+    }
+
+    // ── is_zip_url_source ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_zip_url_source_accepts_explicit_prefix() {
+        assert!(is_zip_url_source("zip:https://example.com/skill.zip"));
+        assert!(is_zip_url_source(
+            "zip:https://example.com/api/download?slug=my-skill"
+        ));
+    }
+
+    #[test]
+    fn is_zip_url_source_accepts_direct_zip_url() {
+        assert!(is_zip_url_source("https://example.com/skill.zip"));
+        assert!(is_zip_url_source(
+            "https://releases.example.com/my-skill-1.0.0.zip"
+        ));
+    }
+
+    #[test]
+    fn is_zip_url_source_rejects_non_zip_https() {
+        // Plain HTTPS URL without .zip suffix and without zip: prefix
+        assert!(!is_zip_url_source("https://github.com/org/skill"));
+        assert!(!is_zip_url_source(
+            "https://example.com/api/download?slug=foo"
+        ));
+    }
+
+    #[test]
+    fn is_zip_url_source_rejects_non_https() {
+        assert!(!is_zip_url_source("zip:http://example.com/skill.zip"));
+        assert!(!is_zip_url_source("http://example.com/skill.zip"));
+        assert!(!is_zip_url_source("ftp://example.com/skill.zip"));
+    }
+
+    #[test]
+    fn is_zip_url_source_rejects_other_formats() {
+        assert!(!is_zip_url_source("zeroclaw/skill"));
+        assert!(!is_zip_url_source("./local/skill.zip"));
+        assert!(!is_zip_url_source("/absolute/path/skill.zip"));
+    }
+
+    // ── normalize_skill_name ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_skill_name_converts_hyphens_and_lowercases() {
+        assert_eq!(normalize_skill_name("My-Skill"), "my_skill");
+        assert_eq!(normalize_skill_name("weather-lookup"), "weather_lookup");
+        assert_eq!(normalize_skill_name("GOG"), "gog");
+    }
+
+    #[test]
+    fn normalize_skill_name_strips_non_alnum() {
+        assert_eq!(normalize_skill_name("skill.v1"), "skillv1");
+        assert_eq!(normalize_skill_name("skill@1.0.0"), "skill100");
     }
 }
 

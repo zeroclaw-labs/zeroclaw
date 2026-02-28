@@ -1,0 +1,110 @@
+name: CI Supply Chain Provenance
+
+on:
+    push:
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "scripts/ci/generate_provenance.py"
+            - ".github/workflows/ci-supply-chain-provenance.yml"
+    workflow_dispatch:
+    schedule:
+        - cron: "20 6 * * 1" # Weekly Monday 06:20 UTC
+
+concurrency:
+    group: supply-chain-provenance-${{ github.ref || github.run_id }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    id-token: write
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+    CARGO_TERM_COLOR: always
+
+jobs:
+    provenance:
+        name: Build + Provenance Bundle
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 35
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - name: Build release-fast artifact
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+                  cargo build --profile release-fast --locked --target "$host_target"
+                  cp "target/${host_target}/release-fast/zeroclaw" "artifacts/zeroclaw-${host_target}"
+                  sha256sum "artifacts/zeroclaw-${host_target}" > "artifacts/zeroclaw-${host_target}.sha256"
+
+            - name: Generate provenance statement
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+                  python3 scripts/ci/generate_provenance.py \
+                    --artifact "artifacts/zeroclaw-${host_target}" \
+                    --subject-name "zeroclaw-${host_target}" \
+                    --output "artifacts/provenance-${host_target}.intoto.json"
+
+            - name: Install cosign
+              uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+            - name: Sign provenance bundle
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+                  statement="artifacts/provenance-${host_target}.intoto.json"
+                  cosign sign-blob --yes \
+                    --bundle="${statement}.sigstore.json" \
+                    --output-signature="${statement}.sig" \
+                    --output-certificate="${statement}.pem" \
+                    "${statement}"
+
+            - name: Emit normalized audit event
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type supply_chain_provenance \
+                    --input-json "artifacts/provenance-${host_target}.intoto.json" \
+                    --output-json "artifacts/audit-event-supply-chain-provenance.json" \
+                    --artifact-name supply-chain-provenance \
+                    --retention-days 30
+
+            - name: Upload provenance artifacts
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: supply-chain-provenance
+                  path: artifacts/*
+                  retention-days: 30
+
+            - name: Publish summary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+                  {
+                    echo "### Supply Chain Provenance"
+                    echo "- Target: \`${host_target}\`"
+                    echo "- Artifact: \`artifacts/zeroclaw-${host_target}\`"
+                    echo "- Statement: \`artifacts/provenance-${host_target}.intoto.json\`"
+                    echo "- Signature: \`artifacts/provenance-${host_target}.intoto.json.sig\`"
+                  } >> "$GITHUB_STEP_SUMMARY"

@@ -3,6 +3,12 @@ contact_links:
   - name: Security vulnerability report
     url: https://github.com/zeroclaw-labs/zeroclaw/security/policy
     about: Please report security vulnerabilities privately via SECURITY.md policy.
+  - name: Private vulnerability report template
+    url: https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/security/private-vulnerability-report-template.md
+    about: Use this template when filing a private vulnerability report in Security Advisories.
+  - name: 私密漏洞报告模板（中文）
+    url: https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/security/private-vulnerability-report-template.zh-CN.md
+    about: 使用该中文模板通过 Security Advisories 进行私密漏洞提交。
   - name: Contribution guide
     url: https://github.com/zeroclaw-labs/zeroclaw/blob/main/CONTRIBUTING.md
     about: Please read contribution and PR requirements before opening an issue.

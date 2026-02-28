@@ -19,6 +19,10 @@ module.exports = async ({ github, context, core }) => {
     "## Rollback Plan (required)",
   ];
   const body = pr.body || "";
+  const linearKeyRegex = /\b(?:RMN|CDV|COM)-\d+\b/g;
+  const linearKeys = Array.from(
+    new Set([...(pr.title.match(linearKeyRegex) || []), ...(body.match(linearKeyRegex) || [])]),
+  );
 
   const missingSections = requiredSections.filter((section) => !body.includes(section));
   const missingFields = [];
@@ -88,6 +92,12 @@ module.exports = async ({ github, context, core }) => {
   const promotionAuthorAllowlist = new Set(["willsarg", "theonlyhennygod"]);
   const shouldRetargetToDev =
     prBaseRef === "main" && !promotionAuthorAllowlist.has(prAuthor);
+
+  if (linearKeys.length === 0) {
+    blockingFindings.push(
+      "Missing Linear issue key reference (`RMN-<id>`, `CDV-<id>`, or `COM-<id>`) in PR title/body.",
+    );
+  }
 
   if (shouldRetargetToDev) {
     advisoryFindings.push(
@@ -160,14 +170,17 @@ module.exports = async ({ github, context, core }) => {
     "",
     "Action items:",
     "1. Complete required PR template sections/fields.",
-    "2. Remove tabs, trailing whitespace, and merge conflict markers from added lines.",
-    "3. Re-run local checks before pushing:",
+    "2. Link this PR to exactly one active Linear issue key (`RMN-xxx`/`CDV-xxx`/`COM-xxx`).",
+    "3. Remove tabs, trailing whitespace, and merge conflict markers from added lines.",
+    "4. Re-run local checks before pushing:",
     "   - `./scripts/ci/rust_quality_gate.sh`",
     "   - `./scripts/ci/rust_strict_delta_gate.sh`",
     "   - `./scripts/ci/docs_quality_gate.sh`",
     ...(shouldRetargetToDev
-      ? ["4. Retarget this PR base branch from `main` to `dev`."]
+      ? ["5. Retarget this PR base branch from `main` to `dev`."]
       : []),
+    "",
+    `Detected Linear keys: ${linearKeys.length > 0 ? linearKeys.join(", ") : "none"}`,
     "",
     `Run logs: ${runUrl}`,
     "",

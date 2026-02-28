@@ -5,7 +5,7 @@ import { getStatus } from './api';
 // Translation dictionaries
 // ---------------------------------------------------------------------------
 
-export type Locale = 'en' | 'tr';
+export type Locale = 'en' | 'tr' | 'zh-CN';
 
 const translations: Record<Locale, Record<string, string>> = {
   en: {
@@ -373,6 +373,189 @@ const translations: Record<Locale, Record<string, string>> = {
     'health.uptime': 'Calisma Suresi',
     'health.updated_at': 'Son Guncelleme',
   },
+
+  'zh-CN': {
+    // Navigation
+    'nav.dashboard': '仪表盘',
+    'nav.agent': '智能体',
+    'nav.tools': '工具',
+    'nav.cron': '定时任务',
+    'nav.integrations': '集成',
+    'nav.memory': '记忆',
+    'nav.config': '配置',
+    'nav.cost': '成本追踪',
+    'nav.logs': '日志',
+    'nav.doctor': '诊断',
+
+    // Dashboard
+    'dashboard.title': '仪表盘',
+    'dashboard.provider': '提供商',
+    'dashboard.model': '模型',
+    'dashboard.uptime': '运行时长',
+    'dashboard.temperature': '温度',
+    'dashboard.gateway_port': '网关端口',
+    'dashboard.locale': '语言区域',
+    'dashboard.memory_backend': '记忆后端',
+    'dashboard.paired': '已配对',
+    'dashboard.channels': '渠道',
+    'dashboard.health': '健康状态',
+    'dashboard.status': '状态',
+    'dashboard.overview': '总览',
+    'dashboard.system_info': '系统信息',
+    'dashboard.quick_actions': '快捷操作',
+
+    // Agent / Chat
+    'agent.title': '智能体聊天',
+    'agent.send': '发送',
+    'agent.placeholder': '输入消息...',
+    'agent.connecting': '连接中...',
+    'agent.connected': '已连接',
+    'agent.disconnected': '已断开连接',
+    'agent.reconnecting': '重连中...',
+    'agent.thinking': '思考中...',
+    'agent.tool_call': '工具调用',
+    'agent.tool_result': '工具结果',
+
+    // Tools
+    'tools.title': '可用工具',
+    'tools.name': '名称',
+    'tools.description': '描述',
+    'tools.parameters': '参数',
+    'tools.search': '搜索工具...',
+    'tools.empty': '暂无可用工具。',
+    'tools.count': '工具总数',
+
+    // Cron
+    'cron.title': '定时任务',
+    'cron.add': '添加任务',
+    'cron.delete': '删除',
+    'cron.enable': '启用',
+    'cron.disable': '禁用',
+    'cron.name': '名称',
+    'cron.command': '命令',
+    'cron.schedule': '计划',
+    'cron.next_run': '下次运行',
+    'cron.last_run': '上次运行',
+    'cron.last_status': '上次状态',
+    'cron.enabled': '已启用',
+    'cron.empty': '暂无定时任务。',
+    'cron.confirm_delete': '确定要删除此任务吗？',
+
+    // Integrations
+    'integrations.title': '集成',
+    'integrations.available': '可用',
+    'integrations.active': '已激活',
+    'integrations.coming_soon': '即将推出',
+    'integrations.category': '分类',
+    'integrations.status': '状态',
+    'integrations.search': '搜索集成...',
+    'integrations.empty': '未找到集成。',
+    'integrations.activate': '激活',
+    'integrations.deactivate': '停用',
+
+    // Memory
+    'memory.title': '记忆存储',
+    'memory.search': '搜索记忆...',
+    'memory.add': '存储记忆',
+    'memory.delete': '删除',
+    'memory.key': '键',
+    'memory.content': '内容',
+    'memory.category': '分类',
+    'memory.timestamp': '时间戳',
+    'memory.session': '会话',
+    'memory.score': '评分',
+    'memory.empty': '未找到记忆条目。',
+    'memory.confirm_delete': '确定要删除此记忆条目吗？',
+    'memory.all_categories': '全部分类',
+
+    // Config
+    'config.title': '配置',
+    'config.save': '保存',
+    'config.reset': '重置',
+    'config.saved': '配置保存成功。',
+    'config.error': '配置保存失败。',
+    'config.loading': '配置加载中...',
+    'config.editor_placeholder': 'TOML 配置...',
+
+    // Cost
+    'cost.title': '成本追踪',
+    'cost.session': '会话成本',
+    'cost.daily': '每日成本',
+    'cost.monthly': '每月成本',
+    'cost.total_tokens': 'Token 总数',
+    'cost.request_count': '请求数',
+    'cost.by_model': '按模型统计成本',
+    'cost.model': '模型',
+    'cost.tokens': 'Token',
+    'cost.requests': '请求',
+    'cost.usd': '成本（USD）',
+
+    // Logs
+    'logs.title': '实时日志',
+    'logs.clear': '清空',
+    'logs.pause': '暂停',
+    'logs.resume': '继续',
+    'logs.filter': '筛选日志...',
+    'logs.empty': '暂无日志条目。',
+    'logs.connected': '已连接到事件流。',
+    'logs.disconnected': '与事件流断开连接。',
+
+    // Doctor
+    'doctor.title': '系统诊断',
+    'doctor.run': '运行诊断',
+    'doctor.running': '正在运行诊断...',
+    'doctor.ok': '正常',
+    'doctor.warn': '警告',
+    'doctor.error': '错误',
+    'doctor.severity': '严重级别',
+    'doctor.category': '分类',
+    'doctor.message': '消息',
+    'doctor.empty': '尚未运行诊断。',
+    'doctor.summary': '诊断摘要',
+
+    // Auth / Pairing
+    'auth.pair': '设备配对',
+    'auth.pairing_code': '配对码',
+    'auth.pair_button': '配对',
+    'auth.logout': '退出登录',
+    'auth.pairing_success': '配对成功！',
+    'auth.pairing_failed': '配对失败，请重试。',
+    'auth.enter_code': '输入配对码以连接到智能体。',
+
+    // Common
+    'common.loading': '加载中...',
+    'common.error': '发生错误。',
+    'common.retry': '重试',
+    'common.cancel': '取消',
+    'common.confirm': '确认',
+    'common.save': '保存',
+    'common.delete': '删除',
+    'common.edit': '编辑',
+    'common.close': '关闭',
+    'common.yes': '是',
+    'common.no': '否',
+    'common.search': '搜索...',
+    'common.no_data': '暂无数据。',
+    'common.refresh': '刷新',
+    'common.back': '返回',
+    'common.actions': '操作',
+    'common.name': '名称',
+    'common.description': '描述',
+    'common.status': '状态',
+    'common.created': '创建时间',
+    'common.updated': '更新时间',
+
+    // Health
+    'health.title': '系统健康',
+    'health.component': '组件',
+    'health.status': '状态',
+    'health.last_ok': '最近正常',
+    'health.last_error': '最近错误',
+    'health.restart_count': '重启次数',
+    'health.pid': '进程 ID',
+    'health.uptime': '运行时长',
+    'health.updated_at': '最后更新',
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -413,6 +596,13 @@ export function tLocale(key: string, locale: Locale): string {
 // React hook
 // ---------------------------------------------------------------------------
 
+function normalizeLocale(locale: string | undefined): Locale {
+  const lowered = locale?.toLowerCase();
+  if (lowered?.startsWith('tr')) return 'tr';
+  if (lowered === 'zh' || lowered?.startsWith('zh-')) return 'zh-CN';
+  return 'en';
+}
+
 /**
  * React hook that fetches the locale from /api/status on mount and keeps the
  * i18n module in sync. Returns the current locale and a `t` helper bound to it.
@@ -426,9 +616,7 @@ export function useLocale(): { locale: Locale; t: (key: string) => string } {
     getStatus()
       .then((status) => {
         if (cancelled) return;
-        const detected = status.locale?.toLowerCase().startsWith('tr')
-          ? 'tr'
-          : 'en';
+        const detected = normalizeLocale(status.locale);
         setLocale(detected);
         setLocaleState(detected);
       })

@@ -1165,6 +1165,7 @@ mod tests {
             hint: "fast".into(),
             provider: "groq".into(),
             model: String::new(),
+            max_tokens: None,
             api_key: None,
         }];
         let mut items = Vec::new();

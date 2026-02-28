@@ -11,10 +11,16 @@ concurrency:
 permissions:
     contents: read
 
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
 jobs:
     enforce-dev-promotion:
         name: Enforce Dev -> Main Promotion
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         steps:
             - name: Validate PR source branch
               shell: bash

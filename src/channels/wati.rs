@@ -197,7 +197,8 @@ impl Channel for WatiChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("WATI send failed: {status} — {error_body}");
+            let sanitized = crate::providers::sanitize_api_error(&error_body);
+            tracing::error!("WATI send failed: {status} — {sanitized}");
             anyhow::bail!("WATI API error: {status}");
         }
 
@@ -335,7 +336,7 @@ mod tests {
             "text": "Hello from WATI!",
             "waId": "1234567890",
             "fromMe": false,
-            "timestamp": 1705320000u64
+            "timestamp": 1_705_320_000_u64
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
@@ -344,7 +345,7 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello from WATI!");
         assert_eq!(msgs[0].channel, "wati");
         assert_eq!(msgs[0].reply_target, "+1234567890");
-        assert_eq!(msgs[0].timestamp, 1705320000);
+        assert_eq!(msgs[0].timestamp, 1_705_320_000);
     }
 
     #[test]
@@ -381,7 +382,7 @@ mod tests {
             "message": { "body": "Alt field test" },
             "wa_id": "1234567890",
             "from_me": false,
-            "timestamp": 1705320000u64
+            "timestamp": 1_705_320_000_u64
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
@@ -396,11 +397,11 @@ mod tests {
         let payload = serde_json::json!({
             "text": "Test",
             "waId": "1234567890",
-            "timestamp": 1705320000u64
+            "timestamp": 1_705_320_000_u64
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs[0].timestamp, 1705320000);
+        assert_eq!(msgs[0].timestamp, 1_705_320_000);
     }
 
     #[test]
@@ -409,11 +410,11 @@ mod tests {
         let payload = serde_json::json!({
             "text": "Test",
             "waId": "1234567890",
-            "timestamp": 1705320000000u64
+            "timestamp": 1_705_320_000_000_u64
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs[0].timestamp, 1705320000);
+        assert_eq!(msgs[0].timestamp, 1_705_320_000);
     }
 
     #[test]
@@ -426,7 +427,7 @@ mod tests {
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs[0].timestamp, 1736942400);
+        assert_eq!(msgs[0].timestamp, 1_736_942_400);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 24, 2026**.
 
 ## How to List Providers
 
@@ -44,6 +44,7 @@ credential is not reused for fallback providers.
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
 | `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
+| `hunyuan` | `tencent` | No | `HUNYUAN_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
@@ -78,6 +79,28 @@ credential is not reused for fallback providers.
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 - Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
 
+### Qwen (Alibaba Cloud) Notes
+
+- Provider IDs: `qwen`, `qwen-code` (OAuth), `qwen-oauth`, `dashscope`, `qwen-intl`, `qwen-us`
+- **OAuth Free Tier**: Use `qwen-code` or set `api_key = "qwen-oauth"` in config
+  - Endpoint: `portal.qwen.ai/v1`
+  - Credentials: `~/.qwen/oauth_creds.json` (use `qwen login` to authenticate)
+  - Daily quota: 1000 requests
+  - Available model: `qwen3-coder-plus` (verified 2026-02-24)
+  - Context window: ~32K tokens
+- **API Key Access**: Use `qwen` or `dashscope` provider with `DASHSCOPE_API_KEY`
+  - Endpoint: `dashscope.aliyuncs.com/compatible-mode/v1`
+  - Higher quotas and more models available with paid API key
+- **Authentication**: `QWEN_OAUTH_TOKEN` (for OAuth) or `DASHSCOPE_API_KEY` (for API key)
+- **Recommended Model**: `qwen3-coder-plus` - Optimized for coding tasks
+- **Quota Tracking**: `zeroclaw providers-quota --provider qwen-code` shows static quota info (`?/1000` - unknown remaining, 1000/day total)
+  - Qwen OAuth API does not return rate limit headers
+  - Actual request counting requires local counter (not implemented)
+  - Rate limit errors are detected and parsed for retry backoff
+- **Limitations**:
+  - OAuth free tier limited to 1 model and 1000 requests/day
+  - See test report: `docs/qwen-provider-test-report.md`
+
 ### Ollama Vision Notes
 
 - Provider ID: `ollama`
@@ -92,6 +115,13 @@ credential is not reused for fallback providers.
 - ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
+
+### Hunyuan Notes
+
+- Provider ID: `hunyuan` (alias: `tencent`)
+- Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
+- Authentication: `HUNYUAN_API_KEY` (obtain from [Tencent Cloud console](https://console.cloud.tencent.com/hunyuan))
+- Recommended models: `hunyuan-t1-latest` (deep reasoning), `hunyuan-turbo-latest` (fast), `hunyuan-pro` (high quality)
 
 ### llama.cpp Server Notes
 
@@ -151,6 +181,42 @@ Behavior:
 - `false`: sends `think: false` to Ollama `/api/chat` requests.
 - `true`: sends `think: true`.
 - Unset: omits `think` and keeps Ollama/model defaults.
+
+### Ollama Vision Override
+
+Some Ollama models support vision (e.g. `llava`, `llama3.2-vision`) while others do not.
+Since ZeroClaw cannot auto-detect this, you can override it in `config.toml`:
+
+```toml
+default_provider = "ollama"
+default_model = "llava"
+model_support_vision = true
+```
+
+Behavior:
+
+- `true`: enables image attachment processing in the agent loop.
+- `false`: disables vision even if the provider reports support.
+- Unset: uses the provider's built-in default.
+
+Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
+
+### OpenAI Codex Reasoning Level
+
+You can control OpenAI Codex reasoning effort from `config.toml`:
+
+```toml
+[provider]
+reasoning_level = "high"
+```
+
+Behavior:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT`.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- Legacy compatibility: `runtime.reasoning_level` is accepted but deprecated; prefer `provider.reasoning_level`.
+- If both `provider.reasoning_level` and `runtime.reasoning_level` are set, provider-level value wins.
 
 ### Kimi Code Notes
 
@@ -243,6 +309,7 @@ You can route model calls by hint using `[[model_routes]]`:
 hint = "reasoning"
 provider = "openrouter"
 model = "anthropic/claude-opus-4-20250514"
+max_tokens = 8192
 
 [[model_routes]]
 hint = "fast"

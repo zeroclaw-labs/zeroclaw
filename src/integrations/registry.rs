@@ -162,7 +162,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         // ── AI Models ───────────────────────────────────────────
         IntegrationEntry {
             name: "OpenRouter",
-            description: "200+ models, 1 API key",
+            description: "Claude Sonnet 4.6, GPT-5.2, Gemini 3.1 Pro",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("openrouter") && c.api_key.is_some() {
@@ -174,7 +174,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Anthropic",
-            description: "Claude 3.5/4 Sonnet & Opus",
+            description: "Claude Sonnet 4.6, Claude Opus 4.6",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("anthropic") {
@@ -186,7 +186,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "OpenAI",
-            description: "GPT-4o, GPT-5, o1",
+            description: "GPT-5.2, GPT-5.2-Codex",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("openai") {
@@ -198,7 +198,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Google",
-            description: "Gemini 2.5 Pro/Flash",
+            description: "Gemini 3.1 Pro, Gemini 3 Flash",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_model
@@ -213,7 +213,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "DeepSeek",
-            description: "DeepSeek V3 & R1",
+            description: "DeepSeek-Reasoner, DeepSeek-Chat",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_model
@@ -228,7 +228,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "xAI",
-            description: "Grok 3 & 4",
+            description: "Grok 4, Grok 3",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_model
@@ -243,7 +243,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Mistral",
-            description: "Mistral Large & Codestral",
+            description: "Mistral Large Latest, Codestral",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_model
@@ -270,7 +270,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Perplexity",
-            description: "Search-augmented AI",
+            description: "Sonar Pro, Sonar Reasoning Pro",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("perplexity") {
@@ -294,7 +294,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Venice",
-            description: "Privacy-first inference (Llama, Opus)",
+            description: "Venice Llama 3.3 70B and frontier blends",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("venice") {
@@ -306,7 +306,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Vercel AI",
-            description: "Vercel AI Gateway",
+            description: "Gateway for GPT-5.2 and multi-provider routing",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("vercel") {
@@ -318,7 +318,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Cloudflare AI",
-            description: "Cloudflare AI Gateway",
+            description: "Workers AI + Llama 3.3 / gateway routing",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("cloudflare") {
@@ -330,7 +330,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Moonshot",
-            description: "Kimi & Kimi Coding",
+            description: "Kimi 2.5 and Kimi Coding",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_moonshot_alias) {
@@ -342,7 +342,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Synthetic",
-            description: "Synthetic AI models",
+            description: "Synthetic-1 and synthetic family models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("synthetic") {
@@ -354,7 +354,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "OpenCode Zen",
-            description: "Code-focused AI models",
+            description: "OpenCode Zen and coding-specialized models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("opencode") {
@@ -366,7 +366,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Z.AI",
-            description: "Z.AI inference",
+            description: "GLM 4.7 and Z.AI hosted variants",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_zai_alias) {
@@ -378,7 +378,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "GLM",
-            description: "ChatGLM / Zhipu models",
+            description: "GLM 4.7 and GLM 4.5 family",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_glm_alias) {
@@ -390,7 +390,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "MiniMax",
-            description: "MiniMax AI models",
+            description: "MiniMax M1 and latest multimodal variants",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_minimax_alias) {
@@ -402,7 +402,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Qwen",
-            description: "Alibaba DashScope Qwen models",
+            description: "Qwen Max and Qwen reasoning families",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_qwen_alias) {
@@ -414,7 +414,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Amazon Bedrock",
-            description: "AWS managed model access",
+            description: "Claude Sonnet 4.5 and Bedrock model catalog",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("bedrock") {
@@ -426,7 +426,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Qianfan",
-            description: "Baidu AI models",
+            description: "ERNIE 4.x and Qianfan model catalog",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_qianfan_alias) {
@@ -438,7 +438,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Groq",
-            description: "Ultra-fast LPU inference",
+            description: "Llama 3.3 70B Versatile and low-latency models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("groq") {
@@ -450,7 +450,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Together AI",
-            description: "Open-source model hosting",
+            description: "Llama 3.3 70B Turbo and open model hosting",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("together") {
@@ -462,7 +462,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Fireworks AI",
-            description: "Fast open-source inference",
+            description: "DeepSeek / Llama high-throughput inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("fireworks") {
@@ -473,20 +473,8 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
-            name: "Novita AI",
-            description: "Affordable open-source inference",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.default_provider.as_deref() == Some("novita") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
             name: "Cohere",
-            description: "Command R+ & embeddings",
+            description: "Command R+ (08-2024) and embedding models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("cohere") {
@@ -804,6 +792,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
@@ -853,6 +843,7 @@ mod tests {
             device_id: None,
             room_id: "!r:m".into(),
             allowed_users: vec![],
+            mention_only: false,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

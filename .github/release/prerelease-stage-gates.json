@@ -1,0 +1,34 @@
+{
+  "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+  "stage_order": ["alpha", "beta", "rc", "stable"],
+  "required_previous_stage": {
+    "beta": "alpha",
+    "rc": "beta",
+    "stable": "rc"
+  },
+  "required_checks": {
+    "alpha": [
+      "CI Required Gate",
+      "Security Audit"
+    ],
+    "beta": [
+      "CI Required Gate",
+      "Security Audit",
+      "Feature Matrix Summary"
+    ],
+    "rc": [
+      "CI Required Gate",
+      "Security Audit",
+      "Feature Matrix Summary",
+      "Nightly Summary & Routing"
+    ],
+    "stable": [
+      "Main Promotion Gate",
+      "CI Required Gate",
+      "Security Audit",
+      "Feature Matrix Summary",
+      "Verify Artifact Set",
+      "Nightly Summary & Routing"
+    ]
+  }
+}

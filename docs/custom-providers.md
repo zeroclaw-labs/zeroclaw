@@ -14,6 +14,25 @@ api_key = "your-api-key"
 default_model = "your-model-name"
 ```
 
+Optional API mode:
+
+```toml
+# Default (chat-completions first, responses fallback when available)
+provider_api = "openai-chat-completions"
+
+# Responses-first mode (calls /responses directly)
+provider_api = "openai-responses"
+```
+
+`provider_api` is only valid when `default_provider` uses `custom:<url>`.
+
+Responses API WebSocket mode is supported for OpenAI-compatible endpoints:
+
+- Auto mode: when your `custom:` endpoint resolves to `api.openai.com`, ZeroClaw will try WebSocket mode first (`wss://.../responses`) and automatically fall back to HTTP if the websocket handshake or stream fails.
+- Manual override:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode for any `custom:` endpoint.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` disables websocket mode and uses HTTP only.
+
 ### Anthropic-Compatible Endpoints (`anthropic-custom:`)
 
 For services that implement the Anthropic API format:
@@ -44,6 +63,28 @@ For `custom:` and `anthropic-custom:` providers, use the generic key env vars:
 export API_KEY="your-api-key"
 # or: export ZEROCLAW_API_KEY="your-api-key"
 zeroclaw agent
+```
+
+## Hunyuan (Tencent)
+
+ZeroClaw includes a first-class provider for [Tencent Hunyuan](https://hunyuan.tencent.com/):
+
+- Provider ID: `hunyuan` (alias: `tencent`)
+- Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
+
+Configure ZeroClaw:
+
+```toml
+default_provider = "hunyuan"
+default_model = "hunyuan-t1-latest"
+default_temperature = 0.7
+```
+
+Set your API key:
+
+```bash
+export HUNYUAN_API_KEY="your-api-key"
+zeroclaw agent -m "hello"
 ```
 
 ## llama.cpp Server (Recommended Local Setup)

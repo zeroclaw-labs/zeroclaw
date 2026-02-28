@@ -9,6 +9,16 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// Minimum sensitivity required to activate heuristic (generic) secret rules.
+///
+/// Structurally identifiable patterns (API keys with known prefixes, AWS keys,
+/// JWTs, PEM blocks, database URLs) are always scanned regardless of sensitivity.
+/// Generic rules (password=, secret=, token=) only fire when `sensitivity` exceeds
+/// this threshold, reducing false positives on technical content.
+const GENERIC_SECRET_SENSITIVITY_THRESHOLD: f64 = 0.5;
+const ENTROPY_TOKEN_MIN_LEN: usize = 20;
+const HIGH_ENTROPY_BASELINE: f64 = 4.2;
+
 /// Result of leak detection.
 #[derive(Debug, Clone)]
 pub enum LeakResult {
@@ -61,6 +71,7 @@ impl LeakDetector {
         self.check_private_keys(content, &mut patterns, &mut redacted);
         self.check_jwt_tokens(content, &mut patterns, &mut redacted);
         self.check_database_urls(content, &mut patterns, &mut redacted);
+        self.check_high_entropy_tokens(content, &mut patterns, &mut redacted);
 
         if patterns.is_empty() {
             LeakResult::Clean
@@ -189,7 +200,7 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) && self.sensitivity > 0.5 {
+            if regex.is_match(content) && self.sensitivity > GENERIC_SECRET_SENSITIVITY_THRESHOLD {
                 patterns.push(name.to_string());
                 *redacted = regex.replace_all(redacted, "[REDACTED_SECRET]").to_string();
             }
@@ -288,6 +299,74 @@ impl LeakDetector {
             }
         }
     }
+
+    /// Check for high-entropy tokens that resemble obfuscated secrets.
+    fn check_high_entropy_tokens(
+        &self,
+        content: &str,
+        patterns: &mut Vec<String>,
+        redacted: &mut String,
+    ) {
+        let threshold = (HIGH_ENTROPY_BASELINE + (self.sensitivity - 0.5) * 0.6).clamp(3.9, 4.8);
+        let mut flagged = false;
+
+        for token in extract_candidate_tokens(content) {
+            if token.len() < ENTROPY_TOKEN_MIN_LEN {
+                continue;
+            }
+
+            // Lower false positives by requiring mixed alphanumerics.
+            let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
+            let has_digit = token.chars().any(|c| c.is_ascii_digit());
+            if !(has_alpha && has_digit) {
+                continue;
+            }
+
+            let entropy = shannon_entropy(token.as_bytes());
+            if entropy >= threshold {
+                flagged = true;
+                let replaced = redacted.replace(token, "[REDACTED_HIGH_ENTROPY_TOKEN]");
+                if replaced != *redacted {
+                    *redacted = replaced;
+                } else if redacted.contains("[REDACTED_SECRET]") {
+                    *redacted =
+                        redacted.replacen("[REDACTED_SECRET]", "[REDACTED_HIGH_ENTROPY_TOKEN]", 1);
+                }
+            }
+        }
+
+        if flagged {
+            patterns.push("High-entropy token (possible encoded secret)".to_string());
+        }
+    }
+}
+
+fn extract_candidate_tokens(content: &str) -> Vec<&str> {
+    content
+        .split(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '/' || c == '=')
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn shannon_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0_u32; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let len = bytes.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = count as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -380,5 +459,69 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         let result = detector.scan(content);
         // Low sensitivity should not flag generic secrets
         assert!(matches!(result, LeakResult::Clean));
+    }
+
+    #[test]
+    fn sensitivity_at_threshold_does_not_fire_generic() {
+        // The condition is strict `>`, so exactly 0.5 must NOT trigger generic rules.
+        let detector = LeakDetector::with_sensitivity(GENERIC_SECRET_SENSITIVITY_THRESHOLD);
+        let content = "password=hunter2isasecret";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "sensitivity == threshold (0.5) should NOT activate generic-secret rules"
+        );
+    }
+
+    #[test]
+    fn sensitivity_just_above_threshold_fires_generic() {
+        let detector = LeakDetector::with_sensitivity(GENERIC_SECRET_SENSITIVITY_THRESHOLD + 0.01);
+        let content = "password=hunter2isasecret";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Detected { .. }),
+            "sensitivity just above threshold should activate generic-secret rules"
+        );
+    }
+
+    #[test]
+    fn structural_api_key_detected_regardless_of_sensitivity() {
+        // Stripe key is structurally identifiable — must be caught even at zero sensitivity.
+        let detector = LeakDetector::with_sensitivity(0.0);
+        let content = "key: sk_test_1234567890abcdefghijklmnop";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Detected { .. }),
+            "structural API key patterns must fire at any sensitivity level"
+        );
+    }
+
+    #[test]
+    fn high_entropy_token_is_detected_and_redacted() {
+        let detector = LeakDetector::with_sensitivity(0.9);
+        let content = "token: A9sD2kL0zQ1xW8vN3mR7tY6uI4oP2qS9dF1gH5jK";
+        let result = detector.scan(content);
+        match result {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("High-entropy token")));
+                assert!(redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"));
+            }
+            _ => panic!("expected high-entropy detection"),
+        }
+    }
+
+    #[test]
+    fn natural_language_text_is_not_flagged_as_high_entropy() {
+        let detector = LeakDetector::with_sensitivity(0.9);
+        let content = "the quick brown fox jumps over the lazy dog";
+        let result = detector.scan(content);
+        assert!(matches!(result, LeakResult::Clean));
+    }
+
+    #[test]
+    fn shannon_entropy_distinguishes_repetitive_from_random_tokens() {
+        let low = shannon_entropy(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let high = shannon_entropy(b"aB3f9K1mP0qX8vT2nR6sW4yZ7uH5");
+        assert!(high > low);
     }
 }
