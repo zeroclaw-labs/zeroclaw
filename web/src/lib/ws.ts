@@ -52,10 +52,11 @@ export class WebSocketClient {
     this.clearReconnectTimer();
 
     const token = getToken();
-    const url = `${this.baseUrl}/ws/chat`;
+    let url = `${this.baseUrl}/ws/chat`;
     const protocols = ['zeroclaw.v1'];
     if (token) {
       protocols.push(`bearer.${token}`);
+      url += `?token=${encodeURIComponent(token)}`;
     }
 
     this.ws = new WebSocket(url, protocols);

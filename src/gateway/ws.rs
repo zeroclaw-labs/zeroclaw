@@ -17,14 +17,20 @@ use crate::providers::ChatMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap},
     response::IntoResponse,
 };
+use serde::Deserialize;
 
 const EMPTY_WS_RESPONSE_FALLBACK: &str =
     "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
+
+#[derive(Deserialize)]
+pub struct WsQueryParams {
+    pub token: Option<String>,
+}
 
 fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
     let sanitized = crate::channels::sanitize_channel_response(response, tools);
@@ -155,15 +161,16 @@ fn build_ws_system_prompt(
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<WsQueryParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth via Authorization header or websocket protocol token.
+    // Auth via Authorization header, websocket protocol token, or query parameter.
     if state.pairing.require_pairing() {
-        let token = extract_ws_bearer_token(&headers).unwrap_or_default();
+        let token = extract_ws_bearer_token(&headers, params.token.as_deref()).unwrap_or_default();
         if !state.pairing.is_authenticated(&token) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token> or Sec-WebSocket-Protocol: bearer.<token>",
+                "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token> query parameter",
             )
                 .into_response();
         }
@@ -295,7 +302,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
-fn extract_ws_bearer_token(headers: &HeaderMap) -> Option<String> {
+fn extract_ws_bearer_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<String> {
+    // Priority: Authorization header > Query parameter > WebSocket protocol
     if let Some(auth_header) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -308,6 +316,14 @@ fn extract_ws_bearer_token(headers: &HeaderMap) -> Option<String> {
         }
     }
 
+    // Check query parameter token
+    if let Some(token) = query_token {
+        if !token.trim().is_empty() {
+            return Some(token.trim().to_string());
+        }
+    }
+
+    // Fallback to WebSocket protocol (for backward compatibility)
     let offered = headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok())?;
@@ -343,7 +359,7 @@ mod tests {
         );
 
         assert_eq!(
-            extract_ws_bearer_token(&headers).as_deref(),
+            extract_ws_bearer_token(&headers, None).as_deref(),
             Some("from-auth-header")
         );
     }
@@ -357,8 +373,37 @@ mod tests {
         );
 
         assert_eq!(
-            extract_ws_bearer_token(&headers).as_deref(),
+            extract_ws_bearer_token(&headers, None).as_deref(),
             Some("protocol-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_reads_query_parameter_token() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            extract_ws_bearer_token(&headers, Some("query-token")).as_deref(),
+            Some("query-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_priority_order() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer auth-header-token"),
+        );
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer.protocol-token"),
+        );
+
+        // Authorization header should take priority over query parameter
+        assert_eq!(
+            extract_ws_bearer_token(&headers, Some("query-token")).as_deref(),
+            Some("auth-header-token")
         );
     }
 
@@ -374,7 +419,9 @@ mod tests {
             HeaderValue::from_static("zeroclaw.v1, bearer."),
         );
 
-        assert!(extract_ws_bearer_token(&headers).is_none());
+        assert!(extract_ws_bearer_token(&headers, None).is_none());
+        assert!(extract_ws_bearer_token(&headers, Some("")).is_none());
+        assert!(extract_ws_bearer_token(&headers, Some("   ")).is_none());
     }
 
     struct MockScheduleTool;
