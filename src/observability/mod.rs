@@ -9,11 +9,11 @@ pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
-pub use cost::CostObserver;
 #[allow(unused_imports)]
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+pub use cost::CostObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -22,8 +22,8 @@ pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
-use crate::config::ObservabilityConfig;
 use crate::config::schema::CostConfig;
+use crate::config::ObservabilityConfig;
 use crate::cost::CostTracker;
 use std::sync::Arc;
 

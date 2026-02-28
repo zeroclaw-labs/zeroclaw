@@ -78,11 +78,11 @@ impl SurvivalStatus {
     /// Get a color code for terminal output (ANSI).
     pub fn ansi_color(&self) -> &'static str {
         match self {
-            Self::Thriving => "\x1b[32m",  // Green
-            Self::Stable => "\x1b[34m",    // Blue
+            Self::Thriving => "\x1b[32m",   // Green
+            Self::Stable => "\x1b[34m",     // Blue
             Self::Struggling => "\x1b[33m", // Yellow
-            Self::Critical => "\x1b[31m",  // Red
-            Self::Bankrupt => "\x1b[35m",  // Magenta
+            Self::Critical => "\x1b[31m",   // Red
+            Self::Bankrupt => "\x1b[35m",   // Magenta
         }
     }
 }
