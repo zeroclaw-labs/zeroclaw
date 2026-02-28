@@ -93,7 +93,7 @@ pub async fn handle_api_chat(
     // ── Auth: require at least one layer for non-loopback ──
     if !state.pairing.require_pairing()
         && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
+        && !super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
     {
         tracing::warn!("/api/chat: rejected unauthenticated non-loopback request");
         let err = serde_json::json!({
@@ -383,7 +383,7 @@ pub async fn handle_v1_chat_completions_with_tools(
     // ── Auth: require at least one layer for non-loopback ──
     if !state.pairing.require_pairing()
         && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
+        && !super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
     {
         tracing::warn!(
             "/v1/chat/completions (compat): rejected unauthenticated non-loopback request"
