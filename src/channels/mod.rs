@@ -938,10 +938,10 @@ fn resolved_default_provider(config: &Config) -> String {
 }
 
 fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    crate::config::resolve_default_model_id(
+        config.default_model.as_deref(),
+        config.default_provider.as_deref(),
+    )
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
@@ -8788,6 +8788,27 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::config::OutboundLeakGuardAction::Block
         );
         assert_eq!(policy.outbound_leak_guard.sensitivity, 0.95);
+    }
+
+    #[tokio::test]
+    async fn load_runtime_defaults_from_config_file_uses_provider_fallback_when_model_missing() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut cfg = Config::default();
+        cfg.config_path = config_path.clone();
+        cfg.workspace_dir = workspace_dir;
+        cfg.default_provider = Some("openai".to_string());
+        cfg.default_model = None;
+        cfg.save().await.expect("save config");
+
+        let (defaults, _policy) = load_runtime_defaults_from_config_file(&config_path)
+            .await
+            .expect("runtime defaults");
+        assert_eq!(defaults.default_provider, "openai");
+        assert_eq!(defaults.model, "gpt-5.2");
     }
 
     #[tokio::test]

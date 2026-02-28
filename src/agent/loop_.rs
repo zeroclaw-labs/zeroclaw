@@ -1816,10 +1816,12 @@ pub async fn run(
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter");
 
-    let model_name = model_override
-        .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+    let model_name = crate::config::resolve_default_model_id(
+        model_override
+            .as_deref()
+            .or(config.default_model.as_deref()),
+        Some(provider_name),
+    );
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -1840,7 +1842,7 @@ pub async fn run(
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
 
@@ -2003,7 +2005,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
@@ -2085,7 +2087,7 @@ pub async fn run(
                         &tools_registry,
                         observer.as_ref(),
                         provider_name,
-                        model_name,
+                        &model_name,
                         temperature,
                         false,
                         approval_manager.as_ref(),
@@ -2251,7 +2253,7 @@ pub async fn run(
                             &tools_registry,
                             observer.as_ref(),
                             provider_name,
-                            model_name,
+                            &model_name,
                             temperature,
                             false,
                             approval_manager.as_ref(),
@@ -2307,7 +2309,7 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
             )
             .await
@@ -2388,10 +2390,10 @@ pub async fn process_message_with_session(
     tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = crate::config::resolve_default_model_id(
+        config.default_model.as_deref(),
+        Some(provider_name),
+    );
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),

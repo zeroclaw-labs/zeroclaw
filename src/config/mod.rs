@@ -4,9 +4,10 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
-    AgentConfig, AgentsIpcConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig,
-    BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
+    build_runtime_proxy_client_with_timeouts, default_model_fallback_for_provider,
+    resolve_default_model_id, runtime_proxy_config, set_runtime_proxy_config, AgentConfig,
+    AgentsIpcConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
+    BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
     CoordinationConfig, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig,
     DockerRuntimeConfig, EconomicConfig, EconomicTokenPricing, EmbeddingRouteConfig, EstopConfig,
     FeishuConfig, GatewayConfig, GroupReplyConfig, GroupReplyMode, HardwareConfig,
@@ -23,6 +24,7 @@ pub use schema::{
     StorageProviderSection, StreamMode, SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig,
     TunnelConfig, UrlAccessConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy,
     WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

@@ -1,5 +1,7 @@
 use crate::config::traits::ChannelConfig;
-use crate::providers::{is_glm_alias, is_zai_alias};
+use crate::providers::{
+    canonical_china_provider_name, is_glm_alias, is_qwen_oauth_alias, is_zai_alias,
+};
 use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -13,6 +15,100 @@ use std::sync::{OnceLock, RwLock};
 use tokio::fs::File;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+
+/// Default fallback model when none is configured. Uses a format compatible with
+/// OpenRouter and other multi-provider gateways. For Anthropic direct API, this
+/// model ID will be normalized by the provider layer.
+pub const DEFAULT_MODEL_FALLBACK: &str = "anthropic/claude-sonnet-4.6";
+
+fn canonical_provider_for_model_defaults(provider_name: &str) -> String {
+    if let Some(canonical) = canonical_china_provider_name(provider_name) {
+        return if canonical == "doubao" {
+            "volcengine".to_string()
+        } else {
+            canonical.to_string()
+        };
+    }
+
+    match provider_name {
+        "grok" => "xai".to_string(),
+        "together" => "together-ai".to_string(),
+        "google" | "google-gemini" => "gemini".to_string(),
+        "github-copilot" => "copilot".to_string(),
+        "openai_codex" | "codex" => "openai-codex".to_string(),
+        "kimi_coding" | "kimi_for_coding" => "kimi-code".to_string(),
+        "nvidia-nim" | "build.nvidia.com" => "nvidia".to_string(),
+        "aws-bedrock" => "bedrock".to_string(),
+        "llama.cpp" => "llamacpp".to_string(),
+        _ => provider_name.to_string(),
+    }
+}
+
+/// Returns a provider-aware fallback model ID when `default_model` is missing.
+pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'static str {
+    let normalized_provider = provider_name
+        .unwrap_or("openrouter")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+
+    if normalized_provider == "qwen-coding-plan" {
+        return "qwen3-coder-plus";
+    }
+
+    let canonical_provider = if is_qwen_oauth_alias(&normalized_provider) {
+        "qwen-code".to_string()
+    } else {
+        canonical_provider_for_model_defaults(&normalized_provider)
+    };
+
+    match canonical_provider.as_str() {
+        "anthropic" => "claude-sonnet-4-5-20250929",
+        "openai" => "gpt-5.2",
+        "openai-codex" => "gpt-5-codex",
+        "venice" => "zai-org-glm-5",
+        "groq" => "llama-3.3-70b-versatile",
+        "mistral" => "mistral-large-latest",
+        "deepseek" => "deepseek-chat",
+        "xai" => "grok-4-1-fast-reasoning",
+        "perplexity" => "sonar-pro",
+        "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "novita" => "minimax/minimax-m2.5",
+        "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "cohere" => "command-a-03-2025",
+        "moonshot" => "kimi-k2.5",
+        "hunyuan" => "hunyuan-t1-latest",
+        "glm" | "zai" => "glm-5",
+        "minimax" => "MiniMax-M2.5",
+        "qwen" => "qwen-plus",
+        "volcengine" => "doubao-1-5-pro-32k-250115",
+        "siliconflow" => "Pro/zai-org/GLM-4.7",
+        "qwen-code" => "qwen3-coder-plus",
+        "ollama" => "llama3.2",
+        "llamacpp" => "ggml-org/gpt-oss-20b-GGUF",
+        "sglang" | "vllm" | "osaurus" | "copilot" => "default",
+        "gemini" => "gemini-2.5-pro",
+        "kimi-code" => "kimi-for-coding",
+        "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "nvidia" => "meta/llama-3.3-70b-instruct",
+        _ => DEFAULT_MODEL_FALLBACK,
+    }
+}
+
+/// Resolves the model ID used by runtime components.
+/// Preference order:
+/// 1) Explicit configured model (if non-empty)
+/// 2) Provider-aware fallback
+pub fn resolve_default_model_id(
+    default_model: Option<&str>,
+    provider_name: Option<&str>,
+) -> String {
+    if let Some(model) = default_model.map(str::trim).filter(|m| !m.is_empty()) {
+        return model.to_string();
+    }
+
+    default_model_fallback_for_provider(provider_name).to_string()
+}
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.anthropic",
@@ -10814,6 +10910,31 @@ provider_api = "not-a-real-mode"
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
         std::env::remove_var("ZEROCLAW_MODEL");
+    }
+
+    #[test]
+    async fn resolve_default_model_id_prefers_configured_model() {
+        let resolved =
+            resolve_default_model_id(Some("  anthropic/claude-opus-4.6  "), Some("openrouter"));
+        assert_eq!(resolved, "anthropic/claude-opus-4.6");
+    }
+
+    #[test]
+    async fn resolve_default_model_id_uses_provider_specific_fallback() {
+        let openai = resolve_default_model_id(None, Some("openai"));
+        assert_eq!(openai, "gpt-5.2");
+
+        let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
+        assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
+    }
+
+    #[test]
+    async fn resolve_default_model_id_handles_special_provider_aliases() {
+        let qwen_coding_plan = resolve_default_model_id(None, Some("qwen-coding-plan"));
+        assert_eq!(qwen_coding_plan, "qwen3-coder-plus");
+
+        let google_alias = resolve_default_model_id(None, Some("google-gemini"));
+        assert_eq!(google_alias, "gemini-2.5-pro");
     }
 
     #[test]

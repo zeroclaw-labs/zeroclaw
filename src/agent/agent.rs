@@ -218,9 +218,7 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: self
-                .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            model_name: crate::config::resolve_default_model_id(self.model_name.as_deref(), None),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -298,11 +296,10 @@ impl Agent {
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
-        let model_name = config
-            .default_model
-            .as_deref()
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
-            .to_string();
+        let model_name = crate::config::resolve_default_model_id(
+            config.default_model.as_deref(),
+            Some(provider_name),
+        );
 
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
@@ -714,8 +711,12 @@ pub async fn run(
     let model_name = effective_config
         .default_model
         .as_deref()
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            crate::config::default_model_fallback_for_provider(Some(&provider_name)).to_string()
+        });
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
