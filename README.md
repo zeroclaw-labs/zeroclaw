@@ -532,6 +532,7 @@ Recommended low-friction setup (secure + fast):
 - **Discord:** allowlist your own Discord user ID.
 - **Slack:** allowlist your own Slack member ID (usually starts with `U`).
 - **Mattermost:** uses standard API v4. Allowlists use Mattermost user IDs.
+- **Matrix:** allowlist Matrix user IDs (e.g. `@user:matrix.org`). Requires `channel-matrix` feature. Plain rooms only for cron delivery; E2EE listener sessions use `zeroclaw daemon`.
 - **Nostr:** allowlist sender public keys (hex or npub). Supports NIP-04 and NIP-17 DMs.
 - Use `"*"` only for temporary open testing.
 

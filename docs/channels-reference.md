@@ -120,6 +120,7 @@ cargo check --no-default-features --features hardware,channel-lark
 ```
 
 If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
+The same applies to cron delivery: setting `delivery.channel` to a feature-gated channel in a build without that feature will return an error at delivery time.
 
 ---
 
