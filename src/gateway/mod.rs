@@ -2356,6 +2356,9 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            sop_engine: None,
+            sop_audit: None,
+            sop_collector: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -2399,6 +2402,9 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            sop_engine: None,
+            sop_audit: None,
+            sop_collector: None,
         };
 
         let unauthorized =
@@ -2835,7 +2841,7 @@ Reminder set successfully."#;
     }
 
     fn test_uri() -> axum::http::Uri {
-        "/webhook".parse::<axum::http::Uri>().unwrap()
+        "/webhook".parse().unwrap()
     }
 
     #[tokio::test]
@@ -2943,11 +2949,15 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            sop_engine: None,
+            sop_audit: None,
+            sop_collector: None,
         };
 
         let response = handle_webhook(
             State(state),
             test_public_connect_info(),
+            test_uri(),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
