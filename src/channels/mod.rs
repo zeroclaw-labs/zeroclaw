@@ -2318,7 +2318,8 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
-        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id) => {
+        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id)
+        | ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
             let request_id = raw_request_id.trim().to_string();
             if request_id.is_empty() {
                 "Usage: `/approve-confirm <request-id>`".to_string()
