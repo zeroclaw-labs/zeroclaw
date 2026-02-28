@@ -779,6 +779,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "sglang" | "vllm" | "osaurus" => "default".into(),
+        "copilot" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -1225,6 +1226,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
             ),
         ],
+        "copilot" => vec![(
+            "default".to_string(),
+            "Copilot default model (recommended)".to_string(),
+        )],
         _ => vec![("default".to_string(), "Default model".to_string())],
     }
 }
@@ -2213,7 +2218,7 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
-        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
+        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini, GitHub Copilot)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
@@ -2239,6 +2244,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             (
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
+            ),
+            (
+                "copilot",
+                "GitHub Copilot — OAuth device flow (Copilot subscription)",
             ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
@@ -2534,6 +2543,24 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("OSAURUS_API_KEY").yellow()
             ));
+        }
+
+        key
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        print_bullet("GitHub Copilot uses GitHub OAuth device flow.");
+        print_bullet("Press Enter to keep setup keyless and authenticate on first run.");
+        print_bullet("Optional: paste a GitHub token now to skip the first-run device prompt.");
+        println!();
+
+        let key: String = Input::new()
+            .with_prompt("  Paste your GitHub token (optional; Enter = device flow)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(
+                "No token provided. ZeroClaw will open the GitHub device login flow on first use.",
+            );
         }
 
         key
@@ -6096,8 +6123,19 @@ fn print_summary(config: &Config) {
     let mut step = 1u8;
 
     let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let canonical_provider = canonical_provider_name(provider);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if provider == "openai-codex" {
+        if canonical_provider == "copilot" {
+            println!(
+                "    {} Authenticate GitHub Copilot:",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!("       {}", style("zeroclaw agent -m \"Hello!\"").yellow());
+            println!(
+                "       {}",
+                style("(device/OAuth prompt appears automatically on first run)").dim()
+            );
+        } else if canonical_provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
                 style(format!("{step}.")).cyan().bold()
@@ -6106,7 +6144,7 @@ fn print_summary(config: &Config) {
                 "       {}",
                 style("zeroclaw auth login --provider openai-codex --device-code").yellow()
             );
-        } else if provider == "anthropic" {
+        } else if canonical_provider == "anthropic" {
             println!(
                 "    {} Configure Anthropic auth:",
                 style(format!("{step}.")).cyan().bold()
@@ -7254,6 +7292,7 @@ mod tests {
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("copilot"), "default");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
             default_model_for_provider("bedrock"),
@@ -7345,6 +7384,18 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_have_default_entry() {
+        let models = curated_models_for_provider("copilot");
+        assert_eq!(
+            models,
+            vec![(
+                "default".to_string(),
+                "Copilot default model (recommended)".to_string(),
+            )]
+        );
     }
 
     #[test]
