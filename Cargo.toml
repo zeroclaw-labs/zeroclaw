@@ -183,7 +183,6 @@ tempfile = "3.14"
 wasmtime = { version = "24.0.6", optional = true, default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "24.0.6", optional = true, default-features = false, features = ["preview1"] }
 
-
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
 
@@ -195,18 +194,6 @@ wa-rs-binary = { version = "0.2", optional = true, default-features = false }
 wa-rs-proto = { version = "0.2", optional = true, default-features = false }
 wa-rs-ureq-http = { version = "0.2", optional = true }
 wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
-
-# USB device enumeration (hardware discovery) — only on platforms nusb supports
-# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nusb = { version = "0.2", default-features = false, optional = true }
-
-# probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.31", optional = true }
-
-# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
-pdf-extract = { version = "0.10", optional = true }
-tempfile = "3.14"
 
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
