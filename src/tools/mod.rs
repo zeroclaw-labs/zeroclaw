@@ -33,7 +33,6 @@ pub mod delegate_coordination_status;
 pub mod docx_read;
 #[cfg(feature = "channel-lark")]
 pub mod feishu_doc;
-pub mod docx_read;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -113,7 +112,6 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
-pub use docx_read::DocxReadTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;

@@ -2230,36 +2230,13 @@ async fn handle_runtime_command_if_needed(
                             ApprovalResponse::Yes,
                         );
                         let tool_name = req.tool_name;
-                        let mut approval_message = if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
-                            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
-                            format!(
-                                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
-                            )
-                        } else {
-                            ctx.approval_manager.grant_non_cli_session(&tool_name);
-                            ctx.approval_manager
-                                .apply_persistent_runtime_grant(&tool_name);
-                            match persist_non_cli_approval_to_config(ctx, &tool_name).await {
-                                Ok(Some(path)) => format!(
-                                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nPersisted to `{}` so future channel sessions (including after restart) remain approved.",
-                                    path.display()
-                                ),
-                                Ok(None) => format!(
-                                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nNo runtime config path was found, so this approval is active for the current daemon runtime only."
-                                ),
-                                Err(err) => format!(
-                                    "Approved supervised execution for `{tool_name}` from request `{request_id}` in-memory.\nFailed to persist this approval to config: {err}"
-                                ),
-                            }
-                        };
-                        if tool_name != APPROVAL_ALL_TOOLS_ONCE_TOKEN {
-                            if let Some(exclusion_note) =
-                                clear_non_cli_exclusion_after_approval(ctx, &tool_name).await
-                            {
-                                approval_message.push('\n');
-                                approval_message.push_str(&exclusion_note);
-                            }
-                        }
+                        let approval_message = handle_confirm_tool_approval_side_effects(
+                            ctx,
+                            &request_id,
+                            &tool_name,
+                            source_channel,
+                        )
+                        .await;
                         runtime_trace::record_event(
                             "approval_request_confirmed",
                             Some(source_channel),
@@ -2564,6 +2541,10 @@ async fn handle_runtime_command_if_needed(
                     reply_target,
                 ) {
                     Ok(req) => {
+                        ctx.approval_manager.record_non_cli_pending_resolution(
+                            &request_id,
+                            ApprovalResponse::Yes,
+                        );
                         let approval_message = handle_confirm_tool_approval_side_effects(
                             ctx,
                             &request_id,
@@ -2641,17 +2622,6 @@ async fn handle_runtime_command_if_needed(
                         format!("Pending approval request `{request_id}` can only be approved by the original requester in the same channel/thread.")
                     }
                 }
-            }
-        }
-        ChannelRuntimeCommand::DenyToolApproval(request_id) => {
-            match ctx.approval_manager.reject_non_cli_pending_request(
-                &request_id,
-                sender,
-                source_channel,
-                reply_target,
-            ) {
-                Ok(_) => format!("Denied request `{request_id}`."),
-                Err(_) => format!("Request `{request_id}` not found, expired, or you are not authorized to deny it."),
             }
         }
     };
