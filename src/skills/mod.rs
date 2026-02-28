@@ -31,6 +31,9 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When true, include full skill instructions even in compact prompt mode.
+    #[serde(default)]
+    pub always: bool,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -431,12 +434,14 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
+        always: false,
     })
 }
 
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
+    let (fm, body) = parse_front_matter(&content);
     let mut name = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -467,6 +472,28 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         }
     }
 
+    if let Some(fm_name) = fm.get("name") {
+        if !fm_name.is_empty() {
+            name = fm_name.clone();
+        }
+    }
+    if let Some(fm_version) = fm.get("version") {
+        if !fm_version.is_empty() {
+            version = fm_version.clone();
+        }
+    }
+    if let Some(fm_author) = fm.get("author") {
+        if !fm_author.is_empty() {
+            author = Some(fm_author.clone());
+        }
+    }
+    let always = fm_bool(&fm, "always");
+    let prompt_body = if body.trim().is_empty() {
+        content.clone()
+    } else {
+        body.to_string()
+    };
+
     Ok(Skill {
         name,
         description: extract_description(&content),
@@ -474,8 +501,9 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         author,
         tags: Vec::new(),
         tools: Vec::new(),
-        prompts: vec![content],
+        prompts: vec![prompt_body],
         location: Some(path.to_path_buf()),
+        always,
     })
 }
 
@@ -496,12 +524,79 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![content],
         location: Some(path.to_path_buf()),
+        always: false,
     })
 }
 
+/// Strip matching single/double quotes from a scalar value.
+fn strip_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+/// Parse optional YAML-like front matter from a SKILL.md body.
+/// Returns (front_matter_map, body_without_front_matter).
+fn parse_front_matter(content: &str) -> (HashMap<String, String>, &str) {
+    let text = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return (HashMap::new(), content);
+    };
+    if first.trim() != "---" {
+        return (HashMap::new(), content);
+    }
+
+    let mut map = HashMap::new();
+    let start = first.len() + 1;
+    let mut end = start;
+    for line in lines {
+        if line.trim() == "---" {
+            let body_start = end + line.len() + 1;
+            let body = if body_start <= text.len() {
+                text[body_start..].trim_start_matches(['\n', '\r'])
+            } else {
+                ""
+            };
+            return (map, body);
+        }
+
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim().to_lowercase();
+            let value = strip_quotes(value).to_string();
+            if !key.is_empty() && !value.is_empty() {
+                map.insert(key, value);
+            }
+        }
+        end += line.len() + 1;
+    }
+
+    // Unclosed block: ignore as plain markdown for safety/backward compatibility.
+    (HashMap::new(), content)
+}
+
+/// Parse permissive boolean values from front matter.
+fn fm_bool(map: &HashMap<String, String>, key: &str) -> bool {
+    map.get(key)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+        .unwrap_or(false)
+}
+
 fn extract_description(content: &str) -> String {
-    content
-        .lines()
+    let (fm, body) = parse_front_matter(content);
+    if let Some(desc) = fm.get("description") {
+        if !desc.trim().is_empty() {
+            return desc.trim().to_string();
+        }
+    }
+
+    body.lines()
         .find(|line| !line.starts_with('#') && !line.trim().is_empty())
         .unwrap_or("No description")
         .trim()
@@ -584,7 +679,8 @@ pub fn skills_to_prompt_with_mode(
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
+             Skill instructions are loaded on demand: read the skill file in `location` when needed. \
+             Skills marked `always` include full instructions below even in compact mode.\n\n\
              <available_skills>\n",
         ),
     };
@@ -600,7 +696,9 @@ pub fn skills_to_prompt_with_mode(
         );
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
+        let inject_full =
+            matches!(mode, crate::config::SkillsPromptInjectionMode::Full) || skill.always;
+        if inject_full {
             if !skill.prompts.is_empty() {
                 let _ = writeln!(prompt, "    <instructions>");
                 for instruction in &skill.prompts {
@@ -2295,6 +2393,7 @@ command = "echo hello"
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
+            always: false,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -2319,6 +2418,7 @@ command = "echo hello"
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
+            always: false,
         }];
         let prompt = skills_to_prompt_with_mode(
             &skills,
@@ -2333,6 +2433,71 @@ command = "echo hello"
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(!prompt.contains("<tools>"));
+    }
+
+    #[test]
+    fn skills_to_prompt_compact_mode_includes_always_skill_instructions_and_tools() {
+        let skills = vec![Skill {
+            name: "always-skill".to_string(),
+            description: "Must always inject".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: "run".to_string(),
+                description: "Run task".to_string(),
+                kind: "shell".to_string(),
+                command: "echo hi".to_string(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["Do the thing every time.".to_string()],
+            location: Some(PathBuf::from("/tmp/workspace/skills/always-skill/SKILL.md")),
+            always: true,
+        }];
+        let prompt = skills_to_prompt_with_mode(
+            &skills,
+            Path::new("/tmp/workspace"),
+            crate::config::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>always-skill</name>"));
+        assert!(prompt.contains("<instruction>Do the thing every time.</instruction>"));
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>run</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
+    fn load_skill_md_front_matter_overrides_metadata_and_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("fm-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_md,
+            r#"---
+name: "overridden-name"
+version: "2.1.3"
+author: "alice"
+description: "Front-matter description"
+always: true
+---
+# Heading
+Body text that should be included.
+"#,
+        )
+        .unwrap();
+
+        let skill = load_skill_md(&skill_md, &skill_dir).unwrap();
+        assert_eq!(skill.name, "overridden-name");
+        assert_eq!(skill.version, "2.1.3");
+        assert_eq!(skill.author.as_deref(), Some("alice"));
+        assert_eq!(skill.description, "Front-matter description");
+        assert!(skill.always);
+        assert_eq!(skill.prompts.len(), 1);
+        assert!(!skill.prompts[0].contains("name: \"overridden-name\""));
+        assert!(skill.prompts[0].contains("# Heading"));
     }
 
     #[test]
@@ -2519,6 +2684,7 @@ description = "Bare minimum"
             }],
             prompts: vec![],
             location: None,
+            always: false,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -2538,6 +2704,7 @@ description = "Bare minimum"
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
+            always: false,
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
