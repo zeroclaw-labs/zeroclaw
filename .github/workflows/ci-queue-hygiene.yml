@@ -82,9 +82,11 @@ jobs:
 
                   "${cmd[@]}"
 
-                  echo "status_scope=${status_scope}" >> "$GITHUB_OUTPUT"
-                  echo "max_cancel=${max_cancel}" >> "$GITHUB_OUTPUT"
-                  echo "apply_mode=${apply_mode}" >> "$GITHUB_OUTPUT"
+                  {
+                    echo "status_scope=${status_scope}"
+                    echo "max_cancel=${max_cancel}"
+                    echo "apply_mode=${apply_mode}"
+                  } >> "$GITHUB_OUTPUT"
 
             - name: Publish queue hygiene summary
               if: always()
