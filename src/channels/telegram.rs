@@ -562,6 +562,18 @@ impl TelegramChannel {
         }
     }
 
+    fn build_typing_action_body(reply_target: &str) -> serde_json::Value {
+        let (chat_id, thread_id) = Self::parse_reply_target(reply_target);
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "action": "typing"
+        });
+        if let Some(thread_id) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(thread_id);
+        }
+        body
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
         let message = update.get("message")?;
         let chat_id = message
@@ -1056,6 +1068,31 @@ impl TelegramChannel {
         }
     }
 
+    fn passes_mention_only_gate(
+        &self,
+        message: &serde_json::Value,
+        sender_id: Option<&str>,
+        text_to_check: Option<&str>,
+    ) -> bool {
+        if !self.mention_only || !Self::is_group_message(message) {
+            return true;
+        }
+
+        if self.is_group_sender_trigger_enabled(sender_id) {
+            return true;
+        }
+
+        let Some(text) = text_to_check else {
+            return false;
+        };
+
+        let bot_username = self.bot_username.lock();
+        match bot_username.as_deref() {
+            Some(bot_username) => Self::contains_bot_mention(text, bot_username),
+            None => false,
+        }
+    }
+
     fn is_user_allowed(&self, username: &str) -> bool {
         let identity = Self::normalize_identity(username);
         self.allowed_users
@@ -1451,19 +1488,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Check mention_only for group messages (apply to caption for attachments)
-        let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                let text_to_check = attachment.caption.as_deref().unwrap_or("");
-                if !Self::contains_bot_mention(text_to_check, bot_username) {
-                    return None;
-                }
-            } else {
-                // Bot username unknown, can't verify mention
-                return None;
-            }
+        if !self.passes_mention_only_gate(
+            message,
+            sender_id.as_deref(),
+            attachment.caption.as_deref(),
+        ) {
+            return None;
         }
 
         let chat_id = message
@@ -1487,21 +1517,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
-
-        // Check mention_only for group messages
-        let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                // Check if caption contains bot mention
-                let caption_text = attachment.caption.as_deref().unwrap_or("");
-                if !Self::contains_bot_mention(caption_text, bot_username) {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        }
 
         // Ensure workspace directory is configured
         let workspace = self.workspace_dir.as_ref().or_else(|| {
@@ -1638,12 +1653,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Voice messages have no text to mention the bot, so ignore in mention_only mode when in groups.
-        // Private chats are always processed.
-        let is_group = Self::is_group_message(message);
-        let allow_sender_without_mention =
-            is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
-        if self.mention_only && is_group && !allow_sender_without_mention {
+        if !self.passes_mention_only_gate(message, sender_id.as_deref(), None) {
             return None;
         }
 
@@ -1668,13 +1678,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
-
-        // Check mention_only for group messages
-        // Voice messages cannot contain mentions, so skip in group chats when mention_only is set
-        let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            return None;
-        }
 
         // Download and transcribe
         let file_path = match self.get_file_path(&metadata.file_id).await {
@@ -1841,15 +1844,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let allow_sender_without_mention =
             is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
 
-        if self.mention_only && is_group && !allow_sender_without_mention {
-            let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                if !Self::contains_bot_mention(text, bot_username) {
-                    return None;
-                }
-            } else {
-                return None;
-            }
+        if !self.passes_mention_only_gate(message, sender_id.as_deref(), Some(text)) {
+            return None;
         }
 
         let chat_id = message
@@ -1878,8 +1874,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let content = if self.mention_only && is_group && !allow_sender_without_mention {
             let bot_username = self.bot_username.lock();
-            let bot_username = bot_username.as_ref()?;
-            Self::normalize_incoming_content(text, bot_username)?
+            match bot_username.as_ref() {
+                Some(bot_username) => Self::normalize_incoming_content(text, bot_username)?,
+                None => {
+                    tracing::debug!(
+                        "Telegram: bot_username missing at normalize stage; using original text"
+                    );
+                    text.to_string()
+                }
+            }
         } else {
             text.to_string()
         };
@@ -3341,10 +3344,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                     }
 
                     // Send "typing" indicator immediately when we receive a message
-                    let typing_body = serde_json::json!({
-                        "chat_id": &msg.reply_target,
-                        "action": "typing"
-                    });
+                    let typing_body = Self::build_typing_action_body(&msg.reply_target);
                     let _ = self
                         .http_client()
                         .post(self.api_url("sendChatAction"))
@@ -4023,6 +4023,37 @@ mod tests {
         assert_eq!(
             TelegramChannel::parse_approval_callback_command("zcapr:no:"),
             None
+        );
+    }
+
+    #[test]
+    fn build_typing_action_body_uses_plain_chat_id_and_optional_thread_id() {
+        let body = TelegramChannel::build_typing_action_body("-100200300:789");
+        assert_eq!(
+            body.get("chat_id").and_then(serde_json::Value::as_str),
+            Some("-100200300")
+        );
+        assert_eq!(
+            body.get("message_thread_id")
+                .and_then(serde_json::Value::as_str),
+            Some("789")
+        );
+        assert_eq!(
+            body.get("action").and_then(serde_json::Value::as_str),
+            Some("typing")
+        );
+    }
+
+    #[test]
+    fn build_typing_action_body_without_thread_does_not_emit_thread_id() {
+        let body = TelegramChannel::build_typing_action_body("12345");
+        assert_eq!(
+            body.get("chat_id").and_then(serde_json::Value::as_str),
+            Some("12345")
+        );
+        assert!(
+            body.get("message_thread_id").is_none(),
+            "thread id field should be absent for non-topic chats"
         );
     }
 
@@ -4712,6 +4743,55 @@ mod tests {
             .parse_update_message(&update)
             .expect("sender override should bypass mention requirement");
         assert_eq!(parsed.content, "run daily sync");
+    }
+
+    #[test]
+    fn passes_mention_only_gate_allows_configured_sender_for_non_text_messages() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true)
+            .with_group_reply_allowed_senders(vec!["555".into()]);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let group_message = serde_json::json!({
+            "chat": { "type": "group" }
+        });
+
+        assert!(
+            ch.passes_mention_only_gate(&group_message, Some("555"), None),
+            "voice/audio updates should honor sender bypass"
+        );
+        assert!(
+            ch.passes_mention_only_gate(&group_message, Some("555"), Some("status update")),
+            "attachment updates should honor sender bypass"
+        );
+    }
+
+    #[test]
+    fn passes_mention_only_gate_rejects_non_mentioned_non_bypassed_non_text_messages() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let group_message = serde_json::json!({
+            "chat": { "type": "group" }
+        });
+
+        assert!(
+            !ch.passes_mention_only_gate(&group_message, Some("999"), None),
+            "voice/audio updates without sender bypass must be rejected"
+        );
+        assert!(
+            !ch.passes_mention_only_gate(&group_message, Some("999"), Some("no mention here")),
+            "attachments without sender bypass must include bot mention"
+        );
+        assert!(
+            ch.passes_mention_only_gate(&group_message, Some("999"), Some("@mybot status")),
+            "attachments with explicit mention should pass"
+        );
     }
 
     #[test]
