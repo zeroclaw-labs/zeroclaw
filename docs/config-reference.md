@@ -1094,6 +1094,7 @@ Rule object fields (`[[channels_config.ack_reaction.<channel>.rules]]`):
 | `regex_all` | `[]` | Match only when all regex patterns match |
 | `regex_none` | `[]` | Match only when none of these regex patterns match |
 | `sender_ids` | `[]` | Match only these sender IDs (`"*"` matches all) |
+| `chat_ids` | `[]` | Match only these chat/channel IDs (`"*"` matches all) |
 | `chat_types` | `[]` | Restrict to `group` and/or `direct` |
 | `locale_any` | `[]` | Restrict by locale tag (prefix supported, e.g. `zh`) |
 | `action` | `react` | `react` to emit ACK, `suppress` to force no ACK when matched |
@@ -1114,6 +1115,7 @@ emojis = ["✅", "👌", "🔥"]
 contains_any = ["deploy", "release"]
 contains_none = ["dry-run"]
 regex_none = ["panic|fatal"]
+chat_ids = ["-100200300"]
 chat_types = ["group"]
 strategy = "first"
 sample_rate = 0.9

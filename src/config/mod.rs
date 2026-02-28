@@ -113,15 +113,19 @@ mod tests {
     }
 
     #[test]
-    fn reexported_http_request_credential_profile_is_constructible() {
-        let profile = HttpRequestCredentialProfile {
-            header_name: "Authorization".into(),
-            env_var: "OPENROUTER_API_KEY".into(),
-            value_prefix: "Bearer ".into(),
+    fn reexported_http_request_config_is_constructible() {
+        let cfg = HttpRequestConfig {
+            enabled: true,
+            allowed_domains: vec!["api.openai.com".into()],
+            max_response_size: 256_000,
+            timeout_secs: 10,
+            user_agent: "zeroclaw-test".into(),
         };
 
-        assert_eq!(profile.header_name, "Authorization");
-        assert_eq!(profile.env_var, "OPENROUTER_API_KEY");
-        assert_eq!(profile.value_prefix, "Bearer ");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.allowed_domains, vec!["api.openai.com"]);
+        assert_eq!(cfg.max_response_size, 256_000);
+        assert_eq!(cfg.timeout_secs, 10);
+        assert_eq!(cfg.user_agent, "zeroclaw-test");
     }
 }

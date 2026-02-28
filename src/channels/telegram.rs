@@ -3373,6 +3373,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                         let reaction_ctx = AckReactionContext {
                             text: &msg.content,
                             sender_id: sender_id.as_deref(),
+                            chat_id: Some(&reaction_chat_id),
                             chat_type,
                             locale_hint: None,
                         };

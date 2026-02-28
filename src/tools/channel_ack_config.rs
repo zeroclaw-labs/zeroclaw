@@ -10,6 +10,7 @@ use crate::config::{
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 
@@ -133,6 +134,19 @@ impl ChannelAckConfigTool {
             Some("group") => Ok(AckReactionContextChatType::Group),
             Some(other) => anyhow::bail!("Invalid chat_type '{other}'. Use direct|group"),
         }
+    }
+
+    fn parse_runs(args: &Value) -> anyhow::Result<usize> {
+        let Some(raw_runs) = args.get("runs") else {
+            return Ok(1);
+        };
+        let runs_u64 = raw_runs
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("'runs' must be an integer in range [1, 1000]"))?;
+        if !(1..=1000).contains(&runs_u64) {
+            anyhow::bail!("'runs' must be within [1, 1000]");
+        }
+        usize::try_from(runs_u64).map_err(|_| anyhow::anyhow!("'runs' is too large"))
     }
 
     fn fallback_defaults(channel: AckChannel) -> Vec<String> {
@@ -444,7 +458,9 @@ impl ChannelAckConfigTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required field: text"))?;
         let chat_type = Self::parse_chat_type(args)?;
         let sender_id = args.get("sender_id").and_then(Value::as_str);
+        let chat_id = args.get("chat_id").and_then(Value::as_str);
         let locale_hint = args.get("locale_hint").and_then(Value::as_str);
+        let runs = Self::parse_runs(args)?;
 
         let defaults = if let Some(raw_defaults) = args.get("defaults") {
             Self::parse_string_list(raw_defaults, "defaults")?
@@ -455,16 +471,68 @@ impl ChannelAckConfigTool {
 
         let cfg = self.load_config_without_env()?;
         let policy = Self::channel_config_ref(&cfg.channels_config.ack_reaction, channel);
-        let selection = select_ack_reaction_with_trace(
-            policy,
-            &default_refs,
-            &AckReactionContext {
-                text,
-                sender_id,
-                chat_type,
-                locale_hint,
-            },
-        );
+        let mut first_selection = None;
+        let mut emoji_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut no_emoji_count = 0usize;
+        let mut suppressed_count = 0usize;
+        let mut matched_rule_index_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut source_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+        for _ in 0..runs {
+            let selection = select_ack_reaction_with_trace(
+                policy,
+                &default_refs,
+                &AckReactionContext {
+                    text,
+                    sender_id,
+                    chat_id,
+                    chat_type,
+                    locale_hint,
+                },
+            );
+
+            if first_selection.is_none() {
+                first_selection = Some(selection.clone());
+            }
+
+            if let Some(emoji) = selection.emoji.clone() {
+                *emoji_counts.entry(emoji).or_insert(0) += 1;
+            } else {
+                no_emoji_count += 1;
+            }
+
+            if selection.suppressed {
+                suppressed_count += 1;
+            }
+
+            if let Some(index) = selection.matched_rule_index {
+                *matched_rule_index_counts
+                    .entry(index.to_string())
+                    .or_insert(0) += 1;
+            }
+
+            let source_key = match selection.source {
+                Some(AckReactionSelectionSource::Rule(_)) => "rule",
+                Some(AckReactionSelectionSource::ChannelPool) => "channel_pool",
+                Some(AckReactionSelectionSource::DefaultPool) => "default_pool",
+                None => "none",
+            };
+            *source_counts.entry(source_key.to_string()).or_insert(0) += 1;
+        }
+
+        let selection = first_selection.unwrap_or_else(|| {
+            select_ack_reaction_with_trace(
+                policy,
+                &default_refs,
+                &AckReactionContext {
+                    text,
+                    sender_id,
+                    chat_id,
+                    chat_type,
+                    locale_hint,
+                },
+            )
+        });
 
         let source = selection.source.as_ref().map(|source| match source {
             AckReactionSelectionSource::Rule(index) => json!({
@@ -486,19 +554,29 @@ impl ChannelAckConfigTool {
                 "input": {
                     "text": text,
                     "sender_id": sender_id,
+                    "chat_id": chat_id,
                     "chat_type": match chat_type {
                         AckReactionContextChatType::Direct => "direct",
                         AckReactionContextChatType::Group => "group",
                     },
                     "locale_hint": locale_hint,
                     "defaults": defaults,
+                    "runs": runs,
                 },
                 "selection": {
                     "emoji": selection.emoji,
                     "matched_rule_index": selection.matched_rule_index,
                     "suppressed": selection.suppressed,
                     "source": source,
-                }
+                },
+                "aggregate": {
+                    "runs": runs,
+                    "emoji_counts": emoji_counts,
+                    "no_emoji_count": no_emoji_count,
+                    "suppressed_count": suppressed_count,
+                    "matched_rule_index_counts": matched_rule_index_counts,
+                    "source_counts": source_counts,
+                },
             }))?,
             error: None,
         })
@@ -543,8 +621,10 @@ impl Tool for ChannelAckConfigTool {
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},
                 "sender_id": {"type": ["string", "null"]},
+                "chat_id": {"type": ["string", "null"]},
                 "chat_type": {"type": "string", "enum": ["direct", "group"]},
                 "locale_hint": {"type": ["string", "null"]},
+                "runs": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "defaults": {
                     "anyOf": [
                         {"type": "string"},
@@ -766,5 +846,48 @@ mod tests {
         assert_eq!(output["selection"]["matched_rule_index"], json!(0));
         assert_eq!(output["selection"]["suppressed"], json!(false));
         assert_eq!(output["selection"]["source"]["kind"], json!("rule"));
+    }
+
+    #[tokio::test]
+    async fn simulate_runs_reports_aggregate_counts() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ChannelAckConfigTool::new(test_config(&tmp).await, test_security());
+
+        let set_result = tool
+            .execute(json!({
+                "action": "set",
+                "channel": "discord",
+                "enabled": true,
+                "strategy": "first",
+                "sample_rate": 1.0,
+                "emojis": ["✅"]
+            }))
+            .await
+            .unwrap();
+        assert!(set_result.success, "{:?}", set_result.error);
+
+        let result = tool
+            .execute(json!({
+                "action": "simulate",
+                "channel": "discord",
+                "text": "hello world",
+                "chat_type": "group",
+                "chat_id": "c-1",
+                "runs": 5
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["input"]["runs"], json!(5));
+        assert_eq!(output["aggregate"]["runs"], json!(5));
+        assert_eq!(output["aggregate"]["emoji_counts"]["✅"], json!(5));
+        assert_eq!(output["aggregate"]["no_emoji_count"], json!(0));
+        assert_eq!(output["aggregate"]["suppressed_count"], json!(0));
+        assert_eq!(
+            output["aggregate"]["source_counts"]["channel_pool"],
+            json!(5)
+        );
     }
 }

@@ -4378,6 +4378,9 @@ pub struct AckReactionRuleConfig {
     /// Match only for these sender IDs. `*` matches any sender.
     #[serde(default)]
     pub sender_ids: Vec<String>,
+    /// Match only for these chat/channel IDs. `*` matches any chat.
+    #[serde(default)]
+    pub chat_ids: Vec<String>,
     /// Match only for selected chat types; empty means no chat-type constraint.
     #[serde(default)]
     pub chat_types: Vec<AckReactionChatType>,
@@ -4410,6 +4413,7 @@ impl Default for AckReactionRuleConfig {
             regex_all: Vec::new(),
             regex_none: Vec::new(),
             sender_ids: Vec::new(),
+            chat_ids: Vec::new(),
             chat_types: Vec::new(),
             locale_any: Vec::new(),
             action: AckReactionRuleAction::React,
@@ -10386,6 +10390,7 @@ allowed_users = ["@ops:matrix.org"]
                         regex_all: Vec::new(),
                         regex_none: vec![r"panic|fatal".into()],
                         sender_ids: vec!["u123".into()],
+                        chat_ids: vec!["-100200300".into()],
                         chat_types: vec![AckReactionChatType::Group],
                         locale_any: vec!["en".into()],
                         action: AckReactionRuleAction::React,
@@ -10413,6 +10418,7 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(first_rule.contains_any, vec!["deploy"]);
         assert_eq!(first_rule.contains_none, vec!["dry-run"]);
         assert_eq!(first_rule.regex_any, vec![r"deploy\s+ok"]);
+        assert_eq!(first_rule.chat_ids, vec!["-100200300"]);
         assert_eq!(first_rule.action, AckReactionRuleAction::React);
         assert_eq!(first_rule.sample_rate, Some(0.5));
         assert_eq!(first_rule.chat_types, vec![AckReactionChatType::Group]);

@@ -14,6 +14,7 @@ pub enum AckReactionContextChatType {
 pub struct AckReactionContext<'a> {
     pub text: &'a str,
     pub sender_id: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
     pub chat_type: AckReactionContextChatType,
     pub locale_hint: Option<&'a str>,
 }
@@ -80,6 +81,21 @@ fn matches_sender(rule: &AckReactionRuleConfig, sender_id: Option<&str>) -> bool
             return true;
         }
         normalized_sender.is_some_and(|sender| sender == candidate)
+    })
+}
+
+fn matches_chat_id(rule: &AckReactionRuleConfig, chat_id: Option<&str>) -> bool {
+    if rule.chat_ids.is_empty() {
+        return true;
+    }
+
+    let normalized_chat = chat_id.map(str::trim).filter(|value| !value.is_empty());
+    rule.chat_ids.iter().any(|candidate| {
+        let candidate = candidate.trim();
+        if candidate == "*" {
+            return true;
+        }
+        normalized_chat.is_some_and(|chat| chat == candidate)
     })
 }
 
@@ -213,6 +229,7 @@ fn rule_matches(rule: &AckReactionRuleConfig, ctx: &AckReactionContext<'_>) -> b
     rule.enabled
         && matches_chat_type(rule, ctx.chat_type)
         && matches_sender(rule, ctx.sender_id)
+        && matches_chat_id(rule, ctx.chat_id)
         && matches_locale(rule, ctx.locale_hint)
         && matches_text(rule, ctx.text)
 }
@@ -355,6 +372,7 @@ mod tests {
         AckReactionContext {
             text: "Deploy succeeded in group chat",
             sender_id: Some("u123"),
+            chat_id: Some("-100200300"),
             chat_type: AckReactionContextChatType::Group,
             locale_hint: Some("en_us"),
         }
@@ -416,6 +434,26 @@ mod tests {
             locale_any: vec!["zh".into()],
             strategy: Some(AckReactionStrategy::First),
             emojis: vec!["🇨🇳".into()],
+            ..AckReactionRuleConfig::default()
+        };
+        let cfg = AckReactionConfig {
+            emojis: vec!["👍".into()],
+            rules: vec![rule],
+            ..AckReactionConfig::default()
+        };
+        assert_eq!(
+            select_ack_reaction(Some(&cfg), &["👍"], &ctx()).as_deref(),
+            Some("👍")
+        );
+    }
+
+    #[test]
+    fn rule_respects_chat_id_filter() {
+        let rule = AckReactionRuleConfig {
+            contains_any: vec!["deploy".into()],
+            chat_ids: vec!["chat-other".into()],
+            strategy: Some(AckReactionStrategy::First),
+            emojis: vec!["🔒".into()],
             ..AckReactionRuleConfig::default()
         };
         let cfg = AckReactionConfig {

@@ -1001,6 +1001,7 @@ impl LarkChannel {
                     let reaction_ctx = AckReactionContext {
                         text: &text,
                         sender_id: Some(sender_open_id),
+                        chat_id: Some(&lark_msg.chat_id),
                         chat_type: if lark_msg.chat_type == "group" {
                             AckReactionContextChatType::Group
                         } else {
@@ -1586,6 +1587,10 @@ impl LarkChannel {
                         .pointer("/event/sender/sender_id/open_id")
                         .and_then(|value| value.as_str())
                         .map(str::to_string);
+                    let chat_id = payload
+                        .pointer("/event/message/chat_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
                     let chat_type = payload
                         .pointer("/event/message/chat_type")
                         .and_then(|value| value.as_str())
@@ -1601,6 +1606,7 @@ impl LarkChannel {
                     let reaction_ctx = AckReactionContext {
                         text: ack_text,
                         sender_id: sender_id.as_deref(),
+                        chat_id: chat_id.as_deref(),
                         chat_type,
                         locale_hint: Some(lark_locale_tag(locale)),
                     };

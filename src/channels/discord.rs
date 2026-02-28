@@ -898,6 +898,7 @@ impl Channel for DiscordChannel {
                         let reaction_ctx = AckReactionContext {
                             text: &final_content,
                             sender_id: Some(author_id),
+                            chat_id: Some(&channel_id),
                             chat_type: if is_group_message {
                                 AckReactionContextChatType::Group
                             } else {
