@@ -359,12 +359,14 @@ fn format_relative_time(dt: chrono::DateTime<Utc>) -> String {
 
 /// Truncate string to max length with ellipsis.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else if max_len >= 3 {
-        format!("{}...", &s[..max_len - 3])
+    if max_len == 0 {
+        return String::new();
+    }
+
+    if max_len >= 3 {
+        crate::util::truncate_with_ellipsis(s, max_len - 3)
     } else {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     }
 }
 
@@ -454,6 +456,10 @@ mod tests {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 8), "hello...");
         assert_eq!(truncate("hi", 5), "hi");
+        assert_eq!(truncate("你好世界和平", 6), "你好世...");
+        assert_eq!(truncate("😀😀😀😀", 3), "...");
+        assert_eq!(truncate("😀😀😀😀", 2), "😀😀");
+        assert_eq!(truncate("abc", 0), "");
     }
 
     #[test]

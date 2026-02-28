@@ -3106,8 +3106,8 @@ impl Channel for TelegramChannel {
         let thread_id = parsed_thread_id.or(thread_ts);
 
         let raw_args = arguments.to_string();
-        let args_preview = if raw_args.len() > 260 {
-            format!("{}...", &raw_args[..260])
+        let args_preview = if raw_args.chars().count() > 260 {
+            crate::util::truncate_with_ellipsis(&raw_args, 260)
         } else {
             raw_args
         };
