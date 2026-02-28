@@ -205,9 +205,8 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-# Default enables wasm-tools where platform runtime dependencies are available.
-# Unsupported targets (for example Android/Termux) use a stub implementation.
-default = ["wasm-tools"]
+# Keep default minimal for widest host compatibility (including macOS 10.15).
+default = []
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]

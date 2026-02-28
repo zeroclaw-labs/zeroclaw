@@ -1,3 +1,12 @@
+# macOS targets — pin minimum OS version so binaries run on supported releases.
+# Intel (x86_64): target macOS 10.15 Catalina and later.
+# Apple Silicon (aarch64): target macOS 11.0 Big Sur and later (no Catalina hardware exists).
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-mmacosx-version-min=10.15"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-mmacosx-version-min=11.0"]
+
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
 
