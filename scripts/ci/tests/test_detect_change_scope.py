@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -52,10 +53,14 @@ class DetectChangeScopeTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="zc-detect-scope-"))
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
 
-        run_cmd(["git", "init", "-q"], cwd=self.tmp)
-        run_cmd(["git", "checkout", "-q", "-b", "main"], cwd=self.tmp)
-        run_cmd(["git", "config", "user.name", "CI Test"], cwd=self.tmp)
-        run_cmd(["git", "config", "user.email", "ci@example.com"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "init", "-q"], "git init")
+        self._assert_cmd_ok(["git", "checkout", "-q", "-b", "main"], "git checkout -b main")
+        self._assert_cmd_ok(["git", "config", "user.name", "CI Test"], "git config user.name")
+        self._assert_cmd_ok(["git", "config", "user.email", "ci@example.com"], "git config user.email")
+
+    def _assert_cmd_ok(self, cmd: list[str], desc: str) -> None:
+        proc = run_cmd(cmd, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, msg=f"{desc} failed: {proc.stderr}\n{proc.stdout}")
 
     def _commit(self, message: str) -> str:
         proc = run_cmd(["git", "commit", "-q", "-m", message], cwd=self.tmp)
@@ -67,7 +72,7 @@ class DetectChangeScopeTest(unittest.TestCase):
     def _run_scope(self, *, event_name: str, base_sha: str) -> dict[str, str | list[str]]:
         output_path = self.tmp / "github_output.txt"
         env = {
-            "PATH": str(Path("/usr/bin")) + ":" + str(Path("/bin")),
+            "PATH": os.environ.get("PATH") or "/usr/bin:/bin",
             "GITHUB_OUTPUT": str(output_path),
             "EVENT_NAME": event_name,
             "BASE_SHA": base_sha,

@@ -240,8 +240,8 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- Open a PR to `dev`; do not push directly to `dev` or `main`.
-- `main` is reserved for release promotion PRs from `dev`.
+- Open a PR to `main` by default (`dev` is optional for integration batching); do not push directly to `dev` or `main`.
+- `main` accepts direct PR merges after required checks and review policy pass.
 - Wait for required checks and review outcomes before merging.
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
 - After merge/close, clean up task branches/worktrees that are no longer needed.
