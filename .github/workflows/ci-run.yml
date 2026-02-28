@@ -158,7 +158,7 @@ jobs:
         name: Docs-Only Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         steps:
             - name: Skip heavy jobs for docs-only change
               run: echo "Docs-only change detected. Rust lint/test/build skipped."
@@ -167,7 +167,7 @@ jobs:
         name: Non-Rust Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         steps:
             - name: Skip Rust jobs for non-Rust change scope
               run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
@@ -231,7 +231,7 @@ jobs:
         name: Lint Feedback
         if: github.event_name == 'pull_request'
         needs: [changes, lint, docs-quality]
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         permissions:
             contents: read
             pull-requests: write
@@ -257,7 +257,7 @@ jobs:
         name: CI/CD Owner Approval (@chumyin)
         needs: [changes]
         if: github.event_name == 'pull_request' && needs.changes.outputs.ci_cd_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         permissions:
             contents: read
             pull-requests: read
@@ -276,7 +276,7 @@ jobs:
         name: License File Owner Guard
         needs: [changes]
         if: github.event_name == 'pull_request'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         permissions:
             contents: read
             pull-requests: read
@@ -294,7 +294,7 @@ jobs:
         name: CI Required Gate
         if: always()
         needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         steps:
             - name: Enforce required status
               shell: bash
