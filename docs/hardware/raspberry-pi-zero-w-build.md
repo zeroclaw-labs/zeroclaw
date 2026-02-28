@@ -187,9 +187,18 @@ file /usr/local/bin/zeroclaw
 # Should show "statically linked" for musleabihf
 ```
 
-## Option B: Cross-Compilation (Advanced)
+## Option B: Cross-Compilation (Recommended)
 
-For faster builds, you can cross-compile from a more powerful machine (Linux, macOS, or Windows).
+For faster builds, cross-compile from a more powerful machine (Linux, macOS, or Windows). A native build on Pi Zero W can take **30-60 minutes**, while cross-compilation typically completes in **5-10 minutes**.
+
+### Why Cross-Compile?
+
+| Factor | Native (Pi Zero W) | Cross-Compile (x86_64) |
+|--------|-------------------|------------------------|
+| Build time | 30-60 minutes | 5-10 minutes |
+| RAM required | 512MB + 2GB swap | 4GB+ typical |
+| CPU load | High (single core) | Low relative to host |
+| Iteration speed | Slow | Fast |
 
 ### Prerequisites
 
@@ -197,42 +206,93 @@ On your build host (Linux x86_64 example):
 
 ```bash
 # Install musl cross-compilation toolchain (recommended)
-sudo apt install -y musl-tools musl-dev
+sudo apt install -y musl-tools musl-dev gcc-arm-linux-gnueabihf
+
+# Verify cross-compiler is available
+arm-linux-gnueabihf-gcc --version
 ```
+
+**macOS:** Install via Homebrew:
+```bash
+brew install musl-cross
+```
+
+**Windows:** Use WSL2 or install mingw-w64 cross-compilers.
 
 ### Build for musleabihf (Recommended)
 
+The ZeroClaw repository includes pre-configured `.cargo/config.toml` and `.cargo/armv6l-unknown-linux-musleabihf.json` for static linking.
+
 ```bash
-# Add ARMv6 musl target
+# Clone ZeroClaw repository
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+
+# Add ARMv6 musl target to rustup
 rustup target add armv6l-unknown-linux-musleabihf
 
-# Create .cargo/config.toml with:
-cat > .cargo/config.toml << 'EOF'
-[target.armv6l-unknown-linux-musleabihf]
-linker = "arm-linux-musleabihf-gcc"
-EOF
+# The repository's .cargo/config.toml already contains:
+# [target.armv6l-unknown-linux-musleabihf]
+# rustflags = ["-C", "link-arg=-static"]
+#
+# And .cargo/armv6l-unknown-linux-musleabihf.json provides
+# the target specification for proper ARMv6 support.
 
-# Build for target
+# Build for target (static binary, no runtime dependencies)
 cargo build --release --target armv6l-unknown-linux-musleabihf
 ```
 
+### Understanding Static Linking Benefits
+
+The `rustflags = ["-C", "link-arg=-static"]` flag ensures **fully static linking**:
+
+| Benefit | Description |
+|---------|-------------|
+| **No libc dependency** | Binary works on any ARMv6 Linux distribution |
+| **Smaller size** | musl produces more compact binaries than glibc |
+| **Version-agnostic** | Runs on Raspberry Pi OS Bullseye, Bookworm, or future versions |
+| **Secure by default** | Reduced attack surface with musl's minimal libc |
+| **Portable** | Same binary works across different Pi models with ARMv6 |
+
+### Verify Static Linking
+
+After building, confirm the binary is statically linked:
+
+```bash
+file target/armv6l-unknown-linux-musleabihf/release/zeroclaw
+# Output should include: "statically linked"
+
+ldd target/armv6l-unknown-linux-musleabihf/release/zeroclaw
+# Output should be: "not a dynamic executable"
+```
+
 ### Build for gnueabihf (Alternative)
+
+If you need dynamic linking or have specific glibc dependencies:
 
 ```bash
 # Add ARMv6 glibc target
 rustup target add armv6l-unknown-linux-gnueabihf
 
-# Install glibc cross compiler
-sudo apt install -y gcc-arm-linux-gnueabihf
-
-# Update .cargo/config.toml:
-cat >> .cargo/config.toml << 'EOF'
-[target.armv6l-unknown-linux-gnueabihf]
-linker = "arm-linux-gnueabihf-gcc"
-EOF
-
 # Build for target
 cargo build --release --target armv6l-unknown-linux-gnueabihf
+```
+
+**Note:** gnueabihf binaries will be larger and depend on the target system's glibc version.
+
+### Build with Custom Features
+
+Reduce binary size by building only needed features:
+
+```bash
+# Minimal build (agent core only)
+cargo build --release --target armv6l-unknown-linux-musleabihf --no-default-features
+
+# Specific feature set
+cargo build --release --target armv6l-unknown-linux-musleabihf --features "telegram,discord"
+
+# Use dist profile for size-optimized binary
+cargo build --profile dist --target armv6l-unknown-linux-musleabihf
 ```
 
 ### Transfer to Pi Zero W
@@ -245,6 +305,35 @@ scp target/armv6l-unknown-linux-musleabihf/release/zeroclaw pi@zero-w-ip:/home/p
 sudo mv ~/zeroclaw /usr/local/bin/
 sudo chmod +x /usr/local/bin/zeroclaw
 zeroclaw --version
+
+# Verify it's statically linked (no dependencies on target system)
+ldd /usr/local/bin/zeroclaw
+# Should output: "not a dynamic executable"
+```
+
+### Cross-Compilation Workflow Summary
+
+```
+┌─────────────────┐     Clone/Fork     ┌─────────────────────┐
+│  ZeroClaw Repo  │ ──────────────────> │   Your Build Host   │
+│  (GitHub)       │                    │  (Linux/macOS/Win)  │
+└─────────────────┘                    └─────────────────────┘
+                                                │
+                                                │ rustup target add
+                                                │ cargo build --release
+                                                ▼
+                                        ┌─────────────────────┐
+                                        │  Static Binary      │
+                                        │  (armv6l-musl)      │
+                                        └─────────────────────┘
+                                                │
+                                                │ scp / rsync
+                                                ▼
+                                        ┌─────────────────────┐
+                                        │  Raspberry Pi       │
+                                        │  Zero W             │
+                                        │  /usr/local/bin/    │
+                                        └─────────────────────┘
 ```
 
 ## Post-Installation Configuration
