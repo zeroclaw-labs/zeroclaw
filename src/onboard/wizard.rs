@@ -6426,6 +6426,8 @@ async fn scaffold_workspace(
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
+    // Ensure skills README + transparent preloaded defaults + policy metadata are initialized.
+    crate::skills::init_skills_dir(workspace_dir)?;
 
     let mut created = 0;
     let mut skipped = 0;
