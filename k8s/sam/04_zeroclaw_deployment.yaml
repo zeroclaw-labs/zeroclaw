@@ -28,6 +28,8 @@ spec:
         runAsNonRoot: false
         seccompProfile:
           type: RuntimeDefault
+      imagePullSecrets:
+        - name: regcred
       initContainers:
         - name: build-zeroclaw
           image: rust:1.91.0-bookworm
@@ -36,7 +38,7 @@ spec:
             - sh
             - -ec
             - |
-              EXPECTED_BUILD_FEATURES=""
+              EXPECTED_BUILD_FEATURES="2026-02-27"
               mkdir -p /opt/zeroclaw
               if [ -x /opt/zeroclaw/zeroclaw ] && [ -f /opt/zeroclaw/.build_features ] && grep -qx "${EXPECTED_BUILD_FEATURES}" /opt/zeroclaw/.build_features; then
                 echo "Using cached zeroclaw binary from PVC"
@@ -44,6 +46,12 @@ spec:
                 exit 0
               fi
               echo "Building zeroclaw (no extra features)"
+              sed -i \
+                's|http://deb.debian.org|https://deb.debian.org|g;
+                 s|http://security.debian.org|https://security.debian.org|g' \
+                /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true
+              apt-get -o Acquire::https::Verify-Peer=false update -qq
+              apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends ca-certificates
               apt-get update
               apt-get install -y --no-install-recommends git pkg-config libssl-dev perl make g++
               rm -rf /var/lib/apt/lists/*
@@ -124,76 +132,27 @@ spec:
             - |
               TOOLS_DIR=/opt/sam-tools
               NODE_VERSION="20.18.1"
+              INSTALL_STAMP="${NODE_VERSION}-serena-agent-browser-no-playwright-2026-02-28"
               MARKER="${TOOLS_DIR}/.installed"
-              if [ -f "${MARKER}" ] && grep -qx "${NODE_VERSION}" "${MARKER}"; then
-                echo "sam-tools already at ${NODE_VERSION}, skipping"
-                exit 0
-              fi
-              echo "Installing sam-tools (node ${NODE_VERSION})..."
-              rm -rf "${TOOLS_DIR}/node" "${TOOLS_DIR}/npm-global" \
-                     "${TOOLS_DIR}/playwright-browsers" "${TOOLS_DIR}/syslibs" \
-                     "${TOOLS_DIR}/home"
-              mkdir -p "${TOOLS_DIR}/home/.serena" "${TOOLS_DIR}/npm-global" \
-                       "${TOOLS_DIR}/playwright-browsers" "${TOOLS_DIR}/syslibs"
-              # The namespace egress policy only permits TCP/443; switch apt to HTTPS
-              # before the first update so all package fetches use the allowed port.
-              sed -i \
-                's|http://deb.debian.org|https://deb.debian.org|g;
-                 s|http://security.debian.org|https://security.debian.org|g' \
-                /etc/apt/sources.list
-              # Bootstrap: ca-certificates are absent in the slim base image so
-              # peer verification must be disabled for the first two apt calls only.
-              apt-get -o Acquire::https::Verify-Peer=false update -qq
-              apt-get -o Acquire::https::Verify-Peer=false install -y \
-                --no-install-recommends ca-certificates
-              # From here on TLS is fully verified.
-              apt-get update -qq
-              apt-get install -y --no-install-recommends \
-                curl xz-utils git dpkg
-              # Node.js from official tarball (pinned version, update MARKER to reinstall)
-              curl -fsSL \
-                "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
-                | tar -xJ -C "${TOOLS_DIR}/"
-              mv "${TOOLS_DIR}/node-v${NODE_VERSION}-linux-x64" "${TOOLS_DIR}/node"
-              export PATH="${TOOLS_DIR}/node/bin:${PATH}"
-              npm config set prefix "${TOOLS_DIR}/npm-global"
-              export PATH="${TOOLS_DIR}/npm-global/bin:${PATH}"
-              # Context7 MCP
-              npm install -g @upstash/context7-mcp
-              # Playwright MCP + Chromium browser binary
-              npm install -g @playwright/mcp
-              PLAYWRIGHT_BROWSERS_PATH="${TOOLS_DIR}/playwright-browsers" \
-                npx playwright install chromium
-              # Extract Chromium system library dependencies to the PVC so the
-              # runtime container can find them via LD_LIBRARY_PATH without
-              # needing a privileged apt-get at pod startup.
-              apt-get install -y --no-install-recommends \
-                libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
-                libcairo2 libcups2 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 \
-                libnspr4 libnss3 libpango-1.0-0 libwayland-client0 \
-                libx11-6 libx11-xcb1 libxcb1 libxcb-shm0 libxcomposite1 \
-                libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-                libxshmfence1 fonts-liberation
-              mkdir -p /tmp/deb-pkgs && cd /tmp/deb-pkgs
-              apt-get download \
-                libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
-                libcairo2 libcups2 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 \
-                libnspr4 libnss3 libpango-1.0-0 libwayland-client0 \
-                libx11-6 libx11-xcb1 libxcb1 libxcb-shm0 libxcomposite1 \
-                libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-                libxshmfence1 fonts-liberation 2>/dev/null || true
-              for deb in *.deb; do
-                [ -f "${deb}" ] && dpkg-deb -x "${deb}" "${TOOLS_DIR}/syslibs/" || true
-              done
-              cd / && rm -rf /tmp/deb-pkgs
-              # uv (Python package manager, required for Serena)
               export HOME="${TOOLS_DIR}/home"
-              curl -LsSf https://astral.sh/uv/install.sh | sh
-              export PATH="${TOOLS_DIR}/home/.local/bin:${PATH}"
-              # Pre-cache Serena uvx environment so the sidecar starts fast
-              uvx --from git+https://github.com/oraios/serena \
-                serena --version 2>/dev/null || true
-              # Minimal Serena config for headless operation
+              export PATH="${TOOLS_DIR}/node/bin:${TOOLS_DIR}/npm-global/bin:${TOOLS_DIR}/home/.local/bin:${PATH}"
+
+              # Per-component presence checks (queries the persistent PVC).
+              # Called from 'if' conditions so set -e is suspended inside them.
+              _node_ok() {
+                [ -x "${TOOLS_DIR}/node/bin/node" ] && \
+                [ "$(${TOOLS_DIR}/node/bin/node -v 2>/dev/null)" = "v${NODE_VERSION}" ]
+              }
+              _npm_ok() {
+                [ -x "${TOOLS_DIR}/npm-global/bin/context7-mcp" ] && \
+                [ -x "${TOOLS_DIR}/npm-global/bin/agent-browser" ]
+              }
+              _uv_ok()      { [ -x "${TOOLS_DIR}/home/.local/bin/uv" ]; }
+              _serena_ok()  { [ -x "${TOOLS_DIR}/home/.local/bin/serena" ]; }
+
+              # Always refresh Serena config on every start (cheap NFS write, ensures
+              # config stays current even when the fast path skips heavy installation).
+              mkdir -p "${TOOLS_DIR}/home/.serena"
               printf '%s\n' \
                 'language_backend: LSP' \
                 'gui_log_window: false' \
@@ -202,10 +161,127 @@ spec:
                 'default_modes:' \
                 '  - interactive' \
                 '  - editing' \
+                'projects:' \
+                '  sam:' \
+                '    path: /data/workspace' \
                 > "${TOOLS_DIR}/home/.serena/serena_config.yml"
-              chown -R 1000:1000 "${TOOLS_DIR}/"
-              printf '%s\n' "${NODE_VERSION}" > "${MARKER}"
+              chown 1000:1000 "${TOOLS_DIR}/home/.serena/serena_config.yml" 2>/dev/null || true
+
+              # Always refresh serena-cli on every start so updates take effect without
+              # requiring a stamp bump. Sourced from the zeroclaw-serena-cli ConfigMap.
+              cp /etc/zeroclaw-scripts/serena-cli "${TOOLS_DIR}/npm-global/bin/serena-cli"
+              chmod +x "${TOOLS_DIR}/npm-global/bin/serena-cli"
+
+              # Cleanup legacy Playwright MCP/bootstrap artifacts that conflict
+              # with zeroclaw's internal agent-browser lifecycle.
+              # Keep browser cache under /data/.cache/ms-playwright so installs
+              # persist across pod restarts.
+              if [ -x "${TOOLS_DIR}/npm-global/bin/playwright-mcp" ] \
+                 || [ -d "${TOOLS_DIR}/npm-global/lib/node_modules/@playwright" ] \
+                 || [ -d "${TOOLS_DIR}/syslibs" ]; then
+                echo "Removing legacy Playwright MCP artifacts..."
+                rm -rf \
+                  "${TOOLS_DIR}/npm-global/bin/playwright-mcp" \
+                  "${TOOLS_DIR}/npm-global/lib/node_modules/@playwright" \
+                  "${TOOLS_DIR}/syslibs"
+              fi
+
+              # Fast path: stamp matches AND all components verified on the PVC.
+              if [ -f "${MARKER}" ] && grep -qx "${INSTALL_STAMP}" "${MARKER}" \
+                 && _node_ok && _npm_ok && _uv_ok && _serena_ok; then
+                echo "sam-tools already at ${INSTALL_STAMP}, skipping"
+                exit 0
+              fi
+
+              mkdir -p "${TOOLS_DIR}/npm-global"
+
+              # Stamp-only update: all components present but stamp has changed.
+              # Skips apt and the expensive chown; just rewrites the marker.
+              if _node_ok && _npm_ok && _uv_ok && _serena_ok; then
+                printf '%s\n' "${INSTALL_STAMP}" > "${MARKER}"
+                echo "sam-tools components up-to-date, stamp updated to ${INSTALL_STAMP}"
+                exit 0
+              fi
+
+              echo "Installing missing sam-tools components..."
+
+              # Determine which apt packages are needed (npm reinstall needs none).
+              APT_EXTRA=""
+              if ! _node_ok || ! _uv_ok; then APT_EXTRA="${APT_EXTRA} curl"; fi
+              if ! _node_ok; then APT_EXTRA="${APT_EXTRA} xz-utils"; fi
+              if ! _serena_ok; then APT_EXTRA="${APT_EXTRA} git"; fi
+
+              # Only run apt when system packages are actually required.
+              # The namespace egress policy only permits TCP/443; switch apt to HTTPS.
+              # Debian 12 (bookworm) uses DEB822 format in /etc/apt/sources.list.d/debian.sources.
+              if [ -n "${APT_EXTRA}" ]; then
+                sed -i \
+                  's|http://deb.debian.org|https://deb.debian.org|g;
+                   s|http://security.debian.org|https://security.debian.org|g' \
+                  /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true
+                # Bootstrap ca-certificates (peer verification disabled for first two calls only).
+                apt-get -o Acquire::https::Verify-Peer=false update -qq
+                apt-get -o Acquire::https::Verify-Peer=false install -y \
+                  --no-install-recommends ca-certificates
+                apt-get update -qq
+                # shellcheck disable=SC2086
+                apt-get install -y --no-install-recommends ${APT_EXTRA}
+              fi
+
+              # Node.js from official tarball (pinned to NODE_VERSION).
+              if ! _node_ok; then
+                echo "Installing Node.js ${NODE_VERSION}..."
+                rm -rf "${TOOLS_DIR}/node"
+                curl -fsSL \
+                  "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+                  | tar -xJ --no-same-owner -C "${TOOLS_DIR}/"
+                mv "${TOOLS_DIR}/node-v${NODE_VERSION}-linux-x64" "${TOOLS_DIR}/node"
+              fi
+              if [ -x "${TOOLS_DIR}/node/bin/node" ]; then
+                npm config set prefix "${TOOLS_DIR}/npm-global"
+              fi
+
+              # Context7 MCP: install independently so a killed pod only resumes this one.
+              if ! [ -x "${TOOLS_DIR}/npm-global/bin/context7-mcp" ]; then
+                echo "Installing @upstash/context7-mcp..."
+                rm -rf "${TOOLS_DIR}/npm-global/lib/node_modules/@upstash"
+                npm install -g @upstash/context7-mcp
+              fi
+
+              # agent-browser (Vercel CLI): spawned by zeroclaw's agent_browser browser backend.
+              if ! [ -x "${TOOLS_DIR}/npm-global/bin/agent-browser" ]; then
+                echo "Installing agent-browser..."
+                rm -rf "${TOOLS_DIR}/npm-global/lib/node_modules/agent-browser"
+                npm install -g agent-browser
+              fi
+
+              # uv (Python package manager, required for Serena).
+              if ! _uv_ok; then
+                echo "Installing uv..."
+                mkdir -p "${TOOLS_DIR}/home/.local/bin"
+                curl -fsSL \
+                  "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz" \
+                  | tar -xz --no-same-owner -C "${TOOLS_DIR}/home/.local/bin" --strip-components=1
+              fi
+
+              # Serena: permanently installed so the sidecar needs no git at runtime.
+              if ! _serena_ok; then
+                echo "Installing Serena..."
+                # The uv git cache may be owned by uid 1000 from a previous run's chown,
+                # triggering git's dubious-ownership check when running as root.
+                printf '[safe]\n\tdirectory = *\n' > "${TOOLS_DIR}/home/.gitconfig"
+                export GIT_CONFIG_GLOBAL="${TOOLS_DIR}/home/.gitconfig"
+                uv tool install git+https://github.com/oraios/serena
+                unset GIT_CONFIG_GLOBAL
+                # Chown is only needed after a Serena/uv install since those are the
+                # only operations that write root-owned files into home/. Skipping it
+                # on every other slow-path trigger saves several minutes per restart.
+                chown -R 1000:1000 "${TOOLS_DIR}/home/"
+              fi
+
+              printf '%s\n' "${INSTALL_STAMP}" > "${MARKER}"
               echo "sam-tools installation complete"
+
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -220,6 +296,10 @@ spec:
           volumeMounts:
             - name: sam-tools
               mountPath: /opt/sam-tools
+            - name: zeroclaw-data
+              mountPath: /data
+            - name: zeroclaw-serena-cli
+              mountPath: /etc/zeroclaw-scripts
       containers:
         - name: zeroclaw
           image: debian:bookworm-slim
@@ -228,7 +308,21 @@ spec:
             - sh
             - -ec
             - |
-              mkdir -p /data/.zeroclaw /data/workspace
+              mkdir -p /data/.zeroclaw /data/workspace /tmp/agent-browser
+              cd /data/workspace
+              # Pre-start the agent-browser daemon so it's warm when zeroclaw
+              # needs it. Playwright initialization (browser discovery + first
+              # launch) can take 60-90s on a cold NFS-backed volume.
+              # Redirect stdin from /dev/null so process.stdin.resume() inside
+              # the daemon doesn't trigger SIGTTIN when run in background.
+              node /opt/sam-tools/npm-global/lib/node_modules/agent-browser/dist/daemon.js </dev/null &
+              # Wait up to 120s for the socket to appear before starting zeroclaw.
+              echo "Waiting for agent-browser daemon socket..."
+              for _i in $(seq 1 120); do
+                [ -S /tmp/agent-browser/default.sock ] && echo "Daemon ready." && break
+                sleep 1
+              done
+              [ -S /tmp/agent-browser/default.sock ] || echo "Warning: daemon socket not ready, starting zeroclaw anyway"
               exec /opt/zeroclaw/zeroclaw daemon
           ports:
             - name: http
@@ -241,10 +335,10 @@ spec:
               value: /opt/sam-tools/node/bin:/opt/sam-tools/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: NPM_CONFIG_PREFIX
               value: /opt/sam-tools/npm-global
-            - name: PLAYWRIGHT_BROWSERS_PATH
-              value: /opt/sam-tools/playwright-browsers
-            - name: LD_LIBRARY_PATH
-              value: /opt/sam-tools/syslibs/usr/lib/x86_64-linux-gnu:/opt/sam-tools/syslibs/usr/lib:/opt/sam-tools/syslibs/lib/x86_64-linux-gnu:/opt/sam-tools/syslibs/lib
+            - name: AGENT_BROWSER_SOCKET_DIR
+              value: /tmp/agent-browser
+            - name: AGENT_BROWSER_ARGS
+              value: "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage"
             - name: SERENA_SESSION_FILE
               value: /data/.zeroclaw/serena-session-id
             - name: SERENA_DEFAULT_PROJECT
@@ -262,6 +356,8 @@ spec:
                   key: anthropic-api-key
                   optional: true
           securityContext:
+            runAsUser: 0
+            runAsGroup: 0
             allowPrivilegeEscalation: true
           resources:
             requests:
@@ -279,7 +375,6 @@ spec:
               mountPath: /data/.zeroclaw
             - name: sam-tools
               mountPath: /opt/sam-tools
-              readOnly: true
         - name: serena
           image: debian:bookworm-slim
           imagePullPolicy: IfNotPresent
@@ -288,14 +383,13 @@ spec:
             - -ec
             - |
               mkdir -p /data/workspace
-              exec /opt/sam-tools/home/.local/bin/uvx \
-                --from git+https://github.com/oraios/serena \
-                serena start-mcp-server \
+              cd /data/workspace
+              exec /opt/sam-tools/home/.local/bin/serena start-mcp-server \
                 --transport streamable-http \
                 --port 9121 \
                 --enable-web-dashboard false \
                 --enable-gui-log-window false \
-                --project /data/workspace
+                --project sam
           ports:
             - name: serena-mcp
               containerPort: 9121
@@ -365,3 +459,6 @@ spec:
         - name: zeroclaw-config-template
           configMap:
             name: zeroclaw-config
+        - name: zeroclaw-serena-cli
+          configMap:
+            name: zeroclaw-serena-cli

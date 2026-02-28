@@ -1,39 +1,425 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: zeroclaw-config
-  namespace: zeroclaw-test
+    name: zeroclaw-config
+    namespace: zeroclaw-test
 data:
-  config.toml: |
-    log_level = "info"
-    api_key = "sk-2xz3q0bNAs7ZOB9Gwr8M1w"
-    api_url = "https://assistant-api.coffee-anon.com/v1"
-    default_provider = "custom:https://assistant-api.coffee-anon.com/v1"
-    default_model = "litellm-local-default"
-    default_temperature = 1.0
+    config.toml: |
+        api_key = "sk-2xz3q0bNAs7ZOB9Gwr8M1w"
+        default_provider = "custom:https://assistant-api.coffee-anon.com/v1"
+        default_model = "litellm-qwen35-thinking"
+        default_temperature = 1.0
+        model_routes = []
+        embedding_routes = []
 
-    [runtime]
-    kind = "native"
+        [model_providers]
 
-    [memory]
-    backend = "sqlite"
-    auto_save = true
-    embedding_provider = "none"
+        [provider]
 
-    [gateway]
-    host = "0.0.0.0"
-    port = 3000
-    require_pairing = true
-    allow_public_bind = true
+        [observability]
+        backend = "none"
+        runtime_trace_mode = "none"
+        runtime_trace_path = "state/runtime-trace.jsonl"
+        runtime_trace_max_entries = 200
 
-    [channels_config]
-    cli = true
-    message_timeout_secs = 120
+        [autonomy]
+        level = "full"
+        workspace_only = false
+        allowed_commands = ["*"]
+        forbidden_paths = [
+            "/etc/shadow",
+            "/etc/passwd",
+            "/root",
+            "/home",
+            "/boot",
+            "/dev",
+            "/proc",
+            "/sys",
+            "~/.ssh",
+            "~/.gnupg",
+            "~/.aws",
+        ]
+        max_actions_per_hour = 0
+        max_cost_per_day_cents = 500
+        require_approval_for_medium_risk = false
+        block_high_risk_commands = true
+        shell_env_passthrough = ["*"]
+        auto_approve = [
+            "file_read",
+            "memory_recall",
+        ]
+        always_ask = []
+        allowed_roots = []
+        non_cli_excluded_tools = []
+        non_cli_approval_approvers = []
+        non_cli_natural_language_approval_mode = "direct"
 
-    [channels_config.signal]
-    http_url = "http://127.0.0.1:8686"
-    account = "+15873986009"
-    allowed_from = ["*"]
-    ignore_attachments = false
-    ignore_stories = true
+        [autonomy.non_cli_natural_language_approval_mode_by_channel]
 
+        [security]
+        roles = []
+
+        [security.sandbox]
+        backend = "auto"
+        firejail_args = []
+
+        [security.resources]
+        max_memory_mb = 512
+        max_cpu_time_seconds = 60
+        max_subprocesses = 10
+        memory_monitoring = true
+
+        [security.audit]
+        enabled = true
+        log_path = "audit.log"
+        max_size_mb = 100
+        sign_events = false
+
+        [security.otp]
+        enabled = false
+        method = "totp"
+        token_ttl_secs = 30
+        cache_valid_secs = 300
+        gated_actions = [
+            "shell",
+            "file_write",
+            "browser_open",
+            "browser",
+            "memory_forget",
+        ]
+        gated_domains = []
+        gated_domain_categories = []
+        challenge_delivery = "dm"
+        challenge_timeout_secs = 120
+        challenge_max_attempts = 3
+
+        [security.estop]
+        enabled = false
+        state_file = "~/.zeroclaw/estop-state.json"
+        require_otp_to_resume = true
+
+        [security.syscall_anomaly]
+        enabled = true
+        strict_mode = false
+        alert_on_unknown_syscall = true
+        max_denied_events_per_minute = 5
+        max_total_events_per_minute = 120
+        max_alerts_per_minute = 30
+        alert_cooldown_secs = 20
+        log_path = "syscall-anomalies.log"
+        baseline_syscalls = [
+            "read",
+            "write",
+            "open",
+            "openat",
+            "close",
+            "stat",
+            "fstat",
+            "newfstatat",
+            "lseek",
+            "mmap",
+            "mprotect",
+            "munmap",
+            "brk",
+            "rt_sigaction",
+            "rt_sigprocmask",
+            "ioctl",
+            "fcntl",
+            "access",
+            "pipe2",
+            "dup",
+            "dup2",
+            "dup3",
+            "epoll_create1",
+            "epoll_ctl",
+            "epoll_wait",
+            "poll",
+            "ppoll",
+            "select",
+            "futex",
+            "clock_gettime",
+            "nanosleep",
+            "getpid",
+            "gettid",
+            "set_tid_address",
+            "set_robust_list",
+            "clone",
+            "clone3",
+            "fork",
+            "execve",
+            "wait4",
+            "exit",
+            "exit_group",
+            "socket",
+            "connect",
+            "accept",
+            "accept4",
+            "listen",
+            "sendto",
+            "recvfrom",
+            "sendmsg",
+            "recvmsg",
+            "getsockname",
+            "getpeername",
+            "setsockopt",
+            "getsockopt",
+            "getrandom",
+            "statx",
+        ]
+
+        [runtime]
+        kind = "native"
+
+        [runtime.docker]
+        image = "alpine:3.20"
+        network = "none"
+        memory_limit_mb = 512
+        cpu_limit = 1.0
+        read_only_rootfs = true
+        mount_workspace = true
+        allowed_workspace_roots = []
+
+        [runtime.wasm]
+        tools_dir = "tools/wasm"
+        fuel_limit = 1000000
+        memory_limit_mb = 64
+        max_module_size_mb = 50
+        allow_workspace_read = false
+        allow_workspace_write = false
+        allowed_hosts = []
+
+        [runtime.wasm.security]
+        require_workspace_relative_tools_dir = true
+        reject_symlink_modules = true
+        reject_symlink_tools_dir = true
+        strict_host_validation = true
+        capability_escalation_mode = "deny"
+        module_hash_policy = "warn"
+
+        [runtime.wasm.security.module_sha256]
+
+        [research]
+        enabled = true
+        trigger = "never"
+        keywords = [
+            "find",
+            "search",
+            "check",
+            "investigate",
+            "look",
+            "research",
+        ]
+        min_message_length = 50
+        max_iterations = 5
+        show_progress = true
+        system_prompt_prefix = ""
+
+        [reliability]
+        provider_retries = 2
+        provider_backoff_ms = 500
+        fallback_providers = []
+        api_keys = []
+        channel_initial_backoff_secs = 2
+        channel_max_backoff_secs = 60
+        scheduler_poll_secs = 15
+        scheduler_retries = 2
+
+        [reliability.model_fallbacks]
+
+        [scheduler]
+        enabled = true
+        max_tasks = 64
+        max_concurrent = 4
+
+        [agent]
+        compact_context = false
+        max_tool_iterations = 20
+        max_history_messages = 50
+        parallel_tools = false
+        tool_dispatcher = "auto"
+
+        [skills]
+        open_skills_enabled = false
+        prompt_injection_mode = "full"
+
+        [query_classification]
+        enabled = false
+        rules = []
+
+        [heartbeat]
+        enabled = false
+        interval_minutes = 30
+
+        [cron]
+        enabled = true
+        max_run_history = 50
+
+        [goal_loop]
+        enabled = false
+        interval_minutes = 10
+        step_timeout_secs = 120
+        max_steps_per_cycle = 3
+
+        [channels_config]
+        cli = true
+        message_timeout_secs = 300
+
+        [memory]
+        backend = "sqlite"
+        auto_save = true
+        hygiene_enabled = true
+        archive_after_days = 7
+        purge_after_days = 30
+        conversation_retention_days = 30
+        embedding_provider = "none"
+        embedding_model = "text-embedding-3-small"
+        embedding_dimensions = 1536
+        vector_weight = 0.7
+        keyword_weight = 0.3
+        min_relevance_score = 0.4
+        embedding_cache_size = 10000
+        chunk_max_tokens = 512
+        response_cache_enabled = false
+        response_cache_ttl_minutes = 60
+        response_cache_max_entries = 5000
+        snapshot_enabled = false
+        snapshot_on_hygiene = false
+        auto_hydrate = true
+
+        [memory.qdrant]
+        collection = "zeroclaw_memories"
+
+        [storage.provider.config]
+        provider = ""
+        schema = "public"
+        table = "memories"
+        tls = false
+
+        [tunnel]
+        provider = "none"
+
+        [gateway]
+        port = 3000
+        host = "0.0.0.0"
+        require_pairing = true
+        allow_public_bind = true
+        paired_tokens = []
+        pair_rate_limit_per_minute = 10
+        webhook_rate_limit_per_minute = 60
+        trust_forwarded_headers = false
+        rate_limit_max_keys = 10000
+        idempotency_ttl_secs = 300
+        idempotency_max_keys = 10000
+
+        [gateway.node_control]
+        enabled = false
+        allowed_node_ids = []
+
+        [composio]
+        enabled = false
+        entity_id = "default"
+
+        [secrets]
+        encrypt = true
+
+        [browser]
+        enabled = true
+        allowed_domains = ["*"]
+        backend = "agent_browser"
+        native_headless = true
+        native_webdriver_url = "http://127.0.0.1:9515"
+        native_chrome_path = ""
+
+        [browser.computer_use]
+        endpoint = "http://127.0.0.1:8787/v1/actions"
+        timeout_ms = 15000
+        allow_remote_endpoint = false
+        window_allowlist = []
+
+        [http_request]
+        enabled = true
+        allowed_domains = ["*"]
+        max_response_size = 1000000
+        timeout_secs = 30
+        user_agent = "ZeroClaw/1.0"
+
+        [multimodal]
+        max_images = 10
+        max_image_size_mb = 10
+        allow_remote_fetch = true
+
+        [web_fetch]
+        enabled = true
+        provider = "fast_html2md"
+        allowed_domains = ["*"]
+        blocked_domains = []
+        max_response_size = 500000
+        timeout_secs = 30
+        user_agent = "ZeroClaw/1.0"
+
+        [web_search]
+        enabled = true
+        provider = "duckduckgo"
+        max_results = 5
+        timeout_secs = 15
+        user_agent = "ZeroClaw/1.0"
+
+        [proxy]
+        enabled = false
+        no_proxy = []
+        scope = "zeroclaw"
+        services = []
+
+        [identity]
+        format = "openclaw"
+
+        [cost]
+        enabled = false
+        daily_limit_usd = 10.0
+        monthly_limit_usd = 100.0
+        warn_at_percent = 80
+        allow_override = false
+
+        [peripherals]
+        enabled = false
+        boards = []
+
+        [agents]
+
+        [coordination]
+        enabled = true
+        lead_agent = "delegate-lead"
+        max_inbox_messages_per_agent = 256
+        max_dead_letters = 256
+        max_context_entries = 512
+        max_seen_message_ids = 4096
+
+        [hooks]
+        enabled = true
+
+        [hooks.builtin]
+        command_logger = false
+
+        [hardware]
+        enabled = false
+        transport = "None"
+        baud_rate = 115200
+        workspace_datasheets = false
+
+        [transcription]
+        enabled = false
+        api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        model = "whisper-large-v3-turbo"
+        max_duration_secs = 120
+
+        [agents_ipc]
+        enabled = false
+        db_path = "~/.zeroclaw/agents.db"
+        staleness_secs = 300
+
+        [channels_config.signal]
+        http_url = "http://127.0.0.1:8686"
+        account = "+15873986009"
+        allowed_from = ["*"]
+        ignore_attachments = false
+        ignore_stories = true

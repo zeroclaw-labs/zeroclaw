@@ -1,0 +1,171 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-serena-cli
+  namespace: zeroclaw-test
+data:
+  serena-cli: |
+    #!/usr/bin/env node
+    'use strict';
+    const http = require('http');
+    const HOST = process.env.SERENA_HOST || '127.0.0.1';
+    const PORT = +(process.env.SERENA_PORT || 9121);
+    const BASE = process.env.SERENA_PATH || '/mcp';
+    let sid = null, rid = 0;
+    function rpc(body, drain) {
+      return new Promise((ok, fail) => {
+        const d = JSON.stringify(body);
+        const h = {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(d),
+          'Accept': 'application/json, text/event-stream',
+        };
+        if (sid) h['Mcp-Session-Id'] = sid;
+        const req = http.request({ hostname: HOST, port: PORT, path: BASE, method: 'POST', headers: h }, res => {
+          if (res.headers['mcp-session-id']) sid = res.headers['mcp-session-id'];
+          if (drain) { res.resume(); return ok(null); }
+          const bufs = [];
+          res.on('data', c => bufs.push(c));
+          res.on('end', () => {
+            const s = Buffer.concat(bufs).toString();
+            let last = null;
+            for (const ln of s.split('\n'))
+              if (ln.startsWith('data: ')) try { last = JSON.parse(ln.slice(6)); } catch (_) {}
+            ok(last || (s ? { _raw: s } : null));
+          });
+        });
+        req.on('error', fail);
+        req.write(d);
+        req.end();
+      });
+    }
+    async function init() {
+      await rpc({ jsonrpc: '2.0', id: ++rid, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'serena-cli', version: '1.0' } } });
+      await rpc({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, true);
+    }
+    function placeholderForSchema(schema) {
+      if (!schema || typeof schema !== 'object') return '<value>';
+      if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0];
+      if (schema.default !== undefined) return schema.default;
+      if (schema.examples && Array.isArray(schema.examples) && schema.examples.length > 0) return schema.examples[0];
+      switch (schema.type) {
+        case 'string': return '<string>';
+        case 'integer': return 0;
+        case 'number': return 0;
+        case 'boolean': return false;
+        case 'array': return [placeholderForSchema(schema.items)];
+        case 'object': return exampleArgsFromSchema(schema);
+        default: return '<value>';
+      }
+    }
+    function exampleArgsFromSchema(schema) {
+      if (!schema || typeof schema !== 'object') return {};
+      const props = schema.properties && typeof schema.properties === 'object' ? schema.properties : null;
+      if (!props) return {};
+      const required = new Set(Array.isArray(schema.required) ? schema.required : Object.keys(props));
+      const out = {};
+      for (const [k, v] of Object.entries(props))
+        if (required.has(k)) out[k] = placeholderForSchema(v);
+      return out;
+    }
+    async function listToolsRaw() {
+      const r = await rpc({ jsonrpc: '2.0', id: ++rid, method: 'tools/list', params: {} });
+      const tools = r && r.result && r.result.tools;
+      return { r, tools: Array.isArray(tools) ? tools : null };
+    }
+    function findToolByName(tools, query) {
+      if (!tools || !query) return null;
+      const q = String(query).trim();
+      return tools.find(t => t.name === q) ||
+        tools.find(t => String(t.name).toLowerCase() === q.toLowerCase()) ||
+        tools.find(t => String(t.name).toLowerCase().includes(q.toLowerCase())) ||
+        null;
+    }
+    async function main() {
+      const [,, cmd, ...rest] = process.argv;
+      if (!cmd || cmd === '--help' || (cmd === 'help' && !rest[0])) {
+        process.stdout.write([
+          'serena-cli — Serena MCP interface',
+          '',
+          'Commands:',
+          '  list-tools              List all available Serena tools',
+          '  call <tool> [json]      Call a tool with optional JSON args',
+          '  help <tool>             Show description + JSON input schema for a tool',
+          '  tool-help <tool>        Alias for help <tool>',
+          '  schema <tool>           Alias for help <tool>',
+          '  help                    Show this help',
+          '',
+          'Environment:',
+          '  SERENA_HOST  (default: 127.0.0.1)',
+          '  SERENA_PORT  (default: 9121)',
+          '  SERENA_PATH  (default: /mcp)',
+          '',
+          'Examples:',
+          '  serena-cli list-tools',
+          '  serena-cli help read_file',
+          '  serena-cli schema replace_content',
+          "  serena-cli call read_file '{\"relative_path\":\"src/main.rs\"}'",
+          "  serena-cli call get_symbols_overview '{\"relative_path\":\"src/\"}'",
+          '',
+        ].join('\n'));
+        return;
+      }
+      try { await init(); } catch (e) {
+        process.stderr.write('Cannot connect to Serena at ' + HOST + ':' + PORT + BASE + ': ' + e.message + '\n');
+        process.exit(1);
+      }
+      if (cmd === 'list-tools' || cmd === 'tools') {
+        const { r, tools } = await listToolsRaw();
+        if (!tools) { process.stdout.write(JSON.stringify(r, null, 2) + '\n'); return; }
+        for (const t of tools)
+          process.stdout.write('  ' + t.name.padEnd(36) + ' ' + (t.description || '').split('\n')[0] + '\n');
+        return;
+      }
+      if (cmd === 'tool-help' || cmd === 'schema' || (cmd === 'help' && rest[0])) {
+        const query = rest[0];
+        const { r, tools } = await listToolsRaw();
+        if (!tools) { process.stdout.write(JSON.stringify(r, null, 2) + '\n'); return; }
+        const t = findToolByName(tools, query);
+        if (!t) {
+          process.stderr.write('Tool not found: ' + query + '\n');
+          process.stderr.write('Run `serena-cli list-tools` to view available tools.\n');
+          process.exit(1);
+        }
+        const schema = t.inputSchema || t.input_schema || t.parameters || {};
+        const example = exampleArgsFromSchema(schema);
+        process.stdout.write([
+          'Tool: ' + t.name,
+          'Description: ' + (t.description || ''),
+          '',
+          'Input schema (JSON):',
+          JSON.stringify(schema, null, 2),
+          '',
+          'Example args (JSON):',
+          JSON.stringify(example, null, 2),
+          '',
+          'Example call:',
+          "  serena-cli call " + t.name + " '" + JSON.stringify(example).replace(/'/g, "\\'") + "'",
+          '',
+        ].join('\n'));
+        return;
+      }
+      if (cmd === 'call') {
+        const tool = rest[0];
+        if (!tool) { process.stderr.write('Usage: serena-cli call <tool> [json-args]\n'); process.exit(1); }
+        let args = {};
+        if (rest[1]) try { args = JSON.parse(rest[1]); } catch (_) { process.stderr.write('Args must be valid JSON\n'); process.exit(1); }
+        const r = await rpc({ jsonrpc: '2.0', id: ++rid, method: 'tools/call', params: { name: tool, arguments: args } });
+        if (r && r.error) { process.stderr.write('Error: ' + r.error.message + '\n'); process.exit(1); }
+        const content = r && r.result && r.result.content;
+        if (content) {
+          for (const c of content)
+            process.stdout.write(c.type === 'text' ? c.text + (c.text.endsWith('\n') ? '' : '\n') : JSON.stringify(c, null, 2) + '\n');
+        } else {
+          process.stdout.write(JSON.stringify(r, null, 2) + '\n');
+        }
+        return;
+      }
+      process.stderr.write('Unknown command: ' + cmd + '\nRun serena-cli help for usage.\n');
+      process.exit(1);
+    }
+    main().catch(e => { process.stderr.write('Fatal: ' + e.message + '\n'); process.exit(1); });
