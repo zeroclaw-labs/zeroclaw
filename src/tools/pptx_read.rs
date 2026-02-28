@@ -66,11 +66,17 @@ fn extract_pptx_text(bytes: &[u8]) -> anyhow::Result<String> {
 
         loop {
             match reader.read_event() {
-                Ok(Event::Start(e) | Event::Empty(e)) => {
+                Ok(Event::Start(e)) => {
                     let name = e.name();
                     if name.as_ref() == b"a:t" {
                         in_text = true;
                     } else if name.as_ref() == b"a:p" && text.len() > slide_start {
+                        text.push('\n');
+                    }
+                }
+                Ok(Event::Empty(e)) => {
+                    // Self-closing <a:t/> contains no text and must not flip `in_text`.
+                    if e.name().as_ref() == b"a:p" && text.len() > slide_start {
                         text.push('\n');
                     }
                 }
@@ -521,6 +527,37 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("truncated"));
+    }
+
+    #[test]
+    fn empty_text_tag_does_not_leak_in_text_state() {
+        use std::io::Write;
+
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:sp>
+        <p:txBody>
+          <a:p><a:r><a:t/></a:r></a:p>
+          <a:p><a:r><a:t>Visible</a:t></a:r></a:p>
+        </p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>"#;
+
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("ppt/slides/slide1.xml", options).unwrap();
+        zip.write_all(slide_xml.as_bytes()).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+
+        let extracted = extract_pptx_text(&bytes).expect("extract text");
+        assert!(extracted.contains("Visible"));
     }
 
     #[cfg(unix)]
