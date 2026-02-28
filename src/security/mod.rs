@@ -113,5 +113,8 @@ mod tests {
         assert_eq!(redact("ab"), "***");
         assert_eq!(redact(""), "***");
         assert_eq!(redact("12345"), "1234***");
+        assert_eq!(redact("你好世界和平"), "你好世界***");
+        assert_eq!(redact("😀😀😀😀"), "***");
+        assert_eq!(redact("😀😀😀😀😀"), "😀😀😀😀***");
     }
 }
