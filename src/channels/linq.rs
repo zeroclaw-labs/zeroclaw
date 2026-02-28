@@ -61,7 +61,11 @@ impl LinqChannel {
 
     /// Parse an incoming webhook payload from Linq and extract messages.
     ///
-    /// Linq webhook envelope:
+    /// Supports both legacy and current Linq v3 webhook payload variants:
+    /// - Legacy shape: `data.from`, `data.chat_id`, `data.message.parts`
+    /// - Current shape: `data.sender_handle.handle`, `data.chat.id`, `data.parts`
+    ///
+    /// Linq webhook envelope (legacy example):
     /// ```json
     /// {
     ///   "api_version": "v3",
@@ -99,18 +103,41 @@ impl LinqChannel {
             return messages;
         };
 
-        // Skip messages sent by the bot itself
-        if data
+        // Skip messages sent by the bot itself.
+        // Linq can express this as:
+        // - legacy: data.is_from_me
+        // - v3: data.sender_handle.is_me
+        // - v3 direction marker: data.direction == "outbound"
+        let is_from_me = data
             .get("is_from_me")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
-        {
+            || data
+                .get("sender_handle")
+                .and_then(|sender| sender.get("is_me"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            || matches!(
+                data.get("direction").and_then(|v| v.as_str()),
+                Some("outbound")
+            );
+        if is_from_me {
             tracing::debug!("Linq: skipping is_from_me message");
             return messages;
         }
 
-        // Get sender phone number
-        let Some(from) = data.get("from").and_then(|f| f.as_str()) else {
+        // Get sender phone number.
+        // Prefer legacy `from`, then fallback to v3 `sender_handle.handle`.
+        let Some(from) = data
+            .get("from")
+            .and_then(|f| f.as_str())
+            .or_else(|| data.get("sender").and_then(|f| f.as_str()))
+            .or_else(|| {
+                data.get("sender_handle")
+                    .and_then(|sender| sender.get("handle"))
+                    .and_then(|h| h.as_str())
+            })
+        else {
             return messages;
         };
 
@@ -131,19 +158,29 @@ impl LinqChannel {
             return messages;
         }
 
-        // Get chat_id for reply routing
+        // Get chat_id for reply routing.
+        // Legacy: data.chat_id
+        // v3: data.chat.id
         let chat_id = data
             .get("chat_id")
             .and_then(|c| c.as_str())
+            .or_else(|| {
+                data.get("chat")
+                    .and_then(|chat| chat.get("id"))
+                    .and_then(|id| id.as_str())
+            })
             .unwrap_or("")
             .to_string();
 
-        // Extract text from message parts
-        let Some(message) = data.get("message") else {
-            return messages;
-        };
-
-        let Some(parts) = message.get("parts").and_then(|p| p.as_array()) else {
+        // Extract text from message parts.
+        // Legacy: data.message.parts
+        // v3: data.parts
+        let Some(parts) = data
+            .get("message")
+            .and_then(|message| message.get("parts"))
+            .and_then(|p| p.as_array())
+            .or_else(|| data.get("parts").and_then(|p| p.as_array()))
+        else {
             return messages;
         };
 
@@ -363,8 +400,7 @@ impl Channel for LinqChannel {
 /// The signature is sent in `X-Webhook-Signature` (hex-encoded) and the
 /// timestamp in `X-Webhook-Timestamp`. Reject timestamps older than 300s.
 pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signature: &str) -> bool {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use ring::hmac;
 
     // Reject stale timestamps (>300s old)
     if let Ok(ts) = timestamp.parse::<i64>() {
@@ -380,10 +416,6 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
 
     // Compute HMAC-SHA256 over "{timestamp}.{body}"
     let message = format!("{timestamp}.{body}");
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(message.as_bytes());
     let signature_hex = signature
         .trim()
         .strip_prefix("sha256=")
@@ -393,8 +425,8 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
         return false;
     };
 
-    // Constant-time comparison via HMAC verify.
-    mac.verify_slice(&provided).is_ok()
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    hmac::verify(&key, message.as_bytes(), &provided).is_ok()
 }
 
 #[cfg(test)]
@@ -466,6 +498,56 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
         assert_eq!(msgs[0].channel, "linq");
         assert_eq!(msgs[0].reply_target, "chat-789");
+    }
+
+    #[test]
+    fn linq_parse_current_v3_payload_shape() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "api_version": "v3",
+            "event_type": "message.received",
+            "created_at": "2026-02-25T19:00:00Z",
+            "data": {
+                "chat": {
+                    "id": "chat-v3-123"
+                },
+                "sender_handle": {
+                    "handle": "+12197797846",
+                    "is_me": false
+                },
+                "direction": "inbound",
+                "parts": [{
+                    "type": "text",
+                    "value": "hi clawd ppp"
+                }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+12197797846");
+        assert_eq!(msgs[0].content, "hi clawd ppp");
+        assert_eq!(msgs[0].reply_target, "chat-v3-123");
+    }
+
+    #[test]
+    fn linq_parse_current_v3_outbound_is_skipped() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-v3-123" },
+                "sender_handle": {
+                    "handle": "+12197797846",
+                    "is_me": true
+                },
+                "direction": "outbound",
+                "parts": [{ "type": "text", "value": "self echo" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "outbound/self messages should be skipped");
     }
 
     #[test]

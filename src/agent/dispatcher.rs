@@ -33,7 +33,18 @@ impl XmlToolDispatcher {
     fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut text_parts = Vec::new();
         let mut calls = Vec::new();
-        let mut remaining = response;
+        // Normalize tag variants produced by some models/channels so the parser is consistent.
+        // The dispatcher expects <tool_call>...</tool_call>, but other parts of the system accept
+        // <toolcall>, <tool-call>, and <invoke>. Normalize them here.
+        let normalized = response
+            .replace("<toolcall>", "<tool_call>")
+            .replace("</toolcall>", "</tool_call>")
+            .replace("<tool-call>", "<tool_call>")
+            .replace("</tool-call>", "</tool_call>")
+            .replace("<invoke>", "<tool_call>")
+            .replace("</invoke>", "</tool_call>");
+
+        let mut remaining = normalized.as_str();
 
         while let Some(start) = remaining.find("<tool_call>") {
             let before = &remaining[..start];
@@ -252,6 +263,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+                quota_metadata: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -270,6 +282,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         };
         let dispatcher = NativeToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);

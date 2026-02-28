@@ -6,6 +6,7 @@ Time-bound project status snapshots for planning documentation and operations wo
 
 - [../project-triage-snapshot-2026-02-18.md](../project-triage-snapshot-2026-02-18.md)
 - [../docs-audit-2026-02-24.md](../docs-audit-2026-02-24.md)
+- [m4-5-rfi-spike-2026-02-28.md](m4-5-rfi-spike-2026-02-28.md)
 
 ## Scope
 

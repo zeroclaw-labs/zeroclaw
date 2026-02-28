@@ -92,6 +92,9 @@ pub struct ApprovalManager {
         RwLock<HashMap<String, NonCliNaturalLanguageApprovalMode>>,
     /// Pending non-CLI approval requests awaiting explicit human confirmation.
     pending_non_cli_requests: Mutex<HashMap<String, PendingNonCliApprovalRequest>>,
+    /// Resolved decision snapshots for pending non-CLI requests, consumed by
+    /// waiting tool loops.
+    resolved_non_cli_requests: Mutex<HashMap<String, ApprovalResponse>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
 }
@@ -142,6 +145,7 @@ impl ApprovalManager {
                 ),
             ),
             pending_non_cli_requests: Mutex::new(HashMap::new()),
+            resolved_non_cli_requests: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -439,6 +443,9 @@ impl ApprovalManager {
             expires_at: expires.to_rfc3339(),
         };
         pending.insert(request_id, req.clone());
+        self.resolved_non_cli_requests
+            .lock()
+            .remove(&req.request_id);
         req
     }
 
@@ -473,6 +480,64 @@ impl ApprovalManager {
         Ok(req)
     }
 
+    /// Reject a pending non-CLI approval request.
+    /// Rejection must come from the same sender in the same channel.
+    pub fn reject_non_cli_pending_request(
+        &self,
+        request_id: &str,
+        rejected_by: &str,
+        rejected_channel: &str,
+        rejected_reply_target: &str,
+    ) -> Result<PendingNonCliApprovalRequest, PendingApprovalError> {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+
+        let Some(req) = pending.remove(request_id) else {
+            return Err(PendingApprovalError::NotFound);
+        };
+
+        if is_pending_request_expired(&req) {
+            return Err(PendingApprovalError::Expired);
+        }
+
+        if req.requested_by != rejected_by
+            || req.requested_channel != rejected_channel
+            || req.requested_reply_target != rejected_reply_target
+        {
+            pending.insert(req.request_id.clone(), req);
+            return Err(PendingApprovalError::RequesterMismatch);
+        }
+
+        Ok(req)
+    }
+
+    /// Return whether a pending non-CLI request still exists.
+    pub fn has_non_cli_pending_request(&self, request_id: &str) -> bool {
+        let mut pending = self.pending_non_cli_requests.lock();
+        prune_expired_pending_requests(&mut pending);
+        pending.contains_key(request_id)
+    }
+
+    /// Record a yes/no resolution for a pending non-CLI request.
+    pub fn record_non_cli_pending_resolution(&self, request_id: &str, decision: ApprovalResponse) {
+        if !matches!(decision, ApprovalResponse::Yes | ApprovalResponse::No) {
+            return;
+        }
+
+        let mut resolved = self.resolved_non_cli_requests.lock();
+        if resolved.len() >= 1024 {
+            if let Some(first_key) = resolved.keys().next().cloned() {
+                resolved.remove(&first_key);
+            }
+        }
+        resolved.insert(request_id.to_string(), decision);
+    }
+
+    /// Consume a resolved pending-request decision if present.
+    pub fn take_non_cli_pending_resolution(&self, request_id: &str) -> Option<ApprovalResponse> {
+        self.resolved_non_cli_requests.lock().remove(request_id)
+    }
+
     /// List active pending non-CLI approval requests.
     pub fn list_non_cli_pending_requests(
         &self,
@@ -502,8 +567,15 @@ impl ApprovalManager {
     pub fn clear_non_cli_pending_requests_for_tool(&self, tool_name: &str) -> usize {
         let mut pending = self.pending_non_cli_requests.lock();
         prune_expired_pending_requests(&mut pending);
+        let mut resolved = self.resolved_non_cli_requests.lock();
         let before = pending.len();
-        pending.retain(|_, req| req.tool_name != tool_name);
+        pending.retain(|request_id, req| {
+            let keep = req.tool_name != tool_name;
+            if !keep {
+                resolved.remove(request_id);
+            }
+            keep
+        });
         before.saturating_sub(pending.len())
     }
 
@@ -783,6 +855,31 @@ mod tests {
         assert!(mgr
             .confirm_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-1")
             .is_err());
+    }
+
+    #[test]
+    fn create_and_reject_pending_non_cli_approval_request() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+
+        let rejected = mgr
+            .reject_non_cli_pending_request(&req.request_id, "alice", "telegram", "chat-1")
+            .expect("request should reject");
+        assert_eq!(rejected.request_id, req.request_id);
+        assert!(!mgr.has_non_cli_pending_request(&req.request_id));
+    }
+
+    #[test]
+    fn pending_non_cli_resolution_is_recorded_and_consumed() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let req = mgr.create_non_cli_pending_request("shell", "alice", "telegram", "chat-1", None);
+
+        mgr.record_non_cli_pending_resolution(&req.request_id, ApprovalResponse::Yes);
+        assert_eq!(
+            mgr.take_non_cli_pending_resolution(&req.request_id),
+            Some(ApprovalResponse::Yes)
+        );
+        assert_eq!(mgr.take_non_cli_pending_resolution(&req.request_id), None);
     }
 
     #[test]

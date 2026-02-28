@@ -7,6 +7,7 @@ import Tools from './pages/Tools';
 import Cron from './pages/Cron';
 import Integrations from './pages/Integrations';
 import Memory from './pages/Memory';
+import Devices from './pages/Devices';
 import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
@@ -80,7 +81,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 }
 
 function AppContent() {
-  const { isAuthenticated, pair, logout } = useAuth();
+  const { isAuthenticated, loading, pair, logout } = useAuth();
   const [locale, setLocaleState] = useState<Locale>('tr');
 
   const setAppLocale = (newLocale: Locale) => {
@@ -119,6 +120,7 @@ function AppContent() {
           <Route path="/cron" element={<Cron />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/memory" element={<Memory />} />
+          <Route path="/devices" element={<Devices />} />
           <Route path="/config" element={<Config />} />
           <Route path="/cost" element={<Cost />} />
           <Route path="/logs" element={<Logs />} />

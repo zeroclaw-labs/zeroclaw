@@ -4,23 +4,28 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
-    AgentConfig, AgentsIpcConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig,
-    BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
+    build_runtime_proxy_client_with_timeouts, default_model_fallback_for_provider,
+    resolve_default_model_id, runtime_proxy_config, set_runtime_proxy_config, AgentConfig,
+    AgentSessionBackend, AgentSessionConfig, AgentSessionStrategy, AgentsIpcConfig, AuditConfig,
+    AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
+    ClassificationRule, ComposioConfig, Config,
     CoordinationConfig, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig,
-    DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
-    GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
+    DockerRuntimeConfig, EconomicConfig, EconomicTokenPricing, EmbeddingRouteConfig, EstopConfig,
+    FeishuConfig, GatewayConfig, GroupReplyConfig, GroupReplyMode, HardwareConfig,
+    HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
+    HttpRequestCredentialProfile, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
     MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
-    NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpConfig, OtpMethod,
-    PeripheralBoardConfig, PeripheralsConfig, ProviderConfig, ProxyConfig, ProxyScope,
-    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
-    ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig,
-    WasmCapabilityEscalationMode, WasmModuleHashPolicy, WasmRuntimeConfig, WasmSecurityConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig,
+    NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpChallengeDelivery, OtpConfig,
+    OtpMethod, OutboundLeakGuardAction, OutboundLeakGuardConfig, PeripheralBoardConfig,
+    PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig, PluginsConfig, ProviderConfig,
+    ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig,
+    ResearchPhaseConfig, ResearchTrigger, ResourceLimitsConfig, RuntimeConfig, SandboxBackend,
+    SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SecurityRoleConfig,
+    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig,
+    TunnelConfig, UrlAccessConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy,
+    WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -50,6 +55,8 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             group_reply: None,
+            base_url: None,
+            ack_enabled: true,
         };
 
         let discord = DiscordConfig {
@@ -102,5 +109,18 @@ mod tests {
         assert_eq!(lark.app_id, "app-id");
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
+    }
+
+    #[test]
+    fn reexported_http_request_credential_profile_is_constructible() {
+        let profile = HttpRequestCredentialProfile {
+            header_name: "Authorization".into(),
+            env_var: "OPENROUTER_API_KEY".into(),
+            value_prefix: "Bearer ".into(),
+        };
+
+        assert_eq!(profile.header_name, "Authorization");
+        assert_eq!(profile.env_var, "OPENROUTER_API_KEY");
+        assert_eq!(profile.value_prefix, "Bearer ");
     }
 }

@@ -10,10 +10,6 @@ Primary workflow:
 
 - `.github/workflows/ci-provider-connectivity.yml`
 
-Legacy compatibility wrapper (manual only):
-
-- `.github/workflows/ci-connectivity-probes.yml`
-
 Probe engine and config:
 
 - `scripts/ci/provider_connectivity_matrix.py`
@@ -47,18 +43,12 @@ Enforcement policy:
 - critical endpoint unreachable + `fail_on_critical=true` -> workflow fails
 - non-critical endpoint unreachable -> reported but non-blocking
 
-`Connectivity Probes (Legacy Wrapper)` behavior:
-
-- manual dispatch only
-- accepts `enforcement_mode=enforce|report-only`
-- delegates to the same `providers.json` probe engine
-
 ## CI Artifacts
 
 Per run artifacts include:
 
-- `provider-connectivity-matrix.json` or `connectivity-report.json`
-- `provider-connectivity-matrix.md` or `connectivity-summary.md`
+- `provider-connectivity-matrix.json`
+- `provider-connectivity-matrix.md`
 - normalized audit event JSON when emitted by workflow
 
 Markdown summary is appended to `GITHUB_STEP_SUMMARY`.

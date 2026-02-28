@@ -49,6 +49,7 @@ pub(crate) mod cost;
 pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
+pub mod economic;
 pub mod gateway;
 pub mod goals;
 pub(crate) mod hardware;
@@ -56,6 +57,7 @@ pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
+// Intentionally unused re-export — public API surface for plugin authors.
 pub(crate) mod integrations;
 pub mod memory;
 pub(crate) mod migration;
@@ -63,6 +65,8 @@ pub(crate) mod multimodal;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
+#[allow(unused_imports)]
+pub(crate) mod plugins;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
@@ -71,6 +75,7 @@ pub(crate) mod service;
 pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
+pub mod update;
 pub(crate) mod util;
 
 pub use config::Config;
@@ -108,13 +113,13 @@ Add a new channel configuration.
 Provide the channel type and a JSON object with the required \
 configuration keys for that channel type.
 
-Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.
+Supported types: telegram, discord, slack, whatsapp, github, matrix, imessage, email.
 
 Examples:
   zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
   zeroclaw channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
     Add {
-        /// Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)
+        /// Channel type (telegram, discord, slack, whatsapp, github, matrix, imessage, email)
         channel_type: String,
         /// Optional configuration as JSON
         config: String,
@@ -146,14 +151,33 @@ Examples:
 pub enum SkillCommands {
     /// List all installed skills
     List,
+    /// Scaffold a new skill project from a template
+    New {
+        /// Skill name (snake_case recommended, e.g. my_weather_tool)
+        name: String,
+        /// Template language: typescript, rust, go, python
+        #[arg(long, short, default_value = "typescript")]
+        template: String,
+    },
+    /// Run a skill tool locally for testing (reads args from --args or stdin)
+    Test {
+        /// Path to the skill directory or installed skill name
+        path: String,
+        /// Optional tool name inside the skill (defaults to first tool found)
+        #[arg(long)]
+        tool: Option<String>,
+        /// JSON arguments to pass to the tool, e.g. '{"city":"Hanoi"}'
+        #[arg(long, short)]
+        args: Option<String>,
+    },
     /// Audit a skill source directory or installed skill name
     Audit {
         /// Skill path or installed skill name
         source: String,
     },
-    /// Install a new skill from a URL or local path
+    /// Install a new skill from a local path, git URL, or registry (namespace/name)
     Install {
-        /// Source URL or local path
+        /// Source: local path, git URL, or registry package (e.g. acme/my-tool)
         source: String,
     },
     /// Remove an installed skill
@@ -161,6 +185,8 @@ pub enum SkillCommands {
         /// Skill name to remove
         name: String,
     },
+    /// List all available skill templates
+    Templates,
 }
 
 /// Migration subcommands

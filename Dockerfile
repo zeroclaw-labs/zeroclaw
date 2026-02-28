@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+FROM rust:1.93-slim@sha256:7e6fa79cf81be23fd45d857f75f583d80cfdbb11c91fa06180fd747fda37a61d AS builder
 
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES=""
@@ -25,7 +25,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
       cargo build --release --locked; \
     fi
@@ -36,6 +36,7 @@ COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
+COPY templates/ templates/
 COPY web/ web/
 # Keep release builds resilient when frontend dist assets are not prebuilt in Git.
 RUN mkdir -p web/dist && \
@@ -58,7 +59,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
       cargo build --release --locked; \
     fi && \
@@ -83,7 +84,7 @@ allow_public_bind = false
 EOF
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────
-FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
+FROM debian:trixie-slim@sha256:1d3c811171a08a5adaa4a163fbafd96b61b87aa871bbc7aa15431ac275d3d430 AS dev
 
 # Install essential runtime dependencies only (use docker-compose.override.yml for dev tools)
 RUN apt-get update && apt-get install -y \

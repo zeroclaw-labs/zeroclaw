@@ -1,6 +1,7 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::agent::research;
@@ -16,6 +17,8 @@ use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -217,9 +220,7 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: self
-                .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            model_name: crate::config::resolve_default_model_id(self.model_name.as_deref(), None),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -297,11 +298,10 @@ impl Agent {
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
-        let model_name = config
-            .default_model
-            .as_deref()
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
-            .to_string();
+        let model_name = crate::config::resolve_default_model_id(
+            config.default_model.as_deref(),
+            Some(provider_name),
+        );
 
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
@@ -557,8 +557,13 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        let mut loop_detector = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: self.config.loop_detection_no_progress_threshold,
+            ping_pong_cycles: self.config.loop_detection_ping_pong_cycles,
+            failure_streak_threshold: self.config.loop_detection_failure_streak,
+        });
 
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let response = match self
                 .provider
@@ -592,6 +597,17 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
+                if self.auto_save && final_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                    let _ = self
+                        .memory
+                        .store(
+                            "assistant_resp",
+                            &final_text,
+                            MemoryCategory::Conversation,
+                            None,
+                        )
+                        .await;
+                }
                 self.trim_history();
 
                 return Ok(final_text);
@@ -613,9 +629,34 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
+
+            // ── Loop detection: record calls ─────────────────────
+            for (call, result) in calls.iter().zip(results.iter()) {
+                let args_sig =
+                    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+                loop_detector.record_call(&call.name, &args_sig, &result.output, result.success);
+            }
+
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
+
+            // ── Loop detection: check verdict ────────────────────
+            match loop_detector.check() {
+                DetectionVerdict::Continue => {}
+                DetectionVerdict::InjectWarning(warning) => {
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::user(warning)));
+                }
+                DetectionVerdict::HardStop(reason) => {
+                    anyhow::bail!(
+                        "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
+                        iteration + 1,
+                        self.config.max_tool_iterations,
+                        reason
+                    );
+                }
+            }
         }
 
         anyhow::bail!(
@@ -683,8 +724,12 @@ pub async fn run(
     let model_name = effective_config
         .default_model
         .as_deref()
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            crate::config::default_model_fallback_for_provider(Some(&provider_name)).to_string()
+        });
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -745,6 +790,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -782,6 +828,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -821,6 +868,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             }]),
         });
 
@@ -861,12 +909,14 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 },
             ]),
         });
@@ -908,6 +958,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             }]),
             seen_models: seen_models.clone(),
         });

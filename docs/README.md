@@ -79,6 +79,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 > Note: this area includes proposal/roadmap docs. For current behavior, start with [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
 
 - [security/README.md](security/README.md)
+- [security/official-channels-and-fraud-prevention.md](security/official-channels-and-fraud-prevention.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)
@@ -90,6 +91,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 
 - Unified TOC: [SUMMARY.md](SUMMARY.md)
 - Docs structure map (language/part/function): [structure/README.md](structure/README.md)
+- Docs map by function: [structure/by-function.md](structure/by-function.md)
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
 - i18n docs index: [i18n/README.md](i18n/README.md)
 - i18n coverage map: [i18n-coverage.md](i18n-coverage.md)

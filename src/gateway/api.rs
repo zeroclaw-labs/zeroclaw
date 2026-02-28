@@ -529,6 +529,48 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/pairing/devices — list paired devices
+pub async fn handle_api_pairing_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let devices = state.pairing.paired_devices();
+    Json(serde_json::json!({ "devices": devices })).into_response()
+}
+
+/// DELETE /api/pairing/devices/:id — revoke paired device
+pub async fn handle_api_pairing_device_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if !state.pairing.revoke_device(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Paired device not found"})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to persist pairing state: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "revoked": true, "id": id})).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn normalize_dashboard_config_toml(root: &mut toml::Value) {
@@ -607,10 +649,14 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     mask_optional_secret(&mut masked.proxy.http_proxy);
     mask_optional_secret(&mut masked.proxy.https_proxy);
     mask_optional_secret(&mut masked.proxy.all_proxy);
+    mask_optional_secret(&mut masked.transcription.api_key);
     mask_optional_secret(&mut masked.browser.computer_use.api_key);
     mask_optional_secret(&mut masked.web_fetch.api_key);
     mask_optional_secret(&mut masked.web_search.api_key);
     mask_optional_secret(&mut masked.web_search.brave_api_key);
+    mask_optional_secret(&mut masked.web_search.perplexity_api_key);
+    mask_optional_secret(&mut masked.web_search.exa_api_key);
+    mask_optional_secret(&mut masked.web_search.jina_api_key);
     mask_optional_secret(&mut masked.storage.provider.config.db_url);
     if let Some(cloudflare) = masked.tunnel.cloudflare.as_mut() {
         mask_required_secret(&mut cloudflare.token);
@@ -651,6 +697,10 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut linq.api_token);
         mask_optional_secret(&mut linq.signing_secret);
     }
+    if let Some(github) = masked.channels_config.github.as_mut() {
+        mask_required_secret(&mut github.access_token);
+        mask_optional_secret(&mut github.webhook_secret);
+    }
     if let Some(wati) = masked.channels_config.wati.as_mut() {
         mask_required_secret(&mut wati.api_token);
     }
@@ -679,6 +729,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
     }
+    if let Some(napcat) = masked.channels_config.napcat.as_mut() {
+        mask_optional_secret(&mut napcat.access_token);
+    }
     if let Some(qq) = masked.channels_config.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
     }
@@ -706,6 +759,10 @@ fn restore_masked_sensitive_fields(
     restore_optional_secret(&mut incoming.proxy.https_proxy, &current.proxy.https_proxy);
     restore_optional_secret(&mut incoming.proxy.all_proxy, &current.proxy.all_proxy);
     restore_optional_secret(
+        &mut incoming.transcription.api_key,
+        &current.transcription.api_key,
+    );
+    restore_optional_secret(
         &mut incoming.browser.computer_use.api_key,
         &current.browser.computer_use.api_key,
     );
@@ -717,6 +774,18 @@ fn restore_masked_sensitive_fields(
     restore_optional_secret(
         &mut incoming.web_search.brave_api_key,
         &current.web_search.brave_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.perplexity_api_key,
+        &current.web_search.perplexity_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.exa_api_key,
+        &current.web_search.exa_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.jina_api_key,
+        &current.web_search.jina_api_key,
     );
     restore_optional_secret(
         &mut incoming.storage.provider.config.db_url,
@@ -794,6 +863,13 @@ fn restore_masked_sensitive_fields(
         restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.github.as_mut(),
+        current.channels_config.github.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.wati.as_mut(),
         current.channels_config.wati.as_ref(),
     ) {
@@ -853,6 +929,12 @@ fn restore_masked_sensitive_fields(
         current.channels_config.dingtalk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.napcat.as_mut(),
+        current.channels_config.napcat.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.qq.as_mut(),
@@ -917,6 +999,7 @@ mod tests {
         current.config_path = std::path::PathBuf::from("/tmp/current/config.toml");
         current.workspace_dir = std::path::PathBuf::from("/tmp/current/workspace");
         current.api_key = Some("real-key".to_string());
+        current.transcription.api_key = Some("transcription-real-key".to_string());
         current.reliability.api_keys = vec!["r1".to_string(), "r2".to_string()];
 
         let mut incoming = mask_sensitive_fields(&current);
@@ -929,6 +1012,10 @@ mod tests {
         assert_eq!(hydrated.config_path, current.config_path);
         assert_eq!(hydrated.workspace_dir, current.workspace_dir);
         assert_eq!(hydrated.api_key, current.api_key);
+        assert_eq!(
+            hydrated.transcription.api_key,
+            current.transcription.api_key
+        );
         assert_eq!(hydrated.default_model.as_deref(), Some("gpt-4.1-mini"));
         assert_eq!(
             hydrated.reliability.api_keys,
@@ -964,6 +1051,12 @@ mod tests {
         cfg.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         cfg.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
         cfg.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".to_string());
+        cfg.transcription.api_key = Some("transcription-real-key".to_string());
+        cfg.web_search.api_key = Some("web-search-generic-key".to_string());
+        cfg.web_search.brave_api_key = Some("web-search-brave-key".to_string());
+        cfg.web_search.perplexity_api_key = Some("web-search-perplexity-key".to_string());
+        cfg.web_search.exa_api_key = Some("web-search-exa-key".to_string());
+        cfg.web_search.jina_api_key = Some("web-search-jina-key".to_string());
         cfg.tunnel.cloudflare = Some(CloudflareTunnelConfig {
             token: "cloudflare-real-token".to_string(),
         });
@@ -998,6 +1091,24 @@ mod tests {
         assert_eq!(masked.proxy.http_proxy.as_deref(), Some(MASKED_SECRET));
         assert_eq!(masked.proxy.https_proxy.as_deref(), Some(MASKED_SECRET));
         assert_eq!(masked.proxy.all_proxy.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(masked.transcription.api_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(masked.web_search.api_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(
+            masked.web_search.brave_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.web_search.perplexity_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.web_search.exa_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.web_search.jina_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
         assert_eq!(
             masked
                 .tunnel
@@ -1049,6 +1160,11 @@ mod tests {
         current.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         current.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
         current.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".to_string());
+        current.web_search.api_key = Some("web-search-generic-key".to_string());
+        current.web_search.brave_api_key = Some("web-search-brave-key".to_string());
+        current.web_search.perplexity_api_key = Some("web-search-perplexity-key".to_string());
+        current.web_search.exa_api_key = Some("web-search-exa-key".to_string());
+        current.web_search.jina_api_key = Some("web-search-jina-key".to_string());
         current.tunnel.cloudflare = Some(CloudflareTunnelConfig {
             token: "cloudflare-real-token".to_string(),
         });
@@ -1093,6 +1209,26 @@ mod tests {
         assert_eq!(
             restored.proxy.all_proxy.as_deref(),
             Some("socks5://user:pass@proxy.internal:1080")
+        );
+        assert_eq!(
+            restored.web_search.api_key.as_deref(),
+            Some("web-search-generic-key")
+        );
+        assert_eq!(
+            restored.web_search.brave_api_key.as_deref(),
+            Some("web-search-brave-key")
+        );
+        assert_eq!(
+            restored.web_search.perplexity_api_key.as_deref(),
+            Some("web-search-perplexity-key")
+        );
+        assert_eq!(
+            restored.web_search.exa_api_key.as_deref(),
+            Some("web-search-exa-key")
+        );
+        assert_eq!(
+            restored.web_search.jina_api_key.as_deref(),
+            Some("web-search-jina-key")
         );
         assert_eq!(
             restored

@@ -12,6 +12,13 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config as RlConfig, Context, Editor, Helper};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -21,11 +28,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod context;
+pub(crate) mod detection;
 mod execution;
 mod history;
 mod parsing;
 
 use context::{build_context, build_hardware_context};
+use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
     ToolExecutionOutcome,
@@ -46,11 +55,98 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
-const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
+    if provider.supports_vision() {
+        return true;
+    }
+
+    // Guardrail for issue #2107: some anthropic setups have reported false
+    // negatives from provider capability probing even though Claude models
+    // accept image inputs. Keep the preflight permissive for anthropic routes
+    // and rely on upstream API validation if a specific model cannot handle
+    // vision.
+    let normalized = provider_name.trim().to_ascii_lowercase();
+    normalized == "anthropic" || normalized.starts_with("anthropic-custom:")
+}
+
+/// Slash-command definitions for interactive-mode completion.
+/// Each entry: (trigger aliases, display label, description).
+const SLASH_COMMANDS: &[(&[&str], &str, &str)] = &[
+    (&["/help"], "/help", "Show this help message"),
+    (
+        &["/clear", "/new"],
+        "/clear /new",
+        "Clear conversation history",
+    ),
+    (&["/quit", "/exit"], "/quit /exit", "Exit interactive mode"),
+];
+
+struct SlashCommandCompleter;
+
+impl Completer for SlashCommandCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if !line.starts_with('/') {
+            return Ok((0, vec![]));
+        }
+
+        let prefix = &line[..pos];
+        let matches: Vec<Pair> = SLASH_COMMANDS
+            .iter()
+            .filter(|(triggers, _, _)| triggers.iter().any(|trigger| trigger.starts_with(prefix)))
+            .map(|(triggers, label, desc)| {
+                let replacement = triggers
+                    .iter()
+                    .find(|trigger| trigger.starts_with(prefix))
+                    .unwrap_or(&triggers[0]);
+                Pair {
+                    display: format!("  {:<14}{desc:<64}", label),
+                    replacement: replacement.to_string(),
+                }
+            })
+            .collect();
+
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for SlashCommandCompleter {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        if !line.starts_with('/') || pos == 0 {
+            return None;
+        }
+
+        let prefix = &line[..pos];
+        SLASH_COMMANDS
+            .iter()
+            .flat_map(|(triggers, _, _)| triggers.iter())
+            .find(|trigger| trigger.starts_with(prefix) && **trigger != prefix)
+            .map(|trigger| trigger[pos..].to_string())
+    }
+}
+
+impl Highlighter for SlashCommandCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
+    }
+}
+
+impl Validator for SlashCommandCompleter {}
+impl Helper for SlashCommandCompleter {}
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -67,6 +163,43 @@ static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+});
+
+/// Detect "I'll do X" style deferred-action replies that often indicate a missing
+/// follow-up tool call in agentic flows.
+static DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(
+            i(?:'ll|\s+will)|
+            i\s+am\s+going\s+to|
+            let\s+me|
+            let(?:'s|\s+us)|
+            we(?:'ll|\s+will)
+        )\b
+        [^.!?\n]{0,160}
+        \b(
+            check|look|search|browse|open|read|write|run|execute|call|
+            inspect|analy(?:s|z)e|verify|list|fetch|try|see|continue
+        )\b",
+    )
+    .unwrap()
+});
+
+/// Detect common CJK deferred-action phrases (e.g., Chinese "让我…查看")
+/// that imply a follow-up tool call should occur.
+static CJK_DEFERRED_ACTION_CUE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(让我|我来|我会|我们来|我们会|我先|先让我|马上)").unwrap());
+
+/// Action verbs commonly used when promising to perform tool-backed work in CJK text.
+static CJK_DEFERRED_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|试试|继续|处理|修复|看看|看一看|看一下)").unwrap()
+});
+
+/// Fast check for CJK scripts (Han/Hiragana/Katakana/Hangul) so we only run
+/// additional regexes when non-Latin text is present.
+static CJK_SCRIPT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]").unwrap()
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
@@ -122,6 +255,56 @@ pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 /// when the user explicitly asks for command/tool execution details.
 pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
 
+tokio::task_local! {
+    static TOOL_LOOP_REPLY_TARGET: Option<String>;
+}
+
+const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "lark",
+    "feishu",
+];
+
+const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
+const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
+const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply indicated you were about to take an action, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
+
+#[derive(Debug, Clone)]
+pub(crate) struct NonCliApprovalPrompt {
+    pub request_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NonCliApprovalContext {
+    pub sender: String,
+    pub reply_target: String,
+    pub prompt_tx: tokio::sync::mpsc::UnboundedSender<NonCliApprovalPrompt>,
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
+    static LOOP_DETECTION_CONFIG: LoopDetectionConfig;
+    static SAFETY_HEARTBEAT_CONFIG: Option<SafetyHeartbeatConfig>;
+}
+
+/// Configuration for periodic safety-constraint re-injection (heartbeat).
+#[derive(Clone)]
+pub(crate) struct SafetyHeartbeatConfig {
+    /// Pre-rendered security policy summary text.
+    pub body: String,
+    /// Inject a heartbeat every `interval` tool iterations (0 = disabled).
+    pub interval: usize,
+}
+
+fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
+    interval > 0 && counter > 0 && counter % interval == 0
+}
+
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
     let hint = match name {
@@ -135,6 +318,131 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
     match hint {
         Some(s) => truncate_with_ellipsis(s, max_len),
         None => String::new(),
+    }
+}
+
+fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX.is_match(trimmed) {
+        return true;
+    }
+
+    CJK_SCRIPT_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_CUE_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
+}
+
+fn maybe_inject_cron_add_delivery(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_name: &str,
+    reply_target: Option<&str>,
+) {
+    if tool_name != "cron_add"
+        || !AUTO_CRON_DELIVERY_CHANNELS
+            .iter()
+            .any(|supported| supported == &channel_name)
+    {
+        return;
+    }
+
+    let Some(reply_target) = reply_target.map(str::trim).filter(|v| !v.is_empty()) else {
+        return;
+    };
+
+    let Some(args_obj) = tool_args.as_object_mut() else {
+        return;
+    };
+
+    let is_agent_job = match args_obj.get("job_type").and_then(serde_json::Value::as_str) {
+        Some("agent") => true,
+        Some(_) => false,
+        None => args_obj.contains_key("prompt"),
+    };
+    if !is_agent_job {
+        return;
+    }
+
+    let delivery = args_obj
+        .entry("delivery".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(delivery_obj) = delivery.as_object_mut() else {
+        return;
+    };
+
+    let mode = delivery_obj
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    if mode.eq_ignore_ascii_case("none") || mode.trim().is_empty() {
+        delivery_obj.insert(
+            "mode".to_string(),
+            serde_json::Value::String("announce".to_string()),
+        );
+    } else if !mode.eq_ignore_ascii_case("announce") {
+        // Respect explicitly chosen non-announce modes.
+        return;
+    }
+
+    let needs_channel = delivery_obj
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if needs_channel {
+        delivery_obj.insert(
+            "channel".to_string(),
+            serde_json::Value::String(channel_name.to_string()),
+        );
+    }
+
+    let needs_target = delivery_obj
+        .get("to")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if needs_target {
+        delivery_obj.insert(
+            "to".to_string(),
+            serde_json::Value::String(reply_target.to_string()),
+        );
+    }
+}
+
+async fn await_non_cli_approval_decision(
+    mgr: &ApprovalManager,
+    request_id: &str,
+    sender: &str,
+    channel_name: &str,
+    reply_target: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> ApprovalResponse {
+    let started = Instant::now();
+
+    loop {
+        if let Some(decision) = mgr.take_non_cli_pending_resolution(request_id) {
+            return decision;
+        }
+
+        if !mgr.has_non_cli_pending_request(request_id) {
+            // Fail closed when the request disappears without an explicit resolution.
+            return ApprovalResponse::No;
+        }
+
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            return ApprovalResponse::No;
+        }
+
+        if started.elapsed() >= Duration::from_secs(NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS) {
+            let _ =
+                mgr.reject_non_cli_pending_request(request_id, sender, channel_name, reply_target);
+            let _ = mgr.take_non_cli_pending_resolution(request_id);
+            return ApprovalResponse::No;
+        }
+
+        tokio::time::sleep(Duration::from_millis(NON_CLI_APPROVAL_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -272,6 +580,22 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+pub(crate) fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .to_string()
+            .contains("Agent exceeded maximum tool iterations")
+    })
+}
+
+pub(crate) fn is_loop_detection_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .to_string()
+            .contains("Agent stopped early due to detected loop pattern")
+    })
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -309,6 +633,110 @@ pub(crate) async fn agent_turn(
     .await
 }
 
+/// Run the tool loop with channel reply_target context, used by channel runtimes
+/// to auto-populate delivery routing for scheduled reminders.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_reply_target(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    reply_target: Option<&str>,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+) -> Result<String> {
+    TOOL_LOOP_REPLY_TARGET
+        .scope(
+            reply_target.map(str::to_string),
+            run_tool_call_loop(
+                provider,
+                history,
+                tools_registry,
+                observer,
+                provider_name,
+                model,
+                temperature,
+                silent,
+                approval,
+                channel_name,
+                multimodal_config,
+                max_tool_iterations,
+                cancellation_token,
+                on_delta,
+                hooks,
+                excluded_tools,
+            ),
+        )
+        .await
+}
+
+/// Run the tool loop with optional non-CLI approval context scoped to this task.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    non_cli_approval_context: Option<NonCliApprovalContext>,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+    safety_heartbeat: Option<SafetyHeartbeatConfig>,
+) -> Result<String> {
+    let reply_target = non_cli_approval_context
+        .as_ref()
+        .map(|ctx| ctx.reply_target.clone());
+
+    SAFETY_HEARTBEAT_CONFIG
+        .scope(
+            safety_heartbeat,
+            TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                non_cli_approval_context,
+                TOOL_LOOP_REPLY_TARGET.scope(
+                    reply_target,
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
+                ),
+            ),
+        )
+        .await
+}
+
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -342,6 +770,20 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
 ) -> Result<String> {
+    let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    let channel_reply_target = TOOL_LOOP_REPLY_TARGET
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            non_cli_approval_context
+                .as_ref()
+                .map(|ctx| ctx.reply_target.clone())
+        });
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -356,6 +798,17 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut missing_tool_call_retry_used = false;
+    let mut missing_tool_call_retry_prompt: Option<String> = None;
+    let ld_config = LOOP_DETECTION_CONFIG
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    let mut loop_detector = LoopDetector::new(ld_config);
+    let mut loop_detection_prompt: Option<String> = None;
+    let heartbeat_config = SAFETY_HEARTBEAT_CONFIG
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -380,7 +833,9 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
+        let provider_supports_vision =
+            should_treat_provider_as_vision_capable(provider_name, provider);
+        if image_marker_count > 0 && !provider_supports_vision {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
                 capability: "vision".to_string(),
@@ -393,6 +848,26 @@ pub(crate) async fn run_tool_call_loop(
 
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let mut request_messages = prepared_messages.messages.clone();
+        if let Some(prompt) = missing_tool_call_retry_prompt.take() {
+            request_messages.push(ChatMessage::user(prompt));
+        }
+        if let Some(prompt) = loop_detection_prompt.take() {
+            request_messages.push(ChatMessage::user(prompt));
+        }
+
+        // ── Safety heartbeat: periodic security-constraint re-injection ──
+        if let Some(ref hb) = heartbeat_config {
+            if should_inject_safety_heartbeat(iteration, hb.interval) {
+                let reminder = format!(
+                    "[Safety Heartbeat — round {}/{}]\n{}",
+                    iteration + 1,
+                    max_iterations,
+                    hb.body
+                );
+                request_messages.push(ChatMessage::user(reminder));
+            }
+        }
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -440,7 +915,7 @@ pub(crate) async fn run_tool_call_loop(
 
         let chat_future = provider.chat(
             ChatRequest {
-                messages: &prepared_messages.messages,
+                messages: &request_messages,
                 tools: request_tools,
             },
             model,
@@ -456,138 +931,145 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
-                        .usage
-                        .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
+        let (
+            response_text,
+            parsed_text,
+            tool_calls,
+            assistant_history_content,
+            native_tool_calls,
+            parse_issue_detected,
+        ) = match chat_result {
+            Ok(resp) => {
+                let (resp_input_tokens, resp_output_tokens) = resp
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
 
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                    });
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                    input_tokens: resp_input_tokens,
+                    output_tokens: resp_output_tokens,
+                });
 
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
 
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
                     }
-
-                    if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls)
-                    {
-                        runtime_trace::record_event(
-                            "tool_call_parse_issue",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&parse_issue),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "response_excerpt": truncate_with_ellipsis(
-                                    &scrub_credentials(&response_text),
-                                    600
-                                ),
-                            }),
-                        );
-                    }
-
-                    runtime_trace::record_event(
-                        "llm_response",
-                        Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
-                        Some(&turn_id),
-                        Some(true),
-                        None,
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
-                            "input_tokens": resp_input_tokens,
-                            "output_tokens": resp_output_tokens,
-                            "raw_response": scrub_credentials(&response_text),
-                            "native_tool_calls": resp.tool_calls.len(),
-                            "parsed_tool_calls": calls.len(),
-                        }),
-                    );
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let reasoning_content = resp.reasoning_content.clone();
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        if use_native_tools {
-                            build_native_assistant_history_from_parsed_calls(
-                                &response_text,
-                                &calls,
-                                reasoning_content.as_deref(),
-                            )
-                            .unwrap_or_else(|| response_text.clone())
-                        } else {
-                            response_text.clone()
-                        }
-                    } else {
-                        build_native_assistant_history(
-                            &response_text,
-                            &resp.tool_calls,
-                            reasoning_content.as_deref(),
-                        )
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
+                    calls = fallback_calls;
                 }
-                Err(e) => {
-                    let safe_error = crate::providers::sanitize_api_error(&e.to_string());
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error.clone()),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
+
+                let parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                if let Some(parse_issue) = parse_issue.as_deref() {
                     runtime_trace::record_event(
-                        "llm_response",
+                        "tool_call_parse_issue",
                         Some(channel_name),
                         Some(provider_name),
                         Some(model),
                         Some(&turn_id),
                         Some(false),
-                        Some(&safe_error),
+                        Some(parse_issue),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
+                            "response_excerpt": truncate_with_ellipsis(
+                                &scrub_credentials(&response_text),
+                                600
+                            ),
                         }),
                     );
-                    return Err(e);
                 }
-            };
+
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                        "input_tokens": resp_input_tokens,
+                        "output_tokens": resp_output_tokens,
+                        "raw_response": scrub_credentials(&response_text),
+                        "native_tool_calls": resp.tool_calls.len(),
+                        "parsed_tool_calls": calls.len(),
+                    }),
+                );
+
+                // Preserve native tool call IDs in assistant history so role=tool
+                // follow-up messages can reference the exact call id.
+                let reasoning_content = resp.reasoning_content.clone();
+                let assistant_history_content = if resp.tool_calls.is_empty() {
+                    if use_native_tools {
+                        build_native_assistant_history_from_parsed_calls(
+                            &response_text,
+                            &calls,
+                            reasoning_content.as_deref(),
+                        )
+                        .unwrap_or_else(|| response_text.clone())
+                    } else {
+                        response_text.clone()
+                    }
+                } else {
+                    build_native_assistant_history(
+                        &response_text,
+                        &resp.tool_calls,
+                        reasoning_content.as_deref(),
+                    )
+                };
+
+                let native_calls = resp.tool_calls;
+                (
+                    response_text,
+                    parsed_text,
+                    calls,
+                    assistant_history_content,
+                    native_calls,
+                    parse_issue.is_some(),
+                )
+            }
+            Err(e) => {
+                let safe_error = crate::providers::sanitize_api_error(&e.to_string());
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(safe_error.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                    }),
+                );
+                return Err(e);
+            }
+        };
 
         let display_text = if parsed_text.is_empty() {
             response_text.clone()
@@ -609,6 +1091,46 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            let missing_tool_call_followthrough = !missing_tool_call_retry_used
+                && iteration + 1 < max_iterations
+                && !tool_specs.is_empty()
+                && (parse_issue_detected
+                    || looks_like_deferred_action_without_tool_call(&display_text));
+            if missing_tool_call_followthrough {
+                missing_tool_call_retry_used = true;
+                missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
+                let retry_reason = if parse_issue_detected {
+                    "parse_issue_detected"
+                } else {
+                    "deferred_action_text_detected"
+                };
+
+                runtime_trace::record_event(
+                    "tool_call_followthrough_retry",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    Some("llm response implied follow-up action but emitted no tool call"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "reason": retry_reason,
+                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                    }),
+                );
+
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!(
+                            "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying: response deferred action without a tool call\n"
+                        ))
+                        .await;
+                }
+
+                continue;
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -717,6 +1239,13 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            maybe_inject_cron_add_delivery(
+                &tool_name,
+                &mut tool_args,
+                channel_name,
+                channel_reply_target.as_deref(),
+            );
+
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
                 let blocked = format!("Tool '{tool_name}' is not available in this channel.");
                 runtime_trace::record_event(
@@ -749,23 +1278,65 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if bypass_non_cli_approval_for_turn {
+                let non_cli_session_granted =
+                    channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
+                if bypass_non_cli_approval_for_turn || non_cli_session_granted {
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
                         ApprovalResponse::Yes,
                         channel_name,
                     );
+                    if non_cli_session_granted {
+                        runtime_trace::record_event(
+                            "approval_bypass_non_cli_session_grant",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(true),
+                            Some("using runtime non-cli session approval grant"),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name.clone(),
+                            }),
+                        );
+                    }
                 } else if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
                     };
 
-                    // Only CLI supports interactive prompts today. For non-CLI channels,
-                    // fail closed instead of silently auto-approving privileged tools.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
+                    } else if let Some(ctx) = non_cli_approval_context.as_ref() {
+                        let pending = mgr.create_non_cli_pending_request(
+                            &tool_name,
+                            &ctx.sender,
+                            channel_name,
+                            &ctx.reply_target,
+                            Some(
+                                "interactive approval required for supervised non-cli tool execution"
+                                    .to_string(),
+                            ),
+                        );
+
+                        let _ = ctx.prompt_tx.send(NonCliApprovalPrompt {
+                            request_id: pending.request_id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: tool_args.clone(),
+                        });
+
+                        await_non_cli_approval_decision(
+                            mgr,
+                            &pending.request_id,
+                            &ctx.sender,
+                            channel_name,
+                            &ctx.reply_target,
+                            cancellation_token.as_ref(),
+                        )
+                        .await
                     } else {
                         ApprovalResponse::No
                     };
@@ -941,6 +1512,12 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
 
+            // ── Loop detection: record call ──────────────────────
+            {
+                let sig = tool_call_signature(&call.name, &call.arguments);
+                loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
+            }
+
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
@@ -984,6 +1561,49 @@ pub(crate) async fn run_tool_call_loop(
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
+            }
+        }
+
+        // ── Loop detection: check verdict ────────────────────────
+        match loop_detector.check() {
+            DetectionVerdict::Continue => {}
+            DetectionVerdict::InjectWarning(warning) => {
+                runtime_trace::record_event(
+                    "loop_detected_warning",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("loop pattern detected, injecting self-correction prompt"),
+                    serde_json::json!({ "iteration": iteration + 1, "warning": &warning }),
+                );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!(
+                            "{DRAFT_PROGRESS_SENTINEL}\u{26a0}\u{fe0f} Loop detected, attempting self-correction\n"
+                        ))
+                        .await;
+                }
+                loop_detection_prompt = Some(warning);
+            }
+            DetectionVerdict::HardStop(reason) => {
+                runtime_trace::record_event(
+                    "loop_detected_hard_stop",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("loop persisted after warning, stopping early"),
+                    serde_json::json!({ "iteration": iteration + 1, "reason": &reason }),
+                );
+                anyhow::bail!(
+                    "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
+                    iteration + 1,
+                    max_iterations,
+                    reason
+                );
             }
         }
     }
@@ -1122,6 +1742,12 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
 // and hard trimming to keep the context window bounded.
 
 #[allow(clippy::too_many_lines)]
+/// Run the agent loop with the given configuration.
+///
+/// When `hooks` is `Some`, the supplied [`HookRunner`](crate::hooks::HookRunner)
+/// is invoked at every tool-call boundary (`before_tool_call` /
+/// `on_after_tool_call`), enabling library consumers to inject safety,
+/// audit, or transformation logic without patching the crate.
 pub async fn run(
     config: Config,
     message: Option<String>,
@@ -1130,6 +1756,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -1196,14 +1823,17 @@ pub async fn run(
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter");
 
-    let model_name = model_override
-        .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+    let model_name = crate::config::resolve_default_model_id(
+        model_override
+            .as_deref()
+            .or(config.default_model.as_deref()),
+        Some(provider_name),
+    );
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
+        provider_transport: config.effective_provider_transport(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
@@ -1219,7 +1849,7 @@ pub async fn run(
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
 
@@ -1268,6 +1898,10 @@ pub async fn run(
             "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
         ),
         (
+            "memory_observe",
+            "Store observation memory. Use when: capturing patterns/signals that should remain searchable over long horizons.",
+        ),
+        (
             "memory_recall",
             "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
         ),
@@ -1307,6 +1941,10 @@ pub async fn run(
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
+        tool_descs.push((
+            "browser",
+            "Automate browser actions (open/click/type/scroll/screenshot) with backend-aware safety checks.",
+        ));
     }
     if config.composio.enabled {
         tool_descs.push((
@@ -1321,6 +1959,14 @@ pub async fn run(
     tool_descs.push((
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
+    ));
+    tool_descs.push((
+        "web_search_config",
+        "Configure web search providers/keys/fallbacks at runtime.",
+    ));
+    tool_descs.push((
+        "web_access_config",
+        "Configure shared URL access policy (first-visit approval, allowlist/blocklist, approved domains).",
     ));
     if !config.agents.is_empty() {
         tool_descs.push((
@@ -1366,7 +2012,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
@@ -1405,7 +2051,7 @@ pub async fn run(
 
         // Inject memory + hardware RAG context into user message
         let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -1424,26 +2070,57 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            approval_manager.as_ref(),
-            channel_name,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await?;
+        let ld_cfg = LoopDetectionConfig {
+            no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+            ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+            failure_streak_threshold: config.agent.loop_detection_failure_streak,
+        };
+        let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+            Some(SafetyHeartbeatConfig {
+                body: security.summary_for_heartbeat(),
+                interval: config.agent.safety_heartbeat_interval,
+            })
+        } else {
+            None
+        };
+        let response = SAFETY_HEARTBEAT_CONFIG
+            .scope(
+                hb_cfg,
+                LOOP_DETECTION_CONFIG.scope(
+                    ld_cfg,
+                    run_tool_call_loop(
+                        provider.as_ref(),
+                        &mut history,
+                        &tools_registry,
+                        observer.as_ref(),
+                        provider_name,
+                        &model_name,
+                        temperature,
+                        false,
+                        approval_manager.as_ref(),
+                        channel_name,
+                        &config.multimodal,
+                        config.agent.max_tool_iterations,
+                        None,
+                        None,
+                        hooks,
+                        &[],
+                    ),
+                ),
+            )
+            .await?;
         final_output = response.clone();
+        if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            let assistant_key = autosave_memory_key("assistant_resp");
+            let _ = mem
+                .store(
+                    &assistant_key,
+                    &response,
+                    MemoryCategory::Conversation,
+                    None,
+                )
+                .await;
+        }
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
@@ -1453,25 +2130,32 @@ pub async fn run(
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut interactive_turn: usize = 0;
+        // Reusable readline editor for UTF-8 input support
+        let mut rl = Editor::with_config(
+            RlConfig::builder()
+                .completion_type(CompletionType::List)
+                .build(),
+        )?;
+        rl.set_helper(Some(SlashCommandCompleter));
 
         loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
-
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
-                Ok(0) => break,
-                Ok(_) => {}
+            let input = match rl.readline("> ") {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                    break;
+                }
                 Err(e) => {
                     eprintln!("\nError reading input: {e}\n");
                     break;
                 }
-            }
+            };
 
             let user_input = input.trim().to_string();
             if user_input.is_empty() {
                 continue;
             }
+            rl.add_history_entry(&input)?;
             match user_input.as_str() {
                 "/quit" | "/exit" => break,
                 "/help" => {
@@ -1486,20 +2170,18 @@ pub async fn run(
                         "This will clear the current conversation and delete all session memory."
                     );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
-                    print!("Continue? [y/N] ");
-                    let _ = std::io::stdout().flush();
+                    let confirm = rl.readline("Continue? [y/N] ").unwrap_or_default();
 
-                    let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
-                        continue;
-                    }
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                         println!("Cancelled.\n");
                         continue;
                     }
 
+                    // Ensure prior prompts are not navigable after reset.
+                    rl.clear_history()?;
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
+                    interactive_turn = 0;
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -1529,8 +2211,13 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(
+                mem.as_ref(),
+                &user_input,
+                config.memory.min_relevance_score,
+                None,
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -1545,34 +2232,98 @@ pub async fn run(
             };
 
             history.push(ChatMessage::user(&enriched));
+            interactive_turn += 1;
 
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &[],
-            )
-            .await
+            // Inject interactive safety heartbeat at configured turn intervals
+            if should_inject_safety_heartbeat(
+                interactive_turn,
+                config.agent.safety_heartbeat_turn_interval,
+            ) {
+                let reminder = format!(
+                    "[Safety Heartbeat — turn {}]\n{}",
+                    interactive_turn,
+                    security.summary_for_heartbeat()
+                );
+                history.push(ChatMessage::user(reminder));
+            }
+
+            let ld_cfg = LoopDetectionConfig {
+                no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+                ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+                failure_streak_threshold: config.agent.loop_detection_failure_streak,
+            };
+            let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+                Some(SafetyHeartbeatConfig {
+                    body: security.summary_for_heartbeat(),
+                    interval: config.agent.safety_heartbeat_interval,
+                })
+            } else {
+                None
+            };
+            let response = match SAFETY_HEARTBEAT_CONFIG
+                .scope(
+                    hb_cfg,
+                    LOOP_DETECTION_CONFIG.scope(
+                        ld_cfg,
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            provider_name,
+                            &model_name,
+                            temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            hooks,
+                            &[],
+                        ),
+                    ),
+                )
+                .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
+                    if is_tool_iteration_limit_error(&e) {
+                        let pause_notice = format!(
+                            "⚠️ Reached tool-iteration limit ({}). Context and progress are preserved. \
+                            Reply \"continue\" to resume, or increase `agent.max_tool_iterations` in config.",
+                            config.agent.max_tool_iterations.max(DEFAULT_MAX_TOOL_ITERATIONS)
+                        );
+                        history.push(ChatMessage::assistant(&pause_notice));
+                        eprintln!("\n{pause_notice}\n");
+                        continue;
+                    }
+                    if is_loop_detection_error(&e) {
+                        let notice =
+                            "\u{26a0}\u{fe0f} Loop pattern detected and agent stopped early. \
+                            Context preserved. Reply \"continue\" to resume, or adjust \
+                            loop_detection_* thresholds in config.";
+                        history.push(ChatMessage::assistant(notice));
+                        eprintln!("\n{notice}\n");
+                        continue;
+                    }
                     eprintln!("\nError: {e}\n");
                     continue;
                 }
             };
             final_output = response.clone();
+            if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                let assistant_key = autosave_memory_key("assistant_resp");
+                let _ = mem
+                    .store(
+                        &assistant_key,
+                        &response,
+                        MemoryCategory::Conversation,
+                        None,
+                    )
+                    .await;
+            }
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
@@ -1587,7 +2338,7 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
             )
             .await
@@ -1617,6 +2368,14 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_session(config, message, None).await
+}
+
+pub async fn process_message_with_session(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -1660,13 +2419,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = crate::config::resolve_default_model_id(
+        config.default_model.as_deref(),
+        Some(provider_name),
+    );
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
+        provider_transport: config.effective_provider_transport(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
@@ -1706,17 +2466,27 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
         ("memory_store", "Save to memory."),
+        ("memory_observe", "Store observation memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
         (
             "model_routing_config",
             "Configure default model, scenario routing, and delegate agents.",
         ),
+        (
+            "web_search_config",
+            "Configure web search providers/keys/fallbacks.",
+        ),
+        (
+            "web_access_config",
+            "Configure shared URL access policy for network tools.",
+        ),
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
+        tool_descs.push(("browser", "Automate browser interactions."));
     }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
@@ -1769,7 +2539,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -1788,19 +2564,31 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-    )
-    .await
+    let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+        Some(SafetyHeartbeatConfig {
+            body: security.summary_for_heartbeat(),
+            interval: config.agent.safety_heartbeat_interval,
+        })
+    } else {
+        None
+    };
+    SAFETY_HEARTBEAT_CONFIG
+        .scope(
+            hb_cfg,
+            agent_turn(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                &model_name,
+                config.default_temperature,
+                true,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+            ),
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -1831,6 +2619,100 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_populates_agent_delivery_from_channel_context() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later"
+        });
+
+        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+
+        assert_eq!(args["delivery"]["mode"], "announce");
+        assert_eq!(args["delivery"]["channel"], "telegram");
+        assert_eq!(args["delivery"]["to"], "-10012345");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_does_not_override_explicit_target() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "delivery": {
+                "mode": "announce",
+                "channel": "discord",
+                "to": "C123"
+            }
+        });
+
+        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+
+        assert_eq!(args["delivery"]["channel"], "discord");
+        assert_eq!(args["delivery"]["to"], "C123");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_skips_shell_jobs() {
+        let mut args = serde_json::json!({
+            "job_type": "shell",
+            "command": "echo hello"
+        });
+
+        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+
+        assert!(args.get("delivery").is_none());
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_supports_lark_and_feishu_channels() {
+        let mut lark_args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "daily summary"
+        });
+        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
+        assert_eq!(lark_args["delivery"]["channel"], "lark");
+        assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
+
+        let mut feishu_args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "daily summary"
+        });
+        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
+        assert_eq!(feishu_args["delivery"]["channel"], "feishu");
+        assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
+    }
+
+    #[test]
+    fn safety_heartbeat_interval_zero_disables_injection() {
+        for counter in [0, 1, 2, 10, 100] {
+            assert!(
+                !should_inject_safety_heartbeat(counter, 0),
+                "counter={counter} should not inject when interval=0"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_heartbeat_interval_one_injects_every_non_initial_step() {
+        assert!(!should_inject_safety_heartbeat(0, 1));
+        for counter in 1..=6 {
+            assert!(
+                should_inject_safety_heartbeat(counter, 1),
+                "counter={counter} should inject when interval=1"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_heartbeat_injects_only_on_exact_multiples() {
+        let interval = 3;
+        let injected: Vec<usize> = (0..=10)
+            .filter(|counter| should_inject_safety_heartbeat(*counter, interval))
+            .collect();
+        assert_eq!(injected, vec![3, 6, 9]);
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
@@ -1900,6 +2782,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             })
         }
     }
@@ -1918,6 +2801,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 })
                 .collect();
             Self {
@@ -2119,6 +3003,39 @@ mod tests {
         assert!(err.to_string().contains("provider_capability_error"));
         assert!(err.to_string().contains("capability=vision"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_anthropic_route_on_vision_probe_false_negative() {
+        let provider = ScriptedProvider::from_text_responses(vec!["vision-ok"]);
+        let mut history = vec![ChatMessage::user(
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "anthropic",
+            "opus-4-6",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("anthropic route should not fail on a false-negative vision capability probe");
+
+        assert_eq!(result, "vision-ok");
     }
 
     #[tokio::test]
@@ -2408,6 +3325,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_uses_non_cli_session_grant_without_waiting_for_prompt() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        approval_mgr.grant_non_cli_session("shell");
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should consume non-cli session grants");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "shell tool should execute when runtime non-cli session grant exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_waits_for_non_cli_approval_resolution() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let approval_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            approval_mgr_for_task
+                .confirm_non_cli_pending_request(
+                    &prompt.request_id,
+                    "alice",
+                    "telegram",
+                    "chat-approval",
+                )
+                .expect("pending approval should confirm");
+            approval_mgr_for_task
+                .record_non_cli_pending_resolution(&prompt.request_id, ApprovalResponse::Yes);
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approval".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("tool loop should continue after non-cli approval");
+
+        approval_task.await.expect("approval task should complete");
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_consumes_one_time_non_cli_allow_all_token() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -2647,6 +3703,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_tool_call_loop_retries_once_when_response_defers_action_without_tool_call() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I'll check that right away.",
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"retry"}}
+</tool_call>"#,
+            "done after tool",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please check the workspace"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should recover after one deferred-action reply");
+
+        assert_eq!(result, "done after tool");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "the fallback retry should lead to an actual tool execution"
+        );
+    }
+
     #[test]
     fn parse_tool_calls_extracts_single_call() {
         let response = r#"Let me check that.
@@ -2747,6 +3854,73 @@ After text."#;
         assert!(text.is_empty()); // No content field
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "memory_recall");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_openai_message_wrapper_with_content() {
+        let response = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "<think>plan</think>\nI will call a tool.",
+                "tool_calls": [
+                    {
+                        "id": "chatcmpl-tool-a18c01b8849eb05d",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": "{\"command\": \"ls -la\"}"
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+        assert!(text.contains("I will call a tool."));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_openai_choices_message_wrapper() {
+        let response = r#"{
+            "id": "chatcmpl-123",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Checking now.",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": "{\"command\":\"pwd\"}"
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        }"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(text, "Checking now.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+        assert_eq!(calls[0].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
@@ -2879,6 +4053,49 @@ I will now call the tool with this payload:
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "pwd"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_direct_xml_tool_tags_without_wrapper() {
+        let response = r#"<shell>dir "C:\Users\u\Desktop" /b</shell>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            r#"dir "C:\Users\u\Desktop" /b"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_mixed_direct_xml_blocks_with_guidance_text() {
+        let response = r#"
+// check desktop images
+<shell>dir "C:\Users\u\Desktop" /b | findstr /i "\.jpg$ \.png$"</shell>
+
+// create a file
+<file_write>
+<path>C:\Users\u\Desktop\new_file.txt</path>
+<content></content>
+</file_write>
+"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            r#"dir "C:\Users\u\Desktop" /b | findstr /i "\.jpg$ \.png$""#
+        );
+        assert_eq!(calls[1].name, "file_write");
+        assert_eq!(
+            calls[1].arguments.get("path").unwrap().as_str().unwrap(),
+            r#"C:\Users\u\Desktop\new_file.txt"#
+        );
+        assert!(text.contains("check desktop images"));
+        assert!(text.contains("create a file"));
     }
 
     #[test]
@@ -3378,7 +4595,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = build_context(&mem, "status updates", 0.0, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -3434,6 +4651,32 @@ Done."#;
     fn detect_tool_call_parse_issue_ignores_normal_text() {
         let issue = detect_tool_call_parse_issue("Thanks, done.", &[]);
         assert!(issue.is_none());
+    }
+
+    #[test]
+    fn looks_like_deferred_action_without_tool_call_detects_action_promises() {
+        assert!(looks_like_deferred_action_without_tool_call(
+            "Webpage opened, let's see what's new here."
+        ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "It seems absolute paths are blocked. Let me try using a relative path."
+        ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "看起来绝对路径不可用，让我尝试使用当前目录的相对路径。"
+        ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "页面已打开，让我获取快照查看详细信息。"
+        ));
+    }
+
+    #[test]
+    fn looks_like_deferred_action_without_tool_call_ignores_final_answers() {
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "The latest update is already shown above."
+        ));
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "最新结果已经在上面整理完成。"
+        ));
     }
 
     #[test]

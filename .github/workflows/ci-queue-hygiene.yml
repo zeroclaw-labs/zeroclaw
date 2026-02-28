@@ -1,0 +1,144 @@
+name: CI Queue Hygiene
+
+on:
+    schedule:
+        - cron: "*/15 * * * *"
+    workflow_dispatch:
+        inputs:
+            apply:
+                description: "Cancel selected queued runs (false = dry-run report only)"
+                required: true
+                default: true
+                type: boolean
+            status:
+                description: "Queued-run status scope"
+                required: true
+                default: queued
+                type: choice
+                options:
+                    - queued
+                    - in_progress
+                    - requested
+                    - waiting
+            max_cancel:
+                description: "Maximum runs to cancel in one execution"
+                required: true
+                default: "120"
+                type: string
+
+concurrency:
+    group: ci-queue-hygiene
+    cancel-in-progress: false
+
+permissions:
+    actions: write
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+jobs:
+    hygiene:
+        name: Queue Hygiene
+        runs-on: ubuntu-22.04
+        timeout-minutes: 15
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Run queue hygiene policy
+              id: hygiene
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+
+                  status_scope="queued"
+                  max_cancel="120"
+                  apply_mode="true"
+                  if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+                    status_scope="${{ github.event.inputs.status || 'queued' }}"
+                    max_cancel="${{ github.event.inputs.max_cancel || '120' }}"
+                    apply_mode="${{ github.event.inputs.apply || 'true' }}"
+                  fi
+
+                  cmd=(python3 scripts/ci/queue_hygiene.py
+                    --repo "${{ github.repository }}"
+                    --status "${status_scope}"
+                    --max-cancel "${max_cancel}"
+                    --dedupe-workflow "PR Intake Checks"
+                    --dedupe-workflow "PR Labeler"
+                    --dedupe-workflow "PR Auto Responder"
+                    --dedupe-workflow "Workflow Sanity"
+                    --dedupe-workflow "PR Label Policy Check"
+                    --output-json artifacts/queue-hygiene-report.json
+                    --verbose)
+
+                  if [ "${apply_mode}" = "true" ]; then
+                    cmd+=(--apply)
+                  fi
+
+                  "${cmd[@]}"
+
+                  {
+                    echo "status_scope=${status_scope}"
+                    echo "max_cancel=${max_cancel}"
+                    echo "apply_mode=${apply_mode}"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Publish queue hygiene summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ ! -f artifacts/queue-hygiene-report.json ]; then
+                    echo "Queue hygiene report not found." >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+
+                  python3 - <<'PY'
+                  from __future__ import annotations
+
+                  import json
+                  from pathlib import Path
+
+                  report_path = Path("artifacts/queue-hygiene-report.json")
+                  report = json.loads(report_path.read_text(encoding="utf-8"))
+                  counts = report.get("counts", {})
+                  results = report.get("results", {})
+                  reasons = report.get("reason_counts", {})
+
+                  lines = [
+                      "### Queue Hygiene Report",
+                      f"- Mode: `{report.get('mode', 'unknown')}`",
+                      f"- Status scope: `{report.get('status_scope', 'queued')}`",
+                      f"- Runs in scope: `{counts.get('runs_in_scope', 0)}`",
+                      f"- Candidate runs before cap: `{counts.get('candidate_runs_before_cap', 0)}`",
+                      f"- Candidate runs after cap: `{counts.get('candidate_runs_after_cap', 0)}`",
+                      f"- Skipped by cap: `{counts.get('skipped_by_cap', 0)}`",
+                      f"- Canceled: `{results.get('canceled', 0)}`",
+                      f"- Cancel skipped (already terminal/conflict): `{results.get('skipped', 0)}`",
+                      f"- Cancel failed: `{results.get('failed', 0)}`",
+                  ]
+                  if reasons:
+                      lines.append("")
+                      lines.append("Reason counts:")
+                      for reason, value in sorted(reasons.items()):
+                          lines.append(f"- `{reason}`: `{value}`")
+
+                  with Path("/tmp/queue-hygiene-summary.md").open("w", encoding="utf-8") as handle:
+                      handle.write("\n".join(lines) + "\n")
+                  PY
+
+                  cat /tmp/queue-hygiene-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload queue hygiene report
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: queue-hygiene-report
+                  path: artifacts/queue-hygiene-report.json
+                  if-no-files-found: ignore
+                  retention-days: 14

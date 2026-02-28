@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS_DIR = ROOT / "scripts" / "ci"
+ANDROID_SCRIPTS_DIR = ROOT / "scripts" / "android"
 
 
 def run_cmd(
@@ -91,6 +92,244 @@ class CiScriptsBehaviorTest(unittest.TestCase):
 
     def _script(self, name: str) -> str:
         return str(SCRIPTS_DIR / name)
+
+    def _android_script(self, name: str) -> str:
+        return str(ANDROID_SCRIPTS_DIR / name)
+
+    def test_android_selfcheck_help_mentions_modes(self) -> None:
+        proc = run_cmd(["bash", self._android_script("termux_source_build_check.sh"), "--help"])
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("--mode <auto|termux-native|ndk-cross>", proc.stdout)
+        self.assertIn("--diagnose-log <p>", proc.stdout)
+        self.assertIn("--json-output <p|-]", proc.stdout)
+        self.assertIn("--quiet", proc.stdout)
+        self.assertIn("--strict", proc.stdout)
+
+    def test_android_selfcheck_diagnose_log_ndk_cross(self) -> None:
+        log_path = self.tmp / "android-failure.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        self.assertIn("detected cc-rs compiler lookup failure", combined)
+        self.assertIn("export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", combined)
+        self.assertIn("export CC_aarch64_linux_android", combined)
+
+    def test_android_selfcheck_diagnose_log_termux_native(self) -> None:
+        log_path = self.tmp / "android-failure-termux.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "termux-native",
+                "--diagnose-log",
+                str(log_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        self.assertIn("suggested recovery (termux-native)", combined)
+        self.assertIn("unset CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", combined)
+
+    def test_android_selfcheck_json_output_on_diagnose_success(self) -> None:
+        log_path = self.tmp / "android-failure-json.log"
+        json_path = self.tmp / "android-selfcheck.json"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], "zeroclaw.android-selfcheck.v1")
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["error_code"], "NONE")
+        self.assertFalse(report["strict_mode"])
+        self.assertEqual(report["target"], "aarch64-linux-android")
+        self.assertEqual(report["mode_effective"], "ndk-cross")
+        self.assertTrue(any("cc-rs compiler lookup failure" in x for x in report["detections"]))
+        self.assertIn("CC_RS_TOOL_NOT_FOUND", report["detection_codes"])
+        self.assertTrue(any("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" in x for x in report["suggestions"]))
+
+    def test_android_selfcheck_json_output_on_missing_diagnose_log(self) -> None:
+        missing_log = self.tmp / "missing.log"
+        json_path = self.tmp / "android-selfcheck-error.json"
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(missing_log),
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["error_code"], "MISSING_DIAGNOSE_LOG")
+        self.assertIn("does not exist", report["error_message"])
+
+    def test_android_selfcheck_json_stdout_mode(self) -> None:
+        log_path = self.tmp / "android-failure-stdout.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                "-",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["mode_effective"], "ndk-cross")
+
+    def test_android_selfcheck_strict_fails_when_warnings_present(self) -> None:
+        log_path = self.tmp / "android-failure-strict.log"
+        json_path = self.tmp / "android-selfcheck-strict-error.json"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+                "--strict",
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error_code"], "STRICT_WARNINGS")
+        self.assertTrue(report["strict_mode"])
+        self.assertGreater(report["warning_count"], 0)
+
+    def test_android_selfcheck_strict_passes_without_warnings(self) -> None:
+        log_path = self.tmp / "android-clean-strict.log"
+        json_path = self.tmp / "android-selfcheck-strict-ok.json"
+        log_path.write_text("build completed cleanly\n", encoding="utf-8")
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+                "--strict",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["error_code"], "NONE")
+        self.assertEqual(report["warning_count"], 0)
+        self.assertTrue(report["strict_mode"])
+
+    def test_android_selfcheck_bad_argument_reports_error_code(self) -> None:
+        json_path = self.tmp / "android-selfcheck-bad-arg.json"
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--mode",
+                "invalid-mode",
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error_code"], "BAD_ARGUMENT")
 
     def test_emit_audit_event_envelope(self) -> None:
         payload_path = self.tmp / "payload.json"
@@ -3053,7 +3292,6 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "Nightly Summary & Routing",
                         ],
                         "stable": [
-                            "Main Promotion Gate",
                             "CI Required Gate",
                             "Security Audit",
                             "Feature Matrix Summary",
@@ -3151,7 +3389,6 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "Nightly Summary & Routing",
                         ],
                         "stable": [
-                            "Main Promotion Gate",
                             "CI Required Gate",
                             "Security Audit",
                             "Feature Matrix Summary",
@@ -3246,7 +3483,6 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "Nightly Summary & Routing",
                         ],
                         "stable": [
-                            "Main Promotion Gate",
                             "CI Required Gate",
                             "Security Audit",
                             "Feature Matrix Summary",
@@ -3364,6 +3600,164 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("stage_order", joined)
         self.assertIn("required_checks.rc", joined)
         self.assertIn("required_checks.stable", joined)
+
+    def test_queue_hygiene_dry_run_selects_obsolete_and_superseded_runs(self) -> None:
+        runs_json = self.tmp / "runs.json"
+        output_json = self.tmp / "queue-hygiene.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 11,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-11",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 12,
+                            "name": "CI Build (Fast)",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-12",
+                            "created_at": "2026-02-27T20:01:00Z",
+                            "pull_requests": [{"number": 1001}],
+                        },
+                        {
+                            "id": 21,
+                            "name": "CI Run",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-21",
+                            "created_at": "2026-02-27T20:02:00Z",
+                            "pull_requests": [{"number": 1001}],
+                        },
+                        {
+                            "id": 22,
+                            "name": "CI Run",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-22",
+                            "created_at": "2026-02-27T20:03:00Z",
+                            "pull_requests": [{"number": 1001}],
+                        },
+                        {
+                            "id": 23,
+                            "name": "CI Run",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-23",
+                            "created_at": "2026-02-27T20:04:00Z",
+                            "pull_requests": [{"number": 1002}],
+                        },
+                        {
+                            "id": 24,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-24",
+                            "created_at": "2026-02-27T20:05:00Z",
+                        },
+                        {
+                            "id": 25,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-25",
+                            "created_at": "2026-02-27T20:06:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--obsolete-workflow",
+                "CI Build (Fast)",
+                "--dedupe-workflow",
+                "CI Run",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["counts"]["runs_in_scope"], 7)
+        self.assertEqual(report["counts"]["candidate_runs_before_cap"], 3)
+        planned_ids = [item["id"] for item in report["planned_actions"]]
+        self.assertEqual(planned_ids, [11, 12, 21])
+        reasons_by_id = {item["id"]: item["reasons"] for item in report["planned_actions"]}
+        self.assertIn("obsolete-workflow", reasons_by_id[11])
+        self.assertIn("obsolete-workflow", reasons_by_id[12])
+        self.assertTrue(any(reason.startswith("dedupe-superseded-by:22") for reason in reasons_by_id[21]))
+
+    def test_queue_hygiene_respects_max_cancel_cap(self) -> None:
+        runs_json = self.tmp / "runs-cap.json"
+        output_json = self.tmp / "queue-hygiene-cap.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 101,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 102,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                        {
+                            "id": 103,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "created_at": "2026-02-27T20:02:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--obsolete-workflow",
+                "CI Build (Fast)",
+                "--max-cancel",
+                "2",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["counts"]["candidate_runs_before_cap"], 3)
+        self.assertEqual(report["counts"]["candidate_runs_after_cap"], 2)
+        self.assertEqual(report["counts"]["skipped_by_cap"], 1)
+        planned_ids = [item["id"] for item in report["planned_actions"]]
+        self.assertEqual(planned_ids, [101, 102])
 
 
 if __name__ == "__main__":  # pragma: no cover

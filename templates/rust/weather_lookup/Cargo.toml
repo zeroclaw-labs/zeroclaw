@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "__SKILL_NAME__"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "__BIN_NAME__"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

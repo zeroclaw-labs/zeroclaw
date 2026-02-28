@@ -1,0 +1,15 @@
+{
+  "name": "__SKILL_NAME__",
+  "version": "1",
+  "description": "Greet a user by name",
+  "parameters": {
+    "type": "object",
+    "required": ["name"],
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Name to greet"
+      }
+    }
+  }
+}
