@@ -8437,9 +8437,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
         });
 
@@ -8514,9 +8512,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
         });
 
