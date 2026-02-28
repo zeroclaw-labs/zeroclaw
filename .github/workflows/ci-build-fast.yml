@@ -29,7 +29,6 @@ jobs:
         outputs:
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
             docs_only: ${{ steps.scope.outputs.docs_only }}
-            workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
