@@ -2040,6 +2040,7 @@ async fn handle_linq_webhook(
 }
 
 /// POST /github — incoming GitHub webhook (issue/PR comments)
+#[allow(clippy::large_futures)]
 async fn handle_github_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2173,7 +2174,7 @@ async fn handle_github_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
