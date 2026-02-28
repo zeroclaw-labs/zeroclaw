@@ -203,7 +203,7 @@ struct LarkMessage {
     chat_type: String,
     message_type: String,
     #[serde(default)]
-    content: String,
+    content: serde_json::Value,
     #[serde(default)]
     mentions: Vec<serde_json::Value>,
 }
@@ -244,6 +244,37 @@ fn should_refresh_lark_tenant_token(status: reqwest::StatusCode, body: &serde_js
     status == reqwest::StatusCode::UNAUTHORIZED || is_lark_invalid_access_token(body)
 }
 
+fn normalize_message_content(content: &serde_json::Value) -> Option<serde_json::Value> {
+    match content {
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed).ok()
+        }
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => Some(content.clone()),
+        _ => None,
+    }
+}
+
+fn extract_text_message_content(content: &serde_json::Value) -> Option<String> {
+    let normalized = normalize_message_content(content)?;
+    match normalized {
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(|text| text.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned),
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
+}
+
 fn parse_image_key(content: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(content)
         .ok()
@@ -253,6 +284,20 @@ fn parse_image_key(content: &str) -> Option<String> {
                 .and_then(|key| key.as_str())
                 .map(str::to_string)
         })
+}
+
+fn parse_image_key_value(content: &serde_json::Value) -> Option<String> {
+    let normalized = normalize_message_content(content)?;
+    match normalized {
+        serde_json::Value::Object(map) => map
+            .get("image_key")
+            .and_then(|key| key.as_str())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(ToOwned::to_owned),
+        serde_json::Value::String(raw) => parse_image_key(&raw),
+        _ => None,
+    }
 }
 
 fn extract_lark_token_ttl_seconds(body: &serde_json::Value) -> u64 {
@@ -850,22 +895,16 @@ impl LarkChannel {
 
                     // Decode content by type (mirrors clawdbot-feishu parsing)
                     let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
-                        "text" => {
-                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
-                            match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
-                                Some(t) => (t.to_string(), Vec::new()),
-                                None => continue,
-                            }
-                        }
-                        "post" => match parse_post_content_details(&lark_msg.content) {
+                        "text" => match extract_text_message_content(&lark_msg.content) {
+                            Some(text) => (text, Vec::new()),
+                            None => continue,
+                        },
+                        "post" => match parse_post_content_details_value(&lark_msg.content) {
                             Some(details) => (details.text, details.mentioned_open_ids),
                             None => continue,
                         },
                         "image" => {
-                            let text = if let Some(image_key) = parse_image_key(&lark_msg.content) {
+                            let text = if let Some(image_key) = parse_image_key_value(&lark_msg.content) {
                                 match self.fetch_image_marker(&image_key).await {
                                     Ok(marker) => marker,
                                     Err(error) => {
@@ -1164,27 +1203,17 @@ impl LarkChannel {
             .cloned()
             .unwrap_or_default();
 
-        let content_str = event
+        let content = event
             .pointer("/message/content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
-            "text" => {
-                let extracted = serde_json::from_str::<serde_json::Value>(content_str)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("text")
-                            .and_then(|t| t.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    });
-                match extracted {
-                    Some(t) => (t, Vec::new()),
-                    None => return messages,
-                }
-            }
-            "post" => match parse_post_content_details(content_str) {
+            "text" => match extract_text_message_content(&content) {
+                Some(text) => (text, Vec::new()),
+                None => return messages,
+            },
+            "post" => match parse_post_content_details_value(&content) {
                 Some(details) => (details.text, details.mentioned_open_ids),
                 None => return messages,
             },
@@ -1287,32 +1316,22 @@ impl LarkChannel {
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default();
-        let content_str = event
+        let content = event
             .pointer("/message/content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
-            "text" => {
-                let extracted = serde_json::from_str::<serde_json::Value>(content_str)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("text")
-                            .and_then(|t| t.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    });
-                match extracted {
-                    Some(t) => (t, Vec::new()),
-                    None => return messages,
-                }
-            }
-            "post" => match parse_post_content_details(content_str) {
+            "text" => match extract_text_message_content(&content) {
+                Some(text) => (text, Vec::new()),
+                None => return messages,
+            },
+            "post" => match parse_post_content_details_value(&content) {
                 Some(details) => (details.text, details.mentioned_open_ids),
                 None => return messages,
             },
             "image" => {
-                let text = if let Some(image_key) = parse_image_key(content_str) {
+                let text = if let Some(image_key) = parse_image_key_value(&content) {
                     match self.fetch_image_marker(&image_key).await {
                         Ok(marker) => marker,
                         Err(error) => {
@@ -1711,14 +1730,17 @@ fn detect_lark_ack_locale(
 
         let message_content = payload
             .pointer("/message/content")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/message/content")
-                    .and_then(serde_json::Value::as_str)
-            });
+            .or_else(|| payload.pointer("/event/message/content"));
+        let message_content_str = message_content.and_then(|value| match value {
+            serde_json::Value::String(raw) => Some(raw.clone()),
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => Some(value.to_string()),
+            _ => None,
+        });
 
-        if let Some(locale) = message_content.and_then(detect_locale_from_post_content) {
+        if let Some(locale) = message_content_str
+            .as_deref()
+            .and_then(detect_locale_from_post_content)
+        {
             return locale;
         }
     }
@@ -1819,6 +1841,17 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
             text: result,
             mentioned_open_ids,
         })
+    }
+}
+
+fn parse_post_content_details_value(content: &serde_json::Value) -> Option<ParsedPostContent> {
+    let normalized = normalize_message_content(content)?;
+    match normalized {
+        serde_json::Value::String(raw) => parse_post_content_details(&raw),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            parse_post_content_details(&normalized.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -2156,6 +2189,59 @@ mod tests {
         assert_eq!(msgs[0].sender, "oc_chat123");
         assert_eq!(msgs[0].channel, "lark");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+    }
+
+    #[test]
+    fn lark_parse_valid_text_message_with_object_content() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_testuser123"
+                    }
+                },
+                "message": {
+                    "message_type": "text",
+                    "content": { "text": "Hello from object content" },
+                    "chat_id": "oc_chat123",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello from object content");
+        assert_eq!(msgs[0].sender, "oc_chat123");
+        assert_eq!(msgs[0].channel, "lark");
+    }
+
+    #[test]
+    fn lark_ws_payload_deserializes_object_content() {
+        let payload = serde_json::json!({
+            "sender": {
+                "sender_id": { "open_id": "ou_testuser123" },
+                "sender_type": "user"
+            },
+            "message": {
+                "message_id": "om_123",
+                "chat_id": "oc_chat123",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": { "text": "Hello websocket" },
+                "mentions": []
+            }
+        });
+
+        let parsed: MsgReceivePayload = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            extract_text_message_content(&parsed.message.content).as_deref(),
+            Some("Hello websocket")
+        );
     }
 
     #[test]

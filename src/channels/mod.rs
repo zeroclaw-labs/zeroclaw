@@ -130,6 +130,36 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
+fn live_channels_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) {
+    let mut guard = live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.clear();
+    for (name, channel) in channels_by_name {
+        guard.insert(name.to_ascii_lowercase(), Arc::clone(channel));
+    }
+}
+
+fn clear_live_channels() {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&name.to_ascii_lowercase())
+        .cloned()
+}
+
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
@@ -1079,6 +1109,11 @@ async fn load_runtime_defaults_from_config_file(
     if let Some(zeroclaw_dir) = path.parent() {
         let store = crate::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
+        decrypt_optional_secret_for_runtime_reload(
+            &store,
+            &mut parsed.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
     }
 
     parsed.apply_env_overrides();
@@ -3815,6 +3850,7 @@ fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     max_chars_per_file: usize,
+    identity_config: Option<&crate::config::IdentityConfig>,
 ) {
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
@@ -3837,6 +3873,44 @@ fn load_openclaw_bootstrap_files(
     if memory_path.exists() {
         inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
     }
+
+    let extra_files = identity_config.map_or(&[][..], |cfg| cfg.extra_files.as_slice());
+    for file in extra_files {
+        match normalize_openclaw_identity_extra_file(file) {
+            Some(safe_relative) => {
+                inject_workspace_file(prompt, workspace_dir, safe_relative, max_chars_per_file);
+            }
+            None => {
+                tracing::warn!(
+                    file = file.as_str(),
+                    "Ignoring unsafe identity.extra_files entry; expected workspace-relative path without traversal"
+                );
+            }
+        }
+    }
+}
+
+fn normalize_openclaw_identity_extra_file(raw: &str) -> Option<&str> {
+    use std::path::{Component, Path};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return None;
+    }
+
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(trimmed)
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -3982,7 +4056,12 @@ pub fn build_system_prompt_with_mode(
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    load_openclaw_bootstrap_files(
+                        &mut prompt,
+                        workspace_dir,
+                        max_chars,
+                        identity_config,
+                    );
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -3990,18 +4069,23 @@ pub fn build_system_prompt_with_mode(
                         "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    load_openclaw_bootstrap_files(
+                        &mut prompt,
+                        workspace_dir,
+                        max_chars,
+                        identity_config,
+                    );
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, identity_config);
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, identity_config);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -4358,6 +4442,7 @@ fn collect_configured_channels(
             channel: Arc::new(
                 SlackChannel::new(
                     sl.bot_token.clone(),
+                    sl.app_token.clone(),
                     sl.channel_id.clone(),
                     sl.allowed_users.clone(),
                 )
@@ -4713,6 +4798,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    // Ensure stale channel handles are never reused across restarts.
+    clear_live_channels();
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -5038,6 +5126,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    register_live_channels(channels_by_name.as_ref());
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -5111,6 +5200,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     for h in handles {
         let _ = h.await;
     }
+
+    clear_live_channels();
 
     Ok(())
 }
@@ -9964,6 +10055,7 @@ BTC is currently around $65,000 based on latest tool output."#;
         // Create identity config pointing to the file
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("aieos_identity.json".into()),
             aieos_inline: None,
         };
@@ -9998,6 +10090,7 @@ BTC is currently around $65,000 based on latest tool output."#;
 
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
         };
@@ -10021,6 +10114,7 @@ BTC is currently around $65,000 based on latest tool output."#;
 
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("nonexistent.json".into()),
             aieos_inline: None,
         };
@@ -10040,6 +10134,7 @@ BTC is currently around $65,000 based on latest tool output."#;
         // Format is "aieos" but neither path nor inline is set
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         };
@@ -10058,6 +10153,7 @@ BTC is currently around $65,000 based on latest tool output."#;
 
         let config = IdentityConfig {
             format: "openclaw".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };
@@ -10069,6 +10165,63 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(prompt.contains("### SOUL.md"));
         assert!(prompt.contains("Be helpful"));
         assert!(!prompt.contains("## Identity"));
+    }
+
+    #[test]
+    fn openclaw_extra_files_are_injected() {
+        use crate::config::IdentityConfig;
+
+        let ws = make_workspace();
+        std::fs::write(
+            ws.path().join("FRAMEWORK.md"),
+            "# Framework\nSession-level context.",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.path().join("memory")).unwrap();
+        std::fs::write(
+            ws.path().join("memory").join("notes.md"),
+            "# Notes\nSupplemental context.",
+        )
+        .unwrap();
+
+        let config = IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: vec!["FRAMEWORK.md".into(), "memory/notes.md".into()],
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
+
+        assert!(prompt.contains("### FRAMEWORK.md"));
+        assert!(prompt.contains("Session-level context."));
+        assert!(prompt.contains("### memory/notes.md"));
+        assert!(prompt.contains("Supplemental context."));
+    }
+
+    #[test]
+    fn openclaw_extra_files_reject_unsafe_paths() {
+        use crate::config::IdentityConfig;
+
+        let ws = make_workspace();
+        std::fs::write(ws.path().join("SAFE.md"), "safe").unwrap();
+
+        let config = IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: vec![
+                "SAFE.md".into(),
+                "../outside.md".into(),
+                "/tmp/absolute.md".into(),
+            ],
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
+
+        assert!(prompt.contains("### SAFE.md"));
+        assert!(!prompt.contains("outside.md"));
+        assert!(!prompt.contains("absolute.md"));
     }
 
     #[test]

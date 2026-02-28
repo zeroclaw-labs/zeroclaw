@@ -3365,6 +3365,164 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("required_checks.rc", joined)
         self.assertIn("required_checks.stable", joined)
 
+    def test_queue_hygiene_dry_run_selects_obsolete_and_superseded_runs(self) -> None:
+        runs_json = self.tmp / "runs.json"
+        output_json = self.tmp / "queue-hygiene.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 11,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-11",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 12,
+                            "name": "CI Build (Fast)",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-12",
+                            "created_at": "2026-02-27T20:01:00Z",
+                            "pull_requests": [{"number": 1001}],
+                        },
+                        {
+                            "id": 21,
+                            "name": "CI Run",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-21",
+                            "created_at": "2026-02-27T20:02:00Z",
+                            "pull_requests": [{"number": 1001}],
+                        },
+                        {
+                            "id": 22,
+                            "name": "CI Run",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-22",
+                            "created_at": "2026-02-27T20:03:00Z",
+                            "pull_requests": [{"number": 1001}],
+                        },
+                        {
+                            "id": 23,
+                            "name": "CI Run",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-23",
+                            "created_at": "2026-02-27T20:04:00Z",
+                            "pull_requests": [{"number": 1002}],
+                        },
+                        {
+                            "id": 24,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-24",
+                            "created_at": "2026-02-27T20:05:00Z",
+                        },
+                        {
+                            "id": 25,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-25",
+                            "created_at": "2026-02-27T20:06:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--obsolete-workflow",
+                "CI Build (Fast)",
+                "--dedupe-workflow",
+                "CI Run",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["counts"]["runs_in_scope"], 7)
+        self.assertEqual(report["counts"]["candidate_runs_before_cap"], 3)
+        planned_ids = [item["id"] for item in report["planned_actions"]]
+        self.assertEqual(planned_ids, [11, 12, 21])
+        reasons_by_id = {item["id"]: item["reasons"] for item in report["planned_actions"]}
+        self.assertIn("obsolete-workflow", reasons_by_id[11])
+        self.assertIn("obsolete-workflow", reasons_by_id[12])
+        self.assertTrue(any(reason.startswith("dedupe-superseded-by:22") for reason in reasons_by_id[21]))
+
+    def test_queue_hygiene_respects_max_cancel_cap(self) -> None:
+        runs_json = self.tmp / "runs-cap.json"
+        output_json = self.tmp / "queue-hygiene-cap.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 101,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 102,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                        {
+                            "id": 103,
+                            "name": "CI Build (Fast)",
+                            "event": "push",
+                            "head_branch": "main",
+                            "created_at": "2026-02-27T20:02:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--obsolete-workflow",
+                "CI Build (Fast)",
+                "--max-cancel",
+                "2",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["counts"]["candidate_runs_before_cap"], 3)
+        self.assertEqual(report["counts"]["candidate_runs_after_cap"], 2)
+        self.assertEqual(report["counts"]["skipped_by_cap"], 1)
+        planned_ids = [item["id"] for item in report["planned_actions"]]
+        self.assertEqual(planned_ids, [101, 102])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

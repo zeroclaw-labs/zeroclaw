@@ -12,6 +12,7 @@ site/node_modules/
 site/.vite/
 site/public/docs-content/
 gh-pages/
+.idea
 
 # Environment files (may contain secrets)
 .env

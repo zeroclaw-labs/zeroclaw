@@ -1316,6 +1316,7 @@ mod tests {
     fn is_aieos_configured_true_with_path() {
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };
@@ -1326,6 +1327,7 @@ mod tests {
     fn is_aieos_configured_true_with_inline() {
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: Some("{\"identity\":{}}".into()),
         };
@@ -1336,6 +1338,7 @@ mod tests {
     fn is_aieos_configured_false_openclaw_format() {
         let config = IdentityConfig {
             format: "openclaw".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };
@@ -1346,6 +1349,7 @@ mod tests {
     fn is_aieos_configured_false_no_config() {
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         };
@@ -1520,6 +1524,7 @@ mod tests {
 
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };

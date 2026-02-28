@@ -1,13 +1,16 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderMap;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
     bot_token: String,
+    app_token: Option<String>,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
     mention_only: bool,
@@ -20,9 +23,15 @@ const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
 const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
 
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bot_token: String,
+        app_token: Option<String>,
+        channel_id: Option<String>,
+        allowed_users: Vec<String>,
+    ) -> Self {
         Self {
             bot_token,
+            app_token,
             channel_id,
             allowed_users,
             mention_only: false,
@@ -100,6 +109,14 @@ impl SlackChannel {
 
     fn configured_channel_id(&self) -> Option<String> {
         Self::normalized_channel_id(self.channel_id.as_deref())
+    }
+
+    fn configured_app_token(&self) -> Option<String> {
+        self.app_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
     }
 
     fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
@@ -265,6 +282,222 @@ impl SlackChannel {
             .entry(channel_id.to_string())
             .or_insert_with(|| now_ts.to_string())
             .clone()
+    }
+
+    async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
+        let app_token = self
+            .configured_app_token()
+            .ok_or_else(|| anyhow::anyhow!("Slack Socket Mode requires app_token"))?;
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/apps.connections.open")
+            .bearer_auth(app_token)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            anyhow::bail!("Slack apps.connections.open failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack apps.connections.open failed: {err}");
+        }
+
+        parsed
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open did not return url"))
+    }
+
+    async fn listen_socket_mode(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        bot_user_id: &str,
+        scoped_channel: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+
+        loop {
+            let ws_url = match self.open_socket_mode_url().await {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::warn!("Slack Socket Mode: failed to open websocket URL: {e}");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+
+            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+                Ok(connection) => connection,
+                Err(e) => {
+                    tracing::warn!("Slack Socket Mode: websocket connect failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+            tracing::info!("Slack Socket Mode: websocket connected");
+
+            let (mut write, mut read) = ws_stream.split();
+
+            while let Some(frame) = read.next().await {
+                let text = match frame {
+                    Ok(WsMessage::Text(text)) => text,
+                    Ok(WsMessage::Ping(payload)) => {
+                        if let Err(e) = write.send(WsMessage::Pong(payload)).await {
+                            tracing::warn!("Slack Socket Mode: pong send failed: {e}");
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(WsMessage::Close(_)) => {
+                        tracing::warn!("Slack Socket Mode: websocket closed by server");
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::warn!("Slack Socket Mode: websocket read failed: {e}");
+                        break;
+                    }
+                };
+
+                let envelope: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::warn!("Slack Socket Mode: invalid JSON payload: {e}");
+                        continue;
+                    }
+                };
+
+                if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
+                    let ack = serde_json::json!({ "envelope_id": envelope_id });
+                    if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
+                        tracing::warn!("Slack Socket Mode: ack send failed: {e}");
+                        break;
+                    }
+                }
+
+                let envelope_type = envelope
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if envelope_type == "disconnect" {
+                    tracing::warn!("Slack Socket Mode: received disconnect event");
+                    break;
+                }
+                if envelope_type != "events_api" {
+                    continue;
+                }
+
+                let Some(event) = envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("event"))
+                else {
+                    continue;
+                };
+                if event.get("type").and_then(|v| v.as_str()) != Some("message") {
+                    continue;
+                }
+                // Skip non-user message subtypes (e.g. channel_join/message_changed)
+                // to avoid invalid thread replies.
+                if event.get("subtype").is_some() {
+                    continue;
+                }
+
+                let channel_id = event
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                if channel_id.is_empty() {
+                    continue;
+                }
+                if let Some(ref configured_channel) = scoped_channel {
+                    if channel_id != *configured_channel {
+                        continue;
+                    }
+                }
+
+                let user = event
+                    .get("user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if user.is_empty() || user == bot_user_id {
+                    continue;
+                }
+                if !self.is_user_allowed(user) {
+                    tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                    continue;
+                }
+
+                let text = event
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+
+                let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or_default();
+                if ts.is_empty() {
+                    continue;
+                }
+                let last_ts = last_ts_by_channel
+                    .get(&channel_id)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if ts <= last_ts {
+                    continue;
+                }
+
+                let is_group_message = Self::is_group_channel_id(&channel_id);
+                let allow_sender_without_mention =
+                    is_group_message && self.is_group_sender_trigger_enabled(user);
+                let require_mention =
+                    self.mention_only && is_group_message && !allow_sender_without_mention;
+
+                let Some(normalized_text) =
+                    Self::normalize_incoming_content(text, require_mention, bot_user_id)
+                else {
+                    continue;
+                };
+
+                last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+
+                let channel_msg = ChannelMessage {
+                    id: format!("slack_{channel_id}_{ts}"),
+                    sender: user.to_string(),
+                    reply_target: channel_id.clone(),
+                    content: normalized_text,
+                    channel: "slack".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts: Self::inbound_thread_ts(event, ts),
+                };
+
+                if tx.send(channel_msg).await.is_err() {
+                    return Ok(());
+                }
+            }
+
+            tracing::warn!("Slack Socket Mode: reconnecting in 3 seconds...");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
     }
 
     fn parse_retry_after_secs(headers: &HeaderMap) -> Option<u64> {
@@ -463,6 +696,13 @@ impl Channel for SlackChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
         let scoped_channel = self.configured_channel_id();
+        if self.configured_app_token().is_some() {
+            tracing::info!("Slack channel listening in Socket Mode");
+            return self
+                .listen_socket_mode(tx, &bot_user_id, scoped_channel)
+                .await;
+        }
+
         let mut discovered_channels: Vec<String> = Vec::new();
         let mut last_discovery = Instant::now();
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
@@ -534,6 +774,11 @@ impl Channel for SlackChannel {
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                     // Messages come newest-first, reverse to process oldest first
                     for msg in messages.iter().rev() {
+                        // Skip non-user message subtypes (e.g. channel_join/message_changed)
+                        // to avoid invalid thread replies.
+                        if msg.get("subtype").is_some() {
+                            continue;
+                        }
                         let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
                         let user = msg
                             .get("user")
@@ -615,26 +860,26 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![]);
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_channel_with_channel_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, Some("C12345".into()), vec![]);
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
     }
 
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()]);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
     }
 
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()])
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()])
             .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
 
         assert!(ch.mention_only);
@@ -657,6 +902,18 @@ mod tests {
             SlackChannel::normalized_channel_id(Some(" C12345 ")),
             Some("C12345".to_string())
         );
+    }
+
+    #[test]
+    fn configured_app_token_ignores_blank_values() {
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("   ".into()), None, vec![]);
+        assert_eq!(ch.configured_app_token(), None);
+    }
+
+    #[test]
+    fn configured_app_token_trims_value() {
+        let ch = SlackChannel::new("xoxb-fake".into(), Some(" xapp-123 ".into()), None, vec![]);
+        assert_eq!(ch.configured_app_token().as_deref(), Some("xapp-123"));
     }
 
     #[test]
@@ -684,14 +941,14 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![]);
         assert!(!ch.is_user_allowed("U12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
     }
 
@@ -714,7 +971,12 @@ mod tests {
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "U222".into()]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            None,
+            vec!["U111".into(), "U222".into()],
+        );
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("U222"));
         assert!(!ch.is_user_allowed("U333"));
@@ -722,27 +984,32 @@ mod tests {
 
     #[test]
     fn allowlist_exact_match_not_substring() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
         assert!(!ch.is_user_allowed("U1111"));
         assert!(!ch.is_user_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(!ch.is_user_allowed("u111"));
     }
 
     #[test]
     fn allowlist_wildcard_and_specific() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            None,
+            vec!["U111".into(), "*".into()],
+        );
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("anyone"));
     }

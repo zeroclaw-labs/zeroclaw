@@ -1,5 +1,6 @@
 use crate::providers::ToolCall;
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone)]
@@ -368,15 +369,15 @@ pub(super) fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCa
     let mut calls = Vec::new();
     let trimmed = xml_content.trim();
 
-    if !trimmed.starts_with('<') || !trimmed.contains('>') {
+    if !trimmed.contains('<') || !trimmed.contains('>') {
         return None;
     }
 
     for (tool_name_str, inner_content) in extract_xml_pairs(trimmed) {
-        let tool_name = tool_name_str.to_string();
-        if is_xml_meta_tag(&tool_name) {
+        if is_xml_meta_tag(tool_name_str) {
             continue;
         }
+        let tool_name = map_tool_name_alias(tool_name_str).to_string();
 
         if inner_content.is_empty() {
             continue;
@@ -412,9 +413,15 @@ pub(super) fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCa
             }
         }
 
+        let arguments = normalize_tool_arguments(
+            &tool_name,
+            serde_json::Value::Object(args),
+            Some(inner_content),
+        );
+
         calls.push(ParsedToolCall {
             name: tool_name,
-            arguments: serde_json::Value::Object(args),
+            arguments,
             tool_call_id: None,
         });
     }
@@ -884,6 +891,38 @@ pub(super) fn map_tool_name_alias(tool_name: &str) -> &str {
         "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
         _ => tool_name,
     }
+}
+
+fn is_probable_direct_xml_tool_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() || is_xml_meta_tag(&normalized) {
+        return false;
+    }
+
+    if map_tool_name_alias(&normalized) != normalized {
+        return true;
+    }
+
+    normalized.contains('_')
+        || matches!(
+            normalized.as_str(),
+            "shell"
+                | "http"
+                | "curl"
+                | "wget"
+                | "fetch"
+                | "browser"
+                | "message"
+                | "notify"
+                | "recall"
+                | "store"
+                | "forget"
+                | "search"
+                | "read"
+                | "write"
+                | "edit"
+                | "list"
+        )
 }
 
 pub(super) fn build_curl_command(url: &str) -> Option<String> {
@@ -1422,6 +1461,47 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
         }
     }
 
+    // Direct XML tool tags (without <tool_call> wrapper), e.g.:
+    // <shell>pwd</shell>
+    // <file_write><path>...</path><content>...</content></file_write>
+    if calls.is_empty() {
+        if let Some(xml_calls) = parse_xml_tool_calls(remaining) {
+            let direct_calls: Vec<ParsedToolCall> = xml_calls
+                .into_iter()
+                .filter(|call| is_probable_direct_xml_tool_name(&call.name))
+                .collect();
+            if !direct_calls.is_empty() {
+                let mut cleaned_text = remaining.to_string();
+                let parsed_names: HashSet<&str> =
+                    direct_calls.iter().map(|call| call.name.as_str()).collect();
+
+                for (tag_name, _) in extract_xml_pairs(remaining) {
+                    let canonical_tag = map_tool_name_alias(tag_name);
+                    if !parsed_names.contains(tag_name) && !parsed_names.contains(canonical_tag) {
+                        continue;
+                    }
+
+                    let open = format!("<{tag_name}>");
+                    let close = format!("</{tag_name}>");
+                    while let Some(start) = cleaned_text.find(&open) {
+                        let search_from = start + open.len();
+                        let Some(end_rel) = cleaned_text[search_from..].find(&close) else {
+                            break;
+                        };
+                        let end = search_from + end_rel + close.len();
+                        cleaned_text.replace_range(start..end, "");
+                    }
+                }
+
+                calls.extend(direct_calls);
+                if !cleaned_text.trim().is_empty() {
+                    text_parts.push(cleaned_text.trim().to_string());
+                }
+                remaining = "";
+            }
+        }
+    }
+
     // XML attribute-style tool calls:
     // <minimax:toolcall>
     // <invoke name="shell">
@@ -1571,6 +1651,10 @@ pub(super) fn detect_tool_call_parse_issue(
     let looks_like_tool_payload = trimmed.contains("<tool_call")
         || trimmed.contains("<toolcall")
         || trimmed.contains("<tool-call")
+        || trimmed.contains("<shell>")
+        || trimmed.contains("<file_write>")
+        || trimmed.contains("<file_read>")
+        || trimmed.contains("<memory_recall>")
         || trimmed.contains("```tool_call")
         || trimmed.contains("```toolcall")
         || trimmed.contains("```tool-call")

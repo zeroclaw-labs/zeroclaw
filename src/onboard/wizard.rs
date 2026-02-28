@@ -3667,6 +3667,7 @@ fn setup_identity_backend() -> Result<IdentityConfig> {
         );
         IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some(default_path),
             aieos_inline: None,
         }
@@ -3678,6 +3679,7 @@ fn setup_identity_backend() -> Result<IdentityConfig> {
         );
         IdentityConfig {
             format: "openclaw".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         }
@@ -6600,6 +6602,7 @@ mod tests {
         };
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.aieos.json".into()),
             aieos_inline: None,
         };
@@ -6629,6 +6632,7 @@ mod tests {
         let ctx = ProjectContext::default();
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.aieos.json".into()),
             aieos_inline: None,
         };
