@@ -4370,6 +4370,7 @@ fn collect_configured_channels(
             tg.bot_token.clone(),
             tg.allowed_users.clone(),
             tg.effective_group_reply_mode().requires_mention(),
+            tg.ack_enabled,
         )
         .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)

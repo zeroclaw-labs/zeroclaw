@@ -201,6 +201,7 @@ stream_mode = "off"               # optional: off | partial
 draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
 mention_only = false              # legacy fallback; used when group_reply.mode is not set
 interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
+ack_enabled = true                # optional: send emoji reaction acknowledgments (default: true)
 
 [channels_config.telegram.group_reply]
 mode = "all_messages"             # optional: all_messages | mention_only
@@ -211,6 +212,7 @@ Telegram notes:
 
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
+- `ack_enabled = false` disables the emoji reaction (⚡️, 👌, 👀, 🔥, 👍) sent to incoming messages as acknowledgment.
 
 ### 4.2 Discord
 

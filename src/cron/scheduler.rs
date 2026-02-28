@@ -331,6 +331,7 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
+                tg.ack_enabled,
             )
             .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;

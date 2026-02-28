@@ -465,10 +465,17 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// Whether to send emoji reaction acknowledgments to incoming messages.
+    ack_enabled: bool,
 }
 
 impl TelegramChannel {
-    pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
+    pub fn new(
+        bot_token: String,
+        allowed_users: Vec<String>,
+        mention_only: bool,
+        ack_enabled: bool,
+    ) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
             let guard = PairingGuard::new(true, &[]);
@@ -497,6 +504,7 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            ack_enabled,
         }
     }
 
@@ -536,6 +544,12 @@ impl TelegramChannel {
         if config.enabled {
             self.transcription = Some(config);
         }
+        self
+    }
+
+    /// Enable or disable emoji reaction acknowledgments to incoming messages.
+    pub fn with_ack_enabled(mut self, enabled: bool) -> Self {
+        self.ack_enabled = enabled;
         self
     }
 
@@ -673,6 +687,10 @@ impl TelegramChannel {
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
+        if !self.ack_enabled {
+            return;
+        }
+
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
         let emoji = random_telegram_ack_reaction().to_string();
@@ -3425,7 +3443,7 @@ mod tests {
 
     #[test]
     fn telegram_channel_name() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         assert_eq!(ch.name(), "telegram");
     }
 
@@ -3462,14 +3480,14 @@ mod tests {
 
     #[test]
     fn typing_handle_starts_as_none() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
     }
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
         // Manually insert a dummy handle
         {
@@ -3488,7 +3506,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_typing_replaces_previous_handle() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
         // Insert a dummy handle first
         {
@@ -3507,10 +3525,10 @@ mod tests {
 
     #[test]
     fn supports_draft_updates_respects_stream_mode() {
-        let off = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let off = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         assert!(!off.supports_draft_updates());
 
-        let partial = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+        let partial = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
             .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
@@ -3518,7 +3536,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_draft_returns_none_when_stream_mode_off() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let id = ch
             .send_draft(&SendMessage::new("draft", "123"))
             .await
@@ -3528,7 +3546,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_rate_limit_short_circuits_network() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
             .with_streaming(StreamMode::Partial, 60_000);
         ch.last_draft_edit
             .lock()
@@ -3540,7 +3558,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_utf8_truncation_is_safe_for_multibyte_text() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
             .with_streaming(StreamMode::Partial, 0);
         let long_emoji_text = "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 20);
 
@@ -3554,7 +3572,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_draft_invalid_message_id_falls_back_to_chunk_send() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
             .with_streaming(StreamMode::Partial, 0);
         let long_text = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 64);
 
@@ -4090,7 +4108,7 @@ mod tests {
     #[tokio::test]
     async fn telegram_send_document_bytes_builds_correct_form() {
         // This test verifies the method doesn't panic and handles bytes correctly
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let file_bytes = b"Hello, this is a test file content".to_vec();
 
         // The actual API call will fail (no real server), but we verify the method exists
@@ -4111,7 +4129,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_bytes_builds_correct_form() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         // Minimal valid PNG header bytes
         let file_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -4124,7 +4142,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_by_url_builds_correct_json() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
         let result = ch
             .send_document_by_url(
@@ -4140,7 +4158,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_by_url_builds_correct_json() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
         let result = ch
             .send_photo_by_url("123456", None, "https://example.com/image.jpg", None)
@@ -4153,7 +4171,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_nonexistent_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let path = Path::new("/nonexistent/path/to/file.txt");
 
         let result = ch.send_document("123456", None, path, None).await;
@@ -4169,7 +4187,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_nonexistent_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let path = Path::new("/nonexistent/path/to/photo.jpg");
 
         let result = ch.send_photo("123456", None, path, None).await;
@@ -4179,7 +4197,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_video_nonexistent_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let path = Path::new("/nonexistent/path/to/video.mp4");
 
         let result = ch.send_video("123456", None, path, None).await;
@@ -4189,7 +4207,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_audio_nonexistent_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let path = Path::new("/nonexistent/path/to/audio.mp3");
 
         let result = ch.send_audio("123456", None, path, None).await;
@@ -4199,7 +4217,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_voice_nonexistent_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let path = Path::new("/nonexistent/path/to/voice.ogg");
 
         let result = ch.send_voice("123456", None, path, None).await;
@@ -4287,7 +4305,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_bytes_with_caption() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let file_bytes = b"test content".to_vec();
 
         // With caption
@@ -4311,7 +4329,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_bytes_with_caption() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let file_bytes = vec![0x89, 0x50, 0x4E, 0x47];
 
         // With caption
@@ -4337,7 +4355,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_bytes_empty_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let file_bytes: Vec<u8> = vec![];
 
         let result = ch
@@ -4350,7 +4368,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_bytes_empty_filename() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let file_bytes = b"content".to_vec();
 
         let result = ch
@@ -4363,7 +4381,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_bytes_empty_chat_id() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         let file_bytes = b"content".to_vec();
 
         let result = ch
@@ -5475,7 +5493,7 @@ mod tests {
 
     #[test]
     fn with_workspace_dir_sets_field() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
             .with_workspace_dir(std::path::PathBuf::from("/tmp/test_workspace"));
         assert_eq!(
             ch.workspace_dir.as_deref(),

@@ -4251,6 +4251,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only: false,
                     group_reply: None,
                     base_url: None,
+                    ack_enabled: true,
                 });
             }
             ChannelMenuChoice::Discord => {

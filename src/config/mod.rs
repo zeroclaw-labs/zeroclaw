@@ -53,6 +53,7 @@ mod tests {
             mention_only: false,
             group_reply: None,
             base_url: None,
+            ack_enabled: true,
         };
 
         let discord = DiscordConfig {

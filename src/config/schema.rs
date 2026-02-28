@@ -3997,6 +3997,10 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+fn default_ack_enabled() -> bool {
+    true
+}
+
 /// Group-chat reply trigger mode for channels that support mention gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -4083,6 +4087,10 @@ pub struct TelegramConfig {
     /// Example for Bale messenger: "https://tapi.bale.ai"
     #[serde(default)]
     pub base_url: Option<String>,
+    /// When true, send emoji reaction acknowledgments (⚡️, 👌, 👀, 🔥, 👍) to incoming messages.
+    /// When false, no reaction is sent. Default is true.
+    #[serde(default = "default_ack_enabled")]
+    pub ack_enabled: bool,
 }
 
 impl ChannelConfig for TelegramConfig {
