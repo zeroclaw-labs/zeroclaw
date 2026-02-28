@@ -1,6 +1,8 @@
 use crate::config::{
-    AckReactionChatType, AckReactionConfig, AckReactionRuleConfig, AckReactionStrategy,
+    AckReactionChatType, AckReactionConfig, AckReactionRuleAction, AckReactionRuleConfig,
+    AckReactionStrategy,
 };
+use regex::RegexBuilder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckReactionContextChatType {
@@ -14,6 +16,21 @@ pub struct AckReactionContext<'a> {
     pub sender_id: Option<&'a str>,
     pub chat_type: AckReactionContextChatType,
     pub locale_hint: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckReactionSelectionSource {
+    Rule(usize),
+    ChannelPool,
+    DefaultPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckReactionSelection {
+    pub emoji: Option<String>,
+    pub matched_rule_index: Option<usize>,
+    pub suppressed: bool,
+    pub source: Option<AckReactionSelectionSource>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -100,6 +117,24 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
     text.contains(&keyword.to_ascii_lowercase())
 }
 
+fn regex_is_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+
+    match RegexBuilder::new(pattern).case_insensitive(true).build() {
+        Ok(regex) => regex.is_match(text),
+        Err(error) => {
+            tracing::warn!(
+                pattern = pattern,
+                "Invalid ACK reaction regex pattern: {error}"
+            );
+            false
+        }
+    }
+}
+
 fn matches_text(rule: &AckReactionRuleConfig, text: &str) -> bool {
     let normalized = text.to_ascii_lowercase();
 
@@ -122,6 +157,51 @@ fn matches_text(rule: &AckReactionRuleConfig, text: &str) -> bool {
         .map(str::trim)
         .filter(|keyword| !keyword.is_empty())
         .all(|keyword| contains_keyword(&normalized, keyword))
+    {
+        return false;
+    }
+
+    if rule
+        .contains_none
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .any(|keyword| contains_keyword(&normalized, keyword))
+    {
+        return false;
+    }
+
+    if !rule.regex_any.is_empty()
+        && !rule
+            .regex_any
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .any(|pattern| regex_is_match(pattern, text))
+    {
+        return false;
+    }
+
+    if !rule
+        .regex_all
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .all(|pattern| regex_is_match(pattern, text))
+    {
+        return false;
+    }
+
+    if rule
+        .regex_none
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| regex_is_match(pattern, text))
     {
         return false;
     }
@@ -156,22 +236,69 @@ fn default_pool(defaults: &[&str]) -> Vec<String> {
         .collect()
 }
 
+fn normalize_sample_rate(rate: f64) -> f64 {
+    if rate.is_finite() {
+        rate.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn passes_sample_rate(rate: f64) -> bool {
+    let rate = normalize_sample_rate(rate);
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    rand::random::<f64>() < rate
+}
+
 pub fn select_ack_reaction(
     policy: Option<&AckReactionConfig>,
     defaults: &[&str],
     ctx: &AckReactionContext<'_>,
 ) -> Option<String> {
+    select_ack_reaction_with_trace(policy, defaults, ctx).emoji
+}
+
+pub fn select_ack_reaction_with_trace(
+    policy: Option<&AckReactionConfig>,
+    defaults: &[&str],
+    ctx: &AckReactionContext<'_>,
+) -> AckReactionSelection {
     let enabled = policy.is_none_or(|cfg| cfg.enabled);
     if !enabled {
-        return None;
+        return AckReactionSelection {
+            emoji: None,
+            matched_rule_index: None,
+            suppressed: false,
+            source: None,
+        };
     }
 
     let default_strategy = policy.map_or(AckReactionStrategy::Random, |cfg| cfg.strategy);
+    let default_sample_rate = policy.map_or(1.0, |cfg| cfg.sample_rate);
 
     if let Some(cfg) = policy {
-        for rule in &cfg.rules {
+        for (index, rule) in cfg.rules.iter().enumerate() {
             if !rule_matches(rule, ctx) {
                 continue;
+            }
+
+            let effective_sample_rate = rule.sample_rate.unwrap_or(default_sample_rate);
+            if !passes_sample_rate(effective_sample_rate) {
+                continue;
+            }
+
+            if rule.action == AckReactionRuleAction::Suppress {
+                return AckReactionSelection {
+                    emoji: None,
+                    matched_rule_index: Some(index),
+                    suppressed: true,
+                    source: Some(AckReactionSelectionSource::Rule(index)),
+                };
             }
 
             let rule_pool = normalize_entries(&rule.emojis);
@@ -181,17 +308,43 @@ pub fn select_ack_reaction(
 
             let strategy = rule.strategy.unwrap_or(default_strategy);
             if let Some(picked) = pick_from_pool(&rule_pool, strategy) {
-                return Some(picked);
+                return AckReactionSelection {
+                    emoji: Some(picked),
+                    matched_rule_index: Some(index),
+                    suppressed: false,
+                    source: Some(AckReactionSelectionSource::Rule(index)),
+                };
             }
         }
     }
 
-    let fallback_pool = policy
-        .map(|cfg| normalize_entries(&cfg.emojis))
-        .filter(|pool| !pool.is_empty())
-        .unwrap_or_else(|| default_pool(defaults));
+    if !passes_sample_rate(default_sample_rate) {
+        return AckReactionSelection {
+            emoji: None,
+            matched_rule_index: None,
+            suppressed: false,
+            source: None,
+        };
+    }
 
-    pick_from_pool(&fallback_pool, default_strategy)
+    let maybe_channel_pool = policy
+        .map(|cfg| normalize_entries(&cfg.emojis))
+        .filter(|pool| !pool.is_empty());
+    let (fallback_pool, source) = if let Some(channel_pool) = maybe_channel_pool {
+        (channel_pool, AckReactionSelectionSource::ChannelPool)
+    } else {
+        (
+            default_pool(defaults),
+            AckReactionSelectionSource::DefaultPool,
+        )
+    };
+
+    AckReactionSelection {
+        emoji: pick_from_pool(&fallback_pool, default_strategy),
+        matched_rule_index: None,
+        suppressed: false,
+        source: Some(source),
+    }
 }
 
 #[cfg(test)]
@@ -211,9 +364,8 @@ mod tests {
     fn disabled_policy_returns_none() {
         let cfg = AckReactionConfig {
             enabled: false,
-            strategy: AckReactionStrategy::Random,
             emojis: vec!["✅".into()],
-            rules: Vec::new(),
+            ..AckReactionConfig::default()
         };
         assert_eq!(select_ack_reaction(Some(&cfg), &["👍"], &ctx()), None);
     }
@@ -227,10 +379,9 @@ mod tests {
     #[test]
     fn first_strategy_uses_first_emoji() {
         let cfg = AckReactionConfig {
-            enabled: true,
             strategy: AckReactionStrategy::First,
             emojis: vec!["🔥".into(), "✅".into()],
-            rules: Vec::new(),
+            ..AckReactionConfig::default()
         };
         assert_eq!(
             select_ack_reaction(Some(&cfg), &["👍"], &ctx()).as_deref(),
@@ -241,20 +392,16 @@ mod tests {
     #[test]
     fn rule_matches_chat_type_and_keyword() {
         let rule = AckReactionRuleConfig {
-            enabled: true,
             contains_any: vec!["deploy".into()],
-            contains_all: Vec::new(),
-            sender_ids: Vec::new(),
             chat_types: vec![AckReactionChatType::Group],
-            locale_any: Vec::new(),
             strategy: Some(AckReactionStrategy::First),
             emojis: vec!["🚀".into()],
+            ..AckReactionRuleConfig::default()
         };
         let cfg = AckReactionConfig {
-            enabled: true,
-            strategy: AckReactionStrategy::Random,
             emojis: vec!["👍".into()],
             rules: vec![rule],
+            ..AckReactionConfig::default()
         };
         assert_eq!(
             select_ack_reaction(Some(&cfg), &["👍"], &ctx()).as_deref(),
@@ -265,24 +412,86 @@ mod tests {
     #[test]
     fn rule_respects_sender_and_locale_filters() {
         let rule = AckReactionRuleConfig {
-            enabled: true,
-            contains_any: Vec::new(),
-            contains_all: Vec::new(),
             sender_ids: vec!["u999".into()],
-            chat_types: Vec::new(),
             locale_any: vec!["zh".into()],
             strategy: Some(AckReactionStrategy::First),
             emojis: vec!["🇨🇳".into()],
+            ..AckReactionRuleConfig::default()
         };
         let cfg = AckReactionConfig {
-            enabled: true,
-            strategy: AckReactionStrategy::Random,
             emojis: vec!["👍".into()],
             rules: vec![rule],
+            ..AckReactionConfig::default()
         };
         assert_eq!(
             select_ack_reaction(Some(&cfg), &["👍"], &ctx()).as_deref(),
             Some("👍")
         );
+    }
+
+    #[test]
+    fn rule_can_suppress_reaction() {
+        let rule = AckReactionRuleConfig {
+            contains_any: vec!["deploy".into()],
+            action: AckReactionRuleAction::Suppress,
+            ..AckReactionRuleConfig::default()
+        };
+        let cfg = AckReactionConfig {
+            emojis: vec!["👍".into()],
+            rules: vec![rule],
+            ..AckReactionConfig::default()
+        };
+        let selected = select_ack_reaction_with_trace(Some(&cfg), &["✅"], &ctx());
+        assert_eq!(selected.emoji, None);
+        assert!(selected.suppressed);
+        assert_eq!(selected.matched_rule_index, Some(0));
+    }
+
+    #[test]
+    fn contains_none_blocks_keyword_match() {
+        let rule = AckReactionRuleConfig {
+            contains_any: vec!["deploy".into()],
+            contains_none: vec!["succeeded".into()],
+            emojis: vec!["🚀".into()],
+            ..AckReactionRuleConfig::default()
+        };
+        let cfg = AckReactionConfig {
+            emojis: vec!["👍".into()],
+            rules: vec![rule],
+            ..AckReactionConfig::default()
+        };
+        assert_eq!(
+            select_ack_reaction(Some(&cfg), &["✅"], &ctx()).as_deref(),
+            Some("👍")
+        );
+    }
+
+    #[test]
+    fn regex_filters_are_supported() {
+        let rule = AckReactionRuleConfig {
+            regex_any: vec![r"deploy\s+succeeded".into()],
+            regex_none: vec![r"panic|fatal".into()],
+            strategy: Some(AckReactionStrategy::First),
+            emojis: vec!["🧪".into(), "🚀".into()],
+            ..AckReactionRuleConfig::default()
+        };
+        let cfg = AckReactionConfig {
+            rules: vec![rule],
+            ..AckReactionConfig::default()
+        };
+        assert_eq!(
+            select_ack_reaction(Some(&cfg), &["✅"], &ctx()).as_deref(),
+            Some("🧪")
+        );
+    }
+
+    #[test]
+    fn sample_rate_zero_disables_fallback_reaction() {
+        let cfg = AckReactionConfig {
+            sample_rate: 0.0,
+            emojis: vec!["✅".into()],
+            ..AckReactionConfig::default()
+        };
+        assert_eq!(select_ack_reaction(Some(&cfg), &["👍"], &ctx()), None);
     }
 }

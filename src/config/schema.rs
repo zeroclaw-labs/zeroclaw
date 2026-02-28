@@ -4330,6 +4330,17 @@ pub enum AckReactionStrategy {
     First,
 }
 
+/// Rule action for ACK reaction matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AckReactionRuleAction {
+    /// React using the configured emoji pool.
+    #[default]
+    React,
+    /// Suppress ACK reactions when this rule matches.
+    Suppress,
+}
+
 /// Chat context selector for ACK emoji reaction rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -4352,6 +4363,18 @@ pub struct AckReactionRuleConfig {
     /// Match only when message contains all keywords (case-insensitive).
     #[serde(default)]
     pub contains_all: Vec<String>,
+    /// Match only when message contains none of these keywords (case-insensitive).
+    #[serde(default)]
+    pub contains_none: Vec<String>,
+    /// Match when any regex pattern matches message text.
+    #[serde(default)]
+    pub regex_any: Vec<String>,
+    /// Match only when all regex patterns match message text.
+    #[serde(default)]
+    pub regex_all: Vec<String>,
+    /// Match only when none of these regex patterns match message text.
+    #[serde(default)]
+    pub regex_none: Vec<String>,
     /// Match only for these sender IDs. `*` matches any sender.
     #[serde(default)]
     pub sender_ids: Vec<String>,
@@ -4361,6 +4384,13 @@ pub struct AckReactionRuleConfig {
     /// Match only for selected locale tags; supports prefix matching (`zh`, `zh_cn`).
     #[serde(default)]
     pub locale_any: Vec<String>,
+    /// Rule action (`react` or `suppress`).
+    #[serde(default)]
+    pub action: AckReactionRuleAction,
+    /// Optional probabilistic gate in `[0.0, 1.0]` for this rule.
+    /// When omitted, falls back to channel-level `sample_rate`.
+    #[serde(default)]
+    pub sample_rate: Option<f64>,
     /// Per-rule strategy override (falls back to parent strategy when omitted).
     #[serde(default)]
     pub strategy: Option<AckReactionStrategy>,
@@ -4375,9 +4405,15 @@ impl Default for AckReactionRuleConfig {
             enabled: true,
             contains_any: Vec::new(),
             contains_all: Vec::new(),
+            contains_none: Vec::new(),
+            regex_any: Vec::new(),
+            regex_all: Vec::new(),
+            regex_none: Vec::new(),
             sender_ids: Vec::new(),
             chat_types: Vec::new(),
             locale_any: Vec::new(),
+            action: AckReactionRuleAction::React,
+            sample_rate: None,
             strategy: None,
             emojis: Vec::new(),
         }
@@ -4393,6 +4429,10 @@ pub struct AckReactionConfig {
     /// Default emoji selection strategy.
     #[serde(default)]
     pub strategy: AckReactionStrategy,
+    /// Probabilistic gate in `[0.0, 1.0]` applied to default fallback selection.
+    /// Rule-level `sample_rate` overrides this for matched rules.
+    #[serde(default = "default_ack_reaction_sample_rate")]
+    pub sample_rate: f64,
     /// Default emoji pool. When empty, channel built-in defaults are used.
     #[serde(default)]
     pub emojis: Vec<String>,
@@ -4406,10 +4446,15 @@ impl Default for AckReactionConfig {
         Self {
             enabled: true,
             strategy: AckReactionStrategy::Random,
+            sample_rate: default_ack_reaction_sample_rate(),
             emojis: Vec::new(),
             rules: Vec::new(),
         }
     }
+}
+
+fn default_ack_reaction_sample_rate() -> f64 {
+    1.0
 }
 
 /// ACK reaction policy table under `[channels_config.ack_reaction]`.
@@ -10330,14 +10375,21 @@ allowed_users = ["@ops:matrix.org"]
                 telegram: Some(AckReactionConfig {
                     enabled: true,
                     strategy: AckReactionStrategy::First,
+                    sample_rate: 0.8,
                     emojis: vec!["✅".into(), "👍".into()],
                     rules: vec![AckReactionRuleConfig {
                         enabled: true,
                         contains_any: vec!["deploy".into()],
                         contains_all: vec!["ok".into()],
+                        contains_none: vec!["dry-run".into()],
+                        regex_any: vec![r"deploy\s+ok".into()],
+                        regex_all: Vec::new(),
+                        regex_none: vec![r"panic|fatal".into()],
                         sender_ids: vec!["u123".into()],
                         chat_types: vec![AckReactionChatType::Group],
                         locale_any: vec!["en".into()],
+                        action: AckReactionRuleAction::React,
+                        sample_rate: Some(0.5),
                         strategy: Some(AckReactionStrategy::Random),
                         emojis: vec!["🚀".into()],
                     }],
@@ -10354,10 +10406,15 @@ allowed_users = ["@ops:matrix.org"]
         let telegram = parsed.ack_reaction.telegram.expect("telegram ack config");
         assert!(telegram.enabled);
         assert_eq!(telegram.strategy, AckReactionStrategy::First);
+        assert_eq!(telegram.sample_rate, 0.8);
         assert_eq!(telegram.emojis, vec!["✅", "👍"]);
         assert_eq!(telegram.rules.len(), 1);
         let first_rule = &telegram.rules[0];
         assert_eq!(first_rule.contains_any, vec!["deploy"]);
+        assert_eq!(first_rule.contains_none, vec!["dry-run"]);
+        assert_eq!(first_rule.regex_any, vec![r"deploy\s+ok"]);
+        assert_eq!(first_rule.action, AckReactionRuleAction::React);
+        assert_eq!(first_rule.sample_rate, Some(0.5));
         assert_eq!(first_rule.chat_types, vec![AckReactionChatType::Group]);
     }
 

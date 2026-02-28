@@ -1078,8 +1078,9 @@ Per-channel ACK reaction policy (`<channel>`: `telegram`, `discord`, `lark`, `fe
 |---|---|---|
 | `enabled` | `true` | Master switch for ACK reactions on this channel |
 | `strategy` | `random` | Pool selection strategy: `random` or `first` |
+| `sample_rate` | `1.0` | Probabilistic gate in `[0.0, 1.0]` for channel fallback ACKs |
 | `emojis` | `[]` | Channel-level custom fallback pool (uses built-in pool when empty) |
-| `rules` | `[]` | Ordered conditional rules; first matching rule with emojis is used |
+| `rules` | `[]` | Ordered conditional rules; first matching rule can react or suppress |
 
 Rule object fields (`[[channels_config.ack_reaction.<channel>.rules]]`):
 
@@ -1088,9 +1089,15 @@ Rule object fields (`[[channels_config.ack_reaction.<channel>.rules]]`):
 | `enabled` | `true` | Enable/disable this single rule |
 | `contains_any` | `[]` | Match when message contains any keyword (case-insensitive) |
 | `contains_all` | `[]` | Match when message contains all keywords (case-insensitive) |
+| `contains_none` | `[]` | Match only when message contains none of these keywords |
+| `regex_any` | `[]` | Match when any regex pattern matches |
+| `regex_all` | `[]` | Match only when all regex patterns match |
+| `regex_none` | `[]` | Match only when none of these regex patterns match |
 | `sender_ids` | `[]` | Match only these sender IDs (`"*"` matches all) |
 | `chat_types` | `[]` | Restrict to `group` and/or `direct` |
 | `locale_any` | `[]` | Restrict by locale tag (prefix supported, e.g. `zh`) |
+| `action` | `react` | `react` to emit ACK, `suppress` to force no ACK when matched |
+| `sample_rate` | unset | Optional rule-level gate in `[0.0, 1.0]` (overrides channel `sample_rate`) |
 | `strategy` | unset | Optional per-rule strategy override |
 | `emojis` | `[]` | Emoji pool used when this rule matches |
 
@@ -1100,17 +1107,22 @@ Example:
 [channels_config.ack_reaction.telegram]
 enabled = true
 strategy = "random"
+sample_rate = 1.0
 emojis = ["✅", "👌", "🔥"]
 
 [[channels_config.ack_reaction.telegram.rules]]
 contains_any = ["deploy", "release"]
+contains_none = ["dry-run"]
+regex_none = ["panic|fatal"]
 chat_types = ["group"]
 strategy = "first"
+sample_rate = 0.9
 emojis = ["🚀"]
 
 [[channels_config.ack_reaction.telegram.rules]]
 contains_any = ["error", "failed"]
-emojis = ["👀", "🛠️"]
+action = "suppress"
+sample_rate = 1.0
 ```
 
 ### `[channels_config.nostr]`

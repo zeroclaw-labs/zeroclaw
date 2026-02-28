@@ -1,4 +1,8 @@
 use super::traits::{Tool, ToolResult};
+use crate::channels::ack_reaction::{
+    select_ack_reaction_with_trace, AckReactionContext, AckReactionContextChatType,
+    AckReactionSelectionSource,
+};
 use crate::config::{
     AckReactionChannelsConfig, AckReactionConfig, AckReactionRuleConfig, AckReactionStrategy,
     Config,
@@ -105,6 +109,45 @@ impl ChannelAckConfigTool {
         }
     }
 
+    fn parse_sample_rate(raw: &Value, field: &str) -> anyhow::Result<f64> {
+        let value = raw
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a number in range [0.0, 1.0]"))?;
+        if !value.is_finite() {
+            anyhow::bail!("'{field}' must be finite");
+        }
+        if !(0.0..=1.0).contains(&value) {
+            anyhow::bail!("'{field}' must be within [0.0, 1.0]");
+        }
+        Ok(value)
+    }
+
+    fn parse_chat_type(args: &Value) -> anyhow::Result<AckReactionContextChatType> {
+        match args
+            .get("chat_type")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("direct") => Ok(AckReactionContextChatType::Direct),
+            Some("group") => Ok(AckReactionContextChatType::Group),
+            Some(other) => anyhow::bail!("Invalid chat_type '{other}'. Use direct|group"),
+        }
+    }
+
+    fn fallback_defaults(channel: AckChannel) -> Vec<String> {
+        match channel {
+            AckChannel::Telegram => vec!["⚡️", "👌", "👀", "🔥", "👍"],
+            AckChannel::Discord => vec!["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"],
+            AckChannel::Lark | AckChannel::Feishu => {
+                vec!["✅", "👍", "👌", "👏", "💯", "🎉", "🫡", "✨", "🚀"]
+            }
+        }
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+    }
+
     fn parse_string_list(raw: &Value, field: &str) -> anyhow::Result<Vec<String>> {
         if raw.is_null() {
             return Ok(Vec::new());
@@ -190,6 +233,7 @@ impl ChannelAckConfigTool {
                     AckReactionStrategy::Random => "random",
                     AckReactionStrategy::First => "first",
                 },
+                "sample_rate": cfg.sample_rate,
                 "emojis": cfg.emojis,
                 "rules": cfg.rules,
             })
@@ -249,6 +293,14 @@ impl ChannelAckConfigTool {
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("'strategy' must be a string or null"))?;
                 channel_cfg.strategy = Self::parse_strategy(value)?;
+            }
+        }
+
+        if let Some(raw_sample_rate) = args.get("sample_rate") {
+            if raw_sample_rate.is_null() {
+                channel_cfg.sample_rate = 1.0;
+            } else {
+                channel_cfg.sample_rate = Self::parse_sample_rate(raw_sample_rate, "sample_rate")?;
             }
         }
 
@@ -383,6 +435,74 @@ impl ChannelAckConfigTool {
             error: None,
         })
     }
+
+    fn handle_simulate(&self, args: &Value) -> anyhow::Result<ToolResult> {
+        let channel = Self::parse_channel(args)?;
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Missing required field: text"))?;
+        let chat_type = Self::parse_chat_type(args)?;
+        let sender_id = args.get("sender_id").and_then(Value::as_str);
+        let locale_hint = args.get("locale_hint").and_then(Value::as_str);
+
+        let defaults = if let Some(raw_defaults) = args.get("defaults") {
+            Self::parse_string_list(raw_defaults, "defaults")?
+        } else {
+            Self::fallback_defaults(channel)
+        };
+        let default_refs = defaults.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let cfg = self.load_config_without_env()?;
+        let policy = Self::channel_config_ref(&cfg.channels_config.ack_reaction, channel);
+        let selection = select_ack_reaction_with_trace(
+            policy,
+            &default_refs,
+            &AckReactionContext {
+                text,
+                sender_id,
+                chat_type,
+                locale_hint,
+            },
+        );
+
+        let source = selection.source.as_ref().map(|source| match source {
+            AckReactionSelectionSource::Rule(index) => json!({
+                "kind": "rule",
+                "index": index
+            }),
+            AckReactionSelectionSource::ChannelPool => json!({
+                "kind": "channel_pool"
+            }),
+            AckReactionSelectionSource::DefaultPool => json!({
+                "kind": "default_pool"
+            }),
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "channel": channel.as_str(),
+                "input": {
+                    "text": text,
+                    "sender_id": sender_id,
+                    "chat_type": match chat_type {
+                        AckReactionContextChatType::Direct => "direct",
+                        AckReactionContextChatType::Group => "group",
+                    },
+                    "locale_hint": locale_hint,
+                    "defaults": defaults,
+                },
+                "selection": {
+                    "emoji": selection.emoji,
+                    "matched_rule_index": selection.matched_rule_index,
+                    "suppressed": selection.suppressed,
+                    "source": source,
+                }
+            }))?,
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -401,7 +521,7 @@ impl Tool for ChannelAckConfigTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get", "set", "add_rule", "remove_rule", "clear_rules", "unset"],
+                    "enum": ["get", "set", "add_rule", "remove_rule", "clear_rules", "unset", "simulate"],
                     "description": "Operation to perform"
                 },
                 "channel": {
@@ -410,6 +530,7 @@ impl Tool for ChannelAckConfigTool {
                 },
                 "enabled": {"type": "boolean"},
                 "strategy": {"type": ["string", "null"], "enum": ["random", "first", null]},
+                "sample_rate": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
                 "emojis": {
                     "anyOf": [
                         {"type": "string"},
@@ -419,7 +540,18 @@ impl Tool for ChannelAckConfigTool {
                 },
                 "rules": {"type": ["array", "null"]},
                 "rule": {"type": "object"},
-                "index": {"type": "integer", "minimum": 0}
+                "index": {"type": "integer", "minimum": 0},
+                "text": {"type": "string"},
+                "sender_id": {"type": ["string", "null"]},
+                "chat_type": {"type": "string", "enum": ["direct", "group"]},
+                "locale_hint": {"type": ["string", "null"]},
+                "defaults": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"}
+                    ]
+                }
             },
             "required": ["action"]
         })
@@ -463,8 +595,9 @@ impl Tool for ChannelAckConfigTool {
                 }
                 self.handle_unset(&args).await
             }
+            "simulate" => self.handle_simulate(&args),
             other => anyhow::bail!(
-                "Unsupported action '{other}'. Use get|set|add_rule|remove_rule|clear_rules|unset"
+                "Unsupported action '{other}'. Use get|set|add_rule|remove_rule|clear_rules|unset|simulate"
             ),
         }
     }
@@ -513,6 +646,7 @@ mod tests {
                 "channel": "telegram",
                 "enabled": true,
                 "strategy": "first",
+                "sample_rate": 0.75,
                 "emojis": ["✅", "👍"]
             }))
             .await
@@ -529,6 +663,7 @@ mod tests {
         assert!(get_result.success, "{:?}", get_result.error);
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert_eq!(output["ack_reaction"]["strategy"], json!("first"));
+        assert_eq!(output["ack_reaction"]["sample_rate"], json!(0.75));
         assert_eq!(output["ack_reaction"]["emojis"], json!(["✅", "👍"]));
     }
 
@@ -587,5 +722,49 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn simulate_reports_rule_selection() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ChannelAckConfigTool::new(test_config(&tmp).await, test_security());
+
+        let set_result = tool
+            .execute(json!({
+                "action": "set",
+                "channel": "telegram",
+                "enabled": true,
+                "strategy": "first",
+                "emojis": ["✅"],
+                "rules": [{
+                    "enabled": true,
+                    "contains_any": ["deploy"],
+                    "action": "react",
+                    "strategy": "first",
+                    "emojis": ["🚀"]
+                }]
+            }))
+            .await
+            .unwrap();
+        assert!(set_result.success, "{:?}", set_result.error);
+
+        let result = tool
+            .execute(json!({
+                "action": "simulate",
+                "channel": "telegram",
+                "text": "deploy finished",
+                "chat_type": "group",
+                "sender_id": "u1",
+                "locale_hint": "en"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["selection"]["emoji"], json!("🚀"));
+        assert_eq!(output["selection"]["matched_rule_index"], json!(0));
+        assert_eq!(output["selection"]["suppressed"], json!(false));
+        assert_eq!(output["selection"]["source"]["kind"], json!("rule"));
     }
 }
