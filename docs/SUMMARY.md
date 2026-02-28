@@ -77,6 +77,7 @@ Last refreshed: **February 25, 2026**.
 ### 5) Hardware & Peripherals
 
 - [hardware/README.md](hardware/README.md)
+- [hardware/raspberry-pi-zero-w-build.md](hardware/raspberry-pi-zero-w-build.md)
 - [hardware-peripherals-design.md](hardware-peripherals-design.md)
 - [adding-boards-and-tools.md](adding-boards-and-tools.md)
 - [nucleo-setup.md](nucleo-setup.md)
