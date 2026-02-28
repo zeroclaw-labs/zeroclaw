@@ -5937,6 +5937,8 @@ impl Config {
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
+        let mut has_explicit_zeroclaw_api_key = false;
+
         // API Key: ZEROCLAW_API_KEY always wins (explicit intent).
         // API_KEY (generic) is only used as a fallback when config has no api_key,
         // because API_KEY is a very common env var name that may be set by unrelated
@@ -5944,6 +5946,7 @@ impl Config {
         if let Ok(key) = std::env::var("ZEROCLAW_API_KEY") {
             if !key.is_empty() {
                 self.api_key = Some(key);
+                has_explicit_zeroclaw_api_key = true;
             }
         } else if self.api_key.as_ref().map_or(true, |k| k.is_empty()) {
             if let Ok(key) = std::env::var("API_KEY") {
@@ -5953,7 +5956,9 @@ impl Config {
             }
         }
         // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
-        if self.default_provider.as_deref().is_some_and(is_glm_alias) {
+        if !has_explicit_zeroclaw_api_key
+            && self.default_provider.as_deref().is_some_and(is_glm_alias)
+        {
             if let Ok(key) = std::env::var("GLM_API_KEY") {
                 if !key.is_empty() {
                     self.api_key = Some(key);
@@ -5962,7 +5967,9 @@ impl Config {
         }
 
         // API Key: ZAI_API_KEY overrides when provider is a Z.AI variant.
-        if self.default_provider.as_deref().is_some_and(is_zai_alias) {
+        if !has_explicit_zeroclaw_api_key
+            && self.default_provider.as_deref().is_some_and(is_zai_alias)
+        {
             if let Ok(key) = std::env::var("ZAI_API_KEY") {
                 if !key.is_empty() {
                     self.api_key = Some(key);
@@ -8670,6 +8677,23 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn env_override_zeroclaw_api_key_beats_glm_api_key_for_regional_aliases() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("glm-cn".to_string()),
+            ..Config::default()
+        };
+
+        std::env::set_var("ZEROCLAW_API_KEY", "sk-explicit-env-key");
+        std::env::set_var("GLM_API_KEY", "glm-regional-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("sk-explicit-env-key"));
+
+        std::env::remove_var("ZEROCLAW_API_KEY");
+        std::env::remove_var("GLM_API_KEY");
+    }
+
+    #[test]
     async fn env_override_zai_api_key_for_regional_aliases() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -8681,6 +8705,23 @@ provider_api = "not-a-real-mode"
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
 
+        std::env::remove_var("ZAI_API_KEY");
+    }
+
+    #[test]
+    async fn env_override_zeroclaw_api_key_beats_zai_api_key_for_regional_aliases() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("zai-cn".to_string()),
+            ..Config::default()
+        };
+
+        std::env::set_var("ZEROCLAW_API_KEY", "sk-explicit-env-key");
+        std::env::set_var("ZAI_API_KEY", "zai-regional-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("sk-explicit-env-key"));
+
+        std::env::remove_var("ZEROCLAW_API_KEY");
         std::env::remove_var("ZAI_API_KEY");
     }
 
