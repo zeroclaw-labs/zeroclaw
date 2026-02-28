@@ -87,7 +87,10 @@ class DetectChangeScopeTest(unittest.TestCase):
         self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         stale_base = self._commit("base")
 
-        run_cmd(["git", "checkout", "-q", "-b", "feature/workflow-only"], cwd=self.tmp)
+        self._assert_cmd_ok(
+            ["git", "checkout", "-q", "-b", "feature/workflow-only"],
+            "git checkout -b feature/workflow-only",
+        )
         (self.tmp / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
         (self.tmp / ".github" / "workflows" / "ci-example.yml").write_text(
             "name: Example\non: pull_request\njobs: {}\n",
@@ -99,7 +102,7 @@ class DetectChangeScopeTest(unittest.TestCase):
         )
         self._commit("feature: workflow only")
 
-        run_cmd(["git", "checkout", "-q", "main"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "checkout", "-q", "main"], "git checkout main")
         (self.tmp / "src" / "lib.rs").write_text("pub fn answer() -> i32 { 43 }\n", encoding="utf-8")
         self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         main_tip = self._commit("main: rust change after feature fork")
@@ -124,17 +127,23 @@ class DetectChangeScopeTest(unittest.TestCase):
         self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         common_base = self._commit("base")
 
-        run_cmd(["git", "checkout", "-q", "-b", "feature/rust-change"], cwd=self.tmp)
+        self._assert_cmd_ok(
+            ["git", "checkout", "-q", "-b", "feature/rust-change"],
+            "git checkout -b feature/rust-change",
+        )
         (self.tmp / "src" / "lib.rs").write_text("pub fn alpha() {}\npub fn beta() {}\n", encoding="utf-8")
         self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         self._commit("feature: rust change")
 
-        run_cmd(["git", "checkout", "-q", "main"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "checkout", "-q", "main"], "git checkout main")
         (self.tmp / "README.md").write_text("# docs touch\n", encoding="utf-8")
         self._assert_cmd_ok(["git", "add", "README.md"], "git add README.md")
         advanced_base = self._commit("main advanced")
 
-        run_cmd(["git", "checkout", "-q", "feature/rust-change"], cwd=self.tmp)
+        self._assert_cmd_ok(
+            ["git", "checkout", "-q", "feature/rust-change"],
+            "git checkout feature/rust-change",
+        )
         out = self._run_scope(event_name="push", base_sha=advanced_base)
         self.assertEqual(out["rust_changed"], "true")
         self.assertEqual(out["workflow_changed"], "false")
