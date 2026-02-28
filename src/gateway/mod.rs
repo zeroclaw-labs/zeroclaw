@@ -2356,6 +2356,9 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            sop_engine: None,
+            sop_audit: None,
+            sop_collector: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -2399,6 +2402,9 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            sop_engine: None,
+            sop_audit: None,
+            sop_collector: None,
         };
 
         let unauthorized =
@@ -2834,6 +2840,10 @@ Reminder set successfully."#;
         ConnectInfo(SocketAddr::from(([203, 0, 113, 10], 30_300)))
     }
 
+    fn test_uri() -> axum::http::Uri {
+        "/webhook".parse().unwrap()
+    }
+
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockProvider::default());
@@ -2939,11 +2949,15 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            sop_engine: None,
+            sop_audit: None,
+            sop_collector: None,
         };
 
         let response = handle_webhook(
             State(state),
             test_public_connect_info(),
+            test_uri(),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),

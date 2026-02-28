@@ -768,6 +768,9 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
+            None,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"wasm_module"));
@@ -1009,6 +1012,8 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
+            None,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));

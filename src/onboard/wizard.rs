@@ -7448,9 +7448,13 @@ mod tests {
             verification_token: None,
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: true,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
         assert!(has_launchable_channels(&channels));
     }
