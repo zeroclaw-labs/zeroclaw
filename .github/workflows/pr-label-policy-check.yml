@@ -7,6 +7,7 @@ on:
             - ".github/workflows/pr-labeler.yml"
             - ".github/workflows/pr-auto-response.yml"
     push:
+        branches: [dev, main]
         paths:
             - ".github/label-policy.json"
             - ".github/workflows/pr-labeler.yml"
