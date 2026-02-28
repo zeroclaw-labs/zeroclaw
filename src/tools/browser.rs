@@ -6,12 +6,16 @@
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{validate_url as validate_network_url, DomainPolicy, UrlSchemePolicy};
+use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,8 +65,13 @@ impl Default for ComputerUseConfig {
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    url_access: UrlAccessConfig,
     session_name: Option<String>,
     backend: String,
+    auto_backend_priority: Vec<String>,
+    agent_browser_command: String,
+    agent_browser_extra_args: Vec<String>,
+    agent_browser_timeout_ms: u64,
     native_headless: bool,
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
@@ -202,11 +211,16 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
     ) -> Self {
-        Self::new_with_backend(
+        Self::new_with_backend_and_url_access(
             security,
             allowed_domains,
+            UrlAccessConfig::default(),
             session_name,
             "agent_browser".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -220,6 +234,43 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
         backend: String,
+        auto_backend_priority: Vec<String>,
+        agent_browser_command: String,
+        agent_browser_extra_args: Vec<String>,
+        agent_browser_timeout_ms: u64,
+        native_headless: bool,
+        native_webdriver_url: String,
+        native_chrome_path: Option<String>,
+        computer_use: ComputerUseConfig,
+    ) -> Self {
+        Self::new_with_backend_and_url_access(
+            security,
+            allowed_domains,
+            UrlAccessConfig::default(),
+            session_name,
+            backend,
+            auto_backend_priority,
+            agent_browser_command,
+            agent_browser_extra_args,
+            agent_browser_timeout_ms,
+            native_headless,
+            native_webdriver_url,
+            native_chrome_path,
+            computer_use,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_backend_and_url_access(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        url_access: UrlAccessConfig,
+        session_name: Option<String>,
+        backend: String,
+        auto_backend_priority: Vec<String>,
+        agent_browser_command: String,
+        agent_browser_extra_args: Vec<String>,
+        agent_browser_timeout_ms: u64,
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
@@ -228,8 +279,13 @@ impl BrowserTool {
         Self {
             security,
             allowed_domains: normalize_domains(allowed_domains),
+            url_access,
             session_name,
             backend,
+            auto_backend_priority,
+            agent_browser_command,
+            agent_browser_extra_args,
+            agent_browser_timeout_ms,
             native_headless,
             native_webdriver_url,
             native_chrome_path,
@@ -239,9 +295,9 @@ impl BrowserTool {
         }
     }
 
-    /// Check if agent-browser CLI is available
-    pub async fn is_agent_browser_available() -> bool {
-        Command::new("agent-browser")
+    /// Check if agent-browser CLI is available.
+    async fn is_agent_browser_available_with_command(command: &str) -> bool {
+        Command::new(command)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -249,6 +305,11 @@ impl BrowserTool {
             .await
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// Backward-compatible helper using default executable name.
+    pub async fn is_agent_browser_available() -> bool {
+        Self::is_agent_browser_available_with_command("agent-browser").await
     }
 
     /// Backward-compatible alias.
@@ -325,17 +386,54 @@ impl BrowserTool {
         Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
     }
 
+    fn auto_backend_priority(&self) -> anyhow::Result<Vec<BrowserBackendKind>> {
+        if self.auto_backend_priority.is_empty() {
+            return Ok(vec![
+                BrowserBackendKind::AgentBrowser,
+                BrowserBackendKind::RustNative,
+                BrowserBackendKind::ComputerUse,
+            ]);
+        }
+
+        let mut ordered: Vec<BrowserBackendKind> = Vec::new();
+        for raw in &self.auto_backend_priority {
+            let parsed = BrowserBackendKind::parse(raw)?;
+            if parsed == BrowserBackendKind::Auto {
+                anyhow::bail!("browser.auto_backend_priority cannot contain 'auto'");
+            }
+            if !ordered.contains(&parsed) {
+                ordered.push(parsed);
+            }
+        }
+
+        if ordered.is_empty() {
+            anyhow::bail!(
+                "browser.auto_backend_priority resolved to empty list; configure at least one backend"
+            );
+        }
+
+        Ok(ordered)
+    }
+
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
         let configured = self.configured_backend()?;
+        let agent_browser_command = self.agent_browser_command.trim();
+        if agent_browser_command.is_empty() {
+            anyhow::bail!("browser.agent_browser_command cannot be empty");
+        }
+        if self.agent_browser_timeout_ms == 0 {
+            anyhow::bail!("browser.agent_browser_timeout_ms must be > 0");
+        }
 
         match configured {
             BrowserBackendKind::AgentBrowser => {
-                if Self::is_agent_browser_available().await {
+                if Self::is_agent_browser_available_with_command(agent_browser_command).await {
                     Ok(ResolvedBackend::AgentBrowser)
                 } else {
                     anyhow::bail!(
-                        "browser.backend='{}' but agent-browser CLI is unavailable. Install with: npm install -g agent-browser",
-                        configured.as_str()
+                        "browser.backend='{}' but agent-browser CLI ('{}') is unavailable. Install agent-browser or set browser.agent_browser_command",
+                        configured.as_str(),
+                        agent_browser_command
                     )
                 }
             }
@@ -361,84 +459,96 @@ impl BrowserTool {
                 Ok(ResolvedBackend::ComputerUse)
             }
             BrowserBackendKind::Auto => {
-                if Self::rust_native_compiled() && self.rust_native_available() {
-                    return Ok(ResolvedBackend::RustNative);
-                }
-                if Self::is_agent_browser_available().await {
-                    return Ok(ResolvedBackend::AgentBrowser);
-                }
-
-                let computer_use_err = match self.computer_use_available() {
-                    Ok(true) => return Ok(ResolvedBackend::ComputerUse),
-                    Ok(false) => None,
-                    Err(err) => Some(err.to_string()),
-                };
-
-                if Self::rust_native_compiled() {
-                    if let Some(err) = computer_use_err {
-                        anyhow::bail!(
-                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
-                        );
+                let priority = self.auto_backend_priority()?;
+                let mut reasons: Vec<String> = Vec::new();
+                for candidate in priority.iter().copied() {
+                    match candidate {
+                        BrowserBackendKind::AgentBrowser => {
+                            if Self::is_agent_browser_available_with_command(agent_browser_command)
+                                .await
+                            {
+                                return Ok(ResolvedBackend::AgentBrowser);
+                            }
+                            reasons.push(format!(
+                                "agent_browser unavailable at '{}'",
+                                agent_browser_command
+                            ));
+                        }
+                        BrowserBackendKind::RustNative => {
+                            if !Self::rust_native_compiled() {
+                                reasons.push(
+                                    "rust_native backend not compiled (enable feature browser-native)"
+                                        .into(),
+                                );
+                            } else if self.rust_native_available() {
+                                return Ok(ResolvedBackend::RustNative);
+                            } else {
+                                reasons.push(
+                                    "rust_native unavailable (WebDriver endpoint not reachable)"
+                                        .into(),
+                                );
+                            }
+                        }
+                        BrowserBackendKind::ComputerUse => match self.computer_use_available() {
+                            Ok(true) => return Ok(ResolvedBackend::ComputerUse),
+                            Ok(false) => reasons.push(
+                                "computer_use unavailable (sidecar endpoint unreachable)".into(),
+                            ),
+                            Err(err) => reasons.push(format!("computer_use invalid: {err}")),
+                        },
+                        BrowserBackendKind::Auto => {
+                            reasons.push("invalid auto backend priority entry: auto".into())
+                        }
                     }
-                    anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
-                    )
                 }
 
-                if let Some(err) = computer_use_err {
-                    anyhow::bail!(
-                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
-                    );
-                }
-
+                let priority_display = priority
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 anyhow::bail!(
-                    "browser.backend='auto' needs agent-browser CLI, browser-native, or computer-use sidecar"
-                )
+                    "browser.backend='auto' found no usable backend. Checked [{}]: {}",
+                    priority_display,
+                    reasons.join("; ")
+                );
             }
         }
     }
 
     /// Validate URL against allowlist
     fn validate_url(&self, url: &str) -> anyhow::Result<()> {
-        let url = url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        // Block file:// URLs — browser file access bypasses all SSRF and
-        // domain-allowlist controls and can exfiltrate arbitrary local files.
-        if url.starts_with("file://") {
-            anyhow::bail!("file:// URLs are not allowed in browser automation");
-        }
-
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool enabled but no allowed_domains configured. \
-                Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' not in browser.allowed_domains");
-        }
-
+        let _ = validate_network_url(
+            url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &[],
+                allowed_field_name: "browser.allowed_domains",
+                blocked_field_name: None,
+                empty_allowed_message: "Browser tool enabled but no allowed_domains configured. Add [browser].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpsOnly,
+                ipv6_error_context: "browser",
+                url_access: Some(&self.url_access),
+            },
+        )?;
         Ok(())
     }
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let mut cmd = Command::new("agent-browser");
+        let command = self.agent_browser_command.trim();
+        if command.is_empty() {
+            anyhow::bail!("browser.agent_browser_command cannot be empty");
+        }
+
+        let mut cmd = Command::new(command);
+
+        for extra in &self.agent_browser_extra_args {
+            let trimmed = extra.trim();
+            if !trimmed.is_empty() {
+                cmd.arg(trimmed);
+            }
+        }
 
         // Add session if configured
         if let Some(ref session) = self.session_name {
@@ -448,13 +558,19 @@ impl BrowserTool {
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
 
-        debug!("Running: agent-browser {} --json", args.join(" "));
+        debug!("Running: {} {} --json", command, args.join(" "));
 
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
+        let output = tokio::time::timeout(
+            Duration::from_millis(self.agent_browser_timeout_ms),
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "agent-browser command timed out after {} ms",
+                self.agent_browser_timeout_ms
+            )
+        })??;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -633,14 +749,34 @@ impl BrowserTool {
         {
             let mut state = self.native_state.lock().await;
 
-            let output = state
+            let first_attempt = state
                 .execute_action(
-                    action,
+                    action.clone(),
                     self.native_headless,
                     &self.native_webdriver_url,
                     self.native_chrome_path.as_deref(),
                 )
-                .await?;
+                .await;
+
+            let output = match first_attempt {
+                Ok(output) => output,
+                Err(err) => {
+                    if !is_recoverable_rust_native_error(&err) {
+                        return Err(err);
+                    }
+
+                    state.reset_session().await;
+                    state
+                        .execute_action(
+                            action,
+                            self.native_headless,
+                            &self.native_webdriver_url,
+                            self.native_chrome_path.as_deref(),
+                        )
+                        .await
+                        .with_context(|| "rust_native backend retry after session reset failed")?
+                }
+            };
 
             Ok(ToolResult {
                 success: true,
@@ -684,6 +820,75 @@ impl BrowserTool {
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
     }
 
+    fn validate_output_path(&self, key: &str, path: &str) -> anyhow::Result<()> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("'{key}' path cannot be empty");
+        }
+        if trimmed.contains('\0') {
+            anyhow::bail!("'{key}' path contains invalid null byte");
+        }
+        if !self.security.is_path_allowed(trimmed) {
+            anyhow::bail!("'{key}' path blocked by security policy: {trimmed}");
+        }
+        Ok(())
+    }
+
+    async fn resolve_output_path_for_write(
+        &self,
+        key: &str,
+        path: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let trimmed = path.trim();
+        self.validate_output_path(key, trimmed)?;
+
+        tokio::fs::create_dir_all(&self.security.workspace_dir).await?;
+        let workspace_root = tokio::fs::canonicalize(&self.security.workspace_dir)
+            .await
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+
+        let raw_path = Path::new(trimmed);
+        let output_path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            workspace_root.join(raw_path)
+        };
+
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("'{key}' path has no parent directory"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let resolved_parent = tokio::fs::canonicalize(parent).await?;
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+            anyhow::bail!(
+                "{}",
+                self.security
+                    .resolved_path_violation_message(&resolved_parent)
+            );
+        }
+
+        match tokio::fs::symlink_metadata(&output_path).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "Refusing to write browser output through symlink: {}",
+                        output_path.display()
+                    );
+                }
+                if !meta.is_file() {
+                    anyhow::bail!(
+                        "Browser output path is not a regular file: {}",
+                        output_path.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        Ok(output_path)
+    }
+
     fn validate_computer_use_action(
         &self,
         action: &str,
@@ -713,6 +918,37 @@ impl BrowserTool {
                 self.validate_coordinate("from_y", from_y, self.computer_use.max_coordinate_y)?;
                 self.validate_coordinate("to_y", to_y, self.computer_use.max_coordinate_y)?;
             }
+            "key_type" => {
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'text' for key_type action"))?;
+                if text.trim().is_empty() {
+                    anyhow::bail!("'text' for key_type must not be empty");
+                }
+                if text.len() > 4096 {
+                    anyhow::bail!("'text' for key_type exceeds maximum length (4096 chars)");
+                }
+            }
+            "key_press" => {
+                let key = params
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'key' for key_press action"))?;
+                let valid = !key.trim().is_empty()
+                    && key.len() <= 32
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'));
+                if !valid {
+                    anyhow::bail!("'key' for key_press must be 1-32 chars of [A-Za-z0-9_+-]");
+                }
+            }
+            "screen_capture" => {
+                if let Some(path) = params.get("path").and_then(Value::as_str) {
+                    self.validate_output_path("path", path)?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -732,6 +968,15 @@ impl BrowserTool {
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
+        if action == "screen_capture" {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                let resolved = self.resolve_output_path_for_write("path", path).await?;
+                params.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
+            }
+        }
 
         let payload = json!({
             "action": action,
@@ -1062,6 +1307,19 @@ impl Tool for BrowserTool {
             }
         };
 
+        if let BrowserAction::Screenshot {
+            path: Some(path), ..
+        } = &action
+        {
+            if let Err(err) = self.validate_output_path("path", path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+
         self.execute_action(action, backend).await
     }
 }
@@ -1072,6 +1330,7 @@ mod native_backend {
     use anyhow::{Context, Result};
     use base64::Engine;
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
+    use fantoccini::error::CmdError;
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
     use serde_json::{json, Map, Value};
@@ -1142,7 +1401,7 @@ mod native_backend {
                 }
                 BrowserAction::Click { selector } => {
                     let client = self.active_client()?;
-                    find_element(client, &selector).await?.click().await?;
+                    click_with_recovery(client, &selector).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1152,9 +1411,7 @@ mod native_backend {
                 }
                 BrowserAction::Fill { selector, value } => {
                     let client = self.active_client()?;
-                    let element = find_element(client, &selector).await?;
-                    let _ = element.clear().await;
-                    element.send_keys(&value).await?;
+                    fill_with_recovery(client, &selector, &value).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1164,10 +1421,7 @@ mod native_backend {
                 }
                 BrowserAction::Type { selector, text } => {
                     let client = self.active_client()?;
-                    find_element(client, &selector)
-                        .await?
-                        .send_keys(&text)
-                        .await?;
+                    type_with_recovery(client, &selector, &text).await?;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1348,9 +1602,7 @@ mod native_backend {
                     }))
                 }
                 BrowserAction::Close => {
-                    if let Some(client) = self.client.take() {
-                        let _ = client.close().await;
-                    }
+                    self.reset_session().await;
 
                     Ok(json!({
                         "backend": "rust_native",
@@ -1366,35 +1618,37 @@ mod native_backend {
                 } => {
                     let client = self.active_client()?;
                     let selector = selector_for_find(&by, &value);
-                    let element = find_element(client, &selector).await?;
 
                     let payload = match action.as_str() {
                         "click" => {
-                            element.click().await?;
+                            click_with_recovery(client, &selector).await?;
                             json!({"result": "clicked"})
                         }
                         "fill" => {
                             let fill = fill_value.ok_or_else(|| {
                                 anyhow::anyhow!("find_action='fill' requires fill_value")
                             })?;
-                            let _ = element.clear().await;
-                            element.send_keys(&fill).await?;
+                            fill_with_recovery(client, &selector, &fill).await?;
                             json!({"result": "filled", "typed": fill.len()})
                         }
                         "text" => {
+                            let element = find_element(client, &selector).await?;
                             let text = element.text().await?;
                             json!({"result": "text", "text": text})
                         }
                         "hover" => {
+                            let element = prepare_interactable_element(client, &selector).await?;
                             hover_element(client, &element).await?;
                             json!({"result": "hovered"})
                         }
                         "check" => {
+                            let element = prepare_interactable_element(client, &selector).await?;
                             let checked_before = element_checked(&element).await?;
                             if !checked_before {
-                                element.click().await?;
+                                click_with_recovery(client, &selector).await?;
                             }
-                            let checked_after = element_checked(&element).await?;
+                            let refreshed = find_element(client, &selector).await?;
+                            let checked_after = element_checked(&refreshed).await?;
                             json!({
                                 "result": "checked",
                                 "checked_before": checked_before,
@@ -1415,6 +1669,12 @@ mod native_backend {
                         "data": payload,
                     }))
                 }
+            }
+        }
+
+        pub async fn reset_session(&mut self) {
+            if let Some(client) = self.client.take() {
+                let _ = client.close().await;
             }
         }
 
@@ -1521,6 +1781,10 @@ mod native_backend {
         }
     }
 
+    const INTERACTABLE_TIMEOUT_MS: u64 = 5_000;
+    const INTERACTABLE_POLL_MS: u64 = 120;
+    const INTERACTABLE_RETRY_DELAY_MS: u64 = 180;
+
     async fn wait_for_selector(client: &Client, selector: &str) -> Result<()> {
         match parse_selector(selector) {
             SelectorKind::Css(css) => {
@@ -1541,6 +1805,46 @@ mod native_backend {
         Ok(())
     }
 
+    async fn prepare_interactable_element(
+        client: &Client,
+        selector: &str,
+    ) -> Result<fantoccini::elements::Element> {
+        wait_for_selector(client, selector).await?;
+        wait_for_interactable_element(
+            client,
+            selector,
+            Duration::from_millis(INTERACTABLE_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    async fn wait_for_interactable_element(
+        client: &Client,
+        selector: &str,
+        timeout: Duration,
+    ) -> Result<fantoccini::elements::Element> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(element) = find_element(client, selector).await {
+                let _ = scroll_element_into_view(client, &element).await;
+                let visible = element.is_displayed().await.unwrap_or(false);
+                let disabled = element_disabled(&element).await.unwrap_or(false);
+                if visible && !disabled {
+                    return Ok(element);
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Element '{selector}' became visible in DOM but stayed non-interactable for {}ms",
+                    timeout.as_millis()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_POLL_MS)).await;
+        }
+    }
+
     async fn find_element(
         client: &Client,
         selector: &str,
@@ -1556,6 +1860,125 @@ mod native_backend {
                 .with_context(|| format!("Failed to find element by XPath '{xpath}'"))?,
         };
         Ok(element)
+    }
+
+    async fn scroll_element_into_view(
+        client: &Client,
+        element: &fantoccini::elements::Element,
+    ) -> Result<()> {
+        let element_arg = serde_json::to_value(element)
+            .context("Failed to serialize element for scrollIntoView")?;
+        client
+            .execute(
+                r#"const el = arguments[0];
+if (!el || typeof el.scrollIntoView !== "function") return false;
+try {
+  el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+} catch (_) {
+  el.scrollIntoView(true);
+}
+return true;"#,
+                vec![element_arg],
+            )
+            .await
+            .context("Failed to execute scrollIntoView for element")?;
+        Ok(())
+    }
+
+    async fn element_disabled(element: &fantoccini::elements::Element) -> Result<bool> {
+        let disabled = element
+            .prop("disabled")
+            .await
+            .context("Failed to read disabled property")?
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(disabled.as_str(), "true" | "disabled" | "1") {
+            return Ok(true);
+        }
+
+        let aria_disabled = element
+            .attr("aria-disabled")
+            .await
+            .context("Failed to read aria-disabled attribute")?
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Ok(matches!(aria_disabled.as_str(), "true" | "1"))
+    }
+
+    async fn javascript_click(
+        client: &Client,
+        element: &fantoccini::elements::Element,
+    ) -> Result<()> {
+        let element_arg =
+            serde_json::to_value(element).context("Failed to serialize element for JS click")?;
+        client
+            .execute(
+                r#"const el = arguments[0];
+if (!el) return false;
+el.click();
+return true;"#,
+                vec![element_arg],
+            )
+            .await
+            .context("Failed JavaScript click fallback")?;
+        Ok(())
+    }
+
+    fn is_non_interactable_cmd_error(err: &CmdError) -> bool {
+        let message = format!("{err:#}").to_ascii_lowercase();
+        message.contains("element not interactable")
+            || message.contains("element click intercepted")
+            || message.contains("not clickable")
+    }
+
+    async fn click_with_recovery(client: &Client, selector: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        if let Err(err) = element.click().await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            match retry_element.click().await {
+                Ok(()) => {}
+                Err(retry_err) if is_non_interactable_cmd_error(&retry_err) => {
+                    javascript_click(client, &retry_element).await?;
+                }
+                Err(retry_err) => return Err(retry_err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn fill_with_recovery(client: &Client, selector: &str, value: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        let _ = element.clear().await;
+        if let Err(err) = element.send_keys(value).await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            let _ = retry_element.clear().await;
+            retry_element.send_keys(value).await?;
+        }
+        Ok(())
+    }
+
+    async fn type_with_recovery(client: &Client, selector: &str, text: &str) -> Result<()> {
+        let element = prepare_interactable_element(client, selector).await?;
+        if let Err(err) = element.send_keys(text).await {
+            if !is_non_interactable_cmd_error(&err) {
+                return Err(err.into());
+            }
+
+            tokio::time::sleep(Duration::from_millis(INTERACTABLE_RETRY_DELAY_MS)).await;
+            let retry_element = prepare_interactable_element(client, selector).await?;
+            retry_element.send_keys(text).await?;
+        }
+        Ok(())
     }
 
     async fn hover_element(client: &Client, element: &fantoccini::elements::Element) -> Result<()> {
@@ -1947,6 +2370,21 @@ fn unavailable_action_for_backend_error(action: &str, backend: ResolvedBackend) 
     )
 }
 
+fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+
+    if message.contains("invalid session id")
+        || message.contains("no such window")
+        || message.contains("session not created")
+        || message.contains("connection reset")
+        || message.contains("broken pipe")
+    {
+        return true;
+    }
+
+    message.contains("webdriver") && (message.contains("timed out") || message.contains("timeout"))
+}
+
 fn normalize_domains(domains: Vec<String>) -> Vec<String> {
     domains
         .into_iter()
@@ -2091,6 +2529,16 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_dir(src, dst).expect("symlink should be created");
+    }
 
     #[test]
     fn normalize_domains_works() {
@@ -2255,6 +2703,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "auto".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2271,6 +2723,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2283,6 +2739,86 @@ mod tests {
     }
 
     #[test]
+    fn auto_backend_priority_defaults_when_unset() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "auto".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        assert_eq!(
+            tool.auto_backend_priority().unwrap(),
+            vec![
+                BrowserBackendKind::AgentBrowser,
+                BrowserBackendKind::RustNative,
+                BrowserBackendKind::ComputerUse
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_backend_priority_accepts_custom_order_and_dedupes() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "auto".into(),
+            vec![
+                "computer_use".into(),
+                "agent_browser".into(),
+                "computer_use".into(),
+            ],
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        assert_eq!(
+            tool.auto_backend_priority().unwrap(),
+            vec![
+                BrowserBackendKind::ComputerUse,
+                BrowserBackendKind::AgentBrowser
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_backend_priority_rejects_invalid_entries() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "auto".into(),
+            vec!["auto".into(), "unknown".into()],
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        assert!(tool.auto_backend_priority().is_err());
+    }
+
+    #[test]
     fn computer_use_endpoint_rejects_public_http_by_default() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new_with_backend(
@@ -2290,6 +2826,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2310,6 +2850,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2331,6 +2875,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2349,6 +2897,54 @@ mod tests {
             .is_err());
         assert!(tool
             .validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
+            .is_err());
+    }
+
+    #[test]
+    fn screenshot_path_validation_blocks_escaped_paths() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        assert!(tool.validate_output_path("path", "/etc/passwd").is_err());
+        assert!(tool.validate_output_path("path", "../outside.png").is_err());
+        assert!(tool
+            .validate_output_path("path", "captures/page.png")
+            .is_ok());
+    }
+
+    #[test]
+    fn computer_use_key_actions_validate_params() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        let key_type_args = serde_json::json!({"text": "hello"});
+        assert!(tool
+            .validate_computer_use_action("key_type", key_type_args.as_object().unwrap())
+            .is_ok());
+        let missing_key_type = serde_json::json!({});
+        assert!(tool
+            .validate_computer_use_action("key_type", missing_key_type.as_object().unwrap())
+            .is_err());
+
+        let key_press_args = serde_json::json!({"key": "Enter"});
+        assert!(tool
+            .validate_computer_use_action("key_press", key_press_args.as_object().unwrap())
+            .is_ok());
+        let bad_key_press_args = serde_json::json!({"key": "Ctrl+Shift+Enter!!"});
+        assert!(tool
+            .validate_computer_use_action("key_press", bad_key_press_args.as_object().unwrap())
             .is_err());
     }
 
@@ -2376,6 +2972,7 @@ mod tests {
         assert!(tool.validate_url("https://127.0.0.1").is_err());
 
         // Invalid - not https
+        assert!(tool.validate_url("http://example.com").is_err());
         assert!(tool.validate_url("ftp://example.com").is_err());
 
         // file:// URLs blocked (local file exfiltration risk)
@@ -2411,5 +3008,50 @@ mod tests {
             unavailable_action_for_backend_error("mouse_move", ResolvedBackend::RustNative),
             "Action 'mouse_move' is unavailable for backend 'rust_native'"
         );
+    }
+
+    #[test]
+    fn recoverable_error_detection_matches_session_patterns() {
+        for message in [
+            "invalid session id",
+            "No Such Window",
+            "session not created",
+            "connection reset by peer",
+            "broken pipe while writing webdriver command",
+            "WebDriver request timed out",
+        ] {
+            let err = anyhow::anyhow!(message);
+            assert!(is_recoverable_rust_native_error(&err), "{message}");
+        }
+
+        let allowlist_error =
+            anyhow::anyhow!("URL host 'localhost' is not in browser allowlist [example.com]");
+        assert!(!is_recoverable_rust_native_error(&allowlist_error));
+    }
+
+    #[test]
+    fn non_recoverable_error_detection_rejects_policy_errors() {
+        for message in [
+            "Blocked by security policy",
+            "URL host '127.0.0.1' is private and disallowed",
+            "Action 'mouse_move' is unavailable for backend 'rust_native'",
+        ] {
+            let err = anyhow::anyhow!(message);
+            assert!(!is_recoverable_rust_native_error(&err), "{message}");
+        }
+    }
+
+    #[cfg(feature = "browser-native")]
+    #[test]
+    fn reset_session_is_idempotent_without_client() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread tokio runtime should build for browser test");
+        runtime.block_on(async {
+            let mut state = native_backend::NativeBrowserState::default();
+            state.reset_session().await;
+            state.reset_session().await;
+        });
     }
 }

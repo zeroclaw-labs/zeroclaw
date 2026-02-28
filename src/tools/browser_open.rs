@@ -1,55 +1,94 @@
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{
+    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
+};
+use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Open approved HTTPS URLs in Brave Browser (no scraping, no DOM automation).
+/// Browser selection for the browser_open tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserChoice {
+    /// Only register the browser automation tool, not browser_open
+    Disable,
+    /// Brave Browser
+    Brave,
+    /// Google Chrome
+    Chrome,
+    /// Mozilla Firefox
+    Firefox,
+    /// Microsoft Edge
+    Edge,
+    /// Use the OS default browser
+    Default,
+}
+
+impl BrowserChoice {
+    /// Parse from config string
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "disable" => Self::Disable,
+            "brave" => Self::Brave,
+            "chrome" => Self::Chrome,
+            "firefox" => Self::Firefox,
+            "edge" | "msedge" => Self::Edge,
+            "default" | "" => Self::Default,
+            _ => Self::Disable,
+        }
+    }
+
+    /// Human-readable name
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Disable => "disabled",
+            Self::Brave => "Brave Browser",
+            Self::Chrome => "Google Chrome",
+            Self::Firefox => "Mozilla Firefox",
+            Self::Edge => "Microsoft Edge",
+            Self::Default => "default browser",
+        }
+    }
+}
+
+/// Open approved HTTPS URLs in the configured browser (no scraping, no DOM automation).
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    url_access: UrlAccessConfig,
+    browser: BrowserChoice,
 }
 
 impl BrowserOpenTool {
-    pub fn new(security: Arc<SecurityPolicy>, allowed_domains: Vec<String>) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        url_access: UrlAccessConfig,
+        browser: BrowserChoice,
+    ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
+            url_access,
+            browser,
         }
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        let url = raw_url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("https://") {
-            anyhow::bail!("Only https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
-        }
-
-        Ok(url.to_string())
+        validate_url(
+            raw_url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &[],
+                allowed_field_name: "browser.allowed_domains",
+                blocked_field_name: None,
+                empty_allowed_message: "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpsOnly,
+                ipv6_error_context: "browser_open",
+                url_access: Some(&self.url_access),
+            },
+        )
     }
 }
 
@@ -60,7 +99,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in Brave Browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open an approved HTTPS URL in a browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +108,7 @@ impl Tool for BrowserOpenTool {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "HTTPS URL to open in Brave Browser"
+                    "description": "HTTPS URL to open"
                 }
             },
             "required": ["url"]
@@ -109,210 +148,376 @@ impl Tool for BrowserOpenTool {
             }
         };
 
-        match open_in_brave(&url).await {
+        match open_in_browser(&url, self.browser).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Opened in Brave: {url}"),
+                output: format!("Opened in {}: {url}", self.browser.name()),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to open Brave Browser: {e}")),
+                error: Some(format!("Failed to open {}: {e}", self.browser.name())),
             }),
         }
     }
 }
 
+/// Platform-specific browser launch implementation
+async fn open_in_browser(url: &str, browser: BrowserChoice) -> anyhow::Result<()> {
+    match browser {
+        BrowserChoice::Disable => {
+            anyhow::bail!("browser_open tool is disabled");
+        }
+        BrowserChoice::Brave => open_in_brave(url).await,
+        BrowserChoice::Chrome => open_in_chrome(url).await,
+        BrowserChoice::Firefox => open_in_firefox(url).await,
+        BrowserChoice::Edge => open_in_edge(url).await,
+        BrowserChoice::Default => open_in_default(url).await,
+    }
+}
+
+// macOS implementations
+#[cfg(target_os = "macos")]
 async fn open_in_brave(url: &str) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        for app in ["Brave Browser", "Brave"] {
-            let status = tokio::process::Command::new("open")
-                .arg("-a")
-                .arg(app)
-                .arg(url)
-                .status()
-                .await;
-
-            if let Ok(s) = status {
-                if s.success() {
-                    return Ok(());
-                }
-            }
-        }
-        anyhow::bail!(
-            "Brave Browser was not found (tried macOS app names 'Brave Browser' and 'Brave')"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut last_error = String::new();
-        for cmd in ["brave-browser", "brave"] {
-            match tokio::process::Command::new(cmd).arg(url).status().await {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    last_error = format!("{cmd} exited with status {status}");
-                }
-                Err(e) => {
-                    last_error = format!("{cmd} not runnable: {e}");
-                }
-            }
-        }
-        anyhow::bail!("{last_error}");
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let status = tokio::process::Command::new("cmd")
-            .args(["/C", "start", "", "brave", url])
+    for app in ["Brave Browser", "Brave"] {
+        let status = tokio::process::Command::new("open")
+            .arg("-a")
+            .arg(app)
+            .arg(url)
             .status()
-            .await?;
+            .await;
 
+        if let Ok(s) = status {
+            if s.success() {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!(
+        "Brave Browser was not found (tried macOS app names 'Brave Browser' and 'Brave')"
+    );
+}
+
+#[cfg(target_os = "macos")]
+async fn open_in_chrome(url: &str) -> anyhow::Result<()> {
+    for app in ["Google Chrome", "Chrome", "Chromium"] {
+        let status = tokio::process::Command::new("open")
+            .arg("-a")
+            .arg(app)
+            .arg(url)
+            .status()
+            .await;
+
+        if let Ok(s) = status {
+            if s.success() {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!(
+        "Google Chrome was not found (tried macOS app names 'Google Chrome', 'Chrome', and 'Chromium')"
+    );
+}
+
+#[cfg(target_os = "macos")]
+async fn open_in_firefox(url: &str) -> anyhow::Result<()> {
+    for app in ["Firefox", "Firefox Developer Edition"] {
+        let status = tokio::process::Command::new("open")
+            .arg("-a")
+            .arg(app)
+            .arg(url)
+            .status()
+            .await;
+
+        if let Ok(s) = status {
+            if s.success() {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!(
+        "Firefox was not found (tried macOS app names 'Firefox' and 'Firefox Developer Edition')"
+    );
+}
+
+#[cfg(target_os = "macos")]
+async fn open_in_default(url: &str) -> anyhow::Result<()> {
+    let status = tokio::process::Command::new("open")
+        .arg(url)
+        .status()
+        .await?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("open command exited with status {status}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn open_in_edge(url: &str) -> anyhow::Result<()> {
+    for app in ["Microsoft Edge", "Edge"] {
+        let status = tokio::process::Command::new("open")
+            .arg("-a")
+            .arg(app)
+            .arg(url)
+            .status()
+            .await;
+
+        if let Ok(s) = status {
+            if s.success() {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!(
+        "Microsoft Edge was not found (tried macOS app names 'Microsoft Edge' and 'Edge')"
+    );
+}
+
+// Linux implementations
+#[cfg(target_os = "linux")]
+async fn open_in_brave(url: &str) -> anyhow::Result<()> {
+    let mut last_error = String::new();
+    for cmd in ["brave-browser", "brave"] {
+        match tokio::process::Command::new(cmd).arg(url).status().await {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = format!("{cmd} exited with status {status}");
+            }
+            Err(e) => {
+                last_error = format!("{cmd} not runnable: {e}");
+            }
+        }
+    }
+    anyhow::bail!("{last_error}");
+}
+
+#[cfg(target_os = "linux")]
+async fn open_in_chrome(url: &str) -> anyhow::Result<()> {
+    let mut last_error = String::new();
+    for cmd in [
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome",
+        "chromium",
+        "chromium-browser",
+    ] {
+        match tokio::process::Command::new(cmd).arg(url).status().await {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = format!("{cmd} exited with status {status}");
+            }
+            Err(e) => {
+                last_error = format!("{cmd} not runnable: {e}");
+            }
+        }
+    }
+    anyhow::bail!("{last_error}");
+}
+
+#[cfg(target_os = "linux")]
+async fn open_in_firefox(url: &str) -> anyhow::Result<()> {
+    let mut last_error = String::new();
+    for cmd in ["firefox", "firefox-developer-edition"] {
+        match tokio::process::Command::new(cmd).arg(url).status().await {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = format!("{cmd} exited with status {status}");
+            }
+            Err(e) => {
+                last_error = format!("{cmd} not runnable: {e}");
+            }
+        }
+    }
+    anyhow::bail!("{last_error}");
+}
+
+#[cfg(target_os = "linux")]
+async fn open_in_default(url: &str) -> anyhow::Result<()> {
+    // Try xdg-open first, fall back to common browsers
+    if let Ok(status) = tokio::process::Command::new("xdg-open")
+        .arg(url)
+        .status()
+        .await
+    {
         if status.success() {
             return Ok(());
         }
+    }
 
+    // Fallback: try common browsers in order
+    for cmd in ["firefox", "google-chrome-stable", "chromium"] {
+        if let Ok(status) = tokio::process::Command::new(cmd).arg(url).status().await {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    anyhow::bail!("xdg-open and fallback browsers all failed");
+}
+
+#[cfg(target_os = "linux")]
+async fn open_in_edge(url: &str) -> anyhow::Result<()> {
+    let mut last_error = String::new();
+    for cmd in ["microsoft-edge", "microsoft-edge-stable", "edge"] {
+        match tokio::process::Command::new(cmd).arg(url).status().await {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = format!("{cmd} exited with status {status}");
+            }
+            Err(e) => {
+                last_error = format!("{cmd} not runnable: {e}");
+            }
+        }
+    }
+    anyhow::bail!("{last_error}");
+}
+
+// Windows implementations
+#[cfg(target_os = "windows")]
+fn escape_for_cmd_start(url: &str) -> String {
+    url.replace('^', "^^")
+        .replace('&', "^&")
+        .replace('|', "^|")
+        .replace('<', "^<")
+        .replace('>', "^>")
+        .replace('%', "%%")
+        .replace('"', "^\"")
+}
+
+#[cfg(target_os = "windows")]
+async fn open_in_brave(url: &str) -> anyhow::Result<()> {
+    let escaped = escape_for_cmd_start(url);
+    let status = tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg("brave")
+        .arg(format!("\"{escaped}\""))
+        .status()
+        .await?;
+
+    if status.success() {
+        Ok(())
+    } else {
         anyhow::bail!("cmd start brave exited with status {status}");
     }
+}
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = url;
-        anyhow::bail!("browser_open is not supported on this OS");
+#[cfg(target_os = "windows")]
+async fn open_in_chrome(url: &str) -> anyhow::Result<()> {
+    let escaped = escape_for_cmd_start(url);
+    let status = tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg("chrome")
+        .arg(format!("\"{escaped}\""))
+        .status()
+        .await?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("cmd start chrome exited with status {status}");
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
+#[cfg(target_os = "windows")]
+async fn open_in_firefox(url: &str) -> anyhow::Result<()> {
+    let escaped = escape_for_cmd_start(url);
+    let status = tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg("firefox")
+        .arg(format!("\"{escaped}\""))
+        .status()
+        .await?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("cmd start firefox exited with status {status}");
+    }
 }
 
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
+#[cfg(target_os = "windows")]
+async fn open_in_default(url: &str) -> anyhow::Result<()> {
+    let escaped = escape_for_cmd_start(url);
+    let status = tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg(format!("\"{escaped}\""))
+        .status()
+        .await?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("cmd start exited with status {status}");
     }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
 }
 
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
+#[cfg(target_os = "windows")]
+async fn open_in_edge(url: &str) -> anyhow::Result<()> {
+    let escaped = escape_for_cmd_start(url);
+    let status = tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg("msedge")
+        .arg(format!("\"{escaped}\""))
+        .status()
+        .await?;
 
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("cmd start msedge exited with status {status}");
     }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in browser_open");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
 }
 
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+// Unsupported platform
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn open_in_brave(url: &str) -> anyhow::Result<()> {
+    let _ = url;
+    anyhow::bail!("browser_open is not supported on this OS");
 }
 
-fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
-        return true;
-    }
-
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
-    }
-
-    false
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn open_in_chrome(url: &str) -> anyhow::Result<()> {
+    let _ = url;
+    anyhow::bail!("browser_open is not supported on this OS");
 }
 
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn open_in_firefox(url: &str) -> anyhow::Result<()> {
+    let _ = url;
+    anyhow::bail!("browser_open is not supported on this OS");
+}
 
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn open_in_edge(url: &str) -> anyhow::Result<()> {
+    let _ = url;
+    anyhow::bail!("browser_open is not supported on this OS");
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn open_in_default(url: &str) -> anyhow::Result<()> {
+    let _ = url;
+    anyhow::bail!("browser_open is not supported on this OS");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::url_validation::normalize_domain;
 
     fn test_tool(allowed_domains: Vec<&str>) -> BrowserOpenTool {
         let security = Arc::new(SecurityPolicy {
@@ -322,6 +527,8 @@ mod tests {
         BrowserOpenTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
+            UrlAccessConfig::default(),
+            BrowserChoice::Default,
         )
     }
 
@@ -368,6 +575,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_subdomain_pattern() {
+        let tool = test_tool(vec!["*.example.com"]);
+        assert!(tool.validate_url("https://example.com").is_ok());
+        assert!(tool.validate_url("https://sub.example.com").is_ok());
+        assert!(tool.validate_url("https://other.com").is_err());
     }
 
     #[test]
@@ -433,24 +648,17 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserOpenTool::new(security, vec![]);
+        let tool = BrowserOpenTool::new(
+            security,
+            vec![],
+            UrlAccessConfig::default(),
+            BrowserChoice::Default,
+        );
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
     }
 
     #[tokio::test]
@@ -459,7 +667,12 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(
+            security,
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            BrowserChoice::Default,
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -474,12 +687,42 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(
+            security,
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            BrowserChoice::Default,
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    #[test]
+    fn browser_choice_from_str() {
+        assert_eq!(BrowserChoice::from_str("disable"), BrowserChoice::Disable);
+        assert_eq!(BrowserChoice::from_str("Disable"), BrowserChoice::Disable);
+        assert_eq!(BrowserChoice::from_str("DISABLE"), BrowserChoice::Disable);
+        assert_eq!(BrowserChoice::from_str("brave"), BrowserChoice::Brave);
+        assert_eq!(BrowserChoice::from_str("chrome"), BrowserChoice::Chrome);
+        assert_eq!(BrowserChoice::from_str("firefox"), BrowserChoice::Firefox);
+        assert_eq!(BrowserChoice::from_str("edge"), BrowserChoice::Edge);
+        assert_eq!(BrowserChoice::from_str("msedge"), BrowserChoice::Edge);
+        assert_eq!(BrowserChoice::from_str("default"), BrowserChoice::Default);
+        assert_eq!(BrowserChoice::from_str(""), BrowserChoice::Default);
+        assert_eq!(BrowserChoice::from_str("unknown"), BrowserChoice::Disable);
+    }
+
+    #[test]
+    fn browser_choice_name() {
+        assert_eq!(BrowserChoice::Disable.name(), "disabled");
+        assert_eq!(BrowserChoice::Brave.name(), "Brave Browser");
+        assert_eq!(BrowserChoice::Chrome.name(), "Google Chrome");
+        assert_eq!(BrowserChoice::Firefox.name(), "Mozilla Firefox");
+        assert_eq!(BrowserChoice::Edge.name(), "Microsoft Edge");
+        assert_eq!(BrowserChoice::Default.name(), "default browser");
     }
 }

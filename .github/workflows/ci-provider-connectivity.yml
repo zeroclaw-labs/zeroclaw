@@ -1,0 +1,112 @@
+name: CI Provider Connectivity
+
+on:
+    schedule:
+        - cron: "30 */6 * * *" # Every 6 hours
+    workflow_dispatch:
+        inputs:
+            fail_on_critical:
+                description: "Fail run when critical endpoints are unreachable"
+                required: true
+                default: false
+                type: boolean
+    pull_request:
+        branches: [dev, main]
+        paths:
+            - ".github/workflows/ci-provider-connectivity.yml"
+            - ".github/connectivity/providers.json"
+            - "scripts/ci/provider_connectivity_matrix.py"
+    push:
+        branches: [dev, main]
+        paths:
+            - ".github/workflows/ci-provider-connectivity.yml"
+            - ".github/connectivity/providers.json"
+            - "scripts/ci/provider_connectivity_matrix.py"
+
+concurrency:
+    group: provider-connectivity-${{ github.event.pull_request.number || github.ref || github.run_id }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
+jobs:
+    probe:
+        name: Provider Connectivity Probe
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 20
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Run connectivity matrix probe
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  fail_on_critical="false"
+                  case "${GITHUB_EVENT_NAME}" in
+                    schedule)
+                      fail_on_critical="true"
+                      ;;
+                    workflow_dispatch)
+                      fail_on_critical="${{ github.event.inputs.fail_on_critical || 'false' }}"
+                      ;;
+                  esac
+
+                  cmd=(python3 scripts/ci/provider_connectivity_matrix.py
+                    --config .github/connectivity/providers.json
+                    --output-json artifacts/provider-connectivity-matrix.json
+                    --output-md artifacts/provider-connectivity-matrix.md)
+                  if [ "$fail_on_critical" = "true" ]; then
+                    cmd+=(--fail-on-critical)
+                  fi
+                  "${cmd[@]}"
+
+            - name: Emit normalized audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/provider-connectivity-matrix.json ]; then
+                    python3 scripts/ci/emit_audit_event.py \
+                      --event-type provider_connectivity \
+                      --input-json artifacts/provider-connectivity-matrix.json \
+                      --output-json artifacts/audit-event-provider-connectivity.json \
+                      --artifact-name provider-connectivity-audit-event \
+                      --retention-days 14
+                  fi
+
+            - name: Upload connectivity artifacts
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              if: always()
+              with:
+                  name: provider-connectivity-matrix
+                  path: artifacts/provider-connectivity-matrix.*
+                  retention-days: 14
+
+            - name: Publish summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/provider-connectivity-matrix.md ]; then
+                    cat artifacts/provider-connectivity-matrix.md >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Provider connectivity report missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+            - name: Upload audit event artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: provider-connectivity-audit-event
+                  path: artifacts/audit-event-provider-connectivity.json
+                  if-no-files-found: ignore
+                  retention-days: 14

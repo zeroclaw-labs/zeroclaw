@@ -2,7 +2,7 @@
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
-Cập nhật lần cuối: **2026-02-19**.
+Cập nhật lần cuối: **2026-02-28**.
 
 ## Cách liệt kê các Provider
 
@@ -41,6 +41,8 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | Không | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | Không | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (tùy chọn: `AWS_REGION`) |
 | `qianfan` | `baidu` | Không | `QIANFAN_API_KEY` |
+| `doubao` | `volcengine`, `ark`, `doubao-cn` | Không | `ARK_API_KEY`, `DOUBAO_API_KEY` |
+| `siliconflow` | `silicon-cloud`, `siliconcloud` | Không | `SILICONFLOW_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | Không | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | Không | `GROQ_API_KEY` |
 | `mistral` | — | Không | `MISTRAL_API_KEY` |
@@ -60,6 +62,53 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 - Xác thực có thể dùng `GEMINI_API_KEY`, `GOOGLE_API_KEY`, hoặc Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
 - Request bằng API key dùng endpoint `generativelanguage.googleapis.com/v1beta`
 - Request OAuth qua Gemini CLI dùng endpoint `cloudcode-pa.googleapis.com/v1internal` theo chuẩn Code Assist request envelope
+
+### Ghi chú về Volcengine ARK (Doubao)
+
+- Runtime provider ID: `doubao` (alias: `volcengine`, `ark`, `doubao-cn`)
+- Tên hiển thị/canonical trong onboarding: `volcengine`
+- Base API URL: `https://ark.cn-beijing.volces.com/api/v3`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Xác thực: `ARK_API_KEY` (fallback: `DOUBAO_API_KEY`)
+- Model mặc định: `doubao-1-5-pro-32k-250115`
+
+Ví dụ thiết lập nhanh:
+
+```bash
+export ARK_API_KEY="your-ark-api-key"
+zeroclaw onboard --provider volcengine --api-key "$ARK_API_KEY" --model doubao-1-5-pro-32k-250115 --force
+```
+
+Kiểm tra nhanh:
+
+```bash
+zeroclaw models refresh --provider volcengine
+zeroclaw agent --provider volcengine --model doubao-1-5-pro-32k-250115 -m "ping"
+```
+
+### Ghi chú về SiliconFlow
+
+- Provider ID: `siliconflow` (alias: `silicon-cloud`, `siliconcloud`)
+- Base API URL: `https://api.siliconflow.cn/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Xác thực: `SILICONFLOW_API_KEY`
+- Model mặc định: `Pro/zai-org/GLM-4.7`
+
+Ví dụ thiết lập nhanh:
+
+```bash
+export SILICONFLOW_API_KEY="your-siliconflow-api-key"
+zeroclaw onboard --provider siliconflow --api-key "$SILICONFLOW_API_KEY" --model Pro/zai-org/GLM-4.7 --force
+```
+
+Kiểm tra nhanh:
+
+```bash
+zeroclaw models refresh --provider siliconflow
+zeroclaw agent --provider siliconflow --model Pro/zai-org/GLM-4.7 -m "ping"
+```
 
 ### Ghi chú về Ollama Vision
 
@@ -93,6 +142,40 @@ Hành vi:
 - `false`: gửi `think: false` đến các yêu cầu Ollama `/api/chat`.
 - `true`: gửi `think: true`.
 - Không đặt: bỏ qua `think` và giữ nguyên mặc định của Ollama/model.
+
+### Ghi đè Vision cho Ollama
+
+Một số model Ollama hỗ trợ vision (ví dụ `llava`, `llama3.2-vision`) trong khi các model khác thì không.
+Vì ZeroClaw không thể tự động phát hiện, bạn có thể ghi đè trong `config.toml`:
+
+```toml
+default_provider = "ollama"
+default_model = "llava"
+model_support_vision = true
+```
+
+Hành vi:
+
+- `true`: bật xử lý hình ảnh đính kèm trong vòng lặp agent.
+- `false`: tắt vision ngay cả khi provider báo hỗ trợ.
+- Không đặt: dùng mặc định của provider.
+
+Biến môi trường: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
+
+### Mức reasoning của OpenAI Codex
+
+Bạn có thể điều chỉnh mức reasoning của OpenAI Codex từ `config.toml`:
+
+```toml
+[provider]
+reasoning_level = "high"
+```
+
+Hành vi:
+
+- Giá trị hỗ trợ: `minimal`, `low`, `medium`, `high`, `xhigh` (không phân biệt hoa/thường).
+- Khi đặt, ghi đè `ZEROCLAW_CODEX_REASONING_EFFORT`.
+- Không đặt sẽ dùng `ZEROCLAW_CODEX_REASONING_EFFORT` nếu có, nếu không mặc định `xhigh`.
 
 ### Ghi chú về Kimi Code
 

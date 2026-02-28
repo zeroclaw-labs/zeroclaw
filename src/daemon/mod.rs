@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,6 +9,22 @@ use tokio::time::Duration;
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Pre-flight: check if port is already in use by another zeroclaw daemon
+    if let Err(_e) = check_port_available(&host, port).await {
+        // Port is in use - check if it's our daemon
+        if is_zeroclaw_daemon_running(&host, port).await {
+            tracing::info!("ZeroClaw daemon already running on {host}:{port}");
+            println!("✓ ZeroClaw daemon already running on http://{host}:{port}");
+            println!("  Use 'zeroclaw restart' to restart, or 'zeroclaw status' to check health.");
+            return Ok(());
+        }
+        // Something else is using the port
+        bail!(
+            "Port {port} is already in use by another process. \
+             Run 'lsof -i :{port}' to identify it, or use a different port."
+        );
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -181,6 +197,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         observer,
     );
+    let delivery = heartbeat_delivery_target(&config)?;
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -188,7 +205,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     loop {
         interval.tick().await;
 
-        let tasks = engine.collect_tasks().await?;
+        let file_tasks = engine.collect_tasks().await?;
+        let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
         if tasks.is_empty() {
             continue;
         }
@@ -196,7 +214,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(
+            match crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -207,13 +225,136 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-            } else {
-                crate::health::mark_component_ok("heartbeat");
+                Ok(output) => {
+                    crate::health::mark_component_ok("heartbeat");
+                    if let Some(announcement) = heartbeat_announcement_text(&output) {
+                        if let Some((channel, target)) = &delivery {
+                            if let Err(e) = crate::cron::scheduler::deliver_announcement(
+                                &config,
+                                channel,
+                                target,
+                                &announcement,
+                            )
+                            .await
+                            {
+                                crate::health::mark_component_error(
+                                    "heartbeat",
+                                    format!("delivery failed: {e}"),
+                                );
+                                tracing::warn!("Heartbeat delivery failed: {e}");
+                            }
+                        }
+                    } else {
+                        tracing::debug!("Heartbeat returned NO_REPLY sentinel; skipping delivery");
+                    }
+                }
+                Err(e) => {
+                    crate::health::mark_component_error("heartbeat", e.to_string());
+                    tracing::warn!("Heartbeat task failed: {e}");
+                }
             }
         }
     }
+}
+
+fn heartbeat_announcement_text(output: &str) -> Option<String> {
+    if crate::cron::scheduler::is_no_reply_sentinel(output) {
+        return None;
+    }
+    if output.trim().is_empty() {
+        return Some("heartbeat task executed".to_string());
+    }
+    Some(output.to_string())
+}
+
+fn heartbeat_tasks_for_tick(
+    file_tasks: Vec<String>,
+    fallback_message: Option<&str>,
+) -> Vec<String> {
+    if !file_tasks.is_empty() {
+        return file_tasks;
+    }
+
+    fallback_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(|message| vec![message.to_string()])
+        .unwrap_or_default()
+}
+
+fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>> {
+    let channel = config
+        .heartbeat
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target = config
+        .heartbeat
+        .to
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (channel, target) {
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!("heartbeat.to is required when heartbeat.target is set"),
+        (None, Some(_)) => anyhow::bail!("heartbeat.target is required when heartbeat.to is set"),
+        (Some(channel), Some(target)) => {
+            validate_heartbeat_channel_config(config, channel)?;
+            Ok(Some((channel.to_string(), target.to_string())))
+        }
+    }
+}
+
+fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
+    let normalized = channel.to_ascii_lowercase();
+    match normalized.as_str() {
+        "telegram" => {
+            if config.channels_config.telegram.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to telegram but channels_config.telegram is not configured"
+                );
+            }
+        }
+        "discord" => {
+            if config.channels_config.discord.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to discord but channels_config.discord is not configured"
+                );
+            }
+        }
+        "slack" => {
+            if config.channels_config.slack.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to slack but channels_config.slack is not configured"
+                );
+            }
+        }
+        "mattermost" => {
+            if config.channels_config.mattermost.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
+                );
+            }
+        }
+        "whatsapp" | "whatsapp_web" => {
+            let wa = config.channels_config.whatsapp.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "heartbeat.target is set to {channel} but channels_config.whatsapp is not configured"
+                )
+            })?;
+
+            if normalized == "whatsapp_web" && wa.is_cloud_config() && !wa.is_web_config() {
+                anyhow::bail!(
+                    "heartbeat.target is set to whatsapp_web but channels_config.whatsapp is configured for cloud mode (set session_path for web mode)"
+                );
+            }
+        }
+        other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
+    }
+
+    Ok(())
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
@@ -222,6 +363,49 @@ fn has_supervised_channels(config: &Config) -> bool {
         .channels_except_webhook()
         .iter()
         .any(|(_, ok)| *ok)
+}
+
+/// Check if a port is available for binding
+async fn check_port_available(host: &str, port: u16) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            // Successfully bound - close it and return Ok
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            bail!("Port {} is already in use", port)
+        }
+        Err(e) => bail!("Failed to check port {}: {}", port, e),
+    }
+}
+
+/// Check if a running daemon on this port is our zeroclaw daemon
+async fn is_zeroclaw_daemon_running(host: &str, port: u16) -> bool {
+    let url = format!("http://{}:{}/health", host, port);
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    // Check if response looks like our health endpoint
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        // Our health endpoint has "status" and "runtime.components"
+                        json.get("status").is_some() && json.get("runtime").is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +486,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply: None,
+            base_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -327,6 +513,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -338,6 +525,8 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -352,5 +541,157 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn heartbeat_tasks_use_file_tasks_when_available() {
+        let tasks =
+            heartbeat_tasks_for_tick(vec!["From file".to_string()], Some("Fallback from config"));
+        assert_eq!(tasks, vec!["From file".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_tasks_fall_back_to_config_message() {
+        let tasks = heartbeat_tasks_for_tick(vec![], Some("  check london time  "));
+        assert_eq!(tasks, vec!["check london time".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_tasks_ignore_empty_fallback_message() {
+        let tasks = heartbeat_tasks_for_tick(vec![], Some("   "));
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_skips_no_reply_sentinel() {
+        assert!(heartbeat_announcement_text(" NO_reply ").is_none());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_uses_default_for_empty_output() {
+        assert_eq!(
+            heartbeat_announcement_text(" \n\t "),
+            Some("heartbeat task executed".to_string())
+        );
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_keeps_regular_output() {
+        assert_eq!(
+            heartbeat_announcement_text("system nominal"),
+            Some("system nominal".to_string())
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_none_when_unset() {
+        let config = Config::default();
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_requires_to_field() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("heartbeat.to is required when heartbeat.target is set"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_requires_target_field() {
+        let mut config = Config::default();
+        config.heartbeat.to = Some("123456".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("heartbeat.target is required when heartbeat.to is set"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_unsupported_channel() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("email".into());
+        config.heartbeat.to = Some("ops@example.com".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported heartbeat.target channel"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_requires_channel_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        config.heartbeat.to = Some("123456".into());
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("channels_config.telegram is not configured"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_telegram_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        config.heartbeat.to = Some("123456".into());
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "bot-token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            group_reply: None,
+            base_url: None,
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_whatsapp_web_target_in_web_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("whatsapp_web".to_string(), "+15551234567".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_whatsapp_web_target_in_cloud_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("token".into()),
+            phone_number_id: Some("123456".into()),
+            verify_token: Some("verify".into()),
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err.to_string().contains("configured for cloud mode"));
     }
 }

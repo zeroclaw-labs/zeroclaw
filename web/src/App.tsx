@@ -16,13 +16,13 @@ import { setLocale, type Locale } from './lib/i18n';
 
 // Locale context
 interface LocaleContextType {
-  locale: string;
-  setAppLocale: (locale: string) => void;
+  locale: Locale;
+  setAppLocale: (locale: Locale) => void;
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
   locale: 'tr',
-  setAppLocale: () => {},
+  setAppLocale: (_locale: Locale) => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -80,12 +80,12 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 }
 
 function AppContent() {
-  const { isAuthenticated, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const { isAuthenticated, loading, pair, logout } = useAuth();
+  const [locale, setLocaleState] = useState<Locale>('tr');
 
-  const setAppLocale = (newLocale: string) => {
+  const setAppLocale = (newLocale: Locale) => {
     setLocaleState(newLocale);
-    setLocale(newLocale as Locale);
+    setLocale(newLocale);
   };
 
   // Listen for 401 events to force logout
@@ -96,6 +96,14 @@ function AppContent() {
     window.addEventListener('zeroclaw-unauthorized', handler);
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
   }, [logout]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <p className="text-gray-400">Connecting...</p>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return <PairingDialog onPair={pair} />;

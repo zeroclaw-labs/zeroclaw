@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -68,6 +68,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -83,6 +85,14 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +220,7 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -291,6 +301,44 @@ impl AnthropicProvider {
         })
     }
 
+    fn parse_inline_image(marker_content: &str) -> Option<NativeContentOut> {
+        let rest = marker_content.strip_prefix("data:")?;
+        let semi_pos = rest.find(';')?;
+        let media_type = rest[..semi_pos].to_string();
+        let after_semi = &rest[semi_pos + 1..];
+        let data = after_semi.strip_prefix("base64,")?;
+        Some(NativeContentOut::Image {
+            source: ImageSource {
+                kind: "base64",
+                media_type,
+                data: data.to_string(),
+            },
+        })
+    }
+
+    fn build_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
+        let (text_part, image_refs) = crate::multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }];
+        }
+        let mut blocks = Vec::new();
+        if !text_part.trim().is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: text_part,
+                cache_control: None,
+            });
+        }
+        for marker_content in image_refs {
+            if let Some(image_block) = Self::parse_inline_image(&marker_content) {
+                blocks.push(image_block);
+            }
+        }
+        blocks
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
@@ -334,10 +382,7 @@ impl AnthropicProvider {
                 _ => {
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: Self::build_user_content_blocks(&msg.content),
                     });
                 }
             }
@@ -512,6 +557,13 @@ impl Provider for AnthropicProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
     }
 
     async fn chat_with_tools(
@@ -1352,5 +1404,13 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn capabilities_reports_vision_and_native_tool_calling() {
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let caps = provider.capabilities();
+        assert!(caps.vision);
+        assert!(caps.native_tool_calling);
     }
 }

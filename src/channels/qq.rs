@@ -1,14 +1,18 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::schema::QQEnvironment;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use ring::signature::Ed25519KeyPair;
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
+const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
@@ -18,6 +22,11 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_remote_media_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("https://") || trimmed.starts_with("http://")
 }
 
 fn is_image_filename(filename: &str) -> bool {
@@ -57,6 +66,32 @@ fn extract_image_marker_from_attachment(attachment: &serde_json::Value) -> Optio
     Some(format!("[IMAGE:{url}]"))
 }
 
+fn parse_image_marker_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let marker = trimmed.strip_prefix("[IMAGE:")?.strip_suffix(']')?.trim();
+    if marker.is_empty() {
+        return None;
+    }
+    Some(marker)
+}
+
+fn parse_outgoing_content(content: &str) -> (String, Vec<String>) {
+    let mut passthrough_lines = Vec::new();
+    let mut image_urls = Vec::new();
+
+    for line in content.lines() {
+        if let Some(marker_target) = parse_image_marker_line(line) {
+            if is_remote_media_url(marker_target) {
+                image_urls.push(marker_target.to_string());
+                continue;
+            }
+        }
+        passthrough_lines.push(line);
+    }
+
+    (passthrough_lines.join("\n").trim().to_string(), image_urls)
+}
+
 fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
     let text = payload
         .get("content")
@@ -90,6 +125,113 @@ fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
     Some(format!("{text}\n\n{}", image_markers.join("\n")))
 }
 
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn build_channel_message(
+    sender: &str,
+    reply_target: String,
+    content: String,
+    msg_id: &str,
+) -> ChannelMessage {
+    ChannelMessage {
+        id: Uuid::new_v4().to_string(),
+        sender: sender.to_string(),
+        reply_target,
+        content,
+        channel: "qq".to_string(),
+        timestamp: current_unix_timestamp_secs(),
+        thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
+    }
+}
+
+fn extract_message_id(payload: &serde_json::Value) -> &str {
+    payload
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("msg_id").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn qq_seed_from_secret(secret: &str) -> Option<[u8; 32]> {
+    let bytes = secret.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut seed = [0_u8; 32];
+    for (idx, slot) in seed.iter_mut().enumerate() {
+        *slot = bytes[idx % bytes.len()];
+    }
+    Some(seed)
+}
+
+fn qq_webhook_validation_signature(
+    app_secret: &str,
+    event_ts: &str,
+    plain_token: &str,
+) -> Option<String> {
+    let seed = qq_seed_from_secret(app_secret)?;
+    let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed).ok()?;
+    let mut payload = String::with_capacity(event_ts.len() + plain_token.len());
+    payload.push_str(event_ts);
+    payload.push_str(plain_token);
+    Some(hex::encode(key_pair.sign(payload.as_bytes()).as_ref()))
+}
+
+fn apply_passive_reply_fields(body: &mut Map<String, Value>, msg_id: Option<&str>, msg_seq: u64) {
+    if let Some(msg_id) = msg_id {
+        body.insert("msg_id".to_string(), Value::String(msg_id.to_string()));
+        body.insert("msg_seq".to_string(), Value::from(msg_seq));
+    }
+}
+
+fn build_text_message_body(content: &str, msg_id: Option<&str>, msg_seq: u64) -> Option<Value> {
+    let text = content.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut body = Map::new();
+    body.insert("content".to_string(), Value::String(text.to_string()));
+    body.insert("msg_type".to_string(), Value::from(0));
+    apply_passive_reply_fields(&mut body, msg_id, msg_seq);
+
+    Some(Value::Object(body))
+}
+
+fn build_media_message_body(file_info: &str, msg_id: Option<&str>, msg_seq: u64) -> Value {
+    let mut body = Map::new();
+    body.insert("content".to_string(), Value::String(" ".to_string()));
+    body.insert("msg_type".to_string(), Value::from(7));
+    body.insert("media".to_string(), json!({ "file_info": file_info }));
+    apply_passive_reply_fields(&mut body, msg_id, msg_seq);
+    Value::Object(body)
+}
+
+fn resolve_send_endpoints(api_base: &str, recipient: &str) -> (String, String) {
+    if let Some(group_id) = recipient.strip_prefix("group:") {
+        (
+            format!("{api_base}/v2/groups/{group_id}/messages"),
+            format!("{api_base}/v2/groups/{group_id}/files"),
+        )
+    } else {
+        let raw_uid = recipient.strip_prefix("user:").unwrap_or(recipient);
+        let user_id: String = raw_uid
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (
+            format!("{api_base}/v2/users/{user_id}/messages"),
+            format!("{api_base}/v2/users/{user_id}/files"),
+        )
+    }
+}
+
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
 
@@ -98,6 +240,7 @@ const DEDUP_CAPACITY: usize = 10_000;
 pub struct QQChannel {
     app_id: String,
     app_secret: String,
+    environment: QQEnvironment,
     allowed_users: Vec<String>,
     /// Cached access token + expiry timestamp.
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
@@ -107,9 +250,19 @@ pub struct QQChannel {
 
 impl QQChannel {
     pub fn new(app_id: String, app_secret: String, allowed_users: Vec<String>) -> Self {
+        Self::new_with_environment(app_id, app_secret, allowed_users, QQEnvironment::Production)
+    }
+
+    pub fn new_with_environment(
+        app_id: String,
+        app_secret: String,
+        allowed_users: Vec<String>,
+        environment: QQEnvironment,
+    ) -> Self {
         Self {
             app_id,
             app_secret,
+            environment,
             allowed_users,
             token_cache: Arc::new(RwLock::new(None)),
             dedup: Arc::new(RwLock::new(HashSet::new())),
@@ -120,8 +273,211 @@ impl QQChannel {
         crate::config::build_runtime_proxy_client("channel.qq")
     }
 
+    pub fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
+    fn api_base(&self) -> &'static str {
+        match self.environment {
+            QQEnvironment::Production => QQ_API_BASE,
+            QQEnvironment::Sandbox => QQ_SANDBOX_API_BASE,
+        }
+    }
+
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    async fn parse_dispatch_message_event(
+        &self,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
+        match event_type {
+            "C2C_MESSAGE_CREATE" => {
+                let msg_id = extract_message_id(payload);
+                if self.is_duplicate(msg_id).await {
+                    return None;
+                }
+
+                let content = compose_message_content(payload)?;
+                let author_id = payload
+                    .get("author")
+                    .and_then(|a| a.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let user_openid = payload
+                    .get("author")
+                    .and_then(|a| a.get("user_openid"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(author_id);
+
+                if !self.is_user_allowed(user_openid) {
+                    tracing::warn!(
+                        "QQ: ignoring C2C message from unauthorized user: {user_openid}"
+                    );
+                    return None;
+                }
+
+                let chat_id = format!("user:{user_openid}");
+                Some(build_channel_message(user_openid, chat_id, content, msg_id))
+            }
+            "GROUP_AT_MESSAGE_CREATE" => {
+                let msg_id = extract_message_id(payload);
+                if self.is_duplicate(msg_id).await {
+                    return None;
+                }
+
+                let content = compose_message_content(payload)?;
+                let author_id = payload
+                    .get("author")
+                    .and_then(|a| a.get("member_openid"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if !self.is_user_allowed(author_id) {
+                    tracing::warn!(
+                        "QQ: ignoring group message from unauthorized user: {author_id}"
+                    );
+                    return None;
+                }
+
+                let group_openid = payload
+                    .get("group_openid")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("group_id").and_then(Value::as_str))
+                    .unwrap_or("unknown");
+                let chat_id = format!("group:{group_openid}");
+                Some(build_channel_message(author_id, chat_id, content, msg_id))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn build_webhook_validation_response(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let op = payload
+            .get("op")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if op != 13 {
+            return None;
+        }
+
+        let validation = payload.get("d")?;
+        let plain_token = validation
+            .get("plain_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?;
+        let event_ts = validation
+            .get("event_ts")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?;
+
+        let signature = qq_webhook_validation_signature(&self.app_secret, event_ts, plain_token)?;
+        Some(json!({
+            "plain_token": plain_token,
+            "signature": signature
+        }))
+    }
+
+    pub async fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        let op = payload
+            .get("op")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if op != 0 {
+            return Vec::new();
+        }
+
+        let event_type = payload
+            .get("t")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if event_type.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(dispatch_payload) = payload.get("d") else {
+            return Vec::new();
+        };
+
+        self.parse_dispatch_message_event(event_type, dispatch_payload)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    async fn post_json(
+        &self,
+        token: &str,
+        url: &str,
+        body: &Value,
+        op: &str,
+    ) -> anyhow::Result<()> {
+        ensure_https(url)?;
+
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ {op} failed ({status}): {sanitized}");
+        }
+
+        Ok(())
+    }
+
+    async fn upload_media_file_info(
+        &self,
+        token: &str,
+        files_url: &str,
+        media_url: &str,
+    ) -> anyhow::Result<String> {
+        ensure_https(files_url)?;
+        ensure_https(media_url)?;
+
+        let upload_body = json!({
+            "file_type": 1,
+            "url": media_url,
+            "srv_send_msg": false
+        });
+
+        let resp = self
+            .http_client()
+            .post(files_url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&upload_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ upload media failed ({status}): {sanitized}");
+        }
+
+        let payload: Value = resp.json().await?;
+        let file_info = payload
+            .get("file_info")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("QQ upload media response missing file_info"))?;
+
+        Ok(file_info.to_string())
     }
 
     /// Fetch an access token from QQ's OAuth2 endpoint.
@@ -141,7 +497,8 @@ impl QQChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ token request failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ token request failed ({status}): {sanitized}");
         }
 
         let data: serde_json::Value = resp.json().await?;
@@ -196,7 +553,7 @@ impl QQChannel {
     async fn get_gateway_url(&self, token: &str) -> anyhow::Result<String> {
         let resp = self
             .http_client()
-            .get(format!("{QQ_API_BASE}/gateway"))
+            .get(format!("{}/gateway", self.api_base()))
             .header("Authorization", format!("QQBot {token}"))
             .send()
             .await?;
@@ -204,7 +561,8 @@ impl QQChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ gateway request failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ gateway request failed ({status}): {sanitized}");
         }
 
         let data: serde_json::Value = resp.json().await?;
@@ -250,49 +608,35 @@ impl Channel for QQChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
+        let (message_url, files_url) = resolve_send_endpoints(self.api_base(), &message.recipient);
 
-        // Determine if this is a group or private message based on recipient format
-        // Format: "user:{openid}" or "group:{group_openid}"
-        let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
-            (
-                format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
-            )
-        } else {
-            let raw_uid = message
-                .recipient
-                .strip_prefix("user:")
-                .unwrap_or(&message.recipient);
-            let user_id: String = raw_uid
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            (
-                format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
-            )
-        };
+        let passive_msg_id = message
+            .thread_ts
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut msg_seq: u64 = 1;
 
-        ensure_https(&url)?;
+        let (text_content, image_urls) = parse_outgoing_content(&message.content);
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await?;
+        if let Some(body) = build_text_message_body(&text_content, passive_msg_id, msg_seq) {
+            self.post_json(&token, &message_url, &body, "send message")
+                .await?;
+            if passive_msg_id.is_some() {
+                msg_seq += 1;
+            }
+        }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send message failed ({status}): {err}");
+        for image_url in image_urls {
+            let file_info = self
+                .upload_media_file_info(&token, &files_url, &image_url)
+                .await?;
+            let media_body = build_media_message_body(&file_info, passive_msg_id, msg_seq);
+            self.post_json(&token, &message_url, &media_body, "send message")
+                .await?;
+            if passive_msg_id.is_some() {
+                msg_seq += 1;
+            }
         }
 
         Ok(())
@@ -428,85 +772,13 @@ impl Channel for QQChannel {
                         None => continue,
                     };
 
-                    match event_type {
-                        "C2C_MESSAGE_CREATE" => {
-                            let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if self.is_duplicate(msg_id).await {
-                                continue;
-                            }
-
-                            let Some(content) = compose_message_content(d) else {
-                                continue;
-                            };
-
-                            let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
-                            // For QQ, user_openid is the identifier
-                            let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
-
-                            if !self.is_user_allowed(user_openid) {
-                                tracing::warn!("QQ: ignoring C2C message from unauthorized user: {user_openid}");
-                                continue;
-                            }
-
-                            let chat_id = format!("user:{user_openid}");
-
-                            let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
-                                sender: user_openid.to_string(),
-                                reply_target: chat_id,
-                                content,
-                                channel: "qq".to_string(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                thread_ts: None,
-                            };
-
-                            if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("QQ: message channel closed");
-                                break;
-                            }
+                    if let Some(channel_msg) =
+                        self.parse_dispatch_message_event(event_type, d).await
+                    {
+                        if tx.send(channel_msg).await.is_err() {
+                            tracing::warn!("QQ: message channel closed");
+                            break;
                         }
-                        "GROUP_AT_MESSAGE_CREATE" => {
-                            let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if self.is_duplicate(msg_id).await {
-                                continue;
-                            }
-
-                            let Some(content) = compose_message_content(d) else {
-                                continue;
-                            };
-
-                            let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
-
-                            if !self.is_user_allowed(author_id) {
-                                tracing::warn!("QQ: ignoring group message from unauthorized user: {author_id}");
-                                continue;
-                            }
-
-                            let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
-                            let chat_id = format!("group:{group_openid}");
-
-                            let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
-                                sender: author_id.to_string(),
-                                reply_target: chat_id,
-                                content,
-                                channel: "qq".to_string(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                thread_ts: None,
-                            };
-
-                            if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("QQ: message channel closed");
-                                break;
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -577,6 +849,130 @@ allowed_users = ["user1"]
         assert_eq!(config.app_id, "12345");
         assert_eq!(config.app_secret, "secret_abc");
         assert_eq!(config.allowed_users, vec!["user1"]);
+        assert_eq!(
+            config.receive_mode,
+            crate::config::schema::QQReceiveMode::Webhook
+        );
+        assert_eq!(
+            config.environment,
+            crate::config::schema::QQEnvironment::Production
+        );
+    }
+
+    #[test]
+    fn test_resolve_send_endpoints_respects_selected_api_base() {
+        let (group_messages, group_files) =
+            resolve_send_endpoints(QQ_SANDBOX_API_BASE, "group:12345");
+        assert_eq!(
+            group_messages,
+            "https://sandbox.api.sgroup.qq.com/v2/groups/12345/messages"
+        );
+        assert_eq!(
+            group_files,
+            "https://sandbox.api.sgroup.qq.com/v2/groups/12345/files"
+        );
+
+        let (user_messages, user_files) = resolve_send_endpoints(QQ_API_BASE, "user:abc_123");
+        assert_eq!(
+            user_messages,
+            "https://api.sgroup.qq.com/v2/users/abc_123/messages"
+        );
+        assert_eq!(
+            user_files,
+            "https://api.sgroup.qq.com/v2/users/abc_123/files"
+        );
+    }
+
+    #[test]
+    fn test_build_webhook_validation_response() {
+        let ch = QQChannel::new(
+            "11111111".into(),
+            "DG5g3B4j9X2KOErG".into(),
+            vec!["*".into()],
+        );
+        let payload = json!({
+            "op": 13,
+            "d": {
+                "plain_token": "Arq0D5A61EgUu4OxUvOp",
+                "event_ts": "1725442341"
+            }
+        });
+
+        let response = ch
+            .build_webhook_validation_response(&payload)
+            .expect("validation response expected");
+
+        assert_eq!(response["plain_token"], "Arq0D5A61EgUu4OxUvOp");
+        assert_eq!(
+            response["signature"],
+            "87befc99c42c651b3aac0278e71ada338433ae26fcb24307bdc5ad38c1adc2d01bcfcadc0842edac85e85205028a1132afe09280305f13aa6909ffc2d652c706"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_webhook_payload_c2c_event() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["user_open_1".into()]);
+        let payload = json!({
+            "op": 0,
+            "t": "C2C_MESSAGE_CREATE",
+            "d": {
+                "id": "msg-1",
+                "content": "hello webhook",
+                "author": {
+                    "id": "author-1",
+                    "user_openid": "user_open_1"
+                }
+            }
+        });
+
+        let messages = ch.parse_webhook_payload(&payload).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, "user_open_1");
+        assert_eq!(messages[0].reply_target, "user:user_open_1");
+        assert_eq!(messages[0].thread_ts.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_webhook_payload_deduplicates_by_message_id() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["user_open_1".into()]);
+        let payload = json!({
+            "op": 0,
+            "t": "C2C_MESSAGE_CREATE",
+            "d": {
+                "id": "msg-dup",
+                "content": "hello webhook",
+                "author": {
+                    "id": "author-1",
+                    "user_openid": "user_open_1"
+                }
+            }
+        });
+
+        let first = ch.parse_webhook_payload(&payload).await;
+        let second = ch.parse_webhook_payload(&payload).await;
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_webhook_payload_supports_msg_id_fallback_for_passive_reply() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["user_open_1".into()]);
+        let payload = json!({
+            "op": 0,
+            "t": "C2C_MESSAGE_CREATE",
+            "d": {
+                "msg_id": "msg-fallback-1",
+                "content": "hello webhook",
+                "author": {
+                    "id": "author-1",
+                    "user_openid": "user_open_1"
+                }
+            }
+        });
+
+        let messages = ch.parse_webhook_payload(&payload).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].thread_ts.as_deref(), Some("msg-fallback-1"));
     }
 
     #[test]
@@ -666,5 +1062,60 @@ allowed_users = ["user1"]
         });
 
         assert_eq!(compose_message_content(&payload), None);
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_extracts_remote_image_markers() {
+        let input = "hello\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:http://cdn.example.com/b.jpg]\nbye";
+        let (text, images) = parse_outgoing_content(input);
+
+        assert_eq!(text, "hello\nbye");
+        assert_eq!(
+            images,
+            vec![
+                "https://cdn.example.com/a.png".to_string(),
+                "http://cdn.example.com/b.jpg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_keeps_non_remote_image_marker_as_text() {
+        let input = "[IMAGE:/tmp/a.png]\nhello";
+        let (text, images) = parse_outgoing_content(input);
+
+        assert_eq!(text, "[IMAGE:/tmp/a.png]\nhello");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn test_build_text_message_body_with_passive_fields() {
+        let body = build_text_message_body("hello", Some("msg-123"), 2).expect("text body");
+        assert_eq!(
+            body,
+            json!({
+                "content": "hello",
+                "msg_type": 0,
+                "msg_id": "msg-123",
+                "msg_seq": 2
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_media_message_body_with_passive_fields() {
+        let body = build_media_message_body("file-info-abc", Some("msg-123"), 3);
+        assert_eq!(
+            body,
+            json!({
+                "content": " ",
+                "msg_type": 7,
+                "media": {
+                    "file_info": "file-info-abc"
+                },
+                "msg_id": "msg-123",
+                "msg_seq": 3
+            })
+        );
     }
 }

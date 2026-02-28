@@ -1,0 +1,43 @@
+[package]
+name = "zeroclaw-android-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Android JNI bridge for ZeroClaw"
+
+[lib]
+crate-type = ["cdylib"]
+name = "zeroclaw_android"
+
+[dependencies]
+# Note: zeroclaw dep commented out until we integrate properly
+# zeroclaw = { path = "../.." }
+uniffi = { version = "0.27" }
+# Minimal tokio - only what we need
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync"] }
+anyhow = "1"
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = "1"
+# Minimal tracing for mobile
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+# ============================================
+# BINARY SIZE OPTIMIZATION
+# ============================================
+# Target: <3MB native library per ABI
+
+[profile.release]
+# Optimize for size over speed
+opt-level = "z"          # Smallest binary (was "3" for speed)
+lto = true               # Link-time optimization - removes dead code
+codegen-units = 1        # Better optimization, slower compile
+panic = "abort"          # No unwinding = smaller binary
+strip = true             # Strip symbols
+
+[profile.release.package."*"]
+opt-level = "z"          # Apply to all dependencies too

@@ -40,6 +40,7 @@ impl SystemPromptBuilder {
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
+                Box::new(ChannelMediaSection),
             ],
         }
     }
@@ -70,6 +71,7 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+pub struct ChannelMediaSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -105,9 +107,21 @@ impl PromptSection for IdentitySection {
             "USER.md",
             "HEARTBEAT.md",
             "BOOTSTRAP.md",
-            "MEMORY.md",
         ] {
             inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
+        }
+        let memory_path = ctx.workspace_dir.join("MEMORY.md");
+        if memory_path.exists() {
+            inject_workspace_file(&mut prompt, ctx.workspace_dir, "MEMORY.md");
+        }
+
+        let extra_files = ctx
+            .identity_config
+            .map_or(&[][..], |cfg| cfg.extra_files.as_slice());
+        for file in extra_files {
+            if let Some(safe_relative) = normalize_openclaw_identity_extra_file(file) {
+                inject_workspace_file(&mut prompt, ctx.workspace_dir, safe_relative);
+            }
         }
 
         Ok(prompt)
@@ -206,6 +220,21 @@ impl PromptSection for DateTimeSection {
     }
 }
 
+impl PromptSection for ChannelMediaSection {
+    fn name(&self) -> &str {
+        "channel_media"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok("## Channel Media Markers\n\n\
+            Messages from channels may contain media markers:\n\
+            - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
+            - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
+            - `[Document: <name>] <path>` — A file attachment saved to the workspace."
+            .into())
+    }
+}
+
 fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {
     let path = workspace_dir.join(filename);
     match std::fs::read_to_string(&path) {
@@ -238,6 +267,29 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
     }
+}
+
+fn normalize_openclaw_identity_extra_file(raw: &str) -> Option<&str> {
+    use std::path::{Component, Path};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return None;
+    }
+
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(trimmed)
 }
 
 #[cfg(test)]
@@ -287,6 +339,7 @@ mod tests {
 
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
         };
@@ -313,6 +366,96 @@ mod tests {
             output.contains("AGENTS_MD_LOADED"),
             "AGENTS.md content should be present even when AIEOS is configured"
         );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn identity_section_openclaw_injects_extra_files() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_prompt_extra_files_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "agent baseline").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "soul baseline").unwrap();
+        std::fs::write(workspace.join("TOOLS.md"), "tools baseline").unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "identity baseline").unwrap();
+        std::fs::write(workspace.join("USER.md"), "user baseline").unwrap();
+        std::fs::write(workspace.join("FRAMEWORK.md"), "framework context").unwrap();
+        std::fs::write(workspace.join("memory").join("notes.md"), "memory notes").unwrap();
+
+        let identity_config = crate::config::IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: vec!["FRAMEWORK.md".into(), "memory/notes.md".into()],
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: Some(&identity_config),
+            dispatcher_instructions: "",
+        };
+
+        let section = IdentitySection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(output.contains("### FRAMEWORK.md"));
+        assert!(output.contains("framework context"));
+        assert!(output.contains("### memory/notes.md"));
+        assert!(output.contains("memory notes"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn identity_section_openclaw_rejects_unsafe_extra_files() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_prompt_extra_files_unsafe_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "agent baseline").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "soul baseline").unwrap();
+        std::fs::write(workspace.join("TOOLS.md"), "tools baseline").unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "identity baseline").unwrap();
+        std::fs::write(workspace.join("USER.md"), "user baseline").unwrap();
+        std::fs::write(workspace.join("SAFE.md"), "safe context").unwrap();
+
+        let identity_config = crate::config::IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: vec![
+                "SAFE.md".into(),
+                "../outside.md".into(),
+                "/tmp/absolute.md".into(),
+            ],
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: Some(&identity_config),
+            dispatcher_instructions: "",
+        };
+
+        let section = IdentitySection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(output.contains("### SAFE.md"));
+        assert!(!output.contains("outside.md"));
+        assert!(!output.contains("absolute.md"));
 
         let _ = std::fs::remove_dir_all(workspace);
     }

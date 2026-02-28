@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! Config Schema Boundary Tests
 //!
 //! Validates: config defaults, backward compatibility, invalid input rejection,
@@ -230,7 +231,7 @@ fn config_empty_toml_requires_temperature() {
 fn config_minimal_toml_with_temperature_uses_defaults() {
     let toml_str = "default_temperature = 0.7\n";
     let parsed: Config = toml::from_str(toml_str).expect("minimal TOML should parse");
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
+    assert_eq!(parsed.agent.max_tool_iterations, 20);
     assert_eq!(parsed.gateway.port, 42617);
 }
 
@@ -239,7 +240,7 @@ fn config_only_temperature_parses() {
     let toml_str = "default_temperature = 1.2\n";
     let parsed: Config = toml::from_str(toml_str).expect("temperature-only TOML should parse");
     assert!((parsed.default_temperature - 1.2).abs() < f64::EPSILON);
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
+    assert_eq!(parsed.agent.max_tool_iterations, 20);
 }
 
 #[test]

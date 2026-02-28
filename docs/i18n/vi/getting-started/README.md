@@ -4,7 +4,7 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 
 ## Lộ trình bắt đầu
 
-1. Tổng quan và khởi động nhanh: [../../../README.vi.md](../../../README.vi.md)
+1. Tổng quan và khởi động nhanh: [docs/i18n/vi/README.md](../README.md)
 2. Cài đặt một lệnh và chế độ bootstrap kép: [../one-click-bootstrap.md](../one-click-bootstrap.md)
 3. Tìm lệnh theo tác vụ: [../commands-reference.md](../commands-reference.md)
 

@@ -1,0 +1,329 @@
+name: CI Canary Gate
+
+on:
+    workflow_dispatch:
+        inputs:
+            mode:
+                description: "dry-run computes decision only; execute enables canary dispatch"
+                required: true
+                default: dry-run
+                type: choice
+                options:
+                    - dry-run
+                    - execute
+            candidate_tag:
+                description: "Candidate release tag (e.g. v0.1.8-rc.1 or v0.1.8)"
+                required: false
+                default: ""
+                type: string
+            candidate_sha:
+                description: "Optional explicit candidate SHA"
+                required: false
+                default: ""
+                type: string
+            error_rate:
+                description: "Observed canary error rate (0.0-1.0)"
+                required: true
+                default: "0.0"
+                type: string
+            crash_rate:
+                description: "Observed canary crash rate (0.0-1.0)"
+                required: true
+                default: "0.0"
+                type: string
+            p95_latency_ms:
+                description: "Observed canary p95 latency in milliseconds"
+                required: true
+                default: "0"
+                type: string
+            sample_size:
+                description: "Observed canary sample size"
+                required: true
+                default: "0"
+                type: string
+            emit_repository_dispatch:
+                description: "Emit canary decision repository_dispatch event"
+                required: true
+                default: false
+                type: boolean
+            trigger_rollback_on_abort:
+                description: "Automatically dispatch CI Rollback Guard when canary decision is abort"
+                required: true
+                default: true
+                type: boolean
+            rollback_branch:
+                description: "Rollback integration branch used by CI Rollback Guard dispatch"
+                required: true
+                default: dev
+                type: choice
+                options:
+                    - dev
+                    - main
+            rollback_target_ref:
+                description: "Optional explicit rollback target ref passed to CI Rollback Guard"
+                required: false
+                default: ""
+                type: string
+            fail_on_violation:
+                description: "Fail on policy violations"
+                required: true
+                default: true
+                type: boolean
+    schedule:
+        - cron: "45 7 * * 1" # Weekly Monday 07:45 UTC
+
+concurrency:
+    group: canary-gate-${{ github.event.inputs.candidate_tag || github.ref || github.run_id }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+    actions: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
+jobs:
+    canary-plan:
+        name: Canary Plan
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 20
+        outputs:
+            mode: ${{ steps.inputs.outputs.mode }}
+            candidate_tag: ${{ steps.inputs.outputs.candidate_tag }}
+            candidate_sha: ${{ steps.inputs.outputs.candidate_sha }}
+            trigger_rollback_on_abort: ${{ steps.inputs.outputs.trigger_rollback_on_abort }}
+            rollback_branch: ${{ steps.inputs.outputs.rollback_branch }}
+            rollback_target_ref: ${{ steps.inputs.outputs.rollback_target_ref }}
+            decision: ${{ steps.extract.outputs.decision }}
+            ready_to_execute: ${{ steps.extract.outputs.ready_to_execute }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Resolve canary inputs
+              id: inputs
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  mode="dry-run"
+                  candidate_tag=""
+                  candidate_sha=""
+                  error_rate="0.0"
+                  crash_rate="0.0"
+                  p95_latency_ms="0"
+                  sample_size="0"
+                  trigger_rollback_on_abort="true"
+                  rollback_branch="dev"
+                  rollback_target_ref=""
+                  fail_on_violation="true"
+
+                  if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+                    mode="${{ github.event.inputs.mode || 'dry-run' }}"
+                    candidate_tag="${{ github.event.inputs.candidate_tag || '' }}"
+                    candidate_sha="${{ github.event.inputs.candidate_sha || '' }}"
+                    error_rate="${{ github.event.inputs.error_rate || '0.0' }}"
+                    crash_rate="${{ github.event.inputs.crash_rate || '0.0' }}"
+                    p95_latency_ms="${{ github.event.inputs.p95_latency_ms || '0' }}"
+                    sample_size="${{ github.event.inputs.sample_size || '0' }}"
+                    trigger_rollback_on_abort="${{ github.event.inputs.trigger_rollback_on_abort || 'true' }}"
+                    rollback_branch="${{ github.event.inputs.rollback_branch || 'dev' }}"
+                    rollback_target_ref="${{ github.event.inputs.rollback_target_ref || '' }}"
+                    fail_on_violation="${{ github.event.inputs.fail_on_violation || 'true' }}"
+                  else
+                    git fetch --tags --force origin
+                    candidate_tag="$(git tag --list 'v*' --sort=-version:refname | head -n1)"
+                    if [ -n "$candidate_tag" ]; then
+                      candidate_sha="$(git rev-parse "${candidate_tag}^{commit}")"
+                    fi
+                  fi
+
+                  {
+                    echo "mode=${mode}"
+                    echo "candidate_tag=${candidate_tag}"
+                    echo "candidate_sha=${candidate_sha}"
+                    echo "error_rate=${error_rate}"
+                    echo "crash_rate=${crash_rate}"
+                    echo "p95_latency_ms=${p95_latency_ms}"
+                    echo "sample_size=${sample_size}"
+                    echo "trigger_rollback_on_abort=${trigger_rollback_on_abort}"
+                    echo "rollback_branch=${rollback_branch}"
+                    echo "rollback_target_ref=${rollback_target_ref}"
+                    echo "fail_on_violation=${fail_on_violation}"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Run canary guard
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+
+                  args=()
+                  if [ "${{ steps.inputs.outputs.fail_on_violation }}" = "true" ]; then
+                    args+=(--fail-on-violation)
+                  fi
+
+                  python3 scripts/ci/canary_guard.py \
+                    --policy-file .github/release/canary-policy.json \
+                    --candidate-tag "${{ steps.inputs.outputs.candidate_tag }}" \
+                    --candidate-sha "${{ steps.inputs.outputs.candidate_sha }}" \
+                    --mode "${{ steps.inputs.outputs.mode }}" \
+                    --error-rate "${{ steps.inputs.outputs.error_rate }}" \
+                    --crash-rate "${{ steps.inputs.outputs.crash_rate }}" \
+                    --p95-latency-ms "${{ steps.inputs.outputs.p95_latency_ms }}" \
+                    --sample-size "${{ steps.inputs.outputs.sample_size }}" \
+                    --output-json artifacts/canary-guard.json \
+                    --output-md artifacts/canary-guard.md \
+                    "${args[@]}"
+
+            - name: Extract canary decision outputs
+              id: extract
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  decision="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/canary-guard.json', encoding='utf-8'))
+                  print(data.get('decision', 'hold'))
+                  PY
+                  )"
+                  ready_to_execute="$(python3 - <<'PY'
+                  import json
+                  data = json.load(open('artifacts/canary-guard.json', encoding='utf-8'))
+                  print(str(bool(data.get('ready_to_execute', False))).lower())
+                  PY
+                  )"
+                  echo "decision=${decision}" >> "$GITHUB_OUTPUT"
+                  echo "ready_to_execute=${ready_to_execute}" >> "$GITHUB_OUTPUT"
+
+            - name: Emit canary audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/emit_audit_event.py \
+                    --event-type canary_guard \
+                    --input-json artifacts/canary-guard.json \
+                    --output-json artifacts/audit-event-canary-guard.json \
+                    --artifact-name canary-guard \
+                    --retention-days 21
+
+            - name: Publish canary summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat artifacts/canary-guard.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload canary artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: canary-guard
+                  path: |
+                      artifacts/canary-guard.json
+                      artifacts/canary-guard.md
+                      artifacts/audit-event-canary-guard.json
+                  if-no-files-found: error
+                  retention-days: 21
+
+    canary-execute:
+        name: Canary Execute
+        needs: [canary-plan]
+        if: github.event_name == 'workflow_dispatch' && needs.canary-plan.outputs.mode == 'execute' && needs.canary-plan.outputs.ready_to_execute == 'true'
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 10
+        permissions:
+            contents: write
+            actions: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Create canary marker tag
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  marker_tag="canary-${{ needs.canary-plan.outputs.candidate_tag }}-${{ github.run_id }}"
+                  git fetch --tags --force origin
+                  git tag -a "$marker_tag" "${{ needs.canary-plan.outputs.candidate_sha }}" -m "Canary decision marker from run ${{ github.run_id }}"
+                  git push origin "$marker_tag"
+                  echo "Created marker tag: $marker_tag" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Emit canary repository dispatch
+              if: github.event.inputs.emit_repository_dispatch == 'true'
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      await github.rest.repos.createDispatchEvent({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        event_type: `canary_${{ needs.canary-plan.outputs.decision }}`,
+                        client_payload: {
+                          candidate_tag: "${{ needs.canary-plan.outputs.candidate_tag }}",
+                          candidate_sha: "${{ needs.canary-plan.outputs.candidate_sha }}",
+                          decision: "${{ needs.canary-plan.outputs.decision }}",
+                          run_id: context.runId,
+                          run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+                          source_sha: context.sha
+                        }
+                      });
+
+            - name: Trigger rollback guard workflow on abort
+              if: needs.canary-plan.outputs.decision == 'abort' && needs.canary-plan.outputs.trigger_rollback_on_abort == 'true'
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const rollbackBranch = "${{ needs.canary-plan.outputs.rollback_branch }}" || "dev";
+                      const rollbackTargetRef = `${{ needs.canary-plan.outputs.rollback_target_ref }}`.trim();
+                      const workflowRef = process.env.GITHUB_REF_NAME || "dev";
+
+                      const inputs = {
+                        branch: rollbackBranch,
+                        mode: "execute",
+                        allow_non_ancestor: "false",
+                        fail_on_violation: "true",
+                        create_marker_tag: "true",
+                        emit_repository_dispatch: "true",
+                      };
+
+                      if (rollbackTargetRef.length > 0) {
+                        inputs.target_ref = rollbackTargetRef;
+                      }
+
+                      await github.rest.actions.createWorkflowDispatch({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        workflow_id: "ci-rollback.yml",
+                        ref: workflowRef,
+                        inputs,
+                      });
+
+            - name: Publish rollback trigger summary
+              if: needs.canary-plan.outputs.decision == 'abort'
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ "${{ needs.canary-plan.outputs.trigger_rollback_on_abort }}" = "true" ]; then
+                    {
+                      echo "### Canary Abort Rollback Trigger"
+                      echo "- CI Rollback Guard dispatch: triggered"
+                      echo "- Rollback branch: \`${{ needs.canary-plan.outputs.rollback_branch }}\`"
+                      if [ -n "${{ needs.canary-plan.outputs.rollback_target_ref }}" ]; then
+                        echo "- Rollback target ref: \`${{ needs.canary-plan.outputs.rollback_target_ref }}\`"
+                      else
+                        echo "- Rollback target ref: _auto (latest release tag strategy)_"
+                      fi
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    {
+                      echo "### Canary Abort Rollback Trigger"
+                      echo "- CI Rollback Guard dispatch: skipped (trigger_rollback_on_abort=false)"
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  fi

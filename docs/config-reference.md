@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 25, 2026**.
 
 Config path resolution at startup:
 
@@ -23,8 +23,17 @@ Schema export command:
 | Key | Default | Notes |
 |---|---|---|
 | `default_provider` | `openrouter` | provider ID or alias |
+| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+| `model_support_vision` | unset (`None`) | Vision support override for active provider/model |
+
+Notes:
+
+- `model_support_vision = true` forces vision support on (e.g. Ollama running `llava`).
+- `model_support_vision = false` forces vision support off.
+- Unset keeps the provider's built-in default.
+- Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION` or `MODEL_SUPPORT_VISION` (values: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`).
 
 ## `[observability]`
 
@@ -71,23 +80,31 @@ Operational note for container users:
 
 - If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
 - Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
+- For OpenAI-compatible Responses fallback transport:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode (`wss://.../responses`) for compatible providers.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` forces HTTP-only mode.
+  - Unset = auto (websocket-first only when endpoint host is `api.openai.com`, then HTTP fallback if websocket fails).
 
 ## `[agent]`
 
 | Key | Default | Purpose |
 |---|---|---|
-| `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
-| `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
+| `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
+| `max_tool_iterations` | `20` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
+| `loop_detection_no_progress_threshold` | `3` | Same tool+args producing identical output this many times triggers loop detection. `0` disables |
+| `loop_detection_ping_pong_cycles` | `2` | A→B→A→B alternating pattern cycle count threshold. `0` disables |
+| `loop_detection_failure_streak` | `3` | Same tool consecutive failure count threshold. `0` disables |
 
 Notes:
 
-- Setting `max_tool_iterations = 0` falls back to safe default `10`.
+- Setting `max_tool_iterations = 0` falls back to safe default `20`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+- **Loop detection** intervenes before `max_tool_iterations` is exhausted. On first detection the agent receives a self-correction prompt; if the loop persists the agent is stopped early. Detection is result-aware: repeated calls with *different* outputs (genuine progress) do not trigger. Set any threshold to `0` to disable that detector.
 
 ## `[security.otp]`
 
@@ -135,6 +152,163 @@ Notes:
 - Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
 - Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
+## `[security.url_access]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `block_private_ip` | `true` | Block local/private/link-local/multicast addresses by default |
+| `allow_cidrs` | `[]` | CIDR ranges allowed to bypass private-IP blocking (`100.64.0.0/10`, `198.18.0.0/15`) |
+| `allow_domains` | `[]` | Domain patterns that bypass private-IP blocking before DNS checks (`internal.example`, `*.svc.local`) |
+| `allow_loopback` | `false` | Permit loopback targets (`localhost`, `127.0.0.1`, `::1`) |
+| `require_first_visit_approval` | `false` | Require explicit human confirmation before first-time access to unseen domains |
+| `enforce_domain_allowlist` | `false` | Require all URL targets to match `domain_allowlist` (in addition to tool-level allowlists) |
+| `domain_allowlist` | `[]` | Global trusted domain allowlist shared across URL tools |
+| `domain_blocklist` | `[]` | Global domain denylist shared across URL tools (highest priority) |
+| `approved_domains` | `[]` | Persisted first-visit approvals granted by a human operator |
+
+Notes:
+
+- This policy is shared by `browser_open`, `http_request`, and `web_fetch`.
+- `browser` automation (`action = "open"`) also follows this policy.
+- Tool-level allowlists still apply. `allow_domains` / `allow_cidrs` only override private/local blocking.
+- `domain_blocklist` is evaluated before allowlists; blocked hosts are always denied.
+- With `require_first_visit_approval = true`, unseen domains are denied until added to `approved_domains` (or matched by `domain_allowlist`).
+- DNS rebinding protection remains enabled: resolved local/private IPs are denied unless explicitly allowlisted.
+- Agents can inspect/update these settings at runtime via `web_access_config` (`action=get|set|check_url`).
+- In supervised mode, `web_access_config` mutations still require normal tool approval unless explicitly auto-approved.
+
+Example:
+
+```toml
+[security.url_access]
+block_private_ip = true
+allow_cidrs = ["100.64.0.0/10", "198.18.0.0/15"]
+allow_domains = ["internal.example", "*.svc.local"]
+allow_loopback = false
+require_first_visit_approval = true
+enforce_domain_allowlist = false
+domain_allowlist = ["docs.rs", "github.com", "*.rust-lang.org"]
+domain_blocklist = ["*.malware.test"]
+approved_domains = ["example.com"]
+```
+
+Runtime workflow (`web_access_config`):
+
+1. Start strict-first mode (deny unknown domains until reviewed):
+
+```json
+{"action":"set","require_first_visit_approval":true,"enforce_domain_allowlist":false}
+```
+
+2. Dry-run a target URL before access:
+
+```json
+{"action":"check_url","url":"https://docs.rs"}
+```
+
+3. After human confirmation, persist approval for future runs:
+
+```json
+{"action":"set","add_approved_domains":["docs.rs"]}
+```
+
+4. Escalate to strict allowlist-only mode (recommended for production agents):
+
+```json
+{"action":"set","enforce_domain_allowlist":true,"domain_allowlist":["docs.rs","github.com","*.rust-lang.org"]}
+```
+
+5. Emergency deny of a domain across all URL tools:
+
+```json
+{"action":"set","add_domain_blocklist":["*.malware.test"]}
+```
+
+Operational guidance:
+
+- Use `approved_domains` for iterative onboarding and temporary approvals.
+- Use `domain_allowlist` for stable long-term trusted domains.
+- Use `domain_blocklist` for immediate global deny; it always overrides allow rules.
+- Keep `allow_domains` focused on private-network bypass cases only (`internal.example`, `*.svc.local`).
+
+Environment overrides:
+
+- `ZEROCLAW_URL_ACCESS_BLOCK_PRIVATE_IP` / `URL_ACCESS_BLOCK_PRIVATE_IP`
+- `ZEROCLAW_URL_ACCESS_ALLOW_LOOPBACK` / `URL_ACCESS_ALLOW_LOOPBACK`
+- `ZEROCLAW_URL_ACCESS_REQUIRE_FIRST_VISIT_APPROVAL` / `URL_ACCESS_REQUIRE_FIRST_VISIT_APPROVAL`
+- `ZEROCLAW_URL_ACCESS_ENFORCE_DOMAIN_ALLOWLIST` / `URL_ACCESS_ENFORCE_DOMAIN_ALLOWLIST`
+- `ZEROCLAW_URL_ACCESS_ALLOW_CIDRS` / `URL_ACCESS_ALLOW_CIDRS` (comma-separated)
+- `ZEROCLAW_URL_ACCESS_ALLOW_DOMAINS` / `URL_ACCESS_ALLOW_DOMAINS` (comma-separated)
+- `ZEROCLAW_URL_ACCESS_DOMAIN_ALLOWLIST` / `URL_ACCESS_DOMAIN_ALLOWLIST` (comma-separated)
+- `ZEROCLAW_URL_ACCESS_DOMAIN_BLOCKLIST` / `URL_ACCESS_DOMAIN_BLOCKLIST` (comma-separated)
+- `ZEROCLAW_URL_ACCESS_APPROVED_DOMAINS` / `URL_ACCESS_APPROVED_DOMAINS` (comma-separated)
+
+## `[security.syscall_anomaly]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable syscall anomaly detection over command output telemetry |
+| `strict_mode` | `false` | Emit anomaly when denied syscalls are observed even if in baseline |
+| `alert_on_unknown_syscall` | `true` | Alert on syscall names not present in baseline |
+| `max_denied_events_per_minute` | `5` | Threshold for denied-syscall spike alerts |
+| `max_total_events_per_minute` | `120` | Threshold for total syscall-event spike alerts |
+| `max_alerts_per_minute` | `30` | Global alert budget guardrail per rolling minute |
+| `alert_cooldown_secs` | `20` | Cooldown between identical anomaly alerts |
+| `log_path` | `syscall-anomalies.log` | JSONL anomaly log path |
+| `baseline_syscalls` | built-in allowlist | Expected syscall profile; unknown entries trigger alerts |
+
+Notes:
+
+- Detection consumes seccomp/audit hints from command `stdout`/`stderr`.
+- Numeric syscall IDs in Linux audit lines are mapped to common x86_64 names when available.
+- Alert budget and cooldown reduce duplicate/noisy events during repeated retries.
+- `max_denied_events_per_minute` must be less than or equal to `max_total_events_per_minute`.
+
+Example:
+
+```toml
+[security.syscall_anomaly]
+enabled = true
+strict_mode = false
+alert_on_unknown_syscall = true
+max_denied_events_per_minute = 5
+max_total_events_per_minute = 120
+max_alerts_per_minute = 30
+alert_cooldown_secs = 20
+log_path = "syscall-anomalies.log"
+baseline_syscalls = ["read", "write", "openat", "close", "execve", "futex"]
+```
+
+## `[security.perplexity_filter]`
+
+Lightweight, opt-in adversarial suffix filter that runs before provider calls in channel and gateway message pipelines.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enable_perplexity_filter` | `false` | Enable pre-LLM statistical suffix anomaly blocking |
+| `perplexity_threshold` | `18.0` | Character-class bigram perplexity threshold |
+| `suffix_window_chars` | `64` | Trailing character window used for anomaly scoring |
+| `min_prompt_chars` | `32` | Minimum prompt length before filter is evaluated |
+| `symbol_ratio_threshold` | `0.20` | Minimum punctuation ratio in suffix window for blocking |
+
+Notes:
+
+- This filter is disabled by default to preserve baseline latency/behavior.
+- The detector combines character-class perplexity with GCG-like token heuristics.
+- Inputs are blocked only when anomaly conditions are met; normal natural-language prompts pass.
+- Typical per-message overhead is designed to stay under `50ms` in debug-safe local tests and substantially lower in release builds.
+
+Example:
+
+```toml
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
+```
+
 ## `[agents.<name>]`
 
 Delegate sub-agent configurations. Each key under `[agents]` defines a named sub-agent that the primary agent can delegate to.
@@ -173,10 +347,52 @@ model = "qwen2.5-coder:32b"
 temperature = 0.2
 ```
 
+## `[research]`
+
+Research phase allows the agent to gather information through tools before generating the main response.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable research phase |
+| `trigger` | `never` | Research trigger strategy: `never`, `always`, `keywords`, `length`, `question` |
+| `keywords` | `["find", "search", "check", "investigate"]` | Keywords that trigger research (when trigger = `keywords`) |
+| `min_message_length` | `50` | Minimum message length to trigger research (when trigger = `length`) |
+| `max_iterations` | `5` | Maximum tool calls during research phase |
+| `show_progress` | `true` | Show research progress to user |
+
+Notes:
+
+- Research phase is **disabled by default** (`trigger = never`).
+- When enabled, the agent first gathers facts through tools (grep, file_read, shell, memory search), then responds using the collected context.
+- Research runs before the main agent turn and does not count toward `agent.max_tool_iterations`.
+- Trigger strategies:
+  - `never` — research disabled (default)
+  - `always` — research on every user message
+  - `keywords` — research when message contains any keyword from the list
+  - `length` — research when message length exceeds `min_message_length`
+  - `question` — research when message contains '?'
+
+Example:
+
+```toml
+[research]
+enabled = true
+trigger = "keywords"
+keywords = ["find", "show", "check", "how many"]
+max_iterations = 3
+show_progress = true
+```
+
+The agent will research the codebase before responding to queries like:
+- "Find all TODO in src/"
+- "Show contents of main.rs"
+- "How many files in the project?"
+
 ## `[runtime]`
 
 | Key | Default | Purpose |
 |---|---|---|
+| `kind` | `native` | Runtime backend: `native`, `docker`, or `wasm` |
 | `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
 
 Notes:
@@ -184,6 +400,74 @@ Notes:
 - `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
+- Deprecated compatibility alias: `runtime.reasoning_level` is still accepted but should be migrated to `provider.reasoning_level`.
+- `runtime.kind = "wasm"` enables capability-bounded module execution and disables shell/process style execution.
+
+### `[runtime.wasm]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `tools_dir` | `"tools/wasm"` | Workspace-relative directory containing `.wasm` modules |
+| `fuel_limit` | `1000000` | Instruction budget per module invocation |
+| `memory_limit_mb` | `64` | Per-module memory cap (MB) |
+| `max_module_size_mb` | `50` | Maximum allowed `.wasm` file size (MB) |
+| `allow_workspace_read` | `false` | Allow WASM host calls to read workspace files (future-facing) |
+| `allow_workspace_write` | `false` | Allow WASM host calls to write workspace files (future-facing) |
+| `allowed_hosts` | `[]` | Explicit network host allowlist for WASM host calls (future-facing) |
+
+Notes:
+
+- `allowed_hosts` entries must be normalized `host` or `host:port` strings; wildcards, schemes, and paths are rejected when `runtime.wasm.security.strict_host_validation = true`.
+- Invocation-time capability overrides are controlled by `runtime.wasm.security.capability_escalation_mode`:
+  - `deny` (default): reject escalation above runtime baseline.
+  - `clamp`: reduce requested capabilities to baseline.
+
+### `[runtime.wasm.security]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `require_workspace_relative_tools_dir` | `true` | Require `runtime.wasm.tools_dir` to be workspace-relative and reject `..` traversal |
+| `reject_symlink_modules` | `true` | Block symlinked `.wasm` module files during execution |
+| `reject_symlink_tools_dir` | `true` | Block execution when `runtime.wasm.tools_dir` is itself a symlink |
+| `strict_host_validation` | `true` | Fail config/invocation on invalid host entries instead of dropping them |
+| `capability_escalation_mode` | `"deny"` | Escalation policy: `deny` or `clamp` |
+| `module_hash_policy` | `"warn"` | Module integrity policy: `disabled`, `warn`, or `enforce` |
+| `module_sha256` | `{}` | Optional map of module names to pinned SHA-256 digests |
+
+Notes:
+
+- `module_sha256` keys must match module names (without `.wasm`) and use `[A-Za-z0-9_-]` only.
+- `module_sha256` values must be 64-character hexadecimal SHA-256 strings.
+- `module_hash_policy = "warn"` allows execution but logs missing/mismatched digests.
+- `module_hash_policy = "enforce"` blocks execution on missing/mismatched digests and requires at least one pin.
+
+WASM profile templates:
+
+- `dev/config.wasm.dev.toml`
+- `dev/config.wasm.staging.toml`
+- `dev/config.wasm.prod.toml`
+
+## `[provider]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `reasoning_level` | unset (`None`) | Reasoning effort/level override for providers that support explicit levels (currently OpenAI Codex `/responses`) |
+| `transport` | unset (`None`) | Provider transport override (`auto`, `websocket`, `sse`) |
+
+Notes:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT` for OpenAI Codex requests.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- If both `provider.reasoning_level` and deprecated `runtime.reasoning_level` are set, provider-level value wins.
+- `provider.transport` is normalized case-insensitively (`ws` aliases to `websocket`; `http` aliases to `sse`).
+- For OpenAI Codex, default transport mode is `auto` (WebSocket-first with SSE fallback).
+- Transport override precedence for OpenAI Codex:
+  1. `[[model_routes]].transport` (route-specific)
+  2. `PROVIDER_TRANSPORT` / `ZEROCLAW_PROVIDER_TRANSPORT` / `ZEROCLAW_CODEX_TRANSPORT`
+  3. `provider.transport`
+  4. legacy `ZEROCLAW_RESPONSES_WEBSOCKET` (boolean)
+- Environment overrides replace configured `provider.transport` when set.
 
 ## `[skills]`
 
@@ -192,6 +476,7 @@ Notes:
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
+| `clawhub_token` | unset | Optional Bearer token for authenticated ClawhHub skill downloads |
 
 Notes:
 
@@ -203,6 +488,14 @@ Notes:
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 - Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
+- `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawhHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
+
+**ClawhHub token example:**
+
+```toml
+[skills]
+clawhub_token = "your-token-here"
+```
 
 ## `[composio]`
 
@@ -271,10 +564,15 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
+| `enabled` | `false` | Enable browser tools (`browser_open` and `browser`) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` and `browser` (exact/subdomain match, or `"*"` for all public domains) |
+| `browser_open` | `default` | Browser used by `browser_open`: `disable`, `brave`, `chrome`, `firefox`, `edge` (`msedge` alias), `default` |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
+| `auto_backend_priority` | `[]` | Priority order for `backend = "auto"` (for example `["agent_browser","rust_native","computer_use"]`) |
+| `agent_browser_command` | `agent-browser` | Executable/path for agent-browser CLI |
+| `agent_browser_extra_args` | `[]` | Extra args prepended to each agent-browser command |
+| `agent_browser_timeout_ms` | `30000` | Timeout per agent-browser action command |
 | `native_headless` | `true` | Headless mode for rust-native backend |
 | `native_webdriver_url` | `http://127.0.0.1:9515` | WebDriver endpoint URL for rust-native backend |
 | `native_chrome_path` | unset | Optional Chrome/Chromium executable path for rust-native backend |
@@ -293,6 +591,7 @@ Notes:
 
 Notes:
 
+- `browser_open` is a simple URL opener; `browser` is full browser automation (open/click/type/scroll/screenshot).
 - When `backend = "computer_use"`, the agent delegates browser actions to the sidecar at `computer_use.endpoint`.
 - `allow_remote_endpoint = false` (default) rejects any non-loopback endpoint to prevent accidental public exposure.
 - Use `window_allowlist` to restrict which OS windows the sidecar can interact with.
@@ -305,12 +604,140 @@ Notes:
 | `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for outbound HTTP requests |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
+- Shell `curl`/`wget` are classified as high-risk and may be blocked by autonomy policy. Prefer `http_request` for direct HTTP calls.
+
+## `[web_fetch]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_fetch` for page-to-text extraction |
+| `provider` | `fast_html2md` | Fetch/render backend: `fast_html2md`, `nanohtml2text`, `firecrawl` |
+| `api_key` | unset | API key for provider backends that require it (e.g. `firecrawl`) |
+| `api_url` | unset | Optional API URL override (self-hosted/alternate endpoint) |
+| `allowed_domains` | `["*"]` | Domain allowlist (`"*"` allows all public domains) |
+| `blocked_domains` | `[]` | Denylist applied before allowlist |
+| `max_response_size` | `500000` | Maximum returned payload size in bytes |
+| `timeout_secs` | `30` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for fetch requests |
+
+Notes:
+
+- `web_fetch` is optimized for summarization/data extraction from web pages.
+- Redirect targets are revalidated against allow/deny domain policy.
+- Local/private network targets remain blocked even when `allowed_domains = ["*"]`.
+
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_search_tool` |
+| `provider` | `duckduckgo` | Search backend: `duckduckgo` (`ddg` alias), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina` |
+| `fallback_providers` | `[]` | Fallback providers tried in order after primary failure |
+| `retries_per_provider` | `0` | Retry count before switching to next provider |
+| `retry_backoff_ms` | `250` | Delay between retry attempts (milliseconds) |
+| `api_key` | unset | Generic provider key (used by `firecrawl`/`tavily`, fallback for dedicated provider keys) |
+| `api_url` | unset | Optional API URL override |
+| `brave_api_key` | unset | Dedicated Brave key (required for `provider = "brave"` unless `api_key` is set) |
+| `perplexity_api_key` | unset | Dedicated Perplexity key |
+| `exa_api_key` | unset | Dedicated Exa key |
+| `jina_api_key` | unset | Optional Jina key |
+| `domain_filter` | `[]` | Optional domain filter forwarded to supported providers |
+| `language_filter` | `[]` | Optional language filter forwarded to supported providers |
+| `country` | unset | Optional country hint for supported providers |
+| `recency_filter` | unset | Optional recency filter for supported providers |
+| `max_tokens` | unset | Optional token budget for providers that support it (for example Perplexity) |
+| `max_tokens_per_page` | unset | Optional per-page token budget for supported providers |
+| `exa_search_type` | `auto` | Exa search mode: `auto`, `keyword`, `neural` |
+| `exa_include_text` | `false` | Include text payloads in Exa responses |
+| `jina_site_filters` | `[]` | Optional site filters for Jina search |
+| `max_results` | `5` | Maximum search results returned (must be 1-10) |
+| `timeout_secs` | `15` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for search requests |
+
+Notes:
+
+- If DuckDuckGo returns `403`/`429` in your network, switch provider to `brave`, `perplexity`, `exa`, or configure `fallback_providers`.
+- `web_search` finds candidate URLs; pair it with `web_fetch` for page content extraction.
+- Agents can modify these settings at runtime via the `web_search_config` tool (`action=get|set|list_providers`).
+- In supervised mode, `web_search_config` mutations still require normal tool approval unless explicitly auto-approved.
+- Invalid provider names, `exa_search_type`, and out-of-range retry/result/timeout values are rejected during config validation.
+
+Recommended resilient profile:
+
+```toml
+[web_search]
+enabled = true
+provider = "perplexity"
+fallback_providers = ["exa", "jina", "duckduckgo"]
+retries_per_provider = 1
+retry_backoff_ms = 300
+max_results = 5
+timeout_secs = 20
+```
+
+Runtime workflow (`web_search_config`):
+
+1. Inspect available providers and current config snapshot:
+
+```json
+{"action":"list_providers"}
+```
+
+```json
+{"action":"get"}
+```
+
+2. Set a primary provider with fallback chain:
+
+```json
+{"action":"set","provider":"perplexity","fallback_providers":["exa","jina","duckduckgo"]}
+```
+
+3. Tune provider-specific options:
+
+```json
+{"action":"set","exa_search_type":"neural","exa_include_text":true}
+```
+
+```json
+{"action":"set","jina_site_filters":["docs.rs","github.com"]}
+```
+
+4. Add geo/language/recency filters for region-aware queries:
+
+```json
+{"action":"set","country":"US","language_filter":["en"],"recency_filter":"week"}
+```
+
+Environment overrides:
+
+- `ZEROCLAW_WEB_SEARCH_ENABLED` / `WEB_SEARCH_ENABLED`
+- `ZEROCLAW_WEB_SEARCH_PROVIDER` / `WEB_SEARCH_PROVIDER`
+- `ZEROCLAW_WEB_SEARCH_MAX_RESULTS` / `WEB_SEARCH_MAX_RESULTS`
+- `ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS` / `WEB_SEARCH_TIMEOUT_SECS`
+- `ZEROCLAW_WEB_SEARCH_FALLBACK_PROVIDERS` / `WEB_SEARCH_FALLBACK_PROVIDERS` (comma-separated)
+- `ZEROCLAW_WEB_SEARCH_RETRIES_PER_PROVIDER` / `WEB_SEARCH_RETRIES_PER_PROVIDER`
+- `ZEROCLAW_WEB_SEARCH_RETRY_BACKOFF_MS` / `WEB_SEARCH_RETRY_BACKOFF_MS`
+- `ZEROCLAW_WEB_SEARCH_DOMAIN_FILTER` / `WEB_SEARCH_DOMAIN_FILTER` (comma-separated)
+- `ZEROCLAW_WEB_SEARCH_LANGUAGE_FILTER` / `WEB_SEARCH_LANGUAGE_FILTER` (comma-separated)
+- `ZEROCLAW_WEB_SEARCH_COUNTRY` / `WEB_SEARCH_COUNTRY`
+- `ZEROCLAW_WEB_SEARCH_RECENCY_FILTER` / `WEB_SEARCH_RECENCY_FILTER`
+- `ZEROCLAW_WEB_SEARCH_MAX_TOKENS` / `WEB_SEARCH_MAX_TOKENS`
+- `ZEROCLAW_WEB_SEARCH_MAX_TOKENS_PER_PAGE` / `WEB_SEARCH_MAX_TOKENS_PER_PAGE`
+- `ZEROCLAW_WEB_SEARCH_EXA_SEARCH_TYPE` / `WEB_SEARCH_EXA_SEARCH_TYPE`
+- `ZEROCLAW_WEB_SEARCH_EXA_INCLUDE_TEXT` / `WEB_SEARCH_EXA_INCLUDE_TEXT`
+- `ZEROCLAW_WEB_SEARCH_JINA_SITE_FILTERS` / `WEB_SEARCH_JINA_SITE_FILTERS` (comma-separated)
+- `ZEROCLAW_BRAVE_API_KEY` / `BRAVE_API_KEY`
+- `ZEROCLAW_PERPLEXITY_API_KEY` / `PERPLEXITY_API_KEY`
+- `ZEROCLAW_EXA_API_KEY` / `EXA_API_KEY`
+- `ZEROCLAW_JINA_API_KEY` / `JINA_API_KEY`
 
 ## `[gateway]`
 
@@ -321,13 +748,21 @@ Notes:
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
 
+## `[gateway.node_control]` (experimental)
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | enable node-control scaffold endpoint (`POST /api/node-control`) |
+| `auth_token` | `null` | optional extra shared token checked via `X-Node-Control-Token` |
+| `allowed_node_ids` | `[]` | allowlist for `node.describe`/`node.invoke` (`[]` accepts any) |
+
 ## `[autonomy]`
 
 | Key | Default | Purpose |
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
-| `allowed_commands` | _required for shell execution_ | allowlist of executable names |
+| `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -336,14 +771,38 @@ Notes:
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
+| `non_cli_excluded_tools` | `[]` | tools hidden from non-CLI channel tool specs |
+| `non_cli_approval_approvers` | `[]` | optional allowlist for who can run non-CLI approval-management commands |
+| `non_cli_natural_language_approval_mode` | `direct` | natural-language behavior for approval-management commands (`direct`, `request_confirm`, `disabled`) |
+| `non_cli_natural_language_approval_mode_by_channel` | `{}` | per-channel override map for natural-language approval mode |
 
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
+- `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+- In supervised mode on non-CLI channels, operators can persist human-approved tools with:
+  - One-step flow: `/approve <tool>`.
+  - Two-step flow: `/approve-request <tool>` then `/approve-confirm <request-id>` (same sender + same chat/channel).
+  Both paths write to `autonomy.auto_approve` and remove the tool from `autonomy.always_ask`.
+- `non_cli_natural_language_approval_mode` controls how strict natural-language approval intents are:
+  - `direct` (default): natural-language approval grants immediately (private-chat friendly).
+  - `request_confirm`: natural-language approval creates a pending request that needs explicit confirm.
+  - `disabled`: natural-language approval commands are rejected; use slash commands only.
+- `non_cli_natural_language_approval_mode_by_channel` can override that mode for specific channels (keys are channel names like `telegram`, `discord`, `slack`).
+  - Example: keep global `direct`, but force `discord = "request_confirm"` for team chats.
+- `non_cli_approval_approvers` can restrict who is allowed to run approval commands (`/approve*`, `/unapprove`, `/approvals`):
+  - `*` allows all channel-admitted senders.
+  - `alice` allows sender `alice` on any channel.
+  - `telegram:alice` allows only that channel+sender pair.
+  - `telegram:*` allows any sender on Telegram.
+  - `*:alice` allows `alice` on any channel.
+- Use `/unapprove <tool>` to remove persisted approval from `autonomy.auto_approve`.
+- `/approve-pending` lists pending requests for the current sender+chat/channel scope.
+- If a tool remains unavailable after approval, check `autonomy.non_cli_excluded_tools` (runtime `/approvals` shows this list). Channel runtime reloads this list from `config.toml` automatically.
 
 ```toml
 [autonomy]
@@ -379,7 +838,9 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
+| `max_tokens` | unset | Optional per-route output token cap forwarded to provider APIs |
 | `api_key` | unset | Optional API key override for this route's provider |
+| `transport` | unset | Optional per-route transport override (`auto`, `websocket`, `sse`) |
 
 ### `[[embedding_routes]]`
 
@@ -399,6 +860,7 @@ embedding_model = "hint:semantic"
 hint = "reasoning"
 provider = "openrouter"
 model = "provider/model-id"
+max_tokens = 8192
 
 [[embedding_routes]]
 hint = "semantic"
@@ -489,6 +951,12 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- Telegram/Discord/Slack/Mattermost/Lark/Feishu support `[channels_config.<channel>.group_reply]`:
+  - `mode = "all_messages"` or `mode = "mention_only"`
+  - `allowed_sender_ids = ["..."]` to bypass mention gating in groups
+  - `allowed_users` allowlist checks still run first
+- Legacy `mention_only` flags (Telegram/Discord/Mattermost/Lark) remain supported as fallback only.
+  If `group_reply.mode` is set, it takes precedence over legacy `mention_only`.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 ### `[channels_config.nostr]`
@@ -627,6 +1095,31 @@ Notes:
 
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
+
+## `[agents_ipc]`
+
+Inter-process communication for independent ZeroClaw agents on the same host.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable IPC tools (`agents_list`, `agents_send`, `agents_inbox`, `state_get`, `state_set`) |
+| `db_path` | `~/.zeroclaw/agents.db` | Shared SQLite database path (all agents on this host share one file) |
+| `staleness_secs` | `300` | Agents not seen within this window are considered offline (seconds) |
+
+Notes:
+
+- When `enabled = false` (default), no IPC tools are registered and no database is created.
+- All agents that share a `db_path` can discover each other and exchange messages.
+- Agent identity is derived from `workspace_dir` (SHA-256 hash), not user-supplied.
+
+Example:
+
+```toml
+[agents_ipc]
+enabled = true
+db_path = "~/.zeroclaw/agents.db"
+staleness_secs = 300
+```
 
 ## Security-Relevant Defaults
 

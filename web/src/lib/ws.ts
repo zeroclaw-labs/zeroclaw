@@ -52,9 +52,13 @@ export class WebSocketClient {
     this.clearReconnectTimer();
 
     const token = getToken();
-    const url = `${this.baseUrl}/ws/chat${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    const url = `${this.baseUrl}/ws/chat`;
+    const protocols = ['zeroclaw.v1'];
+    if (token) {
+      protocols.push(`bearer.${token}`);
+    }
 
-    this.ws = new WebSocket(url);
+    this.ws = new WebSocket(url, protocols);
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ZeroClaw</string>
+    <string name="notification_channel_service">ZeroClaw Service</string>
+    <string name="notification_channel_agent">Agent Messages</string>
+    <string name="service_notification_title">ZeroClaw is running</string>
+    <string name="service_notification_text">Your AI assistant is active</string>
+    
+    <!-- Widget -->
+    <string name="widget_description">Quick access to your AI assistant</string>
+    <string name="widget_status_running">🟢 Running</string>
+    <string name="widget_status_stopped">⚪ Stopped</string>
+    
+    <!-- Accessibility -->
+    <string name="cd_toggle_agent">Toggle agent on or off</string>
+    <string name="cd_open_settings">Open settings</string>
+    <string name="cd_send_message">Send message to agent</string>
+</resources>

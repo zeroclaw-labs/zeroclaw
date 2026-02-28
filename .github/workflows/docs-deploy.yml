@@ -1,0 +1,291 @@
+name: Docs Deploy
+
+on:
+    pull_request:
+        branches: [dev, main]
+        paths:
+            - "docs/**"
+            - "README*.md"
+            - ".github/workflows/docs-deploy.yml"
+            - "scripts/ci/docs_quality_gate.sh"
+            - "scripts/ci/collect_changed_links.py"
+            - ".github/release/docs-deploy-policy.json"
+            - "scripts/ci/docs_deploy_guard.py"
+    push:
+        branches: [dev, main]
+        paths:
+            - "docs/**"
+            - "README*.md"
+            - ".github/workflows/docs-deploy.yml"
+            - "scripts/ci/docs_quality_gate.sh"
+            - "scripts/ci/collect_changed_links.py"
+            - ".github/release/docs-deploy-policy.json"
+            - "scripts/ci/docs_deploy_guard.py"
+    workflow_dispatch:
+        inputs:
+            deploy_target:
+                description: "preview uploads artifact only; production deploys to Pages"
+                required: true
+                default: preview
+                type: choice
+                options:
+                    - preview
+                    - production
+            preview_evidence_run_url:
+                description: "Required for manual production deploys when policy enforces preview promotion evidence"
+                required: false
+                default: ""
+            rollback_ref:
+                description: "Optional rollback source ref (tag/sha/ref) for manual production dispatch"
+                required: false
+                default: ""
+
+concurrency:
+    group: docs-deploy-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
+jobs:
+    docs-quality:
+        name: Docs Quality Gate
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 20
+        outputs:
+            docs_files: ${{ steps.scope.outputs.docs_files }}
+            base_sha: ${{ steps.scope.outputs.base_sha }}
+            deploy_target: ${{ steps.deploy_guard.outputs.deploy_target }}
+            deploy_mode: ${{ steps.deploy_guard.outputs.deploy_mode }}
+            source_ref: ${{ steps.deploy_guard.outputs.source_ref }}
+            production_branch_ref: ${{ steps.deploy_guard.outputs.production_branch_ref }}
+            ready_to_deploy: ${{ steps.deploy_guard.outputs.ready_to_deploy }}
+            docs_preview_retention_days: ${{ steps.deploy_guard.outputs.docs_preview_retention_days }}
+            docs_guard_artifact_retention_days: ${{ steps.deploy_guard.outputs.docs_guard_artifact_retention_days }}
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Resolve docs diff scope
+              id: scope
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  base_sha=""
+                  docs_files=""
+
+                  if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+                    base_sha="${{ github.event.pull_request.base.sha }}"
+                    docs_files="$(git diff --name-only "$base_sha" HEAD | awk '/\.md$|\.mdx$|^README/ {print}')"
+                  elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+                    base_sha="${{ github.event.before }}"
+                    if [ -n "$base_sha" ] && [ "$base_sha" != "0000000000000000000000000000000000000000" ]; then
+                      docs_files="$(git diff --name-only "$base_sha" HEAD | awk '/\.md$|\.mdx$|^README/ {print}')"
+                    fi
+                  else
+                    docs_files="$(git ls-files 'docs/**/*.md' 'README*.md')"
+                  fi
+
+                  {
+                    echo "base_sha=${base_sha}"
+                    echo "docs_files<<EOF"
+                    printf '%s\n' "$docs_files"
+                    echo "EOF"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Validate docs deploy contract
+              id: deploy_guard
+              shell: bash
+              env:
+                  INPUT_DEPLOY_TARGET: ${{ github.event.inputs.deploy_target || '' }}
+                  INPUT_PREVIEW_EVIDENCE_RUN_URL: ${{ github.event.inputs.preview_evidence_run_url || '' }}
+                  INPUT_ROLLBACK_REF: ${{ github.event.inputs.rollback_ref || '' }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  python3 scripts/ci/docs_deploy_guard.py \
+                    --repo-root "$PWD" \
+                    --event-name "${GITHUB_EVENT_NAME}" \
+                    --git-ref "${GITHUB_REF}" \
+                    --git-sha "${GITHUB_SHA}" \
+                    --input-deploy-target "${INPUT_DEPLOY_TARGET}" \
+                    --input-preview-evidence-run-url "${INPUT_PREVIEW_EVIDENCE_RUN_URL}" \
+                    --input-rollback-ref "${INPUT_ROLLBACK_REF}" \
+                    --policy-file .github/release/docs-deploy-policy.json \
+                    --output-json artifacts/docs-deploy-guard.json \
+                    --output-md artifacts/docs-deploy-guard.md \
+                    --github-output-file "$GITHUB_OUTPUT" \
+                    --fail-on-violation
+
+            - name: Emit docs deploy guard audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/docs-deploy-guard.json ]; then
+                    python3 scripts/ci/emit_audit_event.py \
+                      --event-type docs_deploy_guard \
+                      --input-json artifacts/docs-deploy-guard.json \
+                      --output-json artifacts/audit-event-docs-deploy-guard.json \
+                      --artifact-name docs-deploy-guard \
+                      --retention-days 21
+                  fi
+
+            - name: Publish docs deploy guard summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/docs-deploy-guard.md ]; then
+                    cat artifacts/docs-deploy-guard.md >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+            - name: Upload docs deploy guard artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: docs-deploy-guard
+                  path: |
+                      artifacts/docs-deploy-guard.json
+                      artifacts/docs-deploy-guard.md
+                      artifacts/audit-event-docs-deploy-guard.json
+                  if-no-files-found: ignore
+                  retention-days: ${{ steps.deploy_guard.outputs.docs_guard_artifact_retention_days || 21 }}
+
+            - name: Markdown quality gate
+              env:
+                  BASE_SHA: ${{ steps.scope.outputs.base_sha }}
+                  DOCS_FILES: ${{ steps.scope.outputs.docs_files }}
+              run: ./scripts/ci/docs_quality_gate.sh
+
+            - name: Collect added links
+              id: links
+              if: github.event_name != 'workflow_dispatch'
+              shell: bash
+              env:
+                  BASE_SHA: ${{ steps.scope.outputs.base_sha }}
+                  DOCS_FILES: ${{ steps.scope.outputs.docs_files }}
+              run: |
+                  set -euo pipefail
+                  python3 ./scripts/ci/collect_changed_links.py \
+                    --base "$BASE_SHA" \
+                    --docs-files "$DOCS_FILES" \
+                    --output .ci-added-links.txt
+                  count=$(wc -l < .ci-added-links.txt | tr -d ' ')
+                  echo "count=$count" >> "$GITHUB_OUTPUT"
+
+            - name: Link check (added links)
+              if: github.event_name != 'workflow_dispatch' && steps.links.outputs.count != '0'
+              uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
+              with:
+                  fail: true
+                  args: >-
+                      --offline
+                      --no-progress
+                      --format detailed
+                      .ci-added-links.txt
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Skip link check (none added)
+              if: github.event_name != 'workflow_dispatch' && steps.links.outputs.count == '0'
+              run: echo "No added links detected in changed docs lines."
+
+    docs-preview:
+        name: Docs Preview Artifact
+        needs: [docs-quality]
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'preview')
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Build preview bundle
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  rm -rf site
+                  mkdir -p site/docs
+                  cp -R docs/. site/docs/
+                  cp README.md site/README.md
+                  cat > site/index.md <<'EOF'
+                  # ZeroClaw Docs Preview
+
+                  This preview bundle is produced by `.github/workflows/docs-deploy.yml`.
+
+                  - [Repository README](./README.md)
+                  - [Docs Home](./docs/README.md)
+                  EOF
+
+            - name: Upload preview artifact
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: docs-preview
+                  path: site/**
+                  if-no-files-found: error
+                  retention-days: ${{ needs.docs-quality.outputs.docs_preview_retention_days || 14 }}
+
+    docs-deploy:
+        name: Deploy Docs to GitHub Pages
+        needs: [docs-quality]
+        if: needs.docs-quality.outputs.deploy_target == 'production' && needs.docs-quality.outputs.ready_to_deploy == 'true'
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 20
+        permissions:
+            contents: read
+            pages: write
+            id-token: write
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ needs.docs-quality.outputs.source_ref }}
+
+            - name: Build deploy bundle
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  rm -rf site
+                  mkdir -p site/docs
+                  cp -R docs/. site/docs/
+                  cp README.md site/README.md
+                  cat > site/index.md <<'EOF'
+                  # ZeroClaw Documentation
+
+                  This site is deployed automatically from `main` by `.github/workflows/docs-deploy.yml`.
+
+                  - [Repository README](./README.md)
+                  - [Docs Home](./docs/README.md)
+                  EOF
+
+            - name: Publish deploy source summary
+              shell: bash
+              run: |
+                  {
+                    echo "## Docs Deploy Source"
+                    echo "- Deploy mode: \`${{ needs.docs-quality.outputs.deploy_mode }}\`"
+                    echo "- Source ref: \`${{ needs.docs-quality.outputs.source_ref }}\`"
+                    echo "- Production branch ref: \`${{ needs.docs-quality.outputs.production_branch_ref }}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Setup Pages
+              uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+            - name: Upload Pages artifact
+              uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+              with:
+                  path: site
+
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

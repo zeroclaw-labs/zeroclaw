@@ -1,0 +1,31 @@
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+# This is the Ollama Base URL, not a secret key
+api_key = "http://host.docker.internal:11434"
+default_provider = "ollama"
+default_model = "llama3.2"
+default_temperature = 0.7
+
+[runtime]
+kind = "wasm"
+
+[runtime.wasm]
+tools_dir = "tools/wasm"
+fuel_limit = 500000
+memory_limit_mb = 64
+max_module_size_mb = 16
+allow_workspace_read = false
+allow_workspace_write = false
+allowed_hosts = []
+
+[runtime.wasm.security]
+require_workspace_relative_tools_dir = true
+reject_symlink_modules = true
+reject_symlink_tools_dir = true
+strict_host_validation = true
+capability_escalation_mode = "deny"
+module_hash_policy = "warn"
+
+[runtime.wasm.security.module_sha256]
+# Production recommendation: pin all deployed modules and then set module_hash_policy = "enforce".
+# calc = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

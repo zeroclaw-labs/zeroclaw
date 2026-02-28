@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
+use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
@@ -21,11 +22,24 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self::new_with_syscall_detector(security, runtime, None)
+    }
+
+    pub fn new_with_syscall_detector(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            syscall_detector,
+        }
     }
 }
 
@@ -38,7 +52,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
+pub(super) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for key in SAFE_ENV_VARS
@@ -55,6 +69,41 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
         }
     }
     out
+}
+
+fn extract_command_argument(args: &serde_json::Value) -> Option<String> {
+    if let Some(command) = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+    {
+        return Some(command.to_string());
+    }
+
+    for alias in [
+        "cmd",
+        "script",
+        "shell_command",
+        "command_line",
+        "bash",
+        "sh",
+        "input",
+    ] {
+        if let Some(command) = args
+            .get(alias)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+        {
+            return Some(command.to_string());
+        }
+    }
+
+    args.as_str()
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .map(ToString::to_string)
 }
 
 #[async_trait]
@@ -85,10 +134,9 @@ impl Tool for ShellTool {
         })
     }
 
+    #[allow(clippy::incompatible_msrv)]
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
+        let command = extract_command_argument(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
         let approved = args
             .get("approved")
@@ -103,7 +151,7 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
+        match self.security.validate_command_execution(&command, approved) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -114,7 +162,7 @@ impl Tool for ShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(command) {
+        if let Some(path) = self.security.forbidden_path_argument(&command) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -135,7 +183,7 @@ impl Tool for ShellTool {
         // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(&command, &self.security.workspace_dir)
         {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -164,12 +212,27 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stdout.truncate(crate::util::floor_utf8_char_boundary(
+                        &stdout,
+                        MAX_OUTPUT_BYTES,
+                    ));
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stderr.truncate(crate::util::floor_utf8_char_boundary(
+                        &stderr,
+                        MAX_OUTPUT_BYTES,
+                    ));
                     stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+
+                if let Some(detector) = &self.syscall_detector {
+                    let _ = detector.inspect_command_output(
+                        &command,
+                        &stdout,
+                        &stderr,
+                        output.status.code(),
+                    );
                 }
 
                 Ok(ToolResult {
@@ -201,8 +264,10 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use tempfile::TempDir;
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -214,6 +279,22 @@ mod tests {
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    fn test_syscall_detector(tmp: &TempDir) -> Arc<SyscallAnomalyDetector> {
+        let log_path = tmp.path().join("shell-syscall-anomalies.log");
+        let cfg = SyscallAnomalyConfig {
+            baseline_syscalls: vec!["read".into(), "write".into()],
+            log_path: log_path.to_string_lossy().to_string(),
+            alert_cooldown_secs: 1,
+            max_alerts_per_minute: 50,
+            ..SyscallAnomalyConfig::default()
+        };
+        let audit = AuditConfig {
+            enabled: false,
+            ..AuditConfig::default()
+        };
+        Arc::new(SyscallAnomalyDetector::new(cfg, tmp.path(), audit))
     }
 
     #[test]
@@ -240,6 +321,22 @@ mod tests {
         assert!(schema["properties"]["approved"].is_object());
     }
 
+    #[test]
+    fn extract_command_argument_supports_aliases() {
+        assert_eq!(
+            extract_command_argument(&json!({"cmd": "echo from-cmd"})).as_deref(),
+            Some("echo from-cmd")
+        );
+        assert_eq!(
+            extract_command_argument(&json!({"script": "echo from-script"})).as_deref(),
+            Some("echo from-script")
+        );
+        assert_eq!(
+            extract_command_argument(&json!("echo from-string")).as_deref(),
+            Some("echo from-string")
+        );
+    }
+
     #[tokio::test]
     async fn shell_executes_allowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -250,6 +347,17 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_executes_command_from_cmd_alias() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"cmd": "echo alias"}))
+            .await
+            .expect("cmd alias execution should succeed");
+        assert!(result.success);
+        assert!(result.output.trim().contains("alias"));
     }
 
     #[tokio::test]
@@ -658,5 +766,30 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    #[tokio::test]
+    async fn shell_syscall_detector_writes_anomaly_log() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+        let log_path = tmp.path().join("shell-syscall-anomalies.log");
+        let detector = test_syscall_detector(&tmp);
+        let tool = ShellTool::new_with_syscall_detector(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            Some(detector),
+        );
+
+        let result = tool
+            .execute(json!({"command": "echo seccomp denied syscall=openat"}))
+            .await
+            .expect("command execution should return result");
+        assert!(result.success);
+        assert!(result.output.contains("openat"));
+
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("syscall anomaly log should be written");
+        assert!(log.contains("\"kind\":\"unknown_syscall\""));
+        assert!(log.contains("\"syscall\":\"openat\""));
     }
 }

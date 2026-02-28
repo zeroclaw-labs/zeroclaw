@@ -61,7 +61,7 @@ rppal = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.14"
+tempfile = "3.26"
 
 [package.metadata.docs.rs]
 all-features = true

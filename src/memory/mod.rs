@@ -2,12 +2,14 @@ pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod embeddings;
+pub mod hybrid;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+pub mod qdrant;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -19,11 +21,13 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
+pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
+pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
@@ -31,7 +35,6 @@ pub use traits::Memory;
 pub use traits::{MemoryCategory, MemoryEntry};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
-#[cfg(feature = "memory-postgres")]
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
@@ -48,13 +51,17 @@ where
     G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
 {
     match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
+        MemoryBackendKind::Sqlite | MemoryBackendKind::SqliteQdrantHybrid => {
+            Ok(Box::new(sqlite_builder()?))
+        }
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(
@@ -207,7 +214,9 @@ pub fn create_memory_with_storage_and_routes(
         && config.snapshot_on_hygiene
         && matches!(
             backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+            MemoryBackendKind::Sqlite
+                | MemoryBackendKind::SqliteQdrantHybrid
+                | MemoryBackendKind::Lucid
         )
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
@@ -220,7 +229,9 @@ pub fn create_memory_with_storage_and_routes(
     if config.auto_hydrate
         && matches!(
             backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+            MemoryBackendKind::Sqlite
+                | MemoryBackendKind::SqliteQdrantHybrid
+                | MemoryBackendKind::Lucid
         )
         && snapshot::should_hydrate(workspace_dir)
     {
@@ -282,6 +293,7 @@ pub fn create_memory_with_storage_and_routes(
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
+            storage_provider.tls,
         )?;
         Ok(Box::new(memory))
     }
@@ -293,6 +305,64 @@ pub fn create_memory_with_storage_and_routes(
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
         );
+    }
+
+    fn build_qdrant_memory(
+        config: &MemoryConfig,
+        resolved_embedding: &ResolvedEmbeddingConfig,
+    ) -> anyhow::Result<QdrantMemory> {
+        let url = config
+            .qdrant
+            .url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("QDRANT_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "Qdrant memory backend requires url in [memory.qdrant] or QDRANT_URL env var",
+            )?;
+        let collection = std::env::var("QDRANT_COLLECTION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| config.qdrant.collection.clone());
+        let qdrant_api_key = config
+            .qdrant
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("QDRANT_API_KEY").ok())
+            .filter(|s| !s.trim().is_empty());
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
+                &resolved_embedding.provider,
+                resolved_embedding.api_key.as_deref(),
+                &resolved_embedding.model,
+                resolved_embedding.dimensions,
+            ));
+        tracing::info!(
+            "📦 Qdrant memory backend configured (url: {}, collection: {})",
+            url,
+            collection
+        );
+        Ok(QdrantMemory::new_lazy(
+            &url,
+            &collection,
+            qdrant_api_key,
+            embedder,
+        ))
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
+        return Ok(Box::new(build_qdrant_memory(config, &resolved_embedding)?));
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::SqliteQdrantHybrid) {
+        let sqlite: Arc<dyn Memory> = Arc::new(build_sqlite_memory(
+            config,
+            workspace_dir,
+            &resolved_embedding,
+        )?);
+        let qdrant: Arc<dyn Memory> = Arc::new(build_qdrant_memory(config, &resolved_embedding)?);
+        return Ok(Box::new(SqliteQdrantHybridMemory::new(sqlite, qdrant)));
     }
 
     create_memory_with_builders(
@@ -407,6 +477,21 @@ mod tests {
     }
 
     #[test]
+    fn factory_sqlite_qdrant_hybrid() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite_qdrant_hybrid".into(),
+            qdrant: crate::config::QdrantConfig {
+                url: Some("http://localhost:6333".into()),
+                ..crate::config::QdrantConfig::default()
+            },
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "sqlite_qdrant_hybrid");
+    }
+
+    #[test]
     fn factory_none_uses_noop_memory() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
@@ -479,6 +564,26 @@ mod tests {
         } else {
             assert!(error.to_string().contains("memory-postgres"));
         }
+    }
+
+    #[test]
+    fn factory_hybrid_requires_qdrant_url() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite_qdrant_hybrid".into(),
+            qdrant: crate::config::QdrantConfig {
+                url: None,
+                ..crate::config::QdrantConfig::default()
+            },
+            ..MemoryConfig::default()
+        };
+
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("hybrid backend should require qdrant url");
+        assert!(error
+            .to_string()
+            .contains("Qdrant memory backend requires url"));
     }
 
     #[test]

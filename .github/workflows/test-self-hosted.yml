@@ -1,0 +1,16 @@
+name: Test Self-Hosted Runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-runner:
+    runs-on: self-hosted
+    steps:
+      - name: Check runner info
+        run: |
+          echo "Runner: $(hostname)"
+          echo "OS: $(uname -a)"
+          echo "Docker: $(docker --version)"
+      - name: Test Docker
+        run: docker run --rm hello-world

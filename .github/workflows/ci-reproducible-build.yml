@@ -1,0 +1,121 @@
+name: CI Reproducible Build
+
+on:
+    push:
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "scripts/ci/reproducible_build_check.sh"
+            - ".github/workflows/ci-reproducible-build.yml"
+    pull_request:
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "scripts/ci/reproducible_build_check.sh"
+            - ".github/workflows/ci-reproducible-build.yml"
+    schedule:
+        - cron: "45 5 * * 1" # Weekly Monday 05:45 UTC
+    workflow_dispatch:
+        inputs:
+            fail_on_drift:
+                description: "Fail workflow if deterministic hash drift is detected"
+                required: true
+                default: true
+                type: boolean
+            allow_build_id_drift:
+                description: "Treat GNU build-id-only drift as non-blocking"
+                required: true
+                default: true
+                type: boolean
+
+concurrency:
+    group: repro-build-${{ github.event.pull_request.number || github.ref || github.run_id }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+    CARGO_TERM_COLOR: always
+
+jobs:
+    reproducibility:
+        name: Reproducible Build Probe
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 45
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - name: Run reproducible build check
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  fail_on_drift="false"
+                  allow_build_id_drift="true"
+                  if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+                    fail_on_drift="true"
+                  elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+                    fail_on_drift="${{ github.event.inputs.fail_on_drift || 'true' }}"
+                    allow_build_id_drift="${{ github.event.inputs.allow_build_id_drift || 'true' }}"
+                  fi
+                  FAIL_ON_DRIFT="$fail_on_drift" \
+                  ALLOW_BUILD_ID_DRIFT="$allow_build_id_drift" \
+                  OUTPUT_DIR="artifacts" \
+                  ./scripts/ci/reproducible_build_check.sh
+
+            - name: Emit normalized audit event
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/reproducible-build.json ]; then
+                    python3 scripts/ci/emit_audit_event.py \
+                      --event-type reproducible_build \
+                      --input-json artifacts/reproducible-build.json \
+                      --output-json artifacts/audit-event-reproducible-build.json \
+                      --artifact-name reproducible-build-audit-event \
+                      --retention-days 14
+                  fi
+
+            - name: Upload reproducibility artifacts
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: reproducible-build
+                  path: artifacts/reproducible-build*
+                  retention-days: 14
+
+            - name: Upload audit event artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: reproducible-build-audit-event
+                  path: artifacts/audit-event-reproducible-build.json
+                  if-no-files-found: ignore
+                  retention-days: 14
+
+            - name: Publish summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/reproducible-build.md ]; then
+                    cat artifacts/reproducible-build.md >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Reproducible build report missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi

@@ -15,6 +15,9 @@ indent_size = 4
 # Trailing whitespace is significant in Markdown (line breaks).
 trim_trailing_whitespace = false
 
+[*.go]
+indent_style = tab
+
 [*.{yml,yaml}]
 indent_size = 2
 
@@ -23,3 +26,7 @@ indent_size = 2
 
 [Dockerfile]
 indent_size = 4
+
+[*.nix]
+indent_style = space
+indent_size = 2

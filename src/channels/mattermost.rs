@@ -15,6 +15,8 @@ pub struct MattermostChannel {
     thread_replies: bool,
     /// When true, only respond to messages that @-mention the bot.
     mention_only: bool,
+    /// Sender IDs that bypass mention gating in channel/group contexts.
+    group_reply_allowed_sender_ids: Vec<String>,
     /// Handle for the background typing-indicator loop (aborted on stop_typing).
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -37,8 +39,15 @@ impl MattermostChannel {
             allowed_users,
             thread_replies,
             mention_only,
+            group_reply_allowed_sender_ids: Vec::new(),
             typing_handle: Mutex::new(None),
         }
+    }
+
+    /// Configure sender IDs that bypass mention gating in channel/group chats.
+    pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
+        self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -49,6 +58,16 @@ impl MattermostChannel {
     /// Empty list means deny everyone. "*" means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    fn is_group_sender_trigger_enabled(&self, user_id: &str) -> bool {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return false;
+        }
+        self.group_reply_allowed_sender_ids
+            .iter()
+            .any(|entry| entry == "*" || entry == user_id)
     }
 
     /// Get the bot's own user ID and username so we can ignore our own messages
@@ -124,7 +143,8 @@ impl Channel for MattermostChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Mattermost post failed ({status}): {body}");
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            bail!("Mattermost post failed ({status}): {sanitized}");
         }
 
         Ok(())
@@ -293,8 +313,10 @@ impl MattermostChannel {
             return None;
         }
 
+        let require_mention = self.mention_only && !self.is_group_sender_trigger_enabled(user_id);
+
         // mention_only filtering: skip messages that don't @-mention the bot.
-        let content = if self.mention_only {
+        let content = if require_mention {
             let normalized = normalize_mattermost_content(text, bot_user_id, bot_username, post);
             normalized?
         } else {
@@ -446,6 +468,17 @@ fn normalize_mattermost_content(
     }
 
     Some(cleaned)
+}
+
+fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = sender_ids
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 #[cfg(test)]
@@ -773,6 +806,24 @@ mod tests {
         assert_eq!(msg.content, "no mention here");
     }
 
+    #[test]
+    fn mention_only_sender_override_allows_without_mention() {
+        let ch = make_mention_only_channel()
+            .with_group_reply_allowed_senders(vec!["user1".into(), " user1 ".into()]);
+        let post = json!({
+            "id": "post1",
+            "user_id": "user1",
+            "message": "hello everyone",
+            "create_at": 1_600_000_000_000_i64,
+            "root_id": ""
+        });
+
+        let msg = ch
+            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .unwrap();
+        assert_eq!(msg.content, "hello everyone");
+    }
+
     // ── contains_bot_mention_mm unit tests ────────────────────────
 
     #[test]
@@ -914,5 +965,16 @@ mod tests {
         let result =
             normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
         assert_eq!(result.as_deref(), Some("hello @mybotx world"));
+    }
+
+    #[test]
+    fn normalize_group_reply_allowed_sender_ids_deduplicates() {
+        let normalized = normalize_group_reply_allowed_sender_ids(vec![
+            " user-1 ".into(),
+            "user-1".into(),
+            String::new(),
+            "user-2".into(),
+        ]);
+        assert_eq!(normalized, vec!["user-1".to_string(), "user-2".to_string()]);
     }
 }

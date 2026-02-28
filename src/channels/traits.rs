@@ -95,13 +95,17 @@ pub trait Channel: Send + Sync {
     }
 
     /// Update a previously sent draft message with new accumulated content.
+    ///
+    /// Returns `Ok(None)` to keep the current draft message ID, or
+    /// `Ok(Some(new_id))` when a continuation message was created
+    /// (e.g. after hitting a platform edit-count cap).
     async fn update_draft(
         &self,
         _recipient: &str,
         _message_id: &str,
         _text: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
@@ -117,6 +121,31 @@ pub trait Channel: Send + Sync {
     /// Cancel and remove a previously sent draft message if the channel supports it.
     async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Send an interactive approval prompt, if supported by the channel.
+    ///
+    /// Default behavior sends a plain-text fallback with slash-command actions.
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.len() > 220 {
+            let end = crate::util::floor_utf8_char_boundary(&raw_args, 220);
+            format!("{}...", &raw_args[..end])
+        } else {
+            raw_args
+        };
+        let message = format!(
+            "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`\nApprove: `/approve-allow {request_id}`\nDeny: `/approve-deny {request_id}`"
+        );
+        self.send(&SendMessage::new(message, recipient).in_thread(thread_ts))
+            .await
     }
 
     /// Add a reaction (emoji) to a message.
@@ -255,5 +284,27 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_truncates_safely_for_multibyte_utf8() {
+        let channel = DummyChannel;
+        let long_chinese = "測".repeat(100); // 300 bytes, over 220
+        let args = serde_json::json!({"cmd": long_chinese});
+        let result = channel
+            .send_approval_prompt("tester", "req-1", "shell", &args, None)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_short_args_not_truncated() {
+        let channel = DummyChannel;
+        let short_chinese = "測".repeat(10);
+        let args = serde_json::json!({"cmd": short_chinese});
+        let result = channel
+            .send_approval_prompt("tester", "req-1", "shell", &args, None)
+            .await;
+        assert!(result.is_ok());
     }
 }

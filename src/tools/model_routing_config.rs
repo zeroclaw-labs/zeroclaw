@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use crate::providers::has_provider_credential;
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
@@ -124,6 +125,42 @@ impl ModelRoutingConfigTool {
         Ok(output)
     }
 
+    fn normalize_transport_value(raw: &str, field: &str) -> anyhow::Result<String> {
+        let normalized = raw.trim().to_ascii_lowercase().replace(['-', '_'], "");
+        match normalized.as_str() {
+            "auto" => Ok("auto".to_string()),
+            "websocket" | "ws" => Ok("websocket".to_string()),
+            "sse" | "http" => Ok("sse".to_string()),
+            _ => anyhow::bail!("'{field}' must be one of: auto, websocket, sse"),
+        }
+    }
+
+    fn parse_optional_transport_update(
+        args: &Value,
+        field: &str,
+    ) -> anyhow::Result<MaybeSet<String>> {
+        let Some(raw) = args.get(field) else {
+            return Ok(MaybeSet::Unset);
+        };
+
+        if raw.is_null() {
+            return Ok(MaybeSet::Null);
+        }
+
+        let value = raw
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
+            .trim();
+
+        if value.is_empty() {
+            return Ok(MaybeSet::Null);
+        }
+
+        Ok(MaybeSet::Set(Self::normalize_transport_value(
+            value, field,
+        )?))
+    }
+
     fn parse_optional_f64_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<f64>> {
         let Some(raw) = args.get(field) else {
             return Ok(MaybeSet::Unset);
@@ -216,10 +253,8 @@ impl ModelRoutingConfigTool {
             "hint": route.hint,
             "provider": route.provider,
             "model": route.model,
-            "api_key_configured": route
-                .api_key
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty()),
+            "transport": route.transport,
+            "api_key_configured": has_provider_credential(&route.provider, route.api_key.as_deref()),
             "classification": classification,
         })
     }
@@ -264,10 +299,10 @@ impl ModelRoutingConfigTool {
                     "provider": agent.provider,
                     "model": agent.model,
                     "system_prompt": agent.system_prompt,
-                    "api_key_configured": agent
-                        .api_key
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
+                    "api_key_configured": has_provider_credential(
+                        &agent.provider,
+                        agent.api_key.as_deref()
+                    ),
                     "temperature": agent.temperature,
                     "max_depth": agent.max_depth,
                     "agentic": agent.agentic,
@@ -431,6 +466,7 @@ impl ModelRoutingConfigTool {
         let provider = Self::parse_non_empty_string(args, "provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
+        let transport_update = Self::parse_optional_transport_update(args, "transport")?;
 
         let keywords_update = if let Some(raw) = args.get("keywords") {
             Some(Self::parse_string_list(raw, "keywords")?)
@@ -466,7 +502,9 @@ impl ModelRoutingConfigTool {
             hint: hint.clone(),
             provider: provider.clone(),
             model: model.clone(),
+            max_tokens: None,
             api_key: None,
+            transport: None,
         });
 
         next_route.hint = hint.clone();
@@ -476,6 +514,12 @@ impl ModelRoutingConfigTool {
         match api_key_update {
             MaybeSet::Set(api_key) => next_route.api_key = Some(api_key),
             MaybeSet::Null => next_route.api_key = None,
+            MaybeSet::Unset => {}
+        }
+
+        match transport_update {
+            MaybeSet::Set(transport) => next_route.transport = Some(transport),
+            MaybeSet::Null => next_route.transport = None,
             MaybeSet::Unset => {}
         }
 
@@ -783,6 +827,11 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["string", "null"],
                     "description": "Optional API key override for scenario route or delegate agent"
                 },
+                "transport": {
+                    "type": ["string", "null"],
+                    "enum": ["auto", "websocket", "sse", "ws", "http", null],
+                    "description": "Optional route transport override for upsert_scenario (auto, websocket, sse)"
+                },
                 "keywords": {
                     "description": "Classification keywords for upsert_scenario (string or string array)",
                     "oneOf": [
@@ -901,6 +950,7 @@ impl Tool for ModelRoutingConfigTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -917,6 +967,39 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                Some(next) => std::env::set_var(key, next),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.as_deref() {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
     }
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -971,6 +1054,7 @@ mod tests {
                 "hint": "coding",
                 "provider": "openai",
                 "model": "gpt-5.3-codex",
+                "transport": "websocket",
                 "classification_enabled": true,
                 "keywords": ["code", "bug", "refactor"],
                 "patterns": ["```"],
@@ -992,7 +1076,56 @@ mod tests {
             item["hint"] == json!("coding")
                 && item["provider"] == json!("openai")
                 && item["model"] == json!("gpt-5.3-codex")
+                && item["transport"] == json!("websocket")
         }));
+    }
+
+    #[tokio::test]
+    async fn upsert_scenario_transport_alias_is_canonicalized() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "upsert_scenario",
+                "hint": "analysis",
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "transport": "WS"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        let scenarios = output["scenarios"].as_array().unwrap();
+        assert!(scenarios.iter().any(|item| {
+            item["hint"] == json!("analysis") && item["transport"] == json!("websocket")
+        }));
+    }
+
+    #[tokio::test]
+    async fn upsert_scenario_rejects_invalid_transport() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "upsert_scenario",
+                "hint": "analysis",
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "transport": "udp"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("'transport' must be one of: auto, websocket, sse"));
     }
 
     #[tokio::test]
@@ -1081,5 +1214,55 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn get_reports_env_backed_credentials_for_routes_and_agents() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("TELNYX_API_KEY", Some("test-telnyx-key"));
+        let _generic_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+        let _api_key_guard = EnvGuard::set("API_KEY", None);
+
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let upsert_route = tool
+            .execute(json!({
+                "action": "upsert_scenario",
+                "hint": "voice",
+                "provider": "telnyx",
+                "model": "telnyx-conversation"
+            }))
+            .await
+            .unwrap();
+        assert!(upsert_route.success, "{:?}", upsert_route.error);
+
+        let upsert_agent = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "voice_helper",
+                "provider": "telnyx",
+                "model": "telnyx-conversation"
+            }))
+            .await
+            .unwrap();
+        assert!(upsert_agent.success, "{:?}", upsert_agent.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+
+        let route = output["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["hint"] == json!("voice"))
+            .unwrap();
+        assert_eq!(route["api_key_configured"], json!(true));
+
+        assert_eq!(
+            output["agents"]["voice_helper"]["api_key_configured"],
+            json!(true)
+        );
     }
 }

@@ -69,12 +69,12 @@ Lưu ý vận hành:
 
 ## Channel Matrix
 
-### Tùy chọn Build Feature (`channel-matrix`)
+### Tùy chọn Build Feature (`channel-matrix`, `channel-lark`)
 
-Hỗ trợ Matrix được kiểm soát tại thời điểm biên dịch bằng Cargo feature `channel-matrix`.
+Hỗ trợ Matrix và Lark/Feishu được kiểm soát tại thời điểm biên dịch bằng Cargo features.
 
-- Các bản build mặc định đã bao gồm hỗ trợ Matrix (`default = ["hardware", "channel-matrix"]`).
-- Để lặp lại nhanh hơn khi không cần Matrix:
+- Bản build mặc định bao gồm Lark/Feishu (`default = ["channel-lark"]`), còn Matrix là opt-in.
+- Để lặp lại nhanh hơn khi không cần Matrix/Lark:
 
 ```bash
 cargo check --no-default-features --features hardware
@@ -86,7 +86,13 @@ cargo check --no-default-features --features hardware
 cargo check --no-default-features --features hardware,channel-matrix
 ```
 
-Nếu `[channels_config.matrix]` có mặt nhưng binary được build mà không có `channel-matrix`, các lệnh `zeroclaw channel list`, `zeroclaw channel doctor`, và `zeroclaw channel start` sẽ ghi log rằng Matrix bị bỏ qua có chủ ý trong bản build này.
+- Để bật tường minh hỗ trợ Lark/Feishu trong feature set tùy chỉnh:
+
+```bash
+cargo check --no-default-features --features hardware,channel-lark
+```
+
+Nếu `[channels_config.matrix]`, `[channels_config.lark]`, hoặc `[channels_config.feishu]` có mặt nhưng binary được build mà không có feature tương ứng, các lệnh `zeroclaw channel list`, `zeroclaw channel doctor`, và `zeroclaw channel start` sẽ ghi log rằng channel đó bị bỏ qua có chủ ý trong bản build này.
 
 ---
 
@@ -289,8 +295,8 @@ verify_tls = true
 
 ```toml
 [channels_config.lark]
-app_id = "cli_xxx"
-app_secret = "xxx"
+app_id = "your_lark_app_id"
+app_secret = "your_lark_app_secret"
 encrypt_key = ""                    # tùy chọn
 verification_token = ""             # tùy chọn
 allowed_users = ["*"]
@@ -334,7 +340,15 @@ allowed_users = ["*"]
 app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
+receive_mode = "webhook" # webhook (mặc định) hoặc websocket (legacy fallback)
 ```
+
+Ghi chú:
+
+- `webhook` hiện là chế độ mặc định, nhận callback tại `POST /qq`.
+- Gói xác thực QQ (`op = 13`) được ký tự động bằng `app_secret`.
+- Nếu có header `X-Bot-Appid`, giá trị phải khớp `app_id`.
+- Đặt `receive_mode = "websocket"` nếu cần giữ đường nhận sự kiện WS cũ.
 
 ### 4.14 iMessage
 

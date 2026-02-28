@@ -435,21 +435,25 @@ pub trait Provider: Send + Sync {
     }
 
     /// Streaming chat with history.
-    /// Default implementation falls back to stream_chat_with_system with last user message.
+    /// Default implementation extracts the last user message and delegates to
+    /// `stream_chat_with_system`, mirroring the non-streaming `chat_with_history`.
     fn stream_chat_with_history(
         &self,
-        _messages: &[ChatMessage],
-        _model: &str,
-        _temperature: f64,
-        _options: StreamOptions,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // For default implementation, we need to convert to owned strings
-        // This is a limitation of the default implementation
-        let provider_name = "unknown".to_string();
-
-        // Create a single empty chunk to indicate not supported
-        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
-        stream::once(async move { Ok(chunk) }).boxed()
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+        let last_user = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        self.stream_chat_with_system(system, last_user, model, temperature, options)
     }
 }
 

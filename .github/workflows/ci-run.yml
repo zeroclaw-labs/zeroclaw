@@ -5,6 +5,8 @@ on:
         branches: [dev, main]
     pull_request:
         branches: [dev, main]
+    merge_group:
+        branches: [dev, main]
 
 concurrency:
     group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -14,17 +16,21 @@ permissions:
     contents: read
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
     changes:
         name: Detect Change Scope
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         outputs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
             workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
+            ci_cd_changed: ${{ steps.scope.outputs.ci_cd_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
             base_sha: ${{ steps.scope.outputs.base_sha }}
         steps:
@@ -37,15 +43,15 @@ jobs:
               shell: bash
               env:
                   EVENT_NAME: ${{ github.event_name }}
-                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
               run: ./scripts/ci/detect_change_scope.sh
 
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 25
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 40
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -54,7 +60,9 @@ jobs:
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-check
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
             - name: Run strict lint delta gate
@@ -64,32 +72,81 @@ jobs:
 
     test:
         name: Test
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 30
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 60
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
-            - name: Run tests
-              run: cargo test --locked --verbose
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-check
+            - name: Run tests with flake detection
+              shell: bash
+              env:
+                  BLOCK_ON_FLAKE: ${{ vars.CI_BLOCK_ON_FLAKE_SUSPECTED || 'false' }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+
+                  if cargo test --locked --verbose; then
+                    echo '{"flake_suspected":false,"status":"success"}' > artifacts/flake-probe.json
+                    exit 0
+                  fi
+
+                  echo "::warning::First test run failed. Retrying for flake detection..."
+                  if cargo test --locked --verbose; then
+                    echo '{"flake_suspected":true,"status":"flake"}' > artifacts/flake-probe.json
+                    echo "::warning::Flake suspected — test passed on retry"
+                    if [ "${BLOCK_ON_FLAKE}" = "true" ]; then
+                      echo "BLOCK_ON_FLAKE is set; failing on suspected flake."
+                      exit 1
+                    fi
+                    exit 0
+                  fi
+
+                  echo '{"flake_suspected":false,"status":"failure"}' > artifacts/flake-probe.json
+                  exit 1
+            - name: Publish flake probe summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/flake-probe.json ]; then
+                    status=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['status'])")
+                    flake=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['flake_suspected'])")
+                    echo "### Test Flake Probe" >> "$GITHUB_STEP_SUMMARY"
+                    echo "- Status: \`${status}\`" >> "$GITHUB_STEP_SUMMARY"
+                    echo "- Flake suspected: \`${flake}\`" >> "$GITHUB_STEP_SUMMARY"
+                  fi
+            - name: Upload flake probe artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: test-flake-probe
+                  path: artifacts/flake-probe.*
+                  if-no-files-found: ignore
+                  retention-days: 14
 
     build:
         name: Build (Smoke)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 20
+        runs-on: [self-hosted, aws-india]
+        timeout-minutes: 35
 
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-build
+                  cache-targets: true
             - name: Build binary (smoke check)
               run: cargo build --profile release-fast --locked --verbose
             - name: Check binary size
@@ -99,7 +156,7 @@ jobs:
         name: Docs-Only Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         steps:
             - name: Skip heavy jobs for docs-only change
               run: echo "Docs-only change detected. Rust lint/test/build skipped."
@@ -108,7 +165,7 @@ jobs:
         name: Non-Rust Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         steps:
             - name: Skip Rust jobs for non-Rust change scope
               run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
@@ -116,8 +173,8 @@ jobs:
     docs-quality:
         name: Docs Quality
         needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        if: needs.changes.outputs.docs_changed == 'true'
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -172,7 +229,7 @@ jobs:
         name: Lint Feedback
         if: github.event_name == 'pull_request'
         needs: [changes, lint, docs-quality]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         permissions:
             contents: read
             pull-requests: write
@@ -195,10 +252,10 @@ jobs:
                       await script({github, context, core});
 
     workflow-owner-approval:
-        name: Workflow Owner Approval
+        name: CI/CD Owner Approval (@chumyin)
         needs: [changes]
-        if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        if: github.event_name == 'pull_request' && needs.changes.outputs.ci_cd_changed == 'true'
+        runs-on: [self-hosted, aws-india]
         permissions:
             contents: read
             pull-requests: read
@@ -206,10 +263,8 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-            - name: Require owner approval for workflow file changes
+            - name: Require @chumyin approval for CI/CD related changes
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
               with:
                   script: |
                     const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
@@ -219,7 +274,7 @@ jobs:
         name: License File Owner Guard
         needs: [changes]
         if: github.event_name == 'pull_request'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         permissions:
             contents: read
             pull-requests: read
@@ -237,7 +292,7 @@ jobs:
         name: CI Required Gate
         if: always()
         needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         steps:
             - name: Enforce required status
               shell: bash
@@ -247,90 +302,66 @@ jobs:
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
-                  workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
+                  ci_cd_changed="${{ needs.changes.outputs.ci_cd_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
                   workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
                   license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
-                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-                    echo "workflow_owner_approval=${workflow_owner_result}"
-                    echo "license_file_owner_guard=${license_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
+                  # --- Helper: enforce PR governance gates ---
+                  check_pr_governance() {
+                    if [ "$event_name" != "pull_request" ]; then return 0; fi
+                    if [ "$ci_cd_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                      echo "CI/CD related files changed but required @chumyin approval gate did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
+                    if [ "$license_owner_result" != "success" ]; then
                       echo "License file owner guard did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only push changed docs, but docs-quality did not pass."
+                  }
+
+                  check_docs_quality() {
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs changed but docs-quality did not pass."
                       exit 1
                     fi
+                  }
+
+                  # --- Docs-only fast path ---
+                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+                    check_pr_governance
+                    check_docs_quality
                     echo "Docs-only fast path passed."
                     exit 0
                   fi
 
+                  # --- Non-rust fast path ---
                   if [ "$rust_changed" != "true" ]; then
-                    echo "rust_changed=false (non-rust fast path)"
-                    echo "workflow_owner_approval=${workflow_owner_result}"
-                    echo "license_file_owner_guard=${license_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
-                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                      echo "License file owner guard did not pass."
-                      exit 1
-                    fi
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Non-rust push changed docs, but docs-quality did not pass."
-                      exit 1
-                    fi
+                    check_pr_governance
+                    check_docs_quality
                     echo "Non-rust fast path passed."
                     exit 0
                   fi
 
+                  # --- Rust change path ---
                   lint_result="${{ needs.lint.result }}"
-                  lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
 
                   echo "lint=${lint_result}"
-                  echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
-                  if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                    echo "Workflow files changed but workflow owner approval gate did not pass."
+                  check_pr_governance
+
+                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required CI jobs did not pass: lint=${lint_result} test=${test_result} build=${build_result}"
                     exit 1
                   fi
 
-                  if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                    echo "License file owner guard did not pass."
-                    exit 1
-                  fi
+                  check_docs_quality
 
-                  if [ "$event_name" = "pull_request" ]; then
-                    if [ "$build_result" != "success" ]; then
-                      echo "Required PR build job did not pass."
-                      exit 1
-                    fi
-                    echo "PR required checks passed."
-                    exit 0
-                  fi
-
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                    echo "Required push CI jobs did not pass."
-                    exit 1
-                  fi
-
-                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                    echo "Push changed docs, but docs-quality did not pass."
-                    exit 1
-                  fi
-
-                  echo "Push required checks passed."
+                  echo "All required checks passed."
