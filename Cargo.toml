@@ -62,7 +62,7 @@ urlencoding = "2.1"
 nanohtml2text = "0.2"
 
 # Zip archive extraction
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
 
 # XML parsing (DOCX text extraction)
 quick-xml = "0.37"
