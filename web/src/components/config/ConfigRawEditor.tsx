@@ -20,6 +20,7 @@ export default function ConfigRawEditor({ rawToml, onChange, disabled }: Props) 
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}
         spellCheck={false}
+        aria-label="Raw TOML configuration editor"
         className="w-full min-h-[500px] bg-gray-950 text-gray-200 font-mono text-sm p-4 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset disabled:opacity-50"
         style={{ tabSize: 4 }}
       />

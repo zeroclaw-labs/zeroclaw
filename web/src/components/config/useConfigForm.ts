@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { parse, stringify } from 'smol-toml';
 import { getConfig, putConfig } from '@/lib/api';
 
@@ -18,7 +18,9 @@ function scanMasked(obj: unknown, prefix: string, out: Set<string>) {
     return;
   }
   if (Array.isArray(obj)) {
-    obj.forEach((item, i) => scanMasked(item, `${prefix}.${i}`, out));
+    obj.forEach((item, i) => {
+      scanMasked(item, `${prefix}.${i}`, out);
+    });
     return;
   }
   if (typeof obj === 'object') {
@@ -90,6 +92,7 @@ export function useConfigForm(): ConfigFormState {
   const [parsed, setParsed] = useState<ParsedConfig>({});
   const maskedPathsRef = useRef<Set<string>>(new Set());
   const dirtyPathsRef = useRef<Set<string>>(new Set());
+  const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [, forceRender] = useState(0);
 
   const loadConfig = useCallback(async () => {
@@ -121,12 +124,22 @@ export function useConfigForm(): ConfigFormState {
     }
   }, []);
 
-  // Load on first render
+  // Load once on mount.
   const hasLoaded = useRef(false);
-  if (!hasLoaded.current) {
-    hasLoaded.current = true;
-    loadConfig();
-  }
+  useEffect(() => {
+    if (!hasLoaded.current) {
+      hasLoaded.current = true;
+      void loadConfig();
+    }
+  }, [loadConfig]);
+
+  useEffect(() => {
+    return () => {
+      if (successTimeoutRef.current) {
+        clearTimeout(successTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const fieldPath = (sectionPath: string, fieldKey: string) =>
     sectionPath ? `${sectionPath}.${fieldKey}` : fieldKey;
@@ -235,6 +248,9 @@ export function useConfigForm(): ConfigFormState {
     setSaving(true);
     setError(null);
     setSuccess(null);
+    if (successTimeoutRef.current) {
+      clearTimeout(successTimeoutRef.current);
+    }
 
     try {
       let toml: string;
@@ -247,7 +263,7 @@ export function useConfigForm(): ConfigFormState {
       setSuccess('Configuration saved successfully.');
 
       // Auto-dismiss success after 4 seconds
-      setTimeout(() => setSuccess(null), 4000);
+      successTimeoutRef.current = setTimeout(() => setSuccess(null), 4000);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save configuration');
     } finally {
@@ -262,6 +278,10 @@ export function useConfigForm(): ConfigFormState {
   const clearMessages = useCallback(() => {
     setError(null);
     setSuccess(null);
+    if (successTimeoutRef.current) {
+      clearTimeout(successTimeoutRef.current);
+      successTimeoutRef.current = null;
+    }
   }, []);
 
   return {

@@ -15,7 +15,20 @@ export default function NumberField({ field, value, onChange }: FieldProps) {
         }
         const n = Number(raw);
         if (!isNaN(n)) {
-          onChange(field.step && field.step < 1 ? n : Math.floor(n));
+          onChange(n);
+        }
+      }}
+      onBlur={(e) => {
+        if (field.step !== undefined && field.step < 1) {
+          return;
+        }
+        const raw = e.target.value;
+        if (raw === '') {
+          return;
+        }
+        const n = Number(raw);
+        if (!isNaN(n)) {
+          onChange(Math.floor(n));
         }
       }}
       min={field.min}

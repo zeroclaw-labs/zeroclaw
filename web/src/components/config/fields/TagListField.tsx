@@ -32,7 +32,7 @@ export default function TagListField({ field, value, onChange }: FieldProps) {
       <div className="flex flex-wrap gap-1.5 mb-2">
         {tags.map((tag, i) => (
           <span
-            key={i}
+            key={tag}
             className="inline-flex items-center gap-1 bg-gray-700 text-gray-200 rounded-full px-2.5 py-0.5 text-xs"
           >
             {tag}

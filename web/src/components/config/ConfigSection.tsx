@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { SectionDef, FieldDef } from './types';
 import TextField from './fields/TextField';
@@ -47,14 +47,25 @@ export default function ConfigSection({
   visibleFields,
 }: Props) {
   const [collapsed, setCollapsed] = useState(section.defaultCollapsed ?? false);
+  const sectionPanelId = useMemo(
+    () =>
+      `config-section-${(section.path || 'root').replace(/[^a-zA-Z0-9_-]/g, '-')}`,
+    [section.path],
+  );
   const Icon = section.icon;
   const fields = visibleFields ?? section.fields;
+
+  useEffect(() => {
+    setCollapsed(section.defaultCollapsed ?? false);
+  }, [section.path, section.defaultCollapsed]);
 
   return (
     <div className="bg-gray-900 rounded-xl border border-gray-800">
       <button
         type="button"
         onClick={() => setCollapsed(!collapsed)}
+        aria-expanded={!collapsed}
+        aria-controls={sectionPanelId}
         className="w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-800/30 transition-colors rounded-t-xl"
       >
         {collapsed ? (
@@ -75,7 +86,10 @@ export default function ConfigSection({
       </button>
 
       {!collapsed && (
-        <div className="border-t border-gray-800 px-4 py-4 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4">
+        <div
+          id={sectionPanelId}
+          className="border-t border-gray-800 px-4 py-4 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-4"
+        >
           {fields.map((field) => {
             const value = getFieldValue(section.path, field.key);
             const masked = isFieldMasked(section.path, field.key);
