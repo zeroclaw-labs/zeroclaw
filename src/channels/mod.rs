@@ -1028,21 +1028,6 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .clone()
 }
 
-fn runtime_perplexity_filter_snapshot(
-    ctx: &ChannelRuntimeContext,
-) -> crate::config::PerplexityFilterConfig {
-    if let Some(config_path) = runtime_config_path(ctx) {
-        let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = store.get(&config_path) {
-            return state.perplexity_filter.clone();
-        }
-    }
-
-    crate::config::PerplexityFilterConfig::default()
-}
-
 fn filtered_tool_specs_for_runtime(
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
