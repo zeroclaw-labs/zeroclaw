@@ -7,7 +7,7 @@
 ## Точки входа
 
 - Русский i18n Hub: [README.md](README.md)
-- Русский совместимый Hub: [../../README.ru.md](../../README.ru.md)
+- Русский совместимый Hub: [docs/i18n/ru/README.md](README.md)
 - Русский совместимый SUMMARY: [../../SUMMARY.ru.md](../../SUMMARY.ru.md)
 - Индекс i18n: [../README.md](../README.md)
 - Карта покрытия i18n: [../../i18n-coverage.md](../../i18n-coverage.md)

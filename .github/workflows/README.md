@@ -28,3 +28,9 @@ Current workflow helper scripts:
 - `.github/workflows/scripts/pr_intake_checks.js`
 - `.github/workflows/scripts/pr_labeler.js`
 - `.github/workflows/scripts/test_benchmarks_pr_comment.js`
+
+Release/CI policy assets introduced for advanced delivery lanes:
+
+- `.github/release/nightly-owner-routing.json`
+- `.github/release/canary-policy.json`
+- `.github/release/prerelease-stage-gates.json`

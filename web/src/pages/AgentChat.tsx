@@ -11,6 +11,8 @@ interface ChatMessage {
 }
 
 let fallbackMessageIdCounter = 0;
+const EMPTY_DONE_FALLBACK =
+  'Tool execution completed, but no final response text was returned.';
 
 function makeMessageId(): string {
   const uuid = globalThis.crypto?.randomUUID?.();
@@ -59,18 +61,19 @@ export default function AgentChat() {
 
         case 'message':
         case 'done': {
-          const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
-          if (content) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: makeMessageId(),
-                role: 'agent',
-                content,
-                timestamp: new Date(),
-              },
-            ]);
-          }
+          const content = (msg.full_response ?? msg.content ?? pendingContentRef.current ?? '').trim();
+          const finalContent = content || EMPTY_DONE_FALLBACK;
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: makeMessageId(),
+              role: 'agent',
+              content: finalContent,
+              timestamp: new Date(),
+            },
+          ]);
+
           pendingContentRef.current = '';
           setTyping(false);
           break;

@@ -10,12 +10,12 @@ Dernière mise à jour : **24 février 2026**.
 
 - Carte de structure docs (langue/partie/fonction) : [structure/README.md](structure/README.md)
 - README en anglais : [../README.md](../README.md)
-- README en chinois : [../README.zh-CN.md](../README.zh-CN.md)
-- README en japonais : [../README.ja.md](../README.ja.md)
-- README en russe : [../README.ru.md](../README.ru.md)
-- README en français : [../README.fr.md](../README.fr.md)
-- README en vietnamien : [../README.vi.md](../README.vi.md)
-- README en grec : [../README.el.md](../README.el.md)
+- README en chinois : [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- README en japonais : [docs/i18n/ja/README.md](i18n/ja/README.md)
+- README en russe : [docs/i18n/ru/README.md](i18n/ru/README.md)
+- README en français : [docs/i18n/fr/README.md](i18n/fr/README.md)
+- README en vietnamien : [docs/i18n/vi/README.md](i18n/vi/README.md)
+- README en grec : [docs/i18n/el/README.md](i18n/el/README.md)
 - Documentation en anglais : [README.md](README.md)
 - Documentation en chinois : [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - Documentation en japonais : [i18n/ja/README.md](i18n/ja/README.md)
@@ -32,13 +32,13 @@ Dernière mise à jour : **24 février 2026**.
 
 ### 1) Démarrage rapide
 
-- [getting-started/README.fr.md](getting-started/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/one-click-bootstrap.md](i18n/fr/one-click-bootstrap.md)
 - [i18n/fr/android-setup.md](i18n/fr/android-setup.md)
 
 ### 2) Référence des commandes, configuration et intégrations
 
-- [reference/README.fr.md](reference/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/commands-reference.md](i18n/fr/commands-reference.md)
 - [i18n/fr/providers-reference.md](i18n/fr/providers-reference.md)
 - [i18n/fr/channels-reference.md](i18n/fr/channels-reference.md)
@@ -50,7 +50,7 @@ Dernière mise à jour : **24 février 2026**.
 
 ### 3) Exploitation et déploiement
 
-- [operations/README.fr.md](operations/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/operations-runbook.md](i18n/fr/operations-runbook.md)
 - [i18n/fr/release-process.md](i18n/fr/release-process.md)
 - [i18n/fr/troubleshooting.md](i18n/fr/troubleshooting.md)
@@ -60,7 +60,7 @@ Dernière mise à jour : **24 février 2026**.
 
 ### 4) Sécurité et gouvernance
 
-- [security/README.fr.md](security/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/agnostic-security.md](i18n/fr/agnostic-security.md)
 - [i18n/fr/frictionless-security.md](i18n/fr/frictionless-security.md)
 - [i18n/fr/sandboxing.md](i18n/fr/sandboxing.md)
@@ -71,7 +71,7 @@ Dernière mise à jour : **24 février 2026**.
 
 ### 5) Matériel et périphériques
 
-- [hardware/README.fr.md](hardware/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/hardware-peripherals-design.md](i18n/fr/hardware-peripherals-design.md)
 - [i18n/fr/adding-boards-and-tools.md](i18n/fr/adding-boards-and-tools.md)
 - [i18n/fr/nucleo-setup.md](i18n/fr/nucleo-setup.md)
@@ -80,7 +80,7 @@ Dernière mise à jour : **24 février 2026**.
 
 ### 6) Contribution et CI
 
-- [contributing/README.fr.md](contributing/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - [i18n/fr/pr-workflow.md](i18n/fr/pr-workflow.md)
 - [i18n/fr/reviewer-playbook.md](i18n/fr/reviewer-playbook.md)
@@ -89,7 +89,7 @@ Dernière mise à jour : **24 février 2026**.
 
 ### 7) État du projet et instantanés
 
-- [project/README.fr.md](project/README.fr.md)
+- [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/project-triage-snapshot-2026-02-18.md](i18n/fr/project-triage-snapshot-2026-02-18.md)
 - [i18n/fr/docs-audit-2026-02-24.md](i18n/fr/docs-audit-2026-02-24.md)
 - [i18n/fr/docs-inventory.md](i18n/fr/docs-inventory.md)

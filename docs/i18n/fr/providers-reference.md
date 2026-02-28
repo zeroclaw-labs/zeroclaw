@@ -16,3 +16,7 @@ Source anglaise:
 
 - Les IDs provider et noms d'env vars restent en anglais.
 - La source normative de comportement est l'anglais.
+
+## Notes de mise à jour
+
+- Ajout d'un réglage `provider.reasoning_level` pour le niveau de raisonnement OpenAI Codex. Voir la source anglaise pour les détails.

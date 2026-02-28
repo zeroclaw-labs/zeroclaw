@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 25, 2026**.
 
 Config path resolution at startup:
 
@@ -90,14 +90,14 @@ Operational note for container users:
 | Key | Default | Purpose |
 |---|---|---|
 | `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
-| `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
+| `max_tool_iterations` | `20` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
 
 Notes:
 
-- Setting `max_tool_iterations = 0` falls back to safe default `10`.
+- Setting `max_tool_iterations = 0` falls back to safe default `20`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
@@ -147,6 +147,42 @@ Notes:
 - Estop state is persisted atomically and reloaded on startup.
 - Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
 - Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
+
+## `[security.syscall_anomaly]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable syscall anomaly detection over command output telemetry |
+| `strict_mode` | `false` | Emit anomaly when denied syscalls are observed even if in baseline |
+| `alert_on_unknown_syscall` | `true` | Alert on syscall names not present in baseline |
+| `max_denied_events_per_minute` | `5` | Threshold for denied-syscall spike alerts |
+| `max_total_events_per_minute` | `120` | Threshold for total syscall-event spike alerts |
+| `max_alerts_per_minute` | `30` | Global alert budget guardrail per rolling minute |
+| `alert_cooldown_secs` | `20` | Cooldown between identical anomaly alerts |
+| `log_path` | `syscall-anomalies.log` | JSONL anomaly log path |
+| `baseline_syscalls` | built-in allowlist | Expected syscall profile; unknown entries trigger alerts |
+
+Notes:
+
+- Detection consumes seccomp/audit hints from command `stdout`/`stderr`.
+- Numeric syscall IDs in Linux audit lines are mapped to common x86_64 names when available.
+- Alert budget and cooldown reduce duplicate/noisy events during repeated retries.
+- `max_denied_events_per_minute` must be less than or equal to `max_total_events_per_minute`.
+
+Example:
+
+```toml
+[security.syscall_anomaly]
+enabled = true
+strict_mode = false
+alert_on_unknown_syscall = true
+max_denied_events_per_minute = 5
+max_total_events_per_minute = 120
+max_alerts_per_minute = 30
+alert_cooldown_secs = 20
+log_path = "syscall-anomalies.log"
+baseline_syscalls = ["read", "write", "openat", "close", "execve", "futex"]
+```
 
 ## `[agents.<name>]`
 
@@ -231,6 +267,7 @@ The agent will research the codebase before responding to queries like:
 
 | Key | Default | Purpose |
 |---|---|---|
+| `kind` | `native` | Runtime backend: `native`, `docker`, or `wasm` |
 | `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
 
 Notes:
@@ -238,6 +275,65 @@ Notes:
 - `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
+- Deprecated compatibility alias: `runtime.reasoning_level` is still accepted but should be migrated to `provider.reasoning_level`.
+- `runtime.kind = "wasm"` enables capability-bounded module execution and disables shell/process style execution.
+
+### `[runtime.wasm]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `tools_dir` | `"tools/wasm"` | Workspace-relative directory containing `.wasm` modules |
+| `fuel_limit` | `1000000` | Instruction budget per module invocation |
+| `memory_limit_mb` | `64` | Per-module memory cap (MB) |
+| `max_module_size_mb` | `50` | Maximum allowed `.wasm` file size (MB) |
+| `allow_workspace_read` | `false` | Allow WASM host calls to read workspace files (future-facing) |
+| `allow_workspace_write` | `false` | Allow WASM host calls to write workspace files (future-facing) |
+| `allowed_hosts` | `[]` | Explicit network host allowlist for WASM host calls (future-facing) |
+
+Notes:
+
+- `allowed_hosts` entries must be normalized `host` or `host:port` strings; wildcards, schemes, and paths are rejected when `runtime.wasm.security.strict_host_validation = true`.
+- Invocation-time capability overrides are controlled by `runtime.wasm.security.capability_escalation_mode`:
+  - `deny` (default): reject escalation above runtime baseline.
+  - `clamp`: reduce requested capabilities to baseline.
+
+### `[runtime.wasm.security]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `require_workspace_relative_tools_dir` | `true` | Require `runtime.wasm.tools_dir` to be workspace-relative and reject `..` traversal |
+| `reject_symlink_modules` | `true` | Block symlinked `.wasm` module files during execution |
+| `reject_symlink_tools_dir` | `true` | Block execution when `runtime.wasm.tools_dir` is itself a symlink |
+| `strict_host_validation` | `true` | Fail config/invocation on invalid host entries instead of dropping them |
+| `capability_escalation_mode` | `"deny"` | Escalation policy: `deny` or `clamp` |
+| `module_hash_policy` | `"warn"` | Module integrity policy: `disabled`, `warn`, or `enforce` |
+| `module_sha256` | `{}` | Optional map of module names to pinned SHA-256 digests |
+
+Notes:
+
+- `module_sha256` keys must match module names (without `.wasm`) and use `[A-Za-z0-9_-]` only.
+- `module_sha256` values must be 64-character hexadecimal SHA-256 strings.
+- `module_hash_policy = "warn"` allows execution but logs missing/mismatched digests.
+- `module_hash_policy = "enforce"` blocks execution on missing/mismatched digests and requires at least one pin.
+
+WASM profile templates:
+
+- `dev/config.wasm.dev.toml`
+- `dev/config.wasm.staging.toml`
+- `dev/config.wasm.prod.toml`
+
+## `[provider]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `reasoning_level` | unset (`None`) | Reasoning effort/level override for providers that support explicit levels (currently OpenAI Codex `/responses`) |
+
+Notes:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT` for OpenAI Codex requests.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- If both `provider.reasoning_level` and deprecated `runtime.reasoning_level` are set, provider-level value wins.
 
 ## `[skills]`
 
@@ -398,6 +494,10 @@ Notes:
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
+| `non_cli_excluded_tools` | `[]` | tools hidden from non-CLI channel tool specs |
+| `non_cli_approval_approvers` | `[]` | optional allowlist for who can run non-CLI approval-management commands |
+| `non_cli_natural_language_approval_mode` | `direct` | natural-language behavior for approval-management commands (`direct`, `request_confirm`, `disabled`) |
+| `non_cli_natural_language_approval_mode_by_channel` | `{}` | per-channel override map for natural-language approval mode |
 
 Notes:
 
@@ -406,6 +506,25 @@ Notes:
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+- In supervised mode on non-CLI channels, operators can persist human-approved tools with:
+  - One-step flow: `/approve <tool>`.
+  - Two-step flow: `/approve-request <tool>` then `/approve-confirm <request-id>` (same sender + same chat/channel).
+  Both paths write to `autonomy.auto_approve` and remove the tool from `autonomy.always_ask`.
+- `non_cli_natural_language_approval_mode` controls how strict natural-language approval intents are:
+  - `direct` (default): natural-language approval grants immediately (private-chat friendly).
+  - `request_confirm`: natural-language approval creates a pending request that needs explicit confirm.
+  - `disabled`: natural-language approval commands are rejected; use slash commands only.
+- `non_cli_natural_language_approval_mode_by_channel` can override that mode for specific channels (keys are channel names like `telegram`, `discord`, `slack`).
+  - Example: keep global `direct`, but force `discord = "request_confirm"` for team chats.
+- `non_cli_approval_approvers` can restrict who is allowed to run approval commands (`/approve*`, `/unapprove`, `/approvals`):
+  - `*` allows all channel-admitted senders.
+  - `alice` allows sender `alice` on any channel.
+  - `telegram:alice` allows only that channel+sender pair.
+  - `telegram:*` allows any sender on Telegram.
+  - `*:alice` allows `alice` on any channel.
+- Use `/unapprove <tool>` to remove persisted approval from `autonomy.auto_approve`.
+- `/approve-pending` lists pending requests for the current sender+chat/channel scope.
+- If a tool remains unavailable after approval, check `autonomy.non_cli_excluded_tools` (runtime `/approvals` shows this list). Channel runtime reloads this list from `config.toml` automatically.
 
 ```toml
 [autonomy]
@@ -569,6 +688,12 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- Telegram/Discord/Slack/Mattermost/Lark/Feishu support `[channels_config.<channel>.group_reply]`:
+  - `mode = "all_messages"` or `mode = "mention_only"`
+  - `allowed_sender_ids = ["..."]` to bypass mention gating in groups
+  - `allowed_users` allowlist checks still run first
+- Legacy `mention_only` flags (Telegram/Discord/Mattermost/Lark) remain supported as fallback only.
+  If `group_reply.mode` is set, it takes precedence over legacy `mention_only`.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 ### `[channels_config.nostr]`
@@ -707,6 +832,31 @@ Notes:
 
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
+
+## `[agents_ipc]`
+
+Inter-process communication for independent ZeroClaw agents on the same host.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable IPC tools (`agents_list`, `agents_send`, `agents_inbox`, `state_get`, `state_set`) |
+| `db_path` | `~/.zeroclaw/agents.db` | Shared SQLite database path (all agents on this host share one file) |
+| `staleness_secs` | `300` | Agents not seen within this window are considered offline (seconds) |
+
+Notes:
+
+- When `enabled = false` (default), no IPC tools are registered and no database is created.
+- All agents that share a `db_path` can discover each other and exchange messages.
+- Agent identity is derived from `workspace_dir` (SHA-256 hash), not user-supplied.
+
+Example:
+
+```toml
+[agents_ipc]
+enabled = true
+db_path = "~/.zeroclaw/agents.db"
+staleness_secs = 300
+```
 
 ## Security-Relevant Defaults
 

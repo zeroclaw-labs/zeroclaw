@@ -7,7 +7,7 @@
 ## 入口
 
 - 日本語 i18n Hub: [README.md](README.md)
-- 日本語互換 Hub: [../../README.ja.md](../../README.ja.md)
+- 日本語互換 Hub: [docs/i18n/ja/README.md](README.md)
 - 日本語互換 SUMMARY: [../../SUMMARY.ja.md](../../SUMMARY.ja.md)
 - i18n 索引: [../README.md](../README.md)
 - i18n カバレッジ: [../../i18n-coverage.md](../../i18n-coverage.md)

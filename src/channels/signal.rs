@@ -316,7 +316,8 @@ impl Channel for SignalChannel {
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    tracing::warn!("Signal SSE returned {status}: {body}");
+                    let sanitized = crate::providers::sanitize_api_error(&body);
+                    tracing::warn!("Signal SSE returned {status}: {sanitized}");
                     tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
                     retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
                     continue;

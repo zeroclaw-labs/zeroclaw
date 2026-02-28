@@ -27,6 +27,7 @@ from typing import Iterable
 
 AUDIT_PREFIXES = (
     ".github/workflows/",
+    ".github/release/",
     ".github/actions/",
     ".github/codeql/",
     "scripts/ci/",
@@ -39,6 +40,7 @@ AUDIT_FILES = {
 }
 WORKFLOW_PATH_PREFIXES = (
     ".github/workflows/",
+    ".github/release/",
     ".github/actions/",
     ".github/codeql/",
 )

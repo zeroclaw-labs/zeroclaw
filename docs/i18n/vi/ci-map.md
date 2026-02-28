@@ -45,8 +45,6 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
     - Mục đích: build release artifact ở chế độ xác minh (thủ công/theo lịch) và publish GitHub release khi push tag hoặc chế độ publish thủ công
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Mục đích: xác thực chính sách bậc contributor dùng chung trong `.github/label-policy.json` và đảm bảo các label workflow sử dụng chính sách đó
-- `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
-    - Mục đích: Rust setup/cache có thể tái sử dụng + trình chạy lệnh cho các workflow-call consumer
 
 ### Tự động hóa repository tùy chọn
 

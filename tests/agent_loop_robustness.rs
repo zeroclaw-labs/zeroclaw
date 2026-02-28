@@ -315,14 +315,14 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 // TG4.3: Iteration limit enforcement (#777)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should not exceed max_tool_iterations (default=10) even with
+/// Agent should not exceed max_tool_iterations (default=20) even with
 /// a provider that keeps returning tool calls
 #[tokio::test]
 async fn agent_respects_max_tool_iterations() {
     let (counting_tool, count) = CountingTool::new();
 
-    // Create 20 tool call responses - more than the default limit of 10
-    let mut responses: Vec<ChatResponse> = (0..20)
+    // Create 30 tool call responses - more than the default limit of 20
+    let mut responses: Vec<ChatResponse> = (0..30)
         .map(|i| {
             tool_response(vec![ToolCall {
                 id: format!("tc_{i}"),
@@ -344,8 +344,8 @@ async fn agent_respects_max_tool_iterations() {
 
     let invocations = *count.lock().unwrap();
     assert!(
-        invocations <= 10,
-        "tool invocations ({invocations}) should not exceed default max_tool_iterations (10)"
+        invocations <= 20,
+        "tool invocations ({invocations}) should not exceed default max_tool_iterations (20)"
     );
 }
 

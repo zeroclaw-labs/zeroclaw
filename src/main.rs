@@ -57,11 +57,13 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod coordination;
 mod cost;
 mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
+mod goals;
 mod hardware;
 mod health;
 mod heartbeat;
@@ -83,6 +85,7 @@ mod skills;
 mod sop;
 mod tools;
 mod tunnel;
+mod update;
 mod util;
 
 use config::Config;
@@ -236,7 +239,8 @@ Examples:
   zeroclaw gateway                  # use config defaults
   zeroclaw gateway -p 8080          # listen on port 8080
   zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  zeroclaw gateway -p 0             # random available port
+  zeroclaw gateway --new-pairing    # clear tokens and generate fresh pairing code")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -245,6 +249,10 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Clear all paired tokens and generate a fresh pairing code
+        #[arg(long)]
+        new_pairing: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -291,6 +299,28 @@ Examples:
 
     /// Show system status (full details)
     Status,
+
+    /// Self-update ZeroClaw to the latest version
+    #[command(long_about = "\
+Self-update ZeroClaw to the latest release from GitHub.
+
+Downloads the appropriate pre-built binary for your platform and
+replaces the current executable. Requires write permissions to
+the binary location.
+
+Examples:
+  zeroclaw update              # Update to latest version
+  zeroclaw update --check      # Check for updates without installing
+  zeroclaw update --force      # Reinstall even if already up to date")]
+    Update {
+        /// Check for updates without installing
+        #[arg(long)]
+        check: bool,
+
+        /// Force update even if already at latest version
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Engage, inspect, and resume emergency-stop states.
     ///
@@ -788,8 +818,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Onboard { .. } => unreachable!(),
-        Commands::Completions { .. } => unreachable!(),
+        Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
 
         Commands::Agent {
             message,
@@ -835,7 +864,19 @@ async fn main() -> Result<()> {
             .map(|_| ())
         }
 
-        Commands::Gateway { port, host } => {
+        Commands::Gateway {
+            port,
+            host,
+            new_pairing,
+        } => {
+            if new_pairing {
+                // Persist token reset from raw config so env-derived overrides are not written to disk.
+                let mut persisted_config = Config::load_or_init().await?;
+                persisted_config.gateway.paired_tokens.clear();
+                persisted_config.save().await?;
+                config.gateway.paired_tokens.clear();
+                info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -979,6 +1020,11 @@ async fn main() -> Result<()> {
             );
             println!("  Boards:    {}", config.peripherals.boards.len());
 
+            Ok(())
+        }
+
+        Commands::Update { check, force } => {
+            update::self_update(force, check).await?;
             Ok(())
         }
 
@@ -1991,6 +2037,45 @@ mod tests {
                 Commands::Completions { .. } => {}
                 other => panic!("expected completions command, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn gateway_help_includes_new_pairing_flag() {
+        let cmd = Cli::command();
+        let gateway = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "gateway")
+            .expect("gateway subcommand must exist");
+
+        let has_new_pairing_flag = gateway.get_arguments().any(|arg| {
+            arg.get_id().as_str() == "new_pairing" && arg.get_long() == Some("new-pairing")
+        });
+
+        assert!(
+            has_new_pairing_flag,
+            "gateway help should include --new-pairing"
+        );
+    }
+
+    #[test]
+    fn gateway_cli_accepts_new_pairing_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--new-pairing"])
+            .expect("gateway --new-pairing should parse");
+
+        match cli.command {
+            Commands::Gateway { new_pairing, .. } => assert!(new_pairing),
+            other => panic!("expected gateway command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_cli_defaults_new_pairing_to_false() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
+
+        match cli.command {
+            Commands::Gateway { new_pairing, .. } => assert!(!new_pairing),
+            other => panic!("expected gateway command, got {other:?}"),
         }
     }
 

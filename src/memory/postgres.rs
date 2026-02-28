@@ -458,7 +458,7 @@ mod tests {
                 "public",
                 "memories",
                 Some(1),
-                "disable",
+                false,
             )
         });
 

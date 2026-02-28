@@ -19,12 +19,12 @@ Last reviewed: **February 24, 2026**.
 | Doc | Type | Audience |
 |---|---|---|
 | `README.md` | Current Guide | all readers |
-| `README.zh-CN.md` | Current Guide (localized) | Chinese readers |
-| `README.ja.md` | Current Guide (localized) | Japanese readers |
-| `README.ru.md` | Current Guide (localized) | Russian readers |
-| `README.fr.md` | Current Guide (localized) | French readers |
-| `README.vi.md` | Current Guide (localized) | Vietnamese readers |
-| `README.el.md` | Current Guide (localized) | Greek readers |
+| `docs/i18n/zh-CN/README.md` | Current Guide (localized) | Chinese readers |
+| `docs/i18n/ja/README.md` | Current Guide (localized) | Japanese readers |
+| `docs/i18n/ru/README.md` | Current Guide (localized) | Russian readers |
+| `docs/i18n/fr/README.md` | Current Guide (localized) | French readers |
+| `docs/i18n/vi/README.md` | Current Guide (localized) | Vietnamese readers |
+| `docs/i18n/el/README.md` | Current Guide (localized) | Greek readers |
 
 ### Docs system
 
@@ -48,7 +48,7 @@ Last reviewed: **February 24, 2026**.
 | `vi` | `docs/i18n/vi/README.md` | Current Guide (full localized tree) |
 | `el` | `docs/i18n/el/README.md` | Current Guide (full localized tree) |
 
-Compatibility shims such as `docs/README.<locale>.md`, `docs/SUMMARY.<locale>.md`, and `docs/vi/**` remain valid but are non-canonical.
+Compatibility shims such as `docs/SUMMARY.<locale>.md` and `docs/vi/**` remain valid but are non-canonical.
 
 ## Collection Index Docs (English canonical)
 

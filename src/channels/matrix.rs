@@ -102,6 +102,12 @@ struct RoomAliasResponse {
 }
 
 impl MatrixChannel {
+    fn sanitize_error_for_log(error: &impl std::fmt::Display) -> String {
+        // Avoid formatting potentially sensitive upstream payloads into logs.
+        let error_type = std::any::type_name_of_val(error);
+        format!("{error_type} (details redacted)")
+    }
+
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
         value
             .map(|entry| entry.trim().to_string())
@@ -405,7 +411,8 @@ impl MatrixChannel {
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
-            anyhow::bail!("Matrix whoami failed: {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Matrix whoami failed: {sanitized}");
         }
 
         Ok(resp.json().await?)
@@ -425,8 +432,9 @@ impl MatrixChannel {
                     Err(error) => {
                         if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
                         {
+                            let safe_error = Self::sanitize_error_for_log(&error);
                             tracing::warn!(
-                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
+                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {safe_error}"
                             );
                             None
                         } else {
@@ -536,7 +544,10 @@ impl MatrixChannel {
 
             if !resp.status().is_success() {
                 let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Matrix room alias resolution failed for '{configured}': {err}");
+                let sanitized = crate::providers::sanitize_api_error(&err);
+                anyhow::bail!(
+                    "Matrix room alias resolution failed for '{configured}': {sanitized}"
+                );
             }
 
             let resolved: RoomAliasResponse = resp.json().await?;
@@ -564,7 +575,8 @@ impl MatrixChannel {
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Matrix room access check failed for '{room_id}': {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Matrix room access check failed for '{room_id}': {sanitized}");
         }
 
         Ok(())
@@ -593,7 +605,8 @@ impl MatrixChannel {
         }
 
         let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Matrix room encryption check failed for '{room_id}': {err}");
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Matrix room encryption check failed for '{room_id}': {sanitized}");
     }
 
     async fn ensure_room_supported(&self, room_id: &str) -> anyhow::Result<()> {
@@ -639,7 +652,8 @@ impl MatrixChannel {
                 );
             }
             Err(error) => {
-                tracing::warn!("Matrix own-device verification check failed: {error}");
+                let safe_error = Self::sanitize_error_for_log(&error);
+                tracing::warn!("Matrix own-device verification check failed: {safe_error}");
             }
         }
 
@@ -693,8 +707,9 @@ impl Channel for MatrixChannel {
             Ok(user_id) => user_id.parse()?,
             Err(error) => {
                 if let Some(hinted) = self.session_owner_hint.as_ref() {
+                    let safe_error = Self::sanitize_error_for_log(&error);
                     tracing::warn!(
-                        "Matrix whoami failed while resolving listener user_id; using configured user_id hint: {error}"
+                        "Matrix whoami failed while resolving listener user_id; using configured user_id hint: {safe_error}"
                     );
                     hinted.parse()?
                 } else {
@@ -774,8 +789,9 @@ impl Channel for MatrixChannel {
 
                 if mention_only_for_handler {
                     is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
+                        let safe_error = MatrixChannel::sanitize_error_for_log(&error);
                         tracing::warn!(
-                            "Matrix is_direct() failed while evaluating mention_only gate: {error}"
+                            "Matrix is_direct() failed while evaluating mention_only gate: {safe_error}"
                         );
                         false
                     });
@@ -831,7 +847,8 @@ impl Channel for MatrixChannel {
                     }
 
                     if let Err(error) = sync_result {
-                        tracing::warn!("Matrix sync error: {error}, retrying...");
+                        let safe_error = MatrixChannel::sanitize_error_for_log(&error);
+                        tracing::warn!("Matrix sync error: {safe_error}, retrying...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
 

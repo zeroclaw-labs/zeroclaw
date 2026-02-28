@@ -8,8 +8,8 @@ Dernière mise à jour : **24 février 2026**.
 
 ## Accès rapide
 
-- README français (racine) : [../../../README.fr.md](../../../README.fr.md)
-- Hub docs français (compatibilité) : [../../README.fr.md](../../README.fr.md)
+- README français (racine) : [docs/i18n/fr/README.md](README.md)
+- Hub docs français (compatibilité) : [docs/i18n/fr/README.md](README.md)
 - Sommaire français (compatibilité) : [../../SUMMARY.fr.md](../../SUMMARY.fr.md)
 - Hub docs anglais : [../../README.md](../../README.md)
 

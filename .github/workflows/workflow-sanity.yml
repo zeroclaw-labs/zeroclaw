@@ -19,11 +19,23 @@ concurrency:
 permissions:
     contents: read
 
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+
 jobs:
     no-tabs:
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 10
         steps:
+            - name: Normalize git global hooks config
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  git config --global --unset-all core.hooksPath || true
+
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -31,7 +43,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  python - <<'PY'
+                  python3 - <<'PY'
                   from __future__ import annotations
 
                   import pathlib
@@ -54,11 +66,41 @@ jobs:
                   PY
 
     actionlint:
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: [self-hosted, aws-india]
         timeout-minutes: 10
         steps:
+            - name: Normalize git global hooks config
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  git config --global --unset-all core.hooksPath || true
+
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+            - name: Install actionlint binary
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="1.7.11"
+                  arch="$(uname -m)"
+                  case "$arch" in
+                    x86_64|amd64) archive="actionlint_${version}_linux_amd64.tar.gz" ;;
+                    aarch64|arm64) archive="actionlint_${version}_linux_arm64.tar.gz" ;;
+                    *)
+                      echo "::error::Unsupported architecture: ${arch}"
+                      exit 1
+                      ;;
+                  esac
+
+                  curl -fsSL \
+                    -o "$RUNNER_TEMP/actionlint.tgz" \
+                    "https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}"
+                  tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+                  chmod +x "$RUNNER_TEMP/actionlint"
+                  echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+                  "$RUNNER_TEMP/actionlint" -version
+
             - name: Lint GitHub workflows
-              uses: rhysd/actionlint@393031adb9afb225ee52ae2ccd7a5af5525e03e8 # v1.7.11
+              shell: bash
+              run: actionlint -color

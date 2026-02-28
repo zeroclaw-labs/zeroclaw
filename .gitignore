@@ -8,6 +8,10 @@ firmware/*/target
 __pycache__/
 *.pyc
 docker-compose.override.yml
+site/node_modules/
+site/.vite/
+site/public/docs-content/
+gh-pages/
 
 # Environment files (may contain secrets)
 .env
@@ -29,3 +33,6 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# Nix
+result

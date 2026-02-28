@@ -30,17 +30,29 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
   exit 0
 fi
 
-# Use merge-base to avoid false positives when the base branch has advanced
-# and the PR branch is temporarily behind. This limits scope to changes
-# introduced by the head branch itself.
 DIFF_BASE="$BASE"
-if MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
-  if [ -n "$MERGE_BASE" ]; then
-    DIFF_BASE="$MERGE_BASE"
+DIFF_HEAD="HEAD"
+
+# For pull_request events, checkout usually points to refs/pull/*/merge.
+# In that case HEAD is a synthetic merge commit:
+# - HEAD^1 => latest base branch tip
+# - HEAD   => merged result used for CI
+# Diffing HEAD^1..HEAD isolates only PR-introduced changes, even when the
+# BASE_SHA from the event payload is stale.
+if [ "$EVENT_NAME" = "pull_request" ] && git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+  DIFF_BASE="$(git rev-parse HEAD^1)"
+  DIFF_HEAD="HEAD"
+else
+  # Fallback: use merge-base to avoid false positives when the base branch has
+  # advanced and the PR branch is temporarily behind.
+  if MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
+    if [ -n "$MERGE_BASE" ]; then
+      DIFF_BASE="$MERGE_BASE"
+    fi
   fi
 fi
 
-CHANGED="$(git diff --name-only "$DIFF_BASE" HEAD || true)"
+CHANGED="$(git diff --name-only "$DIFF_BASE" "$DIFF_HEAD" || true)"
 if [ -z "$CHANGED" ]; then
   {
     echo "docs_only=false"

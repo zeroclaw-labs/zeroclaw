@@ -710,12 +710,12 @@ impl BedrockProvider {
                         let after_semi = &rest[semi + 1..];
                         if let Some(b64) = after_semi.strip_prefix("base64,") {
                             let format = match mime {
-                                "image/jpeg" | "image/jpg" => "jpeg",
                                 "image/png" => "png",
                                 "image/gif" => "gif",
                                 "image/webp" => "webp",
                                 _ => "jpeg",
                             };
+
                             blocks.push(ContentBlock::Image(ImageWrapper {
                                 image: ImageBlock {
                                     format: format.to_string(),
@@ -1458,9 +1458,10 @@ impl Provider for BedrockProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| "unknown error".to_string());
+                let sanitized = super::sanitize_api_error(&body);
                 let _ = tx
                     .send(Err(StreamError::Provider(format!(
-                        "Bedrock stream request failed ({status}): {body}"
+                        "Bedrock stream request failed ({status}): {sanitized}"
                     ))))
                     .await;
                 return;

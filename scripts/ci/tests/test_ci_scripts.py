@@ -1664,6 +1664,1704 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("unknown", violation_text)
         self.assertIn("no governance metadata", violation_text)
 
+    def test_release_manifest_generates_checksums_and_report(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"release-asset")
+        (artifacts / "zeroclaw.cdx.json").write_text('{"sbom":"ok"}\n', encoding="utf-8")
+        (artifacts / "LICENSE-APACHE").write_text("license\n", encoding="utf-8")
+
+        out_json = self.tmp / "release-manifest.json"
+        out_md = self.tmp / "release-manifest.md"
+        checksums = self.tmp / "SHA256SUMS"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_manifest.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--release-tag",
+                "v0.2.0-rc.1",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--checksums-path",
+                str(checksums),
+                "--fail-empty",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["release_tag"], "v0.2.0-rc.1")
+        self.assertGreaterEqual(len(report["files"]), 3)
+        self.assertIn("zeroclaw-x86_64-unknown-linux-gnu.tar.gz", checksums.read_text(encoding="utf-8"))
+
+    def test_release_notes_supply_chain_refs_generates_release_preface(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "release-manifest.json").write_text('{"ok":true}\n', encoding="utf-8")
+        (artifacts / "release-manifest.md").write_text("# manifest\n", encoding="utf-8")
+        (artifacts / "SHA256SUMS").write_text("abc  file\n", encoding="utf-8")
+        (artifacts / "zeroclaw.cdx.json").write_text('{"sbom":"cdx"}\n', encoding="utf-8")
+        (artifacts / "zeroclaw.spdx.json").write_text('{"sbom":"spdx"}\n', encoding="utf-8")
+        (artifacts / "zeroclaw.sha256sums.intoto.json").write_text('{"_type":"statement"}\n', encoding="utf-8")
+        (artifacts / "audit-event-release-sha256sums-provenance.json").write_text(
+            '{"schema_version":"zeroclaw.audit.v1"}\n',
+            encoding="utf-8",
+        )
+        (artifacts / "release-artifact-guard.publish.json").write_text('{"ready":true}\n', encoding="utf-8")
+        (artifacts / "audit-event-release-artifact-guard-publish.json").write_text(
+            '{"schema_version":"zeroclaw.audit.v1"}\n',
+            encoding="utf-8",
+        )
+        (artifacts / "SHA256SUMS.sig").write_text("sig\n", encoding="utf-8")
+        (artifacts / "SHA256SUMS.pem").write_text("pem\n", encoding="utf-8")
+        (artifacts / "SHA256SUMS.sigstore.json").write_text('{"bundle":"ok"}\n', encoding="utf-8")
+        trigger_dir = artifacts / "release-trigger-guard"
+        trigger_dir.mkdir(parents=True, exist_ok=True)
+        (trigger_dir / "release-trigger-guard.json").write_text('{"ready":true}\n', encoding="utf-8")
+        (trigger_dir / "audit-event-release-trigger-guard.json").write_text(
+            '{"schema_version":"zeroclaw.audit.v1"}\n',
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-notes-supply-chain.json"
+        out_md = self.tmp / "release-notes-supply-chain.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_notes_with_supply_chain_refs.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--release-tag",
+                "v1.2.3",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-missing",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+        sbom_url = report["references"]["sbom_cyclonedx"]["url"]
+        self.assertIn("/releases/download/v1.2.3/zeroclaw.cdx.json", sbom_url)
+        body = out_md.read_text(encoding="utf-8")
+        self.assertIn("Supply-Chain Evidence", body)
+        self.assertIn("Automated Commit Notes", body)
+
+    def test_release_notes_supply_chain_refs_fails_on_missing_required_file(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "release-manifest.json").write_text('{"ok":true}\n', encoding="utf-8")
+        (artifacts / "release-manifest.md").write_text("# manifest\n", encoding="utf-8")
+        (artifacts / "SHA256SUMS").write_text("abc  file\n", encoding="utf-8")
+        (artifacts / "zeroclaw.cdx.json").write_text('{"sbom":"cdx"}\n', encoding="utf-8")
+        (artifacts / "zeroclaw.spdx.json").write_text('{"sbom":"spdx"}\n', encoding="utf-8")
+        (artifacts / "zeroclaw.sha256sums.intoto.json").write_text('{"_type":"statement"}\n', encoding="utf-8")
+        (artifacts / "release-trigger-guard.json").write_text('{"ready":true}\n', encoding="utf-8")
+        (artifacts / "audit-event-release-trigger-guard.json").write_text(
+            '{"schema_version":"zeroclaw.audit.v1"}\n',
+            encoding="utf-8",
+        )
+        (artifacts / "release-artifact-guard.publish.json").write_text('{"ready":true}\n', encoding="utf-8")
+        (artifacts / "audit-event-release-artifact-guard-publish.json").write_text(
+            '{"schema_version":"zeroclaw.audit.v1"}\n',
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-notes-supply-chain.missing.json"
+        out_md = self.tmp / "release-notes-supply-chain.missing.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_notes_with_supply_chain_refs.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--release-tag",
+                "v1.2.3",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-missing",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        self.assertIn(
+            "audit-event-release-sha256sums-provenance.json",
+            "\n".join(report["violations"]),
+        )
+
+    def test_ghcr_publish_contract_guard_passes_with_matching_digests(self) -> None:
+        policy = self.tmp / "ghcr-tag-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-tag-policy.v1",
+                    "release_tag_regex": "^v[0-9]+\\.[0-9]+\\.[0-9]+$",
+                    "sha_tag_prefix": "sha-",
+                    "sha_tag_length": 12,
+                    "latest_tag": "latest",
+                    "require_latest_on_release": True,
+                    "immutable_tag_classes": ["release", "sha"],
+                    "rollback_priority": ["sha", "release"],
+                    "contract_artifact_retention_days": 21,
+                    "scan_artifact_retention_days": 14,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = self.tmp / "ghcr-snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "tags": {
+                        "v1.2.3": {"status_code": 200, "digest": "sha256:abc123"},
+                        "sha-abcdef123456": {"status_code": 200, "digest": "sha256:abc123"},
+                        "latest": {"status_code": 200, "digest": "sha256:abc123"},
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "ghcr-publish-contract.json"
+        out_md = self.tmp / "ghcr-publish-contract.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_publish_contract_guard.py"),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--release-tag",
+                "v1.2.3",
+                "--sha",
+                "abcdef1234567890abcdef1234567890abcdef12",
+                "--policy-file",
+                str(policy),
+                "--manifest-snapshot-file",
+                str(snapshot),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["rollback_candidates"], ["sha-abcdef123456", "v1.2.3"])
+
+    def test_ghcr_publish_contract_guard_detects_digest_parity_violation(self) -> None:
+        policy = self.tmp / "ghcr-tag-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-tag-policy.v1",
+                    "release_tag_regex": "^v[0-9]+\\.[0-9]+\\.[0-9]+$",
+                    "sha_tag_prefix": "sha-",
+                    "sha_tag_length": 12,
+                    "latest_tag": "latest",
+                    "require_latest_on_release": True,
+                    "immutable_tag_classes": ["release", "sha"],
+                    "rollback_priority": ["sha", "release"],
+                    "contract_artifact_retention_days": 21,
+                    "scan_artifact_retention_days": 14,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = self.tmp / "ghcr-snapshot.mismatch.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "tags": {
+                        "v1.2.3": {"status_code": 200, "digest": "sha256:111"},
+                        "sha-abcdef123456": {"status_code": 200, "digest": "sha256:222"},
+                        "latest": {"status_code": 200, "digest": "sha256:333"},
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "ghcr-publish-contract.mismatch.json"
+        out_md = self.tmp / "ghcr-publish-contract.mismatch.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_publish_contract_guard.py"),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--release-tag",
+                "v1.2.3",
+                "--sha",
+                "abcdef1234567890abcdef1234567890abcdef12",
+                "--policy-file",
+                str(policy),
+                "--manifest-snapshot-file",
+                str(snapshot),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        violations = "\n".join(report["violations"])
+        self.assertIn("release tag digest does not match immutable sha tag digest", violations)
+        self.assertIn("latest tag digest does not match release tag digest", violations)
+
+    def test_ghcr_vulnerability_gate_passes_when_blocking_findings_are_zero(self) -> None:
+        policy = self.tmp / "ghcr-vulnerability-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-vulnerability-policy.v1",
+                    "required_tag_classes": ["release", "sha", "latest"],
+                    "blocking_severities": ["HIGH", "CRITICAL"],
+                    "max_blocking_findings_per_tag": 0,
+                    "require_blocking_count_parity": True,
+                    "require_artifact_id_parity": True,
+                    "scan_artifact_retention_days": 14,
+                    "audit_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        release_report = self.tmp / "trivy-v1.2.3.json"
+        sha_report = self.tmp / "trivy-sha-abcdef123456.json"
+        latest_report = self.tmp / "trivy-latest.json"
+        shared_report = {
+            "ArtifactID": "sha256:deadbeef",
+            "Results": [
+                {
+                    "Target": "alpine:3.20",
+                    "Type": "os",
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2026-0001",
+                            "Severity": "MEDIUM",
+                        }
+                    ],
+                }
+            ],
+        }
+        release_report.write_text(json.dumps(shared_report, indent=2) + "\n", encoding="utf-8")
+        sha_report.write_text(json.dumps(shared_report, indent=2) + "\n", encoding="utf-8")
+        latest_report.write_text(json.dumps(shared_report, indent=2) + "\n", encoding="utf-8")
+
+        out_json = self.tmp / "ghcr-vulnerability-gate.json"
+        out_md = self.tmp / "ghcr-vulnerability-gate.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_vulnerability_gate.py"),
+                "--release-tag",
+                "v1.2.3",
+                "--sha-tag",
+                "sha-abcdef123456",
+                "--latest-tag",
+                "latest",
+                "--release-report-json",
+                str(release_report),
+                "--sha-report-json",
+                str(sha_report),
+                "--latest-report-json",
+                str(latest_report),
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["reports"]["release"]["blocking_vulnerabilities"], 0)
+        self.assertEqual(report["reports"]["sha"]["blocking_vulnerabilities"], 0)
+        self.assertEqual(report["reports"]["latest"]["blocking_vulnerabilities"], 0)
+
+    def test_ghcr_vulnerability_gate_fails_on_blocking_and_parity_violations(self) -> None:
+        policy = self.tmp / "ghcr-vulnerability-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-vulnerability-policy.v1",
+                    "required_tag_classes": ["release", "sha", "latest"],
+                    "blocking_severities": ["HIGH", "CRITICAL"],
+                    "max_blocking_findings_per_tag": 0,
+                    "require_blocking_count_parity": True,
+                    "require_artifact_id_parity": True,
+                    "scan_artifact_retention_days": 14,
+                    "audit_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        release_report = self.tmp / "trivy-v1.2.3.json"
+        sha_report = self.tmp / "trivy-sha-abcdef123456.json"
+        latest_report = self.tmp / "trivy-latest.json"
+        release_report.write_text(
+            json.dumps(
+                {
+                    "ArtifactID": "sha256:image-a",
+                    "Results": [
+                        {
+                            "Target": "alpine:3.20",
+                            "Type": "os",
+                            "Vulnerabilities": [
+                                {
+                                    "VulnerabilityID": "CVE-2026-9999",
+                                    "Severity": "CRITICAL",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sha_report.write_text(
+            json.dumps(
+                {
+                    "ArtifactID": "sha256:image-b",
+                    "Results": [{"Target": "alpine:3.20", "Type": "os", "Vulnerabilities": []}],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        latest_report.write_text(
+            json.dumps(
+                {
+                    "ArtifactID": "sha256:image-a",
+                    "Results": [{"Target": "alpine:3.20", "Type": "os", "Vulnerabilities": []}],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "ghcr-vulnerability-gate.fail.json"
+        out_md = self.tmp / "ghcr-vulnerability-gate.fail.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_vulnerability_gate.py"),
+                "--release-tag",
+                "v1.2.3",
+                "--sha-tag",
+                "sha-abcdef123456",
+                "--latest-tag",
+                "latest",
+                "--release-report-json",
+                str(release_report),
+                "--sha-report-json",
+                str(sha_report),
+                "--latest-report-json",
+                str(latest_report),
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        violations = "\n".join(report["violations"])
+        self.assertIn("Blocking vulnerabilities for `release`", violations)
+        self.assertIn("Blocking vulnerability count parity violation across tags", violations)
+        self.assertIn("Artifact ID parity violation across tags", violations)
+
+    def test_docs_deploy_guard_allows_manual_production_rollback_with_preview_evidence(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        run_cmd(["git", "branch", "-m", "main"], cwd=repo)
+
+        notes = repo / "docs.md"
+        notes.write_text("base\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "base"], cwd=repo)
+        rollback_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        notes.write_text("head\n", encoding="utf-8")
+        run_cmd(["git", "commit", "-am", "head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        policy = self.tmp / "docs-deploy-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.docs-deploy-policy.v1",
+                    "production_branch": "main",
+                    "allow_manual_production_dispatch": True,
+                    "require_preview_evidence_on_manual_production": True,
+                    "allow_manual_rollback_dispatch": True,
+                    "rollback_ref_must_be_ancestor_of_production_branch": True,
+                    "docs_preview_retention_days": 14,
+                    "docs_guard_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "docs-deploy-guard.json"
+        out_md = self.tmp / "docs-deploy-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("docs_deploy_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--git-ref",
+                "refs/heads/main",
+                "--git-sha",
+                head_sha,
+                "--input-deploy-target",
+                "production",
+                "--input-preview-evidence-run-url",
+                "https://github.com/zeroclaw-labs/zeroclaw/actions/runs/123",
+                "--input-rollback-ref",
+                rollback_sha,
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["deploy_target"], "production")
+        self.assertEqual(report["deploy_mode"], "rollback")
+        self.assertEqual(report["source_ref"], rollback_sha)
+        self.assertEqual(report["violations"], [])
+
+    def test_docs_deploy_guard_requires_preview_evidence_for_manual_production(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        run_cmd(["git", "branch", "-m", "main"], cwd=repo)
+
+        notes = repo / "docs.md"
+        notes.write_text("head\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        policy = self.tmp / "docs-deploy-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.docs-deploy-policy.v1",
+                    "production_branch": "main",
+                    "allow_manual_production_dispatch": True,
+                    "require_preview_evidence_on_manual_production": True,
+                    "allow_manual_rollback_dispatch": True,
+                    "rollback_ref_must_be_ancestor_of_production_branch": True,
+                    "docs_preview_retention_days": 14,
+                    "docs_guard_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "docs-deploy-guard.missing-preview.json"
+        out_md = self.tmp / "docs-deploy-guard.missing-preview.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("docs_deploy_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--git-ref",
+                "refs/heads/main",
+                "--git-sha",
+                head_sha,
+                "--input-deploy-target",
+                "production",
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        self.assertIn("requires `preview_evidence_run_url`", "\n".join(report["violations"]))
+
+    def test_docs_deploy_guard_rejects_non_ancestor_rollback_ref(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        run_cmd(["git", "branch", "-m", "main"], cwd=repo)
+
+        notes = repo / "docs.md"
+        notes.write_text("base\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "base"], cwd=repo)
+        base_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        notes.write_text("main-head\n", encoding="utf-8")
+        run_cmd(["git", "commit", "-am", "main-head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        run_cmd(["git", "checkout", "-b", "side", base_sha], cwd=repo)
+        notes.write_text("side-head\n", encoding="utf-8")
+        run_cmd(["git", "commit", "-am", "side-head"], cwd=repo)
+        side_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        run_cmd(["git", "checkout", "main"], cwd=repo)
+
+        policy = self.tmp / "docs-deploy-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.docs-deploy-policy.v1",
+                    "production_branch": "main",
+                    "allow_manual_production_dispatch": True,
+                    "require_preview_evidence_on_manual_production": True,
+                    "allow_manual_rollback_dispatch": True,
+                    "rollback_ref_must_be_ancestor_of_production_branch": True,
+                    "docs_preview_retention_days": 14,
+                    "docs_guard_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "docs-deploy-guard.non-ancestor.json"
+        out_md = self.tmp / "docs-deploy-guard.non-ancestor.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("docs_deploy_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--git-ref",
+                "refs/heads/main",
+                "--git-sha",
+                head_sha,
+                "--input-deploy-target",
+                "production",
+                "--input-preview-evidence-run-url",
+                "https://github.com/zeroclaw-labs/zeroclaw/actions/runs/123",
+                "--input-rollback-ref",
+                side_sha,
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        self.assertIn("is not an ancestor", "\n".join(report["violations"]))
+
+    def test_release_artifact_guard_detects_missing_archives_in_verify_stage(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"linux-gnu")
+
+        contract = self.tmp / "artifact-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.release-artifact-contract.v1",
+                    "release_archive_patterns": [
+                        "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                        "zeroclaw-x86_64-unknown-linux-musl.tar.gz",
+                    ],
+                    "required_manifest_files": [
+                        "release-manifest.json",
+                        "release-manifest.md",
+                        "SHA256SUMS",
+                    ],
+                    "required_sbom_files": ["zeroclaw.cdx.json", "zeroclaw.spdx.json"],
+                    "required_notice_files": ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-artifact-guard.verify.json"
+        out_md = self.tmp / "release-artifact-guard.verify.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_artifact_guard.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--contract-file",
+                str(contract),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--allow-extra-archives",
+                "--skip-manifest-files",
+                "--skip-sbom-files",
+                "--skip-notice-files",
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("Missing release archives", joined)
+        self.assertTrue(report["categories"]["manifest_files"]["skipped"])
+        self.assertTrue(report["categories"]["sbom_files"]["skipped"])
+        self.assertTrue(report["categories"]["notice_files"]["skipped"])
+
+    def test_release_artifact_guard_passes_for_full_publish_contract(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"linux-gnu")
+        (artifacts / "zeroclaw-x86_64-unknown-linux-musl.tar.gz").write_bytes(b"linux-musl")
+        (artifacts / "release-manifest.json").write_text('{"ok":true}\n', encoding="utf-8")
+        (artifacts / "release-manifest.md").write_text("# ok\n", encoding="utf-8")
+        (artifacts / "SHA256SUMS").write_text("abc  file\n", encoding="utf-8")
+        (artifacts / "zeroclaw.cdx.json").write_text('{"sbom":"cdx"}\n', encoding="utf-8")
+        (artifacts / "zeroclaw.spdx.json").write_text('{"sbom":"spdx"}\n', encoding="utf-8")
+        (artifacts / "LICENSE-APACHE").write_text("license\n", encoding="utf-8")
+        (artifacts / "LICENSE-MIT").write_text("license\n", encoding="utf-8")
+        (artifacts / "NOTICE").write_text("notice\n", encoding="utf-8")
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sig").write_text("sig\n", encoding="utf-8")
+
+        contract = self.tmp / "artifact-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.release-artifact-contract.v1",
+                    "release_archive_patterns": [
+                        "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                        "zeroclaw-x86_64-unknown-linux-musl.tar.gz",
+                    ],
+                    "required_manifest_files": [
+                        "release-manifest.json",
+                        "release-manifest.md",
+                        "SHA256SUMS",
+                    ],
+                    "required_sbom_files": ["zeroclaw.cdx.json", "zeroclaw.spdx.json"],
+                    "required_notice_files": ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-artifact-guard.publish.json"
+        out_md = self.tmp / "release-artifact-guard.publish.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_artifact_guard.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--contract-file",
+                str(contract),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--allow-extra-archives",
+                "--allow-extra-manifest-files",
+                "--allow-extra-sbom-files",
+                "--allow-extra-notice-files",
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+
+    def test_release_artifact_guard_rejects_invalid_contract_schema(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"linux-gnu")
+
+        contract = self.tmp / "artifact-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.release-artifact-contract.v0",
+                    "release_archive_patterns": ["zeroclaw-x86_64-unknown-linux-gnu.tar.gz"],
+                    "required_manifest_files": ["release-manifest.json"],
+                    "required_sbom_files": ["zeroclaw.cdx.json"],
+                    "required_notice_files": ["NOTICE"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-artifact-guard.invalid-schema.json"
+        out_md = self.tmp / "release-artifact-guard.invalid-schema.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_artifact_guard.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--contract-file",
+                str(contract),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--allow-extra-archives",
+                "--skip-manifest-files",
+                "--skip-sbom-files",
+                "--skip-notice-files",
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertIn("schema_version", "\n".join(report["violations"]))
+
+    def test_release_trigger_guard_allows_authorized_actor_and_tagger(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0", "-m", "v0.2.0"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+
+        out_json = self.tmp / "release-trigger-guard.json"
+        out_md = self.tmp / "release-trigger-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_trigger_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--origin-url",
+                str(repo),
+                "--event-name",
+                "push",
+                "--actor",
+                "chumyin",
+                "--release-ref",
+                "v0.2.0",
+                "--release-tag",
+                "v0.2.0",
+                "--publish-release",
+                "true",
+                "--authorized-actors",
+                "willsarg,theonlyhennygod,chumyin",
+                "--authorized-tagger-emails",
+                "test@example.com",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready_to_publish"])
+        self.assertTrue(report["authorization"]["actor_authorized"])
+        self.assertTrue(report["authorization"]["tagger_authorized"])
+        self.assertTrue(report["tag_metadata"]["annotated_tag"])
+        self.assertEqual(report["tag_metadata"]["cargo_version"], "0.2.0")
+
+    def test_release_trigger_guard_blocks_unauthorized_actor(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0", "-m", "v0.2.0"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+
+        out_json = self.tmp / "release-trigger-guard-unauthorized.json"
+        out_md = self.tmp / "release-trigger-guard-unauthorized.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_trigger_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--origin-url",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--actor",
+                "intruder",
+                "--release-ref",
+                "v0.2.0",
+                "--release-tag",
+                "v0.2.0",
+                "--publish-release",
+                "true",
+                "--authorized-actors",
+                "willsarg,theonlyhennygod,chumyin",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready_to_publish"])
+        self.assertFalse(report["authorization"]["actor_authorized"])
+        joined = "\n".join(report["violations"])
+        self.assertIn("not authorized", joined)
+
+    def test_release_trigger_guard_rejects_lightweight_tag(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        tag_proc = run_cmd(["git", "update-ref", "refs/tags/v0.2.0", "HEAD"], cwd=repo)
+        self.assertEqual(tag_proc.returncode, 0, msg=tag_proc.stderr)
+        tag_list = run_cmd(["git", "tag", "--list", "v0.2.0"], cwd=repo)
+        self.assertEqual(tag_list.stdout.strip(), "v0.2.0")
+        remote_proc = run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        self.assertEqual(remote_proc.returncode, 0, msg=remote_proc.stderr)
+
+        out_json = self.tmp / "release-trigger-guard-lightweight.json"
+        out_md = self.tmp / "release-trigger-guard-lightweight.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_trigger_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--origin-url",
+                str(repo),
+                "--event-name",
+                "push",
+                "--actor",
+                "chumyin",
+                "--release-ref",
+                "v0.2.0",
+                "--release-tag",
+                "v0.2.0",
+                "--publish-release",
+                "true",
+                "--authorized-actors",
+                "willsarg,theonlyhennygod,chumyin",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("annotated tag", joined)
+
+    def test_nightly_matrix_report_fails_on_failed_lane(self) -> None:
+        lane_root = self.tmp / "lane-artifacts"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        (lane_root / "nightly-result-default.json").write_text(
+            json.dumps(
+                {
+                    "lane": "default",
+                    "status": "success",
+                    "exit_code": 0,
+                    "duration_seconds": 12,
+                    "command": "cargo check --locked",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (lane_root / "nightly-result-nightly-all-features.json").write_text(
+            json.dumps(
+                {
+                    "lane": "nightly-all-features",
+                    "status": "failure",
+                    "exit_code": 101,
+                    "duration_seconds": 47,
+                    "command": "cargo test --all-features",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owners = self.tmp / "owners.json"
+        owners.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.nightly-owner-routing.v1",
+                    "owners": {
+                        "default": "@ops",
+                        "nightly-all-features": "@release",
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "nightly-summary.json"
+        out_md = self.tmp / "nightly-summary.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("nightly_matrix_report.py"),
+                "--input-dir",
+                str(lane_root),
+                "--owners-file",
+                str(owners),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-failure",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["passed"], 1)
+
+    def test_nightly_matrix_report_includes_history_trend_snapshot(self) -> None:
+        lane_root = self.tmp / "lane-artifacts-trend"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        (lane_root / "nightly-result-default.json").write_text(
+            json.dumps(
+                {
+                    "lane": "default",
+                    "status": "success",
+                    "exit_code": 0,
+                    "duration_seconds": 11,
+                    "command": "cargo test --locked --test agent_e2e --verbose",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        owners = self.tmp / "owners-trend.json"
+        owners.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.nightly-owner-routing.v1",
+                    "owners": {"default": "@ops"},
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        history = self.tmp / "nightly-history.json"
+        history.write_text(
+            json.dumps(
+                [
+                    {
+                        "run_id": 101,
+                        "url": "https://example.test/runs/101",
+                        "event": "workflow_dispatch",
+                        "conclusion": "success",
+                        "created_at": "2026-02-25T01:00:00Z",
+                    },
+                    {
+                        "run_id": 100,
+                        "url": "https://example.test/runs/100",
+                        "event": "schedule",
+                        "conclusion": "failure",
+                        "created_at": "2026-02-24T01:00:00Z",
+                    },
+                    {
+                        "run_id": 99,
+                        "url": "https://example.test/runs/99",
+                        "event": "schedule",
+                        "conclusion": "success",
+                        "created_at": "2026-02-23T01:00:00Z",
+                    },
+                ],
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "nightly-summary-trend.json"
+        out_md = self.tmp / "nightly-summary-trend.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("nightly_matrix_report.py"),
+                "--input-dir",
+                str(lane_root),
+                "--owners-file",
+                str(owners),
+                "--history-file",
+                str(history),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-failure",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        trend = report["trend_snapshot"]
+        self.assertEqual(trend["history_total"], 3)
+        self.assertEqual(trend["history_passed"], 2)
+        self.assertEqual(trend["history_failed"], 1)
+        self.assertEqual(trend["history_pass_rate"], 0.6667)
+        self.assertEqual(trend["history_runs"][0]["run_id"], 101)
+
+        markdown = out_md.read_text(encoding="utf-8")
+        self.assertIn("## Recent Nightly Runs", markdown)
+        self.assertIn("example.test/runs/101", markdown)
+
+    def test_canary_guard_promote_when_metrics_within_threshold(self) -> None:
+        policy = self.tmp / "canary-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.canary-policy.v1",
+                    "minimum_sample_size": 300,
+                    "observation_window_minutes": 60,
+                    "cohorts": [
+                        {"name": "canary-5pct", "traffic_percent": 5, "duration_minutes": 20},
+                        {"name": "canary-20pct", "traffic_percent": 20, "duration_minutes": 20},
+                    ],
+                    "observability_signals": [
+                        "error_rate",
+                        "crash_rate",
+                        "p95_latency_ms",
+                        "sample_size",
+                    ],
+                    "thresholds": {
+                        "max_error_rate": 0.02,
+                        "max_crash_rate": 0.01,
+                        "max_p95_latency_ms": 1200,
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_json = self.tmp / "canary.json"
+        out_md = self.tmp / "canary.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("canary_guard.py"),
+                "--policy-file",
+                str(policy),
+                "--candidate-tag",
+                "v0.2.0-rc.1",
+                "--mode",
+                "execute",
+                "--error-rate",
+                "0.01",
+                "--crash-rate",
+                "0.005",
+                "--p95-latency-ms",
+                "900",
+                "--sample-size",
+                "500",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["decision"], "promote")
+        self.assertTrue(report["ready_to_execute"])
+        self.assertEqual(report["cohorts"][0]["name"], "canary-5pct")
+        self.assertEqual(report["cohorts"][1]["traffic_percent"], 20)
+        self.assertEqual(
+            report["observability_signals"],
+            ["error_rate", "crash_rate", "p95_latency_ms", "sample_size"],
+        )
+
+    def test_prerelease_guard_requires_previous_stage(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-rc.1", "-m", "v0.2.0-rc.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "rc": ["CI Required Gate", "Nightly All-Features"],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard.json"
+        out_md = self.tmp / "prerelease-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-rc.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("requires at least one `beta` tag", joined)
+
+    def test_prerelease_guard_reports_promotion_transition_and_stage_history(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-beta.1", "-m", "v0.2.0-beta.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "rc", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                        "rc": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Nightly Summary & Routing",
+                        ],
+                        "stable": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Verify Artifact Set",
+                            "Nightly Summary & Routing",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-promotion.json"
+        out_md = self.tmp / "prerelease-guard-promotion.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-beta.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], "zeroclaw.prerelease-guard.v2")
+        self.assertEqual(report["transition"]["type"], "promotion")
+        self.assertEqual(report["transition"]["outcome"], "promotion")
+        self.assertEqual(report["transition"]["required_previous_tag"], "v0.2.0-alpha.1")
+        self.assertEqual(report["stage_history"]["latest_stage"], "beta")
+        self.assertEqual(report["stage_history"]["latest_tag"], "v0.2.0-beta.1")
+        self.assertIn("v0.2.0-alpha.1", report["stage_history"]["per_stage"]["alpha"])
+        self.assertIn("v0.2.0-beta.1", report["stage_history"]["per_stage"]["beta"])
+
+    def test_prerelease_guard_blocks_demotion_and_records_transition(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-beta.1", "-m", "v0.2.0-beta.1"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.2", "-m", "v0.2.0-alpha.2"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "rc", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                        "rc": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Nightly Summary & Routing",
+                        ],
+                        "stable": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Verify Artifact Set",
+                            "Nightly Summary & Routing",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-demotion.json"
+        out_md = self.tmp / "prerelease-guard-demotion.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-alpha.2",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["transition"]["type"], "demotion_blocked")
+        self.assertEqual(report["transition"]["outcome"], "demotion_blocked")
+        self.assertEqual(report["transition"]["previous_highest_stage"], "beta")
+        self.assertEqual(report["transition"]["previous_highest_tag"], "v0.2.0-beta.1")
+        joined = "\n".join(report["violations"])
+        self.assertIn("Refusing stage regression", joined)
+
+    def test_prerelease_guard_requires_monotonic_same_stage_number(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.2", "-m", "v0.2.0-alpha.2"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "rc", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "rc": "beta",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                        "rc": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Nightly Summary & Routing",
+                        ],
+                        "stable": [
+                            "CI Required Gate",
+                            "Security Audit",
+                            "Feature Matrix Summary",
+                            "Verify Artifact Set",
+                            "Nightly Summary & Routing",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-monotonic.json"
+        out_md = self.tmp / "prerelease-guard-monotonic.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-alpha.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "publish",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("must increase monotonically", joined)
+
+    def test_prerelease_guard_detects_incomplete_stage_matrix_config(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        cargo = repo / "Cargo.toml"
+        cargo.write_text(
+            textwrap.dedent(
+                """
+                [package]
+                name = "sample"
+                version = "0.2.0"
+                edition = "2021"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "Cargo.toml"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "init"], cwd=repo)
+        run_cmd(["git", "branch", "-M", "main"], cwd=repo)
+        run_cmd(["git", "tag", "-a", "v0.2.0-alpha.1", "-m", "v0.2.0-alpha.1"], cwd=repo)
+        run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
+        run_cmd(["git", "fetch", "origin", "main:refs/remotes/origin/main"], cwd=repo)
+
+        stage_cfg = self.tmp / "invalid-stage-gates.json"
+        stage_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.prerelease-stage-gates.v1",
+                    "stage_order": ["alpha", "beta", "stable"],
+                    "required_previous_stage": {
+                        "beta": "alpha",
+                        "stable": "rc",
+                    },
+                    "required_checks": {
+                        "alpha": ["CI Required Gate", "Security Audit"],
+                        "beta": ["CI Required Gate", "Security Audit", "Feature Matrix Summary"],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "prerelease-guard-policy.json"
+        out_md = self.tmp / "prerelease-guard-policy.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("prerelease_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--tag",
+                "v0.2.0-alpha.1",
+                "--stage-config-file",
+                str(stage_cfg),
+                "--mode",
+                "dry-run",
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("stage_order", joined)
+        self.assertIn("required_checks.rc", joined)
+        self.assertIn("required_checks.stable", joined)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

@@ -11,7 +11,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -704,6 +706,75 @@ impl BrowserTool {
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
     }
 
+    fn validate_output_path(&self, key: &str, path: &str) -> anyhow::Result<()> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("'{key}' path cannot be empty");
+        }
+        if trimmed.contains('\0') {
+            anyhow::bail!("'{key}' path contains invalid null byte");
+        }
+        if !self.security.is_path_allowed(trimmed) {
+            anyhow::bail!("'{key}' path blocked by security policy: {trimmed}");
+        }
+        Ok(())
+    }
+
+    async fn resolve_output_path_for_write(
+        &self,
+        key: &str,
+        path: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let trimmed = path.trim();
+        self.validate_output_path(key, trimmed)?;
+
+        tokio::fs::create_dir_all(&self.security.workspace_dir).await?;
+        let workspace_root = tokio::fs::canonicalize(&self.security.workspace_dir)
+            .await
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+
+        let raw_path = Path::new(trimmed);
+        let output_path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            workspace_root.join(raw_path)
+        };
+
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("'{key}' path has no parent directory"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let resolved_parent = tokio::fs::canonicalize(parent).await?;
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+            anyhow::bail!(
+                "{}",
+                self.security
+                    .resolved_path_violation_message(&resolved_parent)
+            );
+        }
+
+        match tokio::fs::symlink_metadata(&output_path).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "Refusing to write browser output through symlink: {}",
+                        output_path.display()
+                    );
+                }
+                if !meta.is_file() {
+                    anyhow::bail!(
+                        "Browser output path is not a regular file: {}",
+                        output_path.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        Ok(output_path)
+    }
+
     fn validate_computer_use_action(
         &self,
         action: &str,
@@ -733,6 +804,37 @@ impl BrowserTool {
                 self.validate_coordinate("from_y", from_y, self.computer_use.max_coordinate_y)?;
                 self.validate_coordinate("to_y", to_y, self.computer_use.max_coordinate_y)?;
             }
+            "key_type" => {
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'text' for key_type action"))?;
+                if text.trim().is_empty() {
+                    anyhow::bail!("'text' for key_type must not be empty");
+                }
+                if text.len() > 4096 {
+                    anyhow::bail!("'text' for key_type exceeds maximum length (4096 chars)");
+                }
+            }
+            "key_press" => {
+                let key = params
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'key' for key_press action"))?;
+                let valid = !key.trim().is_empty()
+                    && key.len() <= 32
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'));
+                if !valid {
+                    anyhow::bail!("'key' for key_press must be 1-32 chars of [A-Za-z0-9_+-]");
+                }
+            }
+            "screen_capture" => {
+                if let Some(path) = params.get("path").and_then(Value::as_str) {
+                    self.validate_output_path("path", path)?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -752,6 +854,15 @@ impl BrowserTool {
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
+        if action == "screen_capture" {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                let resolved = self.resolve_output_path_for_write("path", path).await?;
+                params.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
+            }
+        }
 
         let payload = json!({
             "action": action,
@@ -1081,6 +1192,19 @@ impl Tool for BrowserTool {
                 });
             }
         };
+
+        if let BrowserAction::Screenshot {
+            path: Some(path), ..
+        } = &action
+        {
+            if let Err(err) = self.validate_output_path("path", path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
 
         self.execute_action(action, backend).await
     }
@@ -2292,6 +2416,16 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(src: &Path, dst: &Path) {
+        std::os::windows::fs::symlink_dir(src, dst).expect("symlink should be created");
+    }
+
     #[test]
     fn normalize_domains_works() {
         let domains = vec![
@@ -2553,6 +2687,50 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_path_validation_blocks_escaped_paths() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        assert!(tool.validate_output_path("path", "/etc/passwd").is_err());
+        assert!(tool.validate_output_path("path", "../outside.png").is_err());
+        assert!(tool
+            .validate_output_path("path", "captures/page.png")
+            .is_ok());
+    }
+
+    #[test]
+    fn computer_use_key_actions_validate_params() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        let key_type_args = serde_json::json!({"text": "hello"});
+        assert!(tool
+            .validate_computer_use_action("key_type", key_type_args.as_object().unwrap())
+            .is_ok());
+        let missing_key_type = serde_json::json!({});
+        assert!(tool
+            .validate_computer_use_action("key_type", missing_key_type.as_object().unwrap())
+            .is_err());
+
+        let key_press_args = serde_json::json!({"key": "Enter"});
+        assert!(tool
+            .validate_computer_use_action("key_press", key_press_args.as_object().unwrap())
+            .is_ok());
+        let bad_key_press_args = serde_json::json!({"key": "Ctrl+Shift+Enter!!"});
+        assert!(tool
+            .validate_computer_use_action("key_press", bad_key_press_args.as_object().unwrap())
+            .is_err());
+    }
+
+    #[test]
     fn browser_tool_name() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new(security, vec!["example.com".into()], None);
@@ -2647,7 +2825,11 @@ mod tests {
     #[cfg(feature = "browser-native")]
     #[test]
     fn reset_session_is_idempotent_without_client() {
-        tokio_test::block_on(async {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread tokio runtime should build for browser test");
+        runtime.block_on(async {
             let mut state = native_backend::NativeBrowserState::default();
             state.reset_session().await;
             state.reset_session().await;

@@ -8,8 +8,8 @@
 
 ## Быстрые ссылки
 
-- Русский root README: [../../../README.ru.md](../../../README.ru.md)
-- Русский docs hub (совместимость): [../../README.ru.md](../../README.ru.md)
+- Русский root README: [docs/i18n/ru/README.md](README.md)
+- Русский docs hub (совместимость): [docs/i18n/ru/README.md](README.md)
 - Русский SUMMARY (совместимость): [../../SUMMARY.ru.md](../../SUMMARY.ru.md)
 - English docs hub: [../../README.md](../../README.md)
 

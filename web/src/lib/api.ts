@@ -3,6 +3,7 @@ import type {
   ToolSpec,
   CronJob,
   Integration,
+  IntegrationSettingsPayload,
   DiagResult,
   MemoryEntry,
   CostSummary,
@@ -181,6 +182,23 @@ export function deleteCronJob(id: string): Promise<void> {
 export function getIntegrations(): Promise<Integration[]> {
   return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
     (data) => unwrapField(data, 'integrations'),
+  );
+}
+
+export function getIntegrationSettings(): Promise<IntegrationSettingsPayload> {
+  return apiFetch<IntegrationSettingsPayload>('/api/integrations/settings');
+}
+
+export function putIntegrationCredentials(
+  integrationId: string,
+  body: { revision?: string; fields: Record<string, string> },
+): Promise<{ status: string; revision: string; unchanged?: boolean }> {
+  return apiFetch<{ status: string; revision: string; unchanged?: boolean }>(
+    `/api/integrations/${encodeURIComponent(integrationId)}/credentials`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    },
   );
 }
 

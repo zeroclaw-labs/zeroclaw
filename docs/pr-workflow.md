@@ -103,8 +103,8 @@ Maintain these branch protection rules on `dev` and `main`:
 - Default workflow-owner allowlist includes `theonlyhennygod`, `willsarg`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
-- Route normal contributor PRs to `dev`.
-- Allow `main` merges only through a promotion PR from `dev` (enforced by `Main Promotion Gate`).
+- Route normal contributor PRs to `main` by default (`dev` is optional for dedicated integration batching).
+- Allow direct merges to `main` once required checks and review policy pass.
 
 ---
 

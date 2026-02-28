@@ -327,7 +327,8 @@ fn refresh_gemini_cli_token(
         .unwrap_or_else(|_| "<failed to read response body>".to_string());
 
     if !status.is_success() {
-        anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {body}");
+        let sanitized = super::sanitize_api_error(&body);
+        anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {sanitized}");
     }
 
     #[derive(Deserialize)]
@@ -841,7 +842,8 @@ impl GeminiProvider {
                 );
                 return Ok(seed);
             }
-            anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
+            let sanitized = super::sanitize_api_error(&body);
+            anyhow::bail!("loadCodeAssist failed (HTTP {status}): {sanitized}");
         }
 
         #[derive(Deserialize)]
@@ -1375,8 +1377,8 @@ mod tests {
     fn oauth_refresh_form_omits_client_credentials_when_missing() {
         let form = build_oauth_refresh_form("refresh-token", None, None);
         let map: std::collections::HashMap<_, _> = form.into_iter().collect();
-        assert!(map.get("client_id").is_none());
-        assert!(map.get("client_secret").is_none());
+        assert!(!map.contains_key("client_id"));
+        assert!(!map.contains_key("client_secret"));
     }
 
     #[test]
@@ -1802,7 +1804,7 @@ mod tests {
         let creds: GeminiCliOAuthCreds = serde_json::from_str(json).unwrap();
         assert_eq!(creds.access_token.as_deref(), Some("ya29.test-token"));
         assert_eq!(creds.refresh_token.as_deref(), Some("1//test-refresh"));
-        assert_eq!(creds.expiry_date, Some(4102444800000));
+        assert_eq!(creds.expiry_date, Some(4_102_444_800_000));
         assert!(creds.expiry.is_none());
     }
 
@@ -1821,7 +1823,7 @@ mod tests {
         assert_eq!(creds.id_token.as_deref(), Some("header.payload.sig"));
         assert_eq!(creds.client_id.as_deref(), Some("test-client-id"));
         assert_eq!(creds.client_secret.as_deref(), Some("test-client-secret"));
-        assert_eq!(creds.expiry_date, Some(4102444800000));
+        assert_eq!(creds.expiry_date, Some(4_102_444_800_000));
     }
 
     #[test]

@@ -217,93 +217,23 @@ impl WhatsAppWebChannel {
     /// Check if a phone number is allowed (E.164 format: +1234567890)
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed(&self, phone: &str) -> bool {
-        Self::is_number_allowed_for_list(&self.allowed_numbers, phone)
-    }
-
-    /// Check whether a phone number is allowed against a provided allowlist.
-    #[cfg(feature = "whatsapp-web")]
-    fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
-
-        let Some(phone_norm) = Self::normalize_phone_token(phone) else {
-            return false;
-        };
-
-        allowed_numbers.iter().any(|entry| {
-            Self::normalize_phone_token(entry)
-                .as_deref()
-                .is_some_and(|allowed_norm| allowed_norm == phone_norm)
-        })
-    }
-
-    /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    ///
-    /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
-    #[cfg(feature = "whatsapp-web")]
-    fn normalize_phone_token(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed)
-            .trim();
-
-        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
-        }
-    }
-
-    /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
-    #[cfg(feature = "whatsapp-web")]
-    fn sender_phone_candidates(
-        sender: &wa_rs_binary::jid::Jid,
-        sender_alt: Option<&wa_rs_binary::jid::Jid>,
-        mapped_phone: Option<&str>,
-    ) -> Vec<String> {
-        let mut candidates = Vec::new();
-
-        let mut add_candidate = |candidate: Option<String>| {
-            if let Some(candidate) = candidate {
-                if !candidates.iter().any(|existing| existing == &candidate) {
-                    candidates.push(candidate);
-                }
-            }
-        };
-
-        add_candidate(Self::normalize_phone_token(&sender.to_string()));
-        if let Some(alt) = sender_alt {
-            add_candidate(Self::normalize_phone_token(&alt.to_string()));
-        }
-        if let Some(mapped_phone) = mapped_phone {
-            add_candidate(Self::normalize_phone_token(mapped_phone));
-        }
-
-        candidates
+        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
     }
 
     /// Normalize phone number to E.164 format
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone(&self, phone: &str) -> String {
-        if let Some(normalized) = Self::normalize_phone_token(phone) {
-            return normalized;
-        }
-
         let trimmed = phone.trim();
         let user_part = trimmed
             .split_once('@')
             .map(|(user, _)| user)
             .unwrap_or(trimmed);
         let normalized_user = user_part.trim_start_matches('+');
-        format!("+{normalized_user}")
+        if user_part.starts_with('+') {
+            format!("+{normalized_user}")
+        } else {
+            format!("+{normalized_user}")
+        }
     }
 
     /// Whether the recipient string is a WhatsApp JID (contains a domain suffix).
@@ -602,9 +532,7 @@ impl Channel for WhatsAppWebChannel {
                         Event::Message(msg, info) => {
                             // Extract message content
                             let text = msg.text_content().unwrap_or("");
-                            let sender_jid = info.source.sender.clone();
-                            let sender_alt = info.source.sender_alt.clone();
-                            let sender = sender_jid.user().to_string();
+                            let sender = info.source.sender.user().to_string();
                             let chat = info.source.chat.to_string();
 
                             tracing::info!(
@@ -614,24 +542,14 @@ impl Channel for WhatsAppWebChannel {
                                 text
                             );
 
-                            let mapped_phone = if sender_jid.is_lid() {
-                                _client.get_phone_number_from_lid(&sender_jid.user).await
+                            // Check if sender is allowed
+                            let normalized = if sender.starts_with('+') {
+                                sender.clone()
                             } else {
-                                None
+                                format!("+{sender}")
                             };
-                            let sender_candidates = Self::sender_phone_candidates(
-                                &sender_jid,
-                                sender_alt.as_ref(),
-                                mapped_phone.as_deref(),
-                            );
 
-                            if let Some(normalized) = sender_candidates
-                                .iter()
-                                .find(|candidate| {
-                                    Self::is_number_allowed_for_list(&allowed_numbers, candidate)
-                                })
-                                .cloned()
-                            {
+                            if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
                                 let trimmed = text.trim();
                                 if trimmed.is_empty() {
                                     tracing::debug!(
@@ -657,11 +575,7 @@ impl Channel for WhatsAppWebChannel {
                                     tracing::error!("Failed to send message to channel: {}", e);
                                 }
                             } else {
-                                tracing::warn!(
-                                    "WhatsApp Web: message from {} not in allowed list (candidates: {:?})",
-                                    sender_jid,
-                                    sender_candidates
-                                );
+                                tracing::warn!("WhatsApp Web: message from {} not in allowed list", normalized);
                             }
                         }
                         Event::Connected(_) => {
@@ -873,8 +787,6 @@ impl Channel for WhatsAppWebChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "whatsapp-web")]
-    use wa_rs_binary::jid::Jid;
 
     #[cfg(feature = "whatsapp-web")]
     fn make_channel() -> WhatsAppWebChannel {
@@ -943,40 +855,19 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_normalize_phone_token_accepts_formatted_phone() {
-        assert_eq!(
-            WhatsAppWebChannel::normalize_phone_token("+1 (555) 123-4567"),
-            Some("+15551234567".to_string())
-        );
+    fn whatsapp_web_render_pairing_qr_rejects_empty_payload() {
+        let err = WhatsAppWebChannel::render_pairing_qr("   ").expect_err("empty payload");
+        assert!(err.to_string().contains("empty"));
     }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_allowlist_matches_normalized_format() {
-        let allowed = vec!["+15551234567".to_string()];
-        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
-            &allowed,
-            "+1 (555) 123-4567"
-        ));
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_sender_candidates_include_sender_alt_phone() {
-        let sender = Jid::lid("76188559093817");
-        let sender_alt = Jid::pn("15551234567");
-        let candidates =
-            WhatsAppWebChannel::sender_phone_candidates(&sender, Some(&sender_alt), None);
-        assert!(candidates.contains(&"+15551234567".to_string()));
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_sender_candidates_include_lid_mapping_phone() {
-        let sender = Jid::lid("76188559093817");
-        let candidates =
-            WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("15551234567"));
-        assert!(candidates.contains(&"+15551234567".to_string()));
+    fn whatsapp_web_render_pairing_qr_outputs_multiline_text() {
+        let rendered =
+            WhatsAppWebChannel::render_pairing_qr("https://example.com/whatsapp-pairing")
+                .expect("rendered QR");
+        assert!(rendered.lines().count() > 10);
+        assert!(rendered.trim().len() > 64);
     }
 
     #[tokio::test]

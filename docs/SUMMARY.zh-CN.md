@@ -10,12 +10,12 @@
 
 - 文档结构图（按语言/分区/功能）：[structure/README.md](structure/README.md)
 - 英文 README：[../README.md](../README.md)
-- 中文 README：[../README.zh-CN.md](../README.zh-CN.md)
-- 日文 README：[../README.ja.md](../README.ja.md)
-- 俄文 README：[../README.ru.md](../README.ru.md)
-- 法文 README：[../README.fr.md](../README.fr.md)
-- 越南文 README：[../README.vi.md](../README.vi.md)
-- 希腊文 README：[../README.el.md](../README.el.md)
+- 中文 README：[docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- 日文 README：[docs/i18n/ja/README.md](i18n/ja/README.md)
+- 俄文 README：[docs/i18n/ru/README.md](i18n/ru/README.md)
+- 法文 README：[docs/i18n/fr/README.md](i18n/fr/README.md)
+- 越南文 README：[docs/i18n/vi/README.md](i18n/vi/README.md)
+- 希腊文 README：[docs/i18n/el/README.md](i18n/el/README.md)
 - 英文文档中心：[README.md](README.md)
 - 中文文档中心：[i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - 日文文档中心：[i18n/ja/README.md](i18n/ja/README.md)
@@ -32,13 +32,13 @@
 
 ### 1) 快速入门
 
-- [getting-started/README.zh-CN.md](getting-started/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/one-click-bootstrap.md](i18n/zh-CN/one-click-bootstrap.md)
 - [i18n/zh-CN/android-setup.md](i18n/zh-CN/android-setup.md)
 
 ### 2) 命令 / 配置参考与集成
 
-- [reference/README.zh-CN.md](reference/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/commands-reference.md](i18n/zh-CN/commands-reference.md)
 - [i18n/zh-CN/providers-reference.md](i18n/zh-CN/providers-reference.md)
 - [i18n/zh-CN/channels-reference.md](i18n/zh-CN/channels-reference.md)
@@ -50,7 +50,7 @@
 
 ### 3) 运维与部署
 
-- [operations/README.zh-CN.md](operations/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/operations-runbook.md](i18n/zh-CN/operations-runbook.md)
 - [i18n/zh-CN/release-process.md](i18n/zh-CN/release-process.md)
 - [i18n/zh-CN/troubleshooting.md](i18n/zh-CN/troubleshooting.md)
@@ -60,7 +60,7 @@
 
 ### 4) 安全设计与治理
 
-- [security/README.zh-CN.md](security/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/agnostic-security.md](i18n/zh-CN/agnostic-security.md)
 - [i18n/zh-CN/frictionless-security.md](i18n/zh-CN/frictionless-security.md)
 - [i18n/zh-CN/sandboxing.md](i18n/zh-CN/sandboxing.md)
@@ -71,7 +71,7 @@
 
 ### 5) 硬件与外设
 
-- [hardware/README.zh-CN.md](hardware/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/hardware-peripherals-design.md](i18n/zh-CN/hardware-peripherals-design.md)
 - [i18n/zh-CN/adding-boards-and-tools.md](i18n/zh-CN/adding-boards-and-tools.md)
 - [i18n/zh-CN/nucleo-setup.md](i18n/zh-CN/nucleo-setup.md)
@@ -80,7 +80,7 @@
 
 ### 6) 贡献与 CI
 
-- [contributing/README.zh-CN.md](contributing/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - [i18n/zh-CN/pr-workflow.md](i18n/zh-CN/pr-workflow.md)
 - [i18n/zh-CN/reviewer-playbook.md](i18n/zh-CN/reviewer-playbook.md)
@@ -89,7 +89,7 @@
 
 ### 7) 项目状态与快照
 
-- [project/README.zh-CN.md](project/README.zh-CN.md)
+- [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/project-triage-snapshot-2026-02-18.md](i18n/zh-CN/project-triage-snapshot-2026-02-18.md)
 - [i18n/zh-CN/docs-audit-2026-02-24.md](i18n/zh-CN/docs-audit-2026-02-24.md)
 - [i18n/zh-CN/docs-inventory.md](i18n/zh-CN/docs-inventory.md)

@@ -10,12 +10,12 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 - Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [structure/README.md](structure/README.md)
 - README tiếng Anh: [../README.md](../README.md)
-- README tiếng Trung: [../README.zh-CN.md](../README.zh-CN.md)
-- README tiếng Nhật: [../README.ja.md](../README.ja.md)
-- README tiếng Nga: [../README.ru.md](../README.ru.md)
-- README tiếng Pháp: [../README.fr.md](../README.fr.md)
-- README tiếng Việt: [../README.vi.md](../README.vi.md)
-- README tiếng Hy Lạp: [../README.el.md](../README.el.md)
+- README tiếng Trung: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- README tiếng Nhật: [docs/i18n/ja/README.md](i18n/ja/README.md)
+- README tiếng Nga: [docs/i18n/ru/README.md](i18n/ru/README.md)
+- README tiếng Pháp: [docs/i18n/fr/README.md](i18n/fr/README.md)
+- README tiếng Việt: [docs/i18n/vi/README.md](i18n/vi/README.md)
+- README tiếng Hy Lạp: [docs/i18n/el/README.md](i18n/el/README.md)
 - Hub docs tiếng Anh: [README.md](README.md)
 - Hub docs tiếng Trung: [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - Hub docs tiếng Nhật: [i18n/ja/README.md](i18n/ja/README.md)
@@ -32,13 +32,13 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 ### 1) Bắt đầu nhanh
 
-- [getting-started/README.vi.md](getting-started/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/getting-started/README.md)
 - [i18n/vi/one-click-bootstrap.md](i18n/vi/one-click-bootstrap.md)
 - [i18n/vi/android-setup.md](i18n/vi/android-setup.md)
 
 ### 2) Tham chiếu lệnh/cấu hình và tích hợp
 
-- [reference/README.vi.md](reference/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/reference/README.md)
 - [i18n/vi/commands-reference.md](i18n/vi/commands-reference.md)
 - [i18n/vi/providers-reference.md](i18n/vi/providers-reference.md)
 - [i18n/vi/channels-reference.md](i18n/vi/channels-reference.md)
@@ -50,7 +50,7 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 ### 3) Vận hành và triển khai
 
-- [operations/README.vi.md](operations/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/operations/README.md)
 - [i18n/vi/operations-runbook.md](i18n/vi/operations-runbook.md)
 - [i18n/vi/release-process.md](i18n/vi/release-process.md)
 - [i18n/vi/troubleshooting.md](i18n/vi/troubleshooting.md)
@@ -60,7 +60,7 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 ### 4) Bảo mật và quản trị
 
-- [security/README.vi.md](security/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/security/README.md)
 - [i18n/vi/agnostic-security.md](i18n/vi/agnostic-security.md)
 - [i18n/vi/frictionless-security.md](i18n/vi/frictionless-security.md)
 - [i18n/vi/sandboxing.md](i18n/vi/sandboxing.md)
@@ -71,7 +71,7 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 ### 5) Phần cứng và ngoại vi
 
-- [hardware/README.vi.md](hardware/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/hardware/README.md)
 - [i18n/vi/hardware-peripherals-design.md](i18n/vi/hardware-peripherals-design.md)
 - [i18n/vi/adding-boards-and-tools.md](i18n/vi/adding-boards-and-tools.md)
 - [i18n/vi/nucleo-setup.md](i18n/vi/nucleo-setup.md)
@@ -80,7 +80,7 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 ### 6) Đóng góp và CI
 
-- [contributing/README.vi.md](contributing/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/contributing/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - [i18n/vi/pr-workflow.md](i18n/vi/pr-workflow.md)
 - [i18n/vi/reviewer-playbook.md](i18n/vi/reviewer-playbook.md)
@@ -89,7 +89,7 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 
 ### 7) Trạng thái dự án và ảnh chụp
 
-- [project/README.vi.md](project/README.vi.md)
+- [docs/i18n/vi/README.md](i18n/vi/project/README.md)
 - [i18n/vi/project-triage-snapshot-2026-02-18.md](i18n/vi/project-triage-snapshot-2026-02-18.md)
 - [i18n/vi/docs-audit-2026-02-24.md](i18n/vi/docs-audit-2026-02-24.md)
 - [i18n/vi/docs-inventory.md](i18n/vi/docs-inventory.md)

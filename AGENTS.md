@@ -153,7 +153,7 @@ Treat documentation as a first-class product surface, not a post-merge artifact.
 
 Canonical entry points:
 
-- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`, `README.fr.md`, `README.vi.md`, `README.el.md`
+- repository landing + localized hubs: `README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
 - docs hubs: `docs/README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
 - unified TOC: `docs/SUMMARY.md`
 - i18n governance docs: `docs/i18n-guide.md`, `docs/i18n/README.md`, `docs/i18n-coverage.md`
@@ -240,8 +240,8 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- Open a PR to `dev`; do not push directly to `dev` or `main`.
-- `main` is reserved for release promotion PRs from `dev`.
+- Open a PR to `main` by default (`dev` is optional for integration batching); do not push directly to `dev` or `main`.
+- `main` accepts direct PR merges after required checks and review policy pass.
 - Wait for required checks and review outcomes before merging.
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
 - After merge/close, clean up task branches/worktrees that are no longer needed.
@@ -251,7 +251,7 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Decide merge/close outcomes from repository-local authority in this order: `.github/workflows/**`, GitHub branch protection/rulesets, `docs/pr-workflow.md`, then this `AGENTS.md`.
 - External agent skills/templates are execution aids only; they must not override repository-local policy.
-- A normal contributor PR targeting `main` is a routing defect, not by itself a closure reason; if intent and content are legitimate, retarget to `dev`.
+- A normal contributor PR targeting `main` is valid under the main-first flow when required checks and review policy are satisfied; use `dev` only for explicit integration batching.
 - Direct-close the PR (do not supersede/replay) when high-confidence integrity-risk signals exist:
   - unapproved or unrelated repository rebranding attempts (for example replacing project logo/identity assets)
   - unauthorized platform-surface expansion (for example introducing `web` apps, dashboards, frontend stacks, or UI surfaces not requested by maintainers)

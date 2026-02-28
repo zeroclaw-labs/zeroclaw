@@ -8,7 +8,7 @@ Last refreshed: **February 24, 2026**.
 
 ### Layer A: global entry points
 
-- Root product READMEs: `README.md`, `README.<locale>.md`
+- Root product landing: `README.md` (language switch links into `docs/i18n/<locale>/README.md`)
 - Docs hub: `docs/README.md`
 - Unified TOC: `docs/SUMMARY.md`
 
@@ -34,9 +34,9 @@ Last refreshed: **February 24, 2026**.
 
 ### Layer D: compatibility shims (non-canonical)
 
-- `docs/README.<locale>.md`, `docs/SUMMARY.<locale>.md`
+- `docs/SUMMARY.<locale>.md` (if retained)
 - `docs/vi/**`
-- legacy `docs/*.<locale>.md` files where present
+- legacy localized docs-root files where present
 
 Use compatibility paths for backward links only. New localized edits should target `docs/i18n/<locale>/**`.
 
@@ -45,12 +45,12 @@ Use compatibility paths for backward links only. New localized edits should targ
 | Locale | Root landing | Canonical docs hub | Coverage level | Notes |
 |---|---|---|---|---|
 | `en` | `README.md` | `docs/README.md` | Full source | Authoritative runtime-contract wording |
-| `zh-CN` | `README.zh-CN.md` | `docs/i18n/zh-CN/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
-| `ja` | `README.ja.md` | `docs/i18n/ja/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
-| `ru` | `README.ru.md` | `docs/i18n/ru/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
-| `fr` | `README.fr.md` | `docs/i18n/fr/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
-| `vi` | `README.vi.md` | `docs/i18n/vi/README.md` | Full localized tree | `docs/vi/**` kept as compatibility layer |
-| `el` | `README.el.md` | `docs/i18n/el/README.md` | Full localized tree | Greek full tree is canonical in `docs/i18n/el/**` |
+| `zh-CN` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `ja` | `docs/i18n/ja/README.md` | `docs/i18n/ja/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `ru` | `docs/i18n/ru/README.md` | `docs/i18n/ru/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `fr` | `docs/i18n/fr/README.md` | `docs/i18n/fr/README.md` | Hub-level scaffold | Runtime-contract docs mainly shared in English |
+| `vi` | `docs/i18n/vi/README.md` | `docs/i18n/vi/README.md` | Full localized tree | `docs/vi/**` kept as compatibility layer |
+| `el` | `docs/i18n/el/README.md` | `docs/i18n/el/README.md` | Full localized tree | Greek full tree is canonical in `docs/i18n/el/**` |
 
 ## 3) Category Intent Map
 

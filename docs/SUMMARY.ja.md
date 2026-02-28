@@ -10,12 +10,12 @@
 
 - ドキュメント構造マップ（言語/カテゴリ/機能）: [structure/README.md](structure/README.md)
 - 英語 README：[../README.md](../README.md)
-- 中国語 README：[../README.zh-CN.md](../README.zh-CN.md)
-- 日本語 README：[../README.ja.md](../README.ja.md)
-- ロシア語 README：[../README.ru.md](../README.ru.md)
-- フランス語 README：[../README.fr.md](../README.fr.md)
-- ベトナム語 README：[../README.vi.md](../README.vi.md)
-- ギリシャ語 README：[../README.el.md](../README.el.md)
+- 中国語 README：[docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- 日本語 README：[docs/i18n/ja/README.md](i18n/ja/README.md)
+- ロシア語 README：[docs/i18n/ru/README.md](i18n/ru/README.md)
+- フランス語 README：[docs/i18n/fr/README.md](i18n/fr/README.md)
+- ベトナム語 README：[docs/i18n/vi/README.md](i18n/vi/README.md)
+- ギリシャ語 README：[docs/i18n/el/README.md](i18n/el/README.md)
 - 英語ドキュメントハブ：[README.md](README.md)
 - 中国語ドキュメントハブ：[i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - 日本語ドキュメントハブ：[i18n/ja/README.md](i18n/ja/README.md)
@@ -32,13 +32,13 @@
 
 ### 1) はじめに
 
-- [getting-started/README.ja.md](getting-started/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/one-click-bootstrap.md](i18n/ja/one-click-bootstrap.md)
 - [i18n/ja/android-setup.md](i18n/ja/android-setup.md)
 
 ### 2) コマンド・設定リファレンスと統合
 
-- [reference/README.ja.md](reference/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/commands-reference.md](i18n/ja/commands-reference.md)
 - [i18n/ja/providers-reference.md](i18n/ja/providers-reference.md)
 - [i18n/ja/channels-reference.md](i18n/ja/channels-reference.md)
@@ -50,7 +50,7 @@
 
 ### 3) 運用とデプロイ
 
-- [operations/README.ja.md](operations/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/operations-runbook.md](i18n/ja/operations-runbook.md)
 - [i18n/ja/release-process.md](i18n/ja/release-process.md)
 - [i18n/ja/troubleshooting.md](i18n/ja/troubleshooting.md)
@@ -60,7 +60,7 @@
 
 ### 4) セキュリティ設計と統制
 
-- [security/README.ja.md](security/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/agnostic-security.md](i18n/ja/agnostic-security.md)
 - [i18n/ja/frictionless-security.md](i18n/ja/frictionless-security.md)
 - [i18n/ja/sandboxing.md](i18n/ja/sandboxing.md)
@@ -71,7 +71,7 @@
 
 ### 5) ハードウェアと周辺機器
 
-- [hardware/README.ja.md](hardware/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/hardware-peripherals-design.md](i18n/ja/hardware-peripherals-design.md)
 - [i18n/ja/adding-boards-and-tools.md](i18n/ja/adding-boards-and-tools.md)
 - [i18n/ja/nucleo-setup.md](i18n/ja/nucleo-setup.md)
@@ -80,7 +80,7 @@
 
 ### 6) コントリビューションと CI
 
-- [contributing/README.ja.md](contributing/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - [i18n/ja/pr-workflow.md](i18n/ja/pr-workflow.md)
 - [i18n/ja/reviewer-playbook.md](i18n/ja/reviewer-playbook.md)
@@ -89,7 +89,7 @@
 
 ### 7) プロジェクト状況とスナップショット
 
-- [project/README.ja.md](project/README.ja.md)
+- [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/project-triage-snapshot-2026-02-18.md](i18n/ja/project-triage-snapshot-2026-02-18.md)
 - [i18n/ja/docs-audit-2026-02-24.md](i18n/ja/docs-audit-2026-02-24.md)
 - [i18n/ja/docs-inventory.md](i18n/ja/docs-inventory.md)

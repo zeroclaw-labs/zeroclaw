@@ -97,7 +97,8 @@ impl DingTalkChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DingTalk gateway registration failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("DingTalk gateway registration failed ({status}): {sanitized}");
         }
 
         let gw: GatewayResponse = resp.json().await?;
@@ -140,7 +141,8 @@ impl Channel for DingTalkChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DingTalk webhook reply failed ({status}): {err}");
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("DingTalk webhook reply failed ({status}): {sanitized}");
         }
 
         Ok(())
@@ -163,7 +165,8 @@ impl Channel for DingTalkChannel {
                 Ok(Message::Text(t)) => t,
                 Ok(Message::Close(_)) => break,
                 Err(e) => {
-                    tracing::warn!("DingTalk WebSocket error: {e}");
+                    let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+                    tracing::warn!("DingTalk WebSocket error: {sanitized}");
                     break;
                 }
                 _ => continue,

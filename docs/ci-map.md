@@ -24,21 +24,25 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Recommended for workflow-changing PRs
 - `.github/workflows/pr-intake-checks.yml` (`PR Intake Checks`)
     - Purpose: safe pre-CI PR checks (template completeness, added-line tabs/trailing-whitespace/conflict markers) with immediate sticky feedback comment
-- `.github/workflows/main-promotion-gate.yml` (`Main Promotion Gate`)
-    - Purpose: enforce stable-branch policy by allowing only `dev` -> `main` PR promotion authored by `willsarg` or `theonlyhennygod`
 
 ### Non-Blocking but Important
 
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
     - Purpose: PR Docker smoke check on `dev`/`main` PRs and publish images on tag pushes (`v*`) only
+    - Additional behavior: `ghcr_publish_contract_guard.py` enforces GHCR publish contract from `.github/release/ghcr-tag-policy.json` (`vX.Y.Z`, `sha-<12>`, `latest` digest parity + rollback mapping evidence)
+    - Additional behavior: `ghcr_vulnerability_gate.py` enforces policy-driven Trivy gate + parity checks from `.github/release/ghcr-vulnerability-policy.json` and emits `ghcr-vulnerability-gate` audit evidence
+- `.github/workflows/feature-matrix.yml` (`Feature Matrix`)
+    - Purpose: compile-time matrix validation for `default`, `whatsapp-web`, `browser-native`, and `nightly-all-features` lanes
+    - Additional behavior: each lane emits machine-readable result artifacts; summary lane aggregates owner routing from `.github/release/nightly-owner-routing.json`
+    - Additional behavior: supports `compile` (merge-gate) and `nightly` (integration-oriented) profiles with bounded retry policy and trend snapshot artifact (`nightly-history.json`)
+    - Additional behavior: required-check mapping is anchored to stable job name `Feature Matrix Summary`; lane jobs stay informational
+- `.github/workflows/nightly-all-features.yml` (`Nightly All-Features`)
+    - Purpose: legacy/dev-only nightly template; primary nightly signal is emitted by `feature-matrix.yml` nightly profile
+    - Additional behavior: owner routing + escalation policy is documented in `docs/operations/nightly-all-features-runbook.md`
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA), policy/license checks (`cargo deny`), gitleaks-based secrets governance (allowlist policy metadata + expiry guard), and SBOM snapshot artifacts (`CycloneDX` + `SPDX`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
     - Purpose: static analysis for security findings on PR/push (Rust/codeql paths) plus scheduled/manual runs
-- `.github/workflows/ci-connectivity-probes.yml` (`Connectivity Probes`)
-    - Purpose: legacy manual wrapper for provider endpoint probe diagnostics (delegates to config-driven probe engine)
-    - Output: uploads `connectivity-report.json` and `connectivity-summary.md`
-    - Usage: prefer `CI Provider Connectivity` for scheduled + PR/push coverage
 - `.github/workflows/ci-change-audit.yml` (`CI/CD Change Audit`)
     - Purpose: machine-auditable diff report for CI/security workflow changes (line churn, new `uses:` references, unpinned action-policy violations, pipe-to-shell policy violations, broad `permissions: write-all` grants, new `pull_request_target` trigger introductions, new secret references)
 - `.github/workflows/ci-provider-connectivity.yml` (`CI Provider Connectivity`)
@@ -48,19 +52,14 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/ci-supply-chain-provenance.yml` (`CI Supply Chain Provenance`)
     - Purpose: release-fast artifact provenance statement generation + keyless signature bundle for supply-chain traceability
 - `.github/workflows/ci-rollback.yml` (`CI Rollback Guard`)
-    - Purpose: deterministic rollback plan generation with guarded execute mode (manual), marker-tag option, and rollback audit artifacts
+    - Purpose: deterministic rollback plan generation with guarded execute mode, marker-tag option, rollback audit artifacts, and dispatch contract for canary-abort auto-triggering
 - `.github/workflows/sec-vorpal-reviewdog.yml` (`Sec Vorpal Reviewdog`)
     - Purpose: manual secure-coding feedback scan for supported non-Rust files (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`) using reviewdog annotations
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
-- `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
-    - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
-    - Guardrail: release tag must match `Cargo.toml` version
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
-- `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
-    - Purpose: reusable Rust setup/cache + command runner for workflow-call consumers
 
 ### Optional Repository Automation
 
@@ -93,19 +92,13 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `CI`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`
 - `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
+- `Feature Matrix`: PR/push on Rust + workflow paths, merge queue, weekly schedule, manual dispatch
+- `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
-- `Connectivity Probes`: manual dispatch only (legacy wrapper)
-- `Pub Homebrew Core`: manual dispatch only
-- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`, weekly schedule
-- `CI/CD Change Audit`: PR/push on CI/security workflow paths, manual dispatch
-- `CI Provider Connectivity`: schedule every 6 hours, manual dispatch, and PR/push for probe config/script/workflow changes
-- `CI Reproducible Build`: PR/push on Rust/build paths, weekly schedule, manual dispatch
-- `CI Supply Chain Provenance`: push on Rust/build paths, weekly schedule, manual dispatch
-- `CI Rollback Guard`: weekly schedule (plan-only) and manual dispatch (`dry-run` or guarded `execute`)
+- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
-- `Main Promotion Gate`: PRs to `main` only; requires PR author `willsarg`/`theonlyhennygod` and head branch `dev` in the same repository
-- `Dependabot`: all update PRs target `dev` (not `main`)
+- `Dependabot`: all update PRs target `main` (not `dev`)
 - `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review
 - `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/pr-labeler.yml`, or `.github/workflows/pr-auto-response.yml` changes
 - `PR Labeler`: `pull_request_target` lifecycle events
@@ -117,21 +110,14 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 1. `CI Required Gate` failing: start with `.github/workflows/ci-run.yml`.
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
+   - For tag-publish failures, inspect `ghcr-publish-contract.json` / `audit-event-ghcr-publish-contract.json`, `ghcr-vulnerability-gate.json` / `audit-event-ghcr-vulnerability-gate.json`, and Trivy artifacts from `pub-docker-img.yml`.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
-5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-6. Connectivity probe failures: inspect `connectivity-summary.md` and `connectivity-report.json` artifacts from `.github/workflows/ci-connectivity-probes.yml`; apply runbook in `docs/operations/connectivity-probes-runbook.md`.
-7. CI policy failures (`unpinned action` / `pipe-to-shell` / `permissions: write-all` / `pull_request_target`): inspect `.github/workflows/ci-change-audit.yml` summary + artifact.
-8. Provider connectivity drift/incidents: inspect `.github/workflows/ci-provider-connectivity.yml` summary + artifact.
-9. Reproducibility drift signals: inspect `.github/workflows/ci-reproducible-build.yml` artifacts.
-10. Provenance/signing failures: inspect `.github/workflows/ci-supply-chain-provenance.yml` logs and bundle artifacts.
-11. Rollback planning/execution issues: inspect `.github/workflows/ci-rollback.yml` summary + `ci-rollback-plan` artifact.
-12. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-13. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-14. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-15. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-16. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
-17. Suspected flaky tests: inspect `Test Flake Retry Probe` summary and `test-flake-probe` artifact in `.github/workflows/ci-run.yml`.
+4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
+7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
@@ -143,12 +129,18 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep gitleaks allowlist governance metadata current in `.github/security/gitleaks-allowlist-governance.json` (owner/reason/expiry/ticket enforced by `secrets_governance_guard.py`).
 - Keep audit event schema + retention metadata aligned with `docs/audit-event-schema.md` (`emit_audit_event.py` envelope + workflow artifact policy).
 - Keep rollback operations guarded and reversible (`ci-rollback.yml` defaults to `dry-run`; `execute` is manual and policy-gated).
+- Keep canary policy thresholds and sample-size rules current in `.github/release/canary-policy.json`.
+- Keep GHCR tag taxonomy and immutability policy current in `.github/release/ghcr-tag-policy.json` and `docs/operations/ghcr-tag-policy.md`.
+- Keep GHCR vulnerability gate policy current in `.github/release/ghcr-vulnerability-policy.json` and `docs/operations/ghcr-vulnerability-policy.md`.
+- Keep pre-release stage transition policy + matrix coverage + transition audit semantics current in `.github/release/prerelease-stage-gates.json`.
+- Keep required check naming stable and documented in `docs/operations/required-check-mapping.md` before changing branch protection settings.
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
 - Keep docs link gating incremental via `./scripts/ci/collect_changed_links.py` + lychee (check only links added on changed lines).
+- Keep docs deploy policy current in `.github/release/docs-deploy-policy.json`, `docs/operations/docs-deploy-policy.md`, and `docs/operations/docs-deploy-runbook.md`.
 - Prefer explicit workflow permissions (least privilege).
 - Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
 - Use path filters for expensive workflows when practical.

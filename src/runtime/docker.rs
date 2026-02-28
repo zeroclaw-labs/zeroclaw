@@ -53,6 +53,10 @@ impl DockerRuntime {
 }
 
 impl RuntimeAdapter for DockerRuntime {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &str {
         "docker"
     }

@@ -95,13 +95,17 @@ pub trait Channel: Send + Sync {
     }
 
     /// Update a previously sent draft message with new accumulated content.
+    ///
+    /// Returns `Ok(None)` to keep the current draft message ID, or
+    /// `Ok(Some(new_id))` when a continuation message was created
+    /// (e.g. after hitting a platform edit-count cap).
     async fn update_draft(
         &self,
         _recipient: &str,
         _message_id: &str,
         _text: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
@@ -117,6 +121,30 @@ pub trait Channel: Send + Sync {
     /// Cancel and remove a previously sent draft message if the channel supports it.
     async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Send an interactive approval prompt, if supported by the channel.
+    ///
+    /// Default behavior sends a plain-text fallback with slash-command actions.
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.len() > 220 {
+            format!("{}...", &raw_args[..220])
+        } else {
+            raw_args
+        };
+        let message = format!(
+            "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`\nApprove: `/approve-allow {request_id}`\nDeny: `/approve-deny {request_id}`"
+        );
+        self.send(&SendMessage::new(message, recipient).in_thread(thread_ts))
+            .await
     }
 
     /// Add a reaction (emoji) to a message.
