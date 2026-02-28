@@ -89,12 +89,15 @@ cargo build --release --target aarch64-linux-android
 ## Troubleshooting
 
 ### "Permission denied"
+
 ```bash
 chmod +x zeroclaw
 ```
 
 ### "not found" or linker errors
+
 Make sure you downloaded the correct architecture for your device.
 
 ### Old Android (4.x)
+
 Use the `armv7-linux-androideabi` build with API level 16+.

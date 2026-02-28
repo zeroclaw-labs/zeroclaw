@@ -350,7 +350,6 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Apply `docs/i18n-guide.md` completion checklist before merge and include i18n status in PR notes.
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
 
-
 ## 8) Validation Matrix
 
 Default local checks for code changes:

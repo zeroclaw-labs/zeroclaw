@@ -112,6 +112,8 @@ done <<< "$CHANGED"
   echo "workflow_changed=$workflow_changed"
   echo "base_sha=$DIFF_BASE"
   echo "docs_files<<EOF"
-  printf '%s\n' "${docs_files[@]}"
+  if [ "${#docs_files[@]}" -gt 0 ]; then
+    printf '%s\n' "${docs_files[@]}"
+  fi
   echo "EOF"
 } >> "$GITHUB_OUTPUT"
