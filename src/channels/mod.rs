@@ -289,6 +289,7 @@ struct ChannelRuntimeContext {
     model_routes: Vec<crate::config::ModelRouteConfig>,
     approval_manager: Arc<ApprovalManager>,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
+    startup_perplexity_filter: crate::config::PerplexityFilterConfig,
 }
 
 #[derive(Clone)]
@@ -1010,7 +1011,8 @@ fn runtime_perplexity_filter_snapshot(
             return state.perplexity_filter.clone();
         }
     }
-    crate::config::PerplexityFilterConfig::default()
+    // Fallback to startup snapshot to preserve originally configured policy
+    ctx.startup_perplexity_filter.clone()
 }
 
 fn runtime_outbound_leak_guard_snapshot(
@@ -2059,6 +2061,48 @@ async fn handle_runtime_command_if_needed(
         }
     }
 
+    /// Handle the side effects of confirming a tool approval:
+    /// - Grant session and persistent runtime grants
+    /// - Persist to config
+    /// - Clear exclusions
+    /// Returns the approval success message.
+    async fn handle_confirm_tool_approval_side_effects(
+        ctx: &ChannelRuntimeContext,
+        request_id: &str,
+        tool_name: &str,
+        _source_channel: &str,
+    ) -> String {
+        if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
+            format!(
+                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
+            )
+        } else {
+            ctx.approval_manager.grant_non_cli_session(tool_name);
+            ctx.approval_manager
+                .apply_persistent_runtime_grant(tool_name);
+            let mut approval_message = match persist_non_cli_approval_to_config(ctx, tool_name).await {
+                Ok(Some(path)) => format!(
+                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nPersisted to `{}` so future channel sessions (including after restart) remain approved.",
+                    path.display()
+                ),
+                Ok(None) => format!(
+                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nNo runtime config path was found, so this approval is active for the current daemon runtime only."
+                ),
+                Err(err) => format!(
+                    "Approved supervised execution for `{tool_name}` from request `{request_id}` in-memory.\nFailed to persist this approval to config: {err}"
+                ),
+            };
+            if let Some(exclusion_note) =
+                clear_non_cli_exclusion_after_approval(ctx, tool_name).await
+            {
+                approval_message.push('\n');
+                approval_message.push_str(&exclusion_note);
+            }
+            approval_message
+        }
+    }
+
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
@@ -2196,9 +2240,7 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
-        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id)
-        | ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
-        
+        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id) => {
             let request_id = raw_request_id.trim().to_string();
             if request_id.is_empty() {
                 "Usage: `/approve-confirm <request-id>`".to_string()
@@ -2213,36 +2255,13 @@ async fn handle_runtime_command_if_needed(
                         ctx.approval_manager
                             .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
                         let tool_name = req.tool_name;
-                        let mut approval_message = if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
-                            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
-                            format!(
-                                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
-                            )
-                        } else {
-                            ctx.approval_manager.grant_non_cli_session(&tool_name);
-                            ctx.approval_manager
-                                .apply_persistent_runtime_grant(&tool_name);
-                            match persist_non_cli_approval_to_config(ctx, &tool_name).await {
-                                Ok(Some(path)) => format!(
-                                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nPersisted to `{}` so future channel sessions (including after restart) remain approved.",
-                                    path.display()
-                                ),
-                                Ok(None) => format!(
-                                    "Approved supervised execution for `{tool_name}` from request `{request_id}`.\nNo runtime config path was found, so this approval is active for the current daemon runtime only."
-                                ),
-                                Err(err) => format!(
-                                    "Approved supervised execution for `{tool_name}` from request `{request_id}` in-memory.\nFailed to persist this approval to config: {err}"
-                                ),
-                            }
-                        };
-                        if tool_name != APPROVAL_ALL_TOOLS_ONCE_TOKEN {
-                            if let Some(exclusion_note) =
-                                clear_non_cli_exclusion_after_approval(ctx, &tool_name).await
-                            {
-                                approval_message.push('\n');
-                                approval_message.push_str(&exclusion_note);
-                            }
-                        }
+                        let approval_message = handle_confirm_tool_approval_side_effects(
+                            ctx,
+                            &request_id,
+                            &tool_name,
+                            source_channel,
+                        )
+                        .await;
                         runtime_trace::record_event(
                             "approval_request_confirmed",
                             Some(source_channel),
@@ -2527,8 +2546,14 @@ async fn handle_runtime_command_if_needed(
                 }
             }
         }
-        ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
-            let request_id = raw_request_id.trim().to_string();
+        ChannelRuntimeCommand::ListApprovals => {
+            match describe_non_cli_approvals(ctx, sender, source_channel, reply_target).await {
+                Ok(summary) => summary,
+                Err(err) => format!("Failed to read approval state: {err}"),
+            }
+        }
+        ChannelRuntimeCommand::ApprovePendingRequest(request_id) => {
+            let request_id = request_id.trim().to_string();
             if request_id.is_empty() {
                 "Usage: `/approve-allow <request-id>`".to_string()
             } else {
@@ -2539,53 +2564,24 @@ async fn handle_runtime_command_if_needed(
                     reply_target,
                 ) {
                     Ok(req) => {
-                        let tool_name = req.tool_name;
-                        if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
-                            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
-                            format!(
-                                "Allowed one-time all-tools bypass from request `{request_id}`.\nQueued bypass tokens: `{remaining}`."
-                            )
-                        } else {
-                            ctx.approval_manager.grant_non_cli_session(&tool_name);
-                            ctx.approval_manager
-                                .apply_persistent_runtime_grant(&tool_name);
-                            format!(
-                                "Allowed supervised execution for `{tool_name}` from request `{request_id}`."
-                            )
-                        }
-                    }
-                    Err(PendingApprovalError::NotFound) => format!(
-                        "Pending approval request `{request_id}` not found."
-                    ),
-                    Err(PendingApprovalError::Expired) => format!(
-                        "Pending approval request `{request_id}` has expired."
-                    ),
-                    Err(PendingApprovalError::RequesterMismatch) => format!(
-                        "Request `{request_id}` can only be allowed by the original requester in the same chat/channel."
-                    ),
-                }
-            }
-        }
-        ChannelRuntimeCommand::DenyToolApproval(raw_request_id) => {
-            let request_id = raw_request_id.trim().to_string();
-            if request_id.is_empty() {
-                "Usage: `/approve-deny <request-id>`".to_string()
-            } else {
-                match ctx.approval_manager.reject_non_cli_pending_request(
-                    &request_id,
-                    sender,
-                    source_channel,
-                    reply_target,
-                ) {
-                    Ok(req) => {
+                        ctx.approval_manager.record_non_cli_pending_resolution(
+                            &request_id,
+                            ApprovalResponse::Yes,
+                        );
+                        let approval_message = handle_confirm_tool_approval_side_effects(
+                            ctx,
+                            &request_id,
+                            &req.tool_name,
+                            source_channel,
+                        ).await;
                         runtime_trace::record_event(
-                            "approval_request_denied",
+                            "approval_request_approved",
                             Some(source_channel),
                             None,
                             None,
                             None,
                             Some(true),
-                            Some("pending request denied"),
+                            Some("pending request approved"),
                             serde_json::json!({
                                 "request_id": request_id,
                                 "tool_name": req.tool_name,
@@ -2593,27 +2589,62 @@ async fn handle_runtime_command_if_needed(
                                 "channel": source_channel,
                             }),
                         );
+                        approval_message
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        runtime_trace::record_event(
+                            "approval_request_approved",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request not found"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
                         format!(
-                            "Denied approval request `{request_id}` for tool `{}`.",
-                            req.tool_name
+                            "Pending approval request `{request_id}` was not found. Create one with `/approve-request <tool-name>` or `/approve-all-once`."
                         )
                     }
-                    Err(PendingApprovalError::NotFound) => format!(
-                        "Pending approval request `{request_id}` not found."
-                    ),
-                    Err(PendingApprovalError::Expired) => format!(
-                        "Pending approval request `{request_id}` has expired."
-                    ),
-                    Err(PendingApprovalError::RequesterMismatch) => format!(
-                        "Request `{request_id}` can only be denied by the original requester in the same chat/channel."
-                    ),
+                    Err(PendingApprovalError::Expired) => {
+                        runtime_trace::record_event(
+                            "approval_request_approved",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request expired"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        runtime_trace::record_event(
+                            "approval_request_approved",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request requester mismatch"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!("Pending approval request `{request_id}` can only be approved by the original requester in the same channel/thread.")
+                    }
                 }
-            }
-        }
-        ChannelRuntimeCommand::ListApprovals => {
-            match describe_non_cli_approvals(ctx, sender, source_channel, reply_target).await {
-                Ok(summary) => summary,
-                Err(err) => format!("Failed to read approval state: {err}"),
             }
         }
     };
@@ -5304,6 +5335,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )),
         query_classification: config.query_classification.clone(),
         model_routes: config.model_routes.clone(),
+        // Preserve startup perplexity filter config to ensure policy is not weakened
+        // when runtime store lookup misses.
+        startup_perplexity_filter: config.security.perplexity_filter.clone(),
         // WASM skill tools are sandboxed by the WASM engine and cannot access the
         // host filesystem, network, or shell. Pre-approve them so they are not
         // denied on non-CLI channels (which have no interactive stdin to prompt).
