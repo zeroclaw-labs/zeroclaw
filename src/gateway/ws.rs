@@ -24,13 +24,24 @@ use axum::{
 const EMPTY_WS_RESPONSE_FALLBACK: &str =
     "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
 
-fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
-    let sanitized = crate::channels::sanitize_channel_response(response, tools);
-    if sanitized.is_empty() && !response.trim().is_empty() {
-        "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
-            .to_string()
-    } else {
-        sanitized
+fn sanitize_ws_response(
+    response: &str,
+    tools: &[Box<dyn crate::tools::Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
+) -> String {
+    match crate::channels::sanitize_channel_response(response, tools, leak_guard) {
+        crate::channels::ChannelSanitizationResult::Sanitized(sanitized) => {
+            if sanitized.is_empty() && !response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                    .to_string()
+            } else {
+                sanitized
+            }
+        }
+        crate::channels::ChannelSanitizationResult::Blocked { .. } => {
+            "I blocked a draft response because it appeared to contain credential material. Please ask for a redacted summary."
+                .to_string()
+        }
     }
 }
 
@@ -94,8 +105,9 @@ fn finalize_ws_response(
     response: &str,
     history: &[ChatMessage],
     tools: &[Box<dyn crate::tools::Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
 ) -> String {
-    let sanitized = sanitize_ws_response(response, tools);
+    let sanitized = sanitize_ws_response(response, tools, leak_guard);
     if !sanitized.trim().is_empty() {
         return sanitized;
     }
@@ -257,8 +269,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
         match super::run_gateway_chat_with_tools(&state, &content).await {
             Ok(response) => {
-                let safe_response =
-                    finalize_ws_response(&response, &history, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = { state.config.lock().security.outbound_leak_guard.clone() };
+                let safe_response = finalize_ws_response(
+                    &response,
+                    &history,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 // Add assistant response to history
                 history.push(ChatMessage::assistant(&safe_response));
 
@@ -465,7 +482,8 @@ mod tests {
 </tool_call>
 After"#;
 
-        let result = sanitize_ws_response(input, &[]);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_ws_response(input, &[], &leak_guard);
         let normalized = result
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -483,10 +501,25 @@ After"#;
 {"result":{"status":"scheduled"}}
 Reminder set successfully."#;
 
-        let result = sanitize_ws_response(input, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_ws_response(input, &tools, &leak_guard);
         assert_eq!(result, "Reminder set successfully.");
         assert!(!result.contains("\"name\":\"schedule\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_ws_response_blocks_detected_credentials_when_configured() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig {
+            enabled: true,
+            action: crate::config::OutboundLeakGuardAction::Block,
+            sensitivity: 0.7,
+        };
+
+        let result =
+            sanitize_ws_response("Temporary key: AKIAABCDEFGHIJKLMNOP", &tools, &leak_guard);
+        assert!(result.contains("blocked a draft response"));
     }
 
     #[test]
@@ -523,7 +556,8 @@ Reminder set successfully."#;
             ),
         ];
 
-        let result = finalize_ws_response("", &history, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert!(result.contains("Latest tool output:"));
         assert!(result.contains("Disk usage: 72%"));
         assert!(!result.contains("<tool_result"));
@@ -538,7 +572,8 @@ Reminder set successfully."#;
                 .to_string(),
         }];
 
-        let result = finalize_ws_response("", &history, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert!(result.contains("Latest tool output:"));
         assert!(result.contains("/dev/disk3s1"));
     }
@@ -548,7 +583,8 @@ Reminder set successfully."#;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
         let history = vec![ChatMessage::system("sys")];
 
-        let result = finalize_ws_response("", &history, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
     }
 }

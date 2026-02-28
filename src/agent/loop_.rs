@@ -1243,13 +1243,30 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if bypass_non_cli_approval_for_turn {
+                let non_cli_session_granted =
+                    channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
+                if bypass_non_cli_approval_for_turn || non_cli_session_granted {
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
                         ApprovalResponse::Yes,
                         channel_name,
                     );
+                    if non_cli_session_granted {
+                        runtime_trace::record_event(
+                            "approval_bypass_non_cli_session_grant",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(true),
+                            Some("using runtime non-cli session approval grant"),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name.clone(),
+                            }),
+                        );
+                    }
                 } else if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
@@ -3132,6 +3149,62 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             0,
             "shell tool must not execute when approval is unavailable on non-CLI channels"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_uses_non_cli_session_grant_without_waiting_for_prompt() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        approval_mgr.grant_non_cli_session("shell");
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should consume non-cli session grants");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "shell tool should execute when runtime non-cli session grant exists"
         );
     }
 

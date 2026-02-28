@@ -455,7 +455,9 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     #[test]
     fn low_sensitivity_skips_generic() {
         let detector = LeakDetector::with_sensitivity(0.3);
-        let content = "secret=mygenericvalue123456";
+        // Use low entropy so this test only exercises the generic rule gate and
+        // does not trip the independent high-entropy detector.
+        let content = "secret=aaaaaaaaaaaaaaaa";
         let result = detector.scan(content);
         // Low sensitivity should not flag generic secrets
         assert!(matches!(result, LeakResult::Clean));

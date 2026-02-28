@@ -986,13 +986,30 @@ pub(super) async fn run_gateway_chat_with_tools(
     crate::agent::process_message(config, message).await
 }
 
-fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
-    let sanitized = crate::channels::sanitize_channel_response(response, tools);
-    if sanitized.is_empty() && !response.trim().is_empty() {
-        "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
-            .to_string()
-    } else {
-        sanitized
+fn gateway_outbound_leak_guard_snapshot(
+    state: &AppState,
+) -> crate::config::OutboundLeakGuardConfig {
+    state.config.lock().security.outbound_leak_guard.clone()
+}
+
+fn sanitize_gateway_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
+) -> String {
+    match crate::channels::sanitize_channel_response(response, tools, leak_guard) {
+        crate::channels::ChannelSanitizationResult::Sanitized(sanitized) => {
+            if sanitized.is_empty() && !response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                    .to_string()
+            } else {
+                sanitized
+            }
+        }
+        crate::channels::ChannelSanitizationResult::Blocked { .. } => {
+            "I blocked a draft response because it appeared to contain credential material. Please ask for a redacted summary."
+                .to_string()
+        }
     }
 }
 
@@ -1227,9 +1244,11 @@ fn handle_webhook_streaming(
                 .await
             {
                 Ok(response) => {
+                    let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state_for_call);
                     let safe_response = sanitize_gateway_response(
                         &response,
                         state_for_call.tools_registry_exec.as_ref(),
+                        &leak_guard_cfg,
                     );
                     let duration = started_at.elapsed();
                     state_for_call.observer.record_event(
@@ -1608,8 +1627,12 @@ async fn handle_webhook(
 
     match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
-            let safe_response =
-                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+            let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+            let safe_response = sanitize_gateway_response(
+                &response,
+                state.tools_registry_exec.as_ref(),
+                &leak_guard_cfg,
+            );
             let duration = started_at.elapsed();
             state
                 .observer
@@ -1814,8 +1837,12 @@ async fn handle_whatsapp_message(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -1933,8 +1960,12 @@ async fn handle_linq_webhook(
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 // Send reply via Linq
                 if let Err(e) = linq
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -2027,8 +2058,12 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         // Call the LLM
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 // Send reply via WATI
                 if let Err(e) = wati
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
@@ -2133,8 +2168,12 @@ async fn handle_nextcloud_talk_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
@@ -2224,8 +2263,12 @@ async fn handle_qq_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 if let Err(e) = qq
                     .send(
                         &SendMessage::new(safe_response, &msg.reply_target)
@@ -2787,7 +2830,8 @@ mod tests {
 </tool_call>
 After"#;
 
-        let result = sanitize_gateway_response(input, &[]);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_gateway_response(input, &[], &leak_guard);
         let normalized = result
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -2805,10 +2849,25 @@ After"#;
 {"result":{"status":"scheduled"}}
 Reminder set successfully."#;
 
-        let result = sanitize_gateway_response(input, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_gateway_response(input, &tools, &leak_guard);
         assert_eq!(result, "Reminder set successfully.");
         assert!(!result.contains("\"name\":\"schedule\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_gateway_response_blocks_detected_credentials_when_configured() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig {
+            enabled: true,
+            action: crate::config::OutboundLeakGuardAction::Block,
+            sensitivity: 0.7,
+        };
+
+        let result =
+            sanitize_gateway_response("Temporary key: AKIAABCDEFGHIJKLMNOP", &tools, &leak_guard);
+        assert!(result.contains("blocked a draft response"));
     }
 
     #[derive(Default)]

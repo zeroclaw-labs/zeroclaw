@@ -20,6 +20,7 @@ For current runtime behavior, start here:
 - CI/Security audit event schema: [../audit-event-schema.md](../audit-event-schema.md)
 - Syscall anomaly detection: [./syscall-anomaly-detection.md](./syscall-anomaly-detection.md)
 - Perplexity suffix filter: [./perplexity-filter.md](./perplexity-filter.md)
+- Enject-inspired hardening notes: [./enject-inspired-hardening.md](./enject-inspired-hardening.md)
 
 ## Proposal / Roadmap Docs
 

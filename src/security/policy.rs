@@ -106,6 +106,8 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
+    pub allow_sensitive_file_reads: bool,
+    pub allow_sensitive_file_writes: bool,
     pub tracker: ActionTracker,
 }
 
@@ -158,6 +160,8 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
+            allow_sensitive_file_reads: false,
+            allow_sensitive_file_writes: false,
             tracker: ActionTracker::new(),
         }
     }
@@ -1096,6 +1100,8 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
+            allow_sensitive_file_reads: autonomy_config.allow_sensitive_file_reads,
+            allow_sensitive_file_writes: autonomy_config.allow_sensitive_file_writes,
             tracker: ActionTracker::new(),
         }
     }
@@ -1459,6 +1465,8 @@ mod tests {
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
             shell_env_passthrough: vec!["DATABASE_URL".into()],
+            allow_sensitive_file_reads: true,
+            allow_sensitive_file_writes: true,
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
@@ -1473,6 +1481,8 @@ mod tests {
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
         assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
+        assert!(policy.allow_sensitive_file_reads);
+        assert!(policy.allow_sensitive_file_writes);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
 
