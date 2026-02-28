@@ -120,6 +120,7 @@ mod tests {
             max_response_size: 256_000,
             timeout_secs: 10,
             user_agent: "zeroclaw-test".into(),
+            credential_profiles: std::collections::HashMap::new(),
         };
 
         assert!(cfg.enabled);

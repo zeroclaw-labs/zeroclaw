@@ -2318,8 +2318,7 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
-        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id)
-        | ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
+        ChannelRuntimeCommand::ConfirmToolApproval(raw_request_id) => {
             let request_id = raw_request_id.trim().to_string();
             if request_id.is_empty() {
                 "Usage: `/approve-confirm <request-id>`".to_string()
@@ -4695,10 +4694,10 @@ fn collect_configured_channels(
             tg.bot_token.clone(),
             tg.allowed_users.clone(),
             tg.effective_group_reply_mode().requires_mention(),
-            tg.ack_enabled,
         )
         .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
         .with_ack_reaction(config.channels_config.ack_reaction.telegram.clone())
+        .with_ack_enabled(tg.ack_enabled)
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
         .with_transcription(config.transcription.clone())
         .with_workspace_dir(config.workspace_dir.clone());
@@ -7446,6 +7445,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::clone(&approval_manager),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
         });
 
         process_channel_message(
@@ -7465,7 +7466,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Approved pending request"));
+        assert!(sent[0].contains("Approved supervised execution for `mock_price`"));
         assert!(sent[0].contains("mock_price"));
         drop(sent);
 
@@ -7530,6 +7531,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::clone(&approval_manager),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
         });
 
         process_channel_message(
@@ -7549,7 +7552,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Denied pending request"));
+        assert!(sent[0].contains("Rejected approval request"));
         assert!(sent[0].contains("mock_price"));
         drop(sent);
 
