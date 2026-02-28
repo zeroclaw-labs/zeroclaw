@@ -835,30 +835,106 @@ impl SecurityPolicy {
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
             }
             "git" => {
-                // git alias and -c can be used for command execution
-                if args.iter().any(|arg| arg == "alias" || arg.starts_with("alias.") || arg == "-c") {
+                // Global git config injection can be used to set dangerous options
+                // (e.g., pager/editor/credential helpers) even without `git config`.
+                if args.iter().any(|arg| {
+                    arg == "-c"
+                        || arg == "--config"
+                        || arg.starts_with("--config=")
+                        || arg == "--config-env"
+                        || arg.starts_with("--config-env=")
+                }) {
                     return false;
                 }
 
-                // git config can set dangerous options (e.g., core.editor, credential.helper)
-                // Allow ONLY read-only operations: --get, --list, -l, --get-all, --get-regexp, --get-urlmatch
-                if args.iter().any(|arg| arg == "config" || arg.starts_with("config.")) {
-                    // These are the ONLY flags that indicate a read-only operation
-                    let has_readonly_flag = args.iter().any(|arg| {
-                        arg == "--get"
-                            || arg == "--list"
-                            || arg == "-l"
-                            || arg == "--get-all"
-                            || arg == "--get-regexp"
-                            || arg == "--get-urlmatch"
-                    });
+                // Determine subcommand by first non-option token.
+                let Some(subcommand_index) = args.iter().position(|arg| !arg.starts_with('-'))
+                else {
+                    return true;
+                };
+                let subcommand = args[subcommand_index].as_str();
 
-                    // If we have config but no readonly flag, it's a write operation - block it
-                    if !has_readonly_flag {
+                // `git alias` can create executable aliases.
+                if subcommand == "alias" || subcommand.starts_with("alias.") {
+                    return false;
+                }
+
+                // Only `git config` needs special handling. Other git subcommands are
+                // allowed after the global option checks above.
+                if subcommand != "config" {
+                    return true;
+                }
+
+                let config_args = &args[subcommand_index + 1..];
+
+                // Allow ONLY read-only operations.
+                let has_readonly_flag = config_args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--get" | "--list" | "-l" | "--get-all" | "--get-regexp" | "--get-urlmatch"
+                    )
+                });
+                if !has_readonly_flag {
+                    return false;
+                }
+
+                // Explicit write/edit operations must never be mixed with reads.
+                let has_write_flag = config_args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--add"
+                            | "--replace-all"
+                            | "--unset"
+                            | "--unset-all"
+                            | "--edit"
+                            | "-e"
+                            | "--rename-section"
+                            | "--remove-section"
+                    )
+                });
+                if has_write_flag {
+                    return false;
+                }
+
+                // Reject unknown config flags to avoid option-based bypasses.
+                let has_unknown_flag = config_args.iter().any(|arg| {
+                    if !arg.starts_with('-') {
                         return false;
                     }
 
-                    // Read operations are safe - they have no side effects
+                    let is_known_flag = matches!(
+                        arg.as_str(),
+                        "--get"
+                            | "--list"
+                            | "-l"
+                            | "--get-all"
+                            | "--get-regexp"
+                            | "--get-urlmatch"
+                            | "--global"
+                            | "--system"
+                            | "--local"
+                            | "--worktree"
+                            | "--show-origin"
+                            | "--show-scope"
+                            | "--null"
+                            | "-z"
+                            | "--name-only"
+                            | "--includes"
+                            | "--no-includes"
+                    ) || arg == "--file"
+                        || arg == "-f"
+                        || arg.starts_with("--file=")
+                        || arg == "--blob"
+                        || arg.starts_with("--blob=")
+                        || arg == "--default"
+                        || arg.starts_with("--default=")
+                        || arg == "--type"
+                        || arg.starts_with("--type=");
+
+                    !is_known_flag
+                });
+                if has_unknown_flag {
+                    return false;
                 }
 
                 true
@@ -1845,6 +1921,8 @@ mod tests {
         // scoped read operations are allowed
         assert!(p.is_command_allowed("git config --global --get user.name"));
         assert!(p.is_command_allowed("git config --local --list"));
+        assert!(p.is_command_allowed("git config --global --get user.name --show-origin"));
+        assert!(p.is_command_allowed("git config --default=unknown --get user.name"));
     }
 
     #[test]
@@ -1864,6 +1942,25 @@ mod tests {
         // git config --edit is blocked (opens editor)
         assert!(!p.is_command_allowed("git config -e"));
         assert!(!p.is_command_allowed("git config --edit"));
+    }
+
+    #[test]
+    fn git_config_mixed_read_write_flags_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("git config --get --unset user.name"));
+        assert!(!p.is_command_allowed("git config --list --add user.name test"));
+        assert!(!p.is_command_allowed("git config --get-all --replace-all user.name test"));
+    }
+
+    #[test]
+    fn git_config_global_injection_flags_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("git --config-env=core.editor=EVIL_EDITOR status"));
+        assert!(!p.is_command_allowed("git --config=core.pager=cat status"));
+        assert!(
+            !p.is_command_allowed("git --config-env=credential.helper=EVIL config --get user.name")
+        );
+        assert!(!p.is_command_allowed("git --config=core.editor=vim config --get user.name"));
     }
 
     #[test]
