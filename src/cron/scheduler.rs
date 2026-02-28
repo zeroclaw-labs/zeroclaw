@@ -22,6 +22,10 @@ const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
+pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
+    output.trim().eq_ignore_ascii_case("NO_REPLY")
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -287,6 +291,13 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
+        return Ok(());
+    }
+    if is_no_reply_sentinel(output) {
+        tracing::debug!(
+            "Cron job '{}' returned NO_REPLY sentinel; skipping announce delivery",
+            job.id
+        );
         return Ok(());
     }
 
@@ -1131,6 +1142,31 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_skips_no_reply_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("invalid".into()),
+            to: Some("target".into()),
+            best_effort: true,
+        };
+
+        assert!(deliver_if_configured(&config, &job, "  no_reply  ")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn no_reply_sentinel_matching_is_trimmed_and_case_insensitive() {
+        assert!(is_no_reply_sentinel("NO_REPLY"));
+        assert!(is_no_reply_sentinel("  no_reply  "));
+        assert!(!is_no_reply_sentinel("NO_REPLY please"));
+        assert!(!is_no_reply_sentinel(""));
     }
 
     #[tokio::test]
