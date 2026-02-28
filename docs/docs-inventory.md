@@ -2,7 +2,7 @@
 
 This inventory classifies documentation by intent and canonical location.
 
-Last reviewed: **February 24, 2026**.
+Last reviewed: **February 28, 2026**.
 
 ## Classification Legend
 
@@ -124,6 +124,7 @@ These are valuable context, but **not strict runtime contracts**.
 |---|---|
 | `docs/project-triage-snapshot-2026-02-18.md` | Snapshot |
 | `docs/docs-audit-2026-02-24.md` | Snapshot (docs architecture audit) |
+| `docs/project/m4-5-rfi-spike-2026-02-28.md` | Snapshot (M4-5 workspace split RFI baseline and execution plan) |
 | `docs/i18n-gap-backlog.md` | Snapshot (i18n depth gap tracking) |
 
 ## Maintenance Contract
