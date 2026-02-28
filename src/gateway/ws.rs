@@ -11,7 +11,7 @@
 
 use super::AppState;
 use crate::agent::loop_::{
-    build_shell_policy_instructions, build_tool_instructions_from_specs, run_tool_call_loop,
+    build_shell_policy_instructions, build_tool_instructions_from_specs,
 };
 use crate::approval::ApprovalManager;
 use crate::providers::ChatMessage;
@@ -192,7 +192,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Add system message to history
     history.push(ChatMessage::system(&system_prompt));
 
-    let approval_manager = {
+    let _approval_manager = {
         let config_guard = state.config.lock();
         ApprovalManager::from_config(&config_guard.autonomy)
     };

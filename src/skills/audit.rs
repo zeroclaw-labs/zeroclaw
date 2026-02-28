@@ -3,7 +3,6 @@ use regex::Regex;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
-use zip::ZipArchive;
 
 const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
