@@ -234,6 +234,11 @@ rag-pdf = ["dep:pdf-extract"]
 wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+# Optional provider feature flags used by cfg(feature = "...") guards.
+# Keep disabled by default to preserve current runtime behavior.
+firecrawl = []
+web-fetch-html2md = []
+web-fetch-plaintext = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size
