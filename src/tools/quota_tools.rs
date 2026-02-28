@@ -112,16 +112,23 @@ impl Tool for CheckProviderQuotaTool {
             let _ = writeln!(output, "Available providers: {}", available.join(", "));
         }
         if !rate_limited.is_empty() {
-            let _ = writeln!(output, "Rate-limited providers: {}", rate_limited.join(", "));
+            let _ = writeln!(
+                output,
+                "Rate-limited providers: {}",
+                rate_limited.join(", ")
+            );
         }
         if !circuit_open.is_empty() {
-            let _ = writeln!(output, "Circuit-open providers: {}", circuit_open.join(", "));
+            let _ = writeln!(
+                output,
+                "Circuit-open providers: {}",
+                circuit_open.join(", ")
+            );
         }
 
         if available.is_empty() && rate_limited.is_empty() && circuit_open.is_empty() {
-            output.push_str(
-                "No quota information available. Quota is populated after API calls.\n",
-            );
+            output
+                .push_str("No quota information available. Quota is populated after API calls.\n");
         }
 
         // Always show per-provider and per-profile details

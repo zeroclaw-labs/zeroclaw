@@ -37,8 +37,7 @@ impl ManageAuthProfileTool {
         let mut count = 0u32;
         for (id, profile) in &data.profiles {
             if let Some(filter) = provider_filter {
-                let normalized =
-                    normalize_provider(filter).unwrap_or_else(|_| filter.to_string());
+                let normalized = normalize_provider(filter).unwrap_or_else(|_| filter.to_string());
                 if profile.provider != normalized {
                     continue;
                 }
