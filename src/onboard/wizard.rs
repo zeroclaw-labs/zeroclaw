@@ -8007,13 +8007,14 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+    fn channel_menu_choices_include_signal_nextcloud_and_dingtalk() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::DingTalk));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
+    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_dingtalk() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -8054,6 +8055,14 @@ mod tests {
             base_url: "https://cloud.example.com".into(),
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.nextcloud_talk = None;
+        channels.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client-id".into(),
+            client_secret: "client-secret".into(),
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));

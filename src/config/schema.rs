@@ -10521,6 +10521,46 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn dingtalk_config_defaults_allowed_users_to_empty() {
+        let json = r#"{"client_id":"ding-app-key","client_secret":"ding-app-secret"}"#;
+        let parsed: DingTalkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.client_id, "ding-app-key");
+        assert_eq!(parsed.client_secret, "ding-app-secret");
+        assert!(parsed.allowed_users.is_empty());
+    }
+
+    #[test]
+    async fn dingtalk_config_toml_roundtrip() {
+        let dc = DingTalkConfig {
+            client_id: "ding-app-key".into(),
+            client_secret: "ding-app-secret".into(),
+            allowed_users: vec!["*".into(), "staff123".into()],
+        };
+        let toml_str = toml::to_string(&dc).unwrap();
+        let parsed: DingTalkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.client_id, "ding-app-key");
+        assert_eq!(parsed.client_secret, "ding-app-secret");
+        assert_eq!(parsed.allowed_users, vec!["*", "staff123"]);
+    }
+
+    #[test]
+    async fn channels_except_webhook_reports_dingtalk_as_enabled() {
+        let mut channels = ChannelsConfig::default();
+        channels.dingtalk = Some(DingTalkConfig {
+            client_id: "ding-app-key".into(),
+            client_secret: "ding-app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+
+        let dingtalk_state = channels
+            .channels_except_webhook()
+            .iter()
+            .find_map(|(handle, enabled)| (handle.name() == "DingTalk").then_some(*enabled));
+
+        assert_eq!(dingtalk_state, Some(true));
+    }
+
+    #[test]
     async fn nextcloud_talk_config_serde() {
         let nc = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),

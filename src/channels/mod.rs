@@ -10281,6 +10281,21 @@ BTC is currently around $65,000 based on latest tool output."#;
             .any(|entry| entry.channel.name() == "mattermost"));
     }
 
+    #[test]
+    fn collect_configured_channels_includes_dingtalk_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "ding-app-key".to_string(),
+            client_secret: "ding-app-secret".to_string(),
+            allowed_users: vec!["*".to_string()],
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels.iter().any(|entry| entry.display_name == "DingTalk"));
+        assert!(channels.iter().any(|entry| entry.channel.name() == "dingtalk"));
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
