@@ -138,16 +138,9 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
   <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
 </p>
 
-### 🙏 Special Thanks
+---
 
-A heartfelt thank you to the communities and institutions that inspire and fuel this open-source work:
-
-- **Harvard University** — for fostering intellectual curiosity and pushing the boundaries of what's possible.
-- **MIT** — for championing open knowledge, open source, and the belief that technology should be accessible to everyone.
-- **Sundai Club** — for the community, the energy, and the relentless drive to build things that matter.
-- **The World & Beyond** 🌍✨ — to every contributor, dreamer, and builder out there making open source a force for good. This is for you.
-
-We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
+For full documentation, see [`docs/README.md`](docs/README.md) | [`docs/SUMMARY.md`](docs/SUMMARY.md)
 
 ## ⚠️ Official Repository & Impersonation Warning
 
@@ -172,31 +165,9 @@ ZeroClaw is dual-licensed for maximum openness and contributor protection:
 
 You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
 
-### Trademark
-
-The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](TRADEMARK.md) for permitted and prohibited uses.
-
-### Contributor Protections
-
-- You **retain copyright** of your contributions
-- **Patent grant** (Apache 2.0) shields you from patent claims by other contributors
-- Your contributions are **permanently attributed** in commit history and [NOTICE](NOTICE)
-- No trademark rights are transferred by contributing
-
 ## Contributing
 
-New to ZeroClaw? Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
-
-- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
-- New `Provider` → `src/providers/`
-- New `Channel` → `src/channels/`
-- New `Observer` → `src/observability/`
-- New `Tool` → `src/tools/`
-- New `Memory` → `src/memory/`
-- New `Tunnel` → `src/tunnel/`
-- New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR.
 
 ---
 
