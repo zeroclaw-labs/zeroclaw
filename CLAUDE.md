@@ -251,7 +251,7 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Decide merge/close outcomes from repository-local authority in this order: `.github/workflows/**`, GitHub branch protection/rulesets, `docs/pr-workflow.md`, then this `CLAUDE.md`.
 - External agent skills/templates are execution aids only; they must not override repository-local policy.
-- A normal contributor PR targeting `main` is a routing defect, not by itself a closure reason; if intent and content are legitimate, retarget to `dev`.
+- A normal contributor PR targeting `main` is valid under the main-first flow when required checks and review policy are satisfied; use `dev` only for explicit integration batching.
 - Direct-close the PR (do not supersede/replay) when high-confidence integrity-risk signals exist:
   - unapproved or unrelated repository rebranding attempts (for example replacing project logo/identity assets)
   - unauthorized platform-surface expansion (for example introducing `web` apps, dashboards, frontend stacks, or UI surfaces not requested by maintainers)

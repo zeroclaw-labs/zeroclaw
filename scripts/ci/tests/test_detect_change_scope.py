@@ -84,7 +84,7 @@ class DetectChangeScopeTest(unittest.TestCase):
     def test_pull_request_merge_commit_uses_merge_parents(self) -> None:
         (self.tmp / "src").mkdir(parents=True, exist_ok=True)
         (self.tmp / "src" / "lib.rs").write_text("pub fn answer() -> i32 { 42 }\n", encoding="utf-8")
-        run_cmd(["git", "add", "src/lib.rs"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         stale_base = self._commit("base")
 
         run_cmd(["git", "checkout", "-q", "-b", "feature/workflow-only"], cwd=self.tmp)
@@ -93,12 +93,15 @@ class DetectChangeScopeTest(unittest.TestCase):
             "name: Example\non: pull_request\njobs: {}\n",
             encoding="utf-8",
         )
-        run_cmd(["git", "add", ".github/workflows/ci-example.yml"], cwd=self.tmp)
+        self._assert_cmd_ok(
+            ["git", "add", ".github/workflows/ci-example.yml"],
+            "git add .github/workflows/ci-example.yml",
+        )
         self._commit("feature: workflow only")
 
         run_cmd(["git", "checkout", "-q", "main"], cwd=self.tmp)
         (self.tmp / "src" / "lib.rs").write_text("pub fn answer() -> i32 { 43 }\n", encoding="utf-8")
-        run_cmd(["git", "add", "src/lib.rs"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         main_tip = self._commit("main: rust change after feature fork")
 
         merge_proc = run_cmd(
@@ -118,17 +121,17 @@ class DetectChangeScopeTest(unittest.TestCase):
     def test_push_event_falls_back_to_merge_base(self) -> None:
         (self.tmp / "src").mkdir(parents=True, exist_ok=True)
         (self.tmp / "src" / "lib.rs").write_text("pub fn alpha() {}\n", encoding="utf-8")
-        run_cmd(["git", "add", "src/lib.rs"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         common_base = self._commit("base")
 
         run_cmd(["git", "checkout", "-q", "-b", "feature/rust-change"], cwd=self.tmp)
         (self.tmp / "src" / "lib.rs").write_text("pub fn alpha() {}\npub fn beta() {}\n", encoding="utf-8")
-        run_cmd(["git", "add", "src/lib.rs"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "add", "src/lib.rs"], "git add src/lib.rs")
         self._commit("feature: rust change")
 
         run_cmd(["git", "checkout", "-q", "main"], cwd=self.tmp)
         (self.tmp / "README.md").write_text("# docs touch\n", encoding="utf-8")
-        run_cmd(["git", "add", "README.md"], cwd=self.tmp)
+        self._assert_cmd_ok(["git", "add", "README.md"], "git add README.md")
         advanced_base = self._commit("main advanced")
 
         run_cmd(["git", "checkout", "-q", "feature/rust-change"], cwd=self.tmp)
