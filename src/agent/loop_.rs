@@ -778,36 +778,40 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    progress_mode: ProgressMode,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
         .map(|ctx| ctx.reply_target.clone());
 
-    SAFETY_HEARTBEAT_CONFIG
+    TOOL_LOOP_PROGRESS_MODE
         .scope(
-            safety_heartbeat,
-            TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
-                non_cli_approval_context,
-                TOOL_LOOP_REPLY_TARGET.scope(
-                    reply_target,
-                    run_tool_call_loop(
-                        provider,
-                        history,
-                        tools_registry,
-                        observer,
-                        provider_name,
-                        model,
-                        temperature,
-                        silent,
-                        approval,
-                        channel_name,
-                        multimodal_config,
-                        max_tool_iterations,
-                        cancellation_token,
-                        on_delta,
-                        hooks,
-                        excluded_tools,
+            progress_mode,
+            SAFETY_HEARTBEAT_CONFIG.scope(
+                safety_heartbeat,
+                TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                    non_cli_approval_context,
+                    TOOL_LOOP_REPLY_TARGET.scope(
+                        reply_target,
+                        run_tool_call_loop(
+                            provider,
+                            history,
+                            tools_registry,
+                            observer,
+                            provider_name,
+                            model,
+                            temperature,
+                            silent,
+                            approval,
+                            channel_name,
+                            multimodal_config,
+                            max_tool_iterations,
+                            cancellation_token,
+                            on_delta,
+                            hooks,
+                            excluded_tools,
+                        ),
                     ),
                 ),
             ),
@@ -3617,6 +3621,7 @@ mod tests {
             None,
             None,
             &[],
+            ProgressMode::Verbose,
             None,
         )
         .await
