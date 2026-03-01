@@ -387,7 +387,7 @@ pub async fn handle_ws_chat(
         Some(WsAuthRejection::MissingPairingToken) => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
+                "Unauthorized — provide Authorization: Bearer <token>, ?token=<token>, or Sec-WebSocket-Protocol: zeroclaw.v1, bearer.<token>",
             )
                 .into_response();
         }
@@ -911,5 +911,34 @@ Reminder set successfully."#;
         let leak_guard = crate::config::OutboundLeakGuardConfig::default();
         let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_works_when_bearer_offered_alongside_subprotocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer.my-secret-token"),
+        );
+
+        assert_eq!(
+            extract_ws_bearer_token(&headers, None).as_deref(),
+            Some("my-secret-token"),
+            "bearer.<token> must be extractable when offered alongside zeroclaw.v1"
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_ignores_standalone_subprotocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1"),
+        );
+
+        assert!(
+            extract_ws_bearer_token(&headers, None).is_none(),
+            "zeroclaw.v1 alone must not produce a bearer token"
+        );
     }
 }
