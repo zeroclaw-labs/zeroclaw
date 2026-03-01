@@ -4,6 +4,8 @@
 //! asynchronously via `tokio::spawn`, returning a session ID immediately.
 //! See `AGENTS.md` §7.3 for the tool change playbook.
 
+use super::agent_selection::select_agent;
+use super::orchestration_settings::load_orchestration_settings;
 use super::subagent_registry::{SubAgentRegistry, SubAgentSession, SubAgentStatus};
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
@@ -15,13 +17,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Default timeout for background sub-agent provider calls.
 const SPAWN_TIMEOUT_SECS: u64 = 300;
-/// Maximum number of concurrent background sub-agents.
-const MAX_CONCURRENT_SUBAGENTS: usize = 10;
 
 /// Tool that spawns a delegate agent in the background, returning immediately
 /// with a session ID. The sub-agent runs asynchronously and stores its result
@@ -34,6 +35,10 @@ pub struct SubAgentSpawnTool {
     registry: Arc<SubAgentRegistry>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     multimodal_config: crate::config::MultimodalConfig,
+    subagents_enabled: bool,
+    max_concurrent_subagents: usize,
+    auto_activate: bool,
+    runtime_config_path: Option<PathBuf>,
 }
 
 impl SubAgentSpawnTool {
@@ -46,6 +51,10 @@ impl SubAgentSpawnTool {
         registry: Arc<SubAgentRegistry>,
         parent_tools: Arc<Vec<Arc<dyn Tool>>>,
         multimodal_config: crate::config::MultimodalConfig,
+        subagents_enabled: bool,
+        max_concurrent_subagents: usize,
+        auto_activate: bool,
+        runtime_config_path: Option<PathBuf>,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
@@ -55,7 +64,35 @@ impl SubAgentSpawnTool {
             registry,
             parent_tools,
             multimodal_config,
+            subagents_enabled,
+            max_concurrent_subagents,
+            auto_activate,
+            runtime_config_path,
         }
+    }
+
+    fn runtime_subagent_settings(&self) -> (bool, bool, usize) {
+        let mut enabled = self.subagents_enabled;
+        let mut auto_activate = self.auto_activate;
+        let mut max_concurrent = self.max_concurrent_subagents.max(1);
+
+        if let Some(path) = self.runtime_config_path.as_deref() {
+            match load_orchestration_settings(path) {
+                Ok((_teams, subagents)) => {
+                    enabled = subagents.enabled;
+                    auto_activate = subagents.auto_activate;
+                    max_concurrent = subagents.max_concurrent.max(1);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "subagent_spawn: failed to hot-reload orchestration settings: {error}"
+                    );
+                }
+            }
+        }
+
+        (enabled, auto_activate, max_concurrent)
     }
 }
 
@@ -67,6 +104,7 @@ impl Tool for SubAgentSpawnTool {
 
     fn description(&self) -> &str {
         "Spawn a delegate agent in the background. Returns immediately with a session_id. \
+         `agent` can be omitted or set to `auto` when subagent auto-activation is enabled. \
          Use subagent_list to check progress and subagent_manage to steer or kill."
     }
 
@@ -98,24 +136,12 @@ impl Tool for SubAgentSpawnTool {
                     "description": "Optional context to prepend (e.g. relevant code, prior findings)"
                 }
             },
-            "required": ["agent", "task"]
+            "required": ["task"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let agent_name = args
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("Missing 'agent' parameter"))?;
-
-        if agent_name.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("'agent' parameter must not be empty".into()),
-            });
-        }
+        let requested_agent = args.get("agent").and_then(|v| v.as_str()).map(str::trim);
 
         let task = args
             .get("task")
@@ -137,6 +163,19 @@ impl Tool for SubAgentSpawnTool {
             .map(str::trim)
             .unwrap_or("");
 
+        let (subagents_enabled, auto_activate, max_concurrent_subagents) =
+            self.runtime_subagent_settings();
+        if !subagents_enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Subagents are currently disabled. Re-enable with model_routing_config action set_orchestration."
+                        .to_string(),
+                ),
+            });
+        }
+
         // Security enforcement: spawn is a write operation
         if let Err(error) = self
             .security
@@ -149,25 +188,30 @@ impl Tool for SubAgentSpawnTool {
             });
         }
 
-        // Look up agent config
-        let agent_config = match self.agents.get(agent_name) {
-            Some(cfg) => cfg.clone(),
-            None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let selection = match select_agent(
+            self.agents.as_ref(),
+            requested_agent,
+            task,
+            context,
+            auto_activate,
+            None,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Unknown agent '{agent_name}'. Available agents: {}",
-                        if available.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    )),
+                    error: Some(error.to_string()),
                 });
             }
+        };
+        let agent_name = selection.agent_name.clone();
+        let Some(agent_config) = self.agents.get(&agent_name).cloned() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Resolved agent '{agent_name}' is unavailable")),
+            });
         };
 
         // Create provider for this agent
@@ -204,7 +248,7 @@ impl Tool for SubAgentSpawnTool {
         };
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let agent_name_owned = agent_name.to_string();
+        let agent_name_owned = agent_name.clone();
         let task_owned = task.to_string();
 
         // Determine if agentic mode
@@ -223,13 +267,14 @@ impl Tool for SubAgentSpawnTool {
             result: None,
             handle: None,
         };
-        if let Err(_running) = self.registry.try_insert(session, MAX_CONCURRENT_SUBAGENTS) {
+        if let Err(_running) = self.registry.try_insert(session, max_concurrent_subagents) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Maximum concurrent sub-agents reached ({MAX_CONCURRENT_SUBAGENTS}). \
-                     Wait for running agents to complete or kill some."
+                    "Maximum concurrent sub-agents reached ({}). \
+                     Wait for running agents to complete or kill some.",
+                    max_concurrent_subagents
                 )),
             });
         }
@@ -281,6 +326,9 @@ impl Tool for SubAgentSpawnTool {
             output: json!({
                 "session_id": session_id,
                 "agent": agent_name,
+                "selection_mode": selection.selection_mode,
+                "selection_score": selection.score,
+                "max_concurrent": max_concurrent_subagents,
                 "status": "running",
                 "message": "Sub-agent spawned in background. Use subagent_list or subagent_manage to check progress."
             })
@@ -506,6 +554,7 @@ async fn run_agentic_background(
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -520,6 +569,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
                 api_key: None,
+                enabled: true,
+                capabilities: vec!["research".to_string()],
+                priority: 0,
                 temperature: Some(0.3),
                 max_depth: 3,
                 agentic: false,
@@ -528,6 +580,35 @@ mod tests {
             },
         );
         agents
+    }
+
+    fn write_runtime_orchestration_config(
+        path: &std::path::Path,
+        teams_enabled: bool,
+        teams_auto_activate: bool,
+        teams_max_agents: usize,
+        subagents_enabled: bool,
+        subagents_auto_activate: bool,
+        subagents_max_concurrent: usize,
+    ) {
+        let contents = format!(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[agent.teams]
+enabled = {teams_enabled}
+auto_activate = {teams_auto_activate}
+max_agents = {teams_max_agents}
+
+[agent.subagents]
+enabled = {subagents_enabled}
+auto_activate = {subagents_auto_activate}
+max_concurrent = {subagents_max_concurrent}
+"#
+        );
+        std::fs::write(path, contents).unwrap();
     }
 
     fn make_tool(
@@ -542,6 +623,10 @@ mod tests {
             Arc::new(SubAgentRegistry::new()),
             Arc::new(Vec::new()),
             crate::config::MultimodalConfig::default(),
+            true,
+            10,
+            true,
+            None,
         )
     }
 
@@ -554,7 +639,6 @@ mod tests {
         assert!(schema["properties"]["task"].is_object());
         assert!(schema["properties"]["context"].is_object());
         let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&json!("agent")));
         assert!(required.contains(&json!("task")));
         assert_eq!(schema["additionalProperties"], json!(false));
     }
@@ -569,7 +653,7 @@ mod tests {
     async fn missing_agent_param() {
         let tool = make_tool(sample_agents(), test_security());
         let result = tool.execute(json!({"task": "test"})).await;
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -580,14 +664,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_agent_rejected() {
+    async fn blank_agent_uses_auto_selection() {
         let tool = make_tool(sample_agents(), test_security());
         let result = tool
             .execute(json!({"agent": "  ", "task": "test"}))
             .await
             .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("must not be empty"));
+        if result.success {
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(output["agent"], json!("researcher"));
+            assert!(output["selection_mode"].is_string());
+        }
     }
 
     #[tokio::test]
@@ -651,6 +738,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_subagent_disable_blocks_spawn() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_runtime_orchestration_config(&config_path, true, true, 8, false, true, 2);
+
+        let tool = SubAgentSpawnTool::new(
+            sample_agents(),
+            None,
+            test_security(),
+            providers::ProviderRuntimeOptions::default(),
+            Arc::new(SubAgentRegistry::new()),
+            Arc::new(Vec::new()),
+            crate::config::MultimodalConfig::default(),
+            true,
+            10,
+            true,
+            Some(config_path),
+        );
+
+        let result = tool
+            .execute(json!({"agent": "researcher", "task": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Subagents are currently disabled"));
+    }
+
+    #[tokio::test]
+    async fn runtime_subagent_auto_activation_disable_requires_agent() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_runtime_orchestration_config(&config_path, true, true, 8, true, false, 2);
+
+        let tool = SubAgentSpawnTool::new(
+            sample_agents(),
+            None,
+            test_security(),
+            providers::ProviderRuntimeOptions::default(),
+            Arc::new(SubAgentRegistry::new()),
+            Arc::new(Vec::new()),
+            crate::config::MultimodalConfig::default(),
+            true,
+            10,
+            true,
+            Some(config_path),
+        );
+
+        let result = tool.execute(json!({"task": "test"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("automatic activation is disabled"));
+    }
+
+    #[tokio::test]
     async fn spawn_returns_session_id() {
         // The agent has an invalid provider so the background task will fail,
         // but spawn itself returns immediately with a session_id.
@@ -678,15 +824,19 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("none configured"));
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("No delegate agents are configured"));
     }
 
     #[tokio::test]
     async fn spawn_respects_concurrent_limit() {
+        let max_concurrent = 3usize;
         let registry = Arc::new(SubAgentRegistry::new());
 
         // Fill up the registry with running sessions
-        for i in 0..MAX_CONCURRENT_SUBAGENTS {
+        for i in 0..max_concurrent {
             registry.insert(SubAgentSession {
                 id: format!("s{i}"),
                 agent_name: "agent".to_string(),
@@ -707,6 +857,10 @@ mod tests {
             registry,
             Arc::new(Vec::new()),
             crate::config::MultimodalConfig::default(),
+            true,
+            max_concurrent,
+            true,
+            None,
         );
 
         let result = tool
@@ -715,6 +869,49 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Maximum concurrent"));
+    }
+
+    #[tokio::test]
+    async fn runtime_max_concurrent_override_is_applied() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_runtime_orchestration_config(&config_path, true, true, 8, true, true, 1);
+
+        let registry = Arc::new(SubAgentRegistry::new());
+        registry.insert(SubAgentSession {
+            id: "existing".to_string(),
+            agent_name: "researcher".to_string(),
+            task: "task".to_string(),
+            status: SubAgentStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            result: None,
+            handle: None,
+        });
+
+        let tool = SubAgentSpawnTool::new(
+            sample_agents(),
+            None,
+            test_security(),
+            providers::ProviderRuntimeOptions::default(),
+            registry,
+            Arc::new(Vec::new()),
+            crate::config::MultimodalConfig::default(),
+            true,
+            10,
+            true,
+            Some(config_path),
+        );
+
+        let result = tool
+            .execute(json!({"agent": "researcher", "task": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Maximum concurrent sub-agents reached (1)"));
     }
 
     #[tokio::test]

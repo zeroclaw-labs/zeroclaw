@@ -1,5 +1,8 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use crate::config::{
+    AgentTeamsConfig, ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig,
+    SubAgentsConfig,
+};
 use crate::providers::has_provider_credential;
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
@@ -303,6 +306,9 @@ impl ModelRoutingConfigTool {
                         &agent.provider,
                         agent.api_key.as_deref()
                     ),
+                    "enabled": agent.enabled,
+                    "capabilities": agent.capabilities,
+                    "priority": agent.priority,
                     "temperature": agent.temperature,
                     "max_depth": agent.max_depth,
                     "agentic": agent.agentic,
@@ -325,6 +331,18 @@ impl ModelRoutingConfigTool {
             "scenarios": scenarios,
             "classification_only_rules": classification_only_rules,
             "agents": agents,
+            "agent_orchestration": {
+                "teams": {
+                    "enabled": cfg.agent.teams.enabled,
+                    "auto_activate": cfg.agent.teams.auto_activate,
+                    "max_agents": cfg.agent.teams.max_agents,
+                },
+                "subagents": {
+                    "enabled": cfg.agent.subagents.enabled,
+                    "auto_activate": cfg.agent.subagents.auto_activate,
+                    "max_concurrent": cfg.agent.subagents.max_concurrent,
+                }
+            }
         })
     }
 
@@ -402,6 +420,15 @@ impl ModelRoutingConfigTool {
                         "keywords": ["code", "bug", "refactor", "test"],
                         "patterns": ["```"],
                         "priority": 50
+                    },
+                    "orchestration": {
+                        "action": "set_orchestration",
+                        "teams_enabled": true,
+                        "teams_auto_activate": true,
+                        "max_team_agents": 12,
+                        "subagents_enabled": true,
+                        "subagents_auto_activate": true,
+                        "max_concurrent_subagents": 4
                     }
                 }
             }))?,
@@ -455,6 +482,77 @@ impl ModelRoutingConfigTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "message": "Default provider/model settings updated",
+                "config": Self::snapshot(&cfg),
+            }))?,
+            error: None,
+        })
+    }
+
+    async fn handle_set_orchestration(&self, args: &Value) -> anyhow::Result<ToolResult> {
+        let teams_enabled = Self::parse_optional_bool(args, "teams_enabled")?;
+        let teams_auto_activate = Self::parse_optional_bool(args, "teams_auto_activate")?;
+        let max_team_agents_update = Self::parse_optional_usize_update(args, "max_team_agents")?;
+
+        let subagents_enabled = Self::parse_optional_bool(args, "subagents_enabled")?;
+        let subagents_auto_activate = Self::parse_optional_bool(args, "subagents_auto_activate")?;
+        let max_concurrent_subagents_update =
+            Self::parse_optional_usize_update(args, "max_concurrent_subagents")?;
+
+        let any_update = teams_enabled.is_some()
+            || teams_auto_activate.is_some()
+            || subagents_enabled.is_some()
+            || subagents_auto_activate.is_some()
+            || !matches!(max_team_agents_update, MaybeSet::Unset)
+            || !matches!(max_concurrent_subagents_update, MaybeSet::Unset);
+        if !any_update {
+            anyhow::bail!(
+                "set_orchestration requires at least one field: \
+                 teams_enabled, teams_auto_activate, max_team_agents, \
+                 subagents_enabled, subagents_auto_activate, max_concurrent_subagents"
+            );
+        }
+
+        let mut cfg = self.load_config_without_env()?;
+        let team_defaults = AgentTeamsConfig::default();
+        let subagent_defaults = SubAgentsConfig::default();
+
+        if let Some(value) = teams_enabled {
+            cfg.agent.teams.enabled = value;
+        }
+        if let Some(value) = teams_auto_activate {
+            cfg.agent.teams.auto_activate = value;
+        }
+        match max_team_agents_update {
+            MaybeSet::Set(value) => cfg.agent.teams.max_agents = value,
+            MaybeSet::Null => cfg.agent.teams.max_agents = team_defaults.max_agents,
+            MaybeSet::Unset => {}
+        }
+
+        if let Some(value) = subagents_enabled {
+            cfg.agent.subagents.enabled = value;
+        }
+        if let Some(value) = subagents_auto_activate {
+            cfg.agent.subagents.auto_activate = value;
+        }
+        match max_concurrent_subagents_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.max_concurrent = value,
+            MaybeSet::Null => cfg.agent.subagents.max_concurrent = subagent_defaults.max_concurrent,
+            MaybeSet::Unset => {}
+        }
+
+        if cfg.agent.teams.max_agents == 0 {
+            anyhow::bail!("'max_team_agents' must be greater than 0");
+        }
+        if cfg.agent.subagents.max_concurrent == 0 {
+            anyhow::bail!("'max_concurrent_subagents' must be greater than 0");
+        }
+
+        cfg.save().await?;
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "message": "Agent orchestration settings updated",
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
@@ -659,9 +757,16 @@ impl ModelRoutingConfigTool {
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
+        let enabled_update = Self::parse_optional_bool(args, "enabled")?;
+        let priority_update = Self::parse_optional_i32_update(args, "priority")?;
 
         let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
             Some(Self::parse_string_list(raw, "allowed_tools")?)
+        } else {
+            None
+        };
+        let capabilities_update = if let Some(raw) = args.get("capabilities") {
+            Some(Self::parse_string_list(raw, "capabilities")?)
         } else {
             None
         };
@@ -677,6 +782,9 @@ impl ModelRoutingConfigTool {
                 model: model.clone(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: DEFAULT_AGENT_MAX_DEPTH,
                 agentic: false,
@@ -696,6 +804,20 @@ impl ModelRoutingConfigTool {
         match api_key_update {
             MaybeSet::Set(value) => next_agent.api_key = Some(value),
             MaybeSet::Null => next_agent.api_key = None,
+            MaybeSet::Unset => {}
+        }
+
+        if let Some(enabled) = enabled_update {
+            next_agent.enabled = enabled;
+        }
+
+        if let Some(capabilities) = capabilities_update {
+            next_agent.capabilities = capabilities;
+        }
+
+        match priority_update {
+            MaybeSet::Set(value) => next_agent.priority = value,
+            MaybeSet::Null => next_agent.priority = 0,
             MaybeSet::Unset => {}
         }
 
@@ -787,7 +909,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
+        "Manage default model settings, scenario routes, classification rules, delegate profiles, and agent team/subagent orchestration switches"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -800,6 +922,7 @@ impl Tool for ModelRoutingConfigTool {
                         "get",
                         "list_hints",
                         "set_default",
+                        "set_orchestration",
                         "upsert_scenario",
                         "remove_scenario",
                         "upsert_agent",
@@ -858,7 +981,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "priority": {
                     "type": ["integer", "null"],
-                    "description": "Classification priority (higher runs first)"
+                    "description": "Priority value. For scenarios: classifier order (higher runs first). For upsert_agent: delegate selection priority."
                 },
                 "classification_enabled": {
                     "type": "boolean",
@@ -875,6 +998,17 @@ impl Tool for ModelRoutingConfigTool {
                 "system_prompt": {
                     "type": ["string", "null"],
                     "description": "Optional system prompt override for delegate agent"
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Enable or disable a delegate profile for selection/invocation"
+                },
+                "capabilities": {
+                    "description": "Capability tags for automatic agent selection (string or string array)",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
+                    ]
                 },
                 "max_depth": {
                     "type": ["integer", "null"],
@@ -896,6 +1030,32 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "description": "Maximum tool-call iterations for agentic delegate mode"
+                },
+                "teams_enabled": {
+                    "type": "boolean",
+                    "description": "Enable/disable synchronous agent-team delegation tools"
+                },
+                "teams_auto_activate": {
+                    "type": "boolean",
+                    "description": "Enable/disable automatic team-agent selection when agent is omitted or 'auto'"
+                },
+                "max_team_agents": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Maximum number of delegate profiles activated for teams"
+                },
+                "subagents_enabled": {
+                    "type": "boolean",
+                    "description": "Enable/disable background sub-agent tools"
+                },
+                "subagents_auto_activate": {
+                    "type": "boolean",
+                    "description": "Enable/disable automatic sub-agent selection when agent is omitted or 'auto'"
+                },
+                "max_concurrent_subagents": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Maximum number of concurrently running background sub-agents"
                 }
             },
             "additionalProperties": false
@@ -913,6 +1073,7 @@ impl Tool for ModelRoutingConfigTool {
             "get" => self.handle_get(),
             "list_hints" => self.handle_list_hints(),
             "set_default"
+            | "set_orchestration"
             | "upsert_scenario"
             | "remove_scenario"
             | "upsert_agent"
@@ -923,6 +1084,7 @@ impl Tool for ModelRoutingConfigTool {
 
                 match action.as_str() {
                     "set_default" => self.handle_set_default(&args).await,
+                    "set_orchestration" => self.handle_set_orchestration(&args).await,
                     "upsert_scenario" => self.handle_upsert_scenario(&args).await,
                     "remove_scenario" => self.handle_remove_scenario(&args).await,
                     "upsert_agent" => self.handle_upsert_agent(&args).await,
@@ -931,7 +1093,7 @@ impl Tool for ModelRoutingConfigTool {
                 }
             }
             _ => anyhow::bail!(
-                "Unknown action '{action}'. Valid: get, list_hints, set_default, upsert_scenario, remove_scenario, upsert_agent, remove_agent"
+                "Unknown action '{action}'. Valid: get, list_hints, set_default, set_orchestration, upsert_scenario, remove_scenario, upsert_agent, remove_agent"
             ),
         };
 
@@ -1196,6 +1358,121 @@ mod tests {
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(output["agents"]["coder"].is_null());
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_persists_selection_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let upsert = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "planner",
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "enabled": false,
+                "capabilities": ["planning", "analysis"],
+                "priority": 7
+            }))
+            .await
+            .unwrap();
+        assert!(upsert.success, "{:?}", upsert.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(output["agents"]["planner"]["enabled"], json!(false));
+        assert_eq!(
+            output["agents"]["planner"]["capabilities"],
+            json!(["planning", "analysis"])
+        );
+        assert_eq!(output["agents"]["planner"]["priority"], json!(7));
+
+        let reset = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "planner",
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "priority": null
+            }))
+            .await
+            .unwrap();
+        assert!(reset.success, "{:?}", reset.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(output["agents"]["planner"]["priority"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_updates_team_and_subagent_controls() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let updated = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "teams_enabled": false,
+                "teams_auto_activate": false,
+                "max_team_agents": 5,
+                "subagents_enabled": true,
+                "subagents_auto_activate": false,
+                "max_concurrent_subagents": 3
+            }))
+            .await
+            .unwrap();
+        assert!(updated.success, "{:?}", updated.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["enabled"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["auto_activate"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["max_agents"],
+            json!(5)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["enabled"],
+            json!(true)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["auto_activate"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["max_concurrent"],
+            json!(3)
+        );
+
+        let reset = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_team_agents": null,
+                "max_concurrent_subagents": null
+            }))
+            .await
+            .unwrap();
+        assert!(reset.success, "{:?}", reset.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["max_agents"],
+            json!(32)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["max_concurrent"],
+            json!(10)
+        );
     }
 
     #[tokio::test]

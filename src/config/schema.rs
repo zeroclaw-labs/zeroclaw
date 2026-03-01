@@ -454,6 +454,15 @@ pub struct DelegateAgentConfig {
     /// Optional API key override
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Whether this delegate profile is active for selection/invocation.
+    #[serde(default = "default_delegate_agent_enabled")]
+    pub enabled: bool,
+    /// Optional capability tags used by automatic agent selection.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Priority hint for automatic agent selection (higher wins on ties).
+    #[serde(default)]
+    pub priority: i32,
     /// Temperature override
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -479,6 +488,10 @@ fn default_max_tool_iterations() -> usize {
     10
 }
 
+fn default_delegate_agent_enabled() -> bool {
+    true
+}
+
 impl std::fmt::Debug for DelegateAgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DelegateAgentConfig")
@@ -486,6 +499,9 @@ impl std::fmt::Debug for DelegateAgentConfig {
             .field("model", &self.model)
             .field("system_prompt", &self.system_prompt)
             .field("api_key_configured", &self.api_key.is_some())
+            .field("enabled", &self.enabled)
+            .field("capabilities", &self.capabilities)
+            .field("priority", &self.priority)
             .field("temperature", &self.temperature)
             .field("max_depth", &self.max_depth)
             .field("agentic", &self.agentic)
@@ -788,6 +804,30 @@ fn default_coordination_max_seen_message_ids() -> usize {
     4096
 }
 
+fn default_agent_teams_enabled() -> bool {
+    true
+}
+
+fn default_agent_teams_auto_activate() -> bool {
+    true
+}
+
+fn default_agent_teams_max_agents() -> usize {
+    32
+}
+
+fn default_subagents_enabled() -> bool {
+    true
+}
+
+fn default_subagents_auto_activate() -> bool {
+    true
+}
+
+fn default_subagents_max_concurrent() -> usize {
+    10
+}
+
 /// Delegate coordination runtime configuration (`[coordination]` section).
 ///
 /// Controls typed delegate message-bus integration used by `delegate` and
@@ -827,6 +867,59 @@ impl Default for CoordinationConfig {
     }
 }
 
+/// Agent-team orchestration controls (`[agent.teams]` section).
+///
+/// This governs synchronous delegation (`delegate`) and team-wide coordination.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTeamsConfig {
+    /// Enable agent-team delegation tools.
+    #[serde(default = "default_agent_teams_enabled")]
+    pub enabled: bool,
+    /// Allow automatic team-agent selection when a specific agent is not given.
+    #[serde(default = "default_agent_teams_auto_activate")]
+    pub auto_activate: bool,
+    /// Maximum number of delegate profiles activated as team members.
+    #[serde(default = "default_agent_teams_max_agents")]
+    pub max_agents: usize,
+}
+
+impl Default for AgentTeamsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_teams_enabled(),
+            auto_activate: default_agent_teams_auto_activate(),
+            max_agents: default_agent_teams_max_agents(),
+        }
+    }
+}
+
+/// Background sub-agent orchestration controls (`[agent.subagents]` section).
+///
+/// This governs asynchronous delegation (`subagent_spawn`, `subagent_list`,
+/// `subagent_manage`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SubAgentsConfig {
+    /// Enable background sub-agent tools.
+    #[serde(default = "default_subagents_enabled")]
+    pub enabled: bool,
+    /// Allow automatic sub-agent selection when a specific agent is not given.
+    #[serde(default = "default_subagents_auto_activate")]
+    pub auto_activate: bool,
+    /// Maximum number of concurrently running background sub-agents.
+    #[serde(default = "default_subagents_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+impl Default for SubAgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_subagents_enabled(),
+            auto_activate: default_subagents_auto_activate(),
+            max_concurrent: default_subagents_max_concurrent(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -848,6 +941,12 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Agent-team runtime controls for synchronous delegation.
+    #[serde(default)]
+    pub teams: AgentTeamsConfig,
+    /// Sub-agent runtime controls for background delegation.
+    #[serde(default)]
+    pub subagents: SubAgentsConfig,
     /// Loop detection: no-progress repeat threshold.
     /// Triggers when the same tool+args produces identical output this many times.
     /// Set to `0` to disable. Default: `3`.
@@ -977,6 +1076,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            teams: AgentTeamsConfig::default(),
+            subagents: SubAgentsConfig::default(),
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
             loop_detection_ping_pong_cycles: default_loop_detection_ping_pong_cycles(),
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
@@ -8297,6 +8398,12 @@ impl Config {
         if self.coordination.max_seen_message_ids == 0 {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
         }
+        if self.agent.teams.max_agents == 0 {
+            anyhow::bail!("agent.teams.max_agents must be greater than 0");
+        }
+        if self.agent.subagents.max_concurrent == 0 {
+            anyhow::bail!("agent.subagents.max_concurrent must be greater than 0");
+        }
 
         // WASM config
         if self.wasm.memory_limit_mb == 0 || self.wasm.memory_limit_mb > 256 {
@@ -9349,6 +9456,9 @@ mod tests {
                 model: "model-test".into(),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -10306,6 +10416,9 @@ tool_dispatcher = "xml"
                 model: "model-test".into(),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -14261,6 +14374,12 @@ sensitivity = 0.9
         assert_eq!(config.coordination.max_dead_letters, 256);
         assert_eq!(config.coordination.max_context_entries, 512);
         assert_eq!(config.coordination.max_seen_message_ids, 4096);
+        assert!(config.agent.teams.enabled);
+        assert!(config.agent.teams.auto_activate);
+        assert_eq!(config.agent.teams.max_agents, 32);
+        assert!(config.agent.subagents.enabled);
+        assert!(config.agent.subagents.auto_activate);
+        assert_eq!(config.agent.subagents.max_concurrent, 10);
     }
 
     #[test]
@@ -14272,6 +14391,12 @@ sensitivity = 0.9
         config.coordination.max_dead_letters = 64;
         config.coordination.max_context_entries = 32;
         config.coordination.max_seen_message_ids = 1024;
+        config.agent.teams.enabled = false;
+        config.agent.teams.auto_activate = false;
+        config.agent.teams.max_agents = 7;
+        config.agent.subagents.enabled = true;
+        config.agent.subagents.auto_activate = false;
+        config.agent.subagents.max_concurrent = 4;
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -14281,6 +14406,12 @@ sensitivity = 0.9
         assert_eq!(parsed.coordination.max_dead_letters, 64);
         assert_eq!(parsed.coordination.max_context_entries, 32);
         assert_eq!(parsed.coordination.max_seen_message_ids, 1024);
+        assert!(!parsed.agent.teams.enabled);
+        assert!(!parsed.agent.teams.auto_activate);
+        assert_eq!(parsed.agent.teams.max_agents, 7);
+        assert!(parsed.agent.subagents.enabled);
+        assert!(!parsed.agent.subagents.auto_activate);
+        assert_eq!(parsed.agent.subagents.max_concurrent, 4);
     }
 
     #[test]
@@ -14323,6 +14454,20 @@ sensitivity = 0.9
             .validate()
             .expect_err("expected coordination lead-agent validation failure");
         assert!(err.to_string().contains("coordination.lead_agent"));
+
+        let mut config = Config::default();
+        config.agent.teams.max_agents = 0;
+        let err = config
+            .validate()
+            .expect_err("expected team-size validation failure");
+        assert!(err.to_string().contains("agent.teams.max_agents"));
+
+        let mut config = Config::default();
+        config.agent.subagents.max_concurrent = 0;
+        let err = config
+            .validate()
+            .expect_err("expected subagent concurrency validation failure");
+        assert!(err.to_string().contains("agent.subagents.max_concurrent"));
     }
 
     #[test]

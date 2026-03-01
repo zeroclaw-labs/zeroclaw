@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agent_selection;
 pub mod agents_ipc;
 pub mod apply_patch;
 pub mod auth_profile;
@@ -59,6 +60,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod openclaw_migration;
+pub mod orchestration_settings;
 pub mod pdf_read;
 pub mod pptx_read;
 pub mod process;
@@ -533,10 +535,11 @@ pub fn all_tools_with_runtime(
 
     // Add delegation and sub-agent orchestration tools when agents are configured
     if !agents.is_empty() {
-        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+        let all_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
+        let delegate_agents = all_agents.clone();
         let delegate_fallback_credential = fallback_api_key.and_then(|value| {
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
@@ -558,6 +561,7 @@ pub fn all_tools_with_runtime(
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };
+        let runtime_config_path = Some(root_config.config_path.clone());
         let parent_tools = Arc::new(tool_arcs.clone());
         let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents.clone(),
@@ -566,7 +570,13 @@ pub fn all_tools_with_runtime(
             provider_runtime_options.clone(),
         )
         .with_parent_tools(parent_tools.clone())
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_runtime_team_settings(
+            root_config.agent.teams.enabled,
+            root_config.agent.teams.auto_activate,
+            root_config.agent.teams.max_agents,
+            runtime_config_path.clone(),
+        );
 
         if root_config.coordination.enabled {
             let coordination_lead_agent = {
@@ -592,7 +602,7 @@ pub fn all_tools_with_runtime(
                     "delegate coordination: failed to register lead agent '{coordination_lead_agent}': {error}"
                 );
             }
-            for agent_name in agents.keys() {
+            for agent_name in delegate_agents.keys() {
                 if let Err(error) = coordination_bus.register_agent(agent_name.clone()) {
                     tracing::warn!(
                         "delegate coordination: failed to register agent '{agent_name}': {error}"
@@ -614,13 +624,17 @@ pub fn all_tools_with_runtime(
 
         let subagent_registry = Arc::new(SubAgentRegistry::new());
         tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
-            delegate_agents,
+            all_agents,
             delegate_fallback_credential,
             security.clone(),
             provider_runtime_options,
             subagent_registry.clone(),
             parent_tools,
             root_config.multimodal.clone(),
+            root_config.agent.subagents.enabled,
+            root_config.agent.subagents.max_concurrent,
+            root_config.agent.subagents.auto_activate,
+            runtime_config_path,
         )));
         tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
         tool_arcs.push(Arc::new(SubAgentManageTool::new(
@@ -1058,6 +1072,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1143,6 +1160,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1168,5 +1188,117 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
         assert!(!names.contains(&"delegate_coordination_status"));
+    }
+
+    #[test]
+    fn all_tools_keeps_delegate_registered_when_team_toggle_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.agent.teams.enabled = false;
+        cfg.agent.subagents.enabled = true;
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &agents,
+            Some("delegate-test-credential"),
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"subagent_spawn"));
+    }
+
+    #[test]
+    fn all_tools_keeps_subagent_tools_registered_when_toggle_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.agent.teams.enabled = true;
+        cfg.agent.subagents.enabled = false;
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &agents,
+            Some("delegate-test-credential"),
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"subagent_spawn"));
+        assert!(names.contains(&"subagent_list"));
+        assert!(names.contains(&"subagent_manage"));
     }
 }

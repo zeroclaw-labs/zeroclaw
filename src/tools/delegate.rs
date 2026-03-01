@@ -1,3 +1,5 @@
+use super::agent_selection::select_agent;
+use super::orchestration_settings::load_orchestration_settings;
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::config::DelegateAgentConfig;
@@ -9,6 +11,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -43,6 +46,14 @@ pub struct DelegateTool {
     coordination_bus: Option<InMemoryMessageBus>,
     /// Logical lead agent identity used in coordination trace events.
     coordination_lead_agent: String,
+    /// Whether to automatically select an agent when `agent` is omitted or `auto`.
+    auto_activate: bool,
+    /// Whether team delegation is currently enabled.
+    teams_enabled: bool,
+    /// Maximum active team agent profiles considered for automatic selection.
+    max_team_agents: usize,
+    /// Optional runtime config file path for hot-reloaded orchestration settings.
+    runtime_config_path: Option<PathBuf>,
 }
 
 impl DelegateTool {
@@ -76,6 +87,10 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
+            auto_activate: true,
+            teams_enabled: true,
+            max_team_agents: usize::MAX,
+            runtime_config_path: None,
         }
     }
 
@@ -115,6 +130,10 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
+            auto_activate: true,
+            teams_enabled: true,
+            max_team_agents: usize::MAX,
+            runtime_config_path: None,
         }
     }
 
@@ -127,6 +146,27 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Set whether agent selection can auto-resolve from task/context.
+    pub fn with_auto_activate(mut self, auto_activate: bool) -> Self {
+        self.auto_activate = auto_activate;
+        self
+    }
+
+    /// Attach runtime team orchestration controls and optional hot-reload config path.
+    pub fn with_runtime_team_settings(
+        mut self,
+        teams_enabled: bool,
+        auto_activate: bool,
+        max_team_agents: usize,
+        runtime_config_path: Option<PathBuf>,
+    ) -> Self {
+        self.teams_enabled = teams_enabled;
+        self.auto_activate = auto_activate;
+        self.max_team_agents = max_team_agents.max(1);
+        self.runtime_config_path = runtime_config_path;
         self
     }
 
@@ -166,6 +206,30 @@ impl DelegateTool {
     fn coordination_bus_snapshot(&self) -> Option<InMemoryMessageBus> {
         self.coordination_bus.clone()
     }
+
+    fn runtime_team_settings(&self) -> (bool, bool, usize) {
+        let mut teams_enabled = self.teams_enabled;
+        let mut auto_activate = self.auto_activate;
+        let mut max_team_agents = self.max_team_agents.max(1);
+
+        if let Some(path) = self.runtime_config_path.as_deref() {
+            match load_orchestration_settings(path) {
+                Ok((teams, _subagents)) => {
+                    teams_enabled = teams.enabled;
+                    auto_activate = teams.auto_activate;
+                    max_team_agents = teams.max_agents.max(1);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "delegate: failed to hot-reload orchestration settings: {error}"
+                    );
+                }
+            }
+        }
+
+        (teams_enabled, auto_activate, max_team_agents)
+    }
 }
 
 #[async_trait]
@@ -177,7 +241,8 @@ impl Tool for DelegateTool {
     fn description(&self) -> &str {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
          (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt by default; with agentic=true it can iterate with a filtered tool-call loop."
+         prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
+         `agent` may be omitted or set to `auto` when team auto-activation is enabled."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -208,24 +273,12 @@ impl Tool for DelegateTool {
                     "description": "Optional context to prepend (e.g. relevant code, prior findings)"
                 }
             },
-            "required": ["agent", "prompt"]
+            "required": ["prompt"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let agent_name = args
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("Missing 'agent' parameter"))?;
-
-        if agent_name.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("'agent' parameter must not be empty".into()),
-            });
-        }
+        let requested_agent = args.get("agent").and_then(|v| v.as_str()).map(str::trim);
 
         let prompt = args
             .get("prompt")
@@ -247,25 +300,42 @@ impl Tool for DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
-        // Look up agent config
-        let agent_config = match self.agents.get(agent_name) {
-            Some(cfg) => cfg,
-            None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let (teams_enabled, auto_activate, max_team_agents) = self.runtime_team_settings();
+        if !teams_enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Agent teams are currently disabled. Re-enable with model_routing_config action set_orchestration."
+                        .to_string(),
+                ),
+            });
+        }
+
+        let selection = match select_agent(
+            self.agents.as_ref(),
+            requested_agent,
+            prompt,
+            context,
+            auto_activate,
+            Some(max_team_agents),
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Unknown agent '{agent_name}'. Available agents: {}",
-                        if available.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    )),
+                    error: Some(error.to_string()),
                 });
             }
+        };
+        let agent_name = selection.agent_name.as_str();
+        let Some(agent_config) = self.agents.get(agent_name) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Resolved agent '{agent_name}' is unavailable")),
+            });
         };
 
         // Check recursion depth (immutable — set at construction, incremented for sub-agents)
@@ -778,6 +848,7 @@ mod tests {
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
+    use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -792,6 +863,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
                 api_key: None,
+                enabled: true,
+                capabilities: vec!["research".to_string(), "summary".to_string()],
+                priority: 0,
                 temperature: Some(0.3),
                 max_depth: 3,
                 agentic: false,
@@ -806,6 +880,9 @@ mod tests {
                 model: crate::config::DEFAULT_MODEL_FALLBACK.to_string(),
                 system_prompt: None,
                 api_key: Some("delegate-test-credential".to_string()),
+                enabled: true,
+                capabilities: vec!["coding".to_string(), "refactor".to_string()],
+                priority: 1,
                 temperature: None,
                 max_depth: 2,
                 agentic: false,
@@ -814,6 +891,35 @@ mod tests {
             },
         );
         agents
+    }
+
+    fn write_runtime_orchestration_config(
+        path: &std::path::Path,
+        teams_enabled: bool,
+        teams_auto_activate: bool,
+        teams_max_agents: usize,
+        subagents_enabled: bool,
+        subagents_auto_activate: bool,
+        subagents_max_concurrent: usize,
+    ) {
+        let contents = format!(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[agent.teams]
+enabled = {teams_enabled}
+auto_activate = {teams_auto_activate}
+max_agents = {teams_max_agents}
+
+[agent.subagents]
+enabled = {subagents_enabled}
+auto_activate = {subagents_auto_activate}
+max_concurrent = {subagents_max_concurrent}
+"#
+        );
+        std::fs::write(path, contents).unwrap();
     }
 
     #[derive(Default)]
@@ -968,6 +1074,9 @@ mod tests {
             model: "model-test".to_string(),
             system_prompt: Some("You are agentic.".to_string()),
             api_key: Some("delegate-test-credential".to_string()),
+            enabled: true,
+            capabilities: Vec::new(),
+            priority: 0,
             temperature: Some(0.2),
             max_depth: 3,
             agentic: true,
@@ -985,7 +1094,6 @@ mod tests {
         assert!(schema["properties"]["prompt"].is_object());
         assert!(schema["properties"]["context"].is_object());
         let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&json!("agent")));
         assert!(required.contains(&json!("prompt")));
         assert_eq!(schema["additionalProperties"], json!(false));
         assert_eq!(schema["properties"]["agent"]["minLength"], json!(1));
@@ -1012,7 +1120,7 @@ mod tests {
     async fn missing_agent_param() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool.execute(json!({"prompt": "test"})).await;
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -1076,6 +1184,9 @@ mod tests {
                 model: "model".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1093,14 +1204,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_agent_rejected() {
+    async fn blank_agent_uses_auto_selection() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
             .execute(json!({"agent": "  ", "prompt": "test"}))
             .await
             .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("must not be empty"));
+        assert!(result.success || result.error.is_some());
+        assert!(!result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Unknown agent"));
     }
 
     #[tokio::test]
@@ -1132,6 +1247,84 @@ mod tests {
                     .unwrap_or("")
                     .contains("Unknown agent")
         );
+    }
+
+    #[tokio::test]
+    async fn auto_selection_can_be_disabled() {
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security()).with_auto_activate(false);
+        let result = tool.execute(json!({"prompt": "test"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("automatic activation is disabled"));
+    }
+
+    #[tokio::test]
+    async fn runtime_team_disable_blocks_delegate() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_runtime_orchestration_config(&config_path, false, true, 8, true, true, 4);
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_runtime_team_settings(true, true, 32, Some(config_path));
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Agent teams are currently disabled"));
+    }
+
+    #[tokio::test]
+    async fn runtime_team_auto_activation_toggle_is_hot_applied() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_runtime_orchestration_config(&config_path, true, true, 8, true, true, 4);
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                provider: "invalid-provider-for-hot-reload-test".to_string(),
+                model: "model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: vec!["research".to_string()],
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tool = DelegateTool::new(agents, None, test_security()).with_runtime_team_settings(
+            true,
+            true,
+            32,
+            Some(config_path.clone()),
+        );
+
+        let first = tool.execute(json!({"prompt": "test"})).await.unwrap();
+        assert!(!first
+            .error
+            .unwrap_or_default()
+            .contains("automatic activation is disabled"));
+
+        write_runtime_orchestration_config(&config_path, true, false, 8, true, true, 4);
+        let second = tool.execute(json!({"prompt": "test"})).await.unwrap();
+        assert!(!second.success);
+        assert!(second
+            .error
+            .unwrap_or_default()
+            .contains("automatic activation is disabled"));
     }
 
     #[tokio::test]
@@ -1182,6 +1375,9 @@ mod tests {
                 model: "test-model".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1217,6 +1413,9 @@ mod tests {
                 model: "test-model".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1256,7 +1455,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("none configured"));
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("No delegate agents are configured"));
     }
 
     #[tokio::test]
@@ -1397,6 +1599,9 @@ mod tests {
                 model: "model".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1466,6 +1671,9 @@ mod tests {
                 model: "model-test".to_string(),
                 system_prompt: None,
                 api_key: Some("delegate-test-credential".to_string()),
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: Some(0.2),
                 max_depth: 2,
                 agentic: false,
