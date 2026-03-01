@@ -1,9 +1,24 @@
-use crate::memory::{self, Memory};
+use crate::memory::{self, Memory, MemoryCategory};
 use std::fmt::Write;
+
+/// Score boost applied to `Core` category memories so durable facts and
+/// preferences surface even when keyword/semantic similarity is moderate.
+const CORE_CATEGORY_SCORE_BOOST: f64 = 0.3;
+
+/// Maximum number of memory entries included in the context preamble.
+const CONTEXT_ENTRY_LIMIT: usize = 5;
+
+/// Over-fetch factor: retrieve more candidates than the output limit so
+/// that Core boost and re-ranking can select the best subset.
+const RECALL_OVER_FETCH_FACTOR: usize = 2;
 
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
+///
+/// `Core` category memories receive a score boost so that durable facts,
+/// preferences, and project rules are more likely to appear in context
+/// even when semantic similarity to the current message is moderate.
 pub(super) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
@@ -12,29 +27,38 @@ pub(super) async fn build_context(
 ) -> String {
     let mut context = String::new();
 
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
-        let relevant: Vec<_> = entries
+    // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
+    let fetch_limit = CONTEXT_ENTRY_LIMIT * RECALL_OVER_FETCH_FACTOR;
+    if let Ok(entries) = mem.recall(user_msg, fetch_limit, session_id).await {
+        // Apply Core category boost and filter by minimum relevance.
+        let mut scored: Vec<_> = entries
             .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
+            .filter(|e| !memory::is_assistant_autosave_key(&e.key))
+            .filter_map(|e| {
+                let base = e.score.unwrap_or(min_relevance_score);
+                let boosted = if e.category == MemoryCategory::Core {
+                    (base + CORE_CATEGORY_SCORE_BOOST).min(1.0)
+                } else {
+                    base
+                };
+                if boosted >= min_relevance_score {
+                    Some((e, boosted))
+                } else {
+                    None
+                }
             })
             .collect();
 
-        if !relevant.is_empty() {
+        // Sort by boosted score descending, then truncate to output limit.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(CONTEXT_ENTRY_LIMIT);
+
+        if !scored.is_empty() {
             context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                if memory::is_assistant_autosave_key(&entry.key) {
-                    continue;
-                }
+            for (entry, _) in &scored {
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
-            } else {
-                context.push('\n');
-            }
+            context.push('\n');
         }
     }
 
