@@ -8,7 +8,7 @@ on:
             apply:
                 description: "Cancel selected queued runs (false = dry-run report only)"
                 required: true
-                default: true
+                default: false
                 type: boolean
             status:
                 description: "Queued-run status scope"
@@ -57,22 +57,27 @@ jobs:
 
                   status_scope="queued"
                   max_cancel="120"
-                  apply_mode="true"
+                  apply_mode="false"
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
                     status_scope="${{ github.event.inputs.status || 'queued' }}"
                     max_cancel="${{ github.event.inputs.max_cancel || '120' }}"
-                    apply_mode="${{ github.event.inputs.apply || 'true' }}"
+                    apply_mode="${{ github.event.inputs.apply || 'false' }}"
                   fi
 
                   cmd=(python3 scripts/ci/queue_hygiene.py
                     --repo "${{ github.repository }}"
                     --status "${status_scope}"
                     --max-cancel "${max_cancel}"
+                    --dedupe-workflow "CI Run"
+                    --dedupe-workflow "Test E2E"
+                    --dedupe-workflow "Docs Deploy"
                     --dedupe-workflow "PR Intake Checks"
                     --dedupe-workflow "PR Labeler"
                     --dedupe-workflow "PR Auto Responder"
                     --dedupe-workflow "Workflow Sanity"
                     --dedupe-workflow "PR Label Policy Check"
+                    --dedupe-include-non-pr
+                    --non-pr-key branch
                     --output-json artifacts/queue-hygiene-report.json
                     --verbose)
 

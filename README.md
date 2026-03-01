@@ -108,11 +108,11 @@ cargo install zeroclaw
 ### First Run
 
 ```bash
-# Start the gateway daemon
-zeroclaw gateway start
+# Start the gateway (serves the Web Dashboard API/UI)
+zeroclaw gateway
 
-# Open the web UI
-zeroclaw dashboard
+# Open the dashboard URL shown in startup logs
+# (default: http://127.0.0.1:3000/)
 
 # Or chat directly
 zeroclaw chat "Hello!"
