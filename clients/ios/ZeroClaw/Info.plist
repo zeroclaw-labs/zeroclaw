@@ -11,5 +11,9 @@
 	<array>
 		<string>ai.zeroclaw.healthcheck</string>
 	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+	</array>
 </dict>
 </plist>

@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 class ShareViewController: SLComposeServiceViewController {
 
     private let appGroupID = "group.ai.zeroclaw"
+    private let partsQueue = DispatchQueue(label: "ai.zeroclaw.share.parts")
 
     override func isContentValid() -> Bool {
         !contentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -29,25 +30,25 @@ class ShareViewController: SLComposeServiceViewController {
                 for provider in providers {
                     if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
                         group.enter()
-                        provider.loadItem(forTypeIdentifier: UTType.url.identifier) { item, _ in
+                        provider.loadItem(forTypeIdentifier: UTType.url.identifier) { [self] item, _ in
                             if let url = item as? URL {
-                                parts.append(url.absoluteString)
+                                partsQueue.sync { parts.append(url.absoluteString) }
                             }
                             group.leave()
                         }
                     } else if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
                         group.enter()
-                        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier) { item, _ in
+                        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier) { [self] item, _ in
                             if let text = item as? String, !text.isEmpty {
-                                parts.append(text)
+                                partsQueue.sync { parts.append(text) }
                             }
                             group.leave()
                         }
                     } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                         group.enter()
-                        provider.loadItem(forTypeIdentifier: UTType.image.identifier) { item, _ in
+                        provider.loadItem(forTypeIdentifier: UTType.image.identifier) { [self] item, _ in
                             if let url = item as? URL {
-                                parts.append("[Image: \(url.lastPathComponent)]")
+                                partsQueue.sync { parts.append("[Image: \(url.lastPathComponent)]") }
                             }
                             group.leave()
                         }
@@ -57,7 +58,8 @@ class ShareViewController: SLComposeServiceViewController {
         }
 
         group.notify(queue: .main) { [weak self] in
-            self?.enqueueMessage(parts.joined(separator: "\n"))
+            let message = self?.partsQueue.sync { parts.joined(separator: "\n") } ?? ""
+            self?.enqueueMessage(message)
             self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
         }
     }

@@ -4,8 +4,8 @@ ZeroClaw provides a native iOS client that connects to a running ZeroClaw gatewa
 
 ## Requirements
 
-- iOS 26.0+ (iPhone 15 Pro and newer)
-- Xcode 26+
+- iOS 26.0+ / iPadOS 26.0+ (requires Liquid Glass UI; iPhone 15 Pro and newer recommended)
+- Xcode 26+ (beta available from [developer.apple.com](https://developer.apple.com))
 - A running ZeroClaw gateway (local or remote)
 
 ## Quick Start
