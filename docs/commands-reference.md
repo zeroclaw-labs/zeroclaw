@@ -191,6 +191,8 @@ Runtime in-chat commands while channel server is running:
 - Supervised tool approvals (all non-CLI channels):
   - `/approve-request <tool-name>` (create pending approval request)
   - `/approve-confirm <request-id>` (confirm pending request; same sender + same chat/channel only)
+  - `/approve-allow <request-id>` (approve current pending runtime execution request once; no policy persistence)
+  - `/approve-deny <request-id>` (deny current pending runtime execution request)
   - `/approve-pending` (list pending requests in current sender+chat/channel scope)
   - `/approve <tool-name>` (direct one-step grant + persist to `autonomy.auto_approve`, compatibility path)
   - `/unapprove <tool-name>` (revoke + remove from `autonomy.auto_approve`)

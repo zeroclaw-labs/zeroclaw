@@ -2245,6 +2245,27 @@ async fn handle_runtime_command_if_needed(
         }
     }
 
+    /// Handle `/approve-allow <request-id>` for pending runtime execution prompts.
+    ///
+    /// This path confirms only the current pending request and intentionally does
+    /// not persist approval policy changes for normal tools.
+    async fn handle_pending_runtime_approval_side_effects(
+        ctx: &ChannelRuntimeContext,
+        request_id: &str,
+        tool_name: &str,
+    ) -> String {
+        if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
+            format!(
+                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
+            )
+        } else {
+            format!(
+                "Approved pending execution request `{request_id}` for `{tool_name}`.\nThis approval applies only to the current pending request and does not change persisted approval policy.\nTo persist approval for future requests, use `/approve {tool_name}` or the `/approve-request` + `/approve-confirm` flow."
+            )
+        }
+    }
+
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
@@ -2708,11 +2729,10 @@ async fn handle_runtime_command_if_needed(
                     Ok(req) => {
                         ctx.approval_manager
                             .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
-                        let approval_message = handle_confirm_tool_approval_side_effects(
+                        let approval_message = handle_pending_runtime_approval_side_effects(
                             ctx,
                             &request_id,
                             &req.tool_name,
-                            source_channel,
                         )
                         .await;
                         runtime_trace::record_event(
@@ -5117,8 +5137,14 @@ fn collect_configured_channels(
 
     #[cfg(not(feature = "channel-lark"))]
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
         tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+            "Lark/Feishu channel is configured but this binary was compiled without `channel-lark`; skipping Lark/Feishu startup. \
+             binary={executable}. \
+             If you built from source, run the built artifact directly (for example `./target/release/zeroclaw daemon`) \
+             or run `cargo run --features channel-lark -- daemon`."
         );
     }
 
@@ -7608,7 +7634,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Approved supervised execution for `mock_price`"));
+        assert!(sent[0].contains("Approved pending execution request"));
         assert!(sent[0].contains("mock_price"));
         drop(sent);
 
@@ -7820,7 +7846,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(
             sent.iter()
-                .any(|entry| entry.contains("Approved supervised execution for `mock_price`")),
+                .any(|entry| entry.contains("Approved pending execution request")),
             "channel should acknowledge explicit approval command"
         );
         assert!(
@@ -7831,6 +7857,17 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent.iter().all(|entry| !entry.contains("Denied by user.")),
             "always_ask tool should not be silently denied once non-cli approval prompt path is wired"
+        );
+        assert!(
+            runtime_ctx.approval_manager.needs_approval("mock_price"),
+            "/approve-allow should not downgrade always_ask policy for future requests"
+        );
+        assert!(
+            runtime_ctx
+                .approval_manager
+                .always_ask_tools()
+                .contains("mock_price"),
+            "always_ask runtime policy should remain intact after one-shot approval"
         );
     }
 
@@ -8245,7 +8282,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Approved supervised execution for `mock_price`"));
+        assert!(sent[0].contains("Approved pending execution request"));
         assert!(sent[0].contains("mock_price"));
         drop(sent);
 
@@ -8255,6 +8292,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             approval_manager.take_non_cli_pending_resolution(&request_id),
             Some(ApprovalResponse::Yes)
+        );
+        assert!(
+            approval_manager.needs_approval("mock_price"),
+            "/approve-allow should not persistently auto-approve tools"
+        );
+        assert!(
+            approval_manager.always_ask_tools().contains("mock_price"),
+            "always_ask tool should remain in always_ask after one-shot approval"
         );
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
