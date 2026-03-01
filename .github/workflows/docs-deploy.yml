@@ -56,7 +56,7 @@ env:
 jobs:
     docs-quality:
         name: Docs Quality Gate
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 20
         outputs:
             docs_files: ${{ steps.scope.outputs.docs_files }}
@@ -160,6 +160,11 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: ${{ steps.deploy_guard.outputs.docs_guard_artifact_retention_days || 21 }}
 
+            - name: Setup Node.js for markdown lint
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version: "22"
+
             - name: Markdown quality gate
               env:
                   BASE_SHA: ${{ steps.scope.outputs.base_sha }}
@@ -203,7 +208,7 @@ jobs:
         name: Docs Preview Artifact
         needs: [docs-quality]
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'preview')
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -237,7 +242,7 @@ jobs:
         name: Deploy Docs to GitHub Pages
         needs: [docs-quality]
         if: needs.docs-quality.outputs.deploy_target == 'production' && needs.docs-quality.outputs.ready_to_deploy == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 20
         permissions:
             contents: read

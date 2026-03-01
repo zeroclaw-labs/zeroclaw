@@ -82,6 +82,8 @@ pub struct PluginRegistry {
     manifests: HashMap<String, PluginManifest>,
     manifest_tools: Vec<PluginToolManifest>,
     manifest_providers: HashSet<String>,
+    tool_modules: HashMap<String, String>,
+    provider_modules: HashMap<String, String>,
 }
 
 impl PluginRegistry {
@@ -94,6 +96,8 @@ impl PluginRegistry {
             manifests: HashMap::new(),
             manifest_tools: Vec::new(),
             manifest_providers: HashSet::new(),
+            tool_modules: HashMap::new(),
+            provider_modules: HashMap::new(),
         }
     }
 
@@ -137,14 +141,34 @@ impl PluginRegistry {
         self.manifest_providers.contains(name)
     }
 
+    pub fn tool_module_path(&self, tool: &str) -> Option<&str> {
+        self.tool_modules.get(tool).map(String::as_str)
+    }
+
+    pub fn provider_module_path(&self, provider: &str) -> Option<&str> {
+        self.provider_modules.get(provider).map(String::as_str)
+    }
+
     fn rebuild_indexes(&mut self) {
         self.manifest_tools.clear();
         self.manifest_providers.clear();
+        self.tool_modules.clear();
+        self.provider_modules.clear();
 
         for manifest in self.manifests.values() {
+            let module_path = manifest.module_path.clone();
             self.manifest_tools.extend(manifest.tools.iter().cloned());
+            for tool in &manifest.tools {
+                self.tool_modules
+                    .entry(tool.name.clone())
+                    .or_insert_with(|| module_path.clone());
+            }
             for provider in &manifest.providers {
-                self.manifest_providers.insert(provider.trim().to_string());
+                let provider = provider.trim().to_string();
+                self.manifest_providers.insert(provider.clone());
+                self.provider_modules
+                    .entry(provider)
+                    .or_insert_with(|| module_path.clone());
             }
         }
     }
@@ -168,6 +192,8 @@ impl Clone for PluginRegistry {
             manifests: self.manifests.clone(),
             manifest_tools: self.manifest_tools.clone(),
             manifest_providers: self.manifest_providers.clone(),
+            tool_modules: self.tool_modules.clone(),
+            provider_modules: self.provider_modules.clone(),
         }
     }
 }

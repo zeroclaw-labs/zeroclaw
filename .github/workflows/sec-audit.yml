@@ -15,6 +15,7 @@ on:
             - ".github/security/unsafe-audit-governance.json"
             - "scripts/ci/install_gitleaks.sh"
             - "scripts/ci/install_syft.sh"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
             - "scripts/ci/deny_policy_guard.py"
             - "scripts/ci/secrets_governance_guard.py"
             - "scripts/ci/unsafe_debt_audit.py"
@@ -37,6 +38,7 @@ on:
             - ".github/security/unsafe-audit-governance.json"
             - "scripts/ci/install_gitleaks.sh"
             - "scripts/ci/install_syft.sh"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
             - "scripts/ci/deny_policy_guard.py"
             - "scripts/ci/secrets_governance_guard.py"
             - "scripts/ci/unsafe_debt_audit.py"
@@ -86,10 +88,14 @@ env:
 jobs:
     audit:
         name: Security Audit
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 20
+        runs-on: ubuntu-22.04
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
 
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
@@ -101,7 +107,7 @@ jobs:
 
     deny:
         name: License & Supply Chain
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -156,23 +162,27 @@ jobs:
 
     security-regressions:
         name: Security Regression Tests
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: sec-audit-security-regressions
+                  cache-bin: false
             - name: Run security regression suite
               shell: bash
               run: ./scripts/ci/security_regression_tests.sh
 
     secrets:
         name: Secrets Governance (Gitleaks)
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -367,7 +377,7 @@ jobs:
 
     sbom:
         name: SBOM Snapshot
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -432,10 +442,15 @@ jobs:
 
     unsafe-debt:
         name: Unsafe Debt Audit
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Setup Python 3.11
+              uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+              with:
+                  python-version: "3.11"
 
             - name: Enforce unsafe policy governance
               shell: bash
@@ -571,7 +586,7 @@ jobs:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
         needs: [audit, deny, security-regressions, secrets, sbom, unsafe-debt]
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         steps:
             - name: Enforce security gate
               shell: bash

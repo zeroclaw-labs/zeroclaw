@@ -9,6 +9,7 @@ on:
             - "src/**"
             - "crates/**"
             - "scripts/ci/reproducible_build_check.sh"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
             - ".github/workflows/ci-reproducible-build.yml"
     pull_request:
         branches: [dev, main]
@@ -18,6 +19,7 @@ on:
             - "src/**"
             - "crates/**"
             - "scripts/ci/reproducible_build_check.sh"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
             - ".github/workflows/ci-reproducible-build.yml"
     schedule:
         - cron: "45 5 * * 1" # Weekly Monday 05:45 UTC
@@ -50,11 +52,15 @@ env:
 jobs:
     reproducibility:
         name: Reproducible Build Probe
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 45
         steps:
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
 
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable

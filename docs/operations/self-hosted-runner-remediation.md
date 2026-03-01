@@ -83,6 +83,20 @@ Safety behavior:
 4. Drain runners, then apply cleanup.
 5. Re-run health report and confirm queue/availability recovery.
 
+## 3.1) Build Smoke Exit `143` Triage
+
+When `CI Run / Build (Smoke)` fails with `Process completed with exit code 143`:
+
+1. Treat it as external termination (SIGTERM), not a compile error.
+2. Confirm the build step ended with `Terminated` and no Rust compiler diagnostic was emitted.
+3. Check current pool pressure (`runner_health_report.py`) before retrying.
+4. Re-run once after pressure drops; persistent `143` should be handled as runner-capacity remediation.
+
+Important:
+
+- `error: cannot install while Rust is installed` from rustup bootstrap can appear in setup logs on pre-provisioned runners.
+- That message is not itself a terminal failure when subsequent `rustup toolchain install` and `rustup default` succeed.
+
 ## 4) Queue Hygiene (Dry-Run First)
 
 Dry-run example:

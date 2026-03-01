@@ -25,7 +25,7 @@ use crate::migration::{
 use crate::providers::{
     canonical_china_provider_name, is_doubao_alias, is_glm_alias, is_glm_cn_alias,
     is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias,
-    is_siliconflow_alias, is_zai_alias, is_zai_cn_alias,
+    is_siliconflow_alias, is_stepfun_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -882,6 +882,13 @@ async fn run_quick_setup_with_home(
         } else {
             let env_var = provider_env_var(&provider_name);
             println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
+            let fallback_env_vars = provider_env_var_fallbacks(&provider_name);
+            if !fallback_env_vars.is_empty() {
+                println!(
+                    "       Alternate accepted env var(s): {}",
+                    fallback_env_vars.join(", ")
+                );
+            }
             println!("    2. Or edit:           ~/.zeroclaw/config.toml");
             println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
             println!("    4. Gateway:           zeroclaw gateway");
@@ -966,6 +973,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
+        "stepfun" => "step-3.5-flash".into(),
         "hunyuan" => "hunyuan-t1-latest".into(),
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
@@ -1246,6 +1254,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Kimi K2 0905 Preview (strong coding)".to_string(),
             ),
         ],
+        "stepfun" => vec![
+            (
+                "step-3.5-flash".to_string(),
+                "Step 3.5 Flash (recommended default)".to_string(),
+            ),
+            (
+                "step-3".to_string(),
+                "Step 3 (flagship reasoning)".to_string(),
+            ),
+            (
+                "step-2-mini".to_string(),
+                "Step 2 Mini (balanced and fast)".to_string(),
+            ),
+            (
+                "step-1o-turbo-vision".to_string(),
+                "Step 1o Turbo Vision (multimodal)".to_string(),
+            ),
+        ],
         "glm" | "zai" => vec![
             ("glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
             (
@@ -1483,6 +1509,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "novita"
             | "cohere"
             | "moonshot"
+            | "stepfun"
             | "glm"
             | "zai"
             | "qwen"
@@ -1515,6 +1542,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "novita" => Some("https://api.novita.ai/openai/v1/models"),
             "cohere" => Some("https://api.cohere.com/compatibility/v1/models"),
             "moonshot" => Some("https://api.moonshot.ai/v1/models"),
+            "stepfun" => Some("https://api.stepfun.com/v1/models"),
             "glm" => Some("https://api.z.ai/api/paas/v4/models"),
             "zai" => Some("https://api.z.ai/api/coding/paas/v4/models"),
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
@@ -1812,20 +1840,7 @@ fn fetch_live_models_for_provider(
         if provider_name == "ollama" && !ollama_remote {
             None
         } else {
-            std::env::var(provider_env_var(provider_name))
-                .ok()
-                .or_else(|| {
-                    // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
-                    if provider_name == "anthropic" {
-                        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                    } else if provider_name == "minimax" {
-                        std::env::var("MINIMAX_OAUTH_TOKEN").ok()
-                    } else {
-                        None
-                    }
-                })
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
+            resolve_provider_api_key_from_env(provider_name)
         }
     } else {
         Some(api_key.trim().to_string())
@@ -2515,6 +2530,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "moonshot-intl",
                 "Moonshot — Kimi API (international endpoint)",
             ),
+            ("stepfun", "StepFun — Step AI OpenAI-compatible endpoint"),
             ("glm", "GLM — ChatGLM / Zhipu (international endpoint)"),
             ("glm-cn", "GLM — ChatGLM / Zhipu (China endpoint)"),
             (
@@ -2934,6 +2950,8 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey"
         } else if is_siliconflow_alias(provider_name) {
             "https://cloud.siliconflow.cn/account/ak"
+        } else if is_stepfun_alias(provider_name) {
+            "https://platform.stepfun.com/interface-key"
         } else {
             match provider_name {
                 "openrouter" => "https://openrouter.ai/keys",
@@ -2996,10 +3014,19 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
             if key.is_empty() {
                 let env_var = provider_env_var(provider_name);
-                print_bullet(&format!(
-                    "Skipped. Set {} or edit config.toml later.",
-                    style(env_var).yellow()
-                ));
+                let fallback_env_vars = provider_env_var_fallbacks(provider_name);
+                if fallback_env_vars.is_empty() {
+                    print_bullet(&format!(
+                        "Skipped. Set {} or edit config.toml later.",
+                        style(env_var).yellow()
+                    ));
+                } else {
+                    print_bullet(&format!(
+                        "Skipped. Set {} (fallback: {}) or edit config.toml later.",
+                        style(env_var).yellow(),
+                        style(fallback_env_vars.join(", ")).yellow()
+                    ));
+                }
             }
 
             key
@@ -3019,13 +3046,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             allows_unauthenticated_model_fetch(provider_name) && !ollama_remote;
         let has_api_key = !api_key.trim().is_empty()
             || ((canonical_provider != "ollama" || ollama_remote)
-                && std::env::var(provider_env_var(provider_name))
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()))
-            || (provider_name == "minimax"
-                && std::env::var("MINIMAX_OAUTH_TOKEN")
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()));
+                && provider_has_env_api_key(provider_name));
 
         if canonical_provider == "ollama" && ollama_remote && !has_api_key {
             print_bullet(&format!(
@@ -3239,6 +3260,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "cohere" => "COHERE_API_KEY",
         "kimi-code" => "KIMI_CODE_API_KEY",
         "moonshot" => "MOONSHOT_API_KEY",
+        "stepfun" => "STEP_API_KEY",
         "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "qwen" => "DASHSCOPE_API_KEY",
@@ -3257,6 +3279,33 @@ fn provider_env_var(name: &str) -> &'static str {
         "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
     }
+}
+
+fn provider_env_var_fallbacks(name: &str) -> &'static [&'static str] {
+    match canonical_provider_name(name) {
+        "anthropic" => &["ANTHROPIC_OAUTH_TOKEN"],
+        "gemini" => &["GOOGLE_API_KEY"],
+        "minimax" => &["MINIMAX_OAUTH_TOKEN"],
+        "volcengine" => &["DOUBAO_API_KEY"],
+        "stepfun" => &["STEPFUN_API_KEY"],
+        "kimi-code" => &["MOONSHOT_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn resolve_provider_api_key_from_env(provider_name: &str) -> Option<String> {
+    std::iter::once(provider_env_var(provider_name))
+        .chain(provider_env_var_fallbacks(provider_name).iter().copied())
+        .find_map(|env_var| {
+            std::env::var(env_var)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn provider_has_env_api_key(provider_name: &str) -> bool {
+    resolve_provider_api_key_from_env(provider_name).is_some()
 }
 
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
@@ -6426,6 +6475,8 @@ async fn scaffold_workspace(
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
+    // Ensure skills README + transparent preloaded defaults + policy metadata are initialized.
+    crate::skills::init_skills_dir(workspace_dir)?;
 
     let mut created = 0;
     let mut skipped = 0;
@@ -7815,6 +7866,7 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
+        assert_eq!(default_model_for_provider("stepfun"), "step-3.5-flash");
         assert_eq!(default_model_for_provider("hunyuan"), "hunyuan-t1-latest");
         assert_eq!(default_model_for_provider("tencent"), "hunyuan-t1-latest");
         assert_eq!(
@@ -7856,6 +7908,9 @@ mod tests {
         assert_eq!(canonical_provider_name("openai_codex"), "openai-codex");
         assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
         assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
+        assert_eq!(canonical_provider_name("step"), "stepfun");
+        assert_eq!(canonical_provider_name("step-ai"), "stepfun");
+        assert_eq!(canonical_provider_name("step_ai"), "stepfun");
         assert_eq!(canonical_provider_name("kimi_coding"), "kimi-code");
         assert_eq!(canonical_provider_name("kimi_for_coding"), "kimi-code");
         assert_eq!(canonical_provider_name("glm-cn"), "glm");
@@ -7958,6 +8013,19 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_stepfun_include_expected_defaults() {
+        let ids: Vec<String> = curated_models_for_provider("stepfun")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"step-3.5-flash".to_string()));
+        assert!(ids.contains(&"step-3".to_string()));
+        assert!(ids.contains(&"step-2-mini".to_string()));
+        assert!(ids.contains(&"step-1o-turbo-vision".to_string()));
+    }
+
+    #[test]
     fn allows_unauthenticated_model_fetch_for_public_catalogs() {
         assert!(allows_unauthenticated_model_fetch("openrouter"));
         assert!(allows_unauthenticated_model_fetch("venice"));
@@ -8044,6 +8112,9 @@ mod tests {
         assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
+        assert!(supports_live_model_fetch("stepfun"));
+        assert!(supports_live_model_fetch("step"));
+        assert!(supports_live_model_fetch("step-ai"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
         assert!(supports_live_model_fetch("qwen-coding-plan"));
@@ -8119,6 +8190,14 @@ mod tests {
             curated_models_for_provider("ark")
         );
         assert_eq!(
+            curated_models_for_provider("stepfun"),
+            curated_models_for_provider("step")
+        );
+        assert_eq!(
+            curated_models_for_provider("stepfun"),
+            curated_models_for_provider("step-ai")
+        );
+        assert_eq!(
             curated_models_for_provider("siliconflow"),
             curated_models_for_provider("silicon-cloud")
         );
@@ -8189,6 +8268,18 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("moonshot"),
             Some("https://api.moonshot.ai/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("stepfun"),
+            Some("https://api.stepfun.com/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("step"),
+            Some("https://api.stepfun.com/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("step-ai"),
+            Some("https://api.stepfun.com/v1/models")
         );
         assert_eq!(
             models_endpoint_for_provider("siliconflow"),
@@ -8495,6 +8586,9 @@ mod tests {
         assert_eq!(provider_env_var("minimax-oauth"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
+        assert_eq!(provider_env_var("stepfun"), "STEP_API_KEY");
+        assert_eq!(provider_env_var("step"), "STEP_API_KEY");
+        assert_eq!(provider_env_var("step-ai"), "STEP_API_KEY");
         assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
         assert_eq!(provider_env_var("doubao"), "ARK_API_KEY");
         assert_eq!(provider_env_var("volcengine"), "ARK_API_KEY");
@@ -8508,6 +8602,52 @@ mod tests {
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
         assert_eq!(provider_env_var("hunyuan"), "HUNYUAN_API_KEY");
         assert_eq!(provider_env_var("tencent"), "HUNYUAN_API_KEY"); // alias
+    }
+
+    #[test]
+    fn provider_env_var_fallbacks_cover_expected_aliases() {
+        assert_eq!(provider_env_var_fallbacks("stepfun"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step-ai"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step_ai"), &["STEPFUN_API_KEY"]);
+        assert_eq!(
+            provider_env_var_fallbacks("anthropic"),
+            &["ANTHROPIC_OAUTH_TOKEN"]
+        );
+        assert_eq!(provider_env_var_fallbacks("gemini"), &["GOOGLE_API_KEY"]);
+        assert_eq!(
+            provider_env_var_fallbacks("minimax"),
+            &["MINIMAX_OAUTH_TOKEN"]
+        );
+        assert_eq!(
+            provider_env_var_fallbacks("volcengine"),
+            &["DOUBAO_API_KEY"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_from_env_prefers_primary_over_fallback() {
+        let _env_guard = env_lock().lock().await;
+        let _primary = EnvVarGuard::set("STEP_API_KEY", "primary-step-key");
+        let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
+
+        assert_eq!(
+            resolve_provider_api_key_from_env("stepfun").as_deref(),
+            Some("primary-step-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_from_env_uses_stepfun_fallback_key() {
+        let _env_guard = env_lock().lock().await;
+        let _unset_primary = EnvVarGuard::unset("STEP_API_KEY");
+        let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
+
+        assert_eq!(
+            resolve_provider_api_key_from_env("step-ai").as_deref(),
+            Some("fallback-step-key")
+        );
+        assert!(provider_has_env_api_key("step_ai"));
     }
 
     #[test]

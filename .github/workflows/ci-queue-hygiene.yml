@@ -51,6 +51,8 @@ jobs:
             - name: Run queue hygiene policy
               id: hygiene
               shell: bash
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
                   mkdir -p artifacts

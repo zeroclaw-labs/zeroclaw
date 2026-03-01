@@ -83,8 +83,32 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
+const STEPFUN_BASE_URL: &str = "https://api.stepfun.com/v1";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
+struct PluginProvider {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for PluginProvider {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        plugins::runtime::execute_plugin_provider_chat(
+            &self.name,
+            system_prompt,
+            message,
+            model,
+            temperature,
+        )
+        .await
+    }
+}
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
         name,
@@ -190,6 +214,10 @@ pub(crate) fn is_doubao_alias(name: &str) -> bool {
 
 pub(crate) fn is_siliconflow_alias(name: &str) -> bool {
     matches!(name, "siliconflow" | "silicon-cloud" | "siliconcloud")
+}
+
+pub(crate) fn is_stepfun_alias(name: &str) -> bool {
+    matches!(name, "stepfun" | "step" | "step-ai" | "step_ai")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -633,6 +661,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("doubao")
     } else if is_siliconflow_alias(name) {
         Some("siliconflow")
+    } else if is_stepfun_alias(name) {
+        Some("stepfun")
     } else if matches!(name, "hunyuan" | "tencent") {
         Some("hunyuan")
     } else {
@@ -689,6 +719,14 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
         Some(ZAI_CN_BASE_URL)
     } else if is_zai_global_alias(name) {
         Some(ZAI_GLOBAL_BASE_URL)
+    } else {
+        None
+    }
+}
+
+fn stepfun_base_url(name: &str) -> Option<&'static str> {
+    if is_stepfun_alias(name) {
+        Some(STEPFUN_BASE_URL)
     } else {
         None
     }
@@ -819,6 +857,57 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// True when HTTP status indicates request-shape/schema rejection for native tools.
+///
+/// 516 is included for OpenAI-compatible providers that surface mapper/schema
+/// errors via vendor-specific status codes instead of standard 4xx.
+pub(crate) fn is_native_tool_schema_rejection_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) || status.as_u16() == 516
+}
+
+/// Detect request-mapper/tool-schema incompatibility hints in provider errors.
+pub(crate) fn has_native_tool_schema_rejection_hint(error: &str) -> bool {
+    let lower = error.to_lowercase();
+
+    let direct_hints = [
+        "unknown parameter: tools",
+        "unsupported parameter: tools",
+        "unrecognized field `tools`",
+        "does not support tools",
+        "function calling is not supported",
+        "unknown parameter: tool_choice",
+        "unsupported parameter: tool_choice",
+        "unrecognized field `tool_choice`",
+        "invalid parameter: tool_choice",
+    ];
+    if direct_hints.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    let mapper_tool_schema_hint = lower.contains("mapper")
+        && (lower.contains("tool") || lower.contains("function"))
+        && (lower.contains("schema")
+            || lower.contains("parameter")
+            || lower.contains("validation"));
+    if mapper_tool_schema_hint {
+        return true;
+    }
+
+    lower.contains("tool schema")
+        && (lower.contains("mismatch")
+            || lower.contains("unsupported")
+            || lower.contains("invalid")
+            || lower.contains("incompatible"))
+}
+
+/// Combined predicate for native tool-schema rejection.
+pub(crate) fn is_native_tool_schema_rejection(status: reqwest::StatusCode, error: &str) -> bool {
+    is_native_tool_schema_rejection_status(status) && has_native_tool_schema_rejection_hint(error)
+}
+
 /// Build a sanitized provider error from a failed HTTP response.
 pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
@@ -892,6 +981,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_siliconflow_alias(name) => vec!["SILICONFLOW_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
+        name if is_stepfun_alias(name) => vec!["STEP_API_KEY", "STEPFUN_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
@@ -1223,6 +1313,12 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
+        name if stepfun_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "StepFun",
+            stepfun_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
+        ))),
         name if qwen_base_url(name).is_some() => {
             Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
                 "Qwen",
@@ -1420,10 +1516,9 @@ fn create_provider_with_url_and_options(
         _ => {
             let registry = plugins::runtime::current_registry();
             if registry.has_provider(name) {
-                anyhow::bail!(
-                    "Plugin providers are not yet supported (requires Part 2). Provider '{}' cannot be used.",
-                    name
-                );
+                return Ok(Box::new(PluginProvider {
+                    name: name.to_string(),
+                }));
             }
             anyhow::bail!(
                 "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard --interactive` to reconfigure.\n\
@@ -1781,6 +1876,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "stepfun",
+            display_name: "StepFun",
+            aliases: &["step", "step-ai", "step_ai"],
+            local: false,
+        },
+        ProviderInfo {
             name: "kimi-code",
             display_name: "Kimi Code",
             aliases: &["kimi_coding", "kimi_for_coding"],
@@ -2073,6 +2174,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_credential_prefers_step_primary_env_key() {
+        let _env_lock = env_lock();
+        let _primary_guard = EnvGuard::set("STEP_API_KEY", Some("step-primary"));
+        let _fallback_guard = EnvGuard::set("STEPFUN_API_KEY", Some("step-fallback"));
+
+        let resolved = resolve_provider_credential("stepfun", None);
+        assert_eq!(resolved.as_deref(), Some("step-primary"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_stepfun_fallback_env_key() {
+        let _env_lock = env_lock();
+        let _primary_guard = EnvGuard::set("STEP_API_KEY", None);
+        let _fallback_guard = EnvGuard::set("STEPFUN_API_KEY", Some("step-fallback"));
+
+        let resolved = resolve_provider_credential("step-ai", None);
+        assert_eq!(resolved.as_deref(), Some("step-fallback"));
+    }
+
+    #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}", std::process::id());
@@ -2222,6 +2343,10 @@ mod tests {
         assert!(is_siliconflow_alias("siliconflow"));
         assert!(is_siliconflow_alias("silicon-cloud"));
         assert!(is_siliconflow_alias("siliconcloud"));
+        assert!(is_stepfun_alias("stepfun"));
+        assert!(is_stepfun_alias("step"));
+        assert!(is_stepfun_alias("step-ai"));
+        assert!(is_stepfun_alias("step_ai"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
@@ -2230,6 +2355,7 @@ mod tests {
         assert!(!is_qianfan_alias("cohere"));
         assert!(!is_doubao_alias("deepseek"));
         assert!(!is_siliconflow_alias("volcengine"));
+        assert!(!is_stepfun_alias("moonshot"));
     }
 
     #[test]
@@ -2261,6 +2387,9 @@ mod tests {
             canonical_china_provider_name("silicon-cloud"),
             Some("siliconflow")
         );
+        assert_eq!(canonical_china_provider_name("stepfun"), Some("stepfun"));
+        assert_eq!(canonical_china_provider_name("step"), Some("stepfun"));
+        assert_eq!(canonical_china_provider_name("step-ai"), Some("stepfun"));
         assert_eq!(canonical_china_provider_name("hunyuan"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("tencent"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("openai"), None);
@@ -2301,6 +2430,10 @@ mod tests {
         assert_eq!(zai_base_url("z.ai-global"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("zai-cn"), Some(ZAI_CN_BASE_URL));
         assert_eq!(zai_base_url("z.ai-cn"), Some(ZAI_CN_BASE_URL));
+
+        assert_eq!(stepfun_base_url("stepfun"), Some(STEPFUN_BASE_URL));
+        assert_eq!(stepfun_base_url("step"), Some(STEPFUN_BASE_URL));
+        assert_eq!(stepfun_base_url("step-ai"), Some(STEPFUN_BASE_URL));
     }
 
     // ── Primary providers ────────────────────────────────────
@@ -2385,6 +2518,13 @@ mod tests {
         assert!(create_provider("moonshot-cn", Some("key")).is_ok());
         assert!(create_provider("kimi-intl", Some("key")).is_ok());
         assert!(create_provider("kimi-cn", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_stepfun() {
+        assert!(create_provider("stepfun", Some("key")).is_ok());
+        assert!(create_provider("step", Some("key")).is_ok());
+        assert!(create_provider("step-ai", Some("key")).is_ok());
     }
 
     #[test]
@@ -2765,6 +2905,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn factory_plugin_provider_from_manifest_registry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("demo.plugin.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+id = "provider-demo"
+version = "1.0.0"
+module_path = "plugins/provider-demo.wasm"
+wit_packages = ["zeroclaw:providers@1.0.0"]
+providers = ["demo-plugin-provider"]
+"#,
+        )
+        .expect("write manifest");
+
+        let cfg = crate::config::PluginsConfig {
+            enabled: true,
+            load_paths: vec![dir.path().to_string_lossy().to_string()],
+            ..crate::config::PluginsConfig::default()
+        };
+        crate::plugins::runtime::initialize_from_config(&cfg)
+            .expect("plugin runtime should initialize");
+
+        assert!(
+            create_provider("demo-plugin-provider", None).is_ok(),
+            "manifest-declared plugin provider should resolve from factory"
+        );
+    }
+
     // ── Error cases ──────────────────────────────────────────
 
     #[test]
@@ -2939,6 +3109,9 @@ mod tests {
             "kimi-code",
             "moonshot-cn",
             "kimi-code",
+            "stepfun",
+            "step",
+            "step-ai",
             "synthetic",
             "opencode",
             "zai",
@@ -3036,6 +3209,67 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn native_tool_schema_rejection_status_covers_vendor_516() {
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code")
+        ));
+        assert!(!is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn native_tool_schema_rejection_hint_is_precise() {
+        assert!(has_native_tool_schema_rejection_hint(
+            "unknown parameter: tools"
+        ));
+        assert!(has_native_tool_schema_rejection_hint(
+            "mapper validation failed: tool schema is incompatible"
+        ));
+        let long_prefix = "x".repeat(300);
+        let long_hint = format!("{long_prefix} unknown parameter: tools");
+        assert!(has_native_tool_schema_rejection_hint(&long_hint));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "upstream gateway unavailable"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "temporary network timeout while contacting provider"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "tool_choice was set to auto by default policy"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "available tools: shell, weather, browser"
+        ));
+    }
+
+    #[test]
+    fn native_tool_schema_rejection_combines_status_and_hint() {
+        assert!(is_native_tool_schema_rejection(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "unknown parameter: tools"
+        ));
+        assert!(is_native_tool_schema_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            "unsupported parameter: tool_choice"
+        ));
+        assert!(!is_native_tool_schema_rejection(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "unknown parameter: tools"
+        ));
+        assert!(!is_native_tool_schema_rejection(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "upstream gateway unavailable"
+        ));
+    }
 
     #[test]
     fn sanitize_scrubs_sk_prefix() {

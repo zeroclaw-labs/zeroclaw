@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 28, 2026**.
+Last verified: **March 1, 2026**.
 
 ## How to List Providers
 
@@ -35,6 +35,7 @@ credential is not reused for fallback providers.
 | `vercel` | `vercel-ai` | No | `VERCEL_API_KEY` |
 | `cloudflare` | `cloudflare-ai` | No | `CLOUDFLARE_API_KEY` |
 | `moonshot` | `kimi` | No | `MOONSHOT_API_KEY` |
+| `stepfun` | `step`, `step-ai`, `step_ai` | No | `STEP_API_KEY`, `STEPFUN_API_KEY` |
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | No | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | No | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
@@ -135,6 +136,33 @@ Quick validation:
 ```bash
 zeroclaw models refresh --provider volcengine
 zeroclaw agent --provider volcengine --model doubao-1-5-pro-32k-250115 -m "ping"
+```
+
+### StepFun Notes
+
+- Provider ID: `stepfun` (aliases: `step`, `step-ai`, `step_ai`)
+- Base API URL: `https://api.stepfun.com/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Authentication: `STEP_API_KEY` (fallback: `STEPFUN_API_KEY`)
+- Default model preset: `step-3.5-flash`
+- Official docs:
+  - Chat Completions: <https://platform.stepfun.com/docs/zh/api-reference/chat/chat-completion-create>
+  - Models List: <https://platform.stepfun.com/docs/api-reference/models/list>
+  - OpenAI migration guide: <https://platform.stepfun.com/docs/guide/openai>
+
+Minimal setup example:
+
+```bash
+export STEP_API_KEY="your-stepfun-api-key"
+zeroclaw onboard --provider stepfun --api-key "$STEP_API_KEY" --model step-3.5-flash --force
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider stepfun
+zeroclaw agent --provider stepfun --model step-3.5-flash -m "ping"
 ```
 
 ### SiliconFlow Notes

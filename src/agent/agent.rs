@@ -243,6 +243,10 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    pub fn tool_specs(&self) -> &[ToolSpec] {
+        &self.tool_specs
+    }
+
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
     }
@@ -486,6 +490,10 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+        } else if let Some(ConversationMessage::Chat(system_msg)) = self.history.first_mut() {
+            if system_msg.role == "system" {
+                crate::agent::prompt::refresh_prompt_datetime(&mut system_msg.content);
+            }
         }
 
         if self.auto_save {

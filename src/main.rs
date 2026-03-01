@@ -42,6 +42,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const PROFILE_MISMATCH_PREFIX: &str = "Pending login profile mismatch:";
+const ZEROCLAW_BUILD_VERSION: &str = env!("ZEROCLAW_BUILD_VERSION");
 
 #[derive(Debug, Clone, ValueEnum)]
 enum QuotaFormat {
@@ -132,7 +133,7 @@ enum EstopLevelArg {
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
+#[command(version = ZEROCLAW_BUILD_VERSION)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -1021,7 +1022,7 @@ async fn main() -> Result<()> {
         Commands::Status => {
             println!("🦀 ZeroClaw Status");
             println!();
-            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
+            println!("Version:     {}", ZEROCLAW_BUILD_VERSION);
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();

@@ -138,7 +138,7 @@ Notes:
 - `zeroclaw models refresh --provider <ID>`
 - `zeroclaw models refresh --force`
 
-`models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, `volcengine` (`doubao`/`ark` aliases), `siliconflow`, and `nvidia`.
+`models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `stepfun`, `glm`, `zai`, `qwen`, `volcengine` (`doubao`/`ark` aliases), `siliconflow`, and `nvidia`.
 
 #### Live model availability test
 
@@ -191,6 +191,8 @@ Runtime in-chat commands while channel server is running:
 - Supervised tool approvals (all non-CLI channels):
   - `/approve-request <tool-name>` (create pending approval request)
   - `/approve-confirm <request-id>` (confirm pending request; same sender + same chat/channel only)
+  - `/approve-allow <request-id>` (approve current pending runtime execution request once; no policy persistence)
+  - `/approve-deny <request-id>` (deny current pending runtime execution request)
   - `/approve-pending` (list pending requests in current sender+chat/channel scope)
   - `/approve <tool-name>` (direct one-step grant + persist to `autonomy.auto_approve`, compatibility path)
   - `/unapprove <tool-name>` (revoke + remove from `autonomy.auto_approve`)

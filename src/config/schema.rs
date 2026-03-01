@@ -77,6 +77,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "cohere" => "command-a-03-2025",
         "moonshot" => "kimi-k2.5",
+        "stepfun" => "step-3.5-flash",
         "hunyuan" => "hunyuan-t1-latest",
         "glm" | "zai" => "glm-5",
         "minimax" => "MiniMax-M2.5",
@@ -3134,6 +3135,67 @@ pub enum NonCliNaturalLanguageApprovalMode {
     Direct,
 }
 
+/// Action to apply when a command-context rule matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandContextRuleAction {
+    /// Matching context is explicitly allowed.
+    #[default]
+    Allow,
+    /// Matching context is explicitly denied.
+    Deny,
+}
+
+/// Context-aware allow/deny rule for shell commands.
+///
+/// Rules are evaluated per command segment. Command matching accepts command
+/// names (`curl`), explicit paths (`/usr/bin/curl`), and wildcard (`*`).
+///
+/// Matching semantics:
+/// - `action = "deny"`: if all constraints match, the segment is rejected.
+/// - `action = "allow"`: if at least one allow rule exists for a command,
+///   segments must match at least one of those allow rules.
+///
+/// Constraints are optional:
+/// - `allowed_domains`: require URL arguments to match these hosts/patterns.
+/// - `allowed_path_prefixes`: require path-like arguments to stay under these prefixes.
+/// - `denied_path_prefixes`: for deny rules, match when any path-like argument
+///   is under these prefixes; for allow rules, require path arguments not to hit
+///   these prefixes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct CommandContextRuleConfig {
+    /// Command name/path pattern (`git`, `/usr/bin/curl`, or `*`).
+    pub command: String,
+
+    /// Rule action (`allow` | `deny`). Defaults to `allow`.
+    #[serde(default)]
+    pub action: CommandContextRuleAction,
+
+    /// Allowed host patterns for URL arguments.
+    ///
+    /// Supports exact hosts (`api.example.com`) and wildcard suffixes (`*.example.com`).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+
+    /// Allowed path prefixes for path-like arguments.
+    ///
+    /// Prefixes may be absolute, `~/...`, or workspace-relative.
+    #[serde(default)]
+    pub allowed_path_prefixes: Vec<String>,
+
+    /// Denied path prefixes for path-like arguments.
+    ///
+    /// Prefixes may be absolute, `~/...`, or workspace-relative.
+    #[serde(default)]
+    pub denied_path_prefixes: Vec<String>,
+
+    /// Permit high-risk commands when this allow rule matches.
+    ///
+    /// The command still requires explicit `approved=true` in supervised mode.
+    #[serde(default)]
+    pub allow_high_risk: bool,
+}
+
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
@@ -3147,6 +3209,13 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
+
+    /// Context-aware shell command allow/deny rules.
+    ///
+    /// These rules are evaluated per command segment and can narrow or override
+    /// global `allowed_commands` behavior for matching commands.
+    #[serde(default)]
+    pub command_context_rules: Vec<CommandContextRuleConfig>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
@@ -3251,6 +3320,7 @@ fn default_always_ask() -> Vec<String> {
 fn default_non_cli_excluded_tools() -> Vec<String> {
     [
         "shell",
+        "process",
         "file_write",
         "file_edit",
         "git_operations",
@@ -3298,6 +3368,10 @@ impl Default for AutonomyConfig {
                 "git".into(),
                 "npm".into(),
                 "cargo".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
                 "ls".into(),
                 "cat".into(),
                 "grep".into(),
@@ -3309,6 +3383,7 @@ impl Default for AutonomyConfig {
                 "tail".into(),
                 "date".into(),
             ],
+            command_context_rules: Vec::new(),
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -3330,8 +3405,8 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_actions_per_hour: 100,
+            max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -7031,6 +7106,75 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     Ok(())
 }
 
+fn legacy_feishu_table(raw_toml: &toml::Value) -> Option<&toml::map::Map<String, toml::Value>> {
+    raw_toml
+        .get("channels_config")?
+        .as_table()?
+        .get("feishu")?
+        .as_table()
+}
+
+fn extract_legacy_feishu_mention_only(raw_toml: &toml::Value) -> Option<bool> {
+    legacy_feishu_table(raw_toml)?
+        .get("mention_only")
+        .and_then(toml::Value::as_bool)
+}
+
+fn has_legacy_feishu_mention_only(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("mention_only"))
+        .is_some()
+}
+
+fn has_legacy_feishu_use_feishu(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("use_feishu"))
+        .is_some()
+}
+
+fn apply_feishu_legacy_compat(
+    config: &mut Config,
+    legacy_feishu_mention_only: Option<bool>,
+    legacy_feishu_use_feishu_present: bool,
+    saw_legacy_feishu_mention_only_path: bool,
+    saw_legacy_feishu_use_feishu_path: bool,
+) {
+    // Backward compatibility: users sometimes migrate config snippets from
+    // [channels_config.lark] to [channels_config.feishu] and keep old keys.
+    if let Some(feishu_cfg) = config.channels_config.feishu.as_mut() {
+        if let Some(legacy_mention_only) = legacy_feishu_mention_only {
+            if feishu_cfg.group_reply.is_none() {
+                let mapped_mode = if legacy_mention_only {
+                    GroupReplyMode::MentionOnly
+                } else {
+                    GroupReplyMode::AllMessages
+                };
+                feishu_cfg.group_reply = Some(GroupReplyConfig {
+                    mode: Some(mapped_mode),
+                    allowed_sender_ids: Vec::new(),
+                });
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is deprecated; mapped to [channels_config.feishu.group_reply].mode."
+                );
+            } else if saw_legacy_feishu_mention_only_path {
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is ignored because [channels_config.feishu.group_reply] is already set."
+                );
+            }
+        } else if saw_legacy_feishu_mention_only_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].mention_only is invalid; expected boolean."
+            );
+        }
+
+        if legacy_feishu_use_feishu_present || saw_legacy_feishu_use_feishu_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].use_feishu is redundant and ignored; [channels_config.feishu] always uses Feishu endpoints."
+            );
+        }
+    }
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -7069,24 +7213,23 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
-            let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
-                |path| {
-                    ignored_paths.push(path.to_string());
-                },
-            )
-            .context("Failed to deserialize config file")?;
+            // Parse raw TOML first so legacy compatibility rewrites can be applied after
+            // deserialization.
+            let raw_toml: toml::Value =
+                toml::from_str(&contents).context("Failed to parse config file")?;
+            let legacy_feishu_mention_only = extract_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_mention_only_present = has_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_use_feishu_present = has_legacy_feishu_use_feishu(&raw_toml);
+            let mut config: Config =
+                toml::from_str(&contents).context("Failed to deserialize config file")?;
 
-            // Warn about each unknown config key
-            for path in ignored_paths {
-                tracing::warn!(
-                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
-                    path
-                );
-            }
+            apply_feishu_legacy_compat(
+                &mut config,
+                legacy_feishu_mention_only,
+                legacy_feishu_use_feishu_present,
+                legacy_feishu_mention_only_present,
+                legacy_feishu_use_feishu_present,
+            );
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -7444,6 +7587,61 @@ impl Config {
                 anyhow::bail!(
                     "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                 );
+            }
+        }
+        for (i, rule) in self.autonomy.command_context_rules.iter().enumerate() {
+            let command = rule.command.trim();
+            if command.is_empty() {
+                anyhow::bail!("autonomy.command_context_rules[{i}].command must not be empty");
+            }
+            if !command
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | '*'))
+            {
+                anyhow::bail!(
+                    "autonomy.command_context_rules[{i}].command contains invalid characters: {command}"
+                );
+            }
+
+            for (j, domain) in rule.allowed_domains.iter().enumerate() {
+                let normalized = domain.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not be empty"
+                    );
+                }
+                if normalized.chars().any(char::is_whitespace) {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not contain whitespace"
+                    );
+                }
+            }
+
+            for (j, prefix) in rule.allowed_path_prefixes.iter().enumerate() {
+                let normalized = prefix.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not be empty"
+                    );
+                }
+                if normalized.contains('\0') {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not contain null bytes"
+                    );
+                }
+            }
+            for (j, prefix) in rule.denied_path_prefixes.iter().enumerate() {
+                let normalized = prefix.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not be empty"
+                    );
+                }
+                if normalized.contains('\0') {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not contain null bytes"
+                    );
+                }
             }
         }
         let mut seen_non_cli_excluded = std::collections::HashSet::new();
@@ -9223,16 +9421,20 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
+        assert!(a.allowed_commands.contains(&"mkdir".to_string()));
+        assert!(a.allowed_commands.contains(&"touch".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
-        assert_eq!(a.max_cost_per_day_cents, 500);
+        assert_eq!(a.max_actions_per_hour, 100);
+        assert_eq!(a.max_cost_per_day_cents, 1000);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+        assert!(a.command_context_rules.is_empty());
         assert!(!a.allow_sensitive_file_reads);
         assert!(!a.allow_sensitive_file_writes);
         assert!(a.non_cli_excluded_tools.contains(&"shell".to_string()));
+        assert!(a.non_cli_excluded_tools.contains(&"process".to_string()));
         assert!(a.non_cli_excluded_tools.contains(&"delegate".to_string()));
     }
 
@@ -9261,10 +9463,51 @@ allowed_roots = []
             !parsed.allow_sensitive_file_writes,
             "Missing allow_sensitive_file_writes must default to false"
         );
+        assert!(
+            parsed.command_context_rules.is_empty(),
+            "Missing command_context_rules must default to empty"
+        );
         assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(parsed
             .non_cli_excluded_tools
+            .contains(&"process".to_string()));
+        assert!(parsed
+            .non_cli_excluded_tools
             .contains(&"browser".to_string()));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_command_context_rule_command() {
+        let mut cfg = Config::default();
+        cfg.autonomy.command_context_rules = vec![CommandContextRuleConfig {
+            command: "curl;rm".into(),
+            action: CommandContextRuleAction::Allow,
+            allowed_domains: vec![],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.command_context_rules[0].command"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_empty_command_context_rule_domain() {
+        let mut cfg = Config::default();
+        cfg.autonomy.command_context_rules = vec![CommandContextRuleConfig {
+            command: "curl".into(),
+            action: CommandContextRuleAction::Allow,
+            allowed_domains: vec!["   ".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: true,
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.command_context_rules[0].allowed_domains[0]"));
     }
 
     #[test]
@@ -9462,6 +9705,7 @@ ws_url = "ws://127.0.0.1:3002"
                 level: AutonomyLevel::Full,
                 workspace_only: false,
                 allowed_commands: vec!["docker".into()],
+                command_context_rules: vec![],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
@@ -11817,6 +12061,9 @@ provider_api = "not-a-real-mode"
         let openai = resolve_default_model_id(None, Some("openai"));
         assert_eq!(openai, "gpt-5.2");
 
+        let stepfun = resolve_default_model_id(None, Some("stepfun"));
+        assert_eq!(stepfun, "step-3.5-flash");
+
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
     }
@@ -11828,6 +12075,12 @@ provider_api = "not-a-real-mode"
 
         let google_alias = resolve_default_model_id(None, Some("google-gemini"));
         assert_eq!(google_alias, "gemini-2.5-pro");
+
+        let step_alias = resolve_default_model_id(None, Some("step"));
+        assert_eq!(step_alias, "step-3.5-flash");
+
+        let step_ai_alias = resolve_default_model_id(None, Some("step-ai"));
+        assert_eq!(step_ai_alias, "step-3.5-flash");
     }
 
     #[test]
@@ -13106,6 +13359,83 @@ default_model = "legacy-model"
         assert_eq!(
             parsed.group_reply_allowed_sender_ids(),
             vec!["ou_9".to_string()]
+        );
+    }
+
+    #[test]
+    async fn feishu_legacy_key_extractors_detect_compat_fields() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+[channels_config.feishu]
+app_id = "cli_123"
+app_secret = "secret"
+mention_only = true
+use_feishu = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_legacy_feishu_mention_only(&raw), Some(true));
+        assert!(has_legacy_feishu_mention_only(&raw));
+        assert!(has_legacy_feishu_use_feishu(&raw));
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_maps_to_group_reply_mode() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_does_not_override_group_reply() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: Some(GroupReplyConfig {
+                mode: Some(GroupReplyMode::AllMessages),
+                allowed_sender_ids: vec![],
+            }),
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
         );
     }
 

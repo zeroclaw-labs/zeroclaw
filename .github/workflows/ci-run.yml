@@ -50,12 +50,15 @@ jobs:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 40
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
@@ -63,6 +66,7 @@ jobs:
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
+                  cache-bin: false
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
             - name: Run strict lint delta gate
@@ -74,16 +78,20 @@ jobs:
         name: Test
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 60
+        runs-on: ubuntu-22.04
+        timeout-minutes: 120
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
+                  cache-bin: false
             - name: Run tests with flake detection
               shell: bash
               env:
@@ -137,11 +145,14 @@ jobs:
         name: Build (Smoke)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 35
+        runs-on: ubuntu-22.04
+        timeout-minutes: 90
 
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
@@ -149,9 +160,17 @@ jobs:
               with:
                   prefix-key: ci-run-build
                   cache-targets: true
+                  cache-bin: false
             - name: Build binary (smoke check)
-              run: cargo build --profile release-fast --locked --verbose
+              env:
+                  CARGO_BUILD_JOBS: 2
+                  CI_SMOKE_BUILD_ATTEMPTS: 3
+              run: bash scripts/ci/smoke_build_retry.sh
             - name: Check binary size
+              env:
+                  BINARY_SIZE_HARD_LIMIT_MB: 28
+                  BINARY_SIZE_ADVISORY_MB: 20
+                  BINARY_SIZE_TARGET_MB: 5
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
     docs-only:
@@ -182,6 +201,10 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+            - name: Setup Node.js for markdown lint
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version: "22"
 
             - name: Markdown lint (changed lines only)
               env:

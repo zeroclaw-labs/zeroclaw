@@ -11,6 +11,12 @@ impl ObserverBridge {
     pub fn new(inner: Arc<dyn Observer>) -> Self {
         Self { inner }
     }
+
+    pub fn new_box(inner: Box<dyn Observer>) -> Self {
+        Self {
+            inner: Arc::from(inner),
+        }
+    }
 }
 
 impl Observer for ObserverBridge {

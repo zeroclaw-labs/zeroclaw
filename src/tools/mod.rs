@@ -85,6 +85,7 @@ pub mod web_search_tool;
 pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
+#[allow(unused_imports)]
 pub use bg_run::{
     format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
 };
@@ -237,15 +238,15 @@ impl Tool for PluginManifestTool {
         self.spec.parameters.clone()
     }
 
-    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        Ok(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "plugin tool '{}' is declared but execution runtime is not wired yet",
-                self.spec.name
-            )),
-        })
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        match plugins::runtime::execute_plugin_tool(&self.spec.name, &args).await {
+            Ok(result) => Ok(result),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error.to_string()),
+            }),
+        }
     }
 }
 

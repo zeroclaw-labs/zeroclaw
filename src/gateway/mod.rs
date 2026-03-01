@@ -296,6 +296,29 @@ pub(crate) fn client_key_from_request(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn request_ip_from_request(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> Option<IpAddr> {
+    if trust_forwarded_headers {
+        if let Some(ip) = forwarded_client_ip(headers) {
+            return Some(ip);
+        }
+    }
+
+    peer_addr.map(|addr| addr.ip())
+}
+
+fn is_loopback_request(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> bool {
+    request_ip_from_request(peer_addr, headers, trust_forwarded_headers)
+        .is_some_and(|ip| ip.is_loopback())
+}
+
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     if configured == 0 {
         fallback.max(1)
@@ -708,14 +731,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
 
     // Wrap observer with broadcast capability for SSE
-    // Use cost-tracking observer when cost tracking is enabled
+    // Use cost-tracking observer when cost tracking is enabled.
+    // Wrap it in ObserverBridge so plugin hooks can observe a stable interface.
     let base_observer = crate::observability::create_observer_with_cost_tracking(
         &config.observability,
         cost_tracker.clone(),
         &config.cost,
     );
-    let broadcast_observer: Arc<dyn crate::observability::Observer> =
-        Arc::new(sse::BroadcastObserver::new(base_observer, event_tx.clone()));
+    let bridged_observer = crate::plugins::bridge::observer::ObserverBridge::new_box(base_observer);
+    let broadcast_observer: Arc<dyn crate::observability::Observer> = Arc::new(
+        sse::BroadcastObserver::new(Box::new(bridged_observer), event_tx.clone()),
+    );
 
     let state = AppState {
         config: config_state,
@@ -888,7 +914,7 @@ async fn handle_metrics(
                 ),
             );
         }
-    } else if !peer_addr.ip().is_loopback() {
+    } else if !is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers) {
         return (
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
@@ -1113,9 +1139,38 @@ fn node_id_allowed(node_id: &str, allowed_node_ids: &[String]) -> bool {
 /// - `node.invoke` (stubbed as not implemented)
 async fn handle_node_control(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<NodeControlRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let node_control = { state.config.lock().gateway.node_control.clone() };
+    if !node_control.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Node-control API is disabled"})),
+        );
+    }
+
+    // Require at least one auth layer for non-loopback traffic:
+    // 1) gateway pairing token, or
+    // 2) node-control shared token.
+    let has_node_control_token = node_control
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !state.pairing.require_pairing()
+        && !has_node_control_token
+        && !is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — enable gateway pairing or configure gateway.node_control.auth_token for non-local access"
+            })),
+        );
+    }
+
     // ── Bearer auth (pairing) ──
     if state.pairing.require_pairing() {
         let auth = headers
@@ -1141,14 +1196,6 @@ async fn handle_node_control(
             return (StatusCode::BAD_REQUEST, Json(err));
         }
     };
-
-    let node_control = { state.config.lock().gateway.node_control.clone() };
-    if !node_control.enabled {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Node-control API is disabled"})),
-        );
-    }
 
     // Optional second-factor shared token for node-control endpoints.
     if let Some(expected_token) = node_control
@@ -1523,7 +1570,7 @@ async fn handle_webhook(
     // Require at least one auth layer for non-loopback traffic.
     if !state.pairing.require_pairing()
         && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
+        && !is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
     {
         tracing::warn!(
             "Webhook: rejected unauthenticated non-loopback request (pairing disabled and no webhook secret configured)"
@@ -3070,6 +3117,33 @@ mod tests {
     }
 
     #[test]
+    fn is_loopback_request_uses_peer_addr_when_untrusted_proxy_mode() {
+        let peer = SocketAddr::from(([203, 0, 113, 10], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        assert!(!is_loopback_request(Some(peer), &headers, false));
+    }
+
+    #[test]
+    fn is_loopback_request_uses_forwarded_ip_in_trusted_proxy_mode() {
+        let peer = SocketAddr::from(([203, 0, 113, 10], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        assert!(is_loopback_request(Some(peer), &headers, true));
+    }
+
+    #[test]
+    fn is_loopback_request_falls_back_to_peer_when_forwarded_invalid() {
+        let peer = SocketAddr::from(([203, 0, 113, 10], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("not-an-ip"));
+
+        assert!(!is_loopback_request(Some(peer), &headers, true));
+    }
+
+    #[test]
     fn normalize_max_keys_uses_fallback_for_zero() {
         assert_eq!(normalize_max_keys(0, 10_000), 10_000);
         assert_eq!(normalize_max_keys(0, 0), 1);
@@ -3664,6 +3738,7 @@ Reminder set successfully."#;
 
         let response = handle_node_control(
             State(state),
+            test_connect_info(),
             HeaderMap::new(),
             Ok(Json(NodeControlRequest {
                 method: "node.list".into(),
@@ -3720,6 +3795,7 @@ Reminder set successfully."#;
 
         let response = handle_node_control(
             State(state),
+            test_connect_info(),
             HeaderMap::new(),
             Ok(Json(NodeControlRequest {
                 method: "node.list".into(),
@@ -3737,6 +3813,64 @@ Reminder set successfully."#;
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["method"], "node.list");
         assert_eq!(parsed["nodes"].as_array().map(|v| v.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn node_control_rejects_public_requests_without_auth_layers() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let mut config = Config::default();
+        config.gateway.node_control.enabled = true;
+        config.gateway.node_control.auth_token = None;
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_node_control(
+            State(state),
+            test_public_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(NodeControlRequest {
+                method: "node.list".into(),
+                node_id: None,
+                capability: None,
+                arguments: serde_json::Value::Null,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
