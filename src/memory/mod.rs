@@ -2,6 +2,7 @@ pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
+pub mod decay;
 pub mod embeddings;
 pub mod hybrid;
 pub mod hygiene;

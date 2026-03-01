@@ -983,7 +983,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tool_call_loop(
+pub async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],

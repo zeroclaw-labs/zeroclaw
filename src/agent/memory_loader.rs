@@ -1,6 +1,9 @@
-use crate::memory::{self, Memory};
+use crate::memory::{self, decay, Memory};
 use async_trait::async_trait;
 use std::fmt::Write;
+
+/// Default half-life (days) for time decay in memory loading.
+const LOADER_DECAY_HALF_LIFE_DAYS: f64 = 7.0;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
@@ -38,10 +41,13 @@ impl MemoryLoader for DefaultMemoryLoader {
         memory: &dyn Memory,
         user_message: &str,
     ) -> anyhow::Result<String> {
-        let entries = memory.recall(user_message, self.limit, None).await?;
+        let mut entries = memory.recall(user_message, self.limit, None).await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
+
+        // Apply time decay: older non-Core memories score lower
+        decay::apply_time_decay(&mut entries, LOADER_DECAY_HALF_LIFE_DAYS);
 
         let mut context = String::from("[Memory context]\n");
         for entry in entries {

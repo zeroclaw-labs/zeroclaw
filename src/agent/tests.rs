@@ -736,6 +736,20 @@ async fn native_dispatcher_sends_tool_specs() {
     assert!(dispatcher.should_send_tool_specs());
 }
 
+#[test]
+fn agent_tool_specs_accessor_exposes_registered_tools() {
+    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let specs = agent.tool_specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].name, "echo");
+}
+
 #[tokio::test]
 async fn xml_dispatcher_does_not_send_tool_specs() {
     let dispatcher = XmlToolDispatcher;
