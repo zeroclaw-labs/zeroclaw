@@ -44,13 +44,18 @@ pub mod registry;
 pub mod runtime;
 pub mod traits;
 
+#[allow(unused_imports)]
 pub use discovery::discover_plugins;
+#[allow(unused_imports)]
 pub use loader::load_plugins;
+#[allow(unused_imports)]
 pub use manifest::{PluginManifest, PLUGIN_MANIFEST_FILENAME};
+#[allow(unused_imports)]
 pub use registry::{
     DiagnosticLevel, PluginDiagnostic, PluginHookRegistration, PluginOrigin, PluginRecord,
     PluginRegistry, PluginStatus, PluginToolRegistration,
 };
+#[allow(unused_imports)]
 pub use traits::{Plugin, PluginApi, PluginCapability, PluginLogger};
 
 #[cfg(test)]

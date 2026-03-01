@@ -20,6 +20,15 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
+    let msg = err.to_string();
+    let msg_lower = msg.to_lowercase();
+
+    // Tool-schema/mapper incompatibility (including vendor 516 wrappers)
+    // is deterministic: retries won't fix an unsupported request shape.
+    if super::has_native_tool_schema_rejection_hint(&msg_lower) {
+        return true;
+    }
+
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -30,7 +39,6 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some providers
     // embed codes in error messages rather than returning typed HTTP errors).
-    let msg = err.to_string();
     for word in msg.split(|c: char| !c.is_ascii_digit()) {
         if let Ok(code) = word.parse::<u16>() {
             if (400..500).contains(&code) {
@@ -41,7 +49,6 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
     // is available (e.g. gRPC or custom transport errors).
-    let msg_lower = msg.to_lowercase();
     let auth_failure_hints = [
         "invalid api key",
         "incorrect api key",
@@ -1138,6 +1145,9 @@ mod tests {
         assert!(is_non_retryable(&anyhow::anyhow!("403 Forbidden")));
         assert!(is_non_retryable(&anyhow::anyhow!("404 Not Found")));
         assert!(is_non_retryable(&anyhow::anyhow!(
+            "516 mapper tool schema mismatch: unknown parameter: tools"
+        )));
+        assert!(is_non_retryable(&anyhow::anyhow!(
             "invalid api key provided"
         )));
         assert!(is_non_retryable(&anyhow::anyhow!("authentication failed")));
@@ -1153,6 +1163,9 @@ mod tests {
             "500 Internal Server Error"
         )));
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
+        assert!(!is_non_retryable(&anyhow::anyhow!(
+            "516 upstream gateway temporarily unavailable"
+        )));
         assert!(!is_non_retryable(&anyhow::anyhow!("timeout")));
         assert!(!is_non_retryable(&anyhow::anyhow!("connection reset")));
         assert!(!is_non_retryable(&anyhow::anyhow!(
@@ -1747,6 +1760,61 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "must not retry non-retryable 429 business errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tool_schema_rejection_skips_retries_for_516() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "API error (516 <unknown status code>): mapper validation failed: tool schema mismatch",
+                }),
+            )],
+            5,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(
+            result.is_err(),
+            "516 tool-schema incompatibility should fail quickly without retries"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "tool-schema mismatch must not consume retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_516_without_schema_hint_remains_retryable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 1,
+                    response: "recovered",
+                    error: "API error (516 <unknown status code>): upstream gateway unavailable",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "generic 516 without schema hint should still retry once and recover"
         );
     }
 

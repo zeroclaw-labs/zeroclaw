@@ -85,6 +85,7 @@ pub mod web_search_tool;
 pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
+#[allow(unused_imports)]
 pub use bg_run::{
     format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
 };

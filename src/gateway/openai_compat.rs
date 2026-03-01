@@ -22,6 +22,29 @@ use uuid::Uuid;
 /// Chat histories with many messages can be much larger than the default 64KB gateway limit.
 pub const CHAT_COMPLETIONS_MAX_BODY_SIZE: usize = 524_288;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiAuthRejection {
+    MissingPairingToken,
+    NonLocalWithoutAuthLayer,
+}
+
+fn evaluate_openai_gateway_auth(
+    pairing_required: bool,
+    is_loopback_request: bool,
+    has_valid_pairing_token: bool,
+    has_webhook_secret: bool,
+) -> Option<OpenAiAuthRejection> {
+    if pairing_required {
+        return (!has_valid_pairing_token).then_some(OpenAiAuthRejection::MissingPairingToken);
+    }
+
+    if !is_loopback_request && !has_webhook_secret && !has_valid_pairing_token {
+        return Some(OpenAiAuthRejection::NonLocalWithoutAuthLayer);
+    }
+
+    None
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // REQUEST / RESPONSE TYPES
 // ══════════════════════════════════════════════════════════════════════════════
@@ -142,14 +165,23 @@ pub async fn handle_v1_chat_completions(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
     }
 
-    // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim();
+    let has_valid_pairing_token = !token.is_empty() && state.pairing.is_authenticated(token);
+    let is_loopback_request =
+        super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+
+    match evaluate_openai_gateway_auth(
+        state.pairing.require_pairing(),
+        is_loopback_request,
+        has_valid_pairing_token,
+        state.webhook_secret_hash.is_some(),
+    ) {
+        Some(OpenAiAuthRejection::MissingPairingToken) => {
             tracing::warn!("/v1/chat/completions: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": {
@@ -160,6 +192,18 @@ pub async fn handle_v1_chat_completions(
             });
             return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
         }
+        Some(OpenAiAuthRejection::NonLocalWithoutAuthLayer) => {
+            tracing::warn!("/v1/chat/completions: rejected unauthenticated non-loopback request");
+            let err = serde_json::json!({
+                "error": {
+                    "message": "Unauthorized — configure pairing or X-Webhook-Secret for non-local access",
+                    "type": "invalid_request_error",
+                    "code": "unauthorized"
+                }
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+        }
+        None => {}
     }
 
     // ── Enforce body size limit (since this route uses a separate limit) ──
@@ -551,16 +595,26 @@ fn handle_streaming(
 /// GET /v1/models — List available models.
 pub async fn handle_v1_models(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim();
+    let has_valid_pairing_token = !token.is_empty() && state.pairing.is_authenticated(token);
+    let is_loopback_request =
+        super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+
+    match evaluate_openai_gateway_auth(
+        state.pairing.require_pairing(),
+        is_loopback_request,
+        has_valid_pairing_token,
+        state.webhook_secret_hash.is_some(),
+    ) {
+        Some(OpenAiAuthRejection::MissingPairingToken) => {
             let err = serde_json::json!({
                 "error": {
                     "message": "Invalid API key",
@@ -570,6 +624,17 @@ pub async fn handle_v1_models(
             });
             return (StatusCode::UNAUTHORIZED, Json(err));
         }
+        Some(OpenAiAuthRejection::NonLocalWithoutAuthLayer) => {
+            let err = serde_json::json!({
+                "error": {
+                    "message": "Unauthorized — configure pairing or X-Webhook-Secret for non-local access",
+                    "type": "invalid_request_error",
+                    "code": "unauthorized"
+                }
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+        None => {}
     }
 
     let response = ModelsResponse {
@@ -854,5 +919,38 @@ mod tests {
             &leak_guard,
         );
         assert!(output.contains("AKIAABCDEFGHIJKLMNOP"));
+    }
+
+    #[test]
+    fn evaluate_openai_gateway_auth_requires_pairing_token_when_pairing_is_enabled() {
+        assert_eq!(
+            evaluate_openai_gateway_auth(true, true, false, false),
+            Some(OpenAiAuthRejection::MissingPairingToken)
+        );
+        assert_eq!(evaluate_openai_gateway_auth(true, false, true, false), None);
+    }
+
+    #[test]
+    fn evaluate_openai_gateway_auth_rejects_public_without_auth_layer_when_pairing_disabled() {
+        assert_eq!(
+            evaluate_openai_gateway_auth(false, false, false, false),
+            Some(OpenAiAuthRejection::NonLocalWithoutAuthLayer)
+        );
+    }
+
+    #[test]
+    fn evaluate_openai_gateway_auth_allows_loopback_or_secondary_auth_layer() {
+        assert_eq!(
+            evaluate_openai_gateway_auth(false, true, false, false),
+            None
+        );
+        assert_eq!(
+            evaluate_openai_gateway_auth(false, false, true, false),
+            None
+        );
+        assert_eq!(
+            evaluate_openai_gateway_auth(false, false, false, true),
+            None
+        );
     }
 }

@@ -34,7 +34,6 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-serde_ignored = "0.1"
 
 # Config
 directories = "6.0"
@@ -248,8 +247,9 @@ panic = "abort"      # Reduce binary size
 
 [profile.release-fast]
 inherits = "release"
-codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
-                     # Use: cargo build --profile release-fast
+# Keep release-fast under CI binary size safeguard (20MB hard gate).
+# Using 1 codegen unit preserves release-level size characteristics.
+codegen-units = 1
 
 [profile.dist]
 inherits = "release"

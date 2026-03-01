@@ -3,6 +3,22 @@
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
+## 0) Session Default Target (Mandatory)
+
+- When operator intent does not explicitly specify another repository/path, treat the active coding target as this repository (`/home/ubuntu/zeroclaw`).
+- Do not switch to or implement in other repositories unless the operator explicitly requests that scope in the current conversation.
+- Ambiguous wording (for example "这个仓库", "当前项目", "the repo") is resolved to `/home/ubuntu/zeroclaw` by default.
+- Context mentioning external repositories does not authorize cross-repo edits; explicit current-turn override is required.
+- Before any repo-affecting action, verify target lock (`pwd` + git root) to prevent accidental execution in sibling repositories.
+
+## 0.1) Clean Worktree First Gate (Mandatory)
+
+- Before handling any repository content (analysis, debugging, coding, tests, docs, CI), create a **new clean dedicated git worktree** for the active task.
+- Do not perform substantive task work in a dirty workspace.
+- Do not reuse a previously dirty worktree for a new task track.
+- If the current location is dirty, stop and bootstrap a clean worktree/branch first.
+- If worktree bootstrap fails, stop and report the blocker; do not continue in-place.
+
 ## 1) Project Snapshot (Read First)
 
 ZeroClaw is a Rust-first autonomous agent runtime optimized for:

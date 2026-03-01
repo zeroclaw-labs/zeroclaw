@@ -50,7 +50,7 @@ jobs:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, aws-india, Linux]
         timeout-minutes: 40
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -74,7 +74,7 @@ jobs:
         name: Test
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, aws-india, Linux]
         timeout-minutes: 60
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -137,7 +137,7 @@ jobs:
         name: Build (Smoke)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, aws-india, Linux]
         timeout-minutes: 35
 
         steps:
@@ -150,7 +150,10 @@ jobs:
                   prefix-key: ci-run-build
                   cache-targets: true
             - name: Build binary (smoke check)
-              run: cargo build --profile release-fast --locked --verbose
+              env:
+                  CARGO_BUILD_JOBS: 2
+                  CI_SMOKE_BUILD_ATTEMPTS: 3
+              run: bash scripts/ci/smoke_build_retry.sh
             - name: Check binary size
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
