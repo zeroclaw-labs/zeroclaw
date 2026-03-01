@@ -20,4 +20,5 @@ Source anglaise:
 ## Notes de mise à jour
 
 - Ajout de `provider.reasoning_level` (OpenAI Codex `/responses`). Voir la source anglaise pour les détails.
+- `runtime.reasoning_enabled` prend désormais en charge Qwen (tous alias, API DashScope) via le champ `enable_thinking`. Le comportement Ollama (`think`) reste inchangé. Voir la source anglaise pour les détails.
 - Valeur par défaut de `agent.max_tool_iterations` augmentée à `20` (fallback sûr si `0`).

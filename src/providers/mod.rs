@@ -2505,6 +2505,45 @@ mod tests {
     }
 
     #[test]
+    fn factory_qwen_reasoning_enabled_wired_for_all_aliases() {
+        // Verify that `reasoning_enabled` from ProviderRuntimeOptions is accepted by both
+        // the `qwen_base_url` catch-all branch and the `is_qwen_oauth_alias` branch without
+        // error. The builder-level propagation is covered in compatible.rs unit tests.
+        let opts_off = ProviderRuntimeOptions {
+            reasoning_enabled: Some(false),
+            ..ProviderRuntimeOptions::default()
+        };
+        let opts_on = ProviderRuntimeOptions {
+            reasoning_enabled: Some(true),
+            ..ProviderRuntimeOptions::default()
+        };
+        // qwen_base_url branch (CN, intl, US, coding-plan)
+        for alias in &[
+            "qwen",
+            "dashscope",
+            "qwen-intl",
+            "qwen-us",
+            "qwen-coding-plan",
+        ] {
+            assert!(
+                create_provider_with_options(alias, Some("key"), &opts_off).is_ok(),
+                "reasoning_enabled=false should not error for alias '{alias}'"
+            );
+            assert!(
+                create_provider_with_options(alias, Some("key"), &opts_on).is_ok(),
+                "reasoning_enabled=true should not error for alias '{alias}'"
+            );
+        }
+        // is_qwen_oauth_alias branch
+        for alias in &["qwen-code", "qwen-oauth", "qwen_oauth"] {
+            assert!(
+                create_provider_with_options(alias, Some("key"), &opts_off).is_ok(),
+                "reasoning_enabled=false should not error for oauth alias '{alias}'"
+            );
+        }
+    }
+
+    #[test]
     fn qwen_provider_supports_vision() {
         let provider = create_provider("qwen", Some("key")).expect("qwen provider should build");
         assert!(provider.supports_vision());

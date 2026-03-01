@@ -418,7 +418,11 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
-    /// Qwen/DashScope only: explicit thinking mode toggle.
+    /// Qwen/DashScope only: explicit thinking mode toggle (`enable_thinking` request field).
+    /// Lives in this shared struct rather than a Qwen-specific type because `OpenAiCompatibleProvider`
+    /// is the single request builder for all OpenAI-compatible providers; a separate per-provider
+    /// request type would require a new trait or enum indirection (YAGNI). Safety: `skip_serializing_if`
+    /// guarantees the field is omitted entirely for non-Qwen providers whose `reasoning_enabled` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
 }
@@ -615,7 +619,9 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
-    /// Qwen/DashScope only: explicit thinking mode toggle.
+    /// Qwen/DashScope only: explicit thinking mode toggle (`enable_thinking` request field).
+    /// Same rationale as in `ApiChatRequest`: lives here to avoid per-provider request types;
+    /// omitted via `skip_serializing_if` for all providers where `reasoning_enabled` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
 }
