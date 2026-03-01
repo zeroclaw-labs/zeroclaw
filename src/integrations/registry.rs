@@ -1,7 +1,7 @@
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
 use crate::providers::{
     is_doubao_alias, is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias,
-    is_qwen_alias, is_siliconflow_alias, is_zai_alias,
+    is_qwen_alias, is_siliconflow_alias, is_stepfun_alias, is_zai_alias,
 };
 
 /// Returns the full catalog of integrations
@@ -346,6 +346,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref().is_some_and(is_moonshot_alias) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "StepFun",
+            description: "Step 3, Step 3.5 Flash, and vision models",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if c.default_provider.as_deref().is_some_and(is_stepfun_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -1017,6 +1029,13 @@ mod tests {
         let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
         assert!(matches!(
             (moonshot.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("step-ai".to_string());
+        let stepfun = entries.iter().find(|e| e.name == "StepFun").unwrap();
+        assert!(matches!(
+            (stepfun.status_fn)(&config),
             IntegrationStatus::Active
         ));
 

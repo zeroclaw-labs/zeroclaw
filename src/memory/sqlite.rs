@@ -813,7 +813,10 @@ impl Memory for SqliteMemory {
             .unwrap_or(false)
     }
 
-    async fn reindex(&self, progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>) -> anyhow::Result<usize> {
+    async fn reindex(
+        &self,
+        progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    ) -> anyhow::Result<usize> {
         // Step 1: Get all memory entries
         let entries = self.list(None, None).await?;
         let total = entries.len();

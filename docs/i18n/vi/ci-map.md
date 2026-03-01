@@ -105,7 +105,7 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 8. Cảnh báo drift tính tái lập build: kiểm tra artifact của `.github/workflows/ci-reproducible-build.yml`.
 9. Lỗi provenance/ký số: kiểm tra log và bundle artifact của `.github/workflows/ci-supply-chain-provenance.yml`.
 10. Sự cố lập kế hoạch/thực thi rollback: kiểm tra summary + artifact `ci-rollback-plan` của `.github/workflows/ci-rollback.yml`.
-11. PR intake thất bại: kiểm tra comment sticky `.github/workflows/pr-intake-checks.yml` và run log.
+11. PR intake thất bại: kiểm tra comment sticky `.github/workflows/pr-intake-checks.yml` và run log. Nếu policy intake vừa thay đổi, hãy kích hoạt sự kiện `pull_request_target` mới (ví dụ close/reopen PR) vì `Re-run jobs` có thể dùng lại snapshot workflow cũ.
 12. Lỗi parity chính sách nhãn: kiểm tra `.github/workflows/pr-label-policy-check.yml`.
 13. Lỗi tài liệu trong CI: kiểm tra log job `docs-quality` trong `.github/workflows/ci-run.yml`.
 14. Lỗi strict delta lint trong CI: kiểm tra log job `lint-strict-delta` và so sánh với phạm vi diff `BASE_SHA`.
@@ -115,7 +115,8 @@ Các kiểm tra chặn merge nên giữ nhỏ và mang tính quyết định. C�
 
 - Giữ các kiểm tra chặn merge mang tính quyết định và tái tạo được (`--locked` khi áp dụng được).
 - Đảm bảo tương thích merge queue bằng cách hỗ trợ `merge_group` cho các workflow bắt buộc (`ci-run`, `sec-audit`, `sec-codeql`).
-- Bắt buộc PR liên kết với Linear issue key (`RMN-*`/`CDV-*`/`COM-*`) qua PR intake checks.
+- Khuyến nghị PR liên kết với Linear issue key (`RMN-*`/`CDV-*`/`COM-*`) khi có để truy vết (PR intake checks chỉ cảnh báo, không chặn merge).
+- Với backfill PR intake, ưu tiên kích hoạt sự kiện PR mới thay vì rerun run cũ để đảm bảo check đánh giá theo snapshot workflow/script mới nhất.
 - Bắt buộc entry `advisories.ignore` trong `deny.toml` dùng object có `id` + `reason` (được kiểm tra bởi `deny_policy_guard.py`).
 - Giữ metadata governance cho deny ignore trong `.github/security/deny-ignore-governance.json` luôn cập nhật (owner/reason/expiry/ticket được kiểm tra bởi `deny_policy_guard.py`).
 - Giữ metadata quản trị allowlist gitleaks trong `.github/security/gitleaks-allowlist-governance.json` luôn cập nhật (owner/reason/expiry/ticket được kiểm tra bởi `secrets_governance_guard.py`).

@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import http.server
 import json
+import os
 import shutil
 import socket
 import socketserver
@@ -408,6 +409,79 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         report = json.loads(out_json.read_text(encoding="utf-8"))
         self.assertEqual(report["classification"], "persistent_failure")
+
+    def test_smoke_build_retry_retries_transient_143_once(self) -> None:
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        counter = self.tmp / "cargo-counter.txt"
+
+        fake_cargo = fake_bin / "cargo"
+        fake_cargo.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                counter="${FAKE_CARGO_COUNTER:?}"
+                attempts=0
+                if [ -f "$counter" ]; then
+                  attempts="$(cat "$counter")"
+                fi
+                attempts="$((attempts + 1))"
+                printf '%s' "$attempts" > "$counter"
+                if [ "$attempts" -eq 1 ]; then
+                  exit 143
+                fi
+                exit 0
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_cargo.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+        env["FAKE_CARGO_COUNTER"] = str(counter)
+        env["CI_SMOKE_BUILD_ATTEMPTS"] = "2"
+
+        proc = run_cmd(["bash", self._script("smoke_build_retry.sh")], env=env, cwd=ROOT)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+        self.assertIn("Retrying", proc.stdout)
+
+    def test_smoke_build_retry_fails_immediately_on_non_retryable_code(self) -> None:
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        counter = self.tmp / "cargo-counter.txt"
+
+        fake_cargo = fake_bin / "cargo"
+        fake_cargo.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                counter="${FAKE_CARGO_COUNTER:?}"
+                attempts=0
+                if [ -f "$counter" ]; then
+                  attempts="$(cat "$counter")"
+                fi
+                attempts="$((attempts + 1))"
+                printf '%s' "$attempts" > "$counter"
+                exit 101
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_cargo.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+        env["FAKE_CARGO_COUNTER"] = str(counter)
+        env["CI_SMOKE_BUILD_ATTEMPTS"] = "3"
+
+        proc = run_cmd(["bash", self._script("smoke_build_retry.sh")], env=env, cwd=ROOT)
+        self.assertEqual(proc.returncode, 101)
+        self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+        self.assertIn("failed with exit code 101", proc.stdout)
 
     def test_deny_policy_guard_detects_invalid_entries(self) -> None:
         deny_path = self.tmp / "deny.toml"
@@ -3871,6 +3945,64 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["counts"]["candidate_runs_before_cap"], 0)
         self.assertEqual(report["planned_actions"], [])
         self.assertEqual(report["policies"]["non_pr_key"], "sha")
+
+    def test_queue_hygiene_apply_requires_authentication_token(self) -> None:
+        runs_json = self.tmp / "runs-apply-auth.json"
+        output_json = self.tmp / "queue-hygiene-apply-auth.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 401,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-401",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 402,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-402",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        isolated_home = self.tmp / "isolated-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        isolated_xdg = self.tmp / "isolated-xdg"
+        isolated_xdg.mkdir(parents=True, exist_ok=True)
+
+        env = dict(os.environ)
+        env["GH_TOKEN"] = ""
+        env["GITHUB_TOKEN"] = ""
+        env["HOME"] = str(isolated_home)
+        env["XDG_CONFIG_HOME"] = str(isolated_xdg)
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--dedupe-workflow",
+                "CI Run",
+                "--apply",
+                "--output-json",
+                str(output_json),
+            ],
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("requires authentication token", proc.stderr.lower())
 
 
 if __name__ == "__main__":  # pragma: no cover
