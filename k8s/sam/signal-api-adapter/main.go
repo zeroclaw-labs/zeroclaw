@@ -122,6 +122,127 @@ func toSSEPayload(item json.RawMessage) ([]byte, bool) {
   return out, err == nil
 }
 
+// fetchAttachmentData calls the signal-cli daemon's getAttachment JSON-RPC
+// method and returns the Base64-encoded attachment content.
+func fetchAttachmentData(ctx context.Context, account, attachmentID, recipient string) (string, error) {
+	params := map[string]any{
+		"id":      attachmentID,
+		"account": account,
+	}
+	if recipient != "" {
+		params["recipient"] = recipient
+	}
+	paramsJSON, _ := json.Marshal(params)
+
+	rpcReq := rpcRequest{
+		JSONRPC: "2.0",
+		Method:  "getAttachment",
+		Params:  json.RawMessage(paramsJSON),
+		ID:      1,
+	}
+	buf, _ := json.Marshal(rpcReq)
+
+	resp, body, err := bridgeRequest(ctx, http.MethodPost, "/api/v1/rpc",
+		bytes.NewReader(buf), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return "", fmt.Errorf("getAttachment request: %w", err)
+	}
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("getAttachment status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var rpcResp struct {
+		Result any       `json:"result"`
+		Error  *rpcError `json:"error"`
+	}
+	if err := json.Unmarshal(body, &rpcResp); err != nil {
+		return "", fmt.Errorf("getAttachment unmarshal: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return "", fmt.Errorf("getAttachment rpc error: %s", rpcResp.Error.Message)
+	}
+
+	switch v := rpcResp.Result.(type) {
+	case string:
+		return v, nil
+	case map[string]any:
+		if data, ok := v["data"].(string); ok {
+			return data, nil
+		}
+	}
+	return "", fmt.Errorf("getAttachment: unexpected result type %T", rpcResp.Result)
+}
+
+// enrichAttachmentsInDataMessage fetches binary data for each attachment in a
+// dataMessage map and injects it as a "data" field.
+func enrichAttachmentsInDataMessage(ctx context.Context, account, source string, dataMsg map[string]any) {
+	attachments, _ := dataMsg["attachments"].([]any)
+	if len(attachments) == 0 {
+		return
+	}
+	for i, att := range attachments {
+		attMap, ok := att.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := attMap["id"].(string)
+		if id == "" {
+			continue
+		}
+		data, err := fetchAttachmentData(ctx, account, id, source)
+		if err != nil {
+			log.Printf("enrichAttachments: id=%s err=%v", id, err)
+			continue
+		}
+		attMap["data"] = data
+		attachments[i] = attMap
+	}
+}
+
+// enrichAttachments parses a message envelope, fetches attachment data from
+// the signal-cli daemon, and returns the enriched JSON.
+func enrichAttachments(ctx context.Context, account string, raw json.RawMessage) json.RawMessage {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return raw
+	}
+
+	// The envelope may be at the top level (REST / polling responses) or
+	// nested inside "params" (JSON-RPC notifications from SSE/WebSocket).
+	envelope, _ := obj["envelope"].(map[string]any)
+	if envelope == nil {
+		if params, ok := obj["params"].(map[string]any); ok {
+			envelope, _ = params["envelope"].(map[string]any)
+		}
+	}
+	if envelope == nil {
+		return raw
+	}
+	log.Printf("enrichAttachments: processing envelope from=%v", envelope["sourceNumber"])
+
+	source, _ := envelope["sourceNumber"].(string)
+
+	// Direct messages.
+	if dm, ok := envelope["dataMessage"].(map[string]any); ok {
+		enrichAttachmentsInDataMessage(ctx, account, source, dm)
+	}
+
+	// Sync messages (messages sent from another linked device).
+	if sm, ok := envelope["syncMessage"].(map[string]any); ok {
+		if sent, ok := sm["sentMessage"].(map[string]any); ok {
+			if dm, ok := sent["dataMessage"].(map[string]any); ok {
+				enrichAttachmentsInDataMessage(ctx, account, source, dm)
+			}
+		}
+	}
+
+	enriched, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return enriched
+}
+
 func handleEvents(w http.ResponseWriter, r *http.Request) {
   account := strings.TrimSpace(r.URL.Query().Get("account"))
   if account == "" {
@@ -205,24 +326,43 @@ func streamEventsFromSSEEndpoint(ctx context.Context, account string, w http.Res
     }
   }()
 
-  scanner := bufio.NewScanner(resp.Body)
-  buf := make([]byte, 0, 64*1024)
-  scanner.Buffer(buf, 1024*1024)
-  for scanner.Scan() {
-    if ctx.Err() != nil {
-      return ctx.Err()
-    }
-    line := scanner.Text()
-    _, _ = w.Write([]byte(line))
-    _, _ = w.Write([]byte("\n"))
-    if line == "" || strings.HasPrefix(line, "data:") || strings.HasPrefix(line, ":") {
-      flusher.Flush()
-    }
-  }
-  if err := scanner.Err(); err != nil {
-    return err
-  }
-  return nil
+	scanner := bufio.NewScanner(resp.Body)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	var dataBuf strings.Builder
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		line := scanner.Text()
+
+		// Buffer data lines; enrich and flush on blank line (end of event).
+		if strings.HasPrefix(line, "data:") {
+			dataBuf.WriteString(strings.TrimPrefix(line, "data:"))
+			continue
+		}
+		if line == "" && dataBuf.Len() > 0 {
+			raw := json.RawMessage(strings.TrimSpace(dataBuf.String()))
+			dataBuf.Reset()
+			enriched := enrichAttachments(ctx, account, raw)
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(enriched)
+			_, _ = w.Write([]byte("\n\n"))
+			flusher.Flush()
+			continue
+		}
+
+		// Pass through comments and other lines as-is.
+		_, _ = w.Write([]byte(line))
+		_, _ = w.Write([]byte("\n"))
+		if line == "" || strings.HasPrefix(line, ":") {
+			flusher.Flush()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func streamEventsOverWebsocket(ctx context.Context, account string, w http.ResponseWriter, flusher http.Flusher) error {
@@ -253,15 +393,16 @@ func streamEventsOverWebsocket(ctx context.Context, account string, w http.Respo
       continue
     }
 
-    payload, ok := toSSEPayload(json.RawMessage(msg))
-    if !ok {
-      continue
-    }
-    _, _ = w.Write([]byte("data: "))
-    _, _ = w.Write(payload)
-    _, _ = w.Write([]byte("\n\n"))
-    flusher.Flush()
-  }
+		enriched := enrichAttachments(ctx, account, json.RawMessage(msg))
+		payload, ok := toSSEPayload(enriched)
+		if !ok {
+			continue
+		}
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(payload)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+	}
 }
 
 func streamEventsByPolling(ctx context.Context, account string, w http.ResponseWriter, flusher http.Flusher) error {
@@ -303,8 +444,9 @@ func streamEventsByPolling(ctx context.Context, account string, w http.ResponseW
       arr = []json.RawMessage{trimmed}
     }
 
-    for _, item := range arr {
-      payload, ok := toSSEPayload(item)
+		for _, item := range arr {
+			enriched := enrichAttachments(ctx, account, item)
+			payload, ok := toSSEPayload(enriched)
       if !ok {
         continue
       }

@@ -316,9 +316,10 @@ spec:
               # Redirect stdin from /dev/null so process.stdin.resume() inside
               # the daemon doesn't trigger SIGTTIN when run in background.
               node /opt/sam-tools/npm-global/lib/node_modules/agent-browser/dist/daemon.js </dev/null &
-              # Wait up to 120s for the socket to appear before starting zeroclaw.
+              # Wait up to 180s for the socket to appear before starting zeroclaw.
+              # Cold starts on NFS-backed volumes can take ~140s for Playwright init.
               echo "Waiting for agent-browser daemon socket..."
-              for _i in $(seq 1 120); do
+              for _i in $(seq 1 180); do
                 [ -S /tmp/agent-browser/default.sock ] && echo "Daemon ready." && break
                 sleep 1
               done
