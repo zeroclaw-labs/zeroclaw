@@ -17,6 +17,24 @@ mkdir -p "${OUTPUT_DIR}"
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
 artifact_path="target/${host_target}/${PROFILE}/${BINARY_NAME}"
 
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${file}" | awk '{print $NF}'
+    return 0
+  fi
+  echo "no SHA256 tool found (need sha256sum, shasum, or openssl)" >&2
+  exit 5
+}
+
 build_once() {
   local pass="$1"
   cargo clean
@@ -26,7 +44,7 @@ build_once() {
     exit 2
   fi
   cp "${artifact_path}" "${OUTPUT_DIR}/repro-build-${pass}.bin"
-  sha256sum "${OUTPUT_DIR}/repro-build-${pass}.bin" | awk '{print $1}'
+  sha256_file "${OUTPUT_DIR}/repro-build-${pass}.bin"
 }
 
 extract_build_id() {
