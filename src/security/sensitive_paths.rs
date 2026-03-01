@@ -7,6 +7,7 @@ const SENSITIVE_EXACT_FILENAMES: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".git-credentials",
+    "config.toml",
     "credentials",
     "credentials.json",
     "auth-profiles.json",
@@ -75,6 +76,8 @@ mod tests {
         assert!(is_sensitive_file_path(Path::new(".env")));
         assert!(is_sensitive_file_path(Path::new("ID_RSA")));
         assert!(is_sensitive_file_path(Path::new("credentials.json")));
+        assert!(is_sensitive_file_path(Path::new("config.toml")));
+        assert!(is_sensitive_file_path(Path::new("CONFIG.TOML")));
     }
 
     #[test]
