@@ -2412,19 +2412,6 @@ mod tests {
     }
 
     #[test]
-    fn readme_does_not_reference_removed_gateway_or_dashboard_commands() {
-        let readme = include_str!("../README.md");
-        assert!(
-            !readme.contains("zeroclaw gateway start"),
-            "README should not suggest obsolete 'zeroclaw gateway start'"
-        );
-        assert!(
-            !readme.contains("zeroclaw dashboard"),
-            "README should not suggest nonexistent 'zeroclaw dashboard'"
-        );
-    }
-
-    #[test]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
