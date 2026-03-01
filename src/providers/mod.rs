@@ -819,6 +819,57 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// True when HTTP status indicates request-shape/schema rejection for native tools.
+///
+/// 516 is included for OpenAI-compatible providers that surface mapper/schema
+/// errors via vendor-specific status codes instead of standard 4xx.
+pub(crate) fn is_native_tool_schema_rejection_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) || status.as_u16() == 516
+}
+
+/// Detect request-mapper/tool-schema incompatibility hints in provider errors.
+pub(crate) fn has_native_tool_schema_rejection_hint(error: &str) -> bool {
+    let lower = error.to_lowercase();
+
+    let direct_hints = [
+        "unknown parameter: tools",
+        "unsupported parameter: tools",
+        "unrecognized field `tools`",
+        "does not support tools",
+        "function calling is not supported",
+        "unknown parameter: tool_choice",
+        "unsupported parameter: tool_choice",
+        "unrecognized field `tool_choice`",
+        "invalid parameter: tool_choice",
+    ];
+    if direct_hints.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    let mapper_tool_schema_hint = lower.contains("mapper")
+        && (lower.contains("tool") || lower.contains("function"))
+        && (lower.contains("schema")
+            || lower.contains("parameter")
+            || lower.contains("validation"));
+    if mapper_tool_schema_hint {
+        return true;
+    }
+
+    lower.contains("tool schema")
+        && (lower.contains("mismatch")
+            || lower.contains("unsupported")
+            || lower.contains("invalid")
+            || lower.contains("incompatible"))
+}
+
+/// Combined predicate for native tool-schema rejection.
+pub(crate) fn is_native_tool_schema_rejection(status: reqwest::StatusCode, error: &str) -> bool {
+    is_native_tool_schema_rejection_status(status) && has_native_tool_schema_rejection_hint(error)
+}
+
 /// Build a sanitized provider error from a failed HTTP response.
 pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
@@ -3036,6 +3087,67 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn native_tool_schema_rejection_status_covers_vendor_516() {
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code")
+        ));
+        assert!(!is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn native_tool_schema_rejection_hint_is_precise() {
+        assert!(has_native_tool_schema_rejection_hint(
+            "unknown parameter: tools"
+        ));
+        assert!(has_native_tool_schema_rejection_hint(
+            "mapper validation failed: tool schema is incompatible"
+        ));
+        let long_prefix = "x".repeat(300);
+        let long_hint = format!("{long_prefix} unknown parameter: tools");
+        assert!(has_native_tool_schema_rejection_hint(&long_hint));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "upstream gateway unavailable"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "temporary network timeout while contacting provider"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "tool_choice was set to auto by default policy"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "available tools: shell, weather, browser"
+        ));
+    }
+
+    #[test]
+    fn native_tool_schema_rejection_combines_status_and_hint() {
+        assert!(is_native_tool_schema_rejection(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "unknown parameter: tools"
+        ));
+        assert!(is_native_tool_schema_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            "unsupported parameter: tool_choice"
+        ));
+        assert!(!is_native_tool_schema_rejection(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "unknown parameter: tools"
+        ));
+        assert!(!is_native_tool_schema_rejection(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "upstream gateway unavailable"
+        ));
+    }
 
     #[test]
     fn sanitize_scrubs_sk_prefix() {

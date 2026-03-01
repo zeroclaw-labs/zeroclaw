@@ -388,6 +388,37 @@ impl OpenAiCompatibleProvider {
             })
             .collect()
     }
+
+    fn openai_tools_to_tool_specs(tools: &[serde_json::Value]) -> Vec<crate::tools::ToolSpec> {
+        tools
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                let name = function.get("name")?.as_str()?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+
+                let description = function
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("No description provided")
+                    .to_string();
+                let parameters = function.get("parameters").cloned().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                });
+
+                Some(crate::tools::ToolSpec {
+                    name: name.to_string(),
+                    description,
+                    parameters,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1584,24 +1615,27 @@ impl OpenAiCompatibleProvider {
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
-        if !matches!(
-            status,
-            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
-        ) {
-            return false;
-        }
+        super::is_native_tool_schema_rejection(status, error)
+    }
 
-        let lower = error.to_lowercase();
-        [
-            "unknown parameter: tools",
-            "unsupported parameter: tools",
-            "unrecognized field `tools`",
-            "does not support tools",
-            "function calling is not supported",
-            "tool_choice",
-        ]
-        .iter()
-        .any(|hint| lower.contains(hint))
+    async fn prompt_guided_tools_fallback(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[crate::tools::ToolSpec]>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let fallback_messages = Self::with_prompt_guided_tool_instructions(messages, tools);
+        let text = self
+            .chat_with_history(&fallback_messages, model, temperature)
+            .await?;
+        Ok(ProviderChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+            quota_metadata: None,
+        })
     }
 }
 
@@ -1955,6 +1989,21 @@ impl Provider for OpenAiCompatibleProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let error = response.text().await?;
+            let sanitized = super::sanitize_api_error(&error);
+
+            if Self::is_native_tool_schema_unsupported(status, &error) {
+                let fallback_tool_specs = Self::openai_tools_to_tool_specs(tools);
+                return self
+                    .prompt_guided_tools_fallback(
+                        messages,
+                        (!fallback_tool_specs.is_empty()).then_some(fallback_tool_specs.as_slice()),
+                        model,
+                        temperature,
+                    )
+                    .await;
+            }
+
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
                     .chat_via_responses_chat(
@@ -1965,7 +2014,8 @@ impl Provider for OpenAiCompatibleProvider {
                     )
                     .await;
             }
-            return Err(super::api_error(&self.name, response).await);
+
+            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
         let body = response.text().await?;
@@ -2090,19 +2140,15 @@ impl Provider for OpenAiCompatibleProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
-                let fallback_messages =
-                    Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
-                    .await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                    quota_metadata: None,
-                });
+            if Self::is_native_tool_schema_unsupported(status, &error) {
+                return self
+                    .prompt_guided_tools_fallback(
+                        request.messages,
+                        request.tools,
+                        model,
+                        temperature,
+                    )
+                    .await;
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
@@ -2273,6 +2319,10 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
@@ -2972,12 +3022,32 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             "unknown parameter: tools"
         ));
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "unknown parameter: tools"
+        ));
         assert!(
             !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
                 reqwest::StatusCode::UNAUTHORIZED,
                 "unknown parameter: tools"
             )
         );
+        assert!(
+            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+                "upstream gateway unavailable"
+            )
+        );
+        assert!(
+            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+                "tool_choice was set to auto by default policy"
+            )
+        );
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "mapper validation failed: tool schema is incompatible"
+        ));
     }
 
     #[test]
@@ -3156,6 +3226,30 @@ mod tests {
     }
 
     #[test]
+    fn openai_tools_convert_back_to_tool_specs_for_prompt_fallback() {
+        let openai_tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "weather_lookup",
+                "description": "Look up weather by city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": { "type": "string" }
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+
+        let specs = OpenAiCompatibleProvider::openai_tools_to_tool_specs(&openai_tools);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "weather_lookup");
+        assert_eq!(specs[0].description, "Look up weather by city");
+        assert_eq!(specs[0].parameters["required"][0], "city");
+    }
+
+    #[test]
     fn request_serializes_with_tools() {
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -3289,6 +3383,393 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("TestProvider API key not set"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_falls_back_on_http_516_tool_schema_error() {
+        #[derive(Clone, Default)]
+        struct NativeToolFallbackState {
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn chat_endpoint(
+            State(state): State<NativeToolFallbackState>,
+            Json(payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.requests.lock().await.push(payload.clone());
+
+            if payload.get("tools").is_some() {
+                let long_mapper_prefix = "x".repeat(260);
+                let error_message = format!("{long_mapper_prefix} unknown parameter: tools");
+                return (
+                    StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": error_message
+                        }
+                    })),
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "CALL weather_lookup {\"city\":\"Paris\"}"
+                        }
+                    }]
+                })),
+            )
+        }
+
+        let state = NativeToolFallbackState::default();
+        let app = Router::new()
+            .route("/chat/completions", post(chat_endpoint))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let provider = make_provider(
+            "TestProvider",
+            &format!("http://{}", addr),
+            Some("test-provider-key"),
+        );
+        let messages = vec![ChatMessage::user("check weather")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "weather_lookup",
+                "description": "Look up weather by city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": { "type": "string" }
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", 0.7)
+            .await
+            .expect("516 tool-schema rejection should trigger prompt-guided fallback");
+
+        assert_eq!(
+            result.text.as_deref(),
+            Some("CALL weather_lookup {\"city\":\"Paris\"}")
+        );
+        assert!(
+            result.tool_calls.is_empty(),
+            "prompt-guided fallback should return text without native tool_calls"
+        );
+
+        let requests = state.requests.lock().await;
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected native attempt + fallback attempt"
+        );
+
+        assert!(
+            requests[0].get("tools").is_some(),
+            "native attempt must include tools schema"
+        );
+        assert_eq!(
+            requests[0].get("tool_choice").and_then(|v| v.as_str()),
+            Some("auto")
+        );
+
+        assert!(
+            requests[1].get("tools").is_none(),
+            "fallback request should not include native tools"
+        );
+        assert!(
+            requests[1].get("tool_choice").is_none(),
+            "fallback request should omit native tool_choice"
+        );
+        let fallback_messages = requests[1]
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("fallback request should include messages");
+        let fallback_system = fallback_messages
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            .expect("fallback should prepend system tool instructions");
+        let fallback_system_text = fallback_system
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("fallback system prompt should be plain text");
+        assert!(fallback_system_text.contains("Available Tools"));
+        assert!(fallback_system_text.contains("weather_lookup"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn chat_falls_back_on_http_516_tool_schema_error() {
+        #[derive(Clone, Default)]
+        struct NativeToolFallbackState {
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn chat_endpoint(
+            State(state): State<NativeToolFallbackState>,
+            Json(payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.requests.lock().await.push(payload.clone());
+
+            if payload.get("tools").is_some() {
+                let long_mapper_prefix = "x".repeat(260);
+                let error_message =
+                    format!("{long_mapper_prefix} mapper validation failed: tool schema mismatch");
+                return (
+                    StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": error_message
+                        }
+                    })),
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "CALL weather_lookup {\"city\":\"Paris\"}"
+                        }
+                    }]
+                })),
+            )
+        }
+
+        let state = NativeToolFallbackState::default();
+        let app = Router::new()
+            .route("/chat/completions", post(chat_endpoint))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let provider = make_provider(
+            "TestProvider",
+            &format!("http://{}", addr),
+            Some("test-provider-key"),
+        );
+        let messages = vec![ChatMessage::user("check weather")];
+        let tools = vec![crate::tools::ToolSpec {
+            name: "weather_lookup".to_string(),
+            description: "Look up weather by city".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" }
+                },
+                "required": ["city"]
+            }),
+        }];
+
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "test-model",
+                0.7,
+            )
+            .await
+            .expect("chat() should fallback on HTTP 516 mapper tool-schema rejection");
+
+        assert_eq!(
+            result.text.as_deref(),
+            Some("CALL weather_lookup {\"city\":\"Paris\"}")
+        );
+        assert!(
+            result.tool_calls.is_empty(),
+            "prompt-guided fallback should return text without native tool_calls"
+        );
+
+        let requests = state.requests.lock().await;
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected native attempt + fallback attempt"
+        );
+        assert!(
+            requests[0].get("tools").is_some(),
+            "native attempt must include tools schema"
+        );
+        assert!(
+            requests[1].get("tools").is_none(),
+            "fallback request should not include native tools"
+        );
+        let fallback_messages = requests[1]
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("fallback request should include messages");
+        let fallback_system = fallback_messages
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            .expect("fallback should prepend system tool instructions");
+        let fallback_system_text = fallback_system
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("fallback system prompt should be plain text");
+        assert!(fallback_system_text.contains("Available Tools"));
+        assert!(fallback_system_text.contains("weather_lookup"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_does_not_fallback_on_generic_516() {
+        #[derive(Clone, Default)]
+        struct Generic516State {
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn chat_endpoint(
+            State(state): State<Generic516State>,
+            Json(payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.requests.lock().await.push(payload);
+            (
+                StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
+                Json(serde_json::json!({
+                    "error": { "message": "upstream gateway unavailable" }
+                })),
+            )
+        }
+
+        let state = Generic516State::default();
+        let app = Router::new()
+            .route("/chat/completions", post(chat_endpoint))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let provider = make_provider(
+            "TestProvider",
+            &format!("http://{}", addr),
+            Some("test-provider-key"),
+        );
+        let messages = vec![ChatMessage::user("check weather")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "weather_lookup",
+                "description": "Look up weather by city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })];
+
+        let err = provider
+            .chat_with_tools(&messages, &tools, "test-model", 0.7)
+            .await
+            .expect_err("generic 516 must not trigger prompt-guided fallback");
+        assert!(err.to_string().contains("API error (516"));
+
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 1, "must not issue fallback retry request");
+        assert!(requests[0].get("tools").is_some());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_fallback_on_generic_516() {
+        #[derive(Clone, Default)]
+        struct Generic516State {
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn chat_endpoint(
+            State(state): State<Generic516State>,
+            Json(payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.requests.lock().await.push(payload);
+            (
+                StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
+                Json(serde_json::json!({
+                    "error": { "message": "upstream gateway unavailable" }
+                })),
+            )
+        }
+
+        let state = Generic516State::default();
+        let app = Router::new()
+            .route("/chat/completions", post(chat_endpoint))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let provider = make_provider(
+            "TestProvider",
+            &format!("http://{}", addr),
+            Some("test-provider-key"),
+        );
+        let messages = vec![ChatMessage::user("check weather")];
+        let tools = vec![crate::tools::ToolSpec {
+            name: "weather_lookup".to_string(),
+            description: "Look up weather by city".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        }];
+
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "test-model",
+                0.7,
+            )
+            .await
+            .expect_err("generic 516 must not trigger prompt-guided fallback");
+        assert!(err.to_string().contains("API error (516"));
+
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 1, "must not issue fallback retry request");
+        assert!(requests[0].get("tools").is_some());
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
