@@ -3837,6 +3837,8 @@ Reminder set successfully."#;
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
