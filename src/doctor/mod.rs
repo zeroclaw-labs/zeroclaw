@@ -748,7 +748,7 @@ fn resolve_provider_probe_url(provider: &str, api_url: Option<&str>) -> Option<S
             .map(str::trim)
             .filter(|u| !u.is_empty())
             .unwrap_or("http://localhost:11434");
-        let base = base.trim_end_matches('/');
+        let base = base.trim_end_matches('/').trim_end_matches("/api");
         Some(format!("{base}/api/tags"))
     } else {
         // Prefer explicit api_url; fallback to URL embedded in custom provider ids
