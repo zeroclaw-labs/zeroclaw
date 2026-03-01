@@ -9,7 +9,7 @@ on:
         branches: [dev, main]
 
 concurrency:
-    group: ci-${{ github.event.pull_request.number || github.sha }}
+    group: ci-run-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
     cancel-in-progress: true
 
 permissions:
