@@ -4091,7 +4091,66 @@ fn setup_memory() -> Result<MemoryConfig> {
 
     let mut config = memory_config_defaults_for_backend(backend);
     config.auto_save = auto_save;
+
+    if classify_memory_backend(backend) == MemoryBackendKind::SqliteQdrantHybrid {
+        configure_hybrid_qdrant_memory(&mut config)?;
+    }
+
     Ok(config)
+}
+
+fn configure_hybrid_qdrant_memory(config: &mut MemoryConfig) -> Result<()> {
+    print_bullet("Hybrid memory keeps local SQLite metadata and uses Qdrant for semantic ranking.");
+    print_bullet("SQLite storage path stays at the default workspace database.");
+
+    let qdrant_url_default = config
+        .qdrant
+        .url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:6333".to_string());
+    let qdrant_url: String = Input::new()
+        .with_prompt("  Qdrant URL")
+        .default(qdrant_url_default)
+        .interact_text()?;
+    let qdrant_url = qdrant_url.trim();
+    if qdrant_url.is_empty() {
+        bail!("Qdrant URL is required for sqlite_qdrant_hybrid backend");
+    }
+    config.qdrant.url = Some(qdrant_url.to_string());
+
+    let qdrant_collection: String = Input::new()
+        .with_prompt("  Qdrant collection")
+        .default(config.qdrant.collection.clone())
+        .interact_text()?;
+    let qdrant_collection = qdrant_collection.trim();
+    if !qdrant_collection.is_empty() {
+        config.qdrant.collection = qdrant_collection.to_string();
+    }
+
+    let qdrant_api_key: String = Input::new()
+        .with_prompt("  Qdrant API key (optional, Enter to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+    let qdrant_api_key = qdrant_api_key.trim();
+    config.qdrant.api_key = if qdrant_api_key.is_empty() {
+        None
+    } else {
+        Some(qdrant_api_key.to_string())
+    };
+
+    println!(
+        "  {} Qdrant: {} (collection: {}, api key: {})",
+        style("✓").green().bold(),
+        style(config.qdrant.url.as_deref().unwrap_or_default()).green(),
+        style(&config.qdrant.collection).green(),
+        if config.qdrant.api_key.is_some() {
+            style("set").green().to_string()
+        } else {
+            style("not set").dim().to_string()
+        }
+    );
+
+    Ok(())
 }
 
 fn setup_identity_backend() -> Result<IdentityConfig> {
@@ -8515,10 +8574,11 @@ mod tests {
     #[test]
     fn backend_key_from_choice_maps_supported_backends() {
         assert_eq!(backend_key_from_choice(0), "sqlite");
-        assert_eq!(backend_key_from_choice(1), "lucid");
-        assert_eq!(backend_key_from_choice(2), "cortex-mem");
-        assert_eq!(backend_key_from_choice(3), "markdown");
-        assert_eq!(backend_key_from_choice(4), "none");
+        assert_eq!(backend_key_from_choice(1), "sqlite_qdrant_hybrid");
+        assert_eq!(backend_key_from_choice(2), "lucid");
+        assert_eq!(backend_key_from_choice(3), "cortex-mem");
+        assert_eq!(backend_key_from_choice(4), "markdown");
+        assert_eq!(backend_key_from_choice(5), "none");
         assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
@@ -8558,6 +8618,18 @@ mod tests {
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 10000);
+    }
+
+    #[test]
+    fn memory_config_defaults_for_hybrid_enable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("sqlite_qdrant_hybrid");
+        assert_eq!(config.backend, "sqlite_qdrant_hybrid");
+        assert!(config.auto_save);
+        assert!(config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 7);
+        assert_eq!(config.purge_after_days, 30);
+        assert_eq!(config.embedding_cache_size, 10000);
+        assert_eq!(config.qdrant.collection, "zeroclaw_memories");
     }
 
     #[test]
