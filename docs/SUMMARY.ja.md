@@ -35,6 +35,7 @@
 - [docs/i18n/ja/README.md](i18n/ja/README.md)
 - [i18n/ja/one-click-bootstrap.md](i18n/ja/one-click-bootstrap.md)
 - [i18n/ja/android-setup.md](i18n/ja/android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) コマンド・設定リファレンスと統合
 

@@ -12,6 +12,8 @@
 |---|---|
 | Γρήγορη εγκατάσταση και εκτέλεση | [README.md (Πρώτα βήματα)](../README.md#quick-start) |
 | Αυτόματη προετοιμασία (Bootstrap) με μία εντολή | [one-click-bootstrap.md](one-click-bootstrap.md) |
+| Εγκατάσταση σε Android (Termux/ADB) | [android-setup.md](../../android-setup.md) |
+| Εγκατάσταση σε iOS (εφαρμογή SwiftUI) | [ios-setup.md](../../ios-setup.md) |
 | Αναφορά εντολών ανά εργασία | [commands-reference.md](commands-reference.md) |
 | Έλεγχος προεπιλογών και παραμέτρων ρύθμισης | [config-reference.md](config-reference.md) |
 | Διαμόρφωση προσαρμοσμένων παρόχων και άκρων (endpoints) | [custom-providers.md](custom-providers.md) |

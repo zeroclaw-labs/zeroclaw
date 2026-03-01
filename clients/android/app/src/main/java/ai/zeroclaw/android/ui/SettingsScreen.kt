@@ -4,8 +4,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -15,6 +13,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import ai.zeroclaw.android.data.ZeroClawSettings
 import ai.zeroclaw.android.util.BatteryUtils
@@ -36,7 +35,7 @@ fun SettingsScreen(
                 title = { Text("Settings") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Text("←")
                     }
                 },
                 actions = {
@@ -156,10 +155,7 @@ fun SettingsScreen(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     trailingIcon = {
                         IconButton(onClick = { showApiKey = !showApiKey }) {
-                            Icon(
-                                if (showApiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                contentDescription = if (showApiKey) "Hide" else "Show"
-                            )
+                            Text(if (showApiKey) "Hide" else "Show")
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -207,12 +203,13 @@ fun SettingsScreen(
 
             // Battery Optimization Section
             val context = LocalContext.current
-            val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+            @Suppress("DEPRECATION")
+            val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
             var isOptimized by remember { mutableStateOf(BatteryUtils.isIgnoringBatteryOptimizations(context)) }
 
             // Refresh battery optimization state when screen resumes
             LaunchedEffect(lifecycleOwner) {
-                lifecycleOwner.lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
+                lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                     isOptimized = BatteryUtils.isIgnoringBatteryOptimizations(context)
                 }
             }

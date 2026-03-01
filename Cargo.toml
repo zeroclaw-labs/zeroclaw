@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/robot-kit"]
+exclude = ["clients/android-bridge", "clients/ios-bridge"]
 resolver = "2"
 
 [package]

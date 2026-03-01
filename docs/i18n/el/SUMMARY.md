@@ -30,6 +30,7 @@
 - [getting-started/README.md](getting-started/README.md)
 - [one-click-bootstrap.md](one-click-bootstrap.md)
 - [android-setup.md](android-setup.md)
+- [ios-setup.md](../../ios-setup.md)
 - [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md)
 
 ### 2) Τεχνικές Αναφορές και Ενσωματώσεις

@@ -8,7 +8,8 @@ For first-time setup and quick orientation.
 2. One-click setup and dual bootstrap mode: [../one-click-bootstrap.md](../one-click-bootstrap.md)
 3. Update or uninstall on macOS: [macos-update-uninstall.md](macos-update-uninstall.md)
 4. Set up on Android (Termux/ADB): [../android-setup.md](../android-setup.md)
-5. Find commands by tasks: [../commands-reference.md](../commands-reference.md)
+5. Set up on iOS (native client): [../ios-setup.md](../ios-setup.md)
+6. Find commands by tasks: [../commands-reference.md](../commands-reference.md)
 
 ## Choose Your Path
 

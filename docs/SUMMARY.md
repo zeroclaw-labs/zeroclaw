@@ -36,6 +36,7 @@ Last refreshed: **February 28, 2026**.
 - [one-click-bootstrap.md](one-click-bootstrap.md)
 - [docker-setup.md](docker-setup.md)
 - [android-setup.md](android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) Command/Config References & Integrations
 

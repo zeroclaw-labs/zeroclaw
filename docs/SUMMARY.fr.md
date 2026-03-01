@@ -35,6 +35,7 @@ Dernière mise à jour : **24 février 2026**.
 - [docs/i18n/fr/README.md](i18n/fr/README.md)
 - [i18n/fr/one-click-bootstrap.md](i18n/fr/one-click-bootstrap.md)
 - [i18n/fr/android-setup.md](i18n/fr/android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) Référence des commandes, configuration et intégrations
 

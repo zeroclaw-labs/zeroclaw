@@ -35,6 +35,7 @@ Cập nhật lần cuối: **24 tháng 2, 2026**.
 - [docs/i18n/vi/README.md](i18n/vi/getting-started/README.md)
 - [i18n/vi/one-click-bootstrap.md](i18n/vi/one-click-bootstrap.md)
 - [i18n/vi/android-setup.md](i18n/vi/android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) Tham chiếu lệnh/cấu hình và tích hợp
 

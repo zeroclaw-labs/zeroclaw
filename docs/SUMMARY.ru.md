@@ -35,6 +35,7 @@
 - [docs/i18n/ru/README.md](i18n/ru/README.md)
 - [i18n/ru/one-click-bootstrap.md](i18n/ru/one-click-bootstrap.md)
 - [i18n/ru/android-setup.md](i18n/ru/android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) Справочник команд, конфигурации и интеграций
 
