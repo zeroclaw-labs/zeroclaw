@@ -8615,8 +8615,14 @@ mod tests {
             &["ANTHROPIC_OAUTH_TOKEN"]
         );
         assert_eq!(provider_env_var_fallbacks("gemini"), &["GOOGLE_API_KEY"]);
-        assert_eq!(provider_env_var_fallbacks("minimax"), &["MINIMAX_OAUTH_TOKEN"]);
-        assert_eq!(provider_env_var_fallbacks("volcengine"), &["DOUBAO_API_KEY"]);
+        assert_eq!(
+            provider_env_var_fallbacks("minimax"),
+            &["MINIMAX_OAUTH_TOKEN"]
+        );
+        assert_eq!(
+            provider_env_var_fallbacks("volcengine"),
+            &["DOUBAO_API_KEY"]
+        );
     }
 
     #[tokio::test]
