@@ -226,9 +226,9 @@ zeroclaw agent --provider siliconflow --model Pro/zai-org/GLM-4.7 -m "ping"
 - Cross-region inference profiles supported (e.g., `us.anthropic.claude-*`).
 - Model IDs use Bedrock format: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, etc.
 
-### Ollama Reasoning Toggle
+### Ollama and Qwen Reasoning Toggle
 
-You can control Ollama reasoning/thinking behavior from `config.toml`:
+You can control reasoning/thinking behavior for Ollama and Qwen from `config.toml`:
 
 ```toml
 [runtime]
@@ -237,9 +237,9 @@ reasoning_enabled = false
 
 Behavior:
 
-- `false`: sends `think: false` to Ollama `/api/chat` requests.
-- `true`: sends `think: true`.
-- Unset: omits `think` and keeps Ollama/model defaults.
+- `false`: sends `think: false` for Ollama and `enable_thinking: false` for Qwen (all aliases).
+- `true`: sends `think: true` for Ollama and `enable_thinking: true` for Qwen.
+- Unset: omits both fields and keeps provider/model defaults.
 
 ### Ollama Vision Override
 

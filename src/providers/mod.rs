@@ -1193,7 +1193,8 @@ fn create_provider_with_url_and_options(
                     AuthStyle::Bearer,
                     "QwenCode/1.0",
                     true,
-                ),
+                )
+                .with_reasoning_enabled(options.reasoning_enabled),
             ))
         }
         "hunyuan" | "tencent" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -1223,15 +1224,16 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        name if qwen_base_url(name).is_some() => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+        name if qwen_base_url(name).is_some() => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_vision(
                 "Qwen",
                 qwen_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
                 true,
-            )))
-        }
+            )
+            .with_reasoning_enabled(options.reasoning_enabled),
+        )),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -2500,6 +2502,45 @@ mod tests {
         assert!(create_provider("qwen-coding-plan", Some("key")).is_ok());
         assert!(create_provider("qwen-code", Some("key")).is_ok());
         assert!(create_provider("qwen-oauth", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_qwen_reasoning_enabled_wired_for_all_aliases() {
+        // Verify that `reasoning_enabled` from ProviderRuntimeOptions is accepted by both
+        // the `qwen_base_url` catch-all branch and the `is_qwen_oauth_alias` branch without
+        // error. The builder-level propagation is covered in compatible.rs unit tests.
+        let opts_off = ProviderRuntimeOptions {
+            reasoning_enabled: Some(false),
+            ..ProviderRuntimeOptions::default()
+        };
+        let opts_on = ProviderRuntimeOptions {
+            reasoning_enabled: Some(true),
+            ..ProviderRuntimeOptions::default()
+        };
+        // qwen_base_url branch (CN, intl, US, coding-plan)
+        for alias in &[
+            "qwen",
+            "dashscope",
+            "qwen-intl",
+            "qwen-us",
+            "qwen-coding-plan",
+        ] {
+            assert!(
+                create_provider_with_options(alias, Some("key"), &opts_off).is_ok(),
+                "reasoning_enabled=false should not error for alias '{alias}'"
+            );
+            assert!(
+                create_provider_with_options(alias, Some("key"), &opts_on).is_ok(),
+                "reasoning_enabled=true should not error for alias '{alias}'"
+            );
+        }
+        // is_qwen_oauth_alias branch
+        for alias in &["qwen-code", "qwen-oauth", "qwen_oauth"] {
+            assert!(
+                create_provider_with_options(alias, Some("key"), &opts_off).is_ok(),
+                "reasoning_enabled=false should not error for oauth alias '{alias}'"
+            );
+        }
     }
 
     #[test]

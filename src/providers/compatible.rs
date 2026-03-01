@@ -51,6 +51,10 @@ pub struct OpenAiCompatibleProvider {
     api_mode: CompatibleApiMode,
     /// Optional max token cap propagated to outbound requests.
     max_tokens_override: Option<u32>,
+    /// Reasoning/thinking toggle for providers that expose an explicit on/off control.
+    /// Currently used by Qwen/DashScope (`enable_thinking` request field).
+    /// `None` omits the field and lets the provider use its own default.
+    reasoning_enabled: Option<bool>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -254,7 +258,18 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             api_mode,
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            reasoning_enabled: None,
         }
+    }
+
+    /// Set an explicit reasoning/thinking toggle for this provider instance.
+    ///
+    /// Currently used by Qwen/DashScope to populate `enable_thinking` in the
+    /// request body. Maps directly from `runtime.reasoning_enabled` in config.
+    /// `None` (the default) omits the field entirely.
+    pub fn with_reasoning_enabled(mut self, reasoning_enabled: Option<bool>) -> Self {
+        self.reasoning_enabled = reasoning_enabled;
+        self
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -403,6 +418,13 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Qwen/DashScope only: explicit thinking mode toggle (`enable_thinking` request field).
+    /// Lives in this shared struct rather than a Qwen-specific type because `OpenAiCompatibleProvider`
+    /// is the single request builder for all OpenAI-compatible providers; a separate per-provider
+    /// request type would require a new trait or enum indirection (YAGNI). Safety: `skip_serializing_if`
+    /// guarantees the field is omitted entirely for non-Qwen providers whose `reasoning_enabled` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -597,6 +619,11 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Qwen/DashScope only: explicit thinking mode toggle (`enable_thinking` request field).
+    /// Same rationale as in `ApiChatRequest`: lives here to avoid per-provider request types;
+    /// omitted via `skip_serializing_if` for all providers where `reasoning_enabled` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1663,6 +1690,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            enable_thinking: self.reasoning_enabled,
         };
 
         let url = self.chat_completions_url();
@@ -1792,6 +1820,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            enable_thinking: self.reasoning_enabled,
         };
 
         if self.should_use_responses_mode() {
@@ -1917,6 +1946,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some("auto".to_string())
             },
+            enable_thinking: self.reasoning_enabled,
         };
 
         if self.should_use_responses_mode() {
@@ -2039,6 +2069,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            enable_thinking: self.reasoning_enabled,
         };
 
         if self.should_use_responses_mode() {
@@ -2192,6 +2223,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
+            enable_thinking: self.reasoning_enabled,
         };
 
         let url = self.chat_completions_url();
@@ -2334,14 +2366,46 @@ mod tests {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            enable_thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
         assert!(json.contains("system"));
         assert!(json.contains("user"));
-        // tools/tool_choice should be omitted when None
+        // tools/tool_choice/enable_thinking should be omitted when None
+        assert!(!json.contains("enable_thinking"));
         assert!(!json.contains("tools"));
         assert!(!json.contains("tool_choice"));
+    }
+
+    #[test]
+    fn with_reasoning_enabled_sets_field() {
+        let p = make_provider(
+            "qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            None,
+        )
+        .with_reasoning_enabled(Some(false));
+        assert_eq!(p.reasoning_enabled, Some(false));
+    }
+
+    #[test]
+    fn request_serializes_qwen_thinking_toggle_when_present() {
+        let req = ApiChatRequest {
+            model: "qwen3-plus".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            temperature: 0.7,
+            max_tokens: None,
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+            enable_thinking: Some(false),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"enable_thinking\":false"));
     }
 
     #[test]
@@ -3182,6 +3246,7 @@ mod tests {
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            enable_thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
