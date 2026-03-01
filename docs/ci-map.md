@@ -103,7 +103,6 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `Dependabot`: all update PRs target `main` (not `dev`)
 - `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/ready_for_review
-- `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review
 - `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/pr-labeler.yml`, or `.github/workflows/pr-auto-response.yml` changes
 - `PR Labeler`: `pull_request_target` on opened/reopened/synchronize/ready_for_review
 - `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
