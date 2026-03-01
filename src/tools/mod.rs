@@ -82,6 +82,7 @@ pub mod web_access_config;
 pub mod web_fetch;
 pub mod web_search_config;
 pub mod web_search_tool;
+pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bg_run::{
@@ -147,6 +148,7 @@ pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
 pub use web_search_tool::WebSearchTool;
+pub use xlsx_read::XlsxReadTool;
 
 pub use auth_profile::ManageAuthProfileTool;
 pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProviderTool};
@@ -510,6 +512,9 @@ pub fn all_tools_with_runtime(
 
     // PPTX text extraction
     tool_arcs.push(Arc::new(PptxReadTool::new(security.clone())));
+
+    // XLSX text extraction
+    tool_arcs.push(Arc::new(XlsxReadTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
