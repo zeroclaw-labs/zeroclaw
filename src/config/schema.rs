@@ -1195,6 +1195,58 @@ pub struct CostConfig {
     /// Per-model pricing (USD per 1M tokens)
     #[serde(default)]
     pub prices: std::collections::HashMap<String, ModelPricing>,
+
+    /// Runtime budget enforcement policy (`[cost.enforcement]`).
+    #[serde(default)]
+    pub enforcement: CostEnforcementConfig,
+}
+
+/// Budget enforcement behavior when projected spend approaches/exceeds limits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostEnforcementMode {
+    /// Log warnings only; never block the request.
+    Warn,
+    /// Attempt one downgrade to a cheaper route/model, then block if still over budget.
+    RouteDown,
+    /// Block immediately when projected spend exceeds configured limits.
+    Block,
+}
+
+fn default_cost_enforcement_mode() -> CostEnforcementMode {
+    CostEnforcementMode::Warn
+}
+
+/// Runtime budget enforcement controls (`[cost.enforcement]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CostEnforcementConfig {
+    /// Enforcement behavior. Default: `warn`.
+    #[serde(default = "default_cost_enforcement_mode")]
+    pub mode: CostEnforcementMode,
+    /// Optional fallback model (or `hint:*`) when `mode = "route_down"`.
+    #[serde(default = "default_route_down_model")]
+    pub route_down_model: Option<String>,
+    /// Extra reserve added to token/cost estimates (percentage, 0-100). Default: `10`.
+    #[serde(default = "default_cost_reserve_percent")]
+    pub reserve_percent: u8,
+}
+
+fn default_route_down_model() -> Option<String> {
+    Some("hint:fast".to_string())
+}
+
+fn default_cost_reserve_percent() -> u8 {
+    10
+}
+
+impl Default for CostEnforcementConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_cost_enforcement_mode(),
+            route_down_model: default_route_down_model(),
+            reserve_percent: default_cost_reserve_percent(),
+        }
+    }
 }
 
 /// Per-model pricing entry (USD per 1M tokens).
@@ -1230,6 +1282,7 @@ impl Default for CostConfig {
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             prices: get_default_pricing(),
+            enforcement: CostEnforcementConfig::default(),
         }
     }
 }
@@ -7764,6 +7817,14 @@ impl Config {
             anyhow::bail!("web_search.timeout_secs must be greater than 0");
         }
 
+        // Cost
+        if self.cost.warn_at_percent > 100 {
+            anyhow::bail!("cost.warn_at_percent must be between 0 and 100");
+        }
+        if self.cost.enforcement.reserve_percent > 100 {
+            anyhow::bail!("cost.enforcement.reserve_percent must be between 0 and 100");
+        }
+
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
             anyhow::bail!("scheduler.max_concurrent must be greater than 0");
@@ -13737,5 +13798,49 @@ sensitivity = 0.9
         config
             .validate()
             .expect("disabled coordination should allow empty lead agent");
+    }
+
+    #[test]
+    async fn cost_enforcement_defaults_are_stable() {
+        let cost = CostConfig::default();
+        assert_eq!(cost.enforcement.mode, CostEnforcementMode::Warn);
+        assert_eq!(
+            cost.enforcement.route_down_model.as_deref(),
+            Some("hint:fast")
+        );
+        assert_eq!(cost.enforcement.reserve_percent, 10);
+    }
+
+    #[test]
+    async fn cost_enforcement_config_parses_route_down_mode() {
+        let parsed: CostConfig = toml::from_str(
+            r#"
+enabled = true
+
+[enforcement]
+mode = "route_down"
+route_down_model = "hint:fast"
+reserve_percent = 15
+"#,
+        )
+        .expect("cost enforcement should parse");
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.enforcement.mode, CostEnforcementMode::RouteDown);
+        assert_eq!(
+            parsed.enforcement.route_down_model.as_deref(),
+            Some("hint:fast")
+        );
+        assert_eq!(parsed.enforcement.reserve_percent, 15);
+    }
+
+    #[test]
+    async fn validation_rejects_cost_enforcement_reserve_over_100() {
+        let mut config = Config::default();
+        config.cost.enforcement.reserve_percent = 150;
+        let err = config
+            .validate()
+            .expect_err("expected cost.enforcement.reserve_percent validation failure");
+        assert!(err.to_string().contains("cost.enforcement.reserve_percent"));
     }
 }
