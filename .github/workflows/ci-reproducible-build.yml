@@ -50,7 +50,7 @@ env:
 jobs:
     reproducibility:
         name: Reproducible Build Probe
-        runs-on: [self-hosted, aws-india]
+        runs-on: ${{ fromJson((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '["ubuntu-22.04"]' || '["self-hosted","aws-india"]') }}
         timeout-minutes: 45
         steps:
             - name: Checkout
