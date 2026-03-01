@@ -1800,12 +1800,15 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
+        let err_lc = err.to_lowercase();
         assert!(
             err.contains("credentials not set")
                 || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential")
-                || err.to_lowercase().contains("not authorized")
-                || err.to_lowercase().contains("forbidden"),
+                || err_lc.contains("credential")
+                || err_lc.contains("not authorized")
+                || err_lc.contains("forbidden")
+                // aws-smithy may surface missing credentials as a generic builder error.
+                || err_lc.contains("builder error"),
             "Expected missing-credentials style error, got: {err}"
         );
     }

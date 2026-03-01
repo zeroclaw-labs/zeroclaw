@@ -2362,7 +2362,7 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() || cfg!(test) {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()

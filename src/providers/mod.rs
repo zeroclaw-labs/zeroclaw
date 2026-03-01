@@ -1685,7 +1685,6 @@ pub fn create_routed_provider_with_options(
 
     // Keep only successfully initialized routed providers and preserve
     // their provider-id bindings (e.g. "<provider>#<hint>").
-
     Ok(Box::new(
         router::RouterProvider::new(
             providers,
