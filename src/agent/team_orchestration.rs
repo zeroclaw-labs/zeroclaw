@@ -71,8 +71,7 @@ impl TeamTopology {
         match self {
             Self::Single => 0.05,
             Self::LeadSubagent => 0.08,
-            Self::StarTeam => 0.10,
-            Self::MeshTeam => 0.10,
+            Self::StarTeam | Self::MeshTeam => 0.10,
         }
     }
 
@@ -98,7 +97,7 @@ impl TeamTopology {
             }
         };
 
-        ((base_messages as f64) * sync_multiplier).round() as u64
+        round_non_negative_to_u64((base_messages as f64) * sync_multiplier)
     }
 }
 
@@ -310,6 +309,7 @@ pub enum ModelTier {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GateOutcome {
     pub coordination_ratio_ok: bool,
     pub quality_ok: bool,
@@ -538,7 +538,9 @@ pub fn derive_planner_config(
 #[must_use]
 pub fn estimate_handoff_tokens(message: &A2ALiteMessage) -> u64 {
     fn text_tokens(text: &str) -> u64 {
-        ((text.chars().count() as f64) / 4.0).ceil() as u64
+        let chars = text.chars().count();
+        let chars_u64 = u64::try_from(chars).unwrap_or(u64::MAX);
+        chars_u64.saturating_add(3) / 4
     }
 
     let artifact_tokens = message
@@ -959,10 +961,10 @@ pub fn allocate_task_budgets(
     let execution_sum = budgets.iter().map(|x| x.execution_tokens).sum::<u64>();
     if execution_sum >= limit {
         // No room for coordination tokens while preserving execution estimates.
-        budgets.iter_mut().for_each(|item| {
+        for item in &mut budgets {
             item.coordination_tokens = 0;
             item.total_tokens = item.execution_tokens;
-        });
+        }
         return budgets;
     }
 
@@ -1003,12 +1005,12 @@ pub fn allocate_task_budgets(
     let extra_request_sum = extra_requests.iter().sum::<u64>();
 
     if extra_request_sum == 0 {
-        budgets.iter_mut().for_each(|item| {
+        for item in &mut budgets {
             item.coordination_tokens = floor;
             item.total_tokens = item
                 .execution_tokens
                 .saturating_add(item.coordination_tokens);
-        });
+        }
         return budgets;
     }
 
@@ -1036,12 +1038,12 @@ pub fn allocate_task_budgets(
         i += 1;
     }
 
-    budgets.iter_mut().enumerate().for_each(|(idx, item)| {
+    for (idx, item) in budgets.iter_mut().enumerate() {
         item.coordination_tokens = floor.saturating_add(allocated_extra[idx]);
         item.total_tokens = item
             .execution_tokens
             .saturating_add(item.coordination_tokens);
-    });
+    }
 
     budgets
 }
@@ -1095,7 +1097,7 @@ fn topological_sort(tasks: &[TaskNodeSpec]) -> Result<Vec<String>, PlanError> {
         .filter_map(|(id, deg)| (*deg == 0).then_some(id.clone()))
         .collect::<BTreeSet<_>>();
     let mut queue = VecDeque::<String>::new();
-    for id in zero.iter() {
+    for id in &zero {
         queue.push_back(id.clone());
     }
 
@@ -1409,22 +1411,24 @@ fn compute_metrics(
         participants.saturating_sub(1).max(1) as f64
     };
 
-    let execution_tokens = ((params.tasks as f64)
-        * (params.avg_task_tokens as f64)
-        * topology.execution_factor()
-        * workload.execution_multiplier)
-        .round() as u64;
+    let execution_tokens = round_non_negative_to_u64(
+        f64::from(params.tasks)
+            * f64::from(params.avg_task_tokens)
+            * topology.execution_factor()
+            * workload.execution_multiplier,
+    );
 
-    let base_summary_tokens = ((params.avg_task_tokens as f64) * 0.08).round() as u64;
+    let base_summary_tokens = round_non_negative_to_u64(f64::from(params.avg_task_tokens) * 0.08);
     let mut summary_tokens = base_summary_tokens
         .max(24)
         .min(u64::from(budget.summary_cap_tokens));
-    summary_tokens = ((summary_tokens as f64)
-        * workload.summary_multiplier
-        * protocol.summary_multiplier
-        * summary_scale)
-        .round()
-        .max(16.0) as u64;
+    summary_tokens = round_non_negative_to_u64(
+        (summary_tokens as f64)
+            * workload.summary_multiplier
+            * protocol.summary_multiplier
+            * summary_scale,
+    )
+    .max(16);
 
     let messages = topology.coordination_messages(
         params.coordination_rounds,
@@ -1435,17 +1439,18 @@ fn compute_metrics(
     let raw_coordination_tokens = messages * summary_tokens;
 
     let compaction_events =
-        (params.coordination_rounds / budget.compaction_interval_rounds.max(1)) as f64;
+        f64::from(params.coordination_rounds / budget.compaction_interval_rounds.max(1));
     let compaction_discount = (compaction_events * 0.10).min(0.35);
 
     let mut coordination_tokens =
-        ((raw_coordination_tokens as f64) * (1.0 - compaction_discount)).round() as u64;
+        round_non_negative_to_u64((raw_coordination_tokens as f64) * (1.0 - compaction_discount));
 
-    coordination_tokens =
-        ((coordination_tokens as f64) * (1.0 - protocol.artifact_discount)).round() as u64;
+    coordination_tokens = round_non_negative_to_u64(
+        (coordination_tokens as f64) * (1.0 - protocol.artifact_discount),
+    );
 
     let cache_factor = (topology.cache_factor() + protocol.cache_bonus).clamp(0.0, 0.30);
-    let cache_savings_tokens = ((execution_tokens as f64) * cache_factor).round() as u64;
+    let cache_savings_tokens = round_non_negative_to_u64((execution_tokens as f64) * cache_factor);
 
     let total_tokens = execution_tokens
         .saturating_add(coordination_tokens)
@@ -1463,11 +1468,12 @@ fn compute_metrics(
 
     let defect_escape = (1.0 - pass_rate).clamp(0.0, 1.0);
 
-    let base_latency_s = (params.tasks as f64 / parallelism) * 6.0 * workload.latency_multiplier;
+    let base_latency_s =
+        (f64::from(params.tasks) / parallelism) * 6.0 * workload.latency_multiplier;
     let sync_penalty_s = messages as f64 * (0.02 + protocol.latency_penalty_per_message_s);
     let p95_latency_s = base_latency_s + sync_penalty_s;
 
-    let throughput_tpd = (params.tasks as f64 / p95_latency_s.max(1.0)) * 86_400.0;
+    let throughput_tpd = (f64::from(params.tasks) / p95_latency_s.max(1.0)) * 86_400.0;
 
     let budget_limit_tokens = u64::from(params.tasks)
         .saturating_mul(u64::from(params.avg_task_tokens))
@@ -1491,7 +1497,7 @@ fn compute_metrics(
         participants,
         model_tier,
         tasks: params.tasks,
-        tasks_per_worker: round4(params.tasks as f64 / parallelism),
+        tasks_per_worker: round4(f64::from(params.tasks) / parallelism),
         workload: params.workload,
         protocol: params.protocol,
         degradation_applied,
@@ -1600,6 +1606,15 @@ fn round4(v: f64) -> f64 {
 
 fn round5(v: f64) -> f64 {
     (v * 100_000.0).round() / 100_000.0
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn round_non_negative_to_u64(v: f64) -> u64 {
+    if !v.is_finite() {
+        return 0;
+    }
+
+    v.max(0.0).round() as u64
 }
 
 #[cfg(test)]
