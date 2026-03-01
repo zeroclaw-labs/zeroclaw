@@ -802,6 +802,12 @@ mod tests {
     }
 
     #[test]
+    fn zero_addr_is_local_endpoint() {
+        let p = OllamaProvider::new(Some("http://0.0.0.0:11434"), None);
+        assert!(p.is_local_endpoint());
+    }
+
+    #[test]
     fn local_endpoint_auth_disabled_even_with_key() {
         let p = OllamaProvider::new(None, Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("llama3").unwrap();

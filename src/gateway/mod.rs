@@ -712,12 +712,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
         ));
 
-    // ── WebSocket route (no timeout — LLM inference can exceed 30s) ──
-    let ws_router = Router::new()
+    // ── WebSocket + SPA routes (permissive CORS for browser dashboard access) ──
+    let dashboard_router = Router::new()
         .route("/ws/chat", get(ws::handle_ws_chat))
+        .route("/_app/{*path}", get(static_files::handle_static))
+        .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    // Build router with middleware (timeout + body limit apply to non-WS routes only)
+    // Build HTTP router with timeout + body limit (no permissive CORS on
+    // webhooks and API routes — server-to-server endpoints don't need it)
     let http_router = Router::new()
         // ── Existing routes ──
         .route("/health", get(handle_health))
@@ -755,8 +758,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/node-control", post(handle_node_control))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
-        // ── Static assets (web dashboard) ──
-        .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
         .with_state(state)
@@ -766,9 +767,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
-    let app = ws_router
+    let app = dashboard_router
         .merge(http_router)
-        .layer(CorsLayer::permissive())
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 

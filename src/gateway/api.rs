@@ -346,7 +346,16 @@ pub async fn handle_api_doctor(
     }
 
     let config = state.config.lock().clone();
-    let results = crate::doctor::diagnose(&config);
+    let results = match tokio::task::spawn_blocking(move || crate::doctor::diagnose(&config)).await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            return Json(serde_json::json!({
+                "error": format!("doctor task panicked: {err}"),
+            }))
+            .into_response();
+        }
+    };
 
     let ok_count = results
         .iter()

@@ -1414,7 +1414,12 @@ fn fetch_ollama_models(api_url: Option<&str>) -> Result<Vec<String>> {
         .map(|url| normalize_ollama_endpoint_url(url))
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| "http://localhost:11434".to_string());
-    let tags_url = format!("{base}/api/tags");
+    let parsed = reqwest::Url::parse(&base)
+        .with_context(|| format!("invalid Ollama endpoint URL: {base}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("Ollama endpoint URL must use http:// or https://: {base}");
+    }
+    let tags_url = format!("{}/api/tags", parsed.as_str().trim_end_matches('/'));
 
     let client = build_model_fetch_client()?;
     let payload: Value = client
@@ -1543,24 +1548,12 @@ fn fetch_live_models_for_provider(
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => {
+            let discovered = fetch_ollama_models(provider_api_url)?;
             if ollama_remote {
-                // Remote Ollama endpoints can serve cloud-routed models.
-                // Keep this curated list aligned with current Ollama cloud catalog.
-                vec![
-                    "glm-5:cloud".to_string(),
-                    "glm-4.7:cloud".to_string(),
-                    "gpt-oss:20b:cloud".to_string(),
-                    "gpt-oss:120b:cloud".to_string(),
-                    "gemini-3-flash-preview:cloud".to_string(),
-                    "qwen3-coder-next:cloud".to_string(),
-                    "qwen3-coder:480b:cloud".to_string(),
-                    "kimi-k2.5:cloud".to_string(),
-                    "minimax-m2.5:cloud".to_string(),
-                    "deepseek-v3.1:671b:cloud".to_string(),
-                ]
+                discovered
             } else {
                 // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models(provider_api_url)?
+                discovered
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
                     .collect()
