@@ -133,8 +133,10 @@ impl OllamaProvider {
     fn is_local_endpoint(&self) -> bool {
         reqwest::Url::parse(&self.base_url)
             .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_string()))
-            .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+            .is_some_and(|host| {
+                matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+            })
     }
 
     fn http_client(&self) -> Client {

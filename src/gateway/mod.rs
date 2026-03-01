@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -711,8 +712,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
         ));
 
-    // Build router with middleware
-    let app = Router::new()
+    // ── WebSocket route (no timeout — LLM inference can exceed 30s) ──
+    let ws_router = Router::new()
+        .route("/ws/chat", get(ws::handle_ws_chat))
+        .with_state(state.clone());
+
+    // Build router with middleware (timeout + body limit apply to non-WS routes only)
+    let http_router = Router::new()
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -749,8 +755,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/node-control", post(handle_node_control))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
-        // ── WebSocket agent chat ──
-        .route("/ws/chat", get(ws::handle_ws_chat))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
@@ -760,7 +764,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ))
+        ));
+
+    let app = ws_router
+        .merge(http_router)
+        .layer(CorsLayer::permissive())
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 

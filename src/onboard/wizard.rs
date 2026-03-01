@@ -1409,13 +1409,19 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     Ok(parse_gemini_model_ids(&payload))
 }
 
-fn fetch_ollama_models() -> Result<Vec<String>> {
+fn fetch_ollama_models(api_url: Option<&str>) -> Result<Vec<String>> {
+    let base = api_url
+        .map(|url| normalize_ollama_endpoint_url(url))
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| "http://localhost:11434".to_string());
+    let tags_url = format!("{base}/api/tags");
+
     let client = build_model_fetch_client()?;
     let payload: Value = client
-        .get("http://localhost:11434/api/tags")
+        .get(&tags_url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .context("model fetch failed: GET http://localhost:11434/api/tags")?
+        .with_context(|| format!("model fetch failed: GET {tags_url}"))?
         .json()
         .context("failed to parse Ollama model list response")?;
 
@@ -1554,7 +1560,7 @@ fn fetch_live_models_for_provider(
                 ]
             } else {
                 // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models()?
+                fetch_ollama_models(provider_api_url)?
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
                     .collect()

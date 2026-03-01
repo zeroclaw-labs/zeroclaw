@@ -46,10 +46,14 @@ export default function AgentChat() {
 
     ws.onClose = () => {
       setConnected(false);
+      setTyping(false);
+      pendingContentRef.current = '';
     };
 
     ws.onError = () => {
       setError('Connection error. Attempting to reconnect...');
+      setTyping(false);
+      pendingContentRef.current = '';
     };
 
     ws.onMessage = (msg: WsMessage) => {
