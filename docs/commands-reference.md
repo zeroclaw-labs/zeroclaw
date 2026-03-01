@@ -15,6 +15,7 @@ Last verified: **February 28, 2026**.
 | `service` | Manage user-level OS service lifecycle |
 | `doctor` | Run diagnostics and freshness checks |
 | `status` | Print current configuration and system summary |
+| `update` | Check or install latest ZeroClaw release |
 | `estop` | Engage/resume emergency stop levels and inspect estop state |
 | `cron` | Manage scheduled tasks |
 | `models` | Refresh provider model catalogs |
@@ -102,6 +103,18 @@ Notes:
 - `zeroclaw service restart`
 - `zeroclaw service status`
 - `zeroclaw service uninstall`
+
+### `update`
+
+- `zeroclaw update --check` (check for new release, no install)
+- `zeroclaw update` (install latest release binary for current platform)
+- `zeroclaw update --force` (reinstall even if current version matches latest)
+- `zeroclaw update --instructions` (print install-method-specific guidance)
+
+Notes:
+
+- If ZeroClaw is installed via Homebrew, prefer `brew upgrade zeroclaw`.
+- `update --instructions` detects common install methods and prints the safest path.
 
 ### `cron`
 

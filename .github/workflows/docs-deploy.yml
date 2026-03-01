@@ -41,7 +41,7 @@ on:
                 default: ""
 
 concurrency:
-    group: docs-deploy-${{ github.event.pull_request.number || github.sha }}
+    group: docs-deploy-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
     cancel-in-progress: true
 
 permissions:

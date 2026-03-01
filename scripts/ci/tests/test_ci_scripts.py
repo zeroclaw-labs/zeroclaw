@@ -3759,6 +3759,119 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         planned_ids = [item["id"] for item in report["planned_actions"]]
         self.assertEqual(planned_ids, [101, 102])
 
+    def test_queue_hygiene_non_pr_branch_mode_dedupes_push_runs(self) -> None:
+        runs_json = self.tmp / "runs-non-pr-branch.json"
+        output_json = self.tmp / "queue-hygiene-non-pr-branch.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 201,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-201",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 202,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-202",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                        {
+                            "id": 203,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "dev",
+                            "head_sha": "sha-203",
+                            "created_at": "2026-02-27T20:02:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--dedupe-workflow",
+                "CI Run",
+                "--dedupe-include-non-pr",
+                "--non-pr-key",
+                "branch",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["counts"]["candidate_runs_before_cap"], 1)
+        planned_ids = [item["id"] for item in report["planned_actions"]]
+        self.assertEqual(planned_ids, [201])
+        reasons = report["planned_actions"][0]["reasons"]
+        self.assertTrue(any(reason.startswith("dedupe-superseded-by:202") for reason in reasons))
+        self.assertEqual(report["policies"]["non_pr_key"], "branch")
+
+    def test_queue_hygiene_non_pr_sha_mode_keeps_distinct_push_commits(self) -> None:
+        runs_json = self.tmp / "runs-non-pr-sha.json"
+        output_json = self.tmp / "queue-hygiene-non-pr-sha.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 301,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-301",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 302,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-302",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--dedupe-workflow",
+                "CI Run",
+                "--dedupe-include-non-pr",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["counts"]["candidate_runs_before_cap"], 0)
+        self.assertEqual(report["planned_actions"], [])
+        self.assertEqual(report["policies"]["non_pr_key"], "sha")
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
