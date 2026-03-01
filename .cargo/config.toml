@@ -24,3 +24,8 @@ linker = "clang"
 
 [target.aarch64-linux-android]
 linker = "clang"
+
+# iOS targets (Apple SDK linker via xcrun).
+[target.aarch64-apple-ios]
+
+[target.aarch64-apple-ios-sim]
