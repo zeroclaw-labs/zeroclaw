@@ -1,46 +1,367 @@
-# 在地化橋接檔案：Pr Workflow
+# ZeroClaw PR 工作流程（高流量協作模式）（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+本文件定義 ZeroClaw 在高 PR 流量下的處理方式，同時維護以下目標：
 
-英文原文:
+- 高效能
+- 高效率
+- 高穩定性
+- 高擴充性
+- 高永續性
+- 高安全性
 
-- [../../pr-workflow.md](../../pr-workflow.md)
+相關參考文件：
 
-## 主題定位
+- [`docs/README.md`](./README.md) 文件分類與導覽。
+- [`docs/ci-map.md`](./ci-map.md) 各工作流程的負責人、觸發條件與分類流程。
+- [`docs/reviewer-playbook.md`](./reviewer-playbook.md) 日常審查者的執行指南。
 
-- 類別：工程流程與專案管理
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+## 0. 摘要
 
-## 原文章節導覽
+- **目的：** 為高吞吐量協作提供確定性的、基於風險的 PR 運作模型。
+- **對象：** 貢獻者、維護者以及 AI 輔助審查者。
+- **範圍：** 儲存庫設定、PR 生命週期、就緒契約、風險路由、佇列紀律及復原協定。
+- **非目標：** 取代分支保護設定或 CI 工作流程檔案作為實作權威。
 
-- [H2 · 0. Summary](../../pr-workflow.md#0-summary)
-- [H2 · 1. Fast Path by PR Situation](../../pr-workflow.md#1-fast-path-by-pr-situation)
-- [H3 · 1.1 Intake is incomplete](../../pr-workflow.md#1-1-intake-is-incomplete)
-- [H3 · 1.2 `CI Required Gate` failing](../../pr-workflow.md#1-2-ci-required-gate-failing)
-- [H3 · 1.3 High-risk path touched](../../pr-workflow.md#1-3-high-risk-path-touched)
-- [H3 · 1.4 PR is superseded or duplicate](../../pr-workflow.md#1-4-pr-is-superseded-or-duplicate)
-- [H2 · 2. Governance Goals and Control Loop](../../pr-workflow.md#2-governance-goals-and-control-loop)
-- [H3 · 2.1 Governance goals](../../pr-workflow.md#2-1-governance-goals)
-- [H3 · 2.2 Governance design logic (control loop)](../../pr-workflow.md#2-2-governance-design-logic-control-loop)
-- [H2 · 3. Required Repository Settings](../../pr-workflow.md#3-required-repository-settings)
-- [H2 · 4. PR Lifecycle Runbook](../../pr-workflow.md#4-pr-lifecycle-runbook)
-- [H3 · 4.1 Step A: Intake](../../pr-workflow.md#4-1-step-a-intake)
-- [H3 · 4.2 Step B: Validation](../../pr-workflow.md#4-2-step-b-validation)
-- [H3 · 4.3 Step C: Review](../../pr-workflow.md#4-3-step-c-review)
-- [H3 · 4.4 Step D: Merge](../../pr-workflow.md#4-4-step-d-merge)
-- [H2 · 5. PR Readiness Contracts (DoR / DoD)](../../pr-workflow.md#5-pr-readiness-contracts-dor-dod)
-- [H3 · 5.1 Definition of Ready (DoR) before requesting review](../../pr-workflow.md#5-1-definition-of-ready-dor-before-requesting-review)
-- [H3 · 5.2 Definition of Done (DoD) merge-ready](../../pr-workflow.md#5-2-definition-of-done-dod-merge-ready)
+---
 
-## 操作建議
+## 1. 依 PR 狀況的快速路由
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+在進行完整深度審查之前，先使用本節快速判斷路由方向。
 
-## 相關入口
+### 1.1 進件不完整
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+1. 以單一待辦清單留言要求補齊範本與缺漏證據。
+2. 在進件阻礙解決前停止深度審查。
+
+前往：
+
+- [第 5.1 節](#51-就緒定義dor-請求審查前)
+
+### 1.2 `CI Required Gate` 未通過
+
+1. 透過 CI 對照表路由失敗項目，先修復確定性的必要檢查。
+2. 待 CI 回傳一致訊號後再重新評估風險。
+
+前往：
+
+- [docs/ci-map.md](./ci-map.md)
+- [第 4.2 節](#42-步驟-b驗證)
+
+### 1.3 觸及高風險路徑
+
+1. 提升至深度審查通道。
+2. 要求明確的回滾方案、失敗模式證據及安全邊界檢查。
+
+前往：
+
+- [第 9 節](#9-安全與穩定性規則)
+- [docs/reviewer-playbook.md](./reviewer-playbook.md)
+
+### 1.4 PR 已被取代或重複
+
+1. 要求明確標示取代連結並清理佇列。
+2. 經維護者確認後關閉被取代的 PR。
+
+前往：
+
+- [第 8.2 節](#82-積壓壓力控管)
+
+---
+
+## 2. 治理目標與控制迴路
+
+### 2.1 治理目標
+
+1. 在高 PR 負載下維持可預測的合併吞吐量。
+2. 維持高品質的 CI 訊號（快速回饋、低誤報率）。
+3. 對高風險面向明確要求安全審查。
+4. 讓變更易於理解且易於回滾。
+5. 確保儲存庫產物不含個人/敏感資料外洩。
+
+### 2.2 治理設計邏輯（控制迴路）
+
+此工作流程刻意採用分層設計，在保持責任歸屬明確的同時降低審查者負擔：
+
+1. **進件分類：** 透過路徑/大小/風險/模組標籤將 PR 路由至適當的審查深度。
+2. **確定性驗證：** 合併閘門仰賴可重現的檢查，而非主觀評論。
+3. **基於風險的審查深度：** 高風險路徑觸發深度審查；低風險路徑維持快速通道。
+4. **回滾優先的合併契約：** 每條合併路徑都包含具體的復原步驟。
+
+自動化協助分類與防護，但最終合併責任仍歸屬於人類維護者與 PR 作者。
+
+---
+
+## 3. 必要的儲存庫設定
+
+在 `dev` 和 `main` 上維護以下分支保護規則：
+
+- 合併前要求狀態檢查。
+- 要求檢查 `CI Required Gate`。
+- 合併前要求 Pull Request 審查。
+- 受保護路徑需要求 CODEOWNERS 審查。
+- 對 CI/CD 相關路徑（`.github/workflows/**`、`.github/codeql/**`、`.github/connectivity/**`、`.github/release/**`、`.github/security/**`、`.github/actionlint.yaml`、`.github/dependabot.yml`、`scripts/ci/**`，以及 CI 治理文件），需透過 `CI Required Gate` 取得 `@chumyin` 的明確核准審查。
+- 將分支/規則集繞過權限限制為組織擁有者。
+- 當新提交推送時撤銷過期的核准。
+- 限制受保護分支上的強制推送。
+- 一般貢獻者的 PR 預設目標為 `main`（`dev` 為選用，供專門的整合批次使用）。
+- 一旦必要檢查與審查政策通過，允許直接合併至 `main`。
+
+---
+
+## 4. PR 生命週期操作手冊
+
+### 4.1 步驟 A：進件
+
+- 貢獻者使用完整的 `.github/pull_request_template.md` 開啟 PR。
+- `PR Labeler` 自動套用範圍/路徑標籤 + 大小標籤 + 風險標籤 + 模組標籤（例如 `channel:telegram`、`provider:kimi`、`tool:shell`），以及依合併 PR 數量判定的貢獻者層級（`trusted` >=5、`experienced` >=10、`principal` >=20、`distinguished` >=50），同時在有更精確的模組標籤時去除較不具體的範圍標籤。
+- 對所有模組前綴，模組標籤會壓縮以減少雜訊：單一具體模組保留 `prefix:component`，但多個具體模組則收合至基礎範圍標籤 `prefix`。
+- 標籤排序以優先順序為主：`risk:*` -> `size:*` -> 貢獻者層級 -> 模組/路徑標籤。
+- 維護者可手動執行 `PR Labeler`（`workflow_dispatch`），使用 `audit` 模式檢視偏差或 `repair` 模式正規化全儲存庫的受管標籤中繼資料。
+- 在 GitHub 中將滑鼠懸停於標籤上可查看其自動管理的描述（規則/閾值摘要）。
+- 受管標籤的顏色依顯示順序排列，在長標籤列中呈現平滑漸層。
+- `PR Auto Responder` 發布首次貢獻指引、處理標籤驅動的低訊號項目路由，並使用與 `PR Labeler` 相同的閾值（`trusted` >=5、`experienced` >=10、`principal` >=20、`distinguished` >=50）自動套用 Issue 的貢獻者層級。
+
+### 4.2 步驟 B：驗證
+
+- `CI Required Gate` 為合併閘門。
+- 純文件 PR 使用快速路徑，跳過繁重的 Rust 作業。
+- 非文件 PR 須通過 lint、測試及 release 建置煙霧測試。
+- 涉及 Rust 的 PR 使用與 `dev`/`main` 推送相同的必要閘門集（無 PR 專屬的建置捷徑）。
+
+### 4.3 步驟 C：審查
+
+- 審查者依風險和大小標籤排定優先順序。
+- 安全敏感路徑（`src/security`、`src/runtime`、`src/gateway`，以及 CI 工作流程）需要維護者關注。
+- 大型 PR（`size: L`/`size: XL`）除非有充分理由，否則應予以拆分。
+
+### 4.4 步驟 D：合併
+
+- 偏好使用 **squash merge** 以保持歷史紀錄精簡。
+- PR 標題應遵循 Conventional Commit 風格。
+- 僅在回滾路徑已記載時才進行合併。
+
+---
+
+## 5. PR 就緒契約（DoR / DoD）
+
+### 5.1 就緒定義（DoR）——請求審查前
+
+- PR 範本已完整填寫。
+- 範圍邊界明確（變更了什麼 / 未變更什麼）。
+- 已附驗證證據（不僅是「CI 會檢查」）。
+- 高風險路徑的安全性與回滾欄位已填寫。
+- 隱私/資料衛生檢查已完成，測試用語保持中性/專案範疇。
+- 若測試/範例中出現身份相關用語，已正規化為 ZeroClaw/專案原生標籤。
+
+### 5.2 完成定義（DoD）——可合併狀態
+
+- `CI Required Gate` 為綠色。
+- 必要審查者已核准（包含 CODEOWNERS 路徑）。
+- 風險等級標籤與觸及的路徑相符。
+- 遷移/相容性影響已記載。
+- 回滾路徑具體且快速。
+
+---
+
+## 6. PR 大小與批次政策
+
+### 6.1 大小層級
+
+- `size: XS` <= 80 行變更
+- `size: S` <= 250 行變更
+- `size: M` <= 500 行變更
+- `size: L` <= 1000 行變更
+- `size: XL` > 1000 行變更
+
+### 6.2 政策
+
+- 預設目標為 `XS/S/M`。
+- `L/XL` PR 需要明確理由與更嚴格的測試證據。
+- 若大型功能無法避免，應拆分為堆疊式 PR。
+
+### 6.3 自動化行為
+
+- `PR Labeler` 依有效變更行數套用 `size:*` 標籤。
+- 純文件/lockfile 為主的 PR 會正規化以避免大小膨脹。
+
+---
+
+## 7. AI/代理貢獻政策
+
+歡迎 AI 輔助的 PR，審查也可以由代理協助。
+
+### 7.1 必要項目
+
+1. 清楚的 PR 摘要與範圍邊界。
+2. 明確的測試/驗證證據。
+3. 高風險變更需附安全影響與回滾說明。
+
+### 7.2 建議項目
+
+1. 當自動化工具實質影響變更內容時，簡述工具/工作流程。
+2. 可選擇附上提示詞/計畫片段以利重現。
+
+我們**不**要求貢獻者量化 AI 與人工的程式碼行數比例。
+
+### 7.3 AI 密集 PR 的審查重點
+
+- 契約相容性。
+- 安全邊界。
+- 錯誤處理與降級行為。
+- 效能與記憶體退化問題。
+
+---
+
+## 8. 審查 SLA 與佇列紀律
+
+- 首次維護者分類目標：48 小時內。
+- 若 PR 被阻擋，維護者留下一份可操作的待辦清單。
+- 使用 `stale` 自動化保持佇列健康；維護者可在需要時套用 `no-stale`。
+- `pr-hygiene` 自動化每 12 小時檢查開啟中的 PR，並在 PR 超過 48 小時無新提交且落後 `main` 或 `CI Required Gate` 缺失/失敗時發出提醒。
+
+### 8.1 佇列預算控管
+
+- 使用審查佇列預算：限制每位維護者同時進行深度審查的 PR 數量，其餘保持在分類狀態。
+- 堆疊式工作需明確標示 `Depends on #...`，以確保審查順序可確定。
+
+### 8.2 積壓壓力控管
+
+- 若新 PR 取代舊的開啟中 PR，需標示 `Supersedes #...`，並在維護者確認後關閉舊的。
+- 以 `stale-candidate` 或 `superseded` 標記休眠/冗餘的 PR，以減少重複審查的工作量。
+
+### 8.3 Issue 分類紀律
+
+- `r:needs-repro` 用於不完整的錯誤回報（在深度分類前先要求可確定性重現）。
+- `r:support` 用於使用/求助類項目，適合在錯誤追蹤之外處理。
+- `invalid` / `duplicate` 標籤觸發**僅限 Issue** 的自動關閉並附帶指引。
+
+### 8.4 自動化副作用防護
+
+- `PR Auto Responder` 針對標籤觸發的留言進行去重，避免洗版。
+- 自動關閉路由僅限 Issue，不適用於 PR。
+- 維護者可使用 `risk: manual` 凍結自動風險重算，在需要人為覆寫時使用。
+
+---
+
+## 9. 安全與穩定性規則
+
+以下領域的變更需要更嚴格的審查及更充分的測試證據：
+
+- `src/security/**`
+- 執行環境程序管理。
+- 閘道入口/認證行為（`src/gateway/**`）。
+- 檔案系統存取邊界。
+- 網路/認證行為。
+- GitHub 工作流程與發布管線。
+- 具備執行能力的工具（`src/tools/**`）。
+
+### 9.1 高風險 PR 的最低要求
+
+- 威脅/風險陳述。
+- 緩解說明。
+- 回滾步驟。
+
+### 9.2 高風險 PR 的建議事項
+
+- 包含一個證明邊界行為的聚焦測試。
+- 包含一個明確的失敗模式情境與預期降級行為。
+
+對於 AI 輔助的貢獻，審查者還應確認作者理解執行環境行為與影響範圍。
+
+---
+
+## 10. 故障復原協定
+
+若已合併的 PR 造成退化：
+
+1. 立即在 `main` 上提交回滾 PR。
+2. 開立後續 Issue 進行根因分析。
+3. 僅在附帶迴歸測試後才重新引入修正。
+
+優先快速恢復服務品質，而非等待延遲的完美修正。
+
+---
+
+## 11. 維護者合併檢查清單
+
+- 範圍聚焦且可理解。
+- CI 閘門為綠色。
+- 文件變更時文件品質檢查為綠色。
+- 安全影響欄位已填寫。
+- 隱私/資料衛生欄位已填寫，證據已脫敏/匿名化。
+- 代理工作流程說明足以重現（若使用了自動化）。
+- 回滾計畫明確。
+- 提交標題遵循 Conventional Commits。
+
+---
+
+## 12. 代理審查運作模型
+
+為在高 PR 流量下保持審查品質穩定，採用雙通道審查模型。
+
+### 12.1 通道 A：快速分類（代理友善）
+
+- 確認 PR 範本完整性。
+- 確認 CI 閘門訊號（`CI Required Gate`）。
+- 透過標籤與觸及路徑確認風險等級。
+- 確認回滾聲明存在。
+- 確認隱私/資料衛生區塊及中性用語要求已滿足。
+- 確認任何身份相關用語使用 ZeroClaw/專案原生術語。
+
+### 12.2 通道 B：深度審查（基於風險）
+
+高風險變更（安全/執行環境/閘道/CI）必要：
+
+- 驗證威脅模型假設。
+- 驗證失敗模式與降級行為。
+- 驗證向後相容性與遷移影響。
+- 驗證可觀測性/日誌影響。
+
+---
+
+## 13. 佇列優先順序與標籤紀律
+
+### 13.1 分類順序建議
+
+1. `size: XS`/`size: S` + 錯誤修復/安全修復。
+2. `size: M` 聚焦變更。
+3. `size: L`/`size: XL` 拆分請求或分階段審查。
+
+### 13.2 標籤紀律
+
+- 路徑標籤可快速識別子系統負責歸屬。
+- 大小標籤驅動批次策略。
+- 風險標籤驅動審查深度（`risk: low/medium/high`）。
+- 模組標籤（`<module>: <component>`）改善整合專屬變更及未來新增模組的審查者路由。
+- `risk: manual` 允許維護者在自動化缺乏上下文時保留人為風險判斷。
+- `no-stale` 保留給已接受但被阻擋的工作。
+
+---
+
+## 14. 代理交接契約
+
+當一個代理交接給另一個代理（或交接給維護者）時，需包含：
+
+1. 範圍邊界（變更了什麼 / 未變更什麼）。
+2. 驗證證據。
+3. 未解風險與未知項目。
+4. 建議的下一步行動。
+
+這可降低上下文遺失並避免重複深入分析。
+
+---
+
+## 15. 相關文件
+
+- [README.md](./README.md) — 文件分類與導覽。
+- [ci-map.md](./ci-map.md) — CI 工作流程負責人與分類對照表。
+- [reviewer-playbook.md](./reviewer-playbook.md) — 審查者執行模型。
+- [actions-source-policy.md](./actions-source-policy.md) — Actions 來源白名單政策。
+
+---
+
+## 16. 維護備註
+
+- **負責人：** 負責協作治理與合併品質的維護者。
+- **更新觸發條件：** 分支保護變更、標籤/風險政策變更、佇列治理更新，或代理審查流程變更。
+- **最後審閱日：** 2026-02-18。

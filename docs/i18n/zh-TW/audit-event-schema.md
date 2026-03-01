@@ -1,32 +1,67 @@
-# 在地化橋接檔案：Audit Event Schema
+# CI/安全稽核事件架構（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+本文件定義 CI/CD 和安全工作流程所使用的標準化稽核事件信封格式。
 
-英文原文:
+## 信封結構
 
-- [../../audit-event-schema.md](../../audit-event-schema.md)
+所有由 `scripts/ci/emit_audit_event.py` 產生的稽核事件，皆遵循以下頂層架構：
 
-## 主題定位
+```json
+{
+  "schema_version": "zeroclaw.audit.v1",
+  "event_type": "string",
+  "generated_at": "RFC3339 timestamp",
+  "run_context": {
+    "repository": "owner/repo",
+    "workflow": "workflow name",
+    "run_id": "GitHub run id",
+    "run_attempt": "GitHub run attempt",
+    "sha": "commit sha",
+    "ref": "git ref",
+    "actor": "trigger actor"
+  },
+  "artifact": {
+    "name": "artifact name",
+    "retention_days": 14
+  },
+  "payload": {}
+}
+```
 
-- 類別：安全與治理
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+注意事項：
 
-## 原文章節導覽
+- `artifact` 為選用欄位，但所有 CI/安全稽核流程都應填入此欄位。
+- `payload` 保留各個流程原始的報告 JSON。
 
-- [H2 · Envelope](../../audit-event-schema.md#envelope)
-- [H2 · Event Types](../../audit-event-schema.md#event-types)
-- [H2 · Retention Policy](../../audit-event-schema.md#retention-policy)
-- [H2 · Governance](../../audit-event-schema.md#governance)
+## 事件類型
 
-## 操作建議
+目前的事件類型包括：
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+- `ci_change_audit`
+- `provider_connectivity`
+- `reproducible_build`
+- `supply_chain_provenance`
+- `rollback_guard`
+- `deny_policy_guard`
+- `secrets_governance_guard`
+- `gitleaks_scan`
+- `sbom_snapshot`
 
-## 相關入口
+## 保留策略
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+保留期間編碼於工作流程的 artifact 上傳中，並同步至事件的中繼資料：
+
+| 工作流程 | Artifact / 事件 | 保留期間 |
+| --- | --- | --- |
+| `ci-change-audit.yml` | `ci-change-audit*` | 14 天 |
+| `ci-provider-connectivity.yml` | `provider-connectivity*` | 14 天 |
+| `ci-reproducible-build.yml` | `reproducible-build*` | 14 天 |
+| `sec-audit.yml` | deny/secrets/gitleaks/sbom artifacts | 14 天 |
+| `ci-rollback.yml` | `ci-rollback-plan*` | 21 天 |
+| `ci-supply-chain-provenance.yml` | `supply-chain-provenance` | 30 天 |
+
+## 治理規範
+
+- 事件酬載架構應保持穩定且僅做累加式變更，以避免破壞下游解析器。
+- 所有稽核流程使用固定版本的 Actions 和確定性的 artifact 命名。
+- 任何保留策略的變更都必須同時記錄在本檔案和 `docs/ci-map.md` 中。

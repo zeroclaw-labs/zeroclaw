@@ -1,46 +1,191 @@
-# 在地化橋接檔案：Reviewer Playbook
+# 審查者操作手冊（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+本操作手冊是 [`docs/pr-workflow.md`](./pr-workflow.md) 的實務執行指南。
+更廣泛的文件導覽請參閱 [`docs/README.md`](./README.md)。
 
-英文原文:
+## 0. 摘要
 
-- [../../reviewer-playbook.md](../../reviewer-playbook.md)
+- **目的：** 定義確定性的審查者運作模型，在高 PR 流量下維持審查品質。
+- **對象：** 維護者、審查者及 AI 輔助審查者。
+- **範圍：** 進件分類、風險對應深度路由、深度審查檢查、自動化覆寫及交接協定。
+- **非目標：** 取代 `CONTRIBUTING.md` 中的 PR 政策權威或 CI 檔案中的工作流程權威。
 
-## 主題定位
+---
 
-- 類別：工程流程與專案管理
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+## 1. 依審查狀況的快速路由
 
-## 原文章節導覽
+在閱讀完整細節前，先使用本節快速路由。
 
-- [H2 · 0. Summary](../../reviewer-playbook.md#0-summary)
-- [H2 · 1. Fast Path by Review Situation](../../reviewer-playbook.md#1-fast-path-by-review-situation)
-- [H3 · 1.1 Intake fails in first 5 minutes](../../reviewer-playbook.md#1-1-intake-fails-in-first-5-minutes)
-- [H3 · 1.2 Risk is high or unclear](../../reviewer-playbook.md#1-2-risk-is-high-or-unclear)
-- [H3 · 1.3 Automation output is wrong/noisy](../../reviewer-playbook.md#1-3-automation-output-is-wrong-noisy)
-- [H3 · 1.4 Need review handoff](../../reviewer-playbook.md#1-4-need-review-handoff)
-- [H2 · 2. Review Depth Decision Matrix](../../reviewer-playbook.md#2-review-depth-decision-matrix)
-- [H2 · 3. Standard Review Workflow](../../reviewer-playbook.md#3-standard-review-workflow)
-- [H3 · 3.1 Five-minute intake triage](../../reviewer-playbook.md#3-1-five-minute-intake-triage)
-- [H3 · 3.2 Fast-lane checklist (all PRs)](../../reviewer-playbook.md#3-2-fast-lane-checklist-all-prs)
-- [H3 · 3.3 Deep review checklist (high risk)](../../reviewer-playbook.md#3-3-deep-review-checklist-high-risk)
-- [H3 · 3.4 Review comment outcome style](../../reviewer-playbook.md#3-4-review-comment-outcome-style)
-- [H2 · 4. Issue Triage and Backlog Governance](../../reviewer-playbook.md#4-issue-triage-and-backlog-governance)
-- [H3 · 4.1 Issue triage label playbook](../../reviewer-playbook.md#4-1-issue-triage-label-playbook)
-- [H3 · 4.2 PR backlog pruning protocol](../../reviewer-playbook.md#4-2-pr-backlog-pruning-protocol)
-- [H2 · 5. Automation Override Protocol](../../reviewer-playbook.md#5-automation-override-protocol)
-- [H2 · 6. Handoff Protocol](../../reviewer-playbook.md#6-handoff-protocol)
-- [H2 · 7. Weekly Queue Hygiene](../../reviewer-playbook.md#7-weekly-queue-hygiene)
+### 1.1 進件在前 5 分鐘內未通過
 
-## 操作建議
+1. 留下一則可操作的待辦清單留言。
+2. 在進件阻礙修正前停止深度審查。
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+前往：
 
-## 相關入口
+- [第 3.1 節](#31-五分鐘進件分類)
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+### 1.2 風險為高或不明確
+
+1. 預設視為 `risk: high`。
+2. 要求深度審查及明確的回滾證據。
+
+前往：
+
+- [第 2 節](#2-審查深度決策矩陣)
+- [第 3.3 節](#33-深度審查檢查清單高風險)
+
+### 1.3 自動化輸出錯誤/雜訊過多
+
+1. 套用覆寫協定（`risk: manual`、去重留言/標籤）。
+2. 附明確理由後繼續審查。
+
+前往：
+
+- [第 5 節](#5-自動化覆寫協定)
+
+### 1.4 需要審查交接
+
+1. 交接時附上範圍/風險/驗證/阻礙資訊。
+2. 指派具體的下一步行動。
+
+前往：
+
+- [第 6 節](#6-交接協定)
+
+---
+
+## 2. 審查深度決策矩陣
+
+| 風險標籤 | 典型觸及路徑 | 最低審查深度 | 必要證據 |
+|---|---|---|---|
+| `risk: low` | 文件/測試/雜務、獨立的非執行環境變更 | 1 位審查者 + CI 閘門 | 一致的本機驗證 + 無行為歧義 |
+| `risk: medium` | `src/providers/**`、`src/channels/**`、`src/memory/**`、`src/config/**` | 1 位熟悉子系統的審查者 + 行為驗證 | 聚焦情境證明 + 明確副作用 |
+| `risk: high` | `src/security/**`、`src/runtime/**`、`src/gateway/**`、`src/tools/**`、`.github/workflows/**` | 快速分類 + 深度審查 + 回滾就緒 | 安全/失敗模式檢查 + 回滾清晰度 |
+
+不確定時，視為 `risk: high`。
+
+若自動風險標籤在上下文中不正確，維護者可套用 `risk: manual` 並明確設定最終的 `risk:*` 標籤。
+
+---
+
+## 3. 標準審查工作流程
+
+### 3.1 五分鐘進件分類
+
+對每一個新 PR：
+
+1. 確認範本完整性（`summary`、`validation`、`security`、`rollback`）。
+2. 確認標籤存在且合理：
+   - `size:*`、`risk:*`
+   - 範圍標籤（例如 `provider`、`channel`、`security`）
+   - 模組範疇標籤（`channel:*`、`provider:*`、`tool:*`）
+   - 適用時的貢獻者層級標籤
+3. 確認 CI 訊號狀態（`CI Required Gate`）。
+4. 確認範圍為單一關注點（除非有正當理由，否則拒絕混合型大 PR）。
+5. 確認隱私/資料衛生及中性測試用語要求已滿足。
+
+若任何進件要求未通過，留下一則可操作的待辦清單留言，而非進行深度審查。
+
+### 3.2 快速通道檢查清單（所有 PR）
+
+- 範圍邊界明確且可信。
+- 驗證指令存在且結果一致。
+- 使用者面向的行為變更已記載。
+- 作者展現對行為與影響範圍的理解（尤其是 AI 輔助的 PR）。
+- 回滾路徑具體（不僅是「revert」）。
+- 相容性/遷移影響清楚。
+- diff 產物中無個人/敏感資料外洩；範例/測試保持中性且專案範疇。
+- 若存在身份相關用語，使用 ZeroClaw/專案原生角色（非個人或真實身份）。
+- 命名與架構邊界遵循專案契約（`AGENTS.md`、`CONTRIBUTING.md`）。
+
+### 3.3 深度審查檢查清單（高風險）
+
+對高風險 PR，至少在每個類別中驗證一個具體範例：
+
+- **安全邊界：** 預設拒絕行為保留，無意外的範圍擴大。
+- **失敗模式：** 錯誤處理明確且能安全降級。
+- **契約穩定性：** CLI/設定/API 相容性保留或已記載遷移方式。
+- **可觀測性：** 失敗可診斷且不會洩漏機密。
+- **回滾安全性：** 回滾路徑與影響範圍清楚。
+
+### 3.4 審查留言結果風格
+
+偏好使用待辦清單風格的留言，附帶單一明確結論：
+
+- **可合併**（說明原因）。
+- **需作者處理**（排序的阻擋清單）。
+- **需更深入的安全/執行環境審查**（陳述確切風險與要求的證據）。
+
+避免模糊留言導致不必要的來回延遲。
+
+---
+
+## 4. Issue 分類與積壓治理
+
+### 4.1 Issue 分類標籤操作手冊
+
+使用標籤保持積壓可行動：
+
+- `r:needs-repro` 用於不完整的錯誤回報。
+- `r:support` 用於使用/支援問題，較適合在錯誤追蹤之外路由。
+- `duplicate` / `invalid` 用於不可行動的重複/雜訊。
+- `no-stale` 用於已接受但等待外部阻礙的工作。
+- 當日誌/載荷包含個人識別資訊或敏感資料時，要求脫敏。
+
+### 4.2 PR 積壓清理協定
+
+當審查需求超過容量時，依此順序處理：
+
+1. 將進行中的錯誤/安全 PR（`size: XS/S`）保持在佇列最前。
+2. 要求重疊的 PR 合併；確認後以 `superseded` 關閉較舊的。
+3. 在過期關閉視窗開始前將休眠 PR 標記為 `stale-candidate`。
+4. 重新開啟過期/被取代的技術工作前，要求 rebase + 重新驗證。
+
+---
+
+## 5. 自動化覆寫協定
+
+當自動化輸出產生審查副作用時使用：
+
+1. **風險標籤錯誤：** 新增 `risk: manual`，然後設定預期的 `risk:*` 標籤。
+2. **Issue 分類自動關閉錯誤：** 重新開啟 Issue、移除路由標籤、留下一則澄清留言。
+3. **標籤洗版/雜訊：** 保留一則權威維護者留言並移除冗餘路由標籤。
+4. **PR 範圍模糊：** 在深度審查前要求拆分。
+
+---
+
+## 6. 交接協定
+
+若將審查交接給另一位維護者/代理，需包含：
+
+1. 範圍摘要。
+2. 當前風險等級與理由。
+3. 已驗證的項目。
+4. 未解阻礙。
+5. 建議的下一步行動。
+
+---
+
+## 7. 每週佇列衛生
+
+- 審查過期佇列，僅對已接受但被阻擋的工作套用 `no-stale`。
+- 優先處理 `size: XS/S` 的錯誤/安全 PR。
+- 將反覆出現的支援問題轉化為文件更新與自動回應指引。
+
+---
+
+## 8. 相關文件
+
+- [README.md](./README.md) — 文件分類與導覽。
+- [pr-workflow.md](./pr-workflow.md) — 治理工作流程與合併契約。
+- [ci-map.md](./ci-map.md) — CI 負責歸屬與分類對照表。
+- [actions-source-policy.md](./actions-source-policy.md) — Actions 來源白名單政策。
+
+---
+
+## 9. 維護備註
+
+- **負責人：** 負責審查品質與佇列吞吐量的維護者。
+- **更新觸發條件：** PR 政策變更、風險路由模型變更，或自動化覆寫行為變更。
+- **最後審閱日：** 2026-02-18。

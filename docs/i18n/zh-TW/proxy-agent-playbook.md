@@ -1,46 +1,229 @@
-# 在地化橋接檔案：Proxy Agent Playbook
+# 代理程式 Proxy 操作手冊（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+本手冊提供可直接複製貼上的工具呼叫範例，用於透過 `proxy_config` 設定代理行為。
 
-英文原文:
+當你需要快速且安全地切換 proxy 範圍時，請參考本文件。
 
-- [../../proxy-agent-playbook.md](../../proxy-agent-playbook.md)
+## 0. 摘要
 
-## 主題定位
+- **用途：** 提供可直接使用的代理程式工具呼叫，涵蓋 proxy 範圍管理與回退操作。
+- **適用對象：** 在需要透過 proxy 連線的網路環境中執行 ZeroClaw 的維運人員與維護者。
+- **涵蓋範圍：** `proxy_config` 動作、模式選擇、驗證流程及疑難排解。
+- **不涵蓋：** ZeroClaw 執行環境行為以外的通用網路除錯。
 
-- 類別：Provider 與整合
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+---
 
-## 原文章節導覽
+## 1. 依意圖快速導覽
 
-- [H2 · 0. Summary](../../proxy-agent-playbook.md#0-summary)
-- [H2 · 1. Fast Path by Intent](../../proxy-agent-playbook.md#1-fast-path-by-intent)
-- [H3 · 1.1 Proxy only ZeroClaw internal traffic](../../proxy-agent-playbook.md#1-1-proxy-only-zeroclaw-internal-traffic)
-- [H3 · 1.2 Proxy only selected services](../../proxy-agent-playbook.md#1-2-proxy-only-selected-services)
-- [H3 · 1.3 Export process-wide proxy environment variables](../../proxy-agent-playbook.md#1-3-export-process-wide-proxy-environment-variables)
-- [H3 · 1.4 Emergency rollback](../../proxy-agent-playbook.md#1-4-emergency-rollback)
-- [H2 · 2. Scope Decision Matrix](../../proxy-agent-playbook.md#2-scope-decision-matrix)
-- [H2 · 3. Standard Safe Workflow](../../proxy-agent-playbook.md#3-standard-safe-workflow)
-- [H2 · 4. Mode A — Proxy Only for ZeroClaw Internals](../../proxy-agent-playbook.md#4-mode-a-proxy-only-for-zeroclaw-internals)
-- [H2 · 5. Mode B — Proxy Only for Specific Services](../../proxy-agent-playbook.md#5-mode-b-proxy-only-for-specific-services)
-- [H3 · 5.1 Target specific services](../../proxy-agent-playbook.md#5-1-target-specific-services)
-- [H3 · 5.2 Target by selectors](../../proxy-agent-playbook.md#5-2-target-by-selectors)
-- [H2 · 6. Mode C — Proxy for Full Process Environment](../../proxy-agent-playbook.md#6-mode-c-proxy-for-full-process-environment)
-- [H3 · 6.1 Configure and apply environment scope](../../proxy-agent-playbook.md#6-1-configure-and-apply-environment-scope)
-- [H2 · 7. Disable / Rollback Patterns](../../proxy-agent-playbook.md#7-disable-rollback-patterns)
-- [H3 · 7.1 Disable proxy (default safe behavior)](../../proxy-agent-playbook.md#7-1-disable-proxy-default-safe-behavior)
-- [H3 · 7.2 Disable proxy and force-clear env vars](../../proxy-agent-playbook.md#7-2-disable-proxy-and-force-clear-env-vars)
-- [H3 · 7.3 Keep proxy enabled but clear environment exports only](../../proxy-agent-playbook.md#7-3-keep-proxy-enabled-but-clear-environment-exports-only)
+根據你的需求快速找到對應操作。
 
-## 操作建議
+### 1.1 僅代理 ZeroClaw 內部流量
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+1. 使用範圍 `zeroclaw`。
+2. 設定 `http_proxy`/`https_proxy` 或 `all_proxy`。
+3. 透過 `{"action":"get"}` 驗證。
 
-## 相關入口
+前往：
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+- [第 4 節](#4-模式-a--僅代理-zeroclaw-內部流量)
+
+### 1.2 僅代理特定服務
+
+1. 使用範圍 `services`。
+2. 在 `services` 中設定具體的服務鍵或萬用字元選擇器。
+3. 透過 `{"action":"list_services"}` 驗證覆蓋範圍。
+
+前往：
+
+- [第 5 節](#5-模式-b--僅代理特定服務)
+
+### 1.3 匯出全行程 proxy 環境變數
+
+1. 使用範圍 `environment`。
+2. 透過 `{"action":"apply_env"}` 套用。
+3. 透過 `{"action":"get"}` 驗證環境快照。
+
+前往：
+
+- [第 6 節](#6-模式-c--全行程環境-proxy)
+
+### 1.4 緊急回退
+
+1. 停用 proxy。
+2. 如有需要，清除環境變數匯出。
+3. 重新檢查執行環境與環境變數快照。
+
+前往：
+
+- [第 7 節](#7-停用與回退模式)
+
+---
+
+## 2. 範圍決策矩陣
+
+| 範圍 | 影響對象 | 是否匯出環境變數 | 典型用途 |
+|---|---|---|---|
+| `zeroclaw` | ZeroClaw 內部 HTTP 用戶端 | 否 | 一般執行環境代理，不產生行程層級副作用 |
+| `services` | 僅選定的服務鍵/選擇器 | 否 | 針對特定供應商/工具/頻道的精細路由 |
+| `environment` | 執行環境 + 行程環境 proxy 變數 | 是 | 需要 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 的整合場景 |
+
+---
+
+## 3. 標準安全工作流程
+
+每次 proxy 變更都應遵循以下步驟：
+
+1. 檢查目前狀態。
+2. 探索可用的服務鍵/選擇器。
+3. 套用目標範圍設定。
+4. 驗證執行環境與環境變數快照。
+5. 若行為不符預期，執行回退。
+
+工具呼叫：
+
+```json
+{"action":"get"}
+{"action":"list_services"}
+```
+
+---
+
+## 4. 模式 A — 僅代理 ZeroClaw 內部流量
+
+當 ZeroClaw 的供應商/頻道/工具 HTTP 流量需要走 proxy，但不需匯出行程層級的 proxy 環境變數時使用。
+
+工具呼叫：
+
+```json
+{"action":"set","enabled":true,"scope":"zeroclaw","http_proxy":"http://127.0.0.1:7890","https_proxy":"http://127.0.0.1:7890","no_proxy":["localhost","127.0.0.1"]}
+{"action":"get"}
+```
+
+預期行為：
+
+- 執行環境 proxy 已為 ZeroClaw HTTP 用戶端啟用。
+- 不需要匯出 `HTTP_PROXY` / `HTTPS_PROXY` 行程環境變數。
+
+---
+
+## 5. 模式 B — 僅代理特定服務
+
+當僅有系統的部分服務需要走 proxy（例如特定的供應商/工具/頻道）時使用。
+
+### 5.1 指定特定服務
+
+```json
+{"action":"set","enabled":true,"scope":"services","services":["provider.openai","tool.http_request","channel.telegram"],"all_proxy":"socks5h://127.0.0.1:1080","no_proxy":["localhost","127.0.0.1",".internal"]}
+{"action":"get"}
+```
+
+### 5.2 使用選擇器指定
+
+```json
+{"action":"set","enabled":true,"scope":"services","services":["provider.*","tool.*"],"http_proxy":"http://127.0.0.1:7890"}
+{"action":"get"}
+```
+
+預期行為：
+
+- 僅匹配的服務使用 proxy。
+- 未匹配的服務直接連線，不走 proxy。
+
+---
+
+## 6. 模式 C — 全行程環境 Proxy
+
+當你明確需要匯出行程環境變數（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`）以供執行環境整合使用時。
+
+### 6.1 設定並套用環境範圍
+
+```json
+{"action":"set","enabled":true,"scope":"environment","http_proxy":"http://127.0.0.1:7890","https_proxy":"http://127.0.0.1:7890","no_proxy":"localhost,127.0.0.1,.internal"}
+{"action":"apply_env"}
+{"action":"get"}
+```
+
+預期行為：
+
+- 執行環境 proxy 已啟用。
+- 環境變數已匯出至行程。
+
+---
+
+## 7. 停用與回退模式
+
+### 7.1 停用 proxy（預設安全行為）
+
+```json
+{"action":"disable"}
+{"action":"get"}
+```
+
+### 7.2 停用 proxy 並強制清除環境變數
+
+```json
+{"action":"disable","clear_env":true}
+{"action":"get"}
+```
+
+### 7.3 保持 proxy 啟用但僅清除環境變數匯出
+
+```json
+{"action":"clear_env"}
+{"action":"get"}
+```
+
+---
+
+## 8. 常見操作範例
+
+### 8.1 從全環境 proxy 切換至僅服務 proxy
+
+```json
+{"action":"set","enabled":true,"scope":"services","services":["provider.openai","tool.http_request"],"all_proxy":"socks5://127.0.0.1:1080"}
+{"action":"get"}
+```
+
+### 8.2 新增一個受代理的服務
+
+```json
+{"action":"set","scope":"services","services":["provider.openai","tool.http_request","channel.slack"]}
+{"action":"get"}
+```
+
+### 8.3 使用選擇器重設 `services` 清單
+
+```json
+{"action":"set","scope":"services","services":["provider.*","channel.telegram"]}
+{"action":"get"}
+```
+
+---
+
+## 9. 疑難排解
+
+- 錯誤：`proxy.scope='services' requires a non-empty proxy.services list`
+  - 修正：設定至少一個具體的服務鍵或選擇器。
+
+- 錯誤：無效的 proxy URL scheme
+  - 允許的 scheme：`http`、`https`、`socks5`、`socks5h`。
+
+- Proxy 未如預期生效
+  - 執行 `{"action":"list_services"}` 確認服務名稱/選擇器是否正確。
+  - 執行 `{"action":"get"}` 檢查 `runtime_proxy` 和 `environment` 快照值。
+
+---
+
+## 10. 相關文件
+
+- [README.md](./README.md) — 文件索引與分類。
+- [network-deployment.md](./network-deployment.md) — 端對端網路部署與通道拓撲指引。
+- [resource-limits.md](./resource-limits.md) — 網路/工具執行環境的執行安全限制。
+
+---
+
+## 11. 維護備註
+
+- **負責人：** 執行環境與工具維護者。
+- **更新時機：** 新增 `proxy_config` 動作、proxy 範圍語意變更或支援的服務選擇器變更時。
+- **最後審閱：** 2026-02-18。

@@ -1,40 +1,116 @@
-# 在地化橋接檔案：Adding Boards And Tools
+# 新增開發板與工具 — ZeroClaw 硬體指南（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+本指南說明如何在 ZeroClaw 中新增硬體開發板和自訂工具。
 
-英文原文:
+## 快速開始：透過 CLI 新增開發板
 
-- [../../adding-boards-and-tools.md](../../adding-boards-and-tools.md)
+```bash
+# 新增開發板（更新 ~/.zeroclaw/config.toml）
+zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
+zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
+zeroclaw peripheral add rpi-gpio native   # 用於 Raspberry Pi GPIO（Linux）
 
-## 主題定位
+# 重新啟動 daemon 以套用設定
+zeroclaw daemon --host 127.0.0.1 --port 42617
+```
 
-- 類別：硬體與外設
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+## 支援的開發板
 
-## 原文章節導覽
+| 開發板 | 傳輸方式 | 路徑範例 |
+|--------|---------|---------|
+| nucleo-f401re | serial | /dev/ttyACM0、/dev/cu.usbmodem* |
+| arduino-uno | serial | /dev/ttyACM0、/dev/cu.usbmodem* |
+| arduino-uno-q | bridge | （Uno Q IP） |
+| rpi-gpio | native | native |
+| esp32 | serial | /dev/ttyUSB0 |
 
-- [H2 · Quick Start: Add a Board via CLI](../../adding-boards-and-tools.md#quick-start-add-a-board-via-cli)
-- [H2 · Supported Boards](../../adding-boards-and-tools.md#supported-boards)
-- [H2 · Manual Config](../../adding-boards-and-tools.md#manual-config)
-- [H2 · Adding a Datasheet (RAG)](../../adding-boards-and-tools.md#adding-a-datasheet-rag)
-- [H3 · Pin Aliases (Recommended)](../../adding-boards-and-tools.md#pin-aliases-recommended)
-- [H2 · Pin Aliases](../../adding-boards-and-tools.md#pin-aliases)
-- [H2 · Pin Aliases](../../adding-boards-and-tools.md#pin-aliases)
-- [H3 · PDF Datasheets](../../adding-boards-and-tools.md#pdf-datasheets)
-- [H2 · Adding a New Board Type](../../adding-boards-and-tools.md#adding-a-new-board-type)
-- [H2 · Adding a Custom Tool](../../adding-boards-and-tools.md#adding-a-custom-tool)
-- [H2 · CLI Reference](../../adding-boards-and-tools.md#cli-reference)
-- [H2 · Troubleshooting](../../adding-boards-and-tools.md#troubleshooting)
+## 手動設定
 
-## 操作建議
+編輯 `~/.zeroclaw/config.toml`：
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+```toml
+[peripherals]
+enabled = true
+datasheet_dir = "docs/datasheets" # 選用：RAG 功能，將「打開紅色 LED」對應到 pin 13
 
-## 相關入口
+[[peripherals.boards]]
+board = "nucleo-f401re"
+transport = "serial"
+path = "/dev/ttyACM0"
+baud = 115200
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+[[peripherals.boards]]
+board = "arduino-uno"
+transport = "serial"
+path = "/dev/cu.usbmodem12345"
+baud = 115200
+```
+
+## 新增資料表（RAG）
+
+將 `.md` 或 `.txt` 檔案放入 `docs/datasheets/`（或你設定的 `datasheet_dir`）。檔案以開發板名稱命名：`nucleo-f401re.md`、`arduino-uno.md`。
+
+### 腳位別名（建議設定）
+
+新增 `## Pin Aliases` 區段，讓代理能將「red led」對應到 pin 13：
+
+```markdown
+# My Board
+
+## Pin Aliases
+
+| alias       | pin |
+|-------------|-----|
+| red_led     | 13  |
+| builtin_led | 13  |
+| user_led    | 5   |
+```
+
+或使用鍵值格式：
+
+```markdown
+## Pin Aliases
+red_led: 13
+builtin_led: 13
+```
+
+### PDF 資料表
+
+啟用 `rag-pdf` feature 後，ZeroClaw 可以索引 PDF 檔案：
+
+```bash
+cargo build --features hardware,rag-pdf
+```
+
+將 PDF 放入資料表目錄中，系統會自動擷取內容並分塊以供 RAG 使用。
+
+## 新增開發板類型
+
+1. **建立資料表** — 在 `docs/datasheets/my-board.md` 中包含腳位別名和 GPIO 資訊。
+2. **加入設定** — `zeroclaw peripheral add my-board /dev/ttyUSB0`
+3. **實作周邊裝置**（選用）— 若需自訂協定，在 `src/peripherals/` 中實作 `Peripheral` trait，並在 `create_peripheral_tools` 中註冊。
+
+完整設計請參閱 `docs/hardware-peripherals-design.md`。
+
+## 新增自訂工具
+
+1. 在 `src/tools/` 中實作 `Tool` trait。
+2. 在 `create_peripheral_tools`（硬體工具）或代理工具註冊表中註冊。
+3. 在 `src/agent/loop_.rs` 的 `tool_descs` 中加入工具描述。
+
+## CLI 參考
+
+| 指令 | 說明 |
+|------|------|
+| `zeroclaw peripheral list` | 列出已設定的開發板 |
+| `zeroclaw peripheral add <board> <path>` | 新增開發板（寫入設定檔） |
+| `zeroclaw peripheral flash` | 燒錄 Arduino 韌體 |
+| `zeroclaw peripheral flash-nucleo` | 燒錄 Nucleo 韌體 |
+| `zeroclaw hardware discover` | 列出 USB 裝置 |
+| `zeroclaw hardware info` | 透過 probe-rs 取得晶片資訊 |
+
+## 疑難排解
+
+- **找不到序列埠** — macOS 上使用 `/dev/cu.usbmodem*`；Linux 上使用 `/dev/ttyACM0` 或 `/dev/ttyUSB0`。
+- **啟用硬體功能編譯** — `cargo build --features hardware`
+- **Nucleo 使用 probe-rs** — `cargo build --features hardware,probe`

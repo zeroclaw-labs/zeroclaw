@@ -1,38 +1,62 @@
-# 在地化橋接檔案：Doc Template
+# 文件範本（操作型）（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+在 `docs/` 下新增操作型或工程文件時，請使用此範本。
 
-英文原文:
+保留適用的章節；合併前移除不適用的預留位置。
 
-- [../../doc-template.md](../../doc-template.md)
+---
 
-## 主題定位
+## 1. 摘要
 
-- 類別：工程流程與專案管理
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+- **用途：** <一句話說明此文件存在的原因>
+- **讀者：** <運維人員 | 審查者 | 貢獻者 | 維護者>
+- **範圍：** <本文件涵蓋的內容>
+- **非目標：** <本文件刻意不涵蓋的內容>
 
-## 原文章節導覽
+## 2. 前置條件
 
-- [H2 · 1. Summary](../../doc-template.md#1-summary)
-- [H2 · 2. Prerequisites](../../doc-template.md#2-prerequisites)
-- [H2 · 3. Procedure](../../doc-template.md#3-procedure)
-- [H3 · 3.1 Baseline Check](../../doc-template.md#3-1-baseline-check)
-- [H3 · 3.2 Main Workflow](../../doc-template.md#3-2-main-workflow)
-- [H3 · 3.3 Verification](../../doc-template.md#3-3-verification)
-- [H2 · 4. Safety, Risk, and Rollback](../../doc-template.md#4-safety-risk-and-rollback)
-- [H2 · 5. Troubleshooting](../../doc-template.md#5-troubleshooting)
-- [H2 · 6. Related Docs](../../doc-template.md#6-related-docs)
-- [H2 · 7. Maintenance Notes](../../doc-template.md#7-maintenance-notes)
+- <必要環境>
+- <必要權限>
+- <必要工具/設定>
 
-## 操作建議
+## 3. 操作步驟
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+### 3.1 基準檢查
 
-## 相關入口
+1. <步驟>
+2. <步驟>
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+### 3.2 主要工作流程
+
+1. <步驟>
+2. <步驟>
+3. <步驟>
+
+### 3.3 驗證
+
+- <預期輸出或成功訊號>
+- <驗證指令/日誌/檢查點>
+
+## 4. 安全性、風險與回復
+
+- **風險面：** <哪些元件可能受影響>
+- **失敗模式：** <可能出錯的情況>
+- **回復計畫：** <具體的回復指令/步驟>
+
+## 5. 疑難排解
+
+- **徵狀：** <錯誤/訊號>
+  - **原因：** <可能的成因>
+  - **修正：** <處理方式>
+
+## 6. 相關文件
+
+- [README.md](./README.md) — 文件分類與導航。
+- <related-doc-1.md>
+- <related-doc-2.md>
+
+## 7. 維護備註
+
+- **負責人：** <團隊/角色/範圍>
+- **更新觸發條件：** <哪些變更應觸發本文件更新>
+- **最近審閱日期：** <YYYY-MM-DD>

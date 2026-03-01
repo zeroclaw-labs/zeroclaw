@@ -1,43 +1,142 @@
-# 在地化橋接檔案：Zai Glm Setup
+# Z.AI GLM 設定指南（繁體中文）
 
-這是增強型 bridge 頁面。它提供該主題的定位、原文章節導覽和執行提示，使用說明你在不丟失英文規範語義的情況下快速落地。
+ZeroClaw 透過 OpenAI 相容端點支援 Z.AI 的 GLM 模型。
+本指南涵蓋與 ZeroClaw provider 行為相符的實用設定選項。
 
-英文原文:
+## 概覽
 
-- [../../zai-glm-setup.md](../../zai-glm-setup.md)
+ZeroClaw 內建支援以下 Z.AI 別名與端點：
 
-## 主題定位
+| 別名 | 端點 | 備註 |
+|-------|----------|-------|
+| `zai` | `https://api.z.ai/api/coding/paas/v4` | 全球端點 |
+| `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` | 中國端點 |
 
-- 類別：Provider 與整合
-- 深度：增強 bridge（章節導覽 + 執行提示）
-- 適用：先理解結構，再按英文規範逐條執行。
+若需使用自訂基礎 URL，請參閱 `docs/custom-providers.md`。
 
-## 原文章節導覽
+## 設定
 
-- [H2 · Overview](../../zai-glm-setup.md#overview)
-- [H2 · Setup](../../zai-glm-setup.md#setup)
-- [H3 · Quick Start](../../zai-glm-setup.md#quick-start)
-- [H3 · Manual Configuration](../../zai-glm-setup.md#manual-configuration)
-- [H2 · Available Models](../../zai-glm-setup.md#available-models)
-- [H2 · Verify Setup](../../zai-glm-setup.md#verify-setup)
-- [H3 · Test with curl](../../zai-glm-setup.md#test-with-curl)
-- [H3 · Test with ZeroClaw CLI](../../zai-glm-setup.md#test-with-zeroclaw-cli)
-- [H2 · Environment Variables](../../zai-glm-setup.md#environment-variables)
-- [H2 · Troubleshooting](../../zai-glm-setup.md#troubleshooting)
-- [H3 · Rate Limiting](../../zai-glm-setup.md#rate-limiting)
-- [H3 · Authentication Errors](../../zai-glm-setup.md#authentication-errors)
-- [H3 · Model Not Found](../../zai-glm-setup.md#model-not-found)
-- [H2 · Getting an API Key](../../zai-glm-setup.md#getting-an-api-key)
-- [H2 · Related Documentation](../../zai-glm-setup.md#related-documentation)
+### 快速開始
 
-## 操作建議
+```bash
+zeroclaw onboard \
+  --provider "zai" \
+  --api-key "YOUR_ZAI_API_KEY"
+```
 
-- 先通讀原文目錄，再聚焦與你當前變更直接相關的小節。
-- 指令名、配置鍵、API 路徑和程式碼標識保持英文。
-- 發生語義歧義或行為衝突時，以英文原文為準。
+### 手動設定
 
-## 相關入口
+編輯 `~/.zeroclaw/config.toml`：
 
-- [README.md](README.md)
-- [SUMMARY.md](SUMMARY.md)
-- [docs-inventory.md](docs-inventory.md)
+```toml
+api_key = "YOUR_ZAI_API_KEY"
+default_provider = "zai"
+default_model = "glm-5"
+default_temperature = 0.7
+```
+
+## 可用模型
+
+| 模型 | 說明 |
+|-------|-------------|
+| `glm-5` | 初始化引導預設模型；推理能力最強 |
+| `glm-4.7` | 強大的通用品質 |
+| `glm-4.6` | 均衡的基準模型 |
+| `glm-4.5-air` | 較低延遲的選項 |
+
+模型可用性因帳號/地區而異，如有疑問請使用 `/models` API 查詢。
+
+## 驗證設定
+
+### 使用 curl 測試
+
+```bash
+# 測試 OpenAI 相容端點
+curl -X POST "https://api.z.ai/api/coding/paas/v4/chat/completions" \
+  -H "Authorization: Bearer YOUR_ZAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+預期回應：
+```json
+{
+  "choices": [{
+    "message": {
+      "content": "Hello! How can I help you today?",
+      "role": "assistant"
+    }
+  }]
+}
+```
+
+### 使用 ZeroClaw CLI 測試
+
+```bash
+# 直接測試 agent
+echo "Hello" | zeroclaw agent
+
+# 檢查狀態
+zeroclaw status
+```
+
+## 環境變數
+
+新增至 `.env` 檔案：
+
+```bash
+# Z.AI API Key
+ZAI_API_KEY=your-id.secret
+
+# 選用的通用金鑰（多數 provider 使用）
+# API_KEY=your-id.secret
+```
+
+金鑰格式為 `id.secret`（例如：`abc123.xyz789`）。
+
+## 疑難排解
+
+### 頻率限制
+
+**症狀：** `rate_limited` 錯誤
+
+**解決方式：**
+- 等待後重試
+- 確認您的 Z.AI 方案額度限制
+- 嘗試使用 `glm-4.5-air` 以獲得較低延遲與較高配額容忍度
+
+### 驗證錯誤
+
+**症狀：** 401 或 403 錯誤
+
+**解決方式：**
+- 確認 API key 格式為 `id.secret`
+- 檢查金鑰是否已過期
+- 確保金鑰中沒有多餘的空白
+
+### 找不到模型
+
+**症狀：** 模型不可用錯誤
+
+**解決方式：**
+- 列出可用模型：
+```bash
+curl -s "https://api.z.ai/api/coding/paas/v4/models" \
+  -H "Authorization: Bearer YOUR_ZAI_API_KEY" | jq '.data[].id'
+```
+
+## 取得 API Key
+
+1. 前往 [Z.AI](https://z.ai)
+2. 註冊 Coding Plan
+3. 從儀表板產生 API key
+4. 金鑰格式：`id.secret`（例如：`abc123.xyz789`）
+
+## 相關文件
+
+- [ZeroClaw README](../README.md)
+- [自訂 Provider 端點](./custom-providers.md)
+- [貢獻指南](../CONTRIBUTING.md)
