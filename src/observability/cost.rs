@@ -48,7 +48,7 @@ impl CostObserver {
         // Try model family matching (e.g., "claude-sonnet-4" matches any claude-sonnet-4-*)
         for (key, pricing) in &self.prices {
             // Strip provider prefix if present
-            let key_model = key.split('/').last().unwrap_or(key);
+            let key_model = key.split('/').next_back().unwrap_or(key);
 
             // Check if model starts with the key (family match)
             if model.starts_with(key_model) || key_model.starts_with(model) {
@@ -100,13 +100,7 @@ impl Observer for CostObserver {
             let (input_price, output_price) = self.get_pricing(provider, model);
             let full_model_name = format!("{provider}/{model}");
 
-            let usage = TokenUsage::new(
-                full_model_name,
-                input,
-                output,
-                input_price,
-                output_price,
-            );
+            let usage = TokenUsage::new(full_model_name, input, output, input_price, output_price);
 
             if let Err(e) = self.tracker.record_usage(usage) {
                 tracing::warn!("Failed to record cost usage: {e}");

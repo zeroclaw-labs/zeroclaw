@@ -59,6 +59,30 @@ impl SqliteMemory {
         cache_max: usize,
         open_timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
+        Self::with_options(
+            workspace_dir,
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+            "wal",
+        )
+    }
+
+    /// Build SQLite memory with full options including journal mode.
+    ///
+    /// `journal_mode` accepts `"wal"` (default, best performance) or `"delete"`
+    /// (required for network/shared filesystems that lack shared-memory support).
+    pub fn with_options(
+        workspace_dir: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        journal_mode: &str,
+    ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
 
         if let Some(parent) = db_path.parent() {
@@ -68,18 +92,27 @@ impl SqliteMemory {
         let conn = Self::open_connection(&db_path, open_timeout_secs)?;
 
         // ── Production-grade PRAGMA tuning ──────────────────────
-        // WAL mode: concurrent reads during writes, crash-safe
-        // normal sync: 2× write speed, still durable on WAL
-        // mmap 8 MB: let the OS page-cache serve hot reads
+        // WAL mode: concurrent reads during writes, crash-safe (default)
+        // DELETE mode: for shared/network filesystems without mmap/shm support
+        // normal sync: 2× write speed, still durable
+        // mmap 8 MB: let the OS page-cache serve hot reads (WAL only)
         // cache 2 MB: keep ~500 hot pages in-process
         // temp_store memory: temp tables never hit disk
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+        let journal_pragma = match journal_mode.to_lowercase().as_str() {
+            "delete" => "PRAGMA journal_mode = DELETE;",
+            _ => "PRAGMA journal_mode = WAL;",
+        };
+        let mmap_pragma = match journal_mode.to_lowercase().as_str() {
+            "delete" => "PRAGMA mmap_size = 0;",
+            _ => "PRAGMA mmap_size = 8388608;",
+        };
+        conn.execute_batch(&format!(
+            "{journal_pragma}
              PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
+             {mmap_pragma}
              PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
-        )?;
+             PRAGMA temp_store   = MEMORY;"
+        ))?;
 
         Self::init_schema(&conn)?;
 
@@ -778,6 +811,60 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+
+    async fn reindex(&self, progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>) -> anyhow::Result<usize> {
+        // Step 1: Get all memory entries
+        let entries = self.list(None, None).await?;
+        let total = entries.len();
+
+        if total == 0 {
+            return Ok(0);
+        }
+
+        // Step 2: Clear embedding cache
+        {
+            let conn = self.conn.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = conn.lock();
+                conn.execute("DELETE FROM embedding_cache", [])?;
+                Ok(())
+            })
+            .await??;
+        }
+
+        // Step 3: Recompute embeddings for each memory
+        let mut reindexed = 0;
+        for (idx, entry) in entries.iter().enumerate() {
+            // Compute new embedding
+            let embedding = self.get_or_compute_embedding(&entry.content).await?;
+
+            if let Some(ref emb) = embedding {
+                // Update the embedding in the memories table
+                let conn = self.conn.clone();
+                let entry_id = entry.id.clone();
+                let emb_bytes = vector::vec_to_bytes(emb);
+
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let conn = conn.lock();
+                    conn.execute(
+                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+                        params![emb_bytes, entry_id],
+                    )?;
+                    Ok(())
+                })
+                .await??;
+
+                reindexed += 1;
+            }
+
+            // Report progress
+            if let Some(ref cb) = progress_callback {
+                cb(idx + 1, total);
+            }
+        }
+
+        Ok(reindexed)
     }
 }
 

@@ -18,6 +18,17 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cutoff = max_bytes;
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    text.truncate(cutoff);
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -212,17 +223,11 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(crate::util::floor_utf8_char_boundary(
-                        &stdout,
-                        MAX_OUTPUT_BYTES,
-                    ));
+                    truncate_utf8_to_max_bytes(&mut stdout, MAX_OUTPUT_BYTES);
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(crate::util::floor_utf8_char_boundary(
-                        &stderr,
-                        MAX_OUTPUT_BYTES,
-                    ));
+                    truncate_utf8_to_max_bytes(&mut stderr, MAX_OUTPUT_BYTES);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 

@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+pub mod cortex;
 pub mod embeddings;
 pub mod hybrid;
 pub mod hygiene;
@@ -21,6 +22,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
+pub use cortex::CortexMemMemory;
 pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
@@ -57,6 +59,10 @@ where
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
+        }
+        MemoryBackendKind::CortexMem => {
+            let local = sqlite_builder()?;
+            Ok(Box::new(CortexMemMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
@@ -217,6 +223,7 @@ pub fn create_memory_with_storage_and_routes(
             MemoryBackendKind::Sqlite
                 | MemoryBackendKind::SqliteQdrantHybrid
                 | MemoryBackendKind::Lucid
+                | MemoryBackendKind::CortexMem
         )
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
@@ -232,6 +239,7 @@ pub fn create_memory_with_storage_and_routes(
             MemoryBackendKind::Sqlite
                 | MemoryBackendKind::SqliteQdrantHybrid
                 | MemoryBackendKind::Lucid
+                | MemoryBackendKind::CortexMem
         )
         && snapshot::should_hydrate(workspace_dir)
     {
@@ -262,13 +270,14 @@ pub fn create_memory_with_storage_and_routes(
             ));
 
         #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
+        let mem = SqliteMemory::with_options(
             workspace_dir,
             embedder,
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
+            &config.sqlite_journal_mode,
         )?;
         Ok(mem)
     }
@@ -380,7 +389,7 @@ pub fn create_memory_for_migration(
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
+            "memory backend 'none' disables persistence; choose sqlite, lucid, cortex-mem, or markdown before migration"
         );
     }
 
@@ -477,6 +486,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_cortex_mem() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "cortex-mem".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "cortex-mem");
+    }
+
+    #[test]
     fn factory_sqlite_qdrant_hybrid() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
@@ -518,6 +538,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
         assert_eq!(mem.name(), "lucid");
+    }
+
+    #[test]
+    fn migration_factory_cortex_mem() {
+        let tmp = TempDir::new().unwrap();
+        let mem = create_memory_for_migration("cortex-mem", tmp.path()).unwrap();
+        assert_eq!(mem.name(), "cortex-mem");
     }
 
     #[test]

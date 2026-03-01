@@ -8,11 +8,12 @@ pub(super) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    session_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {

@@ -22,7 +22,7 @@ Xác minh lần cuối: **2026-02-28**.
 | `integrations` | Kiểm tra chi tiết tích hợp |
 | `skills` | Liệt kê/cài đặt/gỡ bỏ skills |
 | `migrate` | Nhập dữ liệu từ runtime khác (hiện hỗ trợ OpenClaw) |
-| `config` | Xuất schema cấu hình dạng máy đọc được |
+| `config` | Kiểm tra, truy vấn và sửa đổi cấu hình runtime |
 | `completions` | Tạo script tự hoàn thành cho shell ra stdout |
 | `hardware` | Phát hiện và kiểm tra phần cứng USB |
 | `peripheral` | Cấu hình và nạp firmware thiết bị ngoại vi |
@@ -36,6 +36,8 @@ Xác minh lần cuối: **2026-02-28**.
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `zeroclaw onboard --migrate-openclaw`
+- `zeroclaw onboard --migrate-openclaw --openclaw-source <PATH> --openclaw-config <PATH>`
 
 ### `agent`
 
@@ -120,11 +122,22 @@ Skill manifest (`SKILL.toml`) hỗ trợ `prompts` và `[[tools]]`; cả hai đ�
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `zeroclaw migrate openclaw [--source <path>] [--source-config <path>] [--dry-run]`
+
+Gợi ý: trong hội thoại agent, bề mặt tool `openclaw_migration` cho phép preview hoặc áp dụng migration bằng tool-call có kiểm soát quyền.
 
 ### `config`
 
+- `zeroclaw config show`
+- `zeroclaw config get <key>`
+- `zeroclaw config set <key> <value>`
 - `zeroclaw config schema`
+
+`config show` xuất toàn bộ cấu hình hiệu lực dưới dạng JSON với các trường nhạy cảm được ẩn thành `***REDACTED***`. Các ghi đè từ biến môi trường đã được áp dụng.
+
+`config get <key>` truy vấn một giá trị theo đường dẫn phân tách bằng dấu chấm (ví dụ: `gateway.port`, `security.estop.enabled`). Giá trị đơn in trực tiếp; đối tượng và mảng in dạng JSON.
+
+`config set <key> <value>` cập nhật giá trị cấu hình và lưu nguyên tử vào `config.toml`. Kiểu dữ liệu được suy luận tự động (`true`/`false` → bool, số nguyên, số thực, cú pháp JSON → đối tượng/mảng, còn lại → chuỗi). Sai kiểu sẽ bị từ chối trước khi ghi.
 
 `config schema` xuất JSON Schema (draft 2020-12) cho toàn bộ hợp đồng `config.toml` ra stdout.
 

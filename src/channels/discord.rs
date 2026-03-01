@@ -1,4 +1,6 @@
+use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::AckReactionConfig;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +20,7 @@ pub struct DiscordChannel {
     listen_to_bots: bool,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
+    ack_reaction: Option<AckReactionConfig>,
     workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
@@ -37,6 +40,7 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             group_reply_allowed_sender_ids: Vec::new(),
+            ack_reaction: None,
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
@@ -45,6 +49,12 @@ impl DiscordChannel {
     /// Configure sender IDs that bypass mention gating in guild channels.
     pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
         self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+        self
+    }
+
+    /// Configure ACK reaction policy.
+    pub fn with_ack_reaction(mut self, ack_reaction: Option<AckReactionConfig>) -> Self {
+        self.ack_reaction = ack_reaction;
         self
     }
 
@@ -132,9 +142,11 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// `text/*` MIME types are fetched and inlined, while `image/*` MIME types are
-/// forwarded as `[IMAGE:<url>]` markers. Other types are skipped. Fetch errors
-/// are logged as warnings.
+/// `image/*` attachments are forwarded as `[IMAGE:<url>]` markers. For
+/// `application/octet-stream` or missing MIME types, image-like filename/url
+/// extensions are also treated as images.
+/// `text/*` MIME types are fetched and inlined. Other types are skipped.
+/// Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -153,7 +165,9 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-        if ct.starts_with("text/") {
+        if is_image_attachment(ct, name, url) {
+            parts.push(format!("[IMAGE:{url}]"));
+        } else if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
@@ -167,8 +181,6 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
-        } else if ct.starts_with("image/") {
-            parts.push(format!("[IMAGE:{url}]"));
         } else {
             tracing::debug!(
                 name,
@@ -178,6 +190,54 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
+}
+
+fn is_image_attachment(content_type: &str, filename: &str, url: &str) -> bool {
+    let normalized_content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if !normalized_content_type.is_empty() {
+        if normalized_content_type.starts_with("image/") {
+            return true;
+        }
+        // Trust explicit non-image MIME to avoid false positives from filename extensions.
+        if normalized_content_type != "application/octet-stream" {
+            return false;
+        }
+    }
+
+    has_image_extension(filename) || has_image_extension(url)
+}
+
+fn has_image_extension(value: &str) -> bool {
+    let base = value.split('?').next().unwrap_or(value);
+    let base = base.split('#').next().unwrap_or(base);
+    let ext = Path::new(base)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    matches!(
+        ext.as_deref(),
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "tif"
+                | "tiff"
+                | "svg"
+                | "avif"
+                | "heic"
+                | "heif"
+        )
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,21 +895,37 @@ impl Channel for DiscordChannel {
                         );
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
-                        let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
-                            if let Err(err) = reaction_channel
-                                .add_reaction(
-                                    &reaction_channel_id,
-                                    &reaction_message_id,
-                                    &reaction_emoji,
-                                )
-                                .await
-                            {
-                                tracing::debug!(
-                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
-                                );
-                            }
-                        });
+                        let reaction_ctx = AckReactionContext {
+                            text: &final_content,
+                            sender_id: Some(author_id),
+                            chat_id: Some(&channel_id),
+                            chat_type: if is_group_message {
+                                AckReactionContextChatType::Group
+                            } else {
+                                AckReactionContextChatType::Direct
+                            },
+                            locale_hint: None,
+                        };
+                        if let Some(reaction_emoji) = select_ack_reaction(
+                            self.ack_reaction.as_ref(),
+                            DISCORD_ACK_REACTIONS,
+                            &reaction_ctx,
+                        ) {
+                            tokio::spawn(async move {
+                                if let Err(err) = reaction_channel
+                                    .add_reaction(
+                                        &reaction_channel_id,
+                                        &reaction_message_id,
+                                        &reaction_emoji,
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                    );
+                                }
+                            });
+                        }
                     }
 
                     let channel_msg = ChannelMessage {
@@ -1561,8 +1637,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_attachments_emits_single_image_marker() {
+    async fn process_attachments_emits_image_marker_for_image_content_type() {
         let client = reqwest::Client::new();
         let attachments = vec![serde_json::json!({
             "url": "https://cdn.discordapp.com/attachments/123/456/photo.png",
@@ -1598,6 +1673,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_attachments_emits_image_marker_from_filename_without_content_type() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024",
+            "filename": "photo.jpeg"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024]"
+        );
+    }
+
+    #[test]
+    fn is_image_attachment_prefers_non_image_content_type_over_extension() {
+        assert!(!is_image_attachment(
+            "text/plain",
+            "photo.png",
+            "https://cdn.discordapp.com/attachments/123/456/photo.png"
+        ));
+    }
+
+    #[test]
+    fn is_image_attachment_allows_octet_stream_extension_fallback() {
+        assert!(is_image_attachment(
+            "application/octet-stream",
+            "photo.png",
+            "https://cdn.discordapp.com/attachments/123/456/photo.png"
+        ));
+    }
     #[test]
     fn parse_attachment_markers_extracts_supported_markers() {
         let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";

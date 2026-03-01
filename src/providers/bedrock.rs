@@ -16,6 +16,9 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
 const ENDPOINT_PREFIX: &str = "bedrock-runtime";
@@ -27,6 +30,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 // ── AWS Credentials ─────────────────────────────────────────────
 
 /// Resolved AWS credentials for SigV4 signing.
+#[derive(Clone)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
@@ -134,9 +138,64 @@ impl AwsCredentials {
         })
     }
 
-    /// Resolve credentials: env vars first, then EC2 IMDS.
+    /// Fetch credentials from ECS container credential endpoint.
+    /// Available when running on ECS/Fargate with a task IAM role.
+    async fn from_ecs() -> anyhow::Result<Self> {
+        // Try relative URI first (standard ECS), then full URI (ECS Anywhere / custom)
+        let uri = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+            .ok()
+            .map(|rel| format!("http://169.254.170.2{rel}"))
+            .or_else(|| std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok());
+
+        let uri = uri.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Neither AWS_CONTAINER_CREDENTIALS_RELATIVE_URI nor \
+                 AWS_CONTAINER_CREDENTIALS_FULL_URI is set"
+            )
+        })?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+
+        let mut req = client.get(&uri);
+        // ECS Anywhere / full URI may require an authorization token
+        if let Ok(token) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
+            req = req.header("Authorization", token);
+        }
+
+        let creds_json: serde_json::Value = req.send().await?.json().await?;
+
+        let access_key_id = creds_json["AccessKeyId"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in ECS credential response"))?
+            .to_string();
+        let secret_access_key = creds_json["SecretAccessKey"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in ECS credential response"))?
+            .to_string();
+        let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
+
+        let region = env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        tracing::info!("Loaded AWS credentials from ECS container credential endpoint");
+
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+        })
+    }
+
+    /// Resolve credentials: env vars → ECS endpoint → EC2 IMDS.
     async fn resolve() -> anyhow::Result<Self> {
         if let Ok(creds) = Self::from_env() {
+            return Ok(creds);
+        }
+        if let Ok(creds) = Self::from_ecs().await {
             return Ok(creds);
         }
         Self::from_imds().await
@@ -174,6 +233,56 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
+}
+
+/// How long credentials are considered fresh before re-fetching.
+/// ECS STS tokens typically expire after 6-12 hours; we refresh well
+/// before that to avoid any requests hitting expired tokens.
+const CREDENTIAL_TTL_SECS: u64 = 50 * 60; // 50 minutes
+
+/// Thread-safe credential cache that auto-refreshes from the ECS
+/// container credential endpoint (or env vars / IMDS) when the
+/// cached credentials are older than [`CREDENTIAL_TTL_SECS`].
+struct CachedCredentials {
+    inner: Arc<RwLock<Option<(AwsCredentials, Instant)>>>,
+}
+
+impl CachedCredentials {
+    /// Create a new cache, optionally pre-populated with initial credentials.
+    fn new(initial: Option<AwsCredentials>) -> Self {
+        let entry = initial.map(|c| (c, Instant::now()));
+        Self {
+            inner: Arc::new(RwLock::new(entry)),
+        }
+    }
+
+    /// Get current credentials, refreshing if stale or missing.
+    async fn get(&self) -> anyhow::Result<AwsCredentials> {
+        // Fast path: read lock, check freshness
+        {
+            let guard = self.inner.read().await;
+            if let Some((ref creds, fetched_at)) = *guard {
+                if fetched_at.elapsed().as_secs() < CREDENTIAL_TTL_SECS {
+                    return Ok(creds.clone());
+                }
+            }
+        }
+
+        // Slow path: write lock, re-fetch
+        let mut guard = self.inner.write().await;
+        // Double-check after acquiring write lock (another task may have refreshed)
+        if let Some((ref creds, fetched_at)) = *guard {
+            if fetched_at.elapsed().as_secs() < CREDENTIAL_TTL_SECS {
+                return Ok(creds.clone());
+            }
+        }
+
+        tracing::info!("Refreshing AWS credentials (TTL expired or first fetch)");
+        let fresh = AwsCredentials::resolve().await?;
+        let cloned = fresh.clone();
+        *guard = Some((fresh, Instant::now()));
+        Ok(cloned)
+    }
 }
 
 /// Derive the SigV4 signing key via HMAC chain.
@@ -454,19 +563,21 @@ struct ResponseToolUseWrapper {
 // ── BedrockProvider ─────────────────────────────────────────────
 
 pub struct BedrockProvider {
-    credentials: Option<AwsCredentials>,
+    credentials: CachedCredentials,
 }
 
 impl BedrockProvider {
     pub fn new() -> Self {
         Self {
-            credentials: AwsCredentials::from_env().ok(),
+            credentials: CachedCredentials::new(AwsCredentials::from_env().ok()),
         }
     }
 
     pub async fn new_async() -> Self {
-        let credentials = AwsCredentials::resolve().await.ok();
-        Self { credentials }
+        let initial = AwsCredentials::resolve().await.ok();
+        Self {
+            credentials: CachedCredentials::new(initial),
+        }
     }
 
     fn http_client(&self) -> Client {
@@ -504,22 +615,10 @@ impl BedrockProvider {
         format!("/model/{encoded}/converse-stream")
     }
 
-    fn require_credentials(&self) -> anyhow::Result<&AwsCredentials> {
-        self.credentials.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY environment variables, or run on an EC2 \
-                 instance with an IAM role attached."
-            )
-        })
-    }
-
-    /// Resolve credentials: use cached if available, otherwise fetch from IMDS.
-    async fn resolve_credentials(&self) -> anyhow::Result<AwsCredentials> {
-        if let Ok(creds) = AwsCredentials::from_env() {
-            return Ok(creds);
-        }
-        AwsCredentials::from_imds().await
+    /// Get credentials, auto-refreshing from the ECS endpoint / env vars /
+    /// IMDS when they are older than [`CREDENTIAL_TTL_SECS`].
+    async fn get_credentials(&self) -> anyhow::Result<AwsCredentials> {
+        self.credentials.get().await
     }
 
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
@@ -882,6 +981,7 @@ impl BedrockProvider {
             tool_calls,
             usage,
             reasoning_content: None,
+            quota_metadata: None,
         }
     }
 
@@ -1242,7 +1342,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credentials = self.resolve_credentials().await?;
+        let credentials = self.get_credentials().await?;
 
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
@@ -1284,7 +1384,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credentials = self.resolve_credentials().await?;
+        let credentials = self.get_credentials().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
 
@@ -1343,18 +1443,6 @@ impl Provider for BedrockProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credentials = match self.require_credentials() {
-            Ok(c) => c,
-            Err(_) => {
-                return stream::once(async {
-                    Err(StreamError::Provider(
-                        "AWS Bedrock credentials not set".to_string(),
-                    ))
-                })
-                .boxed();
-            }
-        };
-
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
                 text: text.to_string(),
@@ -1380,13 +1468,7 @@ impl Provider for BedrockProvider {
             tool_config: None,
         };
 
-        // Clone what we need for the async block
-        let credentials = AwsCredentials {
-            access_key_id: credentials.access_key_id.clone(),
-            secret_access_key: credentials.secret_access_key.clone(),
-            session_token: credentials.session_token.clone(),
-            region: credentials.region.clone(),
-        };
+        let cred_cache = self.credentials.inner.clone();
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let client = self.http_client();
@@ -1396,6 +1478,21 @@ impl Provider for BedrockProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         tokio::spawn(async move {
+            // Resolve credentials inside the async context so we get
+            // TTL-validated, auto-refreshing credentials (not stale sync cache).
+            let cred_handle = CachedCredentials { inner: cred_cache };
+            let credentials = match cred_handle.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "AWS Bedrock credentials not available: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
             let payload = match serde_json::to_vec(&request) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1529,7 +1626,7 @@ impl Provider for BedrockProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(ref creds) = self.credentials {
+        if let Ok(creds) = self.get_credentials().await {
             let url = format!("https://{ENDPOINT_PREFIX}.{}.amazonaws.com/", creds.region);
             let _ = self.http_client().get(&url).send().await;
         }
@@ -1695,7 +1792,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_credentials() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: CachedCredentials::new(None),
+        };
         let result = provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
             .await;
@@ -1991,14 +2090,18 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: CachedCredentials::new(None),
+        };
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn capabilities_reports_native_tool_calling() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: CachedCredentials::new(None),
+        };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
     }
@@ -2052,7 +2155,9 @@ mod tests {
 
     #[test]
     fn supports_streaming_returns_true() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: CachedCredentials::new(None),
+        };
         assert!(provider.supports_streaming());
     }
 

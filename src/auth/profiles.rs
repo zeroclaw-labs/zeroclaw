@@ -246,6 +246,39 @@ impl AuthProfilesStore {
         Ok(updated_profile)
     }
 
+    /// Update quota metadata for an auth profile.
+    ///
+    /// This is typically called after a successful or rate-limited API call
+    /// to persist quota information (remaining requests, reset time, etc.).
+    pub async fn update_quota_metadata(
+        &self,
+        profile_id: &str,
+        rate_limit_remaining: Option<u64>,
+        rate_limit_reset_at: Option<DateTime<Utc>>,
+        rate_limit_total: Option<u64>,
+    ) -> Result<()> {
+        self.update_profile(profile_id, |profile| {
+            if let Some(remaining) = rate_limit_remaining {
+                profile
+                    .metadata
+                    .insert("rate_limit_remaining".to_string(), remaining.to_string());
+            }
+            if let Some(reset_at) = rate_limit_reset_at {
+                profile
+                    .metadata
+                    .insert("rate_limit_reset_at".to_string(), reset_at.to_rfc3339());
+            }
+            if let Some(total) = rate_limit_total {
+                profile
+                    .metadata
+                    .insert("rate_limit_total".to_string(), total.to_string());
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn load_locked(&self) -> Result<AuthProfilesData> {
         let mut persisted = self.read_persisted_locked().await?;
         let mut migrated = false;

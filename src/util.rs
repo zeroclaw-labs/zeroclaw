@@ -59,6 +59,58 @@ pub fn floor_utf8_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
+/// Allowed serial device path prefixes shared across hardware transports.
+pub const ALLOWED_SERIAL_PATH_PREFIXES: &[&str] = &[
+    "/dev/ttyACM",
+    "/dev/ttyUSB",
+    "/dev/tty.usbmodem",
+    "/dev/cu.usbmodem",
+    "/dev/tty.usbserial",
+    "/dev/cu.usbserial",
+    "COM",
+];
+
+/// Validate serial device path against per-platform rules.
+pub fn is_serial_path_allowed(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        if !std::path::Path::new(path).is_absolute() {
+            return false;
+        }
+        static PAT: OnceLock<regex::Regex> = OnceLock::new();
+        let re = PAT.get_or_init(|| {
+            regex::Regex::new(r"^/dev/tty(ACM|USB|S|AMA|MFD)\d+$").expect("valid regex")
+        });
+        return re.is_match(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::OnceLock;
+        if !std::path::Path::new(path).is_absolute() {
+            return false;
+        }
+        static PAT: OnceLock<regex::Regex> = OnceLock::new();
+        let re = PAT.get_or_init(|| {
+            regex::Regex::new(r"^/dev/(tty|cu)\.(usbmodem|usbserial)[^\x00/]*$")
+                .expect("valid regex")
+        });
+        return re.is_match(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::OnceLock;
+        static PAT: OnceLock<regex::Regex> = OnceLock::new();
+        let re = PAT.get_or_init(|| regex::Regex::new(r"^COM\d{1,3}$").expect("valid regex"));
+        return re.is_match(path);
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),

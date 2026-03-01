@@ -65,7 +65,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
+                    async move { Box::pin(crate::channels::start_channels(cfg)).await }
                 },
             ));
         } else {
@@ -214,7 +214,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            match crate::agent::run(
+            match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -222,7 +222,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 temp,
                 vec![],
                 false,
-            )
+                None,
+            ))
             .await
             {
                 Ok(output) => {
@@ -497,6 +498,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });
@@ -665,6 +668,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });

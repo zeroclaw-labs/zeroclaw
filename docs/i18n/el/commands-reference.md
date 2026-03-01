@@ -44,6 +44,15 @@
 - `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
 - Το `--new-pairing` καθαρίζει όλα τα αποθηκευμένα paired tokens και δημιουργεί νέο pairing code κατά την εκκίνηση του gateway.
 
+### 2.2 OpenClaw Migration Surface
+
+- `zeroclaw onboard --migrate-openclaw`
+- `zeroclaw onboard --migrate-openclaw --openclaw-source <PATH> --openclaw-config <PATH>`
+- `zeroclaw migrate openclaw --dry-run`
+- `zeroclaw migrate openclaw`
+
+Σημείωση: στο agent runtime υπάρχει επίσης το εργαλείο `openclaw_migration` για controlled preview/apply migration flows.
+
 ### 3. `cron` (Προγραμματισμός Εργασιών)
 
 Δυνατότητα αυτοματισμού εντολών:

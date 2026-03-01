@@ -67,6 +67,15 @@ def parse_args() -> argparse.Namespace:
         help="Also dedupe non-PR runs (push/manual). Default dedupe scope is PR-originated runs only.",
     )
     parser.add_argument(
+        "--non-pr-key",
+        default="sha",
+        choices=["sha", "branch"],
+        help=(
+            "Identity key mode for non-PR dedupe when --dedupe-include-non-pr is enabled: "
+            "'sha' keeps one run per commit (default), 'branch' keeps one run per branch."
+        ),
+    )
+    parser.add_argument(
         "--max-cancel",
         type=int,
         default=200,
@@ -165,7 +174,7 @@ def parse_timestamp(value: str | None) -> datetime:
         return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
-def run_identity_key(run: dict[str, Any]) -> tuple[str, str, str, str]:
+def run_identity_key(run: dict[str, Any], *, non_pr_key: str) -> tuple[str, str, str, str]:
     name = str(run.get("name", ""))
     event = str(run.get("event", ""))
     head_branch = str(run.get("head_branch", ""))
@@ -179,7 +188,10 @@ def run_identity_key(run: dict[str, Any]) -> tuple[str, str, str, str]:
     if pr_number:
         # For PR traffic, cancel stale runs across synchronize updates for the same PR.
         return (name, event, f"pr:{pr_number}", "")
-    # For push/manual traffic, key by SHA to avoid collapsing distinct commits.
+    if non_pr_key == "branch":
+        # Branch-level supersedence for push/manual lanes.
+        return (name, event, head_branch, "")
+    # SHA-level supersedence for push/manual lanes.
     return (name, event, head_branch, head_sha)
 
 
@@ -189,6 +201,7 @@ def collect_candidates(
     dedupe_workflows: set[str],
     *,
     include_non_pr: bool,
+    non_pr_key: str,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     reasons_by_id: dict[int, set[str]] = defaultdict(set)
     runs_by_id: dict[int, dict[str, Any]] = {}
@@ -220,7 +233,7 @@ def collect_candidates(
         has_pr_context = isinstance(pull_requests, list) and len(pull_requests) > 0
         if is_pr_event and not has_pr_context and not include_non_pr:
             continue
-        key = run_identity_key(run)
+        key = run_identity_key(run, non_pr_key=non_pr_key)
         by_workflow[name][key].append(run)
 
     for groups in by_workflow.values():
@@ -324,6 +337,7 @@ def main() -> int:
         obsolete_workflows,
         dedupe_workflows,
         include_non_pr=args.dedupe_include_non_pr,
+        non_pr_key=args.non_pr_key,
     )
 
     capped = selected[: max(0, args.max_cancel)]
@@ -338,6 +352,7 @@ def main() -> int:
             "obsolete_workflows": sorted(obsolete_workflows),
             "dedupe_workflows": sorted(dedupe_workflows),
             "dedupe_include_non_pr": args.dedupe_include_non_pr,
+            "non_pr_key": args.non_pr_key,
             "max_cancel": args.max_cancel,
         },
         "counts": {

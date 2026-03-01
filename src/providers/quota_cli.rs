@@ -103,6 +103,9 @@ pub fn build_quota_summary(
                 rate_limit_remaining,
                 rate_limit_reset_at,
                 rate_limit_total,
+                account_id: profile.account_id.clone(),
+                token_expires_at: profile.token_set.as_ref().and_then(|ts| ts.expires_at),
+                plan_type: profile.metadata.get("plan_type").cloned(),
             });
     }
 
@@ -424,6 +427,9 @@ fn add_qwen_oauth_static_quota(
             rate_limit_remaining: None,   // Unknown without local tracking
             rate_limit_reset_at: None,    // Daily reset (exact time unknown)
             rate_limit_total: Some(1000), // OAuth free tier limit
+            account_id: None,
+            token_expires_at: None,
+            plan_type: Some("free".to_string()),
         }],
     });
 

@@ -220,7 +220,9 @@ impl LoopDetector {
 
 fn hash_output(output: &str) -> u64 {
     let prefix = if output.len() > OUTPUT_HASH_PREFIX_BYTES {
-        &output[..OUTPUT_HASH_PREFIX_BYTES]
+        // Use floor_utf8_char_boundary to avoid panic on multi-byte UTF-8 characters
+        let boundary = crate::util::floor_utf8_char_boundary(output, OUTPUT_HASH_PREFIX_BYTES);
+        &output[..boundary]
     } else {
         output
     };
@@ -385,5 +387,27 @@ mod tests {
         det.record_call("file_read", r#"{"path":"b.rs"}"#, "content_b", true);
         det.record_call("shell", r#"{"cmd":"cargo test"}"#, "ok", true);
         assert_eq!(det.check(), DetectionVerdict::Continue);
+    }
+
+    // 11. UTF-8 boundary safety: hash_output must not panic on CJK text
+    #[test]
+    fn hash_output_utf8_boundary_safe() {
+        // Create a string where byte 4096 lands inside a multi-byte char
+        // Chinese chars are 3 bytes each, so 1366 chars = 4098 bytes
+        let cjk_text: String = "文".repeat(1366); // 4098 bytes
+        assert!(cjk_text.len() > super::OUTPUT_HASH_PREFIX_BYTES);
+
+        // This should NOT panic
+        let hash1 = super::hash_output(&cjk_text);
+
+        // Different content should produce different hash
+        let cjk_text2: String = "字".repeat(1366);
+        let hash2 = super::hash_output(&cjk_text2);
+        assert_ne!(hash1, hash2);
+
+        // Mixed ASCII + CJK at boundary
+        let mixed = "a".repeat(4094) + "文文"; // 4094 + 6 = 4100 bytes, boundary at 4096
+        let hash3 = super::hash_output(&mixed);
+        assert!(hash3 != 0); // Just verify it runs
     }
 }

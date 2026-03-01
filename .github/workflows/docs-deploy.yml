@@ -41,7 +41,7 @@ on:
                 default: ""
 
 concurrency:
-    group: docs-deploy-${{ github.event.pull_request.number || github.sha }}
+    group: docs-deploy-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
     cancel-in-progress: true
 
 permissions:
@@ -184,7 +184,7 @@ jobs:
 
             - name: Link check (added links)
               if: github.event_name != 'workflow_dispatch' && steps.links.outputs.count != '0'
-              uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
+              uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
               with:
                   fail: true
                   args: >-

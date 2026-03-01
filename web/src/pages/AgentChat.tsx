@@ -54,6 +54,22 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'history': {
+          const restored = (msg.messages ?? [])
+            .filter((entry) => entry.content?.trim())
+            .map((entry) => ({
+              id: makeMessageId(),
+              role: entry.role === 'user' ? 'user' : 'agent',
+              content: entry.content.trim(),
+              timestamp: new Date(),
+            }));
+
+          setMessages(restored);
+          setTyping(false);
+          pendingContentRef.current = '';
+          break;
+        }
+
         case 'chunk':
           setTyping(true);
           pendingContentRef.current += msg.content ?? '';
