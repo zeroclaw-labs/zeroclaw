@@ -35,6 +35,7 @@
 - [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
 - [i18n/zh-CN/one-click-bootstrap.md](i18n/zh-CN/one-click-bootstrap.md)
 - [i18n/zh-CN/android-setup.md](i18n/zh-CN/android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) 命令 / 配置参考与集成
 

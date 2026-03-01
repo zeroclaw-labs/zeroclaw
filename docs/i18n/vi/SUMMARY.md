@@ -17,6 +17,7 @@
 - [getting-started/README.md](getting-started/README.md)
 - [one-click-bootstrap.md](one-click-bootstrap.md)
 - [android-setup.md](android-setup.md)
+- [ios-setup.md](../../ios-setup.md)
 
 ### 2) Lệnh / Cấu hình / Tích hợp
 

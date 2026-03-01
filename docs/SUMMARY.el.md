@@ -28,6 +28,8 @@
 ### 1) Πρώτα βήματα
 
 - [i18n/el/one-click-bootstrap.md](i18n/el/one-click-bootstrap.md)
+- [android-setup.md](android-setup.md)
+- [ios-setup.md](ios-setup.md)
 
 ### 2) Αναφορές εντολών/παραμέτρων και ενσωματώσεις
 
