@@ -545,8 +545,8 @@ WasmTool::execute(args: JSON)
   │
   ├─ 將參數序列化為 stdin 位元組
   ├─ 啟動 wasmtime WASI 沙箱
-  ├─ 將 stdin 寫入 → WASM 程序
-  ├─ 從 WASM 程序讀取 stdout ←（上限 1 MiB）
+  ├─ 將 stdin 寫入 → WASM 程式
+  ├─ 從 WASM 程式讀取 stdout ←（上限 1 MiB）
   ├─ 強制執行燃料限制          （約 10 億條指令）
   ├─ 強制執行掛鐘時間限制      （30 秒）
   └─ 反序列化 ToolResult JSON
@@ -559,7 +559,7 @@ Agent 格式化輸出並回應使用者
 
 如果工具失敗（非零退出碼、無效 JSON、逾時、燃料耗盡），ZeroClaw
 會記錄警告並將錯誤回傳給 LLM。Agent 會繼續執行 —
-有問題的外掛永遠不會導致程序當掉。
+有問題的外掛永遠不會導致程式當掉。
 
 ---
 
@@ -638,7 +638,7 @@ WASM 工具在由 wasmtime 強制執行的嚴格 WASI 沙箱中執行：
 - 建立網路連線
 - 存取環境變數
 - 消耗無限的 CPU 或記憶體
-- 導致 ZeroClaw 程序當掉
+- 導致 ZeroClaw 程式當掉
 
 ---
 
