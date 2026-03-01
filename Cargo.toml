@@ -207,12 +207,12 @@ libc = "0.2"
 [features]
 # Keep default minimal for widest host compatibility (including macOS 10.15).
 default = []
-hardware = ["nusb", "tokio-serial"]
+hardware = ["dep:tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-peripheral-rpi = ["rppal"]
+peripheral-rpi = ["dep:rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
@@ -268,3 +268,5 @@ scopeguard = "1.2"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+# cpufeatures patch removed due to version conflicts

@@ -59,7 +59,7 @@ export default function AgentChat() {
             .filter((entry) => entry.content?.trim())
             .map((entry) => ({
               id: makeMessageId(),
-              role: entry.role === 'user' ? 'user' : 'agent',
+              role: (entry.role === 'user' ? 'user' : 'agent') as 'user' | 'agent',
               content: entry.content.trim(),
               timestamp: new Date(),
             }));
