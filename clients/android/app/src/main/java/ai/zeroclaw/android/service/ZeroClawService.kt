@@ -27,7 +27,7 @@ class ZeroClawService : Service() {
     private val binder = LocalBinder()
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private val _status = MutableStateFlow(Status.Stopped)
+    private val _status = MutableStateFlow<Status>(Status.Stopped)
     val status: StateFlow<Status> = _status
 
     private val _lastMessage = MutableStateFlow<String?>(null)
