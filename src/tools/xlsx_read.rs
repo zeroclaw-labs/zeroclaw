@@ -1173,5 +1173,4 @@ mod tests {
             .unwrap_or("")
             .contains("escapes workspace"));
     }
-
 }
