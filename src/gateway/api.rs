@@ -350,10 +350,11 @@ pub async fn handle_api_doctor(
     {
         Ok(r) => r,
         Err(err) => {
+            tracing::error!("doctor task panicked: {err}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": format!("doctor task panicked: {err}"),
+                    "error": "doctor diagnostics failed",
                 })),
             )
                 .into_response();
