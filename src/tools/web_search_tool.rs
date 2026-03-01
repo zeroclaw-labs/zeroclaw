@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports providers: DuckDuckGo (free), Brave, Firecrawl, Tavily, Perplexity, Exa, and Jina.
+/// Supports providers: DuckDuckGo (free), Brave, Firecrawl, Tavily, Perplexity, Exa, Jina, and Grok.
 pub struct WebSearchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
@@ -20,7 +20,9 @@ pub struct WebSearchTool {
     perplexity_api_keys: Vec<String>,
     exa_api_keys: Vec<String>,
     jina_api_keys: Vec<String>,
+    xai_api_keys: Vec<String>,
     api_url: Option<String>,
+    grok_model: String,
     max_results: usize,
     timeout_secs: u64,
     user_agent: String,
@@ -40,6 +42,7 @@ pub struct WebSearchTool {
     perplexity_key_index: Arc<AtomicUsize>,
     exa_key_index: Arc<AtomicUsize>,
     jina_key_index: Arc<AtomicUsize>,
+    xai_key_index: Arc<AtomicUsize>,
 }
 
 impl WebSearchTool {
@@ -60,6 +63,7 @@ impl WebSearchTool {
         provider: String,
         api_key: Option<String>,
         api_url: Option<String>,
+        grok_model: String,
         max_results: usize,
         timeout_secs: u64,
         user_agent: String,
@@ -72,7 +76,9 @@ impl WebSearchTool {
             None,
             None,
             None,
+            None,
             api_url,
+            grok_model,
             max_results,
             timeout_secs,
             user_agent,
@@ -100,7 +106,9 @@ impl WebSearchTool {
         perplexity_api_key: Option<String>,
         exa_api_key: Option<String>,
         jina_api_key: Option<String>,
+        xai_api_key: Option<String>,
         api_url: Option<String>,
+        grok_model: String,
         max_results: usize,
         timeout_secs: u64,
         user_agent: String,
@@ -122,6 +130,7 @@ impl WebSearchTool {
         let perplexity_api_keys = Self::parse_api_keys(perplexity_api_key.as_deref());
         let exa_api_keys = Self::parse_api_keys(exa_api_key.as_deref());
         let jina_api_keys = Self::parse_api_keys(jina_api_key.as_deref());
+        let xai_api_keys = Self::parse_api_keys(xai_api_key.as_deref());
         Self {
             security,
             provider: provider.trim().to_lowercase(),
@@ -131,7 +140,9 @@ impl WebSearchTool {
             perplexity_api_keys,
             exa_api_keys,
             jina_api_keys,
+            xai_api_keys,
             api_url,
+            grok_model,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             user_agent,
@@ -151,6 +162,7 @@ impl WebSearchTool {
             perplexity_key_index: Arc::new(AtomicUsize::new(0)),
             exa_key_index: Arc::new(AtomicUsize::new(0)),
             jina_key_index: Arc::new(AtomicUsize::new(0)),
+            xai_key_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -198,6 +210,11 @@ impl WebSearchTool {
             .or_else(|| self.get_next_api_key())
     }
 
+    fn get_next_xai_api_key(&self) -> Option<String> {
+        Self::get_next_key_from(&self.xai_api_keys, &self.xai_key_index)
+            .or_else(|| self.get_next_api_key())
+    }
+
     fn normalize_provider(raw: &str) -> Option<&'static str> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "duckduckgo" | "ddg" => Some("duckduckgo"),
@@ -207,6 +224,7 @@ impl WebSearchTool {
             "perplexity" => Some("perplexity"),
             "exa" => Some("exa"),
             "jina" => Some("jina"),
+            "grok" => Some("grok"),
             _ => None,
         }
     }
@@ -222,7 +240,7 @@ impl WebSearchTool {
         ) {
             let normalized = Self::normalize_provider(raw).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Unknown search provider '{raw}'. Supported: duckduckgo, brave, firecrawl, tavily, perplexity, exa, jina"
+                    "Unknown search provider '{raw}'. Supported: duckduckgo, brave, firecrawl, tavily, perplexity, exa, jina, grok"
                 )
             })?;
             if seen.insert(normalized) {
@@ -474,6 +492,127 @@ impl WebSearchTool {
         anyhow::bail!("web_search provider 'firecrawl' requires Cargo feature 'firecrawl'")
     }
 
+    async fn search_grok(&self, query: &str) -> anyhow::Result<String> {
+        let auth_token = self.get_next_xai_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_search provider 'grok' requires [web_search].xai_api_key in config.toml"
+            )
+        })?;
+
+        let api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.x.ai/v1/responses");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
+            .build()?;
+
+        let response = client
+            .post(api_url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", auth_token),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&json!({
+                "model": self.grok_model,
+                "input": [{"role": "user", "content": query}],
+                "tools": [{"type": "web_search"}],
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Grok search request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Grok search failed with status {}: {}", status.as_u16(), body);
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_grok_results(&json, query)
+    }
+
+    fn parse_grok_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        // Extract text and url_citation annotations from the output message content.
+        let mut summary = String::new();
+        let mut citations: Vec<(String, String)> = Vec::new(); // (title, url)
+
+        if let Some(output) = json.get("output").and_then(|o| o.as_array()) {
+            for item in output {
+                if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+                    continue;
+                }
+                if let Some(contents) = item.get("content").and_then(|c| c.as_array()) {
+                    for content in contents {
+                        if content.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                            if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
+                                if summary.is_empty() {
+                                    summary = text.to_string();
+                                }
+                            }
+                            if let Some(annotations) =
+                                content.get("annotations").and_then(|a| a.as_array())
+                            {
+                                for ann in annotations {
+                                    if ann.get("type").and_then(|t| t.as_str())
+                                        == Some("url_citation")
+                                    {
+                                        let url = ann
+                                            .get("url")
+                                            .and_then(|u| u.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let title = ann
+                                            .get("title")
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if !url.is_empty()
+                                            && !citations.iter().any(|(_, u)| u == &url)
+                                        {
+                                            citations.push((title, url));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if summary.is_empty() && citations.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Grok)", query)];
+
+        if !summary.is_empty() {
+            lines.push(String::new());
+            lines.push(summary);
+        }
+
+        if !citations.is_empty() {
+            lines.push(String::new());
+            lines.push("Sources:".to_string());
+            for (i, (title, url)) in citations.iter().take(self.max_results).enumerate() {
+                if title.is_empty() {
+                    lines.push(format!("{}. {}", i + 1, url));
+                } else {
+                    lines.push(format!("{}. {}", i + 1, title));
+                    lines.push(format!("   {}", url));
+                }
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
     async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
         let api_key = self.get_next_api_key().ok_or_else(|| {
             anyhow::anyhow!(
@@ -493,6 +632,7 @@ impl WebSearchTool {
             .timeout(Duration::from_secs(self.timeout_secs))
             .user_agent(self.user_agent.as_str())
             .build()?;
+
         let response = client
             .post(&endpoint)
             .json(&json!({
@@ -818,6 +958,7 @@ impl WebSearchTool {
             "perplexity" => self.search_perplexity(query).await,
             "exa" => self.search_exa(query).await,
             "jina" => self.search_jina(query).await,
+            "grok" => self.search_grok(query).await,
             _ => anyhow::bail!("Unknown search provider: {provider}"),
         }
     }
@@ -959,6 +1100,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -973,6 +1115,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -987,6 +1130,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1009,6 +1153,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1026,6 +1171,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1046,6 +1192,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1080,6 +1227,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             0,
             0,
             "test".to_string(),
@@ -1099,6 +1247,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1114,6 +1263,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1129,6 +1279,7 @@ mod tests {
             "brave".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1139,12 +1290,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_grok_without_api_key() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "grok".to_string(),
+            None,
+            None,
+            "grok-4-1-fast-non-reasoning".to_string(),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("xai_api_key"));
+    }
+
+    #[test]
+    fn test_parse_grok_results_with_annotations() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "grok".to_string(),
+            None,
+            None,
+            "grok-4-1-fast-non-reasoning".to_string(),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "ZeroClaw is an autonomous agent runtime.",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url": "https://example.com/zeroclaw",
+                            "title": "ZeroClaw Docs",
+                            "start_index": 0,
+                            "end_index": 5
+                        }
+                    ]
+                }]
+            }]
+        });
+        let result = tool.parse_grok_results(&json, "zeroclaw").unwrap();
+        assert!(result.contains("via Grok"));
+        assert!(result.contains("ZeroClaw is an autonomous agent runtime."));
+        assert!(result.contains("ZeroClaw Docs"));
+        assert!(result.contains("https://example.com/zeroclaw"));
+    }
+
+    #[test]
+    fn test_parse_grok_results_empty() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "grok".to_string(),
+            None,
+            None,
+            "grok-4-1-fast-non-reasoning".to_string(),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = serde_json::json!({});
+        let result = tool.parse_grok_results(&json, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[tokio::test]
     async fn test_execute_firecrawl_without_api_key() {
         let tool = WebSearchTool::new(
             test_security(),
             "firecrawl".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1166,6 +1390,7 @@ mod tests {
             "tavily".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1182,6 +1407,7 @@ mod tests {
             "tavily".to_string(),
             Some("key1,key2,key3".to_string()),
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1196,6 +1422,7 @@ mod tests {
             "tavily".to_string(),
             Some("k1,k2".to_string()),
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1216,6 +1443,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1250,6 +1479,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),
@@ -1281,6 +1512,7 @@ mod tests {
             "duckduckgo".to_string(),
             None,
             None,
+            "grok-4-1-fast-non-reasoning".to_string(),
             5,
             15,
             "test".to_string(),

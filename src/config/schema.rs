@@ -328,6 +328,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// X (Twitter) search tool configuration (`[x_search]`).
+    #[serde(default)]
+    pub x_search: XSearchConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -1974,7 +1978,7 @@ pub struct WebSearchConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Search provider: "duckduckgo"/"ddg" (free, no API key), "brave", "firecrawl",
-    /// "tavily", "perplexity", "exa", or "jina"
+    /// "tavily", "perplexity", "exa", "jina", or "grok" (all require API key except duckduckgo)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Generic provider API key (used by firecrawl, tavily, and as fallback for brave).
@@ -1996,8 +2000,14 @@ pub struct WebSearchConfig {
     /// Jina API key (optional; can raise limits for provider = "jina")
     #[serde(default)]
     pub jina_api_key: Option<String>,
+    /// xAI API key (required if provider is "grok")
+    #[serde(default)]
+    pub xai_api_key: Option<String>,
+    /// Model to use for Grok web search (only applies when provider is "grok")
+    #[serde(default = "default_grok_model")]
+    pub grok_model: String,
     /// Fallback providers attempted after primary provider fails.
-    /// Supported values: duckduckgo (or ddg), brave, firecrawl, tavily, perplexity, exa, jina
+    /// Supported values: duckduckgo (or ddg), brave, firecrawl, tavily, perplexity, exa, jina, grok
     #[serde(default)]
     pub fallback_providers: Vec<String>,
     /// Retry count per provider before falling back to next provider
@@ -2046,6 +2056,10 @@ pub struct WebSearchConfig {
 
 fn default_web_search_provider() -> String {
     "duckduckgo".into()
+}
+
+fn default_grok_model() -> String {
+    "grok-4-1-fast-non-reasoning".into()
 }
 
 fn default_web_search_max_results() -> usize {
@@ -2142,6 +2156,8 @@ impl Default for WebSearchConfig {
             perplexity_api_key: None,
             exa_api_key: None,
             jina_api_key: None,
+            xai_api_key: None,
+            grok_model: default_grok_model(),
             fallback_providers: Vec::new(),
             retries_per_provider: default_web_search_retries_per_provider(),
             retry_backoff_ms: default_web_search_retry_backoff_ms(),
@@ -2163,6 +2179,48 @@ impl Default for WebSearchConfig {
 
 fn default_user_agent() -> String {
     "ZeroClaw/1.0".into()
+}
+
+// ── X search ─────────────────────────────────────────────────────
+
+/// X (Twitter) search tool configuration (`[x_search]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct XSearchConfig {
+    /// Enable `x_search_tool` for searching X (Twitter) posts and users
+    #[serde(default)]
+    pub enabled: bool,
+    /// xAI API key (required; env: `ZEROCLAW_XAI_API_KEY` / `XAI_API_KEY`)
+    #[serde(default)]
+    pub xai_api_key: Option<String>,
+    /// Optional API URL override (for custom/self-hosted endpoints)
+    #[serde(default)]
+    pub api_url: Option<String>,
+    /// xAI model to use for X search (must support the `x_search` tool)
+    #[serde(default = "default_grok_model")]
+    pub model: String,
+    /// Maximum results per search (1-10)
+    #[serde(default = "default_web_search_max_results")]
+    pub max_results: usize,
+    /// Request timeout in seconds
+    #[serde(default = "default_web_search_timeout_secs")]
+    pub timeout_secs: u64,
+    /// User-Agent string sent with search requests
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+}
+
+impl Default for XSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            xai_api_key: None,
+            api_url: None,
+            model: default_grok_model(),
+            max_results: default_web_search_max_results(),
+            timeout_secs: default_web_search_timeout_secs(),
+            user_agent: default_user_agent(),
+        }
+    }
 }
 
 // ── Proxy ───────────────────────────────────────────────────────
@@ -6236,6 +6294,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            x_search: XSearchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -7290,6 +7349,18 @@ impl Config {
                 &store,
                 &mut config.web_search.jina_api_key,
                 "config.web_search.jina_api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.xai_api_key,
+                "config.web_search.xai_api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
+                &mut config.x_search.xai_api_key,
+                "config.x_search.xai_api_key",
             )?;
 
             decrypt_optional_secret(
@@ -8553,6 +8624,17 @@ impl Config {
             }
         }
 
+        // xAI API key: ZEROCLAW_XAI_API_KEY or XAI_API_KEY (shared by web_search and x_search)
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_XAI_API_KEY").or_else(|_| std::env::var("XAI_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.xai_api_key = Some(api_key.to_string());
+                self.x_search.xai_api_key = Some(api_key.to_string());
+            }
+        }
+
         // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
         if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
@@ -8974,6 +9056,18 @@ impl Config {
             &store,
             &mut config_to_save.web_search.jina_api_key,
             "config.web_search.jina_api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.xai_api_key,
+            "config.web_search.xai_api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.x_search.xai_api_key,
+            "config.x_search.xai_api_key",
         )?;
 
         encrypt_optional_secret(
@@ -9797,6 +9891,7 @@ ws_url = "ws://127.0.0.1:3002"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            x_search: XSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -10172,6 +10267,7 @@ tool_dispatcher = "xml"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            x_search: XSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),

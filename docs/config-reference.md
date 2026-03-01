@@ -732,7 +732,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `web_search_tool` |
-| `provider` | `duckduckgo` | Search backend: `duckduckgo` (`ddg` alias), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina` |
+| `provider` | `duckduckgo` | Search backend: `duckduckgo` (`ddg` alias), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`, `grok` |
 | `fallback_providers` | `[]` | Fallback providers tried in order after primary failure |
 | `retries_per_provider` | `0` | Retry count before switching to next provider |
 | `retry_backoff_ms` | `250` | Delay between retry attempts (milliseconds) |
@@ -742,6 +742,8 @@ Notes:
 | `perplexity_api_key` | unset | Dedicated Perplexity key |
 | `exa_api_key` | unset | Dedicated Exa key |
 | `jina_api_key` | unset | Optional Jina key |
+| `xai_api_key` | unset | xAI Grok API key (required for `provider = "grok"`; env: `ZEROCLAW_XAI_API_KEY` / `XAI_API_KEY`) |
+| `grok_model` | `grok-4-1-fast-non-reasoning` | xAI model to use when `provider = "grok"` |
 | `domain_filter` | `[]` | Optional domain filter forwarded to supported providers |
 | `language_filter` | `[]` | Optional language filter forwarded to supported providers |
 | `country` | unset | Optional country hint for supported providers |
@@ -757,7 +759,8 @@ Notes:
 
 Notes:
 
-- If DuckDuckGo returns `403`/`429` in your network, switch provider to `brave`, `perplexity`, `exa`, or configure `fallback_providers`.
+- If DuckDuckGo returns `403`/`429` in your network, switch provider to `brave`, `perplexity`, `exa`, `grok`, or configure `fallback_providers`.
+- `grok` provider uses the xAI Responses API (`https://api.x.ai/v1/responses`) with the `web_search` tool and returns an AI-generated summary alongside cited sources.
 - `web_search` finds candidate URLs; pair it with `web_fetch` for page content extraction.
 - Agents can modify these settings at runtime via the `web_search_config` tool (`action=get|set|list_providers`).
 - In supervised mode, `web_search_config` mutations still require normal tool approval unless explicitly auto-approved.
@@ -832,6 +835,24 @@ Environment overrides:
 - `ZEROCLAW_PERPLEXITY_API_KEY` / `PERPLEXITY_API_KEY`
 - `ZEROCLAW_EXA_API_KEY` / `EXA_API_KEY`
 - `ZEROCLAW_JINA_API_KEY` / `JINA_API_KEY`
+- `ZEROCLAW_XAI_API_KEY` / `XAI_API_KEY` (shared by `[web_search]` grok provider and `[x_search]`)
+
+## `[x_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `x_search_tool` for searching X (formerly Twitter) |
+| `xai_api_key` | unset | xAI API key (required; env: `ZEROCLAW_XAI_API_KEY` / `XAI_API_KEY`) |
+| `api_url` | unset | Optional API URL override |
+| `model` | `grok-4-1-fast-non-reasoning` | xAI model to use (must support the `x_search` tool) |
+| `max_results` | `5` | Maximum results returned (clamped to 1-10) |
+| `timeout_secs` | `15` | Request timeout in seconds |
+| `user_agent` | `ZeroClaw/1.0` | User-Agent header for requests |
+
+Notes:
+
+- `x_search_tool` uses the xAI Responses API (`https://api.x.ai/v1/responses`) with the `x_search` server-side tool to search X posts, users, and threads.
+- `XAI_API_KEY` is shared by both `[web_search]` (grok provider) and `[x_search]`.
 
 ## `[gateway]`
 

@@ -8,7 +8,7 @@ use crate::config::{
     HeartbeatConfig, HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig,
     SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebFetchConfig, WebSearchConfig,
-    WebhookConfig,
+    WebhookConfig, XSearchConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::identity::{
@@ -155,7 +155,8 @@ pub async fn run_wizard_with_migration(
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
     print_step(6, 11, "Web & Internet Tools");
-    let (web_search_config, web_fetch_config, http_request_config) = setup_web_tools()?;
+    let (web_search_config, x_search_config, web_fetch_config, http_request_config) =
+        setup_web_tools()?;
 
     print_step(7, 11, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
@@ -222,6 +223,7 @@ pub async fn run_wizard_with_migration(
         multimodal: crate::config::MultimodalConfig::default(),
         web_fetch: web_fetch_config,
         web_search: web_search_config,
+        x_search: x_search_config,
         proxy: crate::config::ProxyConfig::default(),
         identity: identity_config,
         cost: crate::config::CostConfig::default(),
@@ -738,6 +740,7 @@ async fn run_quick_setup_with_home(
         multimodal: crate::config::MultimodalConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
+        x_search: crate::config::XSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -3543,7 +3546,7 @@ fn setup_http_request_credential_profiles(
 
 // ── Step 6: Web & Internet Tools ────────────────────────────────
 
-fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConfig)> {
+fn setup_web_tools() -> Result<(WebSearchConfig, XSearchConfig, WebFetchConfig, HttpRequestConfig)> {
     print_bullet("Configure web-facing tools: search, page fetch, and HTTP requests.");
     print_bullet("You can always change these later in config.toml.");
     println!();
@@ -3561,6 +3564,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         let provider_options = vec![
             "DuckDuckGo (free, no API key)",
             "Brave Search (requires API key)",
+            "Grok / xAI (requires API key)",
             #[cfg(feature = "firecrawl")]
             "Firecrawl (requires API key + firecrawl feature)",
         ];
@@ -3580,8 +3584,17 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
                     web_search_config.brave_api_key = Some(key.trim().to_string());
                 }
             }
-            #[cfg(feature = "firecrawl")]
             2 => {
+                web_search_config.provider = "grok".to_string();
+                let key: String = Input::new()
+                    .with_prompt("  xAI API key")
+                    .interact_text()?;
+                if !key.trim().is_empty() {
+                    web_search_config.xai_api_key = Some(key.trim().to_string());
+                }
+            }
+            #[cfg(feature = "firecrawl")]
+            3 => {
                 web_search_config.provider = "firecrawl".to_string();
                 let key: String = Input::new()
                     .with_prompt("  Firecrawl API key")
@@ -3612,6 +3625,36 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
     } else {
         println!(
             "  {} web_search_tool: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+    }
+
+    println!();
+
+    // ── X Search ────────────────────────────────────────────────
+    let mut x_search_config = XSearchConfig::default();
+    let enable_x_search = Confirm::new()
+        .with_prompt("  Enable x_search_tool (search X / formerly Twitter via xAI)?")
+        .default(false)
+        .interact()?;
+
+    if enable_x_search {
+        x_search_config.enabled = true;
+        let key: String = Input::new()
+            .with_prompt("  xAI API key")
+            .interact_text()?;
+        if !key.trim().is_empty() {
+            x_search_config.xai_api_key = Some(key.trim().to_string());
+        }
+        println!(
+            "  {} x_search_tool: {}",
+            style("✓").green().bold(),
+            style("enabled").green()
+        );
+    } else {
+        println!(
+            "  {} x_search_tool: {}",
             style("✓").green().bold(),
             style("disabled").dim()
         );
@@ -3724,7 +3767,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         );
     }
 
-    Ok((web_search_config, web_fetch_config, http_request_config))
+    Ok((web_search_config, x_search_config, web_fetch_config, http_request_config))
 }
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────

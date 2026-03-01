@@ -82,6 +82,7 @@ pub mod web_access_config;
 pub mod web_fetch;
 pub mod web_search_config;
 pub mod web_search_tool;
+pub mod x_search_tool;
 pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
@@ -149,6 +150,7 @@ pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
 pub use web_search_tool::WebSearchTool;
+pub use x_search_tool::XSearchTool;
 pub use xlsx_read::XlsxReadTool;
 
 pub use auth_profile::ManageAuthProfileTool;
@@ -486,7 +488,9 @@ pub fn all_tools_with_runtime(
             root_config.web_search.perplexity_api_key.clone(),
             root_config.web_search.exa_api_key.clone(),
             root_config.web_search.jina_api_key.clone(),
+            root_config.web_search.xai_api_key.clone(),
             root_config.web_search.api_url.clone(),
+            root_config.web_search.grok_model.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
             root_config.web_search.user_agent.clone(),
@@ -502,6 +506,19 @@ pub fn all_tools_with_runtime(
             root_config.web_search.exa_search_type.clone(),
             root_config.web_search.exa_include_text,
             root_config.web_search.jina_site_filters.clone(),
+        )));
+    }
+
+    // X (Twitter) search tool
+    if root_config.x_search.enabled {
+        tool_arcs.push(Arc::new(XSearchTool::new(
+            security.clone(),
+            root_config.x_search.xai_api_key.clone(),
+            root_config.x_search.api_url.clone(),
+            root_config.x_search.model.clone(),
+            root_config.x_search.max_results,
+            root_config.x_search.timeout_secs,
+            root_config.x_search.user_agent.clone(),
         )));
     }
 
