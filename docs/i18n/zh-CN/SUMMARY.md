@@ -9,6 +9,7 @@
 - 中文 i18n Hub：[README.md](README.md)
 - 中文兼容 Hub：[docs/i18n/zh-CN/README.md](README.md)
 - 中文兼容 SUMMARY：[../../SUMMARY.zh-CN.md](../../SUMMARY.zh-CN.md)
+- 繁中 i18n Hub：[../zh-TW/README.md](../zh-TW/README.md)
 - i18n 索引：[../README.md](../README.md)
 - i18n 覆盖图：[../../i18n-coverage.md](../../i18n-coverage.md)
 

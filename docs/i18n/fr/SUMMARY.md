@@ -9,6 +9,7 @@ Dernière mise à jour : **24 février 2026**.
 - Hub i18n français : [README.md](README.md)
 - Hub français (compatibilité) : [docs/i18n/fr/README.md](README.md)
 - Sommaire français (compatibilité) : [../../SUMMARY.fr.md](../../SUMMARY.fr.md)
+- Hub chinois (traditionnel) : [../zh-TW/README.md](../zh-TW/README.md)
 - Index i18n : [../README.md](../README.md)
 - Carte de couverture i18n : [../../i18n-coverage.md](../../i18n-coverage.md)
 
