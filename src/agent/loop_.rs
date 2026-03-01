@@ -2773,6 +2773,7 @@ pub async fn run(
                 &model_name,
                 config.agent.max_history_messages,
                 effective_hooks,
+                Some(mem.as_ref()),
             )
             .await
             {
