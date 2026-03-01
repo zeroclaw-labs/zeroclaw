@@ -8,7 +8,9 @@ on:
     types: [opened, labeled, unlabeled]
 
 concurrency:
-  group: pr-auto-response-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  # Keep cancellation within the same lifecycle action to avoid `labeled`
+  # events canceling an in-flight `opened` run for the same issue/PR.
+  group: pr-auto-response-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event.action || 'unknown' }}
   cancel-in-progress: true
 
 permissions: {}
@@ -21,11 +23,10 @@ env:
 
 jobs:
   contributor-tier-issues:
+    # Only run for opened/reopened events to avoid duplicate runs with labeled-routes job
     if: >-
       (github.event_name == 'issues' &&
-      (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'labeled' || github.event.action == 'unlabeled')) ||
-      (github.event_name == 'pull_request_target' &&
-      (github.event.action == 'labeled' || github.event.action == 'unlabeled'))
+      (github.event.action == 'opened' || github.event.action == 'reopened'))
     runs-on: ubuntu-22.04
     permissions:
       contents: read
