@@ -410,6 +410,8 @@ impl AnthropicProvider {
             .into_iter()
             .find(|c| c.kind == "text")
             .and_then(|c| c.text)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
@@ -1411,6 +1413,51 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn text_response_skips_empty_text_block() {
+        let json = r#"{"content": [{"type": "text", "text": ""}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_text_response(resp);
+        assert!(result.is_err(), "Empty text block should produce an error");
+    }
+
+    #[test]
+    fn text_response_skips_whitespace_only_block() {
+        let json = r#"{"content": [{"type": "text", "text": "   \n  "}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_text_response(resp);
+        assert!(
+            result.is_err(),
+            "Whitespace-only text block should produce an error"
+        );
+    }
+
+    #[test]
+    fn text_response_trims_valid_text() {
+        let json = r#"{"content": [{"type": "text", "text": "  Hello world  "}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_text_response(resp).unwrap();
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn native_response_skips_empty_text_with_tool_calls() {
+        let json = r#"{
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "id": "call_1", "name": "shell", "input": {"command": "ls"}}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_native_response(resp);
+        assert!(
+            result.text.is_none(),
+            "Empty text block should not produce text output"
+        );
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "shell");
     }
 
     #[test]
