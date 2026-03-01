@@ -1,5 +1,5 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
-use crate::config::Config;
+use crate::config::{Config, ProgressMode};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
@@ -290,6 +290,7 @@ tokio::task_local! {
     static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
     static LOOP_DETECTION_CONFIG: LoopDetectionConfig;
     static SAFETY_HEARTBEAT_CONFIG: Option<SafetyHeartbeatConfig>;
+    static TOOL_LOOP_PROGRESS_MODE: ProgressMode;
 }
 
 /// Configuration for periodic safety-constraint re-injection (heartbeat).
@@ -303,6 +304,14 @@ pub(crate) struct SafetyHeartbeatConfig {
 
 fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
     interval > 0 && counter > 0 && counter % interval == 0
+}
+
+fn should_emit_verbose_progress(mode: ProgressMode) -> bool {
+    mode == ProgressMode::Verbose
+}
+
+fn should_emit_tool_progress(mode: ProgressMode) -> bool {
+    mode != ProgressMode::Off
 }
 
 /// Extract a short hint from tool call arguments for progress display.
@@ -654,27 +663,31 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    progress_mode: ProgressMode,
 ) -> Result<String> {
-    TOOL_LOOP_REPLY_TARGET
+    TOOL_LOOP_PROGRESS_MODE
         .scope(
-            reply_target.map(str::to_string),
-            run_tool_call_loop(
-                provider,
-                history,
-                tools_registry,
-                observer,
-                provider_name,
-                model,
-                temperature,
-                silent,
-                approval,
-                channel_name,
-                multimodal_config,
-                max_tool_iterations,
-                cancellation_token,
-                on_delta,
-                hooks,
-                excluded_tools,
+            progress_mode,
+            TOOL_LOOP_REPLY_TARGET.scope(
+                reply_target.map(str::to_string),
+                run_tool_call_loop(
+                    provider,
+                    history,
+                    tools_registry,
+                    observer,
+                    provider_name,
+                    model,
+                    temperature,
+                    silent,
+                    approval,
+                    channel_name,
+                    multimodal_config,
+                    max_tool_iterations,
+                    cancellation_token,
+                    on_delta,
+                    hooks,
+                    excluded_tools,
+                ),
             ),
         )
         .await
@@ -809,6 +822,9 @@ pub(crate) async fn run_tool_call_loop(
         .try_with(Clone::clone)
         .ok()
         .flatten();
+    let progress_mode = TOOL_LOOP_PROGRESS_MODE
+        .try_with(|mode| *mode)
+        .unwrap_or(ProgressMode::Verbose);
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -870,13 +886,15 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         // ── Progress: LLM thinking ────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
-            } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
-            };
-            let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}{phase}")).await;
+        if should_emit_verbose_progress(progress_mode) {
+            if let Some(ref tx) = on_delta {
+                let phase = if iteration == 0 {
+                    "\u{1f914} Thinking...\n".to_string()
+                } else {
+                    format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
+                };
+                let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}{phase}")).await;
+            }
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -1078,15 +1096,17 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         // ── Progress: LLM responded ─────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let llm_secs = llm_started_at.elapsed().as_secs();
-            if !tool_calls.is_empty() {
-                let _ = tx
-                    .send(format!(
-                        "{DRAFT_PROGRESS_SENTINEL}\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
-                    ))
-                    .await;
+        if should_emit_verbose_progress(progress_mode) {
+            if let Some(ref tx) = on_delta {
+                let llm_secs = llm_started_at.elapsed().as_secs();
+                if !tool_calls.is_empty() {
+                    let _ = tx
+                        .send(format!(
+                            "{DRAFT_PROGRESS_SENTINEL}\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                            tool_calls.len()
+                        ))
+                        .await;
+                }
             }
         }
 
@@ -1120,12 +1140,14 @@ pub(crate) async fn run_tool_call_loop(
                     }),
                 );
 
-                if let Some(ref tx) = on_delta {
-                    let _ = tx
-                        .send(format!(
-                            "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying: response deferred action without a tool call\n"
-                        ))
-                        .await;
+                if should_emit_verbose_progress(progress_mode) {
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx
+                            .send(format!(
+                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying: response deferred action without a tool call\n"
+                            ))
+                            .await;
+                    }
                 }
 
                 continue;
@@ -1422,18 +1444,19 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
 
-            // ── Progress: tool start ────────────────────────────
-            if let Some(ref tx) = on_delta {
-                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
-                let progress = if hint.is_empty() {
-                    format!("\u{23f3} {}\n", tool_name)
-                } else {
-                    format!("\u{23f3} {}: {hint}\n", tool_name)
-                };
-                tracing::debug!(tool = %tool_name, "Sending progress start to draft");
-                let _ = tx
-                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
-                    .await;
+            if should_emit_tool_progress(progress_mode) {
+                if let Some(ref tx) = on_delta {
+                    let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
+                    let progress = if hint.is_empty() {
+                        format!("\u{23f3} {}\n", tool_name)
+                    } else {
+                        format!("\u{23f3} {}: {hint}\n", tool_name)
+                    };
+                    tracing::debug!(tool = %tool_name, "Sending progress start to draft");
+                    let _ = tx
+                        .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
+                        .await;
+                }
             }
 
             executable_indices.push(idx);
@@ -1514,21 +1537,22 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
 
-            // ── Progress: tool completion ───────────────────────
-            if let Some(ref tx) = on_delta {
-                let secs = outcome.duration.as_secs();
-                let icon = if outcome.success {
-                    "\u{2705}"
-                } else {
-                    "\u{274c}"
-                };
-                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx
-                    .send(format!(
-                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
-                        call.name
-                    ))
-                    .await;
+            if should_emit_tool_progress(progress_mode) {
+                if let Some(ref tx) = on_delta {
+                    let secs = outcome.duration.as_secs();
+                    let icon = if outcome.success {
+                        "\u{2705}"
+                    } else {
+                        "\u{274c}"
+                    };
+                    tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                    let _ = tx
+                        .send(format!(
+                            "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
+                            call.name
+                        ))
+                        .await;
+                }
             }
 
             // ── Loop detection: record call ──────────────────────
@@ -1597,12 +1621,14 @@ pub(crate) async fn run_tool_call_loop(
                     Some("loop pattern detected, injecting self-correction prompt"),
                     serde_json::json!({ "iteration": iteration + 1, "warning": &warning }),
                 );
-                if let Some(ref tx) = on_delta {
-                    let _ = tx
-                        .send(format!(
-                            "{DRAFT_PROGRESS_SENTINEL}\u{26a0}\u{fe0f} Loop detected, attempting self-correction\n"
-                        ))
-                        .await;
+                if should_emit_verbose_progress(progress_mode) {
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx
+                            .send(format!(
+                                "{DRAFT_PROGRESS_SENTINEL}\u{26a0}\u{fe0f} Loop detected, attempting self-correction\n"
+                            ))
+                            .await;
+                    }
                 }
                 loop_detection_prompt = Some(warning);
             }
@@ -5644,4 +5670,16 @@ Let me check the result."#;
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
     }
+
+    #[test]
+    fn progress_mode_gates_work_as_expected() {
+        assert!(should_emit_verbose_progress(ProgressMode::Verbose));
+        assert!(!should_emit_verbose_progress(ProgressMode::Compact));
+        assert!(!should_emit_verbose_progress(ProgressMode::Off));
+
+        assert!(should_emit_tool_progress(ProgressMode::Verbose));
+        assert!(should_emit_tool_progress(ProgressMode::Compact));
+        assert!(!should_emit_tool_progress(ProgressMode::Off));
+    }
+
 }

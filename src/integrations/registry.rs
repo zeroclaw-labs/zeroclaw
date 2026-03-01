@@ -770,7 +770,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use crate::config::schema::{
+        IMessageConfig, MatrixConfig, ProgressMode, StreamMode, TelegramConfig,
+    };
     use crate::config::Config;
 
     #[test]
@@ -837,6 +839,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,

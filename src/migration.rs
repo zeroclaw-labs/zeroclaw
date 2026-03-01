@@ -1289,7 +1289,9 @@ fn backup_target_config(config_path: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DelegateAgentConfig, MemoryConfig, StreamMode, TelegramConfig};
+    use crate::config::{
+        Config, DelegateAgentConfig, MemoryConfig, ProgressMode, StreamMode, TelegramConfig,
+    };
     use crate::memory::{Memory, SqliteMemory};
     use rusqlite::params;
     use serde_json::json;
@@ -1454,6 +1456,7 @@ mod tests {
             draft_update_interval_ms: 1_500,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,

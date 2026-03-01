@@ -4285,6 +4285,19 @@ pub enum StreamMode {
     Partial,
 }
 
+/// Progress verbosity for channels that support draft streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgressMode {
+    /// Show all progress lines (thinking rounds, tool-count lines, tool lifecycle).
+    Verbose,
+    /// Show only tool lifecycle lines (start + completion).
+    #[default]
+    Compact,
+    /// Suppress progress lines and stream only final answer text.
+    Off,
+}
+
 fn default_draft_update_interval_ms() -> u64 {
     1000
 }
@@ -4530,6 +4543,9 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Draft progress verbosity for streaming updates.
+    #[serde(default)]
+    pub progress_mode: ProgressMode,
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
@@ -8972,6 +8988,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,
@@ -9399,6 +9416,7 @@ ws_url = "ws://127.0.0.1:3002"
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    progress_mode: ProgressMode::default(),
                     ack_enabled: true,
                     group_reply: None,
                     base_url: None,
@@ -9880,6 +9898,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,
@@ -10064,6 +10083,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,
@@ -10082,6 +10102,7 @@ tool_dispatcher = "xml"
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert_eq!(parsed.progress_mode, ProgressMode::Compact);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
         assert!(parsed.base_url.is_none());
@@ -10097,6 +10118,31 @@ tool_dispatcher = "xml"
         let json = r#"{"bot_token":"tok","allowed_users":[],"base_url":"https://tapi.bale.ai"}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.base_url, Some("https://tapi.bale.ai".to_string()));
+    }
+
+    #[test]
+    async fn progress_mode_deserializes_variants() {
+        let verbose: ProgressMode = serde_json::from_str(r#""verbose""#).unwrap();
+        let compact: ProgressMode = serde_json::from_str(r#""compact""#).unwrap();
+        let off: ProgressMode = serde_json::from_str(r#""off""#).unwrap();
+
+        assert_eq!(verbose, ProgressMode::Verbose);
+        assert_eq!(compact, ProgressMode::Compact);
+        assert_eq!(off, ProgressMode::Off);
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_progress_mode_verbose() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"progress_mode":"verbose"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_progress_mode_off() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"progress_mode":"off"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Off);
     }
 
     #[test]

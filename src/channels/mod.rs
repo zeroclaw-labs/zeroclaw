@@ -82,7 +82,7 @@ use crate::agent::loop_::{
 };
 use crate::agent::session::{resolve_session_id, shared_session_manager, Session, SessionManager};
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
-use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
+use crate::config::{Config, NonCliNaturalLanguageApprovalMode, ProgressMode};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -164,6 +164,23 @@ fn clear_live_channels() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+fn runtime_telegram_progress_mode_store() -> &'static Mutex<ProgressMode> {
+    static STORE: OnceLock<Mutex<ProgressMode>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(ProgressMode::default()))
+}
+
+fn set_runtime_telegram_progress_mode(mode: ProgressMode) {
+    *runtime_telegram_progress_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = mode;
+}
+
+fn runtime_telegram_progress_mode() -> ProgressMode {
+    *runtime_telegram_progress_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
@@ -681,6 +698,27 @@ fn split_internal_progress_delta(delta: &str) -> (bool, &str) {
     } else {
         (false, delta)
     }
+}
+
+fn effective_progress_mode_for_message(
+    channel_name: &str,
+    expose_internal_tool_details: bool,
+) -> ProgressMode {
+    if channel_name.eq_ignore_ascii_case("cli") || expose_internal_tool_details {
+        ProgressMode::Verbose
+    } else if channel_name.eq_ignore_ascii_case("telegram") {
+        runtime_telegram_progress_mode()
+    } else {
+        ProgressMode::Off
+    }
+}
+
+fn is_verbose_only_progress_line(delta: &str) -> bool {
+    let trimmed = delta.trim_start();
+    trimmed.starts_with("\u{1f914} Thinking")
+        || trimmed.starts_with("\u{1f4ac} Got ")
+        || trimmed.starts_with("\u{21bb} Retrying")
+        || trimmed.starts_with("\u{26a0}\u{fe0f} Loop detected")
 }
 
 fn build_channel_system_prompt(
@@ -3460,6 +3498,8 @@ or tune thresholds in config.",
 
     let expose_internal_tool_details =
         msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
+    let progress_mode =
+        effective_progress_mode_for_message(msg.channel.as_str(), expose_internal_tool_details);
     let excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
@@ -3527,7 +3567,7 @@ or tune thresholds in config.",
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
-        let suppress_internal_progress = !expose_internal_tool_details;
+        let mode = progress_mode;
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -3536,10 +3576,15 @@ or tune thresholds in config.",
                     continue;
                 }
                 let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
-                if suppress_internal_progress && is_internal_progress {
-                    continue;
+                if is_internal_progress {
+                    if mode == ProgressMode::Off {
+                        continue;
+                    }
+                    if mode == ProgressMode::Compact && is_verbose_only_progress_line(visible_delta)
+                    {
+                        continue;
+                    }
                 }
-
                 accumulated.push_str(visible_delta);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
@@ -3605,6 +3650,7 @@ or tune thresholds in config.",
                 delta_tx,
                 ctx.hooks.as_deref(),
                 &excluded_tools_snapshot,
+                progress_mode,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -5482,6 +5528,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let telegram_progress_mode = config
+        .channels_config
+        .telegram
+        .as_ref()
+        .map(|tg| tg.progress_mode)
+        .unwrap_or_default();
+    set_runtime_telegram_progress_mode(telegram_progress_mode);
 
     let session_manager = shared_session_manager(&config.agent.session, &config.workspace_dir)?
         .map(|mgr| mgr as Arc<dyn SessionManager + Send + Sync>);
@@ -11158,6 +11211,32 @@ Done reminder set for 1:38 AM."#;
         let (is_internal_plain, plain) = split_internal_progress_delta("final answer");
         assert!(!is_internal_plain);
         assert_eq!(plain, "final answer");
+    }
+
+    #[test]
+    fn effective_progress_mode_defaults_non_telegram_to_off() {
+        assert_eq!(
+            effective_progress_mode_for_message("draft-streaming-channel", false),
+            ProgressMode::Off
+        );
+        assert_eq!(
+            effective_progress_mode_for_message("draft-streaming-channel", true),
+            ProgressMode::Verbose
+        );
+    }
+
+    #[test]
+    fn effective_progress_mode_uses_telegram_runtime_setting() {
+        set_runtime_telegram_progress_mode(ProgressMode::Compact);
+        assert_eq!(
+            effective_progress_mode_for_message("telegram", false),
+            ProgressMode::Compact
+        );
+        set_runtime_telegram_progress_mode(ProgressMode::Off);
+        assert_eq!(
+            effective_progress_mode_for_message("telegram", false),
+            ProgressMode::Off
+        );
     }
 
     #[test]
