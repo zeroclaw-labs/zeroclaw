@@ -56,6 +56,63 @@ install_cc_toolchain() {
     fi
 }
 
+install_zig_cc_shim() {
+    local zig_version="0.14.0"
+    local platform
+    local archive_name
+    local base_dir
+    local extract_dir
+    local archive_path
+    local download_url
+    local shim_dir
+    local zig_bin
+
+    case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64) platform="linux-x86_64" ;;
+        Linux/aarch64 | Linux/arm64) platform="linux-aarch64" ;;
+        Darwin/x86_64) platform="macos-x86_64" ;;
+        Darwin/arm64) platform="macos-aarch64" ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    archive_name="zig-${platform}-${zig_version}"
+    base_dir="${RUNNER_TEMP:-/tmp}/zig"
+    extract_dir="${base_dir}/${archive_name}"
+    archive_path="${base_dir}/${archive_name}.tar.xz"
+    download_url="https://ziglang.org/download/${zig_version}/${archive_name}.tar.xz"
+    zig_bin="${extract_dir}/zig"
+
+    mkdir -p "${base_dir}"
+
+    if [ ! -x "${zig_bin}" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "${download_url}" -o "${archive_path}"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "${archive_path}" "${download_url}"
+        else
+            return 1
+        fi
+        tar -xJf "${archive_path}" -C "${base_dir}"
+    fi
+
+    if [ ! -x "${zig_bin}" ]; then
+        return 1
+    fi
+
+    shim_dir="${RUNNER_TEMP:-/tmp}/cc-shim"
+    mkdir -p "${shim_dir}"
+    cat > "${shim_dir}/cc" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"${zig_bin}" cc "\$@"
+EOF
+    chmod +x "${shim_dir}/cc"
+    prepend_path "${shim_dir}"
+    echo "::notice::Provisioned 'cc' via Zig wrapper (${zig_version})."
+}
+
 if command -v cc >/dev/null 2>&1; then
     print_cc_info
     exit 0
@@ -77,6 +134,11 @@ if ! install_cc_toolchain; then
 fi
 
 if command -v cc >/dev/null 2>&1; then
+    print_cc_info
+    exit 0
+fi
+
+if install_zig_cc_shim && command -v cc >/dev/null 2>&1; then
     print_cc_info
     exit 0
 fi
