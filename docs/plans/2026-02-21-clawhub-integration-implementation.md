@@ -1,5 +1,7 @@
 # ClawHub Integration Implementation Plan
 
+<!-- markdownlint-disable MD036 -->
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add ClawHub integration to ZeroClaw enabling CLI commands and LLM tools for discovering, installing, and managing skills from clawhub.ai.
