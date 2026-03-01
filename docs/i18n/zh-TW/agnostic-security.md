@@ -6,6 +6,7 @@
 > 有關目前的執行期行為，請參閱 [config-reference.md](../../config-reference.md)、[operations-runbook.md](../../operations-runbook.md) 及 [troubleshooting.md](../../troubleshooting.md)。
 
 ## 核心問題：安全功能會破壞以下特性嗎...
+
 1. ❓ 快速交叉編譯建置？
 2. ❓ 可插拔架構（任意替換元件）？
 3. ❓ 硬體無關性（ARM、x86、RISC-V）？
@@ -295,6 +296,7 @@ backend = "docker"
 ## 6. 相依性影響：新增相依極少
 
 ### 目前的相依套件（供參考）
+
 ```
 reqwest, tokio, serde, anyhow, uuid, chrono, rusqlite,
 axum, tracing, opentelemetry, ...
