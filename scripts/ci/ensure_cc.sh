@@ -106,7 +106,18 @@ install_zig_cc_shim() {
     cat > "${shim_dir}/cc" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-"${zig_bin}" cc "\$@"
+args=()
+for arg in "\$@"; do
+    if [[ "\$arg" == --target=* ]]; then
+        target="\${arg#--target=}"
+        target="\${target//-unknown-/-}"
+        target="\${target//-pc-/-}"
+        args+=("--target=\${target}")
+    else
+        args+=("\$arg")
+    fi
+done
+"${zig_bin}" cc "\${args[@]}"
 EOF
     chmod +x "${shim_dir}/cc"
     prepend_path "${shim_dir}"
