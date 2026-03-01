@@ -721,6 +721,29 @@ fn is_verbose_only_progress_line(delta: &str) -> bool {
         || trimmed.starts_with("\u{26a0}\u{fe0f} Loop detected")
 }
 
+fn upsert_progress_section(accumulated: &mut String, block: &str) {
+    let section = format!(
+        "{}{}{}",
+        crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+        block,
+        crate::agent::loop_::DRAFT_PROGRESS_SECTION_END
+    );
+    if let Some(start) = accumulated.find(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START) {
+        if let Some(end_offset) =
+            accumulated[start..].find(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END)
+        {
+            let end = start + end_offset + crate::agent::loop_::DRAFT_PROGRESS_SECTION_END.len();
+            accumulated.replace_range(start..end, &section);
+            return;
+        }
+    }
+    accumulated.push_str(&section);
+}
+
+fn strip_progress_section_markers(text: &str) -> String {
+    text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
+        .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
+}
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -3575,19 +3598,32 @@ or tune thresholds in config.",
                     accumulated.clear();
                     continue;
                 }
-                let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
-                if is_internal_progress {
+                if let Some(block) =
+                    delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
+                {
                     if mode == ProgressMode::Off {
                         continue;
                     }
-                    if mode == ProgressMode::Compact && is_verbose_only_progress_line(visible_delta)
-                    {
-                        continue;
+                    upsert_progress_section(&mut accumulated, block);
+                } else {
+                    let (is_internal_progress, visible_delta) =
+                        split_internal_progress_delta(&delta);
+                    if is_internal_progress {
+                        if mode == ProgressMode::Off {
+                            continue;
+                        }
+                        if mode == ProgressMode::Compact
+                            && is_verbose_only_progress_line(visible_delta)
+                        {
+                            continue;
+                        }
                     }
+
+                    accumulated.push_str(visible_delta);
                 }
-                accumulated.push_str(visible_delta);
+                let display_text = strip_progress_section_markers(&accumulated);
                 if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &accumulated)
+                    .update_draft(&reply_target, &draft_id, &display_text)
                     .await
                 {
                     tracing::debug!("Draft update failed: {e}");
@@ -11237,6 +11273,16 @@ Done reminder set for 1:38 AM."#;
             effective_progress_mode_for_message("telegram", false),
             ProgressMode::Off
         );
+    }
+
+    #[test]
+    fn upsert_progress_section_replaces_existing_block() {
+        let mut text = String::new();
+        upsert_progress_section(&mut text, "⏳ shell: ls\n");
+        upsert_progress_section(&mut text, "✅ shell (1s)\n");
+        let stripped = strip_progress_section_markers(&text);
+        assert!(!stripped.contains("⏳ shell: ls"));
+        assert!(stripped.contains("✅ shell (1s)"));
     }
 
     #[test]

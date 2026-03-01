@@ -254,6 +254,12 @@ pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 /// Channel layers can suppress these messages by default and only expose them
 /// when the user explicitly asks for command/tool execution details.
 pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
+/// Sentinel prefix for full in-place progress blocks.
+pub(crate) const DRAFT_PROGRESS_BLOCK_SENTINEL: &str = "\x00PROGRESS_BLOCK\x00";
+/// Progress-section marker inserted into accumulated streaming drafts.
+pub(crate) const DRAFT_PROGRESS_SECTION_START: &str = "\n<!-- progress-start -->\n";
+/// Progress-section marker inserted into accumulated streaming drafts.
+pub(crate) const DRAFT_PROGRESS_SECTION_END: &str = "\n<!-- progress-end -->\n";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
@@ -314,11 +320,70 @@ fn should_emit_tool_progress(mode: ProgressMode) -> bool {
     mode != ProgressMode::Off
 }
 
+#[derive(Debug, Clone)]
+struct ProgressEntry {
+    name: String,
+    hint: String,
+    completion: Option<(bool, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct ProgressTracker {
+    entries: Vec<ProgressEntry>,
+}
+
+impl ProgressTracker {
+    fn add(&mut self, tool_name: &str, hint: &str) -> usize {
+        let idx = self.entries.len();
+        self.entries.push(ProgressEntry {
+            name: tool_name.to_string(),
+            hint: hint.to_string(),
+            completion: None,
+        });
+        idx
+    }
+
+    fn complete(&mut self, idx: usize, success: bool, secs: u64) {
+        if let Some(entry) = self.entries.get_mut(idx) {
+            entry.completion = Some((success, secs));
+        }
+    }
+
+    fn render_delta(&self) -> String {
+        let mut out = String::from(DRAFT_PROGRESS_BLOCK_SENTINEL);
+        for entry in &self.entries {
+            match entry.completion {
+                None => {
+                    let _ = write!(out, "\u{23f3} {}", entry.name);
+                    if !entry.hint.is_empty() {
+                        let _ = write!(out, ": {}", entry.hint);
+                    }
+                    out.push('\n');
+                }
+                Some((true, secs)) => {
+                    let _ = writeln!(out, "\u{2705} {} ({secs}s)", entry.name);
+                }
+                Some((false, secs)) => {
+                    let _ = writeln!(out, "\u{274c} {} ({secs}s)", entry.name);
+                }
+            }
+        }
+        out
+    }
+}
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
     let hint = match name {
         "shell" => args.get("command").and_then(|v| v.as_str()),
         "file_read" | "file_write" => args.get("path").and_then(|v| v.as_str()),
+        "composio_execute" => args.get("action_name").and_then(|v| v.as_str()),
+        "memory_recall" => args.get("query").and_then(|v| v.as_str()),
+        "memory_store" => args.get("key").and_then(|v| v.as_str()),
+        "web_search" => args.get("query").and_then(|v| v.as_str()),
+        "http_request" => args.get("url").and_then(|v| v.as_str()),
+        "browser_navigate" | "browser_screenshot" | "browser_click" | "browser_type" => {
+            args.get("url").and_then(|v| v.as_str())
+        }
         _ => args
             .get("action")
             .and_then(|v| v.as_str())
@@ -825,6 +890,7 @@ pub(crate) async fn run_tool_call_loop(
     let progress_mode = TOOL_LOOP_PROGRESS_MODE
         .try_with(|mode| *mode)
         .unwrap_or(ProgressMode::Verbose);
+    let mut progress_tracker = ProgressTracker::default();
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -1215,6 +1281,7 @@ pub(crate) async fn run_tool_call_loop(
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut progress_indices: Vec<Option<usize>> = Vec::new();
 
         for (idx, call) in tool_calls.iter().enumerate() {
             // ── Hook: before_tool_call (modifying) ──────────
@@ -1444,20 +1511,17 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
 
-            if should_emit_tool_progress(progress_mode) {
+            let progress_idx = if should_emit_tool_progress(progress_mode) {
+                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
+                let idx = progress_tracker.add(&tool_name, &hint);
                 if let Some(ref tx) = on_delta {
-                    let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
-                    let progress = if hint.is_empty() {
-                        format!("\u{23f3} {}\n", tool_name)
-                    } else {
-                        format!("\u{23f3} {}: {hint}\n", tool_name)
-                    };
                     tracing::debug!(tool = %tool_name, "Sending progress start to draft");
-                    let _ = tx
-                        .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
-                        .await;
+                    let _ = tx.send(progress_tracker.render_delta()).await;
                 }
-            }
+                Some(idx)
+            } else {
+                None
+            };
 
             executable_indices.push(idx);
             executable_calls.push(ParsedToolCall {
@@ -1465,6 +1529,7 @@ pub(crate) async fn run_tool_call_loop(
                 arguments: tool_args,
                 tool_call_id: call.tool_call_id.clone(),
             });
+            progress_indices.push(progress_idx);
         }
 
         let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
@@ -1485,10 +1550,11 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
-        for ((idx, call), mut outcome) in executable_indices
+        for (((idx, call), mut outcome), progress_idx) in executable_indices
             .iter()
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
+            .zip(progress_indices.iter())
         {
             runtime_trace::record_event(
                 "tool_call_result",
@@ -1537,21 +1603,12 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
 
-            if should_emit_tool_progress(progress_mode) {
+            if let Some(idx) = progress_idx {
+                let secs = outcome.duration.as_secs();
+                progress_tracker.complete(*idx, outcome.success, secs);
                 if let Some(ref tx) = on_delta {
-                    let secs = outcome.duration.as_secs();
-                    let icon = if outcome.success {
-                        "\u{2705}"
-                    } else {
-                        "\u{274c}"
-                    };
                     tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                    let _ = tx
-                        .send(format!(
-                            "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
-                            call.name
-                        ))
-                        .await;
+                    let _ = tx.send(progress_tracker.render_delta()).await;
                 }
             }
 
@@ -5682,4 +5739,20 @@ Let me check the result."#;
         assert!(!should_emit_tool_progress(ProgressMode::Off));
     }
 
+    #[test]
+    fn progress_tracker_renders_in_place_block() {
+        let mut tracker = ProgressTracker::default();
+        let first = tracker.add("shell", "ls -la");
+        let second = tracker.add("web_search", "rust async test");
+        let started = tracker.render_delta();
+        assert!(started.starts_with(DRAFT_PROGRESS_BLOCK_SENTINEL));
+        assert!(started.contains("⏳ shell: ls -la"));
+        assert!(started.contains("⏳ web_search: rust async test"));
+
+        tracker.complete(first, true, 2);
+        tracker.complete(second, false, 1);
+        let completed = tracker.render_delta();
+        assert!(completed.contains("✅ shell (2s)"));
+        assert!(completed.contains("❌ web_search (1s)"));
+    }
 }
