@@ -2101,6 +2101,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_credential_prefers_step_primary_env_key() {
+        let _env_lock = env_lock();
+        let _primary_guard = EnvGuard::set("STEP_API_KEY", Some("step-primary"));
+        let _fallback_guard = EnvGuard::set("STEPFUN_API_KEY", Some("step-fallback"));
+
+        let resolved = resolve_provider_credential("stepfun", None);
+        assert_eq!(resolved.as_deref(), Some("step-primary"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_stepfun_fallback_env_key() {
+        let _env_lock = env_lock();
+        let _primary_guard = EnvGuard::set("STEP_API_KEY", None);
+        let _fallback_guard = EnvGuard::set("STEPFUN_API_KEY", Some("step-fallback"));
+
+        let resolved = resolve_provider_credential("step-ai", None);
+        assert_eq!(resolved.as_deref(), Some("step-fallback"));
+    }
+
+    #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}", std::process::id());

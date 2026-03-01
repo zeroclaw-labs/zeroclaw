@@ -882,6 +882,13 @@ async fn run_quick_setup_with_home(
         } else {
             let env_var = provider_env_var(&provider_name);
             println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
+            let fallback_env_vars = provider_env_var_fallbacks(&provider_name);
+            if !fallback_env_vars.is_empty() {
+                println!(
+                    "       Alternate accepted env var(s): {}",
+                    fallback_env_vars.join(", ")
+                );
+            }
             println!("    2. Or edit:           ~/.zeroclaw/config.toml");
             println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
             println!("    4. Gateway:           zeroclaw gateway");
@@ -1833,20 +1840,7 @@ fn fetch_live_models_for_provider(
         if provider_name == "ollama" && !ollama_remote {
             None
         } else {
-            std::env::var(provider_env_var(provider_name))
-                .ok()
-                .or_else(|| {
-                    // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
-                    if provider_name == "anthropic" {
-                        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                    } else if provider_name == "minimax" {
-                        std::env::var("MINIMAX_OAUTH_TOKEN").ok()
-                    } else {
-                        None
-                    }
-                })
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
+            resolve_provider_api_key_from_env(provider_name)
         }
     } else {
         Some(api_key.trim().to_string())
@@ -3020,10 +3014,19 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
             if key.is_empty() {
                 let env_var = provider_env_var(provider_name);
-                print_bullet(&format!(
-                    "Skipped. Set {} or edit config.toml later.",
-                    style(env_var).yellow()
-                ));
+                let fallback_env_vars = provider_env_var_fallbacks(provider_name);
+                if fallback_env_vars.is_empty() {
+                    print_bullet(&format!(
+                        "Skipped. Set {} or edit config.toml later.",
+                        style(env_var).yellow()
+                    ));
+                } else {
+                    print_bullet(&format!(
+                        "Skipped. Set {} (fallback: {}) or edit config.toml later.",
+                        style(env_var).yellow(),
+                        style(fallback_env_vars.join(", ")).yellow()
+                    ));
+                }
             }
 
             key
@@ -3043,13 +3046,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             allows_unauthenticated_model_fetch(provider_name) && !ollama_remote;
         let has_api_key = !api_key.trim().is_empty()
             || ((canonical_provider != "ollama" || ollama_remote)
-                && std::env::var(provider_env_var(provider_name))
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()))
-            || (provider_name == "minimax"
-                && std::env::var("MINIMAX_OAUTH_TOKEN")
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()));
+                && provider_has_env_api_key(provider_name));
 
         if canonical_provider == "ollama" && ollama_remote && !has_api_key {
             print_bullet(&format!(
@@ -3282,6 +3279,33 @@ fn provider_env_var(name: &str) -> &'static str {
         "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
     }
+}
+
+fn provider_env_var_fallbacks(name: &str) -> &'static [&'static str] {
+    match canonical_provider_name(name) {
+        "anthropic" => &["ANTHROPIC_OAUTH_TOKEN"],
+        "gemini" => &["GOOGLE_API_KEY"],
+        "minimax" => &["MINIMAX_OAUTH_TOKEN"],
+        "volcengine" => &["DOUBAO_API_KEY"],
+        "stepfun" => &["STEPFUN_API_KEY"],
+        "kimi-code" => &["MOONSHOT_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn resolve_provider_api_key_from_env(provider_name: &str) -> Option<String> {
+    std::iter::once(provider_env_var(provider_name))
+        .chain(provider_env_var_fallbacks(provider_name).iter().copied())
+        .find_map(|env_var| {
+            std::env::var(env_var)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn provider_has_env_api_key(provider_name: &str) -> bool {
+    resolve_provider_api_key_from_env(provider_name).is_some()
 }
 
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
@@ -8576,6 +8600,46 @@ mod tests {
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
         assert_eq!(provider_env_var("hunyuan"), "HUNYUAN_API_KEY");
         assert_eq!(provider_env_var("tencent"), "HUNYUAN_API_KEY"); // alias
+    }
+
+    #[test]
+    fn provider_env_var_fallbacks_cover_expected_aliases() {
+        assert_eq!(provider_env_var_fallbacks("stepfun"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step-ai"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step_ai"), &["STEPFUN_API_KEY"]);
+        assert_eq!(
+            provider_env_var_fallbacks("anthropic"),
+            &["ANTHROPIC_OAUTH_TOKEN"]
+        );
+        assert_eq!(provider_env_var_fallbacks("gemini"), &["GOOGLE_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("minimax"), &["MINIMAX_OAUTH_TOKEN"]);
+        assert_eq!(provider_env_var_fallbacks("volcengine"), &["DOUBAO_API_KEY"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_from_env_prefers_primary_over_fallback() {
+        let _env_guard = env_lock().lock().await;
+        let _primary = EnvVarGuard::set("STEP_API_KEY", "primary-step-key");
+        let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
+
+        assert_eq!(
+            resolve_provider_api_key_from_env("stepfun").as_deref(),
+            Some("primary-step-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_from_env_uses_stepfun_fallback_key() {
+        let _env_guard = env_lock().lock().await;
+        let _unset_primary = EnvVarGuard::unset("STEP_API_KEY");
+        let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
+
+        assert_eq!(
+            resolve_provider_api_key_from_env("step-ai").as_deref(),
+            Some("fallback-step-key")
+        );
+        assert!(provider_has_env_api_key("step_ai"));
     }
 
     #[test]
