@@ -2,7 +2,7 @@
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
-Cập nhật lần cuối: **2026-02-28**.
+Cập nhật lần cuối: **2026-03-01**.
 
 ## Cách liệt kê các Provider
 
@@ -33,6 +33,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `vercel` | `vercel-ai` | Không | `VERCEL_API_KEY` |
 | `cloudflare` | `cloudflare-ai` | Không | `CLOUDFLARE_API_KEY` |
 | `moonshot` | `kimi` | Không | `MOONSHOT_API_KEY` |
+| `stepfun` | `step`, `step-ai`, `step_ai` | Không | `STEP_API_KEY`, `STEPFUN_API_KEY` |
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | Không | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | Không | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | Không | `OPENCODE_API_KEY` |
@@ -85,6 +86,29 @@ Kiểm tra nhanh:
 ```bash
 zeroclaw models refresh --provider volcengine
 zeroclaw agent --provider volcengine --model doubao-1-5-pro-32k-250115 -m "ping"
+```
+
+### Ghi chú về StepFun
+
+- Provider ID: `stepfun` (alias: `step`, `step-ai`, `step_ai`)
+- Base API URL: `https://api.stepfun.com/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Xác thực: `STEP_API_KEY` (fallback: `STEPFUN_API_KEY`)
+- Model mặc định: `step-3.5-flash`
+
+Ví dụ thiết lập nhanh:
+
+```bash
+export STEP_API_KEY="your-stepfun-api-key"
+zeroclaw onboard --provider stepfun --api-key "$STEP_API_KEY" --model step-3.5-flash --force
+```
+
+Kiểm tra nhanh:
+
+```bash
+zeroclaw models refresh --provider stepfun
+zeroclaw agent --provider stepfun --model step-3.5-flash -m "ping"
 ```
 
 ### Ghi chú về SiliconFlow

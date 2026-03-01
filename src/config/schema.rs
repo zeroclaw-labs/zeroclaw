@@ -77,6 +77,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "cohere" => "command-a-03-2025",
         "moonshot" => "kimi-k2.5",
+        "stepfun" => "step-3.5-flash",
         "hunyuan" => "hunyuan-t1-latest",
         "glm" | "zai" => "glm-5",
         "minimax" => "MiniMax-M2.5",
@@ -11817,6 +11818,9 @@ provider_api = "not-a-real-mode"
         let openai = resolve_default_model_id(None, Some("openai"));
         assert_eq!(openai, "gpt-5.2");
 
+        let stepfun = resolve_default_model_id(None, Some("stepfun"));
+        assert_eq!(stepfun, "step-3.5-flash");
+
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
     }
@@ -11828,6 +11832,12 @@ provider_api = "not-a-real-mode"
 
         let google_alias = resolve_default_model_id(None, Some("google-gemini"));
         assert_eq!(google_alias, "gemini-2.5-pro");
+
+        let step_alias = resolve_default_model_id(None, Some("step"));
+        assert_eq!(step_alias, "step-3.5-flash");
+
+        let step_ai_alias = resolve_default_model_id(None, Some("step-ai"));
+        assert_eq!(step_ai_alias, "step-3.5-flash");
     }
 
     #[test]

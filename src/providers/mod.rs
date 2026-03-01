@@ -83,6 +83,7 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
+const STEPFUN_BASE_URL: &str = "https://api.stepfun.com/v1";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
@@ -190,6 +191,10 @@ pub(crate) fn is_doubao_alias(name: &str) -> bool {
 
 pub(crate) fn is_siliconflow_alias(name: &str) -> bool {
     matches!(name, "siliconflow" | "silicon-cloud" | "siliconcloud")
+}
+
+pub(crate) fn is_stepfun_alias(name: &str) -> bool {
+    matches!(name, "stepfun" | "step" | "step-ai" | "step_ai")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -633,6 +638,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("doubao")
     } else if is_siliconflow_alias(name) {
         Some("siliconflow")
+    } else if is_stepfun_alias(name) {
+        Some("stepfun")
     } else if matches!(name, "hunyuan" | "tencent") {
         Some("hunyuan")
     } else {
@@ -689,6 +696,14 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
         Some(ZAI_CN_BASE_URL)
     } else if is_zai_global_alias(name) {
         Some(ZAI_GLOBAL_BASE_URL)
+    } else {
+        None
+    }
+}
+
+fn stepfun_base_url(name: &str) -> Option<&'static str> {
+    if is_stepfun_alias(name) {
+        Some(STEPFUN_BASE_URL)
     } else {
         None
     }
@@ -892,6 +907,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_siliconflow_alias(name) => vec!["SILICONFLOW_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
+        name if is_stepfun_alias(name) => vec!["STEP_API_KEY", "STEPFUN_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
@@ -1223,6 +1239,12 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
+        name if stepfun_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "StepFun",
+            stepfun_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
+        ))),
         name if qwen_base_url(name).is_some() => {
             Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
                 "Qwen",
@@ -1781,6 +1803,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "stepfun",
+            display_name: "StepFun",
+            aliases: &["step", "step-ai", "step_ai"],
+            local: false,
+        },
+        ProviderInfo {
             name: "kimi-code",
             display_name: "Kimi Code",
             aliases: &["kimi_coding", "kimi_for_coding"],
@@ -2222,6 +2250,10 @@ mod tests {
         assert!(is_siliconflow_alias("siliconflow"));
         assert!(is_siliconflow_alias("silicon-cloud"));
         assert!(is_siliconflow_alias("siliconcloud"));
+        assert!(is_stepfun_alias("stepfun"));
+        assert!(is_stepfun_alias("step"));
+        assert!(is_stepfun_alias("step-ai"));
+        assert!(is_stepfun_alias("step_ai"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
@@ -2230,6 +2262,7 @@ mod tests {
         assert!(!is_qianfan_alias("cohere"));
         assert!(!is_doubao_alias("deepseek"));
         assert!(!is_siliconflow_alias("volcengine"));
+        assert!(!is_stepfun_alias("moonshot"));
     }
 
     #[test]
@@ -2261,6 +2294,9 @@ mod tests {
             canonical_china_provider_name("silicon-cloud"),
             Some("siliconflow")
         );
+        assert_eq!(canonical_china_provider_name("stepfun"), Some("stepfun"));
+        assert_eq!(canonical_china_provider_name("step"), Some("stepfun"));
+        assert_eq!(canonical_china_provider_name("step-ai"), Some("stepfun"));
         assert_eq!(canonical_china_provider_name("hunyuan"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("tencent"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("openai"), None);
@@ -2301,6 +2337,10 @@ mod tests {
         assert_eq!(zai_base_url("z.ai-global"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("zai-cn"), Some(ZAI_CN_BASE_URL));
         assert_eq!(zai_base_url("z.ai-cn"), Some(ZAI_CN_BASE_URL));
+
+        assert_eq!(stepfun_base_url("stepfun"), Some(STEPFUN_BASE_URL));
+        assert_eq!(stepfun_base_url("step"), Some(STEPFUN_BASE_URL));
+        assert_eq!(stepfun_base_url("step-ai"), Some(STEPFUN_BASE_URL));
     }
 
     // ── Primary providers ────────────────────────────────────
@@ -2385,6 +2425,13 @@ mod tests {
         assert!(create_provider("moonshot-cn", Some("key")).is_ok());
         assert!(create_provider("kimi-intl", Some("key")).is_ok());
         assert!(create_provider("kimi-cn", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_stepfun() {
+        assert!(create_provider("stepfun", Some("key")).is_ok());
+        assert!(create_provider("step", Some("key")).is_ok());
+        assert!(create_provider("step-ai", Some("key")).is_ok());
     }
 
     #[test]
@@ -2939,6 +2986,9 @@ mod tests {
             "kimi-code",
             "moonshot-cn",
             "kimi-code",
+            "stepfun",
+            "step",
+            "step-ai",
             "synthetic",
             "opencode",
             "zai",
