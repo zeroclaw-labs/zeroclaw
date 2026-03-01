@@ -1,8 +1,7 @@
 import Foundation
-import Security
 import SwiftUI
 
-/// Manages persistent settings with encrypted API key storage via Keychain
+/// Manages persistent settings with encrypted storage via Keychain
 /// and non-sensitive settings via UserDefaults.
 final class SettingsManager: ObservableObject {
     @Published var provider: String {
@@ -23,10 +22,15 @@ final class SettingsManager: ObservableObject {
     @Published var appearance: String {
         didSet { UserDefaults.standard.set(appearance, forKey: Keys.appearance) }
     }
+    @Published var gatewayHost: String {
+        didSet { UserDefaults.standard.set(gatewayHost, forKey: Keys.gatewayHost) }
+    }
+    @Published var gatewayPort: Int {
+        didSet { UserDefaults.standard.set(gatewayPort, forKey: Keys.gatewayPort) }
+    }
 
-    var isConfigured: Bool {
-        let key = getApiKey()
-        return key != nil && !key!.isEmpty
+    var isGatewayConfigured: Bool {
+        !gatewayHost.isEmpty && gatewayPort > 0 && getGatewayToken() != nil
     }
 
     init() {
@@ -37,6 +41,8 @@ final class SettingsManager: ObservableObject {
         self.autoStart = defaults.bool(forKey: Keys.autoStart)
         self.notificationsEnabled = defaults.bool(forKey: Keys.notifications)
         self.appearance = defaults.string(forKey: Keys.appearance) ?? "system"
+        self.gatewayHost = defaults.string(forKey: Keys.gatewayHost) ?? "127.0.0.1"
+        self.gatewayPort = defaults.object(forKey: Keys.gatewayPort) as? Int ?? 42617
     }
 
     var colorScheme: ColorScheme? {
@@ -47,59 +53,35 @@ final class SettingsManager: ObservableObject {
         }
     }
 
-    // MARK: - API Key (Keychain)
+    // MARK: - API Key
 
     func getApiKey() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: KeychainConfig.service,
-            kSecAttrAccount as String: KeychainConfig.apiKeyAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let key = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return key
+        KeychainHelper.read(account: KeychainHelper.apiKeyAccount)
     }
 
     func setApiKey(_ key: String) {
-        let data = Data(key.utf8)
-
-        // Delete existing entry first
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: KeychainConfig.service,
-            kSecAttrAccount as String: KeychainConfig.apiKeyAccount,
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        // Add new entry
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: KeychainConfig.service,
-            kSecAttrAccount as String: KeychainConfig.apiKeyAccount,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        ]
-        SecItemAdd(addQuery as CFDictionary, nil)
-
+        KeychainHelper.write(account: KeychainHelper.apiKeyAccount, value: key)
         objectWillChange.send()
     }
 
     func deleteApiKey() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: KeychainConfig.service,
-            kSecAttrAccount as String: KeychainConfig.apiKeyAccount,
-        ]
-        SecItemDelete(query as CFDictionary)
+        KeychainHelper.delete(account: KeychainHelper.apiKeyAccount)
+        objectWillChange.send()
+    }
+
+    // MARK: - Gateway Token
+
+    func getGatewayToken() -> String? {
+        KeychainHelper.read(account: KeychainHelper.gatewayTokenAccount)
+    }
+
+    func setGatewayToken(_ token: String) {
+        KeychainHelper.write(account: KeychainHelper.gatewayTokenAccount, value: token)
+        objectWillChange.send()
+    }
+
+    func deleteGatewayToken() {
+        KeychainHelper.delete(account: KeychainHelper.gatewayTokenAccount)
         objectWillChange.send()
     }
 
@@ -129,10 +111,7 @@ final class SettingsManager: ObservableObject {
         static let autoStart = "zeroclaw_auto_start"
         static let notifications = "zeroclaw_notifications"
         static let appearance = "zeroclaw_appearance"
-    }
-
-    private enum KeychainConfig {
-        static let service = "ai.zeroclaw.ios"
-        static let apiKeyAccount = "api_key"
+        static let gatewayHost = "zeroclaw_gateway_host"
+        static let gatewayPort = "zeroclaw_gateway_port"
     }
 }
