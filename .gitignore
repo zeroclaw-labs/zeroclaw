@@ -73,6 +73,7 @@ clients/ios-bridge/target/
 *.aab
 *.ap_
 clients/android-bridge/target/
+clients/android/app/src/main/jniLibs/
 clients/android/app/build/
 clients/android/build/
 clients/android/.gradle/
