@@ -31,6 +31,83 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
+/// Convert audio bytes to WAV using `ffmpeg` if the file is in CAF format
+/// (Core Audio Format — iMessage voice memos). Non-CAF files are returned
+/// unchanged via early `Ok(None)`.
+///
+/// Returns:
+/// - `Ok(None)`        — not a CAF file; caller uses original data as-is
+/// - `Ok(Some(bytes))` — conversion succeeded; use returned WAV bytes
+/// - `Err`             — CAF detected but ffmpeg missing or conversion failed;
+///                       caller should warn and skip transcription
+pub async fn convert_caf_to_wav(data: &[u8], file_name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use tokio::process::Command;
+
+    // Early return: not a CAF file — no conversion needed, caller reuses original bytes
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "caf" {
+        return Ok(None);
+    }
+
+    // CAF requires seekable input — stdin piping does not work; use temp files.
+    // Files are deleted on all exit paths. Note: if the async task is cancelled
+    // between write and cleanup, orphaned files may remain in tmp until OS sweeps.
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_dir = std::env::temp_dir();
+    let caf_path = tmp_dir.join(format!("zc_{base}.caf"));
+    let wav_path = tmp_dir.join(format!("zc_{base}.wav"));
+
+    tokio::fs::write(&caf_path, data)
+        .await
+        .context("Failed to write CAF temp file")?;
+
+    let result = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            caf_path.to_str().unwrap_or(""),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            wav_path.to_str().unwrap_or(""),
+        ])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    let _ = tokio::fs::remove_file(&caf_path).await;
+
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            anyhow::bail!("ffmpeg not found — install ffmpeg to transcribe iMessage CAF audio");
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            return Err(e).context("ffmpeg CAF→WAV conversion error");
+        }
+        Ok(s) if !s.success() => {
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            anyhow::bail!("ffmpeg CAF→WAV conversion failed (exit {:?})", s.code());
+        }
+        Ok(_) => {}
+    }
+
+    let wav = tokio::fs::read(&wav_path)
+        .await
+        .context("Failed to read WAV temp file")?;
+    let _ = tokio::fs::remove_file(&wav_path).await;
+    Ok(Some(wav))
+}
+
 /// Transcribe audio bytes via a Whisper-compatible transcription API.
 ///
 /// Returns the transcribed text on success.
@@ -125,6 +202,18 @@ pub async fn transcribe_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn convert_caf_skips_non_caf() {
+        let r = convert_caf_to_wav(&[0u8; 10], "voice.m4a").await.unwrap();
+        assert!(r.is_none(), "non-CAF should return Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn convert_caf_skips_no_extension() {
+        let r = convert_caf_to_wav(&[0u8; 10], "voice").await.unwrap();
+        assert!(r.is_none());
+    }
 
     #[tokio::test]
     async fn rejects_oversized_audio() {

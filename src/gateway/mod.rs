@@ -531,12 +531,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // BlueBubbles channel (if configured)
     let bluebubbles_channel: Option<Arc<BlueBubblesChannel>> =
         config.channels_config.bluebubbles.as_ref().map(|bb| {
-            Arc::new(BlueBubblesChannel::new(
-                bb.server_url.clone(),
-                bb.password.clone(),
-                bb.allowed_senders.clone(),
-                bb.ignore_senders.clone(),
-            ))
+            Arc::new(
+                BlueBubblesChannel::new(
+                    bb.server_url.clone(),
+                    bb.password.clone(),
+                    bb.allowed_senders.clone(),
+                    bb.ignore_senders.clone(),
+                )
+                .with_transcription(config.transcription.clone()),
+            )
         });
     let bluebubbles_webhook_secret: Option<Arc<str>> = config
         .channels_config
@@ -2277,7 +2280,10 @@ async fn handle_bluebubbles_webhook(
         );
     };
 
-    let messages = bluebubbles.parse_webhook_payload(&payload);
+    // Parse messages from the webhook payload (transcribes audio if configured)
+    let messages = bluebubbles
+        .parse_webhook_payload_with_transcription(&payload)
+        .await;
 
     if messages.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));

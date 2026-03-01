@@ -6,6 +6,12 @@ use uuid::Uuid;
 
 const FROM_ME_CACHE_MAX: usize = 500;
 
+/// Audio attachment metadata extracted from a BlueBubbles webhook payload.
+struct AudioAttachment {
+    guid: String,
+    transfer_name: String,
+}
+
 /// Maps short effect names to full Apple `effectId` strings for BB Private API.
 const EFFECT_MAP: &[(&str, &str)] = &[
     // Bubble effects
@@ -136,6 +142,9 @@ pub struct BlueBubblesChannel {
     /// BB typing indicators expire in ~5 s; tasks refresh every 4 s.
     /// Keyed by chat GUID so concurrent conversations don't cancel each other.
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Optional Groq Whisper transcription config — populated by `with_transcription`
+    /// when `[transcription]` is configured and enabled.
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl BlueBubblesChannel {
@@ -153,7 +162,19 @@ impl BlueBubblesChannel {
             client: reqwest::Client::new(),
             from_me_cache: Mutex::new(FromMeCache::new()),
             typing_handles: Mutex::new(HashMap::new()),
+            transcription: None,
         }
+    }
+
+    /// Configure voice transcription via Groq Whisper.
+    ///
+    /// When `config.enabled` is false the builder is a no-op so callers can
+    /// pass `config.transcription.clone()` unconditionally.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
     }
 
     /// Check if a sender address is in the ignore list.
@@ -406,6 +427,162 @@ impl BlueBubblesChannel {
             None
         } else {
             Some(parts.join("\n"))
+        }
+    }
+
+    /// Extract audio attachments from a BlueBubbles message `data` object.
+    ///
+    /// Returns one entry per attachment whose MIME type starts with `audio/`.
+    /// Supports both camelCase (`mimeType`, `transferName`) and snake_case
+    /// (`mime_type`, `filename`) field names for forward compatibility.
+    fn extract_audio_attachments(data: &serde_json::Value) -> Vec<AudioAttachment> {
+        let Some(arr) = data.get("attachments").and_then(|a| a.as_array()) else {
+            return vec![];
+        };
+        arr.iter()
+            .filter_map(|att| {
+                let mime = att
+                    .get("mimeType")
+                    .or_else(|| att.get("mime_type"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
+                if !mime.starts_with("audio/") {
+                    return None;
+                }
+                let guid = att.get("guid").and_then(|g| g.as_str())?.to_string();
+                let transfer_name = att
+                    .get("transferName")
+                    .or_else(|| att.get("filename"))
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("voice.m4a")
+                    .to_string();
+                Some(AudioAttachment {
+                    guid,
+                    transfer_name,
+                })
+            })
+            .collect()
+    }
+
+    /// Download a BlueBubbles attachment by GUID via the REST API.
+    ///
+    /// GUID bytes that are not unreserved URI characters are percent-encoded
+    /// inline (no new dependency).
+    async fn download_attachment(&self, guid: &str) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context as _;
+
+        let encoded: String = guid
+            .bytes()
+            .flat_map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    vec![b as char]
+                } else {
+                    format!("%{b:02X}").chars().collect()
+                }
+            })
+            .collect();
+
+        let url = format!("{}/api/v1/attachment/{}/download", self.server_url, encoded);
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("password", &self.password)])
+            .send()
+            .await
+            .context("BB attachment download request failed")?;
+
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "BB attachment download failed: HTTP {}",
+            resp.status()
+        );
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Download and transcribe a single audio attachment.
+    ///
+    /// CAF files are converted to WAV via `ffmpeg` before upload.
+    /// Returns `Ok(None)` when the transcript is empty (e.g. silence).
+    async fn download_and_transcribe(
+        &self,
+        att: &AudioAttachment,
+        cfg: &crate::config::TranscriptionConfig,
+    ) -> anyhow::Result<Option<String>> {
+        let raw = self.download_attachment(&att.guid).await?;
+
+        // convert_caf_to_wav takes &[u8] so raw is not consumed on the non-CAF path:
+        //   Ok(None)      → not CAF, reuse raw as-is — no clone needed
+        //   Ok(Some(wav)) → converted; raw is no longer needed
+        //   Err           → CAF but ffmpeg missing/failed → propagates → caller logs + fallback
+        let transfer_name = att.transfer_name.clone();
+        let (audio_data, file_name) =
+            match super::transcription::convert_caf_to_wav(&raw, &transfer_name).await? {
+                Some(wav) => (wav, "voice.wav".to_string()),
+                None => (raw, transfer_name),
+            };
+
+        let transcript =
+            super::transcription::transcribe_audio(audio_data, &file_name, cfg).await?;
+        if transcript.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(transcript))
+    }
+
+    /// Like `parse_webhook_payload` but transcribes audio attachments when
+    /// `[transcription]` is configured. Gracefully falls back to the
+    /// `<media:audio>` placeholder if transcription is disabled, ffmpeg is
+    /// absent, or the API call fails.
+    pub async fn parse_webhook_payload_with_transcription(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Vec<ChannelMessage> {
+        let Some(ref cfg) = self.transcription else {
+            return self.parse_webhook_payload(payload);
+        };
+
+        let event_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some(data) = payload.get("data") else {
+            return self.parse_webhook_payload(payload);
+        };
+
+        if event_type != "new-message" {
+            return self.parse_webhook_payload(payload);
+        }
+
+        let audio_attachments = Self::extract_audio_attachments(data);
+        let Some(att) = audio_attachments.first() else {
+            return self.parse_webhook_payload(payload);
+        };
+
+        match self.download_and_transcribe(att, cfg).await {
+            Ok(Some(transcript)) => {
+                // Inject transcript as text; clear attachments so parse_webhook_payload
+                // skips the <media:audio> placeholder
+                let mut enriched = data.clone();
+                if let Some(obj) = enriched.as_object_mut() {
+                    let existing = obj
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let new_text = if existing.is_empty() {
+                        format!("[Voice] {transcript}")
+                    } else {
+                        format!("{existing}\n[Voice] {transcript}")
+                    };
+                    obj.insert("text".into(), serde_json::Value::String(new_text));
+                    obj.insert("attachments".into(), serde_json::Value::Array(vec![]));
+                }
+                let enriched_payload = serde_json::json!({"type": "new-message", "data": enriched});
+                self.parse_webhook_payload(&enriched_payload)
+            }
+            Ok(None) => self.parse_webhook_payload(payload),
+            Err(e) => {
+                tracing::warn!("BB audio transcription failed: {e}");
+                self.parse_webhook_payload(payload)
+            }
         }
     }
 
@@ -1503,5 +1680,23 @@ mod tests {
         let ch = make_open_channel(); // ignore_senders = []
         assert!(!ch.is_sender_ignored("+1234567890"));
         assert!(!ch.is_sender_ignored("anyone@example.com"));
+    }
+
+    #[test]
+    fn extract_audio_attachments_detects_caf() {
+        let data = serde_json::json!({
+            "attachments": [{"guid": "abc", "mimeType": "audio/caf", "transferName": "voice.caf"}]
+        });
+        let atts = BlueBubblesChannel::extract_audio_attachments(&data);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].transfer_name, "voice.caf");
+    }
+
+    #[test]
+    fn extract_audio_attachments_skips_non_audio() {
+        let data = serde_json::json!({
+            "attachments": [{"guid": "abc", "mimeType": "image/png", "transferName": "photo.png"}]
+        });
+        assert!(BlueBubblesChannel::extract_audio_attachments(&data).is_empty());
     }
 }
