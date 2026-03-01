@@ -1,0 +1,82 @@
+name: Build ZeroClaw for FriendlyWrt
+
+on:
+  push:
+    tags:
+      - 'v*'  # 当打标签时自动构建
+  workflow_dispatch: # 手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev libssh-dev pkg-config wget
+
+    - name: Install Rust (musl target)
+      run: |
+        curl https://sh.rustup.rs -sSf | sh -s -- -y
+        source $HOME/.cargo/env
+        rustup target add aarch64-unknown-linux-musl
+
+    - name: Download FriendlyWrt SDK
+      run: |
+        wget https://downloads.friendlywrt.com/sdk/friendlywrt-sdk-aarch64.tar.gz -O /tmp/sdk.tar.gz
+        tar -xf /tmp/sdk.tar.gz -C ${{ github.workspace }}
+        mv friendlywrt-sdk-* sdk
+
+    - name: Prepare package
+      run: |
+        mkdir -p sdk/package/zeroclaw
+        cp -r . sdk/package/zeroclaw/ # 将源码复制进去
+        # 编写 Makefile (这里是核心，需要自行编写)
+        cat <<'EOF' > sdk/package/zeroclaw/Makefile
+        include $(TOPDIR)/rules.mk
+        PKG_NAME:=zeroclaw
+        PKG_VERSION:=1.0
+        PKG_RELEASE:=1
+        PKG_LICENSE:=Apache-2.0
+        PKG_LICENSE_FILES:=LICENSE
+        PKG_SOURCE_URL:=https://github.com/zeroclaw-labs/zeroclaw.git
+        PKG_SOURCE_PROTO:=git
+        PKG_SOURCE_DATE:=2024-01-01
+        PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
+        PKG_SOURCE_VERSION:=master
+
+        include $(INCLUDE_DIR)/package.mk
+        define Package/zeroclaw
+          SECTION:=utils
+          CATEGORY:=Utilities
+          TITLE:=ZeroClaw AI Agent
+          DEPENDS:=+libstdcpp +libgcc
+        endef
+
+        define Package/zeroclaw/description
+          ZeroClaw 是一个轻量级 AI 代理框架，适用于资源受限的设备。
+        endef
+
+        define Build/Compile
+          $(MAKE) -C $(PKG_BUILD_DIR) install \
+            CARGO_TARGET=aarch64-unknown-linux-musl \
+            CARGO_FLAGS="--release"
+        endef
+
+        $(eval $(call BuildPackage,zeroclaw))
+        EOF
+
+    - name: Build package
+      working-directory: ${{ github.workspace }}/sdk
+      run: |
+        source $HOME/.cargo/env
+        make package/zeroclaw/compile V=s
+
+    - name: Upload ipk artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: zeroclaw-ipk
+        path: ${{ github.workspace }}/sdk/bin/packages/*/zeroclaw_*.ipk
