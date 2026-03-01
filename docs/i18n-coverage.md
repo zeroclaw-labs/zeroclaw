@@ -2,7 +2,7 @@
 
 This document defines the localization structure for ZeroClaw docs and tracks current coverage.
 
-Last refreshed: **February 24, 2026**.
+Last refreshed: **March 2, 2026**.
 
 Execution guide: [i18n-guide.md](i18n-guide.md)
 Gap backlog: [i18n-gap-backlog.md](i18n-gap-backlog.md)
@@ -75,7 +75,7 @@ Not all localized landing pages are full translations of `README.md`:
 
 Hub-style entry points provide quick-start orientation and language navigation but do not replicate the full English README content. This is an accurate status record, not a gap to be immediately resolved.
 
-For `zh-CN`, `ja`, `ru`, and `fr`, canonical `docs/i18n/<locale>/` hubs include full top-level parity coverage and maintain language navigation through canonical i18n paths.
+For `zh-CN`, `zh-TW`, `ja`, `ru`, and `fr`, canonical `docs/i18n/<locale>/` hubs include full top-level parity coverage and maintain language navigation through canonical i18n paths.
 
 ## Collection Index i18n
 

@@ -52,7 +52,7 @@ where
 
 ### 方案 3：記憶體監控
 
-追蹤堆積記憶體使用量，超過限制時終止程序。
+追蹤堆積記憶體使用量，超過限制時終止程式。
 
 ```rust
 use std::alloc::{GlobalAlloc, Layout, System};

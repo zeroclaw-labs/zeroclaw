@@ -14,7 +14,7 @@
 
 ## 持續整合整合
 
-工作流程 [`.github/workflows/ci-build-fast.yml`](../../.github/workflows/ci-build-fast.yml) 在標準建置旁平行執行加速 release 建置。它在 Rust 程式碼變更與工作流程變更時觸發，不阻擋合併，作為非阻擋檢查平行執行。
+工作流程 [`.github/workflows/ci-build-fast.yml`](../../../.github/workflows/ci-build-fast.yml) 在標準建置旁平行執行加速 release 建置。它在 Rust 程式碼變更與工作流程變更時觸發，不阻擋合併，作為非阻擋檢查平行執行。
 
 CI 使用彈性的雙路徑策略：
 - **快速路徑**：安裝 `cargo-slicer` 加上 `rustc-driver` 二進位檔，執行 MIR 精確的切片建置。

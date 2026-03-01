@@ -12,7 +12,7 @@ ZeroClaw 內建支援以下 Z.AI 別名與端點：
 | `zai` | `https://api.z.ai/api/coding/paas/v4` | 全球端點 |
 | `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` | 中國端點 |
 
-若需使用自訂基礎 URL，請參閱 `docs/custom-providers.md`。
+若需使用自訂基礎 URL，請參閱 [custom-providers.md](./custom-providers.md)。
 
 ## 設定
 
@@ -137,6 +137,6 @@ curl -s "https://api.z.ai/api/coding/paas/v4/models" \
 
 ## 相關文件
 
-- [ZeroClaw README](../README.md)
+- [ZeroClaw README](./README.md)
 - [自訂 Provider 端點](./custom-providers.md)
-- [貢獻指南](../CONTRIBUTING.md)
+- [貢獻指南](../../../CONTRIBUTING.md)

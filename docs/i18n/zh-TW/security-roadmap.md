@@ -3,7 +3,7 @@
 > ⚠️ **狀態：提案 / 規劃路線**
 >
 > 本文件描述提案中的方法，可能包含假設性的指令或設定。
-> 有關目前的執行期行為，請參閱 [config-reference.md](../../config-reference.md)、[operations-runbook.md](../../operations-runbook.md) 及 [troubleshooting.md](../../troubleshooting.md)。
+> 有關目前的執行期行為，請參閱 [config-reference.md](./config-reference.md)、[operations-runbook.md](./operations-runbook.md) 及 [troubleshooting.md](./troubleshooting.md)。
 
 ## 現況：堅實的基礎
 
@@ -155,7 +155,7 @@ zeroclaw security --check
 # → → Resource limits: 512MB mem, 50% CPU
 
 # 稽核日誌查詢
-zeroclaw audit --user @alice --since 24h
+zeroclaw audit --user @zeroclaw_user --since 24h
 zeroclaw audit --risk high --violations-only
 zeroclaw audit --verify-signatures
 

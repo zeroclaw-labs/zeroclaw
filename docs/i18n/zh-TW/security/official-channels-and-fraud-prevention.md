@@ -20,7 +20,7 @@ ZeroClaw 維護者不會透過私訊要求金錢或私人錢包/財務憑證。
 請使用以下來源驗證公告：
 
 - GitHub 儲存庫：`zeroclaw-labs/zeroclaw`
-- GitHub 安全政策與公告：[../../SECURITY.md](../../SECURITY.md)
+- GitHub 安全政策與公告：[SECURITY.md](../../../../SECURITY.md)
 
 在 GitHub 儲存庫確認之前，請將第三方連結與社群媒體貼文視為不可信。
 
@@ -40,5 +40,5 @@ ZeroClaw 維護者不會透過私訊要求金錢或私人錢包/財務憑證。
 
 若需進行漏洞揭露，請使用私密通報：
 
-- 安全政策：[../../SECURITY.md](../../SECURITY.md)
+- 安全政策：[SECURITY.md](../../../../SECURITY.md)
 - 私密通報範本：[private-vulnerability-report-template.md](private-vulnerability-report-template.md)
