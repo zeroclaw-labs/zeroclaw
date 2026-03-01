@@ -67,6 +67,9 @@ in [section 2](#32-protocol-stdin--stdout).
 | `wasmtime` CLI | Local testing (`zeroclaw skill test`) |
 | Language-specific toolchain | Building `.wasm` from source |
 
+> Note: Android/Termux builds currently run in stub mode for `wasm-tools`.
+> Build on Linux/macOS/Windows for full WASM runtime support.
+
 Install `wasmtime` CLI:
 
 ```bash

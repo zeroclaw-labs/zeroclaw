@@ -458,6 +458,7 @@ impl AnthropicProvider {
             tool_calls,
             usage,
             reasoning_content: None,
+            quota_metadata: None,
         }
     }
 
@@ -551,8 +552,14 @@ impl Provider for AnthropicProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
+        // Extract quota metadata from response headers before consuming body
+        let quota_extractor = super::quota_adapter::UniversalQuotaExtractor::new();
+        let quota_metadata = quota_extractor.extract("anthropic", response.headers(), None);
+
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+        let mut result = Self::parse_native_response(native_response);
+        result.quota_metadata = quota_metadata;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {

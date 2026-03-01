@@ -301,11 +301,11 @@ mod tests {
             name: "nonexistent".to_string(),
             command: "/usr/bin/this_binary_does_not_exist_zeroclaw_test".to_string(),
             args: vec![],
-            env: Default::default(),
+            env: std::collections::HashMap::default(),
             tool_timeout_secs: None,
             transport: McpTransport::Stdio,
             url: None,
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -320,11 +320,11 @@ mod tests {
             name: "bad".to_string(),
             command: "/usr/bin/does_not_exist_zc_test".to_string(),
             args: vec![],
-            env: Default::default(),
+            env: std::collections::HashMap::default(),
             tool_timeout_secs: None,
             transport: McpTransport::Stdio,
             url: None,
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await

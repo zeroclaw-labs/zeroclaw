@@ -275,11 +275,17 @@ async fn handle_non_streaming(
         .await
     {
         Ok(response_text) => {
+            let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
+            let safe_response = sanitize_openai_compat_response(
+                &response_text,
+                state.tools_registry_exec.as_ref(),
+                &leak_guard_cfg,
+            );
             let duration = started_at.elapsed();
             record_success(&state, &provider_label, &model, duration);
 
             #[allow(clippy::cast_possible_truncation)]
-            let completion_tokens = (response_text.len() / 4) as u32;
+            let completion_tokens = (safe_response.len() / 4) as u32;
             #[allow(clippy::cast_possible_truncation)]
             let prompt_tokens = messages.iter().map(|m| m.content.len() / 4).sum::<usize>() as u32;
 
@@ -292,7 +298,7 @@ async fn handle_non_streaming(
                     index: 0,
                     message: ChatCompletionsResponseMessage {
                         role: "assistant",
-                        content: response_text,
+                        content: safe_response,
                     },
                     finish_reason: "stop",
                 }],
@@ -338,6 +344,71 @@ fn handle_streaming(
 ) -> impl IntoResponse {
     let request_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = unix_timestamp();
+    let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
+
+    // Security-first behavior: when outbound leak guard is enabled, do not emit live
+    // unvetted deltas. Buffer full provider output, sanitize once, then send SSE.
+    if leak_guard_cfg.enabled {
+        let model_clone = model.clone();
+        let id = request_id.clone();
+        let tools_registry = state.tools_registry_exec.clone();
+        let leak_guard = leak_guard_cfg.clone();
+
+        let stream = futures_util::stream::once(async move {
+            match state
+                .provider
+                .chat_with_history(&messages, &model_clone, temperature)
+                .await
+            {
+                Ok(text) => {
+                    let safe_text = sanitize_openai_compat_response(
+                        &text,
+                        tools_registry.as_ref(),
+                        &leak_guard,
+                    );
+                    let duration = started_at.elapsed();
+                    record_success(&state, &provider_label, &model_clone, duration);
+
+                    let chunk = ChatCompletionsChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_clone,
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChunkDelta {
+                                role: Some("assistant"),
+                                content: Some(safe_text),
+                            },
+                            finish_reason: Some("stop"),
+                        }],
+                    };
+                    let json = serde_json::to_string(&chunk).unwrap_or_else(|_| "{}".to_string());
+                    let mut output = format!("data: {json}\n\n");
+                    output.push_str("data: [DONE]\n\n");
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(output))
+                }
+                Err(e) => {
+                    let duration = started_at.elapsed();
+                    let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+                    record_failure(&state, &provider_label, &model_clone, duration, &sanitized);
+
+                    let error_json = serde_json::json!({"error": sanitized});
+                    let output = format!("data: {error_json}\n\ndata: [DONE]\n\n");
+                    Ok(axum::body::Bytes::from(output))
+                }
+            }
+        });
+
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap()
+            .into_response();
+    }
 
     if !state.provider.supports_streaming() {
         // Provider doesn't support streaming — fall back to a single-chunk response
@@ -579,6 +650,27 @@ fn record_failure(
         });
 }
 
+fn sanitize_openai_compat_response(
+    response: &str,
+    tools: &[Box<dyn crate::tools::Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
+) -> String {
+    match crate::channels::sanitize_channel_response(response, tools, leak_guard) {
+        crate::channels::ChannelSanitizationResult::Sanitized(sanitized) => {
+            if sanitized.is_empty() && !response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                    .to_string()
+            } else {
+                sanitized
+            }
+        }
+        crate::channels::ChannelSanitizationResult::Blocked { .. } => {
+            "I blocked a draft response because it appeared to contain credential material. Please ask for a redacted summary."
+                .to_string()
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ══════════════════════════════════════════════════════════════════════════════
@@ -586,6 +678,7 @@ fn record_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
 
     #[test]
     fn chat_completions_request_deserializes_minimal() {
@@ -716,5 +809,50 @@ mod tests {
     #[test]
     fn body_size_limit_is_512kb() {
         assert_eq!(CHAT_COMPLETIONS_MAX_BODY_SIZE, 524_288);
+    }
+
+    #[test]
+    fn sanitize_openai_compat_response_redacts_detected_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let output = sanitize_openai_compat_response(
+            "Temporary key: AKIAABCDEFGHIJKLMNOP",
+            &tools,
+            &leak_guard,
+        );
+        assert!(!output.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(output.contains("[REDACTED_AWS_CREDENTIAL]"));
+    }
+
+    #[test]
+    fn sanitize_openai_compat_response_blocks_detected_credentials_when_configured() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig {
+            enabled: true,
+            action: crate::config::OutboundLeakGuardAction::Block,
+            sensitivity: 0.7,
+        };
+        let output = sanitize_openai_compat_response(
+            "Temporary key: AKIAABCDEFGHIJKLMNOP",
+            &tools,
+            &leak_guard,
+        );
+        assert!(output.contains("blocked a draft response"));
+    }
+
+    #[test]
+    fn sanitize_openai_compat_response_skips_scan_when_disabled() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig {
+            enabled: false,
+            action: crate::config::OutboundLeakGuardAction::Block,
+            sensitivity: 0.7,
+        };
+        let output = sanitize_openai_compat_response(
+            "Temporary key: AKIAABCDEFGHIJKLMNOP",
+            &tools,
+            &leak_guard,
+        );
+        assert!(output.contains("AKIAABCDEFGHIJKLMNOP"));
     }
 }

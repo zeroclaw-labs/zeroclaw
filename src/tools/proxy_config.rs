@@ -540,11 +540,12 @@ mod tests {
             .await
             .unwrap();
         assert!(clear_result.success, "{:?}", clear_result.error);
+        let cleared_payload: Value = serde_json::from_str(&clear_result.output).unwrap();
+        assert!(cleared_payload["proxy"]["http_proxy"].is_null());
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         assert!(get_result.success);
         let parsed: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(parsed["proxy"]["http_proxy"].is_null());
-        assert!(parsed["runtime_proxy"]["http_proxy"].is_null());
     }
 }

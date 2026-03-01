@@ -17,7 +17,8 @@ jobs:
         permissions:
             issues: write
             pull-requests: write
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
+        timeout-minutes: 10
         steps:
             - name: Mark stale issues and pull requests
               uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0

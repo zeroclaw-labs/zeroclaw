@@ -11,31 +11,40 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+pub const ROLE_SYSTEM: &str = "system";
+pub const ROLE_USER: &str = "user";
+pub const ROLE_ASSISTANT: &str = "assistant";
+pub const ROLE_TOOL: &str = "tool";
+
+pub fn is_user_or_assistant_role(role: &str) -> bool {
+    role == ROLE_USER || role == ROLE_ASSISTANT
+}
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: ROLE_SYSTEM.into(),
             content: content.into(),
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: "user".into(),
+            role: ROLE_USER.into(),
             content: content.into(),
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: ROLE_ASSISTANT.into(),
             content: content.into(),
         }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
-            role: "tool".into(),
+            role: ROLE_TOOL.into(),
             content: content.into(),
         }
     }
@@ -70,6 +79,9 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+    /// Quota metadata extracted from response headers (if available).
+    /// Populated by providers that support quota tracking.
+    pub quota_metadata: Option<super::quota_types::QuotaMetadata>,
 }
 
 impl ChatResponse {
@@ -363,6 +375,7 @@ pub trait Provider: Send + Sync {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
         }
@@ -375,6 +388,7 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         })
     }
 
@@ -410,6 +424,7 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         })
     }
 
@@ -539,6 +554,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -552,6 +568,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -574,6 +591,7 @@ mod tests {
                 output_tokens: Some(50),
             }),
             reasoning_content: None,
+            quota_metadata: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));

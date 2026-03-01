@@ -134,13 +134,11 @@ module.exports = async ({ github, context, core }) => {
 
   const isBlocking = blockingFindings.length > 0;
 
-  const ownerApprovalNote = workflowFilesChanged.length > 0
+  const workflowChangeNote = workflowFilesChanged.length > 0
     ? [
         "",
         "Workflow files changed in this PR:",
         ...workflowFilesChanged.map((name) => `- \`${name}\``),
-        "",
-        "Reminder: workflow changes require owner approval via `CI Required Gate`.",
       ].join("\n")
     : "";
 
@@ -174,7 +172,7 @@ module.exports = async ({ github, context, core }) => {
     "",
     "Detected advisory line issues (sample):",
     ...(advisoryDetails.length > 0 ? advisoryDetails : ["- none"]),
-    ownerApprovalNote,
+    workflowChangeNote,
   ].join("\n");
 
   if (existing) {

@@ -287,8 +287,8 @@ mod tests {
         let buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(buf);
 
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
 
         zip.start_file("word/document.xml", options).unwrap();
         zip.write_all(document_xml.as_bytes()).unwrap();
@@ -455,8 +455,8 @@ mod tests {
         use std::io::Write;
         let buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(buf);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         zip.start_file("word/document.xml", options).unwrap();
         zip.write_all(xml.as_bytes()).unwrap();
         let buf = zip.finish().unwrap();

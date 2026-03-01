@@ -10,30 +10,210 @@
 //! ```
 
 use super::AppState;
-use crate::agent::loop_::{
-    build_shell_policy_instructions, build_tool_instructions_from_specs, run_tool_call_loop,
-};
-use crate::approval::ApprovalManager;
+use crate::agent::loop_::{build_shell_policy_instructions, build_tool_instructions_from_specs};
+use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        RawQuery, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap},
     response::IntoResponse,
 };
+use uuid::Uuid;
 
 const EMPTY_WS_RESPONSE_FALLBACK: &str =
     "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
+const WS_HISTORY_MEMORY_KEY_PREFIX: &str = "gateway_ws_history";
+const MAX_WS_PERSISTED_TURNS: usize = 128;
+const MAX_WS_SESSION_ID_LEN: usize = 128;
 
-fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
-    let sanitized = crate::channels::sanitize_channel_response(response, tools);
-    if sanitized.is_empty() && !response.trim().is_empty() {
-        "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
-            .to_string()
-    } else {
-        sanitized
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WsQueryParams {
+    token: Option<String>,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct WsHistoryTurn {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+struct WsPersistedHistory {
+    version: u8,
+    messages: Vec<WsHistoryTurn>,
+}
+
+fn normalize_ws_session_id(candidate: Option<&str>) -> Option<String> {
+    let raw = candidate?.trim();
+    if raw.is_empty() || raw.len() > MAX_WS_SESSION_ID_LEN {
+        return None;
+    }
+
+    if raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Some(raw.to_string());
+    }
+
+    None
+}
+
+fn parse_ws_query_params(raw_query: Option<&str>) -> WsQueryParams {
+    let Some(query) = raw_query else {
+        return WsQueryParams::default();
+    };
+
+    let mut params = WsQueryParams::default();
+    for kv in query.split('&') {
+        let mut parts = kv.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        match key {
+            "token" if params.token.is_none() => {
+                params.token = Some(value.to_string());
+            }
+            "session_id" if params.session_id.is_none() => {
+                params.session_id = normalize_ws_session_id(Some(value));
+            }
+            _ => {}
+        }
+    }
+
+    params
+}
+
+fn ws_history_memory_key(session_id: &str) -> String {
+    format!("{WS_HISTORY_MEMORY_KEY_PREFIX}:{session_id}")
+}
+
+fn ws_history_turns_from_chat(history: &[ChatMessage]) -> Vec<WsHistoryTurn> {
+    let mut turns = history
+        .iter()
+        .filter_map(|msg| match msg.role.as_str() {
+            "user" | "assistant" => {
+                let content = msg.content.trim();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(WsHistoryTurn {
+                        role: msg.role.clone(),
+                        content: content.to_string(),
+                    })
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if turns.len() > MAX_WS_PERSISTED_TURNS {
+        let keep_from = turns.len().saturating_sub(MAX_WS_PERSISTED_TURNS);
+        turns.drain(0..keep_from);
+    }
+    turns
+}
+
+fn restore_chat_history(system_prompt: &str, turns: &[WsHistoryTurn]) -> Vec<ChatMessage> {
+    let mut history = vec![ChatMessage::system(system_prompt)];
+    for turn in turns {
+        match turn.role.as_str() {
+            "user" => history.push(ChatMessage::user(&turn.content)),
+            "assistant" => history.push(ChatMessage::assistant(&turn.content)),
+            _ => {}
+        }
+    }
+    history
+}
+
+async fn load_ws_history(
+    state: &AppState,
+    session_id: &str,
+    system_prompt: &str,
+) -> Vec<ChatMessage> {
+    let key = ws_history_memory_key(session_id);
+    let Some(entry) = state.mem.get(&key).await.ok().flatten() else {
+        return vec![ChatMessage::system(system_prompt)];
+    };
+
+    let parsed = serde_json::from_str::<WsPersistedHistory>(&entry.content)
+        .map(|history| history.messages)
+        .or_else(|_| serde_json::from_str::<Vec<WsHistoryTurn>>(&entry.content));
+
+    match parsed {
+        Ok(turns) => restore_chat_history(system_prompt, &turns),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to parse persisted websocket history for session {}: {}",
+                session_id,
+                err
+            );
+            vec![ChatMessage::system(system_prompt)]
+        }
+    }
+}
+
+async fn persist_ws_history(state: &AppState, session_id: &str, history: &[ChatMessage]) {
+    let payload = WsPersistedHistory {
+        version: 1,
+        messages: ws_history_turns_from_chat(history),
+    };
+    let serialized = match serde_json::to_string(&payload) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to serialize websocket history for session {}: {}",
+                session_id,
+                err
+            );
+            return;
+        }
+    };
+
+    let key = ws_history_memory_key(session_id);
+    if let Err(err) = state
+        .mem
+        .store(
+            &key,
+            &serialized,
+            MemoryCategory::Conversation,
+            Some(session_id),
+        )
+        .await
+    {
+        tracing::warn!(
+            "Failed to persist websocket history for session {}: {}",
+            session_id,
+            err
+        );
+    }
+}
+
+fn sanitize_ws_response(
+    response: &str,
+    tools: &[Box<dyn crate::tools::Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
+) -> String {
+    match crate::channels::sanitize_channel_response(response, tools, leak_guard) {
+        crate::channels::ChannelSanitizationResult::Sanitized(sanitized) => {
+            if sanitized.is_empty() && !response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                    .to_string()
+            } else {
+                sanitized
+            }
+        }
+        crate::channels::ChannelSanitizationResult::Blocked { .. } => {
+            "I blocked a draft response because it appeared to contain credential material. Please ask for a redacted summary."
+                .to_string()
+        }
     }
 }
 
@@ -97,8 +277,9 @@ fn finalize_ws_response(
     response: &str,
     history: &[ChatMessage],
     tools: &[Box<dyn crate::tools::Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
 ) -> String {
-    let sanitized = sanitize_ws_response(response, tools);
+    let sanitized = sanitize_ws_response(response, tools, leak_guard);
     if !sanitized.trim().is_empty() {
         return sanitized;
     }
@@ -156,27 +337,33 @@ fn build_ws_system_prompt(
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let query_params = parse_ws_query_params(query.as_deref());
     // Auth via Authorization header or websocket protocol token.
     if state.pairing.require_pairing() {
-        let token = extract_ws_bearer_token(&headers).unwrap_or_default();
+        let token =
+            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
         if !state.pairing.is_authenticated(&token) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token> or Sec-WebSocket-Protocol: bearer.<token>",
+                "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
             )
                 .into_response();
         }
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    let session_id = query_params
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    // Maintain conversation history for this WebSocket session
-    let mut history: Vec<ChatMessage> = Vec::new();
+async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: String) {
+    let ws_session_id = format!("ws_{}", Uuid::new_v4());
 
     // Build system prompt once for the session
     let system_prompt = {
@@ -189,13 +376,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         )
     };
 
-    // Add system message to history
-    history.push(ChatMessage::system(&system_prompt));
-
-    let approval_manager = {
-        let config_guard = state.config.lock();
-        ApprovalManager::from_config(&config_guard.autonomy)
-    };
+    // Restore persisted history (if any) and replay to the client before processing new input.
+    let mut history = load_ws_history(&state, &session_id, &system_prompt).await;
+    let persisted_turns = ws_history_turns_from_chat(&history);
+    let history_payload = serde_json::json!({
+        "type": "history",
+        "session_id": session_id.as_str(),
+        "messages": persisted_turns,
+    });
+    let _ = socket
+        .send(Message::Text(history_payload.to_string().into()))
+        .await;
 
     while let Some(msg) = socket.recv().await {
         let msg = match msg {
@@ -244,6 +435,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
         // Add user message to history
         history.push(ChatMessage::user(&content));
+        persist_ws_history(&state, &session_id, &history).await;
 
         // Get provider info
         let provider_label = state
@@ -261,12 +453,18 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         }));
 
         // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
-        match super::run_gateway_chat_with_tools(&state, &content).await {
+        match super::run_gateway_chat_with_tools(&state, &content, Some(&ws_session_id)).await {
             Ok(response) => {
-                let safe_response =
-                    finalize_ws_response(&response, &history, state.tools_registry_exec.as_ref());
+                let leak_guard_cfg = { state.config.lock().security.outbound_leak_guard.clone() };
+                let safe_response = finalize_ws_response(
+                    &response,
+                    &history,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 // Add assistant response to history
                 history.push(ChatMessage::assistant(&safe_response));
+                persist_ws_history(&state, &session_id, &history).await;
 
                 // Send the full response as a done message
                 let done = serde_json::json!({
@@ -301,7 +499,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
-fn extract_ws_bearer_token(headers: &HeaderMap) -> Option<String> {
+fn extract_ws_bearer_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<String> {
     if let Some(auth_header) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -314,19 +512,27 @@ fn extract_ws_bearer_token(headers: &HeaderMap) -> Option<String> {
         }
     }
 
-    let offered = headers
+    if let Some(offered) = headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|value| value.to_str().ok())?;
-
-    for protocol in offered.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(token) = protocol.strip_prefix("bearer.") {
-            if !token.trim().is_empty() {
-                return Some(token.trim().to_string());
+        .and_then(|value| value.to_str().ok())
+    {
+        for protocol in offered.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(token) = protocol.strip_prefix("bearer.") {
+                if !token.trim().is_empty() {
+                    return Some(token.trim().to_string());
+                }
             }
         }
     }
 
-    None
+    query_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_query_token(raw_query: Option<&str>) -> Option<String> {
+    parse_ws_query_params(raw_query).token
 }
 
 #[cfg(test)]
@@ -349,7 +555,7 @@ mod tests {
         );
 
         assert_eq!(
-            extract_ws_bearer_token(&headers).as_deref(),
+            extract_ws_bearer_token(&headers, None).as_deref(),
             Some("from-auth-header")
         );
     }
@@ -363,7 +569,7 @@ mod tests {
         );
 
         assert_eq!(
-            extract_ws_bearer_token(&headers).as_deref(),
+            extract_ws_bearer_token(&headers, None).as_deref(),
             Some("protocol-token")
         );
     }
@@ -380,7 +586,103 @@ mod tests {
             HeaderValue::from_static("zeroclaw.v1, bearer."),
         );
 
-        assert!(extract_ws_bearer_token(&headers).is_none());
+        assert!(extract_ws_bearer_token(&headers, None).is_none());
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_reads_query_token_fallback() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_ws_bearer_token(&headers, Some("query-token")).as_deref(),
+            Some("query-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_prefers_protocol_over_query_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer.protocol-token"),
+        );
+
+        assert_eq!(
+            extract_ws_bearer_token(&headers, Some("query-token")).as_deref(),
+            Some("protocol-token")
+        );
+    }
+
+    #[test]
+    fn extract_query_token_reads_token_param() {
+        assert_eq!(
+            extract_query_token(Some("foo=1&token=query-token&bar=2")).as_deref(),
+            Some("query-token")
+        );
+        assert!(extract_query_token(Some("foo=1")).is_none());
+    }
+
+    #[test]
+    fn parse_ws_query_params_reads_token_and_session_id() {
+        let parsed = parse_ws_query_params(Some("foo=1&session_id=sess_123&token=query-token"));
+        assert_eq!(parsed.token.as_deref(), Some("query-token"));
+        assert_eq!(parsed.session_id.as_deref(), Some("sess_123"));
+    }
+
+    #[test]
+    fn parse_ws_query_params_rejects_invalid_session_id() {
+        let parsed = parse_ws_query_params(Some("session_id=../../etc/passwd"));
+        assert!(parsed.session_id.is_none());
+    }
+
+    #[test]
+    fn ws_history_turns_from_chat_skips_system_and_non_dialog_turns() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(" hello "),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ignored".to_string(),
+            },
+            ChatMessage::assistant(" world "),
+        ];
+
+        let turns = ws_history_turns_from_chat(&history);
+        assert_eq!(
+            turns,
+            vec![
+                WsHistoryTurn {
+                    role: "user".to_string(),
+                    content: "hello".to_string()
+                },
+                WsHistoryTurn {
+                    role: "assistant".to_string(),
+                    content: "world".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_chat_history_applies_system_prompt_once() {
+        let turns = vec![
+            WsHistoryTurn {
+                role: "user".to_string(),
+                content: "u1".to_string(),
+            },
+            WsHistoryTurn {
+                role: "assistant".to_string(),
+                content: "a1".to_string(),
+            },
+        ];
+
+        let restored = restore_chat_history("sys", &turns);
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[0].content, "sys");
+        assert_eq!(restored[1].role, "user");
+        assert_eq!(restored[1].content, "u1");
+        assert_eq!(restored[2].role, "assistant");
+        assert_eq!(restored[2].content, "a1");
     }
 
     struct MockScheduleTool;
@@ -421,7 +723,8 @@ mod tests {
 </tool_call>
 After"#;
 
-        let result = sanitize_ws_response(input, &[]);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_ws_response(input, &[], &leak_guard);
         let normalized = result
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -439,10 +742,25 @@ After"#;
 {"result":{"status":"scheduled"}}
 Reminder set successfully."#;
 
-        let result = sanitize_ws_response(input, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_ws_response(input, &tools, &leak_guard);
         assert_eq!(result, "Reminder set successfully.");
         assert!(!result.contains("\"name\":\"schedule\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_ws_response_blocks_detected_credentials_when_configured() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig {
+            enabled: true,
+            action: crate::config::OutboundLeakGuardAction::Block,
+            sensitivity: 0.7,
+        };
+
+        let result =
+            sanitize_ws_response("Temporary key: AKIAABCDEFGHIJKLMNOP", &tools, &leak_guard);
+        assert!(result.contains("blocked a draft response"));
     }
 
     #[test]
@@ -479,7 +797,8 @@ Reminder set successfully."#;
             ),
         ];
 
-        let result = finalize_ws_response("", &history, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert!(result.contains("Latest tool output:"));
         assert!(result.contains("Disk usage: 72%"));
         assert!(!result.contains("<tool_result"));
@@ -494,7 +813,8 @@ Reminder set successfully."#;
                 .to_string(),
         }];
 
-        let result = finalize_ws_response("", &history, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert!(result.contains("Latest tool output:"));
         assert!(result.contains("/dev/disk3s1"));
     }
@@ -504,7 +824,8 @@ Reminder set successfully."#;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
         let history = vec![ChatMessage::system("sys")];
 
-        let result = finalize_ws_response("", &history, &tools);
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
     }
 }

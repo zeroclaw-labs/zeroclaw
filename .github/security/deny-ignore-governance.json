@@ -21,6 +21,13 @@
       "reason": "Transitive via matrix-sdk indexeddb dependency chain in current matrix release line; track removal when upstream drops derivative.",
       "ticket": "RMN-21",
       "expires_on": "2026-12-31"
+    },
+    {
+      "id": "RUSTSEC-2024-0436",
+      "owner": "repo-maintainers",
+      "reason": "Transitive via wasmtime dependency stack; tracked until upstream removes or replaces paste.",
+      "ticket": "RMN-21",
+      "expires_on": "2026-12-31"
     }
   ]
 }

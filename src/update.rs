@@ -5,6 +5,7 @@
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,6 +25,13 @@ struct Release {
 struct Asset {
     name: String,
     browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMethod {
+    Homebrew,
+    CargoOrLocal,
+    Unknown,
 }
 
 /// Get the current version of the binary
@@ -213,6 +221,79 @@ fn get_current_exe() -> Result<PathBuf> {
     env::current_exe().context("Failed to get current executable path")
 }
 
+fn detect_install_method_for_path(resolved_path: &Path, home_dir: Option<&Path>) -> InstallMethod {
+    let lower = resolved_path.to_string_lossy().to_ascii_lowercase();
+    if lower.contains("/cellar/zeroclaw/") || lower.contains("/homebrew/cellar/zeroclaw/") {
+        return InstallMethod::Homebrew;
+    }
+
+    if let Some(home) = home_dir {
+        if resolved_path.starts_with(home.join(".cargo").join("bin"))
+            || resolved_path.starts_with(home.join(".local").join("bin"))
+        {
+            return InstallMethod::CargoOrLocal;
+        }
+    }
+
+    InstallMethod::Unknown
+}
+
+fn detect_install_method(current_exe: &Path) -> InstallMethod {
+    let resolved = fs::canonicalize(current_exe).unwrap_or_else(|_| current_exe.to_path_buf());
+    let home_dir = env::var_os("HOME").map(PathBuf::from);
+    detect_install_method_for_path(&resolved, home_dir.as_deref())
+}
+
+/// Print human-friendly update instructions based on detected install method.
+pub fn print_update_instructions() -> Result<()> {
+    let current_exe = get_current_exe()?;
+    let install_method = detect_install_method(&current_exe);
+
+    println!("ZeroClaw update guide");
+    println!("Detected binary: {}", current_exe.display());
+    println!();
+    println!("1) Check if a new release exists:");
+    println!("   zeroclaw update --check");
+    println!();
+
+    match install_method {
+        InstallMethod::Homebrew => {
+            println!("Detected install method: Homebrew");
+            println!("Recommended update commands:");
+            println!("  brew update");
+            println!("  brew upgrade zeroclaw");
+            println!("  zeroclaw --version");
+            println!();
+            println!(
+                "Tip: avoid `zeroclaw update` on Homebrew installs unless you intentionally want to override the managed binary."
+            );
+        }
+        InstallMethod::CargoOrLocal => {
+            println!("Detected install method: local binary (~/.cargo/bin or ~/.local/bin)");
+            println!("Recommended update command:");
+            println!("  zeroclaw update");
+            println!("Optional force reinstall:");
+            println!("  zeroclaw update --force");
+            println!("Verify:");
+            println!("  zeroclaw --version");
+        }
+        InstallMethod::Unknown => {
+            println!("Detected install method: unknown");
+            println!("Try the built-in updater first:");
+            println!("  zeroclaw update");
+            println!(
+                "If your package manager owns the binary, use that manager's upgrade command."
+            );
+            println!("Verify:");
+            println!("  zeroclaw --version");
+        }
+    }
+
+    println!();
+    println!("Release source: https://github.com/{GITHUB_REPO}/releases/latest");
+    Ok(())
+}
+
 /// Replace the current binary with the new one
 fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     // On Windows, we can't replace a running executable directly
@@ -226,11 +307,43 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
         let _ = fs::remove_file(&old_path);
     }
 
-    // On Unix, we can overwrite the running executable
+    // On Unix, stage the binary in the destination directory first.
+    // This avoids cross-filesystem rename failures (EXDEV) from temp dirs.
     #[cfg(unix)]
     {
-        // Use rename for atomic replacement on Unix
-        fs::rename(new_binary, current_exe).context("Failed to replace binary")?;
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = current_exe
+            .parent()
+            .context("Current executable has no parent directory")?;
+        let binary_name = current_exe
+            .file_name()
+            .context("Current executable path is missing a file name")?
+            .to_string_lossy()
+            .into_owned();
+        let staged_path = parent.join(format!(".{binary_name}.new"));
+        let backup_path = parent.join(format!(".{binary_name}.bak"));
+
+        fs::copy(new_binary, &staged_path).context("Failed to stage updated binary")?;
+        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755))
+            .context("Failed to set permissions on staged binary")?;
+
+        if let Err(err) = fs::remove_file(&backup_path) {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(err).context("Failed to remove stale backup binary");
+            }
+        }
+
+        fs::rename(current_exe, &backup_path).context("Failed to backup current binary")?;
+
+        if let Err(err) = fs::rename(&staged_path, current_exe) {
+            let _ = fs::rename(&backup_path, current_exe);
+            let _ = fs::remove_file(&staged_path);
+            return Err(err).context("Failed to activate updated binary");
+        }
+
+        // Best-effort cleanup of backup.
+        let _ = fs::remove_file(&backup_path);
     }
 
     Ok(())
@@ -258,6 +371,7 @@ pub async fn self_update(force: bool, check_only: bool) -> Result<()> {
     println!();
 
     let current_exe = get_current_exe()?;
+    let install_method = detect_install_method(&current_exe);
     println!("Current binary: {}", current_exe.display());
     println!("Current version: v{}", current_version());
     println!();
@@ -268,21 +382,35 @@ pub async fn self_update(force: bool, check_only: bool) -> Result<()> {
 
     println!("Latest version:  {}", release.tag_name);
 
+    if check_only {
+        println!();
+        if latest_version == current_version() {
+            println!("✅ Already up to date.");
+        } else {
+            println!(
+                "Update available: {} -> {}",
+                current_version(),
+                latest_version
+            );
+            println!("Run `zeroclaw update` to install the update.");
+        }
+        return Ok(());
+    }
+
+    if install_method == InstallMethod::Homebrew && !force {
+        println!();
+        println!("Detected a Homebrew-managed installation.");
+        println!("Use `brew upgrade zeroclaw` for the safest update path.");
+        println!(
+            "Run `zeroclaw update --force` only if you intentionally want to override Homebrew."
+        );
+        return Ok(());
+    }
+
     // Check if update is needed
     if latest_version == current_version() && !force {
         println!();
         println!("✅ Already up to date!");
-        return Ok(());
-    }
-
-    if check_only {
-        println!();
-        println!(
-            "Update available: {} -> {}",
-            current_version(),
-            latest_version
-        );
-        println!("Run `zeroclaw update` to install the update.");
         return Ok(());
     }
 
@@ -314,4 +442,51 @@ pub async fn self_update(force: bool, check_only: bool) -> Result<()> {
     println!("Restart ZeroClaw to use the new version.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_name_uses_zip_for_windows_and_targz_elsewhere() {
+        assert_eq!(
+            get_archive_name("x86_64-pc-windows-msvc"),
+            "zeroclaw-x86_64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            get_archive_name("x86_64-unknown-linux-gnu"),
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
+    #[test]
+    fn detect_install_method_identifies_homebrew_paths() {
+        let path = Path::new("/opt/homebrew/Cellar/zeroclaw/0.1.7/bin/zeroclaw");
+        let method = detect_install_method_for_path(path, None);
+        assert_eq!(method, InstallMethod::Homebrew);
+    }
+
+    #[test]
+    fn detect_install_method_identifies_local_bin_paths() {
+        let home = Path::new("/Users/example");
+        let cargo_path = Path::new("/Users/example/.cargo/bin/zeroclaw");
+        let local_path = Path::new("/Users/example/.local/bin/zeroclaw");
+
+        assert_eq!(
+            detect_install_method_for_path(cargo_path, Some(home)),
+            InstallMethod::CargoOrLocal
+        );
+        assert_eq!(
+            detect_install_method_for_path(local_path, Some(home)),
+            InstallMethod::CargoOrLocal
+        );
+    }
+
+    #[test]
+    fn detect_install_method_returns_unknown_for_other_paths() {
+        let path = Path::new("/usr/bin/zeroclaw");
+        let method = detect_install_method_for_path(path, Some(Path::new("/Users/example")));
+        assert_eq!(method, InstallMethod::Unknown);
+    }
 }

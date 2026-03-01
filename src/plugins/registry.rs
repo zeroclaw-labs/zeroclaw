@@ -2,10 +2,12 @@
 //!
 //! Mirrors OpenClaw's `PluginRegistry` / `createPluginRegistry()`.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::hooks::HookHandler;
 use crate::tools::traits::Tool;
 
-use super::manifest::PluginManifest;
+use super::manifest::{PluginManifest, PluginToolManifest};
 
 /// Status of a loaded plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +32,7 @@ pub enum PluginOrigin {
 }
 
 /// Record for a single loaded plugin.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PluginRecord {
     pub id: String,
     pub name: Option<String>,
@@ -77,6 +79,9 @@ pub struct PluginRegistry {
     pub tools: Vec<PluginToolRegistration>,
     pub hooks: Vec<PluginHookRegistration>,
     pub diagnostics: Vec<PluginDiagnostic>,
+    manifests: HashMap<String, PluginManifest>,
+    manifest_tools: Vec<PluginToolManifest>,
+    manifest_providers: HashSet<String>,
 }
 
 impl PluginRegistry {
@@ -86,6 +91,9 @@ impl PluginRegistry {
             tools: Vec::new(),
             hooks: Vec::new(),
             diagnostics: Vec::new(),
+            manifests: HashMap::new(),
+            manifest_tools: Vec::new(),
+            manifest_providers: HashSet::new(),
         }
     }
 
@@ -101,11 +109,94 @@ impl PluginRegistry {
     pub fn push_diagnostic(&mut self, diag: PluginDiagnostic) {
         self.diagnostics.push(diag);
     }
+
+    /// Register a manifest for lightweight runtime routing lookups.
+    pub fn register(&mut self, manifest: PluginManifest) {
+        self.manifests.insert(manifest.id.clone(), manifest);
+        self.rebuild_indexes();
+    }
+
+    /// Backward-compat alias retained for rebase compatibility.
+    pub fn hooks(&self) -> Vec<&PluginManifest> {
+        self.all_manifests()
+    }
+
+    pub fn all_manifests(&self) -> Vec<&PluginManifest> {
+        self.manifests.values().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.manifests.len()
+    }
+
+    pub fn tools(&self) -> &[PluginToolManifest] {
+        &self.manifest_tools
+    }
+
+    pub fn has_provider(&self, name: &str) -> bool {
+        self.manifest_providers.contains(name)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.manifest_tools.clear();
+        self.manifest_providers.clear();
+
+        for manifest in self.manifests.values() {
+            self.manifest_tools.extend(manifest.tools.iter().cloned());
+            for provider in &manifest.providers {
+                self.manifest_providers.insert(provider.trim().to_string());
+            }
+        }
+    }
+}
+
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for PluginRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            plugins: self.plugins.clone(),
+            // Dynamic tool/hook handlers are not cloneable. Runtime registry clones only
+            // need manifest-derived indexes for routing checks.
+            tools: Vec::new(),
+            hooks: Vec::new(),
+            diagnostics: self.diagnostics.clone(),
+            manifests: self.manifests.clone(),
+            manifest_tools: self.manifest_tools.clone(),
+            manifest_providers: self.manifest_providers.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_with(id: &str, tool_name: &str, provider: &str) -> PluginManifest {
+        PluginManifest {
+            id: id.to_string(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".to_string()),
+            config_schema: None,
+            capabilities: Vec::new(),
+            module_path: "plugins/demo.wasm".to_string(),
+            wit_packages: vec!["zeroclaw:tools@1.0.0".to_string()],
+            tools: vec![PluginToolManifest {
+                name: tool_name.to_string(),
+                description: format!("{tool_name} description"),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            }],
+            providers: vec![provider.to_string()],
+        }
+    }
 
     #[test]
     fn empty_registry() {
@@ -113,7 +204,11 @@ mod tests {
         assert_eq!(reg.active_count(), 0);
         assert!(reg.plugins.is_empty());
         assert!(reg.tools.is_empty());
+        assert!(reg.tools().is_empty());
         assert!(reg.hooks.is_empty());
+        assert!(reg.hooks().is_empty());
+        assert!(reg.all_manifests().is_empty());
+        assert!(!reg.has_provider("demo"));
         assert!(reg.diagnostics.is_empty());
     }
 
@@ -148,5 +243,26 @@ mod tests {
             status: PluginStatus::Error("boom".into()),
         });
         assert_eq!(reg.active_count(), 1);
+    }
+
+    #[test]
+    fn manifest_indexes_replace_on_reregister() {
+        let mut reg = PluginRegistry::default();
+        reg.register(manifest_with(
+            "demo",
+            "tool_v1",
+            "provider_v1_for_replace_test",
+        ));
+        reg.register(manifest_with(
+            "demo",
+            "tool_v2",
+            "provider_v2_for_replace_test",
+        ));
+
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.tools().len(), 1);
+        assert_eq!(reg.tools()[0].name, "tool_v2");
+        assert!(reg.has_provider("provider_v2_for_replace_test"));
+        assert!(!reg.has_provider("provider_v1_for_replace_test"));
     }
 }

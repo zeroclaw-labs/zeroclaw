@@ -1,4 +1,6 @@
 /target
+/target_ci
+/target_review*
 firmware/*/target
 *.db
 *.db-journal
@@ -12,6 +14,7 @@ site/node_modules/
 site/.vite/
 site/public/docs-content/
 gh-pages/
+
 .idea
 
 # Environment files (may contain secrets)
@@ -30,9 +33,11 @@ venv/
 
 # Secret keys and credentials
 .secret_key
+otp-secret
 *.key
 *.pem
 credentials.json
+/config.toml
 .worktrees/
 
 # Nix

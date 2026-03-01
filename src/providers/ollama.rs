@@ -649,6 +649,7 @@ impl Provider for OllamaProvider {
                 tool_calls,
                 usage,
                 reasoning_content: None,
+                quota_metadata: None,
             });
         }
 
@@ -667,6 +668,7 @@ impl Provider for OllamaProvider {
             tool_calls: vec![],
             usage,
             reasoning_content: None,
+            quota_metadata: None,
         })
     }
 
@@ -714,6 +716,7 @@ impl Provider for OllamaProvider {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         })
     }
 }

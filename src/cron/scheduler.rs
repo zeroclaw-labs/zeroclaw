@@ -1,8 +1,10 @@
 #[cfg(feature = "channel-lark")]
 use crate::channels::LarkChannel;
+#[cfg(feature = "channel-matrix")]
+use crate::channels::MatrixChannel;
 use crate::channels::{
-    Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
-    TelegramChannel, WhatsAppChannel,
+    Channel, DingTalkChannel, DiscordChannel, EmailChannel, MattermostChannel, NapcatChannel,
+    QQChannel, SendMessage, SlackChannel, TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -57,7 +59,7 @@ pub async fn run(config: Config) -> Result<()> {
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    execute_job_with_retry(config, &security, job).await
+    Box::pin(execute_job_with_retry(config, &security, job)).await
 }
 
 async fn execute_job_with_retry(
@@ -72,7 +74,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, security, job).await,
+            JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
 
@@ -105,18 +107,21 @@ async fn process_due_jobs(
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight =
-        stream::iter(
-            jobs.into_iter().map(|job| {
-                let config = config.clone();
-                let security = Arc::clone(security);
-                let component = component.to_owned();
-                async move {
-                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
-                }
-            }),
-        )
-        .buffer_unordered(max_concurrent);
+    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
+        let config = config.clone();
+        let security = Arc::clone(security);
+        let component = component.to_owned();
+        async move {
+            Box::pin(execute_and_persist_job(
+                &config,
+                security.as_ref(),
+                &job,
+                &component,
+            ))
+            .await
+        }
+    }))
+    .buffer_unordered(max_concurrent);
 
     while let Some((job_id, success, output)) = in_flight.next().await {
         if !success {
@@ -135,7 +140,7 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = execute_job_with_retry(config, security, job).await;
+    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
@@ -174,7 +179,7 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
+            Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
@@ -182,7 +187,8 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
-            )
+                None,
+            ))
             .await
         }
     };
@@ -331,6 +337,7 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
+                tg.ack_enabled,
             )
             .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
@@ -361,6 +368,7 @@ pub(crate) async fn deliver_announcement(
                 sl.bot_token.clone(),
                 sl.app_token.clone(),
                 sl.channel_id.clone(),
+                sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
@@ -381,6 +389,19 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        "dingtalk" => {
+            let dt = config
+                .channels_config
+                .dingtalk
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("dingtalk channel not configured"))?;
+            let channel = DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                dt.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
         "qq" => {
             let qq = config
                 .channels_config
@@ -393,6 +414,15 @@ pub(crate) async fn deliver_announcement(
                 qq.allowed_users.clone(),
                 qq.environment.clone(),
             );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "napcat" => {
+            let napcat_cfg = config
+                .channels_config
+                .napcat
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("napcat channel not configured"))?;
+            let channel = NapcatChannel::from_config(napcat_cfg.clone())?;
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "whatsapp_web" | "whatsapp" => {
@@ -460,6 +490,30 @@ pub(crate) async fn deliver_announcement(
                 .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
             let channel = EmailChannel::new(email.clone());
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "matrix" => {
+            #[cfg(feature = "channel-matrix")]
+            {
+                // NOTE: uses the basic constructor without session hints (user_id/device_id).
+                // Plain (non-E2EE) Matrix rooms work fine. Encrypted-room delivery is not
+                // supported in cron mode; use start_channels for full E2EE listener sessions.
+                let mx = config
+                    .channels_config
+                    .matrix
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+                let channel = MatrixChannel::new(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-matrix"))]
+            {
+                anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

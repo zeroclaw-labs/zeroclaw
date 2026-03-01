@@ -61,7 +61,8 @@ fn char_class_perplexity(prefix: &str, suffix: &str) -> f64 {
         let class = classify_char(ch);
         if let Some(p) = suffix_prev {
             let numerator = f64::from(transition[p][class] + 1);
-            let denominator = f64::from(row_totals[p] + CLASS_COUNT as u32);
+            let class_count_u32 = u32::try_from(CLASS_COUNT).unwrap_or(u32::MAX);
+            let denominator = f64::from(row_totals[p] + class_count_u32);
             nll += -(numerator / denominator).ln();
             pairs += 1;
         }

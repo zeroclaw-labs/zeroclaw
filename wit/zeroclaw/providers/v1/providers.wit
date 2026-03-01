@@ -1,0 +1,27 @@
+package zeroclaw:providers@1.0.0;
+
+interface providers {
+  record provider-info {
+    name: string,
+  }
+
+  record chat-request {
+    model: string,
+    temperature: float64,
+    messages-json: string,
+    tools-json: option<string>,
+  }
+
+  record chat-response {
+    text: option<string>,
+    tool-calls-json: string,
+    usage-json: option<string>,
+  }
+
+  provider-info: func() -> provider-info;
+  chat: func(request: chat-request) -> chat-response;
+}
+
+world plugin-providers {
+  export providers;
+}
