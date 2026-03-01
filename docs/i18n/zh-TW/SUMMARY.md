@@ -9,6 +9,12 @@
 - 繁中 i18n Hub：[README.md](README.md)
 - 繁中相容 Hub：[docs/i18n/zh-TW/README.md](README.md)
 - 繁中相容 SUMMARY：[../../SUMMARY.zh-TW.md](../../SUMMARY.zh-TW.md)
+- 简中 i18n Hub：[../zh-CN/README.md](../zh-CN/README.md)
+- 日文 i18n Hub：[../ja/README.md](../ja/README.md)
+- 俄文 i18n Hub：[../ru/README.md](../ru/README.md)
+- 法文 i18n Hub：[../fr/README.md](../fr/README.md)
+- 越南文 i18n Hub：[../vi/README.md](../vi/README.md)
+- 希臘文 i18n Hub：[../el/README.md](../el/README.md)
 - i18n 索引：[../README.md](../README.md)
 - i18n 覆寫圖：[../../i18n-coverage.md](../../i18n-coverage.md)
 
