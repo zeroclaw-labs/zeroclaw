@@ -3946,6 +3946,64 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["planned_actions"], [])
         self.assertEqual(report["policies"]["non_pr_key"], "sha")
 
+    def test_queue_hygiene_apply_requires_authentication_token(self) -> None:
+        runs_json = self.tmp / "runs-apply-auth.json"
+        output_json = self.tmp / "queue-hygiene-apply-auth.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 401,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-401",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 402,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "main",
+                            "head_sha": "sha-402",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        isolated_home = self.tmp / "isolated-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        isolated_xdg = self.tmp / "isolated-xdg"
+        isolated_xdg.mkdir(parents=True, exist_ok=True)
+
+        env = dict(os.environ)
+        env["GH_TOKEN"] = ""
+        env["GITHUB_TOKEN"] = ""
+        env["HOME"] = str(isolated_home)
+        env["XDG_CONFIG_HOME"] = str(isolated_xdg)
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--dedupe-workflow",
+                "CI Run",
+                "--apply",
+                "--output-json",
+                str(output_json),
+            ],
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("requires authentication token", proc.stderr.lower())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

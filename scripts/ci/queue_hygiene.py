@@ -321,6 +321,13 @@ def main() -> int:
 
     owner, repo = split_repo(args.repo)
     token = resolve_token(args.token)
+    if args.apply and not token:
+        print(
+            "queue_hygiene: apply mode requires authentication token "
+            "(set GH_TOKEN/GITHUB_TOKEN, pass --token, or configure gh auth).",
+            file=sys.stderr,
+        )
+        return 2
     api = GitHubApi(args.api_url, token)
 
     if args.runs_json:
