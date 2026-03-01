@@ -1026,6 +1026,11 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Optional allowlist of canonical directory roots for workspace skill symlink targets.
+    /// Symlinked workspace skills are rejected unless their resolved targets are under one
+    /// of these roots. Accepts absolute paths and `~/` home-relative paths.
+    #[serde(default)]
+    pub trusted_skill_roots: Vec<String>,
     /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).
     /// Default: `false` (secure by default).
     #[serde(default)]

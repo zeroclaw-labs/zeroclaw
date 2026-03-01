@@ -80,7 +80,7 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -90,6 +90,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
+        Some(&config.skills.trusted_skill_roots),
     )
 }
 
@@ -98,9 +99,12 @@ fn load_skills_with_open_skills_config(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
     config_allow_scripts: Option<bool>,
+    config_trusted_skill_roots: Option<&[String]>,
 ) -> Vec<Skill> {
     let mut skills = Vec::new();
     let allow_scripts = config_allow_scripts.unwrap_or(false);
+    let trusted_skill_roots =
+        resolve_trusted_skill_roots(workspace_dir, config_trusted_skill_roots.unwrap_or(&[]));
 
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
@@ -108,16 +112,113 @@ fn load_skills_with_open_skills_config(
         skills.extend(load_open_skills(&open_skills_dir, allow_scripts));
     }
 
-    skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
+    skills.extend(load_workspace_skills(
+        workspace_dir,
+        allow_scripts,
+        &trusted_skill_roots,
+    ));
     skills
 }
 
-fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_workspace_skills(
+    workspace_dir: &Path,
+    allow_scripts: bool,
+    trusted_skill_roots: &[PathBuf],
+) -> Vec<Skill> {
     let skills_dir = workspace_dir.join("skills");
-    load_skills_from_directory(&skills_dir, allow_scripts)
+    load_skills_from_directory(&skills_dir, allow_scripts, trusted_skill_roots)
 }
 
-fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn resolve_trusted_skill_roots(workspace_dir: &Path, raw_roots: &[String]) -> Vec<PathBuf> {
+    let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    let mut resolved = Vec::new();
+
+    for raw in raw_roots {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let expanded = if trimmed == "~" {
+            home_dir.clone().unwrap_or_else(|| PathBuf::from(trimmed))
+        } else if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
+            home_dir
+                .as_ref()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(trimmed))
+        } else {
+            PathBuf::from(trimmed)
+        };
+
+        let candidate = if expanded.is_relative() {
+            workspace_dir.join(expanded)
+        } else {
+            expanded
+        };
+
+        match candidate.canonicalize() {
+            Ok(canonical) if canonical.is_dir() => resolved.push(canonical),
+            Ok(canonical) => tracing::warn!(
+                "ignoring [skills].trusted_skill_roots entry '{}': canonical path is not a directory ({})",
+                trimmed,
+                canonical.display()
+            ),
+            Err(err) => tracing::warn!(
+                "ignoring [skills].trusted_skill_roots entry '{}': failed to canonicalize {} ({err})",
+                trimmed,
+                candidate.display()
+            ),
+        }
+    }
+
+    resolved.sort();
+    resolved.dedup();
+    resolved
+}
+
+fn enforce_workspace_skill_symlink_trust(
+    path: &Path,
+    trusted_skill_roots: &[PathBuf],
+) -> Result<()> {
+    let canonical_target = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve skill symlink target {}", path.display()))?;
+
+    if !canonical_target.is_dir() {
+        anyhow::bail!(
+            "symlink target is not a directory: {}",
+            canonical_target.display()
+        );
+    }
+
+    if trusted_skill_roots
+        .iter()
+        .any(|root| canonical_target.starts_with(root))
+    {
+        return Ok(());
+    }
+
+    if trusted_skill_roots.is_empty() {
+        anyhow::bail!(
+            "symlink target {} is not allowed because [skills].trusted_skill_roots is empty",
+            canonical_target.display()
+        );
+    }
+
+    anyhow::bail!(
+        "symlink target {} is outside configured [skills].trusted_skill_roots",
+        canonical_target.display()
+    );
+}
+
+fn load_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+    trusted_skill_roots: &[PathBuf],
+) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -130,7 +231,26 @@ fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Ski
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                tracing::warn!(
+                    "skipping skill entry {}: failed to read metadata ({err})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            if let Err(err) = enforce_workspace_skill_symlink_trust(&path, trusted_skill_roots) {
+                tracing::warn!(
+                    "skipping untrusted symlinked skill entry {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        } else if !metadata.is_dir() {
             continue;
         }
 
@@ -180,7 +300,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     // as executable skills.
     let nested_skills_dir = repo_dir.join("skills");
     if nested_skills_dir.is_dir() {
-        return load_skills_from_directory(&nested_skills_dir, allow_scripts);
+        return load_skills_from_directory(&nested_skills_dir, allow_scripts, &[]);
     }
 
     let mut skills = Vec::new();
@@ -2135,6 +2255,20 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
 
             if !target.exists() {
                 anyhow::bail!("Skill source or installed skill not found: {source}");
+            }
+
+            let trusted_skill_roots =
+                resolve_trusted_skill_roots(workspace_dir, &config.skills.trusted_skill_roots);
+            if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+                if metadata.file_type().is_symlink() {
+                    enforce_workspace_skill_symlink_trust(&target, &trusted_skill_roots)
+                        .with_context(|| {
+                            format!(
+                                "trusted-symlink policy rejected audit target {}",
+                                target.display()
+                            )
+                        })?;
+                }
             }
 
             let report = audit::audit_skill_directory_with_options(

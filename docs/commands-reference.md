@@ -264,6 +264,11 @@ Registry packages are installed to `~/.zeroclaw/workspace/skills/<name>/`.
 
 Use `skills audit` to manually validate a candidate skill directory (or an installed skill by name) before sharing it.
 
+Workspace symlink policy:
+- Symlinked entries under `~/.zeroclaw/workspace/skills/` are blocked by default.
+- To allow shared local skill directories, set `[skills].trusted_skill_roots` in `config.toml`.
+- A symlinked skill is accepted only when its resolved canonical target is inside one of the trusted roots.
+
 Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injected into the agent system prompt at runtime, so the model can follow skill instructions without manually reading skill files.
 
 ### `migrate`
