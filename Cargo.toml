@@ -6,6 +6,7 @@ resolver = "2"
 name = "zeroclaw"
 version = "0.1.7"
 edition = "2021"
+build = "build.rs"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
