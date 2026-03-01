@@ -6,6 +6,15 @@ print_cc_info() {
     cc --version | head -n1 || true
 }
 
+print_ar_info() {
+    echo "Archiver available: $(command -v ar)"
+    ar --version 2>/dev/null | head -n1 || true
+}
+
+toolchain_ready() {
+    command -v cc >/dev/null 2>&1 && command -v ar >/dev/null 2>&1
+}
+
 prepend_path() {
     local dir="$1"
     export PATH="${dir}:${PATH}"
@@ -29,6 +38,39 @@ shim_cc_to_compiler() {
     echo "::notice::Created 'cc' shim from ${compiler_path}."
 }
 
+shim_ar_to_tool() {
+    local tool="$1"
+    local tool_path
+    local shim_dir
+    if ! command -v "${tool}" >/dev/null 2>&1; then
+        return 1
+    fi
+    tool_path="$(command -v "${tool}")"
+    shim_dir="${RUNNER_TEMP:-/tmp}/cc-shim"
+    mkdir -p "${shim_dir}"
+    ln -sf "${tool_path}" "${shim_dir}/ar"
+    prepend_path "${shim_dir}"
+    echo "::notice::Created 'ar' shim from ${tool_path}."
+}
+
+ensure_archiver() {
+    if command -v ar >/dev/null 2>&1; then
+        return 0
+    fi
+    shim_ar_to_tool llvm-ar && return 0
+    shim_ar_to_tool gcc-ar && return 0
+    return 1
+}
+
+finish_if_ready() {
+    ensure_archiver || true
+    if toolchain_ready; then
+        print_cc_info
+        print_ar_info
+        exit 0
+    fi
+}
+
 run_as_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -44,11 +86,11 @@ run_as_privileged() {
 install_cc_toolchain() {
     if command -v apt-get >/dev/null 2>&1; then
         run_as_privileged apt-get update
-        run_as_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config
+        run_as_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential binutils pkg-config
     elif command -v yum >/dev/null 2>&1; then
-        run_as_privileged yum install -y gcc gcc-c++ make pkgconfig
+        run_as_privileged yum install -y gcc gcc-c++ binutils make pkgconfig
     elif command -v dnf >/dev/null 2>&1; then
-        run_as_privileged dnf install -y gcc gcc-c++ make pkgconf-pkg-config
+        run_as_privileged dnf install -y gcc gcc-c++ binutils make pkgconf-pkg-config
     elif command -v apk >/dev/null 2>&1; then
         run_as_privileged apk add --no-cache build-base pkgconf
     else
@@ -120,23 +162,26 @@ done
 "${zig_bin}" cc "\${args[@]}"
 EOF
     chmod +x "${shim_dir}/cc"
+    cat > "${shim_dir}/ar" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"${zig_bin}" ar "\$@"
+EOF
+    chmod +x "${shim_dir}/ar"
     prepend_path "${shim_dir}"
-    echo "::notice::Provisioned 'cc' via Zig wrapper (${zig_version})."
+    echo "::notice::Provisioned 'cc' and 'ar' via Zig wrappers (${zig_version})."
 }
 
 if command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+    finish_if_ready
 fi
 
-if shim_cc_to_compiler clang && command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+if shim_cc_to_compiler clang; then
+    finish_if_ready
 fi
 
-if shim_cc_to_compiler gcc && command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+if shim_cc_to_compiler gcc; then
+    finish_if_ready
 fi
 
 echo "::warning::Missing 'cc' on runner. Attempting package-manager install."
@@ -145,24 +190,20 @@ if ! install_cc_toolchain; then
 fi
 
 if command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+    finish_if_ready
 fi
 
-if install_zig_cc_shim && command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+if install_zig_cc_shim; then
+    finish_if_ready
 fi
 
-if shim_cc_to_compiler clang && command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+if shim_cc_to_compiler clang; then
+    finish_if_ready
 fi
 
-if shim_cc_to_compiler gcc && command -v cc >/dev/null 2>&1; then
-    print_cc_info
-    exit 0
+if shim_cc_to_compiler gcc; then
+    finish_if_ready
 fi
 
-echo "::error::Failed to provision 'cc'. Install a compiler toolchain or configure passwordless sudo on the runner."
+echo "::error::Failed to provision 'cc' and 'ar'. Install a compiler/binutils toolchain or configure passwordless sudo on the runner."
 exit 1
