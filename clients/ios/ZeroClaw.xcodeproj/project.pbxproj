@@ -1,0 +1,535 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000010000000000000001 /* ZeroClawApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000001 /* ZeroClawApp.swift */; };
+		A10000010000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000002 /* ContentView.swift */; };
+		A10000010000000000000003 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000003 /* ChatMessage.swift */; };
+		A10000010000000000000004 /* AgentStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000004 /* AgentStatus.swift */; };
+		A10000010000000000000005 /* ZeroClawBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000005 /* ZeroClawBridge.swift */; };
+		A10000010000000000000006 /* SettingsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000006 /* SettingsManager.swift */; };
+		A10000010000000000000007 /* AgentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000007 /* AgentService.swift */; };
+		A10000010000000000000008 /* ChatMessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000008 /* ChatMessageView.swift */; };
+		A10000010000000000000009 /* ChatInputView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000009 /* ChatInputView.swift */; };
+		A1000001000000000000000A /* StatusIndicatorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000000000000000A /* StatusIndicatorView.swift */; };
+		A1000001000000000000000B /* EmptyStateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000000000000000B /* EmptyStateView.swift */; };
+		A1000001000000000000000C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000000000000000C /* SettingsView.swift */; };
+		A1000001000000000000000D /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000000000000000D /* Theme.swift */; };
+		A1000001000000000000000E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000002000000000000000E /* Assets.xcassets */; };
+		A10000010000000000000010 /* ZeroClawTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000010 /* ZeroClawTests.swift */; };
+		D86446DC2F53378F0032947D /* ZeroClawCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */; };
+		D86446DD2F53378F0032947D /* ZeroClawCore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		D86446E22F53389D0032947D /* zeroclaw_ios.swift in Sources */ = {isa = PBXBuildFile; fileRef = D86446E12F53389D0032947D /* zeroclaw_ios.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A10000030000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000040000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000050000000000000001;
+			remoteInfo = ZeroClaw;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		D86446DE2F53378F0032947D /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				D86446DD2F53378F0032947D /* ZeroClawCore.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A10000020000000000000001 /* ZeroClawApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZeroClawApp.swift; sourceTree = "<group>"; };
+		A10000020000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A10000020000000000000003 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
+		A10000020000000000000004 /* AgentStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStatus.swift; sourceTree = "<group>"; };
+		A10000020000000000000005 /* ZeroClawBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZeroClawBridge.swift; sourceTree = "<group>"; };
+		A10000020000000000000006 /* SettingsManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsManager.swift; sourceTree = "<group>"; };
+		A10000020000000000000007 /* AgentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentService.swift; sourceTree = "<group>"; };
+		A10000020000000000000008 /* ChatMessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessageView.swift; sourceTree = "<group>"; };
+		A10000020000000000000009 /* ChatInputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatInputView.swift; sourceTree = "<group>"; };
+		A1000002000000000000000A /* StatusIndicatorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusIndicatorView.swift; sourceTree = "<group>"; };
+		A1000002000000000000000B /* EmptyStateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmptyStateView.swift; sourceTree = "<group>"; };
+		A1000002000000000000000C /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		A1000002000000000000000D /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		A1000002000000000000000E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A10000020000000000000010 /* ZeroClawTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZeroClawTests.swift; sourceTree = "<group>"; };
+		A10000060000000000000001 /* ZeroClaw.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZeroClaw.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000060000000000000002 /* ZeroClawTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZeroClawTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZeroClawCore.xcframework; path = Frameworks/ZeroClawCore.xcframework; sourceTree = "<group>"; };
+		D86446E12F53389D0032947D /* zeroclaw_ios.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = zeroclaw_ios.swift; path = ZeroClaw/Generated/zeroclaw_ios.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000070000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D86446DC2F53378F0032947D /* ZeroClawCore.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000070000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000080000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				D86446E12F53389D0032947D /* zeroclaw_ios.swift */,
+				A10000080000000000000002 /* ZeroClaw */,
+				A10000080000000000000007 /* ZeroClawTests */,
+				D86446DA2F53378F0032947D /* Frameworks */,
+				A10000080000000000000008 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A10000080000000000000002 /* ZeroClaw */ = {
+			isa = PBXGroup;
+			children = (
+				A10000020000000000000001 /* ZeroClawApp.swift */,
+				A10000020000000000000002 /* ContentView.swift */,
+				A10000080000000000000003 /* Models */,
+				A10000080000000000000004 /* Services */,
+				A10000080000000000000005 /* Views */,
+				A10000080000000000000006 /* Theme */,
+				A1000002000000000000000E /* Assets.xcassets */,
+			);
+			path = ZeroClaw;
+			sourceTree = "<group>";
+		};
+		A10000080000000000000003 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				A10000020000000000000003 /* ChatMessage.swift */,
+				A10000020000000000000004 /* AgentStatus.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		A10000080000000000000004 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				A10000020000000000000005 /* ZeroClawBridge.swift */,
+				A10000020000000000000006 /* SettingsManager.swift */,
+				A10000020000000000000007 /* AgentService.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		A10000080000000000000005 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				A10000020000000000000008 /* ChatMessageView.swift */,
+				A10000020000000000000009 /* ChatInputView.swift */,
+				A1000002000000000000000A /* StatusIndicatorView.swift */,
+				A1000002000000000000000B /* EmptyStateView.swift */,
+				A1000002000000000000000C /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		A10000080000000000000006 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				A1000002000000000000000D /* Theme.swift */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		A10000080000000000000007 /* ZeroClawTests */ = {
+			isa = PBXGroup;
+			children = (
+				A10000020000000000000010 /* ZeroClawTests.swift */,
+			);
+			path = ZeroClawTests;
+			sourceTree = "<group>";
+		};
+		A10000080000000000000008 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000060000000000000001 /* ZeroClaw.app */,
+				A10000060000000000000002 /* ZeroClawTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D86446DA2F53378F0032947D /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000050000000000000001 /* ZeroClaw */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000090000000000000001 /* Build configuration list for PBXNativeTarget "ZeroClaw" */;
+			buildPhases = (
+				A1000000A000000000000001 /* Sources */,
+				A10000070000000000000001 /* Frameworks */,
+				A1000000B000000000000001 /* Resources */,
+				D86446DE2F53378F0032947D /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ZeroClaw;
+			productName = ZeroClaw;
+			productReference = A10000060000000000000001 /* ZeroClaw.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A10000050000000000000002 /* ZeroClawTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000090000000000000002 /* Build configuration list for PBXNativeTarget "ZeroClawTests" */;
+			buildPhases = (
+				A1000000A000000000000002 /* Sources */,
+				A10000070000000000000002 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A1000000C000000000000001 /* PBXTargetDependency */,
+			);
+			name = ZeroClawTests;
+			productName = ZeroClawTests;
+			productReference = A10000060000000000000002 /* ZeroClawTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000040000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1540;
+				LastUpgradeCheck = 2630;
+				TargetAttributes = {
+					A10000050000000000000001 = {
+						CreatedOnToolsVersion = 15.4;
+					};
+					A10000050000000000000002 = {
+						CreatedOnToolsVersion = 15.4;
+						TestTargetID = A10000050000000000000001;
+					};
+				};
+			};
+			buildConfigurationList = A10000090000000000000003 /* Build configuration list for PBXProject "ZeroClaw" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A10000080000000000000001;
+			productRefGroup = A10000080000000000000008 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A10000050000000000000001 /* ZeroClaw */,
+				A10000050000000000000002 /* ZeroClawTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A1000000B000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000001000000000000000E /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A1000000A000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000001 /* ZeroClawApp.swift in Sources */,
+				A10000010000000000000002 /* ContentView.swift in Sources */,
+				A10000010000000000000003 /* ChatMessage.swift in Sources */,
+				A10000010000000000000004 /* AgentStatus.swift in Sources */,
+				A10000010000000000000005 /* ZeroClawBridge.swift in Sources */,
+				A10000010000000000000006 /* SettingsManager.swift in Sources */,
+				A10000010000000000000007 /* AgentService.swift in Sources */,
+				A10000010000000000000008 /* ChatMessageView.swift in Sources */,
+				A10000010000000000000009 /* ChatInputView.swift in Sources */,
+				A1000001000000000000000A /* StatusIndicatorView.swift in Sources */,
+				A1000001000000000000000B /* EmptyStateView.swift in Sources */,
+				A1000001000000000000000C /* SettingsView.swift in Sources */,
+				D86446E22F53389D0032947D /* zeroclaw_ios.swift in Sources */,
+				A1000001000000000000000D /* Theme.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1000000A000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000010 /* ZeroClawTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A1000000C000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A10000050000000000000001 /* ZeroClaw */;
+			targetProxy = A10000030000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A1000000D000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A1000000D000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A1000000D000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = FJPAF4M87L;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = ZeroClaw;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.zeroclaw.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1000000D000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = FJPAF4M87L;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = ZeroClaw;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.zeroclaw.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A1000000D000000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.zeroclaw.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZeroClaw.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ZeroClaw";
+			};
+			name = Debug;
+		};
+		A1000000D000000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.zeroclaw.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZeroClaw.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ZeroClaw";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000090000000000000001 /* Build configuration list for PBXNativeTarget "ZeroClaw" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1000000D000000000000003 /* Debug */,
+				A1000000D000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000090000000000000002 /* Build configuration list for PBXNativeTarget "ZeroClawTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1000000D000000000000005 /* Debug */,
+				A1000000D000000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000090000000000000003 /* Build configuration list for PBXProject "ZeroClaw" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1000000D000000000000001 /* Debug */,
+				A1000000D000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A10000040000000000000001 /* Project object */;
+}
