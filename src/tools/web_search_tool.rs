@@ -239,8 +239,9 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
 
         let response = client.get(&search_url).send().await.map_err(|e| {
             anyhow::anyhow!(
@@ -322,8 +323,9 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
 
         let response = client
             .get(&search_url)
@@ -391,8 +393,9 @@ impl WebSearchTool {
         let endpoint = format!("{}/v1/search", api_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
 
         let response = client
             .post(endpoint)
@@ -491,8 +494,9 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
         let response = client
             .post(&endpoint)
             .json(&json!({
@@ -573,8 +577,9 @@ impl WebSearchTool {
         let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
 
         let mut body = json!({
             "query": query,
@@ -683,8 +688,9 @@ impl WebSearchTool {
         let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
 
         let mut body = json!({
             "query": query,
@@ -773,8 +779,9 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+            .user_agent(self.user_agent.as_str());
+        let client =
+            crate::config::apply_runtime_proxy_to_builder(client, "tool.web_search").build()?;
 
         let mut request = client.get(url).header("Accept", "text/plain");
         if let Some(api_key) = self.get_next_jina_api_key() {

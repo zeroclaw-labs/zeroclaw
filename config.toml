@@ -1,0 +1,350 @@
+#api_key = ""
+#default_provider = "openai-codex"
+#default_model = "gpt-5.3-codex"
+#default_temperature = 0.7
+#model_routes = []
+#embedding_routes = []
+
+
+api_key = "sk-api-WsK-_-gDfAOQwwFBYCDQ4DKG3K0kRH2oagpybMVsWeMQeQ8fcg4EIGuf6mF7SyO9NBJQ07Yyj8AAJdR024mumypM8zYlKK2-nhSqi2Zyc0cPdOrfI8j11BA"
+default_provider = "anthropic-custom:https://api.minimaxi.com/anthropic"
+default_model = "MiniMax-M2.5-highspeed"
+default_temperature = 0.7
+model_routes = []
+embedding_routes = []
+
+
+[model_providers]
+
+[observability]
+backend = "none"
+runtime_trace_mode = "none"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = [
+    "git",
+    "npm",
+    "cargo",
+    "ls",
+    "cat",
+    "grep",
+    "find",
+    "echo",
+    "pwd",
+    "wc",
+    "head",
+    "tail",
+    "date",
+]
+forbidden_paths = [
+    "/etc",
+    "/root",
+    "/home",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/opt",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/var",
+    "/tmp",
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.config",
+]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = []
+auto_approve = [
+    "file_read",
+    "memory_recall",
+    "web_search_tool",
+    "web_fetch",
+    "web_search_config",
+]
+always_ask = []
+allowed_roots = []
+non_cli_excluded_tools = []
+
+[security.sandbox]
+backend = "auto"
+firejail_args = []
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 60
+max_subprocesses = 10
+memory_monitoring = true
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+max_size_mb = 100
+sign_events = false
+
+[security.otp]
+enabled = false
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 300
+gated_actions = [
+    "shell",
+    "file_write",
+    "browser_open",
+    "browser",
+    "memory_forget",
+]
+gated_domains = []
+gated_domain_categories = []
+
+[security.estop]
+enabled = false
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+
+[runtime]
+kind = "native"
+
+[runtime.docker]
+image = "alpine:3.20"
+network = "none"
+memory_limit_mb = 512
+cpu_limit = 1.0
+read_only_rootfs = true
+mount_workspace = true
+allowed_workspace_roots = []
+
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 500
+fallback_providers = []
+api_keys = []
+channel_initial_backoff_secs = 2
+channel_max_backoff_secs = 60
+scheduler_poll_secs = 15
+scheduler_retries = 2
+
+[reliability.model_fallbacks]
+
+[scheduler]
+enabled = true
+max_tasks = 64
+max_concurrent = 4
+
+[agent]
+compact_context = false
+max_tool_iterations = 100 # 每一轮工具调用次数
+max_history_messages = 50
+parallel_tools = false
+tool_dispatcher = "auto"
+
+[skills]
+open_skills_enabled = false
+prompt_injection_mode = "full"
+
+[query_classification]
+enabled = false
+rules = []
+
+[heartbeat]
+enabled = false
+interval_minutes = 30
+
+[cron]
+enabled = true
+max_run_history = 50
+
+[channels_config]
+cli = true
+message_timeout_secs = 300
+
+[channels_config.feishu]
+app_id = "cli_a928d4270bf91bca"
+app_secret = "PKbau2FnpY8I3tM6lLjWIIPBJzg81zRF"
+encrypt_key = ""                    # optional
+verification_token = ""             # optional
+allowed_users = ["*"]
+receive_mode = "websocket"          # or "webhook"
+port = 8081                          # required for webhook mode
+
+[memory]
+backend = "sqlite"
+auto_save = true
+hygiene_enabled = true
+archive_after_days = 7
+purge_after_days = 30
+conversation_retention_days = 30
+embedding_provider = "none"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
+vector_weight = 0.7
+keyword_weight = 0.3
+min_relevance_score = 0.4
+embedding_cache_size = 10000
+chunk_max_tokens = 512
+response_cache_enabled = false
+response_cache_ttl_minutes = 60
+response_cache_max_entries = 5000
+snapshot_enabled = false
+snapshot_on_hygiene = false
+auto_hydrate = true
+
+[memory.qdrant]
+collection = "zeroclaw_memories"
+
+[storage.provider.config]
+provider = ""
+schema = "public"
+table = "memories"
+
+[tunnel]
+provider = "none"
+
+[gateway]
+port = 42617
+host = "127.0.0.1"
+require_pairing = false
+allow_public_bind = false
+paired_tokens = ["e03fc48a8ca697557e3d6f08e0d25de9eae127e31084e196bdf5b965daaaee4e"]
+pair_rate_limit_per_minute = 10
+webhook_rate_limit_per_minute = 60
+trust_forwarded_headers = false
+rate_limit_max_keys = 10000
+idempotency_ttl_secs = 300
+idempotency_max_keys = 10000
+
+[composio]
+enabled = false
+entity_id = "default"
+
+[secrets]
+encrypt = true
+
+[browser]
+enabled = false
+allowed_domains = []
+backend = "agent_browser"
+native_headless = true
+native_webdriver_url = "http://127.0.0.1:9515"
+
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions"
+timeout_ms = 15000
+allow_remote_endpoint = false
+window_allowlist = []
+
+[http_request]
+enabled = false
+allowed_domains = []
+max_response_size = 1000000
+timeout_secs = 30
+
+[multimodal]
+max_images = 4
+max_image_size_mb = 5
+allow_remote_fetch = false
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+max_response_size = 500000
+timeout_secs = 30
+
+[web_search]
+enabled = true
+provider = "duckduckgo"
+max_results = 5
+timeout_secs = 15
+
+[proxy]
+#enabled = false
+#no_proxy = []
+#scope = "zeroclaw"
+#services = []
+
+enabled = true
+http_proxy = "http://127.0.0.1:7897"
+https_proxy = "http://127.0.0.1:7897"
+all_proxy = "socks5://127.0.0.1:7897"
+
+
+[identity]
+format = "openclaw"
+
+[cost]
+enabled = false
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+
+[cost.prices."openai/gpt-4o-mini"]
+input = 0.15
+output = 0.6
+
+[cost.prices."anthropic/claude-opus-4-20250514"]
+input = 15.0
+output = 75.0
+
+[cost.prices."anthropic/claude-sonnet-4-20250514"]
+input = 3.0
+output = 15.0
+
+[cost.prices."anthropic/claude-3.5-sonnet"]
+input = 3.0
+output = 15.0
+
+[cost.prices."openai/o1-preview"]
+input = 15.0
+output = 60.0
+
+[cost.prices."google/gemini-2.0-flash"]
+input = 0.1
+output = 0.4
+
+[cost.prices."openai/gpt-4o"]
+input = 5.0
+output = 15.0
+
+[cost.prices."anthropic/claude-3-haiku"]
+input = 0.25
+output = 1.25
+
+[cost.prices."google/gemini-1.5-pro"]
+input = 1.25
+output = 5.0
+
+[peripherals]
+enabled = false
+boards = []
+
+[agents]
+
+[hooks]
+enabled = true
+
+[hooks.builtin]
+command_logger = false
+
+[hardware]
+enabled = false
+transport = "None"
+baud_rate = 115200
+workspace_datasheets = false
+
+[transcription]
+enabled = false
+api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+model = "whisper-large-v3-turbo"
+max_duration_secs = 120
