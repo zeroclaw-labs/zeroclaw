@@ -458,8 +458,12 @@ The agent will research the codebase before responding to queries like:
 
 Notes:
 
-- `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
-- `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
+- `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers:
+  - Ollama: sends `think: false`
+  - Qwen (all aliases, DashScope API): sends `enable_thinking: false`
+- `reasoning_enabled = true` explicitly requests reasoning for supported providers:
+  - Ollama: sends `think: true`
+  - Qwen (all aliases, DashScope API): sends `enable_thinking: true`
 - Unset keeps provider defaults.
 - Deprecated compatibility alias: `runtime.reasoning_level` is still accepted but should be migrated to `provider.reasoning_level`.
 - `runtime.kind = "wasm"` enables capability-bounded module execution and disables shell/process style execution.

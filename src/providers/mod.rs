@@ -1193,7 +1193,8 @@ fn create_provider_with_url_and_options(
                     AuthStyle::Bearer,
                     "QwenCode/1.0",
                     true,
-                ),
+                )
+                .with_reasoning_enabled(options.reasoning_enabled),
             ))
         }
         "hunyuan" | "tencent" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -1223,15 +1224,16 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        name if qwen_base_url(name).is_some() => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+        name if qwen_base_url(name).is_some() => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_vision(
                 "Qwen",
                 qwen_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
                 true,
-            )))
-        }
+            )
+            .with_reasoning_enabled(options.reasoning_enabled),
+        )),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(

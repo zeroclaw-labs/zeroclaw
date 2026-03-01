@@ -135,8 +135,12 @@ temperature = 0.2
 
 Lưu ý:
 
-- `reasoning_enabled = false` tắt tường minh reasoning phía provider cho provider hỗ trợ (hiện tại `ollama`, qua trường `think: false`).
-- `reasoning_enabled = true` yêu cầu reasoning tường minh (`think: true` trên `ollama`).
+- `reasoning_enabled = false` tắt tường minh reasoning phía provider cho provider hỗ trợ:
+  - Ollama: gửi `think: false`
+  - Qwen (mọi alias, DashScope API): gửi `enable_thinking: false`
+- `reasoning_enabled = true` yêu cầu reasoning tường minh cho provider hỗ trợ:
+  - Ollama: gửi `think: true`
+  - Qwen (mọi alias, DashScope API): gửi `enable_thinking: true`
 - Để trống giữ mặc định của provider.
 
 ## `[provider]`
