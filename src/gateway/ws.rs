@@ -405,7 +405,8 @@ pub async fn handle_ws_chat(
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.protocols(["zeroclaw.v1"])
+        .on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
