@@ -5117,8 +5117,14 @@ fn collect_configured_channels(
 
     #[cfg(not(feature = "channel-lark"))]
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
         tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+            "Lark/Feishu channel is configured but this binary was compiled without `channel-lark`; skipping Lark/Feishu startup. \
+             binary={executable}. \
+             If you built from source, run the built artifact directly (for example `./target/release/zeroclaw daemon`) \
+             or run `cargo run --features channel-lark -- daemon`."
         );
     }
 

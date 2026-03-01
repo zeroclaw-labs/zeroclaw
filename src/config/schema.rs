@@ -7032,6 +7032,81 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     Ok(())
 }
 
+fn legacy_feishu_table(raw_toml: &toml::Value) -> Option<&toml::map::Map<String, toml::Value>> {
+    raw_toml
+        .get("channels_config")?
+        .as_table()?
+        .get("feishu")?
+        .as_table()
+}
+
+fn extract_legacy_feishu_mention_only(raw_toml: &toml::Value) -> Option<bool> {
+    legacy_feishu_table(raw_toml)?
+        .get("mention_only")
+        .and_then(toml::Value::as_bool)
+}
+
+fn has_legacy_feishu_use_feishu(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("use_feishu"))
+        .is_some()
+}
+
+fn is_legacy_feishu_unknown_path(path: &str, key: &str) -> bool {
+    if !path.ends_with(key) {
+        return false;
+    }
+
+    let mut segments = path.split('.');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some("channels_config"), Some("feishu"), Some(_))
+    )
+}
+
+fn apply_feishu_legacy_compat(
+    config: &mut Config,
+    legacy_feishu_mention_only: Option<bool>,
+    legacy_feishu_use_feishu_present: bool,
+    saw_legacy_feishu_mention_only_path: bool,
+    saw_legacy_feishu_use_feishu_path: bool,
+) {
+    // Backward compatibility: users sometimes migrate config snippets from
+    // [channels_config.lark] to [channels_config.feishu] and keep old keys.
+    if let Some(feishu_cfg) = config.channels_config.feishu.as_mut() {
+        if let Some(legacy_mention_only) = legacy_feishu_mention_only {
+            if feishu_cfg.group_reply.is_none() {
+                let mapped_mode = if legacy_mention_only {
+                    GroupReplyMode::MentionOnly
+                } else {
+                    GroupReplyMode::AllMessages
+                };
+                feishu_cfg.group_reply = Some(GroupReplyConfig {
+                    mode: Some(mapped_mode),
+                    allowed_sender_ids: Vec::new(),
+                });
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is deprecated; mapped to [channels_config.feishu.group_reply].mode."
+                );
+            } else if saw_legacy_feishu_mention_only_path {
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is ignored because [channels_config.feishu.group_reply] is already set."
+                );
+            }
+        } else if saw_legacy_feishu_mention_only_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].mention_only is invalid; expected boolean."
+            );
+        }
+
+        if legacy_feishu_use_feishu_present || saw_legacy_feishu_use_feishu_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].use_feishu is redundant and ignored; [channels_config.feishu] always uses Feishu endpoints."
+            );
+        }
+    }
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -7070,8 +7145,49 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to deserialize config file")?;
+            // Parse raw TOML first so legacy compatibility rewrites can be applied after
+            // deserialization while still preserving unknown-key detection.
+            let raw_toml: toml::Value =
+                toml::from_str(&contents).context("Failed to parse config file")?;
+            let legacy_feishu_mention_only = extract_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_use_feishu_present = has_legacy_feishu_use_feishu(&raw_toml);
+
+            // Track ignored/unknown config keys to warn users about silent misconfigurations
+            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
+            let mut ignored_paths: Vec<String> = Vec::new();
+            let mut config: Config = serde_ignored::deserialize(
+                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
+                |path| {
+                    ignored_paths.push(path.to_string());
+                },
+            )
+            .context("Failed to deserialize config file")?;
+
+            let mut saw_legacy_feishu_mention_only_path = false;
+            let mut saw_legacy_feishu_use_feishu_path = false;
+            // Warn about each unknown config key
+            for path in ignored_paths {
+                if is_legacy_feishu_unknown_path(&path, ".mention_only") {
+                    saw_legacy_feishu_mention_only_path = true;
+                    continue;
+                }
+                if is_legacy_feishu_unknown_path(&path, ".use_feishu") {
+                    saw_legacy_feishu_use_feishu_path = true;
+                    continue;
+                }
+                tracing::warn!(
+                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
+                    path
+                );
+            }
+
+            apply_feishu_legacy_compat(
+                &mut config,
+                legacy_feishu_mention_only,
+                legacy_feishu_use_feishu_present,
+                saw_legacy_feishu_mention_only_path,
+                saw_legacy_feishu_use_feishu_path,
+            );
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -13100,6 +13216,103 @@ default_model = "legacy-model"
         assert_eq!(
             parsed.group_reply_allowed_sender_ids(),
             vec!["ou_9".to_string()]
+        );
+    }
+
+    #[test]
+    async fn feishu_legacy_key_extractors_detect_compat_fields() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+[channels_config.feishu]
+app_id = "cli_123"
+app_secret = "secret"
+mention_only = true
+use_feishu = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_legacy_feishu_mention_only(&raw), Some(true));
+        assert!(has_legacy_feishu_use_feishu(&raw));
+    }
+
+    #[test]
+    async fn feishu_legacy_unknown_path_matcher_is_strict() {
+        assert!(is_legacy_feishu_unknown_path(
+            "channels_config.feishu.?.mention_only",
+            ".mention_only"
+        ));
+        assert!(is_legacy_feishu_unknown_path(
+            "channels_config.feishu.?.use_feishu",
+            ".use_feishu"
+        ));
+
+        assert!(!is_legacy_feishu_unknown_path(
+            "channels_config.feishu_extra.?.mention_only",
+            ".mention_only"
+        ));
+        assert!(!is_legacy_feishu_unknown_path(
+            "channels_config.feishu_legacy.?.use_feishu",
+            ".use_feishu"
+        ));
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_maps_to_group_reply_mode() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_does_not_override_group_reply() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: Some(GroupReplyConfig {
+                mode: Some(GroupReplyMode::AllMessages),
+                allowed_sender_ids: vec![],
+            }),
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
         );
     }
 
