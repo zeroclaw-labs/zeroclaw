@@ -7046,22 +7046,16 @@ fn extract_legacy_feishu_mention_only(raw_toml: &toml::Value) -> Option<bool> {
         .and_then(toml::Value::as_bool)
 }
 
+fn has_legacy_feishu_mention_only(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("mention_only"))
+        .is_some()
+}
+
 fn has_legacy_feishu_use_feishu(raw_toml: &toml::Value) -> bool {
     legacy_feishu_table(raw_toml)
         .and_then(|table| table.get("use_feishu"))
         .is_some()
-}
-
-fn is_legacy_feishu_unknown_path(path: &str, key: &str) -> bool {
-    if !path.ends_with(key) {
-        return false;
-    }
-
-    let mut segments = path.split('.');
-    matches!(
-        (segments.next(), segments.next(), segments.next()),
-        (Some("channels_config"), Some("feishu"), Some(_))
-    )
 }
 
 fn apply_feishu_legacy_compat(
@@ -7146,47 +7140,21 @@ impl Config {
                 .context("Failed to read config file")?;
 
             // Parse raw TOML first so legacy compatibility rewrites can be applied after
-            // deserialization while still preserving unknown-key detection.
+            // deserialization.
             let raw_toml: toml::Value =
                 toml::from_str(&contents).context("Failed to parse config file")?;
             let legacy_feishu_mention_only = extract_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_mention_only_present = has_legacy_feishu_mention_only(&raw_toml);
             let legacy_feishu_use_feishu_present = has_legacy_feishu_use_feishu(&raw_toml);
-
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
-            let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
-                |path| {
-                    ignored_paths.push(path.to_string());
-                },
-            )
-            .context("Failed to deserialize config file")?;
-
-            let mut saw_legacy_feishu_mention_only_path = false;
-            let mut saw_legacy_feishu_use_feishu_path = false;
-            // Warn about each unknown config key
-            for path in ignored_paths {
-                if is_legacy_feishu_unknown_path(&path, ".mention_only") {
-                    saw_legacy_feishu_mention_only_path = true;
-                    continue;
-                }
-                if is_legacy_feishu_unknown_path(&path, ".use_feishu") {
-                    saw_legacy_feishu_use_feishu_path = true;
-                    continue;
-                }
-                tracing::warn!(
-                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
-                    path
-                );
-            }
+            let mut config: Config =
+                toml::from_str(&contents).context("Failed to deserialize config file")?;
 
             apply_feishu_legacy_compat(
                 &mut config,
                 legacy_feishu_mention_only,
                 legacy_feishu_use_feishu_present,
-                saw_legacy_feishu_mention_only_path,
-                saw_legacy_feishu_use_feishu_path,
+                legacy_feishu_mention_only_present,
+                legacy_feishu_use_feishu_present,
             );
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
@@ -13233,28 +13201,8 @@ use_feishu = true
         .unwrap();
 
         assert_eq!(extract_legacy_feishu_mention_only(&raw), Some(true));
+        assert!(has_legacy_feishu_mention_only(&raw));
         assert!(has_legacy_feishu_use_feishu(&raw));
-    }
-
-    #[test]
-    async fn feishu_legacy_unknown_path_matcher_is_strict() {
-        assert!(is_legacy_feishu_unknown_path(
-            "channels_config.feishu.?.mention_only",
-            ".mention_only"
-        ));
-        assert!(is_legacy_feishu_unknown_path(
-            "channels_config.feishu.?.use_feishu",
-            ".use_feishu"
-        ));
-
-        assert!(!is_legacy_feishu_unknown_path(
-            "channels_config.feishu_extra.?.mention_only",
-            ".mention_only"
-        ));
-        assert!(!is_legacy_feishu_unknown_path(
-            "channels_config.feishu_legacy.?.use_feishu",
-            ".use_feishu"
-        ));
     }
 
     #[test]
