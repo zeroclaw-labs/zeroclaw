@@ -43,7 +43,7 @@ env:
 jobs:
     codeql:
         name: CodeQL Analysis
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 60
         steps:
             - name: Checkout repository

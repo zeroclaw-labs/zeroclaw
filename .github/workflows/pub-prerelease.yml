@@ -43,7 +43,7 @@ env:
 jobs:
     prerelease-guard:
         name: Pre-release Guard
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 20
         outputs:
             release_tag: ${{ steps.vars.outputs.release_tag }}
@@ -239,7 +239,7 @@ jobs:
         name: Publish GitHub Pre-release
         needs: [prerelease-guard, build-prerelease]
         if: needs.prerelease-guard.outputs.ready_to_publish == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 15
         steps:
             - name: Download prerelease artifacts

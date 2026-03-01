@@ -47,7 +47,7 @@ env:
 jobs:
     prepare:
         name: Prepare Release Context
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         outputs:
             release_ref: ${{ steps.vars.outputs.release_ref }}
             release_tag: ${{ steps.vars.outputs.release_tag }}
@@ -386,7 +386,7 @@ jobs:
     verify-artifacts:
         name: Verify Artifact Set
         needs: [prepare, build-release]
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -447,7 +447,7 @@ jobs:
         name: Publish Release
         if: needs.prepare.outputs.publish_release == 'true'
         needs: [prepare, verify-artifacts]
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
