@@ -82,6 +82,7 @@ pub mod web_access_config;
 pub mod web_fetch;
 pub mod web_search_config;
 pub mod web_search_tool;
+pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bg_run::{
@@ -147,13 +148,13 @@ pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
 pub use web_search_tool::WebSearchTool;
+pub use xlsx_read::XlsxReadTool;
 
 pub use auth_profile::ManageAuthProfileTool;
 pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProviderTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
-use crate::plugins;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -208,43 +209,6 @@ pub fn add_bg_tools(tools: Vec<Box<dyn Tool>>) -> (Vec<Box<dyn Tool>>, BgJobStor
     extended.push(Arc::new(bg_run));
     extended.push(Arc::new(bg_status));
     (boxed_registry_from_arcs(extended), bg_job_store)
-}
-
-#[derive(Clone)]
-struct PluginManifestTool {
-    spec: ToolSpec,
-}
-
-impl PluginManifestTool {
-    fn new(spec: ToolSpec) -> Self {
-        Self { spec }
-    }
-}
-
-#[async_trait]
-impl Tool for PluginManifestTool {
-    fn name(&self) -> &str {
-        self.spec.name.as_str()
-    }
-
-    fn description(&self) -> &str {
-        self.spec.description.as_str()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.spec.parameters.clone()
-    }
-
-    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        Ok(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "plugin tool '{}' is declared but execution runtime is not wired yet",
-                self.spec.name
-            )),
-        })
-    }
 }
 
 /// Create the default tool registry
@@ -511,6 +475,9 @@ pub fn all_tools_with_runtime(
     // PPTX text extraction
     tool_arcs.push(Arc::new(PptxReadTool::new(security.clone())));
 
+    // XLSX text extraction
+    tool_arcs.push(Arc::new(XlsxReadTool::new(security.clone())));
+
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
@@ -654,18 +621,6 @@ pub fn all_tools_with_runtime(
                     security.clone(),
                 )));
             }
-        }
-    }
-
-    // Add declared plugin tools from the active plugin registry.
-    if config.plugins.enabled {
-        let registry = plugins::runtime::current_registry();
-        for tool in registry.tools() {
-            tool_arcs.push(Arc::new(PluginManifestTool::new(ToolSpec {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-            })));
         }
     }
 
