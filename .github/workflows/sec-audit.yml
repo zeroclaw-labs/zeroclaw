@@ -95,6 +95,14 @@ jobs:
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: sec-audit-deny
 
             - name: Enforce deny policy hygiene
               shell: bash
@@ -108,9 +116,17 @@ jobs:
                     --output-md artifacts/deny-policy-guard.md \
                     --fail-on-violation
 
-            - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
-              with:
-                  command: check advisories licenses sources
+            - name: Install cargo-deny
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if ! command -v cargo-deny >/dev/null 2>&1; then
+                    cargo install --locked cargo-deny --version 0.18.4
+                  fi
+
+            - name: Run cargo-deny checks
+              shell: bash
+              run: cargo deny check advisories licenses sources
 
             - name: Emit deny audit event
               if: always()
