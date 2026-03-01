@@ -16,6 +16,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -1618,90 +1619,173 @@ impl OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
     ) -> Vec<NativeMessage> {
-        messages
-            .iter()
-            .map(|message| {
-                if message.role == "assistant" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    {
-                        if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
-                            {
-                                let tool_calls = parsed_calls
-                                    .into_iter()
-                                    .map(|tc| ToolCall {
-                                        id: Some(tc.id),
-                                        kind: Some("function".to_string()),
-                                        function: Some(Function {
-                                            name: Some(tc.name),
-                                            arguments: Some(tc.arguments),
-                                        }),
-                                        name: None,
-                                        arguments: None,
-                                        parameters: None,
-                                    })
-                                    .collect::<Vec<_>>();
+        let mut native_messages = Vec::with_capacity(messages.len());
+        let mut assistant_tool_call_ids = HashSet::new();
 
-                                let content = value
-                                    .get("content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(|value| MessageContent::Text(value.to_string()));
-
-                                let reasoning_content = value
-                                    .get("reasoning_content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
-
-                                return NativeMessage {
-                                    role: "assistant".to_string(),
-                                    content,
-                                    tool_call_id: None,
-                                    tool_calls: Some(tool_calls),
-                                    reasoning_content,
-                                };
+        for message in messages {
+            if message.role == "assistant" {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
+                    if let Some(tool_calls) = Self::parse_history_tool_calls(&value) {
+                        for call in &tool_calls {
+                            if let Some(id) = call.id.as_ref() {
+                                assistant_tool_call_ids.insert(id.clone());
                             }
                         }
-                    }
-                }
 
-                if message.role == "tool" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
-                        let tool_call_id = value
-                            .get("tool_call_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
+                        // Some OpenAI-compatible providers (including NVIDIA NIM models)
+                        // reject assistant tool-call messages if `content` is omitted.
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(|value| MessageContent::Text(value.to_string()))
-                            .or_else(|| Some(MessageContent::Text(message.content.clone())));
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
 
-                        return NativeMessage {
-                            role: "tool".to_string(),
-                            content,
-                            tool_call_id,
-                            tool_calls: None,
-                            reasoning_content: None,
-                        };
+                        let reasoning_content = value
+                            .get("reasoning_content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string);
+
+                        native_messages.push(NativeMessage {
+                            role: "assistant".to_string(),
+                            content: Some(MessageContent::Text(content)),
+                            tool_call_id: None,
+                            tool_calls: Some(tool_calls),
+                            reasoning_content,
+                        });
+                        continue;
                     }
                 }
+            }
 
-                NativeMessage {
-                    role: message.role.clone(),
-                    content: Some(Self::to_message_content(
-                        &message.role,
-                        &message.content,
-                        allow_user_image_parts,
-                    )),
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
+            if message.role == "tool" {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
+                    let tool_call_id = value
+                        .get("tool_call_id")
+                        .or_else(|| value.get("tool_use_id"))
+                        .or_else(|| value.get("toolUseId"))
+                        .or_else(|| value.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+
+                    let content_text = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| message.content.clone());
+
+                    if let Some(id) = tool_call_id {
+                        if assistant_tool_call_ids.contains(&id) {
+                            native_messages.push(NativeMessage {
+                                role: "tool".to_string(),
+                                content: Some(MessageContent::Text(content_text)),
+                                tool_call_id: Some(id),
+                                tool_calls: None,
+                                reasoning_content: None,
+                            });
+                            continue;
+                        }
+
+                        tracing::warn!(
+                            tool_call_id = %id,
+                            "Dropping orphan tool-role message; no matching assistant tool_call in history"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Dropping tool-role message missing tool_call_id; preserving as user text fallback"
+                        );
+                    }
+
+                    native_messages.push(NativeMessage {
+                        role: "user".to_string(),
+                        content: Some(MessageContent::Text(format!(
+                            "[Tool result]\n{}",
+                            content_text
+                        ))),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        reasoning_content: None,
+                    });
+                    continue;
                 }
-            })
-            .collect()
+            }
+
+            native_messages.push(NativeMessage {
+                role: message.role.clone(),
+                content: Some(Self::to_message_content(
+                    &message.role,
+                    &message.content,
+                    allow_user_image_parts,
+                )),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            });
+        }
+
+        native_messages
+    }
+
+    fn parse_history_tool_calls(value: &serde_json::Value) -> Option<Vec<ToolCall>> {
+        let tool_calls_value = value.get("tool_calls")?;
+
+        if let Ok(parsed_calls) =
+            serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+        {
+            let tool_calls = parsed_calls
+                .into_iter()
+                .map(|tc| ToolCall {
+                    id: Some(tc.id),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some(tc.name),
+                        arguments: Some(Self::normalize_tool_arguments(tc.arguments)),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                })
+                .collect::<Vec<_>>();
+            if !tool_calls.is_empty() {
+                return Some(tool_calls);
+            }
+        }
+
+        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
+        {
+            let mut normalized_calls = Vec::with_capacity(parsed_calls.len());
+            for call in parsed_calls {
+                let Some(name) = call.function_name() else {
+                    continue;
+                };
+                let arguments = call
+                    .function_arguments()
+                    .unwrap_or_else(|| "{}".to_string());
+                normalized_calls.push(ToolCall {
+                    id: Some(call.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some(name),
+                        arguments: Some(Self::normalize_tool_arguments(arguments)),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                });
+            }
+            if !normalized_calls.is_empty() {
+                return Some(normalized_calls);
+            }
+        }
+
+        None
+    }
+
+    fn normalize_tool_arguments(arguments: String) -> String {
+        if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
+            arguments
+        } else {
+            "{}".to_string()
+        }
     }
 
     fn with_prompt_guided_tool_instructions(
@@ -1741,17 +1825,14 @@ impl OpenAiCompatibleProvider {
             .filter_map(|tc| {
                 let name = tc.function_name()?;
                 let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments =
-                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
-                        arguments
-                    } else {
-                        tracing::warn!(
-                            function = %name,
-                            arguments = %arguments,
-                            "Invalid JSON in native tool-call arguments, using empty object"
-                        );
-                        "{}".to_string()
-                    };
+                let normalized_arguments = Self::normalize_tool_arguments(arguments.clone());
+                if normalized_arguments == "{}" && arguments != "{}" {
+                    tracing::warn!(
+                        function = %name,
+                        arguments = %arguments,
+                        "Invalid JSON in native tool-call arguments, using empty object"
+                    );
+                }
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
@@ -3381,18 +3462,80 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_maps_tool_result_payload() {
-        let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_abc","content":"done"}"#,
+        let input = vec![
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"call_abc","content":"done"}"#),
+        ];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[1].role, "tool");
+        assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_abc"));
+        assert!(matches!(
+            converted[1].content.as_ref(),
+            Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_parses_openai_style_assistant_tool_calls() {
+        let input = vec![ChatMessage::assistant(
+            r#"{
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_openai_1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                }]
+            }"#,
         )];
 
         let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "tool");
-        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(converted[0].role, "assistant");
         assert!(matches!(
             converted[0].content.as_ref(),
-            Some(MessageContent::Text(value)) if value == "done"
+            Some(MessageContent::Text(value)) if value.is_empty()
         ));
+
+        let calls = converted[0]
+            .tool_calls
+            .as_ref()
+            .expect("assistant message should include tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("call_openai_1"));
+        assert!(matches!(
+            calls[0].function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("shell")
+        ));
+        assert!(matches!(
+            calls[0]
+                .function
+                .as_ref()
+                .and_then(|f| f.arguments.as_deref()),
+            Some("{\"command\":\"pwd\"}")
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_rewrites_orphan_tool_message_as_user() {
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_missing","content":"done"}"#,
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value.contains("[Tool result]") && value.contains("done")
+        ));
+        assert!(converted[0].tool_call_id.is_none());
     }
 
     #[test]
