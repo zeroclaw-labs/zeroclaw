@@ -3842,6 +3842,8 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
