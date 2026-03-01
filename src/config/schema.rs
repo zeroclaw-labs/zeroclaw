@@ -3299,6 +3299,10 @@ impl Default for AutonomyConfig {
                 "git".into(),
                 "npm".into(),
                 "cargo".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
                 "ls".into(),
                 "cat".into(),
                 "grep".into(),
@@ -3331,8 +3335,8 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_actions_per_hour: 100,
+            max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -9292,10 +9296,12 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
+        assert!(a.allowed_commands.contains(&"mkdir".to_string()));
+        assert!(a.allowed_commands.contains(&"touch".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
-        assert_eq!(a.max_cost_per_day_cents, 500);
+        assert_eq!(a.max_actions_per_hour, 100);
+        assert_eq!(a.max_cost_per_day_cents, 1000);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());

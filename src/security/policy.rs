@@ -121,6 +121,10 @@ impl Default for SecurityPolicy {
                 "git".into(),
                 "npm".into(),
                 "cargo".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
                 "ls".into(),
                 "cat".into(),
                 "grep".into(),
@@ -156,8 +160,8 @@ impl Default for SecurityPolicy {
                 "~/.config".into(),
             ],
             allowed_roots: Vec::new(),
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_actions_per_hour: 100,
+            max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -1356,6 +1360,8 @@ mod tests {
         assert!(p.is_command_allowed("ls"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("cargo build --release"));
+        assert!(p.is_command_allowed("mkdir -p docs"));
+        assert!(p.is_command_allowed("touch notes.md"));
         assert!(p.is_command_allowed("cat file.txt"));
         assert!(p.is_command_allowed("grep -r pattern ."));
         assert!(p.is_command_allowed("date"));
