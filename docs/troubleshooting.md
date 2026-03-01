@@ -194,6 +194,29 @@ Then verify channel-specific credentials + allowlist fields in config.
 
 ## Web Access Issues
 
+### Browser tool fails with "daemon" or "security policy" error
+Symptom:
+- The browser tool fails to open or navigate.
+- Error logs or the agent report a generic "daemon" failure or mention a "security policy blocking its execution".
+Why this happens:
+- Recent versions of Debian (e.g., Trixie) and Ubuntu have strict AppArmor policies that restrict unprivileged user namespaces. Chromium-based tools (like agent-browser) rely heavily on these namespaces for sandboxing. When the daemon tries to spawn the browser in the background, AppArmor blocks it.
+- If running as a systemd service, the daemon may not have access to your user's custom PATH (e.g., if agent-browser was installed via Linuxbrew).
+Fix:
+Temporarily disable the restriction to see if it resolves the issue:
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+# On newer kernels, the parameter might be named differently:
+sudo sysctl -w kernel.unprivileged_userns_apparmor_policy=0
+```
+To make this fix permanent across reboots, add it to your sysctl configuration:
+```bash
+echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/20-apparmor-userns.conf
+```
+If the error persists and you are running ZeroClaw as a service, ensure the agent-browser binary is symlinked to a system path that systemd can see:
+```bash
+sudo ln -s /home/linuxbrew/.linuxbrew/bin/agent-browser /usr/local/bin/agent-browser
+```
+
 ### `curl`/`wget` blocked in shell tool
 
 Symptom:
@@ -284,6 +307,24 @@ Security notes:
 - keep explicit domain allowlists in production environments when possible
 
 ## Service Mode
+
+### Enabling debug logs for systemd service
+If you are running ZeroClaw as a background service and need deeper visibility into failures (like headless browser subprocesses failing to start), you can enable Rust debug logging by injecting the RUST_LOG environment variable.
+Run:
+```bash
+systemctl --user edit zeroclaw.service
+```
+Add these exact lines at the top of the override file:
+```ini
+[Service]
+Environment="RUST_LOG=debug"
+```
+Save, exit, and apply the changes:
+```bash
+systemctl --user daemon-reload
+systemctl --user restart zeroclaw.service
+journalctl --user -u zeroclaw.service -f
+```
 
 ### Service installed but not running
 
