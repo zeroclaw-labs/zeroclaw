@@ -8,6 +8,8 @@ struct ChatInputView: View {
     var body: some View {
         HStack(spacing: 10) {
             TextField("Message ZeroClaw...", text: $inputText, axis: .vertical)
+                .textInputAutocapitalization(.sentences)
+                .autocorrectionDisabled()
                 .lineLimit(1...5)
                 .focused($isInputFocused)
                 .padding(.horizontal, 14)
@@ -29,6 +31,7 @@ struct ChatInputView: View {
 
     private var canSend: Bool {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && agentService.status == .running
     }
 
     private func sendMessage() {

@@ -6,7 +6,7 @@ struct StatusIndicatorView: View {
     var body: some View {
         HStack(spacing: 5) {
             Circle()
-                .fill(indicatorColor)
+                .fill(status.color)
                 .frame(width: 6, height: 6)
 
             Text(status.displayText)
@@ -17,14 +17,5 @@ struct StatusIndicatorView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .fixedSize()
-    }
-
-    private var indicatorColor: Color {
-        switch status {
-        case .running: .green
-        case .starting, .thinking: .orange
-        case .stopped: .gray
-        case .error(_): .red
-        }
     }
 }
