@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 
 // AgentStatus is defined by UniFFI in zeroclaw_ios.swift.
 // These extensions add display helpers for the UI layer.
@@ -6,11 +6,20 @@ import Foundation
 extension AgentStatus {
     var displayText: String {
         switch self {
-        case .stopped: "Stopped"
-        case .starting: "Starting..."
-        case .running: "Running"
+        case .stopped: "Disconnected"
+        case .starting: "Connecting..."
+        case .running: "Connected"
         case .thinking: "Thinking..."
-        case .error(let message): "Error: \(message)"
+        case .error(let message): message
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .running: .green
+        case .starting, .thinking: .orange
+        case .stopped: .gray
+        case .error: .red
         }
     }
 

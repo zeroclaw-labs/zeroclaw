@@ -6,6 +6,16 @@ import Foundation
 extension ChatMessage: Identifiable {}
 
 extension ChatMessage {
+    /// Create a message with the current timestamp.
+    static func now(content: String, role: String) -> ChatMessage {
+        ChatMessage(
+            id: UUID().uuidString,
+            content: content,
+            role: role,
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+    }
+
     var isUser: Bool {
         role == "user"
     }
