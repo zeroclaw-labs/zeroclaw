@@ -1,9 +1,17 @@
-use crate::memory::{self, decay, Memory};
+use crate::memory::{self, decay, Memory, MemoryCategory};
 use async_trait::async_trait;
 use std::fmt::Write;
 
 /// Default half-life (days) for time decay in memory loading.
 const LOADER_DECAY_HALF_LIFE_DAYS: f64 = 7.0;
+
+/// Score boost applied to `Core` category memories so durable facts and
+/// preferences surface even when keyword/semantic similarity is moderate.
+const CORE_CATEGORY_SCORE_BOOST: f64 = 0.3;
+
+/// Over-fetch factor: retrieve more candidates than the output limit so
+/// that Core boost and re-ranking can select the best subset.
+const RECALL_OVER_FETCH_FACTOR: usize = 2;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
@@ -41,32 +49,47 @@ impl MemoryLoader for DefaultMemoryLoader {
         memory: &dyn Memory,
         user_message: &str,
     ) -> anyhow::Result<String> {
-        let mut entries = memory.recall(user_message, self.limit, None).await?;
+        // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
+        let fetch_limit = self.limit * RECALL_OVER_FETCH_FACTOR;
+        let mut entries = memory.recall(user_message, fetch_limit, None).await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
 
-        // Apply time decay: older non-Core memories score lower
+        // Apply time decay: older non-Core memories score lower.
         decay::apply_time_decay(&mut entries, LOADER_DECAY_HALF_LIFE_DAYS);
 
-        let mut context = String::from("[Memory context]\n");
-        for entry in entries {
-            if memory::is_assistant_autosave_key(&entry.key) {
-                continue;
-            }
-            if let Some(score) = entry.score {
-                if score < self.min_relevance_score {
-                    continue;
+        // Apply Core category boost and filter by minimum relevance.
+        let mut scored: Vec<_> = entries
+            .iter()
+            .filter(|e| !memory::is_assistant_autosave_key(&e.key))
+            .filter_map(|e| {
+                let base = e.score.unwrap_or(self.min_relevance_score);
+                let boosted = if e.category == MemoryCategory::Core {
+                    (base + CORE_CATEGORY_SCORE_BOOST).min(1.0)
+                } else {
+                    base
+                };
+                if boosted >= self.min_relevance_score {
+                    Some((e, boosted))
+                } else {
+                    None
                 }
-            }
-            let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-        }
+            })
+            .collect();
 
-        // If all entries were below threshold, return empty
-        if context == "[Memory context]\n" {
+        // Sort by boosted score descending, then truncate to output limit.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(self.limit);
+
+        if scored.is_empty() {
             return Ok(String::new());
         }
 
+        let mut context = String::from("[Memory context]\n");
+        for (entry, _) in &scored {
+            let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+        }
         context.push('\n');
         Ok(context)
     }
@@ -232,5 +255,94 @@ mod tests {
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
         assert!(!context.contains("fabricated detail"));
+    }
+
+    #[tokio::test]
+    async fn core_category_boost_promotes_low_score_core_entry() {
+        let loader = DefaultMemoryLoader::new(2, 0.4);
+        let memory = MockMemoryWithEntries {
+            entries: Arc::new(vec![
+                MemoryEntry {
+                    id: "1".into(),
+                    key: "chat_detail".into(),
+                    content: "talked about weather".into(),
+                    category: MemoryCategory::Conversation,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    score: Some(0.6),
+                },
+                MemoryEntry {
+                    id: "2".into(),
+                    key: "project_rule".into(),
+                    content: "always use async/await".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    // Below threshold without boost (0.25 < 0.4),
+                    // but above with +0.3 boost (0.55 >= 0.4).
+                    score: Some(0.25),
+                },
+                MemoryEntry {
+                    id: "3".into(),
+                    key: "low_conv".into(),
+                    content: "irrelevant chatter".into(),
+                    category: MemoryCategory::Conversation,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    score: Some(0.2),
+                },
+            ]),
+        };
+
+        let context = loader.load_context(&memory, "code style").await.unwrap();
+        // Core entry should survive thanks to boost
+        assert!(
+            context.contains("project_rule"),
+            "Core entry should be promoted by boost: {context}"
+        );
+        // Low-score Conversation entry should be filtered out
+        assert!(
+            !context.contains("low_conv"),
+            "Low-score non-Core entry should be filtered: {context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_boost_reranks_above_conversation() {
+        let loader = DefaultMemoryLoader::new(1, 0.0);
+        let memory = MockMemoryWithEntries {
+            entries: Arc::new(vec![
+                MemoryEntry {
+                    id: "1".into(),
+                    key: "conv_high".into(),
+                    content: "recent conversation".into(),
+                    category: MemoryCategory::Conversation,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    score: Some(0.6),
+                },
+                MemoryEntry {
+                    id: "2".into(),
+                    key: "core_pref".into(),
+                    content: "user prefers Rust".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    // 0.5 + 0.3 boost = 0.8 > 0.6
+                    score: Some(0.5),
+                },
+            ]),
+        };
+
+        let context = loader.load_context(&memory, "language").await.unwrap();
+        // With limit=1 and Core boost, Core entry (0.8) should win over Conversation (0.6)
+        assert!(
+            context.contains("core_pref"),
+            "Boosted Core should rank above Conversation: {context}"
+        );
+        assert!(
+            !context.contains("conv_high"),
+            "Conversation should be truncated when limit=1: {context}"
+        );
     }
 }

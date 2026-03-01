@@ -251,6 +251,14 @@ struct ChannelRuntimeDefaults {
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
     cost: crate::config::CostConfig,
+    auto_save_memory: bool,
+    max_tool_iterations: usize,
+    min_relevance_score: f64,
+    message_timeout_secs: u64,
+    interrupt_on_new_message: bool,
+    multimodal: crate::config::MultimodalConfig,
+    query_classification: crate::config::QueryClassificationConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,6 +1056,14 @@ fn resolved_default_model(config: &Config) -> String {
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
+    let message_timeout_secs =
+        effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
+    let interrupt_on_new_message = config
+        .channels_config
+        .telegram
+        .as_ref()
+        .is_some_and(|tg| tg.interrupt_on_new_message);
+
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
@@ -1056,6 +1072,14 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
         cost: config.cost.clone(),
+        auto_save_memory: config.memory.auto_save,
+        max_tool_iterations: config.agent.max_tool_iterations,
+        min_relevance_score: config.memory.min_relevance_score,
+        message_timeout_secs,
+        interrupt_on_new_message,
+        multimodal: config.multimodal.clone(),
+        query_classification: config.query_classification.clone(),
+        model_routes: config.model_routes.clone(),
     }
 }
 
@@ -1102,6 +1126,14 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
         cost: crate::config::CostConfig::default(),
+        auto_save_memory: ctx.auto_save_memory,
+        max_tool_iterations: ctx.max_tool_iterations,
+        min_relevance_score: ctx.min_relevance_score,
+        message_timeout_secs: ctx.message_timeout_secs,
+        interrupt_on_new_message: ctx.interrupt_on_new_message,
+        multimodal: ctx.multimodal.clone(),
+        query_classification: ctx.query_classification.clone(),
+        model_routes: ctx.model_routes.clone(),
     }
 }
 
@@ -1722,14 +1754,14 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
 /// Classify a user message and return the appropriate route selection with logging.
 /// Returns None if classification is disabled or no rules match.
 fn classify_message_route(
-    ctx: &ChannelRuntimeContext,
+    query_classification: &crate::config::QueryClassificationConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
     message: &str,
 ) -> Option<ChannelRouteSelection> {
-    let decision =
-        crate::agent::classifier::classify_with_decision(&ctx.query_classification, message)?;
+    let decision = crate::agent::classifier::classify_with_decision(query_classification, message)?;
 
     // Find the matching model route
-    let route = ctx.model_routes.iter().find(|r| r.hint == decision.hint)?;
+    let route = model_routes.iter().find(|r| r.hint == decision.hint)?;
 
     tracing::info!(
         target: "query_classification",
@@ -1956,9 +1988,9 @@ async fn get_or_create_provider(
 
     let provider = create_resilient_provider_nonblocking(
         provider_name,
-        ctx.api_key.clone(),
+        defaults.api_key.clone(),
         api_url.map(ToString::to_string),
-        ctx.reliability.as_ref().clone(),
+        defaults.reliability.clone(),
         ctx.provider_runtime_options.clone(),
     )
     .await?;
@@ -3446,10 +3478,14 @@ or tune thresholds in config.",
             }
         }
     }
-    // Try classification first, fall back to sender/default route
-    let route = classify_message_route(ctx.as_ref(), &msg.content)
-        .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+    // Try classification first, fall back to sender/default route.
+    let route = classify_message_route(
+        &runtime_defaults.query_classification,
+        &runtime_defaults.model_routes,
+        &msg.content,
+    )
+    .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -3469,7 +3505,9 @@ or tune thresholds in config.",
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if runtime_defaults.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+    {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
@@ -3532,7 +3570,7 @@ or tune thresholds in config.",
                 let memory_context = build_memory_context(
                     ctx.memory.as_ref(),
                     &msg.content,
-                    ctx.min_relevance_score,
+                    runtime_defaults.min_relevance_score,
                     Some(&history_key),
                 )
                 .await;
@@ -3686,8 +3724,10 @@ or tune thresholds in config.",
         Cancelled,
     }
 
-    let timeout_budget_secs =
-        channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let timeout_budget_secs = channel_message_timeout_budget_secs(
+        runtime_defaults.message_timeout_secs,
+        runtime_defaults.max_tool_iterations,
+    );
     let cost_enforcement_context = crate::agent::loop_::create_cost_enforcement_context(
         &runtime_defaults.cost,
         ctx.workspace_dir.as_path(),
@@ -3751,8 +3791,8 @@ or tune thresholds in config.",
                     Some(ctx.approval_manager.as_ref()),
                     msg.channel.as_str(),
                     non_cli_approval_context,
-                    &ctx.multimodal,
-                    ctx.max_tool_iterations,
+                    &runtime_defaults.multimodal,
+                    runtime_defaults.max_tool_iterations,
                     Some(cancellation_token.clone()),
                     delta_tx,
                     ctx.hooks.as_deref(),
@@ -3931,7 +3971,7 @@ or tune thresholds in config.",
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-            if ctx.auto_save_memory
+            if runtime_defaults.auto_save_memory
                 && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
             {
                 let assistant_key = assistant_memory_key(&msg);
@@ -4044,7 +4084,7 @@ or tune thresholds in config.",
                     }
                 }
             } else if is_tool_iteration_limit_error(&e) {
-                let limit = ctx.max_tool_iterations.max(1);
+                let limit = runtime_defaults.max_tool_iterations.max(1);
                 let pause_text = format!(
                     "⚠️ Reached tool-iteration limit ({limit}) for this turn. Context and progress were preserved. Reply \"continue\" to resume, or increase `agent.max_tool_iterations`."
                 );
@@ -4140,7 +4180,9 @@ or tune thresholds in config.",
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
-                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
+                timeout_budget_secs,
+                runtime_defaults.message_timeout_secs,
+                runtime_defaults.max_tool_iterations
             );
             runtime_trace::record_event(
                 "channel_message_timeout",
@@ -4221,8 +4263,9 @@ async fn run_message_dispatch_loop(
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
+            let runtime_defaults = runtime_defaults_snapshot(worker_ctx.as_ref());
             let interrupt_enabled =
-                worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
+                runtime_defaults.interrupt_on_new_message && msg.channel == "telegram";
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -9503,6 +9546,14 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
                         cost: crate::config::CostConfig::default(),
+                        auto_save_memory: false,
+                        max_tool_iterations: 5,
+                        min_relevance_score: 0.0,
+                        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+                        interrupt_on_new_message: false,
+                        multimodal: crate::config::MultimodalConfig::default(),
+                        query_classification: crate::config::QueryClassificationConfig::default(),
+                        model_routes: Vec::new(),
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
@@ -9685,6 +9736,13 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.default_provider = Some("ollama".to_string());
         cfg.default_model = Some("llama3.2".to_string());
         cfg.api_key = Some("http://127.0.0.1:11434".to_string());
+        cfg.memory.auto_save = false;
+        cfg.memory.min_relevance_score = 0.15;
+        cfg.agent.max_tool_iterations = 5;
+        cfg.channels_config.message_timeout_secs = 45;
+        cfg.multimodal.allow_remote_fetch = false;
+        cfg.query_classification.enabled = false;
+        cfg.model_routes = vec![];
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Direct;
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".to_string()];
@@ -9751,6 +9809,14 @@ BTC is currently around $65,000 based on latest tool output."#
             runtime_outbound_leak_guard_snapshot(runtime_ctx.as_ref()).action,
             crate::config::OutboundLeakGuardAction::Redact
         );
+        let defaults = runtime_defaults_snapshot(runtime_ctx.as_ref());
+        assert!(!defaults.auto_save_memory);
+        assert_eq!(defaults.min_relevance_score, 0.15);
+        assert_eq!(defaults.max_tool_iterations, 5);
+        assert_eq!(defaults.message_timeout_secs, 45);
+        assert!(!defaults.multimodal.allow_remote_fetch);
+        assert!(!defaults.query_classification.enabled);
+        assert!(defaults.model_routes.is_empty());
 
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Disabled;
@@ -9766,6 +9832,28 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.security.perplexity_filter.perplexity_threshold = 12.5;
         cfg.security.outbound_leak_guard.action = crate::config::OutboundLeakGuardAction::Block;
         cfg.security.outbound_leak_guard.sensitivity = 0.92;
+        cfg.memory.auto_save = true;
+        cfg.memory.min_relevance_score = 0.65;
+        cfg.agent.max_tool_iterations = 11;
+        cfg.channels_config.message_timeout_secs = 120;
+        cfg.multimodal.allow_remote_fetch = true;
+        cfg.query_classification.enabled = true;
+        cfg.query_classification.rules = vec![crate::config::ClassificationRule {
+            hint: "reasoning".to_string(),
+            keywords: vec!["analyze".to_string()],
+            patterns: vec!["deep".to_string()],
+            min_length: None,
+            max_length: None,
+            priority: 10,
+        }];
+        cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openrouter".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            max_tokens: Some(512),
+            api_key: None,
+            transport: None,
+        }];
         cfg.save().await.expect("save updated config");
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -9797,6 +9885,15 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::config::OutboundLeakGuardAction::Block
         );
         assert_eq!(leak_guard_cfg.sensitivity, 0.92);
+        let defaults = runtime_defaults_snapshot(runtime_ctx.as_ref());
+        assert!(defaults.auto_save_memory);
+        assert_eq!(defaults.min_relevance_score, 0.65);
+        assert_eq!(defaults.max_tool_iterations, 11);
+        assert_eq!(defaults.message_timeout_secs, 120);
+        assert!(defaults.multimodal.allow_remote_fetch);
+        assert!(defaults.query_classification.enabled);
+        assert_eq!(defaults.query_classification.rules.len(), 1);
+        assert_eq!(defaults.model_routes.len(), 1);
 
         let mut store = runtime_config_store()
             .lock()
