@@ -753,6 +753,7 @@ fn build_channel_system_prompt(
     expose_internal_tool_details: bool,
 ) -> String {
     let mut prompt = base_prompt.to_string();
+    crate::agent::prompt::refresh_prompt_datetime(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -11520,6 +11521,16 @@ Done reminder set for 1:38 AM."#;
 
         let exposed = build_channel_system_prompt("base", "telegram", "chat", true);
         assert!(exposed.contains("user explicitly requested command/tool details"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_refreshes_datetime_section() {
+        let base_prompt =
+            "## Current Date & Time\n\n2000-01-01 00:00:00 (UTC)\n\n## Runtime\n\nHost: test";
+        let rendered = build_channel_system_prompt(base_prompt, "telegram", "chat", false);
+        assert!(!rendered.contains("2000-01-01 00:00:00 (UTC)"));
+        assert!(rendered.contains("## Current Date & Time\n\n"));
+        assert!(rendered.contains("## Runtime\n\nHost: test"));
     }
 
     #[test]

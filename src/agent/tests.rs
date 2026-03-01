@@ -915,6 +915,38 @@ async fn system_prompt_not_duplicated_on_second_turn() {
     assert_eq!(system_count, 1, "System prompt should appear exactly once");
 }
 
+#[tokio::test]
+async fn system_prompt_datetime_refreshes_between_turns() {
+    let provider = Box::new(ScriptedProvider::new(vec![
+        text_response("first"),
+        text_response("second"),
+    ]));
+    let mut agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+    let first_prompt = match &agent.history()[0] {
+        ConversationMessage::Chat(c) if c.role == "system" => c.content.clone(),
+        _ => panic!("First history entry should be system prompt"),
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let _ = agent.turn("hello again").await.unwrap();
+    let second_prompt = match &agent.history()[0] {
+        ConversationMessage::Chat(c) if c.role == "system" => c.content.clone(),
+        _ => panic!("First history entry should be system prompt"),
+    };
+
+    assert_ne!(
+        first_prompt, second_prompt,
+        "System prompt datetime should refresh between turns"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 15. Conversation history fidelity
 // ═══════════════════════════════════════════════════════════════════════════

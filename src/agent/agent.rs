@@ -486,6 +486,10 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+        } else if let Some(ConversationMessage::Chat(system_msg)) = self.history.first_mut() {
+            if system_msg.role == "system" {
+                crate::agent::prompt::refresh_prompt_datetime(&mut system_msg.content);
+            }
         }
 
         if self.auto_save {

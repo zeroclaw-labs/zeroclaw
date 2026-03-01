@@ -2661,6 +2661,12 @@ pub async fn run(
                 format!("{context}[{now}] {user_input}")
             };
 
+            if let Some(system_message) = history.first_mut() {
+                if system_message.role == "system" {
+                    crate::agent::prompt::refresh_prompt_datetime(&mut system_message.content);
+                }
+            }
+
             history.push(ChatMessage::user(&enriched));
             interactive_turn += 1;
 

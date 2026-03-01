@@ -334,6 +334,14 @@ fn build_ws_system_prompt(
     prompt
 }
 
+fn refresh_ws_history_system_prompt_datetime(history: &mut [ChatMessage]) {
+    if let Some(system_message) = history.first_mut() {
+        if system_message.role == "system" {
+            crate::agent::prompt::refresh_prompt_datetime(&mut system_message.content);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WsAuthRejection {
     MissingPairingToken,
@@ -471,6 +479,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             let _ = socket.send(Message::Text(err.to_string().into())).await;
             continue;
         }
+
+        refresh_ws_history_system_prompt_datetime(&mut history);
 
         // Add user message to history
         history.push(ChatMessage::user(&content));
@@ -699,6 +709,17 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn refresh_ws_history_system_prompt_datetime_updates_only_system_entry() {
+        let mut history = vec![
+            ChatMessage::system("## Current Date & Time\n\n2000-01-01 00:00:00 (UTC)\n"),
+            ChatMessage::user("hello"),
+        ];
+        refresh_ws_history_system_prompt_datetime(&mut history);
+        assert!(!history[0].content.contains("2000-01-01 00:00:00 (UTC)"));
+        assert_eq!(history[1].content, "hello");
     }
 
     #[test]
