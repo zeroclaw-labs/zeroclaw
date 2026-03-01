@@ -3,39 +3,52 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+#[derive(Clone)]
+struct CachedSlackDisplayName {
+    display_name: String,
+    expires_at: Instant,
+}
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
     bot_token: String,
     app_token: Option<String>,
     channel_id: Option<String>,
+    channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
+    user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
 const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
+const SLACK_USER_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 
 impl SlackChannel {
     pub fn new(
         bot_token: String,
         app_token: Option<String>,
         channel_id: Option<String>,
+        channel_ids: Vec<String>,
         allowed_users: Vec<String>,
     ) -> Self {
         Self {
             bot_token,
             app_token,
             channel_id,
+            channel_ids,
             allowed_users,
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
+            user_display_name_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -111,6 +124,22 @@ impl SlackChannel {
         Self::normalized_channel_id(self.channel_id.as_deref())
     }
 
+    /// Resolve the effective channel scope:
+    /// explicit `channel_ids` list first, then single `channel_id`, otherwise wildcard discovery.
+    fn scoped_channel_ids(&self) -> Option<Vec<String>> {
+        let mut seen = HashSet::new();
+        let ids: Vec<String> = self
+            .channel_ids
+            .iter()
+            .filter_map(|entry| Self::normalized_channel_id(Some(entry)))
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+        self.configured_channel_id().map(|id| vec![id])
+    }
+
     fn configured_app_token(&self) -> Option<String> {
         self.app_token
             .as_deref()
@@ -128,6 +157,137 @@ impl SlackChannel {
         normalized.sort();
         normalized.dedup();
         normalized
+    }
+
+    fn user_cache_ttl() -> Duration {
+        Duration::from_secs(SLACK_USER_CACHE_TTL_SECS)
+    }
+
+    fn sanitize_display_name(name: &str) -> Option<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn extract_user_display_name(payload: &serde_json::Value) -> Option<String> {
+        let user = payload.get("user")?;
+        let profile = user.get("profile");
+
+        let candidates = [
+            profile
+                .and_then(|p| p.get("display_name"))
+                .and_then(|v| v.as_str()),
+            profile
+                .and_then(|p| p.get("display_name_normalized"))
+                .and_then(|v| v.as_str()),
+            profile
+                .and_then(|p| p.get("real_name_normalized"))
+                .and_then(|v| v.as_str()),
+            profile
+                .and_then(|p| p.get("real_name"))
+                .and_then(|v| v.as_str()),
+            user.get("real_name").and_then(|v| v.as_str()),
+            user.get("name").and_then(|v| v.as_str()),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            if let Some(display_name) = Self::sanitize_display_name(candidate) {
+                return Some(display_name);
+            }
+        }
+
+        None
+    }
+
+    fn cached_sender_display_name(&self, user_id: &str) -> Option<String> {
+        let now = Instant::now();
+        let Ok(mut cache) = self.user_display_name_cache.lock() else {
+            return None;
+        };
+
+        if let Some(entry) = cache.get(user_id) {
+            if now <= entry.expires_at {
+                return Some(entry.display_name.clone());
+            }
+        }
+
+        cache.remove(user_id);
+        None
+    }
+
+    fn cache_sender_display_name(&self, user_id: &str, display_name: &str) {
+        let Ok(mut cache) = self.user_display_name_cache.lock() else {
+            return;
+        };
+        cache.insert(
+            user_id.to_string(),
+            CachedSlackDisplayName {
+                display_name: display_name.to_string(),
+                expires_at: Instant::now() + Self::user_cache_ttl(),
+            },
+        );
+    }
+
+    async fn fetch_sender_display_name(&self, user_id: &str) -> Option<String> {
+        let resp = match self
+            .http_client()
+            .get("https://slack.com/api/users.info")
+            .bearer_auth(&self.bot_token)
+            .query(&[("user", user_id)])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("Slack users.info request failed for {user_id}: {err}");
+                return None;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::warn!("Slack users.info failed for {user_id} ({status}): {sanitized}");
+            return None;
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = payload
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            tracing::warn!("Slack users.info returned error for {user_id}: {err}");
+            return None;
+        }
+
+        Self::extract_user_display_name(&payload)
+    }
+
+    async fn resolve_sender_identity(&self, user_id: &str) -> String {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return String::new();
+        }
+
+        if let Some(display_name) = self.cached_sender_display_name(user_id) {
+            return display_name;
+        }
+
+        if let Some(display_name) = self.fetch_sender_display_name(user_id).await {
+            self.cache_sender_display_name(user_id, &display_name);
+            return display_name;
+        }
+
+        user_id.to_string()
     }
 
     fn is_group_channel_id(channel_id: &str) -> bool {
@@ -327,7 +487,7 @@ impl SlackChannel {
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         bot_user_id: &str,
-        scoped_channel: Option<String>,
+        scoped_channels: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
 
@@ -425,8 +585,8 @@ impl SlackChannel {
                 if channel_id.is_empty() {
                     continue;
                 }
-                if let Some(ref configured_channel) = scoped_channel {
-                    if channel_id != *configured_channel {
+                if let Some(ref configured_channels) = scoped_channels {
+                    if !configured_channels.iter().any(|id| id == &channel_id) {
                         continue;
                     }
                 }
@@ -476,10 +636,11 @@ impl SlackChannel {
                 };
 
                 last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+                let sender = self.resolve_sender_identity(user).await;
 
                 let channel_msg = ChannelMessage {
                     id: format!("slack_{channel_id}_{ts}"),
-                    sender: user.to_string(),
+                    sender,
                     reply_target: channel_id.clone(),
                     content: normalized_text,
                     channel: "slack".to_string(),
@@ -695,11 +856,11 @@ impl Channel for SlackChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
-        let scoped_channel = self.configured_channel_id();
+        let scoped_channels = self.scoped_channel_ids();
         if self.configured_app_token().is_some() {
             tracing::info!("Slack channel listening in Socket Mode");
             return self
-                .listen_socket_mode(tx, &bot_user_id, scoped_channel)
+                .listen_socket_mode(tx, &bot_user_id, scoped_channels)
                 .await;
         }
 
@@ -707,19 +868,23 @@ impl Channel for SlackChannel {
         let mut last_discovery = Instant::now();
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
 
-        if let Some(ref channel_id) = scoped_channel {
-            tracing::info!("Slack channel listening on #{channel_id}...");
+        if let Some(ref channel_ids) = scoped_channels {
+            tracing::info!(
+                "Slack channel listening on {} configured channel(s): {}",
+                channel_ids.len(),
+                channel_ids.join(", ")
+            );
         } else {
             tracing::info!(
-                "Slack channel_id not set (or '*'); listening across all accessible channels."
+                "Slack channel_id/channel_ids not set (or wildcard only); listening across all accessible channels."
             );
         }
 
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            let target_channels = if let Some(ref channel_id) = scoped_channel {
-                vec![channel_id.clone()]
+            let target_channels = if let Some(ref channel_ids) = scoped_channels {
+                channel_ids.clone()
             } else {
                 if discovered_channels.is_empty()
                     || last_discovery.elapsed() >= Duration::from_secs(60)
@@ -820,10 +985,11 @@ impl Channel for SlackChannel {
                         };
 
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+                        let sender = self.resolve_sender_identity(user).await;
 
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
-                            sender: user.to_string(),
+                            sender,
                             reply_target: channel_id.clone(),
                             content: normalized_text,
                             channel: "slack".to_string(),
@@ -860,26 +1026,32 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_channel_with_channel_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, Some("C12345".into()), vec![]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C12345".into()),
+            vec![],
+            vec![],
+        );
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
     }
 
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
     }
 
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()])
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()])
             .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
 
         assert!(ch.mention_only);
@@ -906,14 +1078,53 @@ mod tests {
 
     #[test]
     fn configured_app_token_ignores_blank_values() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("   ".into()), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("   ".into()), None, vec![], vec![]);
         assert_eq!(ch.configured_app_token(), None);
     }
 
     #[test]
     fn configured_app_token_trims_value() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some(" xapp-123 ".into()), None, vec![]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            Some(" xapp-123 ".into()),
+            None,
+            vec![],
+            vec![],
+        );
         assert_eq!(ch.configured_app_token().as_deref(), Some("xapp-123"));
+    }
+
+    #[test]
+    fn scoped_channel_ids_prefers_explicit_list() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C_SINGLE".into()),
+            vec!["C_LIST1".into(), "D_DM1".into()],
+            vec![],
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_LIST1".to_string(), "D_DM1".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_falls_back_to_single_channel_id() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C_SINGLE".into()),
+            vec![],
+            vec![],
+        );
+        assert_eq!(ch.scoped_channel_ids(), Some(vec!["C_SINGLE".to_string()]));
+    }
+
+    #[test]
+    fn scoped_channel_ids_returns_none_for_wildcard_mode() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert_eq!(ch.scoped_channel_ids(), None);
     }
 
     #[test]
@@ -941,15 +1152,81 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
         assert!(!ch.is_user_allowed("U12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
+    }
+
+    #[test]
+    fn extract_user_display_name_prefers_profile_display_name() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "profile": {
+                    "display_name": "Display Name",
+                    "real_name": "Real Name"
+                }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_user_display_name(&payload).as_deref(),
+            Some("Display Name")
+        );
+    }
+
+    #[test]
+    fn extract_user_display_name_falls_back_to_username() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "profile": {
+                    "display_name": "   ",
+                    "real_name": ""
+                }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_user_display_name(&payload).as_deref(),
+            Some("fallback_name")
+        );
+    }
+
+    #[test]
+    fn cached_sender_display_name_returns_none_when_expired() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        {
+            let mut cache = ch.user_display_name_cache.lock().unwrap();
+            cache.insert(
+                "U123".to_string(),
+                CachedSlackDisplayName {
+                    display_name: "Expired Name".to_string(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
+        }
+
+        assert_eq!(ch.cached_sender_display_name("U123"), None);
+    }
+
+    #[test]
+    fn cached_sender_display_name_returns_cached_value_when_valid() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        ch.cache_sender_display_name("U123", "Cached Name");
+
+        assert_eq!(
+            ch.cached_sender_display_name("U123").as_deref(),
+            Some("Cached Name")
+        );
     }
 
     #[test]
@@ -975,6 +1252,7 @@ mod tests {
             "xoxb-fake".into(),
             None,
             None,
+            vec![],
             vec!["U111".into(), "U222".into()],
         );
         assert!(ch.is_user_allowed("U111"));
@@ -984,20 +1262,20 @@ mod tests {
 
     #[test]
     fn allowlist_exact_match_not_substring() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["U111".into()]);
         assert!(!ch.is_user_allowed("U1111"));
         assert!(!ch.is_user_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["U111".into()]);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["U111".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(!ch.is_user_allowed("u111"));
     }
@@ -1008,6 +1286,7 @@ mod tests {
             "xoxb-fake".into(),
             None,
             None,
+            vec![],
             vec!["U111".into(), "*".into()],
         );
         assert!(ch.is_user_allowed("U111"));

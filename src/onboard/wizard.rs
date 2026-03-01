@@ -1,13 +1,14 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, QQEnvironment, QQReceiveMode, SignalConfig,
-    StreamMode, WhatsAppConfig,
+    NextcloudTalkConfig, NostrConfig, ProgressMode, QQConfig, QQEnvironment, QQReceiveMode,
+    SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
-    TelegramConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    HeartbeatConfig, HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig,
+    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig,
+    SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebFetchConfig, WebSearchConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::identity::{
@@ -16,6 +17,10 @@ use crate::identity::{
 use crate::memory::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind,
+};
+use crate::migration::{
+    load_config_without_env, migrate_openclaw, resolve_openclaw_config, resolve_openclaw_workspace,
+    OpenClawMigrationOptions,
 };
 use crate::providers::{
     canonical_china_provider_name, is_doubao_alias, is_glm_alias, is_glm_cn_alias,
@@ -42,6 +47,13 @@ pub struct ProjectContext {
     pub timezone: String,
     pub agent_name: String,
     pub communication_style: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenClawOnboardMigrationOptions {
+    pub enabled: bool,
+    pub source_workspace: Option<PathBuf>,
+    pub source_config: Option<PathBuf>,
 }
 
 // ── Banner ───────────────────────────────────────────────────────
@@ -80,6 +92,17 @@ enum InteractiveOnboardingMode {
 }
 
 pub async fn run_wizard(force: bool) -> Result<Config> {
+    Box::pin(run_wizard_with_migration(
+        force,
+        OpenClawOnboardMigrationOptions::default(),
+    ))
+    .await
+}
+
+pub async fn run_wizard_with_migration(
+    force: bool,
+    migration_options: OpenClawOnboardMigrationOptions,
+) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -99,7 +122,23 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
         InteractiveOnboardingMode::UpdateProviderOnly => {
-            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+            let raw = fs::read_to_string(&config_path).await.with_context(|| {
+                format!(
+                    "Failed to read existing config at {}",
+                    config_path.display()
+                )
+            })?;
+            let mut existing_config: Config = toml::from_str(&raw).with_context(|| {
+                format!(
+                    "Failed to parse existing config at {}",
+                    config_path.display()
+                )
+            })?;
+            existing_config.workspace_dir = workspace_dir.to_path_buf();
+            existing_config.config_path = config_path.to_path_buf();
+            maybe_run_openclaw_migration(&mut existing_config, &migration_options, true).await?;
+            let config = run_provider_update_wizard(&workspace_dir, &config_path).await?;
+            return Ok(config);
         }
     }
 
@@ -141,7 +180,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: if api_key.is_empty() {
@@ -214,6 +253,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
+
+    maybe_run_openclaw_migration(&mut config, &migration_options, true).await?;
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -380,7 +421,7 @@ fn apply_provider_update(
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
+/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid|cortex-mem`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
@@ -417,6 +458,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        sqlite_journal_mode: "wal".to_string(),
         qdrant: crate::config::QdrantConfig::default(),
     }
 }
@@ -430,11 +472,36 @@ pub async fn run_quick_setup(
     force: bool,
     no_totp: bool,
 ) -> Result<Config> {
+    Box::pin(run_quick_setup_with_migration(
+        credential_override,
+        provider,
+        model_override,
+        memory_backend,
+        force,
+        no_totp,
+        OpenClawOnboardMigrationOptions::default(),
+    ))
+    .await
+}
+
+pub async fn run_quick_setup_with_migration(
+    credential_override: Option<&str>,
+    provider: Option<&str>,
+    model_override: Option<&str>,
+    memory_backend: Option<&str>,
+    force: bool,
+    no_totp: bool,
+    migration_options: OpenClawOnboardMigrationOptions,
+) -> Result<Config> {
+    let migration_requested = migration_options.enabled
+        || migration_options.source_workspace.is_some()
+        || migration_options.source_config.is_some();
+
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(
+    let mut config = run_quick_setup_with_home(
         credential_override,
         provider,
         model_override,
@@ -443,7 +510,130 @@ pub async fn run_quick_setup(
         no_totp,
         &home,
     )
-    .await
+    .await?;
+
+    maybe_run_openclaw_migration(&mut config, &migration_options, false).await?;
+
+    if migration_requested {
+        println!();
+        println!(
+            "  {} Post-migration summary (updated configuration):",
+            style("↻").cyan().bold()
+        );
+        print_summary(&config);
+    }
+    Ok(config)
+}
+
+async fn maybe_run_openclaw_migration(
+    config: &mut Config,
+    options: &OpenClawOnboardMigrationOptions,
+    allow_interactive_prompt: bool,
+) -> Result<()> {
+    let resolved_workspace = resolve_openclaw_workspace(options.source_workspace.clone())?;
+    let resolved_config = resolve_openclaw_config(options.source_config.clone())?;
+
+    let auto_detected = resolved_workspace.exists() || resolved_config.exists();
+    let should_run = if options.enabled {
+        true
+    } else if allow_interactive_prompt && auto_detected {
+        println!();
+        println!(
+            "  {} OpenClaw data detected. Optional merge migration is available.",
+            style("↻").cyan().bold()
+        );
+        Confirm::new()
+            .with_prompt(
+                "  Merge OpenClaw data into this ZeroClaw workspace now? (preserve existing data)",
+            )
+            .default(true)
+            .interact()?
+    } else {
+        false
+    };
+
+    if !should_run {
+        return Ok(());
+    }
+
+    println!(
+        "  {} Running OpenClaw merge migration...",
+        style("↻").cyan().bold()
+    );
+
+    let report = migrate_openclaw(
+        config,
+        OpenClawMigrationOptions {
+            source_workspace: if options.source_workspace.is_some() || resolved_workspace.exists() {
+                Some(resolved_workspace.clone())
+            } else {
+                None
+            },
+            source_config: if options.source_config.is_some() || resolved_config.exists() {
+                Some(resolved_config.clone())
+            } else {
+                None
+            },
+            include_memory: true,
+            include_config: true,
+            dry_run: false,
+        },
+    )
+    .await?;
+
+    *config = load_config_without_env(config)?;
+
+    let report_json = serde_json::to_value(&report).unwrap_or(Value::Null);
+    let metric = |pointer: &str| -> u64 {
+        report_json
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+
+    let changed_units = metric("/memory/imported")
+        + metric("/memory/renamed_conflicts")
+        + metric("/config/defaults_added")
+        + metric("/config/channels_added")
+        + metric("/config/channels_merged")
+        + metric("/config/agents_added")
+        + metric("/config/agents_merged")
+        + metric("/config/agent_tools_added");
+
+    if changed_units > 0 {
+        println!(
+            "  {} OpenClaw migration merged successfully",
+            style("✓").green().bold()
+        );
+    } else {
+        println!(
+            "  {} OpenClaw migration completed with no data changes",
+            style("✓").green().bold()
+        );
+    }
+
+    if let Some(backups) = report_json.get("backups").and_then(Value::as_array) {
+        if !backups.is_empty() {
+            println!("  {} Backups:", style("🛟").cyan().bold());
+            for backup in backups {
+                if let Some(path) = backup.as_str() {
+                    println!("    - {path}");
+                }
+            }
+        }
+    }
+
+    if let Some(notes) = report_json.get("notes").and_then(Value::as_array) {
+        if !notes.is_empty() {
+            println!("  {} Notes:", style("ℹ").cyan().bold());
+            for note in notes {
+                if let Some(text) = note.as_str() {
+                    println!("    - {text}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
@@ -785,8 +975,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "sglang" | "vllm" | "osaurus" => "default".into(),
-        "copilot" => "default".into(),
+        "sglang" | "vllm" | "osaurus" | "copilot" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -3084,7 +3273,63 @@ fn provider_supports_device_flow(provider_name: &str) -> bool {
     )
 }
 
+fn http_request_productivity_allowed_domains() -> Vec<String> {
+    vec![
+        "api.github.com".to_string(),
+        "github.com".to_string(),
+        "api.linear.app".to_string(),
+        "linear.app".to_string(),
+        "calendar.googleapis.com".to_string(),
+        "tasks.googleapis.com".to_string(),
+        "www.googleapis.com".to_string(),
+        "oauth2.googleapis.com".to_string(),
+        "api.notion.com".to_string(),
+        "api.trello.com".to_string(),
+        "api.atlassian.com".to_string(),
+    ]
+}
+
+fn parse_allowed_domains_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
+    if tool_name == "http_request" {
+        let options = vec![
+            "Productivity starter allowlist (GitHub, Linear, Google, Notion, Trello, Atlassian)",
+            "Allow all public domains (*)",
+            "Custom domain list (comma-separated)",
+        ];
+        let choice = Select::new()
+            .with_prompt("  HTTP domain policy")
+            .items(&options)
+            .default(0)
+            .interact()?;
+
+        return match choice {
+            0 => Ok(http_request_productivity_allowed_domains()),
+            1 => Ok(vec!["*".to_string()]),
+            _ => {
+                let raw: String = Input::new()
+                    .with_prompt("  http_request.allowed_domains (comma-separated, '*' allows all)")
+                    .allow_empty(true)
+                    .default("api.github.com,api.linear.app,calendar.googleapis.com".to_string())
+                    .interact_text()?;
+                let domains = parse_allowed_domains_csv(&raw);
+                if domains.is_empty() {
+                    anyhow::bail!(
+                        "Custom domain list cannot be empty. Use 'Allow all public domains (*)' if that is intended."
+                    )
+                }
+                Ok(domains)
+            }
+        };
+    }
+
     let prompt = format!(
         "  {}.allowed_domains (comma-separated, '*' allows all)",
         tool_name
@@ -3095,18 +3340,156 @@ fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
         .default("*".to_string())
         .interact_text()?;
 
-    let domains: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let domains = parse_allowed_domains_csv(&raw);
 
     if domains.is_empty() {
         Ok(vec!["*".to_string()])
     } else {
         Ok(domains)
     }
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn normalize_http_request_profile_name(name: &str) -> String {
+    let normalized = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized.trim_matches('-').to_string()
+}
+
+fn default_env_var_for_profile(profile_name: &str) -> String {
+    match profile_name {
+        "github" => "GITHUB_TOKEN".to_string(),
+        "linear" => "LINEAR_API_KEY".to_string(),
+        "google" => "GOOGLE_API_KEY".to_string(),
+        _ => format!(
+            "{}_TOKEN",
+            profile_name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        ),
+    }
+}
+
+fn setup_http_request_credential_profiles(
+    http_request_config: &mut HttpRequestConfig,
+) -> Result<()> {
+    println!();
+    print_bullet("Optional: configure env-backed credential profiles for http_request.");
+    print_bullet(
+        "This avoids passing raw tokens in tool arguments (use credential_profile instead).",
+    );
+
+    let configure_profiles = Confirm::new()
+        .with_prompt("  Configure HTTP credential profiles now?")
+        .default(false)
+        .interact()?;
+    if !configure_profiles {
+        return Ok(());
+    }
+
+    loop {
+        let default_name = if http_request_config.credential_profiles.is_empty() {
+            "github".to_string()
+        } else {
+            format!(
+                "profile-{}",
+                http_request_config.credential_profiles.len() + 1
+            )
+        };
+        let raw_name: String = Input::new()
+            .with_prompt("  Profile name (e.g., github, linear)")
+            .default(default_name)
+            .interact_text()?;
+        let profile_name = normalize_http_request_profile_name(&raw_name);
+        if profile_name.is_empty() {
+            anyhow::bail!("Credential profile name must contain letters, numbers, '_' or '-'");
+        }
+        if http_request_config
+            .credential_profiles
+            .contains_key(&profile_name)
+        {
+            anyhow::bail!(
+                "Credential profile '{}' normalizes to '{}' which already exists. Choose a different profile name.",
+                raw_name,
+                profile_name
+            );
+        }
+
+        let env_var_default = default_env_var_for_profile(&profile_name);
+        let env_var_raw: String = Input::new()
+            .with_prompt("  Environment variable containing token/secret")
+            .default(env_var_default)
+            .interact_text()?;
+        let env_var = env_var_raw.trim().to_string();
+        if !is_valid_env_var_name(&env_var) {
+            anyhow::bail!(
+                "Invalid environment variable name: {env_var}. Expected [A-Za-z_][A-Za-z0-9_]*"
+            );
+        }
+
+        let header_name: String = Input::new()
+            .with_prompt("  Header name")
+            .default("Authorization".to_string())
+            .interact_text()?;
+        let header_name = header_name.trim().to_string();
+        if header_name.is_empty() {
+            anyhow::bail!("Header name must not be empty");
+        }
+
+        let value_prefix: String = Input::new()
+            .with_prompt("  Header value prefix (e.g., 'Bearer ', empty for raw token)")
+            .allow_empty(true)
+            .default("Bearer ".to_string())
+            .interact_text()?;
+
+        http_request_config.credential_profiles.insert(
+            profile_name.clone(),
+            HttpRequestCredentialProfile {
+                header_name,
+                env_var,
+                value_prefix,
+            },
+        );
+
+        println!(
+            "  {} Added credential profile: {}",
+            style("✓").green().bold(),
+            style(profile_name).green()
+        );
+
+        let add_another = Confirm::new()
+            .with_prompt("  Add another credential profile?")
+            .default(false)
+            .interact()?;
+        if !add_another {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 // ── Step 6: Web & Internet Tools ────────────────────────────────
@@ -3262,11 +3645,28 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
     if enable_http_request {
         http_request_config.enabled = true;
         http_request_config.allowed_domains = prompt_allowed_domains_for_tool("http_request")?;
+        setup_http_request_credential_profiles(&mut http_request_config)?;
         println!(
             "  {} http_request.allowed_domains = [{}]",
             style("✓").green().bold(),
             style(http_request_config.allowed_domains.join(", ")).green()
         );
+        if !http_request_config.credential_profiles.is_empty() {
+            let mut names: Vec<String> = http_request_config
+                .credential_profiles
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            println!(
+                "  {} http_request.credential_profiles = [{}]",
+                style("✓").green().bold(),
+                style(names.join(", ")).green()
+            );
+            print_bullet(
+                "Use tool arg `credential_profile` (for example `github`) instead of raw Authorization headers.",
+            );
+        }
     } else {
         println!(
             "  {} http_request: {}",
@@ -3691,7 +4091,66 @@ fn setup_memory() -> Result<MemoryConfig> {
 
     let mut config = memory_config_defaults_for_backend(backend);
     config.auto_save = auto_save;
+
+    if classify_memory_backend(backend) == MemoryBackendKind::SqliteQdrantHybrid {
+        configure_hybrid_qdrant_memory(&mut config)?;
+    }
+
     Ok(config)
+}
+
+fn configure_hybrid_qdrant_memory(config: &mut MemoryConfig) -> Result<()> {
+    print_bullet("Hybrid memory keeps local SQLite metadata and uses Qdrant for semantic ranking.");
+    print_bullet("SQLite storage path stays at the default workspace database.");
+
+    let qdrant_url_default = config
+        .qdrant
+        .url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:6333".to_string());
+    let qdrant_url: String = Input::new()
+        .with_prompt("  Qdrant URL")
+        .default(qdrant_url_default)
+        .interact_text()?;
+    let qdrant_url = qdrant_url.trim();
+    if qdrant_url.is_empty() {
+        bail!("Qdrant URL is required for sqlite_qdrant_hybrid backend");
+    }
+    config.qdrant.url = Some(qdrant_url.to_string());
+
+    let qdrant_collection: String = Input::new()
+        .with_prompt("  Qdrant collection")
+        .default(config.qdrant.collection.clone())
+        .interact_text()?;
+    let qdrant_collection = qdrant_collection.trim();
+    if !qdrant_collection.is_empty() {
+        config.qdrant.collection = qdrant_collection.to_string();
+    }
+
+    let qdrant_api_key: String = Input::new()
+        .with_prompt("  Qdrant API key (optional, Enter to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+    let qdrant_api_key = qdrant_api_key.trim();
+    config.qdrant.api_key = if qdrant_api_key.is_empty() {
+        None
+    } else {
+        Some(qdrant_api_key.to_string())
+    };
+
+    println!(
+        "  {} Qdrant: {} (collection: {}, api key: {})",
+        style("✓").green().bold(),
+        style(config.qdrant.url.as_deref().unwrap_or_default()).green(),
+        style(&config.qdrant.collection).green(),
+        if config.qdrant.api_key.is_some() {
+            style("set").green().to_string()
+        } else {
+            style("not set").dim().to_string()
+        }
+    );
+
+    Ok(())
 }
 
 fn setup_identity_backend() -> Result<IdentityConfig> {
@@ -4036,8 +4495,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    progress_mode: ProgressMode::default(),
                     group_reply: None,
                     base_url: None,
+                    ack_enabled: true,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -4264,6 +4725,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     } else {
                         Some(channel)
                     },
+                    channel_ids: vec![],
                     allowed_users,
                     group_reply: None,
                 });
@@ -8069,6 +8531,36 @@ mod tests {
     }
 
     #[test]
+    fn http_request_productivity_allowed_domains_include_common_integrations() {
+        let domains = http_request_productivity_allowed_domains();
+        assert!(domains.iter().any(|d| d == "api.github.com"));
+        assert!(domains.iter().any(|d| d == "api.linear.app"));
+        assert!(domains.iter().any(|d| d == "calendar.googleapis.com"));
+    }
+
+    #[test]
+    fn normalize_http_request_profile_name_sanitizes_input() {
+        assert_eq!(
+            normalize_http_request_profile_name(" GitHub Main "),
+            "github-main"
+        );
+        assert_eq!(
+            normalize_http_request_profile_name("LINEAR_API"),
+            "linear_api"
+        );
+        assert_eq!(normalize_http_request_profile_name("!!!"), "");
+    }
+
+    #[test]
+    fn is_valid_env_var_name_accepts_and_rejects_expected_patterns() {
+        assert!(is_valid_env_var_name("GITHUB_TOKEN"));
+        assert!(is_valid_env_var_name("_PRIVATE_KEY"));
+        assert!(!is_valid_env_var_name("1BAD"));
+        assert!(!is_valid_env_var_name("BAD-NAME"));
+        assert!(!is_valid_env_var_name("BAD NAME"));
+    }
+
+    #[test]
     fn local_provider_choices_include_sglang() {
         let choices = local_provider_choices();
         assert!(choices.iter().any(|(provider, _)| *provider == "sglang"));
@@ -8082,9 +8574,11 @@ mod tests {
     #[test]
     fn backend_key_from_choice_maps_supported_backends() {
         assert_eq!(backend_key_from_choice(0), "sqlite");
-        assert_eq!(backend_key_from_choice(1), "lucid");
-        assert_eq!(backend_key_from_choice(2), "markdown");
-        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(1), "sqlite_qdrant_hybrid");
+        assert_eq!(backend_key_from_choice(2), "lucid");
+        assert_eq!(backend_key_from_choice(3), "cortex-mem");
+        assert_eq!(backend_key_from_choice(4), "markdown");
+        assert_eq!(backend_key_from_choice(5), "none");
         assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
@@ -8095,6 +8589,12 @@ mod tests {
         assert!(lucid.uses_sqlite_hygiene);
         assert!(lucid.sqlite_based);
         assert!(lucid.optional_dependency);
+
+        let cortex_mem = memory_backend_profile("cortex-mem");
+        assert!(cortex_mem.auto_save_default);
+        assert!(cortex_mem.uses_sqlite_hygiene);
+        assert!(cortex_mem.sqlite_based);
+        assert!(cortex_mem.optional_dependency);
 
         let markdown = memory_backend_profile("markdown");
         assert!(markdown.auto_save_default);
@@ -8118,6 +8618,18 @@ mod tests {
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 10000);
+    }
+
+    #[test]
+    fn memory_config_defaults_for_hybrid_enable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("sqlite_qdrant_hybrid");
+        assert_eq!(config.backend, "sqlite_qdrant_hybrid");
+        assert!(config.auto_save);
+        assert!(config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 7);
+        assert_eq!(config.purge_after_days, 30);
+        assert_eq!(config.embedding_cache_size, 10000);
+        assert_eq!(config.qdrant.collection, "zeroclaw_memories");
     }
 
     #[test]

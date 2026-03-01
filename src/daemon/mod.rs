@@ -65,7 +65,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
+                    async move { Box::pin(crate::channels::start_channels(cfg)).await }
                 },
             ));
         } else {
@@ -214,7 +214,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            match crate::agent::run(
+            match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -222,7 +222,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 temp,
                 vec![],
                 false,
-            )
+                None,
+            ))
             .await
             {
                 Ok(output) => {
@@ -245,7 +246,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                             }
                         }
                     } else {
-                        tracing::debug!("Heartbeat returned NO_REPLY sentinel; skipping delivery");
+                        tracing::debug!(
+                            "Heartbeat returned sentinel (NO_REPLY/HEARTBEAT_OK); skipping delivery"
+                        );
                     }
                 }
                 Err(e) => {
@@ -258,13 +261,22 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 fn heartbeat_announcement_text(output: &str) -> Option<String> {
-    if crate::cron::scheduler::is_no_reply_sentinel(output) {
+    if crate::cron::scheduler::is_no_reply_sentinel(output) || is_heartbeat_ok_sentinel(output) {
         return None;
     }
     if output.trim().is_empty() {
         return Some("heartbeat task executed".to_string());
     }
     Some(output.to_string())
+}
+
+fn is_heartbeat_ok_sentinel(output: &str) -> bool {
+    const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
+    output
+        .trim()
+        .get(..HEARTBEAT_OK.len())
+        .map(|prefix| prefix.eq_ignore_ascii_case(HEARTBEAT_OK))
+        .unwrap_or(false)
 }
 
 fn heartbeat_tasks_for_tick(
@@ -486,6 +498,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });
@@ -568,6 +582,16 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_announcement_text_skips_heartbeat_ok_sentinel() {
+        assert!(heartbeat_announcement_text(" heartbeat_ok ").is_none());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_skips_heartbeat_ok_prefix_case_insensitive() {
+        assert!(heartbeat_announcement_text(" heArTbEaT_oK - all clear ").is_none());
+    }
+
+    #[test]
     fn heartbeat_announcement_text_uses_default_for_empty_output() {
         assert_eq!(
             heartbeat_announcement_text(" \n\t "),
@@ -644,6 +668,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });

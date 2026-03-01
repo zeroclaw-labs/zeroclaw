@@ -14,9 +14,12 @@ ZeroClaw ghi log đường dẫn config đã giải quyết khi khởi động �
 
 - `Config loaded` với các trường: `path`, `workspace`, `source`, `initialized`
 
-Lệnh xuất schema:
+Lệnh CLI để kiểm tra và sửa đổi cấu hình:
 
-- `zeroclaw config schema` (xuất JSON Schema draft 2020-12 ra stdout)
+- `zeroclaw config show` — xuất cấu hình hiệu lực dạng JSON (ẩn secrets)
+- `zeroclaw config get <key>` — truy vấn giá trị theo đường dẫn (ví dụ: `zeroclaw config get gateway.port`)
+- `zeroclaw config set <key> <value>` — cập nhật giá trị và lưu vào `config.toml`
+- `zeroclaw config schema` — xuất JSON Schema (draft 2020-12) ra stdout
 
 ## Khóa chính
 

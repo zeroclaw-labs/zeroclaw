@@ -2,10 +2,11 @@ use super::traits::{Tool, ToolResult};
 use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
-use crate::config::UrlAccessConfig;
+use crate::config::{HttpRequestCredentialProfile, UrlAccessConfig};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ pub struct HttpRequestTool {
     max_response_size: usize,
     timeout_secs: u64,
     user_agent: String,
+    credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
 }
 
 impl HttpRequestTool {
@@ -28,6 +30,7 @@ impl HttpRequestTool {
         max_response_size: usize,
         timeout_secs: u64,
         user_agent: String,
+        credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
     ) -> Self {
         Self {
             security,
@@ -36,6 +39,10 @@ impl HttpRequestTool {
             max_response_size,
             timeout_secs,
             user_agent,
+            credential_profiles: credential_profiles
+                .into_iter()
+                .map(|(name, profile)| (name.trim().to_ascii_lowercase(), profile))
+                .collect(),
         }
     }
 
@@ -99,6 +106,95 @@ impl HttpRequestTool {
             .collect()
     }
 
+    fn resolve_credential_profile(
+        &self,
+        profile_name: &str,
+    ) -> anyhow::Result<(Vec<(String, String)>, Vec<String>)> {
+        let requested_name = profile_name.trim();
+        if requested_name.is_empty() {
+            anyhow::bail!("credential_profile must not be empty");
+        }
+
+        let profile = self
+            .credential_profiles
+            .get(&requested_name.to_ascii_lowercase())
+            .ok_or_else(|| {
+                let mut names: Vec<&str> = self
+                    .credential_profiles
+                    .keys()
+                    .map(std::string::String::as_str)
+                    .collect();
+                names.sort_unstable();
+                if names.is_empty() {
+                    anyhow::anyhow!(
+                        "Unknown credential_profile '{requested_name}'. No credential profiles are configured under [http_request.credential_profiles]."
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "Unknown credential_profile '{requested_name}'. Available profiles: {}",
+                        names.join(", ")
+                    )
+                }
+            })?;
+
+        let header_name = profile.header_name.trim();
+        if header_name.is_empty() {
+            anyhow::bail!(
+                "credential_profile '{requested_name}' has an empty header_name in config"
+            );
+        }
+
+        let env_var = profile.env_var.trim();
+        if env_var.is_empty() {
+            anyhow::bail!("credential_profile '{requested_name}' has an empty env_var in config");
+        }
+
+        let secret = std::env::var(env_var).map_err(|_| {
+            anyhow::anyhow!(
+                "credential_profile '{requested_name}' requires environment variable {env_var}"
+            )
+        })?;
+        let secret = secret.trim();
+        if secret.is_empty() {
+            anyhow::bail!(
+                "credential_profile '{requested_name}' uses environment variable {env_var}, but it is empty"
+            );
+        }
+
+        let header_value = format!("{}{}", profile.value_prefix, secret);
+        let mut sensitive_values = vec![secret.to_string(), header_value.clone()];
+        sensitive_values.sort_unstable();
+        sensitive_values.dedup();
+
+        Ok((
+            vec![(header_name.to_string(), header_value)],
+            sensitive_values,
+        ))
+    }
+
+    fn has_header_name_conflict(
+        explicit_headers: &[(String, String)],
+        injected_headers: &[(String, String)],
+    ) -> bool {
+        explicit_headers.iter().any(|(explicit_key, _)| {
+            injected_headers
+                .iter()
+                .any(|(injected_key, _)| injected_key.eq_ignore_ascii_case(explicit_key))
+        })
+    }
+
+    fn redact_sensitive_values(text: &str, sensitive_values: &[String]) -> String {
+        let mut redacted = text.to_string();
+        for value in sensitive_values {
+            let needle = value.trim();
+            if needle.is_empty() || needle.len() < 6 {
+                continue;
+            }
+            redacted = redacted.replace(needle, "***REDACTED***");
+        }
+        redacted
+    }
+
     async fn execute_request(
         &self,
         url: &str,
@@ -155,7 +251,7 @@ impl Tool for HttpRequestTool {
 
     fn description(&self) -> &str {
         "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
-        Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
+        Security constraints: allowlist-only domains, no local/private hosts, configurable timeout/response size limits, and optional env-backed credential profiles."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -176,6 +272,10 @@ impl Tool for HttpRequestTool {
                     "description": "Optional HTTP headers as key-value pairs (e.g., {\"Authorization\": \"Bearer token\", \"Content-Type\": \"application/json\"})",
                     "default": {}
                 },
+                "credential_profile": {
+                    "type": "string",
+                    "description": "Optional profile name from [http_request.credential_profiles]. Lets the harness inject credentials from environment variables without passing raw tokens in tool arguments."
+                },
                 "body": {
                     "type": "string",
                     "description": "Optional request body (for POST, PUT, PATCH requests)"
@@ -193,6 +293,19 @@ impl Tool for HttpRequestTool {
 
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
         let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
+        let credential_profile = match args.get("credential_profile") {
+            Some(value) => match value.as_str() {
+                Some(name) => Some(name),
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Invalid 'credential_profile': expected string".into()),
+                    });
+                }
+            },
+            None => None,
+        };
         let body = args.get("body").and_then(|v| v.as_str());
 
         if !self.security.can_act() {
@@ -233,7 +346,37 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = self.parse_headers(&headers_val);
+        let mut request_headers = self.parse_headers(&headers_val);
+        let mut sensitive_values = Vec::new();
+        if let Some(profile_name) = credential_profile {
+            match self.resolve_credential_profile(profile_name) {
+                Ok((injected_headers, profile_sensitive_values)) => {
+                    if Self::has_header_name_conflict(&request_headers, &injected_headers) {
+                        let names = injected_headers
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "credential_profile '{profile_name}' conflicts with explicit headers ({names}); remove duplicate header keys from args.headers"
+                            )),
+                        });
+                    }
+                    request_headers.extend(injected_headers);
+                    sensitive_values.extend(profile_sensitive_values);
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
 
         match self
             .execute_request(&url, method, request_headers, body)
@@ -246,22 +389,31 @@ impl Tool for HttpRequestTool {
                 // Get response headers (redact sensitive ones)
                 let response_headers = response.headers().iter();
                 let headers_text = response_headers
-                    .map(|(k, _)| {
-                        let is_sensitive = k.as_str().to_lowercase().contains("set-cookie");
+                    .map(|(k, v)| {
+                        let lower = k.as_str().to_ascii_lowercase();
+                        let is_sensitive = lower.contains("set-cookie")
+                            || lower.contains("authorization")
+                            || lower.contains("api-key")
+                            || lower.contains("token")
+                            || lower.contains("secret");
                         if is_sensitive {
                             format!("{}: ***REDACTED***", k.as_str())
                         } else {
-                            format!("{}: {:?}", k.as_str(), k.as_str())
+                            let val = v.to_str().unwrap_or("<non-UTF8>");
+                            format!("{}: {}", k.as_str(), val)
                         }
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let headers_text = Self::redact_sensitive_values(&headers_text, &sensitive_values);
 
                 // Get response body with size limit
                 let response_text = match response.text().await {
                     Ok(text) => self.truncate_response(&text),
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
+                let response_text =
+                    Self::redact_sensitive_values(&response_text, &sensitive_values);
 
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
@@ -308,6 +460,7 @@ mod tests {
             1_000_000,
             30,
             "test".to_string(),
+            HashMap::new(),
         )
     }
 
@@ -430,6 +583,7 @@ mod tests {
             1_000_000,
             30,
             "test".to_string(),
+            HashMap::new(),
         );
         let err = tool
             .validate_url("https://example.com")
@@ -553,6 +707,7 @@ mod tests {
             1_000_000,
             30,
             "test".to_string(),
+            HashMap::new(),
         );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -575,6 +730,7 @@ mod tests {
             1_000_000,
             30,
             "test".to_string(),
+            HashMap::new(),
         );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -600,6 +756,7 @@ mod tests {
             10,
             30,
             "test".to_string(),
+            HashMap::new(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -657,6 +814,96 @@ mod tests {
         let headers = vec![("Authorization".into(), "Bearer real-token".into())];
         let _ = HttpRequestTool::redact_headers_for_display(&headers);
         assert_eq!(headers[0].1, "Bearer real-token");
+    }
+
+    #[test]
+    fn resolve_credential_profile_injects_env_backed_header() {
+        let test_secret = "test-credential-value-12345";
+        std::env::set_var("ZEROCLAW_TEST_HTTP_CREDENTIAL", test_secret);
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "github".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "Authorization".to_string(),
+                env_var: "ZEROCLAW_TEST_HTTP_CREDENTIAL".to_string(),
+                value_prefix: "Bearer ".to_string(),
+            },
+        );
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["api.github.com".into()],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+            profiles,
+        );
+
+        let (headers, sensitive_values) = tool
+            .resolve_credential_profile("github")
+            .expect("profile should resolve");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Authorization");
+        assert_eq!(headers[0].1, format!("Bearer {test_secret}"));
+        assert!(sensitive_values.contains(&test_secret.to_string()));
+        assert!(sensitive_values.contains(&format!("Bearer {test_secret}")));
+
+        std::env::remove_var("ZEROCLAW_TEST_HTTP_CREDENTIAL");
+    }
+
+    #[test]
+    fn resolve_credential_profile_missing_env_var_fails() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "missing".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "Authorization".to_string(),
+                env_var: "ZEROCLAW_TEST_MISSING_HTTP_REQUEST_TOKEN".to_string(),
+                value_prefix: "Bearer ".to_string(),
+            },
+        );
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+            profiles,
+        );
+
+        let err = tool
+            .resolve_credential_profile("missing")
+            .expect_err("missing env var should fail")
+            .to_string();
+        assert!(err.contains("ZEROCLAW_TEST_MISSING_HTTP_REQUEST_TOKEN"));
+    }
+
+    #[test]
+    fn has_header_name_conflict_is_case_insensitive() {
+        let explicit = vec![("authorization".to_string(), "Bearer one".to_string())];
+        let injected = vec![("Authorization".to_string(), "Bearer two".to_string())];
+        assert!(HttpRequestTool::has_header_name_conflict(
+            &explicit, &injected
+        ));
+    }
+
+    #[test]
+    fn redact_sensitive_values_scrubs_injected_secrets() {
+        let text = "Authorization: Bearer super-secret-token\nbody=super-secret-token";
+        let redacted = HttpRequestTool::redact_sensitive_values(
+            text,
+            &[
+                "super-secret-token".to_string(),
+                "Bearer super-secret-token".to_string(),
+            ],
+        );
+        assert!(!redacted.contains("super-secret-token"));
+        assert!(redacted.contains("***REDACTED***"));
     }
 
     // ── SSRF: alternate IP notation bypass defense-in-depth ─────────

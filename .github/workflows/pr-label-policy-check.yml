@@ -7,6 +7,7 @@ on:
             - ".github/workflows/pr-labeler.yml"
             - ".github/workflows/pr-auto-response.yml"
     push:
+        branches: [dev, main]
         paths:
             - ".github/label-policy.json"
             - ".github/workflows/pr-labeler.yml"
@@ -27,7 +28,7 @@ env:
 
 jobs:
     contributor-tier-consistency:
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 10
         steps:
             - name: Checkout

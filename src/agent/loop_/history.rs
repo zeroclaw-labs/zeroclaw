@@ -28,8 +28,13 @@ pub(super) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     }
 
     let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let mut trim_end = start + (non_system_count - max_history);
+    // Never keep a leading `role=tool` at the trim boundary. Tool-message runs
+    // must remain attached to their preceding assistant(tool_calls) message.
+    while trim_end < history.len() && history[trim_end].role == "tool" {
+        trim_end += 1;
+    }
+    history.drain(start..trim_end);
 }
 
 pub(super) fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
@@ -61,6 +66,7 @@ pub(super) async fn auto_compact_history(
     provider: &dyn Provider,
     model: &str,
     max_history: usize,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -80,8 +86,23 @@ pub(super) async fn auto_compact_history(
         return Ok(false);
     }
 
-    let compact_end = start + compact_count;
+    let mut compact_end = start + compact_count;
+    // Do not split assistant(tool_calls) -> tool runs across compaction boundary.
+    while compact_end < history.len() && history[compact_end].role == "tool" {
+        compact_end += 1;
+    }
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
+    let to_compact = if let Some(hooks) = hooks {
+        match hooks.run_before_compaction(to_compact).await {
+            crate::hooks::HookResult::Continue(messages) => messages,
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "history compaction cancelled by hook");
+                return Ok(false);
+            }
+        }
+    } else {
+        to_compact
+    };
     let transcript = build_compaction_transcript(&to_compact);
 
     let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
@@ -100,7 +121,112 @@ pub(super) async fn auto_compact_history(
         });
 
     let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
+    let summary = if let Some(hooks) = hooks {
+        match hooks.run_after_compaction(summary).await {
+            crate::hooks::HookResult::Continue(next_summary) => next_summary,
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "post-compaction summary cancelled by hook");
+                return Ok(false);
+            }
+        }
+    } else {
+        summary
+    };
     apply_compaction_summary(history, start, compact_end, &summary);
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{ChatRequest, ChatResponse, Provider};
+    use async_trait::async_trait;
+
+    struct StaticSummaryProvider;
+
+    #[async_trait]
+    impl Provider for StaticSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("- summarized context".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("- summarized context".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+            })
+        }
+    }
+
+    fn assistant_with_tool_call(id: &str) -> ChatMessage {
+        ChatMessage::assistant(format!(
+            "{{\"content\":\"\",\"tool_calls\":[{{\"id\":\"{id}\",\"name\":\"shell\",\"arguments\":\"{{}}\"}}]}}"
+        ))
+    }
+
+    fn tool_result(id: &str) -> ChatMessage {
+        ChatMessage::tool(format!("{{\"tool_call_id\":\"{id}\",\"content\":\"ok\"}}"))
+    }
+
+    #[test]
+    fn trim_history_avoids_orphan_tool_at_boundary() {
+        let mut history = vec![
+            ChatMessage::user("old"),
+            assistant_with_tool_call("call_1"),
+            tool_result("call_1"),
+            ChatMessage::user("recent"),
+        ];
+
+        trim_history(&mut history, 2);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "recent");
+    }
+
+    #[tokio::test]
+    async fn auto_compact_history_does_not_split_tool_run_boundary() {
+        let mut history = vec![
+            ChatMessage::user("oldest"),
+            assistant_with_tool_call("call_2"),
+            tool_result("call_2"),
+        ];
+        for idx in 0..19 {
+            history.push(ChatMessage::user(format!("recent-{idx}")));
+        }
+        // 22 non-system messages => compaction with max_history=21 would
+        // previously cut right before the tool result (index 2).
+        assert_eq!(history.len(), 22);
+
+        let compacted =
+            auto_compact_history(&mut history, &StaticSummaryProvider, "test-model", 21, None)
+                .await
+                .expect("compaction should succeed");
+
+        assert!(compacted);
+        assert_eq!(history[0].role, "assistant");
+        assert!(
+            history[0].content.contains("[Compaction summary]"),
+            "summary message should replace compacted range"
+        );
+        assert_ne!(
+            history[1].role, "tool",
+            "first retained message must not be an orphan tool result"
+        );
+    }
 }

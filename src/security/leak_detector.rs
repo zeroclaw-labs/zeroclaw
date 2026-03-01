@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 /// Generic rules (password=, secret=, token=) only fire when `sensitivity` exceeds
 /// this threshold, reducing false positives on technical content.
 const GENERIC_SECRET_SENSITIVITY_THRESHOLD: f64 = 0.5;
-const ENTROPY_TOKEN_MIN_LEN: usize = 20;
+const ENTROPY_TOKEN_MIN_LEN: usize = 24;
 const HIGH_ENTROPY_BASELINE: f64 = 4.2;
 
 /// Result of leak detection.
@@ -307,6 +307,12 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redacted: &mut String,
     ) {
+        // Keep low-sensitivity mode conservative: structural patterns still
+        // run at any sensitivity, but entropy heuristics should not trigger.
+        if self.sensitivity <= GENERIC_SECRET_SENSITIVITY_THRESHOLD {
+            return;
+        }
+
         let threshold = (HIGH_ENTROPY_BASELINE + (self.sensitivity - 0.5) * 0.6).clamp(3.9, 4.8);
         let mut flagged = false;
 
@@ -363,7 +369,7 @@ fn shannon_entropy(bytes: &[u8]) -> f64 {
         .iter()
         .filter(|&&count| count > 0)
         .map(|&count| {
-            let p = count as f64 / len;
+            let p = f64::from(count) / len;
             -p * p.log2()
         })
         .sum()
@@ -390,7 +396,7 @@ mod tests {
                 assert!(patterns.iter().any(|p| p.contains("Stripe")));
                 assert!(redacted.contains("[REDACTED"));
             }
-            _ => panic!("Should detect Stripe key"),
+            LeakResult::Clean => panic!("Should detect Stripe key"),
         }
     }
 
@@ -403,7 +409,7 @@ mod tests {
             LeakResult::Detected { patterns, .. } => {
                 assert!(patterns.iter().any(|p| p.contains("AWS")));
             }
-            _ => panic!("Should detect AWS key"),
+            LeakResult::Clean => panic!("Should detect AWS key"),
         }
     }
 
@@ -421,7 +427,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(patterns.iter().any(|p| p.contains("private key")));
                 assert!(redacted.contains("[REDACTED_PRIVATE_KEY]"));
             }
-            _ => panic!("Should detect private key"),
+            LeakResult::Clean => panic!("Should detect private key"),
         }
     }
 
@@ -435,7 +441,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(patterns.iter().any(|p| p.contains("JWT")));
                 assert!(redacted.contains("[REDACTED_JWT]"));
             }
-            _ => panic!("Should detect JWT"),
+            LeakResult::Clean => panic!("Should detect JWT"),
         }
     }
 
@@ -448,14 +454,16 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             LeakResult::Detected { patterns, .. } => {
                 assert!(patterns.iter().any(|p| p.contains("PostgreSQL")));
             }
-            _ => panic!("Should detect database URL"),
+            LeakResult::Clean => panic!("Should detect database URL"),
         }
     }
 
     #[test]
     fn low_sensitivity_skips_generic() {
         let detector = LeakDetector::with_sensitivity(0.3);
-        let content = "secret=mygenericvalue123456";
+        // Use low entropy so this test only exercises the generic rule gate and
+        // does not trip the independent high-entropy detector.
+        let content = "secret=aaaaaaaaaaaaaaaa";
         let result = detector.scan(content);
         // Low sensitivity should not flag generic secrets
         assert!(matches!(result, LeakResult::Clean));
@@ -506,7 +514,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(patterns.iter().any(|p| p.contains("High-entropy token")));
                 assert!(redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"));
             }
-            _ => panic!("expected high-entropy detection"),
+            LeakResult::Clean => panic!("expected high-entropy detection"),
         }
     }
 

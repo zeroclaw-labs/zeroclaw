@@ -4,25 +4,29 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
-    AgentConfig, AgentsIpcConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig,
-    BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
-    CoordinationConfig, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig,
-    EconomicConfig, EconomicTokenPricing,
-    DockerRuntimeConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
-    GroupReplyConfig, GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
+    build_runtime_proxy_client_with_timeouts, default_model_fallback_for_provider,
+    resolve_default_model_id, runtime_proxy_config, set_runtime_proxy_config,
+    AckReactionChannelsConfig, AckReactionChatType, AckReactionConfig, AckReactionRuleAction,
+    AckReactionRuleConfig, AckReactionStrategy, AgentConfig, AgentSessionBackend,
+    AgentSessionConfig, AgentSessionStrategy, AgentsIpcConfig, AuditConfig, AutonomyConfig,
+    BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
+    ClassificationRule, ComposioConfig, Config, CoordinationConfig, CostConfig, CronConfig,
+    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EconomicConfig, EconomicTokenPricing,
+    EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig, GroupReplyConfig,
+    GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
+    HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig, IdentityConfig, LarkConfig,
+    MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
     NonCliNaturalLanguageApprovalMode, ObservabilityConfig, OtpChallengeDelivery, OtpConfig,
-    OtpMethod, PeripheralBoardConfig, PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig,
-    PluginsConfig, ProviderConfig, ProxyConfig, ProxyScope, QdrantConfig,
-    QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SecurityRoleConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig, UrlAccessConfig,
+    OtpMethod, OutboundLeakGuardAction, OutboundLeakGuardConfig, PeripheralBoardConfig,
+    PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig, PluginsConfig, ProgressMode,
+    ProviderConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,
+    ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger, ResourceLimitsConfig, RuntimeConfig,
+    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
+    SecurityRoleConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
+    StorageProviderConfig, StorageProviderSection, StreamMode, SyscallAnomalyConfig,
+    TelegramConfig, TranscriptionConfig, TunnelConfig, UrlAccessConfig,
     WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy, WasmRuntimeConfig,
-    WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig, DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -51,8 +55,10 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             group_reply: None,
             base_url: None,
+            ack_enabled: true,
         };
 
         let discord = DiscordConfig {
@@ -105,5 +111,23 @@ mod tests {
         assert_eq!(lark.app_id, "app-id");
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
+    }
+
+    #[test]
+    fn reexported_http_request_config_is_constructible() {
+        let cfg = HttpRequestConfig {
+            enabled: true,
+            allowed_domains: vec!["api.openai.com".into()],
+            max_response_size: 256_000,
+            timeout_secs: 10,
+            user_agent: "zeroclaw-test".into(),
+            credential_profiles: std::collections::HashMap::new(),
+        };
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.allowed_domains, vec!["api.openai.com"]);
+        assert_eq!(cfg.max_response_size, 256_000);
+        assert_eq!(cfg.timeout_secs, 10);
+        assert_eq!(cfg.user_agent, "zeroclaw-test");
     }
 }

@@ -6,6 +6,8 @@ use std::panic::AssertUnwindSafe;
 use tracing::info;
 
 use crate::channels::traits::ChannelMessage;
+use crate::config::HooksConfig;
+use crate::plugins::traits::PluginCapability;
 use crate::providers::traits::{ChatMessage, ChatResponse};
 use crate::tools::traits::ToolResult;
 
@@ -26,6 +28,26 @@ impl HookRunner {
         Self {
             handlers: Vec::new(),
         }
+    }
+
+    /// Build a hook runner from configuration, registering enabled built-in hooks.
+    ///
+    /// Returns `None` if hooks are disabled in config.
+    pub fn from_config(config: &HooksConfig) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+        let mut runner = Self::new();
+        if config.builtin.boot_script {
+            runner.register(Box::new(super::builtin::BootScriptHook));
+        }
+        if config.builtin.command_logger {
+            runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
+        }
+        if config.builtin.session_memory {
+            runner.register(Box::new(super::builtin::SessionMemoryHook));
+        }
+        Some(runner)
     }
 
     /// Register a handler and re-sort by descending priority.
@@ -243,6 +265,119 @@ impl HookRunner {
             }
         }
         HookResult::Continue((name, args))
+    }
+
+    pub async fn run_before_compaction(
+        &self,
+        mut messages: Vec<ChatMessage>,
+    ) -> HookResult<Vec<ChatMessage>> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_compaction(messages.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(next)) => messages = next,
+                Ok(HookResult::Cancel(reason)) => {
+                    info!(
+                        hook = hook_name,
+                        reason, "before_compaction cancelled by hook"
+                    );
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "before_compaction hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(messages)
+    }
+
+    pub async fn run_after_compaction(&self, mut summary: String) -> HookResult<String> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.after_compaction(summary.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(next)) => summary = next,
+                Ok(HookResult::Cancel(reason)) => {
+                    info!(
+                        hook = hook_name,
+                        reason, "after_compaction cancelled by hook"
+                    );
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "after_compaction hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(summary)
+    }
+
+    pub async fn run_tool_result_persist(
+        &self,
+        tool: String,
+        mut result: ToolResult,
+    ) -> HookResult<ToolResult> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            let has_modify_cap = h
+                .capabilities()
+                .contains(&PluginCapability::ModifyToolResults);
+            match AssertUnwindSafe(h.tool_result_persist(tool.clone(), result.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(next_result)) => {
+                    if next_result.success != result.success
+                        || next_result.output != result.output
+                        || next_result.error != result.error
+                    {
+                        if has_modify_cap {
+                            result = next_result;
+                        } else {
+                            tracing::warn!(
+                                hook = hook_name,
+                                "hook attempted to modify tool result without ModifyToolResults capability; ignoring modification"
+                            );
+                        }
+                    } else {
+                        // No actual modification — pass-through is always allowed.
+                        result = next_result;
+                    }
+                }
+                Ok(HookResult::Cancel(reason)) => {
+                    if has_modify_cap {
+                        info!(
+                            hook = hook_name,
+                            reason, "tool_result_persist cancelled by hook"
+                        );
+                        return HookResult::Cancel(reason);
+                    } else {
+                        tracing::warn!(
+                            hook = hook_name,
+                            reason,
+                            "hook attempted to cancel tool result without ModifyToolResults capability; ignoring cancellation"
+                        );
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "tool_result_persist hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(result)
     }
 
     pub async fn run_on_message_received(
@@ -478,6 +613,125 @@ mod tests {
         match runner.run_before_prompt_build("hello".into()).await {
             HookResult::Continue(result) => assert_eq!(result, "HELLO_done"),
             HookResult::Cancel(_) => panic!("should not cancel"),
+        }
+    }
+
+    // -- Capability-gated tool_result_persist tests --
+
+    /// Hook that flips success to false (modification) without capability.
+    struct UncappedResultMutator;
+
+    #[async_trait]
+    impl HookHandler for UncappedResultMutator {
+        fn name(&self) -> &str {
+            "uncapped_mutator"
+        }
+        async fn tool_result_persist(
+            &self,
+            _tool: String,
+            mut result: ToolResult,
+        ) -> HookResult<ToolResult> {
+            result.success = false;
+            result.output = "tampered".into();
+            HookResult::Continue(result)
+        }
+    }
+
+    /// Hook that flips success with the required capability.
+    struct CappedResultMutator;
+
+    #[async_trait]
+    impl HookHandler for CappedResultMutator {
+        fn name(&self) -> &str {
+            "capped_mutator"
+        }
+        fn capabilities(&self) -> &[PluginCapability] {
+            &[PluginCapability::ModifyToolResults]
+        }
+        async fn tool_result_persist(
+            &self,
+            _tool: String,
+            mut result: ToolResult,
+        ) -> HookResult<ToolResult> {
+            result.success = false;
+            result.output = "authorized_change".into();
+            HookResult::Continue(result)
+        }
+    }
+
+    /// Hook without capability that tries to cancel.
+    struct UncappedResultCanceller;
+
+    #[async_trait]
+    impl HookHandler for UncappedResultCanceller {
+        fn name(&self) -> &str {
+            "uncapped_canceller"
+        }
+        async fn tool_result_persist(
+            &self,
+            _tool: String,
+            _result: ToolResult,
+        ) -> HookResult<ToolResult> {
+            HookResult::Cancel("blocked".into())
+        }
+    }
+
+    fn sample_tool_result() -> ToolResult {
+        ToolResult {
+            success: true,
+            output: "original".into(),
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_persist_blocks_modification_without_capability() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(UncappedResultMutator));
+
+        let result = runner
+            .run_tool_result_persist("shell".into(), sample_tool_result())
+            .await;
+        match result {
+            HookResult::Continue(r) => {
+                assert!(r.success, "modification should have been blocked");
+                assert_eq!(r.output, "original");
+            }
+            HookResult::Cancel(_) => panic!("should not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_persist_allows_modification_with_capability() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(CappedResultMutator));
+
+        let result = runner
+            .run_tool_result_persist("shell".into(), sample_tool_result())
+            .await;
+        match result {
+            HookResult::Continue(r) => {
+                assert!(!r.success, "modification should have been applied");
+                assert_eq!(r.output, "authorized_change");
+            }
+            HookResult::Cancel(_) => panic!("should not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_persist_blocks_cancel_without_capability() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(UncappedResultCanceller));
+
+        let result = runner
+            .run_tool_result_persist("shell".into(), sample_tool_result())
+            .await;
+        match result {
+            HookResult::Continue(r) => {
+                assert!(r.success, "cancel should have been blocked");
+                assert_eq!(r.output, "original");
+            }
+            HookResult::Cancel(_) => panic!("cancel without capability should be blocked"),
         }
     }
 }

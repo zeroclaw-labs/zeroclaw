@@ -29,6 +29,8 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 | See project PR/issue docs snapshot | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
 | Perform i18n completion for docs changes | [i18n-guide.md](i18n-guide.md) |
 
+Installation source-of-truth: keep install/run instructions in repository docs and README pages; issue comments are supplemental context only.
+
 ## Quick Decision Tree (10 seconds)
 
 - Need first-time setup or install? → [getting-started/README.md](getting-started/README.md)

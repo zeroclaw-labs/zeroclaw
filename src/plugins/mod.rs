@@ -41,6 +41,7 @@ pub mod discovery;
 pub mod loader;
 pub mod manifest;
 pub mod registry;
+pub mod runtime;
 pub mod traits;
 
 pub use discovery::discover_plugins;
@@ -50,7 +51,7 @@ pub use registry::{
     DiagnosticLevel, PluginDiagnostic, PluginHookRegistration, PluginOrigin, PluginRecord,
     PluginRegistry, PluginStatus, PluginToolRegistration,
 };
-pub use traits::{Plugin, PluginApi, PluginLogger};
+pub use traits::{Plugin, PluginApi, PluginCapability, PluginLogger};
 
 #[cfg(test)]
 mod tests {
@@ -64,6 +65,11 @@ mod tests {
             description: None,
             version: None,
             config_schema: None,
+            capabilities: vec![],
+            module_path: String::new(),
+            wit_packages: vec![],
+            tools: vec![],
+            providers: vec![],
         };
         assert_eq!(PLUGIN_MANIFEST_FILENAME, "zeroclaw.plugin.toml");
     }

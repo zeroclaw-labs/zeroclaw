@@ -159,6 +159,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
                 }
             },
         },
+        IntegrationEntry {
+            name: "Napcat",
+            description: "QQ via Napcat (OneBot)",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.napcat.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
         // ── AI Models ───────────────────────────────────────────
         IntegrationEntry {
             name: "OpenRouter",
@@ -514,9 +526,15 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         // ── Productivity ────────────────────────────────────────
         IntegrationEntry {
             name: "GitHub",
-            description: "Code, issues, PRs",
+            description: "Native issue/PR comment channel",
             category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config.github.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Notion",
@@ -752,7 +770,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use crate::config::schema::{
+        IMessageConfig, MatrixConfig, ProgressMode, StreamMode, TelegramConfig,
+    };
     use crate::config::Config;
 
     #[test]
@@ -819,6 +839,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });

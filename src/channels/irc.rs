@@ -287,7 +287,7 @@ impl IrcChannel {
         };
 
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let domain = rustls::pki_types::ServerName::try_from(self.server.clone())?;
+        let domain = rustls::pki_types::ServerName::try_from(self.server.as_str())?.to_owned();
         let tls = connector.connect(domain, tcp).await?;
 
         Ok(tls)

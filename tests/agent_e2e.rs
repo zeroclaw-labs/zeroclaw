@@ -66,6 +66,7 @@ impl Provider for MockProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             });
         }
         Ok(guard.remove(0))
@@ -192,6 +193,7 @@ impl Provider for RecordingProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             });
         }
         Ok(guard.remove(0))
@@ -241,6 +243,7 @@ fn text_response(text: &str) -> ChatResponse {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }
 }
 
@@ -250,6 +253,7 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
         tool_calls: calls,
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }
 }
 
@@ -375,6 +379,7 @@ async fn e2e_xml_dispatcher_tool_call() {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
         },
         text_response("XML tool executed"),
     ]));
@@ -1013,6 +1018,7 @@ async fn e2e_agent_research_prompt_guided() {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1031,6 +1037,7 @@ async fn e2e_agent_research_prompt_guided() {
         tool_calls: vec![], // Empty! Tool call is in text
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     };
 
     // Response 2: Research complete
@@ -1039,6 +1046,7 @@ async fn e2e_agent_research_prompt_guided() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     };
 
     // Response 3: Main turn response

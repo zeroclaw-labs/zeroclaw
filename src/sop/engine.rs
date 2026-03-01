@@ -210,7 +210,10 @@ impl SopEngine {
         }
 
         // Update run state
-        let run = self.active_runs.get_mut(run_id).unwrap();
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::anyhow!("Active run not found: {run_id}"))?;
         run.current_step = next_step_num;
 
         let step_idx = (next_step_num - 1) as usize;

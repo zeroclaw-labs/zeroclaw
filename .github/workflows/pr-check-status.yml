@@ -18,7 +18,8 @@ env:
 
 jobs:
   nudge-stale-prs:
-    runs-on: [self-hosted, aws-india]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write

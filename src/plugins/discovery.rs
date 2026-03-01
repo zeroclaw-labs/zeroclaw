@@ -126,7 +126,7 @@ pub fn discover_plugins(workspace_dir: Option<&Path>, extra_paths: &[PathBuf]) -
     let mut deduped: Vec<DiscoveredPlugin> = Vec::with_capacity(seen.len());
     // Collect in insertion order of the winning index
     let mut indices: Vec<usize> = seen.values().copied().collect();
-    indices.sort();
+    indices.sort_unstable();
     for i in indices {
         deduped.push(all_plugins.swap_remove(i));
     }

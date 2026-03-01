@@ -529,6 +529,48 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/pairing/devices — list paired devices
+pub async fn handle_api_pairing_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let devices = state.pairing.paired_devices();
+    Json(serde_json::json!({ "devices": devices })).into_response()
+}
+
+/// DELETE /api/pairing/devices/:id — revoke paired device
+pub async fn handle_api_pairing_device_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if !state.pairing.revoke_device(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Paired device not found"})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to persist pairing state: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "revoked": true, "id": id})).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn normalize_dashboard_config_toml(root: &mut toml::Value) {
@@ -655,6 +697,10 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut linq.api_token);
         mask_optional_secret(&mut linq.signing_secret);
     }
+    if let Some(github) = masked.channels_config.github.as_mut() {
+        mask_required_secret(&mut github.access_token);
+        mask_optional_secret(&mut github.webhook_secret);
+    }
     if let Some(wati) = masked.channels_config.wati.as_mut() {
         mask_required_secret(&mut wati.api_token);
     }
@@ -682,6 +728,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     }
     if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
+    }
+    if let Some(napcat) = masked.channels_config.napcat.as_mut() {
+        mask_optional_secret(&mut napcat.access_token);
     }
     if let Some(qq) = masked.channels_config.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
@@ -814,6 +863,13 @@ fn restore_masked_sensitive_fields(
         restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.github.as_mut(),
+        current.channels_config.github.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.wati.as_mut(),
         current.channels_config.wati.as_ref(),
     ) {
@@ -873,6 +929,12 @@ fn restore_masked_sensitive_fields(
         current.channels_config.dingtalk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.napcat.as_mut(),
+        current.channels_config.napcat.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.qq.as_mut(),

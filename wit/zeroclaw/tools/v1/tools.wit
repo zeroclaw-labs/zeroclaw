@@ -1,0 +1,22 @@
+package zeroclaw:tools@1.0.0;
+
+interface tools {
+  record tool-spec {
+    name: string,
+    description: string,
+    parameters-json: string,
+  }
+
+  record tool-exec-result {
+    success: bool,
+    output: string,
+    error: option<string>,
+  }
+
+  list-tools: func() -> list<tool-spec>;
+  execute-tool: func(name: string, args-json: string) -> tool-exec-result;
+}
+
+world plugin-tools {
+  export tools;
+}
