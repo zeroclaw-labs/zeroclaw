@@ -408,8 +408,9 @@ impl AnthropicProvider {
         response
             .content
             .into_iter()
-            .find(|c| c.kind == "text")
-            .and_then(|c| c.text)
+            .filter(|c| c.kind == "text")
+            .filter_map(|c| c.text.map(|text| text.trim().to_string()))
+            .find(|text| !text.is_empty())
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
@@ -1411,6 +1412,36 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn parse_text_response_ignores_empty_and_whitespace_text_blocks() {
+        let json = r#"{
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "   \n  "},
+                {"type": "text", "text": "  final answer  "}
+            ]
+        }"#;
+        let response: ChatResponse = serde_json::from_str(json).unwrap();
+
+        let parsed = AnthropicProvider::parse_text_response(response).unwrap();
+        assert_eq!(parsed, "final answer");
+    }
+
+    #[test]
+    fn parse_text_response_rejects_empty_or_whitespace_only_text_blocks() {
+        let json = r#"{
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "   \n  "},
+                {"type": "tool_use", "id": "tool_1", "name": "shell"}
+            ]
+        }"#;
+        let response: ChatResponse = serde_json::from_str(json).unwrap();
+
+        let err = AnthropicProvider::parse_text_response(response).unwrap_err();
+        assert!(err.to_string().contains("No response from Anthropic"));
     }
 
     #[test]
