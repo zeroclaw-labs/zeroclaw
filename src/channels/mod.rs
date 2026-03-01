@@ -6747,6 +6747,36 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    struct MockProcessTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MockProcessTool {
+        fn name(&self) -> &str {
+            "process"
+        }
+
+        fn description(&self) -> &str {
+            "Mock process tool for runtime visibility tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
     #[test]
     fn build_runtime_tool_visibility_prompt_respects_excluded_snapshot() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool), Box::new(MockEchoTool)];
@@ -6763,6 +6793,23 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(native.contains("Runtime Tool Availability (Authoritative)"));
         assert!(native.contains("native provider function-calling"));
         assert!(!native.contains("## Tool Use Protocol"));
+    }
+
+    #[test]
+    fn build_runtime_tool_visibility_prompt_excludes_process_with_default_policy() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockProcessTool), Box::new(MockEchoTool)];
+        let excluded = crate::config::AutonomyConfig::default().non_cli_excluded_tools;
+
+        assert!(
+            excluded.contains(&"process".to_string()),
+            "default non-CLI exclusion list must include process"
+        );
+
+        let prompt = build_runtime_tool_visibility_prompt(&tools, &excluded, false);
+        assert!(prompt.contains("Excluded by runtime policy:"));
+        assert!(prompt.contains("process"));
+        assert!(!prompt.contains("**process**:"));
+        assert!(prompt.contains("`mock_echo`"));
     }
 
     #[tokio::test]
