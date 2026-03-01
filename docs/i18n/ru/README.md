@@ -45,6 +45,7 @@
 
 - English: [../../README.md](../../README.md)
 - 简体中文: [../zh-CN/README.md](../zh-CN/README.md)
+- 繁體中文: [../zh-TW/README.md](../zh-TW/README.md)
 - 日本語: [../ja/README.md](../ja/README.md)
 - Français: [../fr/README.md](../fr/README.md)
 - Tiếng Việt: [../vi/README.md](../vi/README.md)

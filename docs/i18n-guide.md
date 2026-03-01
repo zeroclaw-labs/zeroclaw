@@ -16,7 +16,7 @@ Primary docs surfaces:
 Supported locales:
 
 - `en` (source of truth)
-- `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el` (full top-level parity in `docs/i18n/<locale>/`)
+- `zh-CN`, `zh-TW`, `ja`, `ru`, `fr`, `vi`, `el` (full top-level parity in `docs/i18n/<locale>/`)
 
 ## Canonical Layout
 

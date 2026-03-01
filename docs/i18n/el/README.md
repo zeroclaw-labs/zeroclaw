@@ -4,7 +4,7 @@
 
 Τελευταία ενημέρωση: **21 Φεβρουαρίου 2026**.
 
-Τοπικοποιημένα κέντρα: [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [Français](../fr/README.md) · [Tiếng Việt](../vi/README.md) · [Ελληνικά](README.md).
+Τοπικοποιημένα κέντρα: [简体中文](../zh-CN/README.md) · [繁體中文](../zh-TW/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [Français](../fr/README.md) · [Tiếng Việt](../vi/README.md) · [Ελληνικά](README.md).
 
 ## Γρήγορη Εκκίνηση
 

@@ -23,6 +23,7 @@ Use these i18n paths:
 |---|---|---|---|---|---|---|
 | `en` | `README.md` | `docs/README.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | Source of truth |
 | `zh-CN` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/commands-reference.md` | `docs/i18n/zh-CN/config-reference.md` | `docs/i18n/zh-CN/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `zh-TW` | `docs/i18n/zh-TW/README.md` | `docs/i18n/zh-TW/README.md` | `docs/i18n/zh-TW/commands-reference.md` | `docs/i18n/zh-TW/config-reference.md` | `docs/i18n/zh-TW/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `ja` | `docs/i18n/ja/README.md` | `docs/i18n/ja/README.md` | `docs/i18n/ja/commands-reference.md` | `docs/i18n/ja/config-reference.md` | `docs/i18n/ja/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `ru` | `docs/i18n/ru/README.md` | `docs/i18n/ru/README.md` | `docs/i18n/ru/commands-reference.md` | `docs/i18n/ru/config-reference.md` | `docs/i18n/ru/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `fr` | `docs/i18n/fr/README.md` | `docs/i18n/fr/README.md` | `docs/i18n/fr/commands-reference.md` | `docs/i18n/fr/config-reference.md` | `docs/i18n/fr/troubleshooting.md` | Full top-level parity (bridge + localized) |
@@ -36,6 +37,7 @@ Baseline on 2026-02-24 uses 40 top-level English docs (`docs/*.md`, locale root 
 | Locale | Missing top-level parity count |
 |---|---:|
 | `zh-CN` | 0 |
+| `zh-TW` | 0 |
 | `ja` | 0 |
 | `ru` | 0 |
 | `fr` | 0 |
@@ -49,6 +51,7 @@ As of 2026-02-24:
 | Locale | Enhanced bridge pages | Notes |
 |---|---:|---|
 | `zh-CN` | 33 | Bridge pages include topic positioning + source section map + execution hints |
+| `zh-TW` | 33 | Bridge pages (converted from zh-CN via OpenCC s2twp + Taiwan IT terminology) |
 | `ja` | 33 | Bridge pages include topic positioning + source section map + execution hints |
 | `ru` | 33 | Bridge pages include topic positioning + source section map + execution hints |
 | `fr` | 33 | Bridge pages include topic positioning + source section map + execution hints |
@@ -63,6 +66,7 @@ Not all localized landing pages are full translations of `README.md`:
 |---|---|---|
 | `en` | Full source | 100% |
 | `zh-CN` | Hub-style entry point | ~26% |
+| `zh-TW` | Hub-style entry point | ~26% |
 | `ja` | Hub-style entry point | ~26% |
 | `ru` | Hub-style entry point | ~26% |
 | `fr` | Near-complete translation | ~90% |

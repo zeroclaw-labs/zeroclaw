@@ -7,7 +7,8 @@ Narrative depth status: **enhanced bridge rollout completed for `zh-CN`/`ja`/`ru
 
 ## Locales
 
-- 简体中文 (Chinese): [zh-CN/README.md](zh-CN/README.md)
+- 简体中文 (Chinese Simplified): [zh-CN/README.md](zh-CN/README.md)
+- 繁體中文 (Chinese Traditional): [zh-TW/README.md](zh-TW/README.md)
 - 日本語 (Japanese): [ja/README.md](ja/README.md)
 - Русский (Russian): [ru/README.md](ru/README.md)
 - Français (French): [fr/README.md](fr/README.md)
@@ -19,6 +20,7 @@ Narrative depth status: **enhanced bridge rollout completed for `zh-CN`/`ja`/`ru
 - Docs structure map (language/part/function): [../structure/README.md](../structure/README.md)
 - Canonical locale trees:
   - `docs/i18n/zh-CN/`
+  - `docs/i18n/zh-TW/`
   - `docs/i18n/ja/`
   - `docs/i18n/ru/`
   - `docs/i18n/fr/`
