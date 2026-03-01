@@ -2295,7 +2295,7 @@ async fn handle_bluebubbles_webhook(
         let _ = bluebubbles.start_typing(&msg.reply_target).await;
         let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 let _ = bluebubbles.stop_typing(&msg.reply_target).await;
                 let safe_response = sanitize_gateway_response(
