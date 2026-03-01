@@ -243,6 +243,10 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    pub fn tool_specs(&self) -> &[ToolSpec] {
+        &self.tool_specs
+    }
+
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
     }

@@ -857,6 +857,7 @@ Environment overrides:
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
+| `command_context_rules` | `[]` | per-command context-aware allow/deny rules (domain/path constraints, optional high-risk override) |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -867,7 +868,7 @@ Environment overrides:
 | `allow_sensitive_file_writes` | `false` | allow `file_write`/`file_edit` on sensitive files/dirs (for example `.env`, `.aws/credentials`, private keys) |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
-| `non_cli_excluded_tools` | `[]` | tools hidden from non-CLI channel tool specs |
+| `non_cli_excluded_tools` | built-in denylist (includes `shell`, `process`, `file_write`, ...) | tools hidden from non-CLI channel tool specs |
 | `non_cli_approval_approvers` | `[]` | optional allowlist for who can run non-CLI approval-management commands |
 | `non_cli_natural_language_approval_mode` | `direct` | natural-language behavior for approval-management commands (`direct`, `request_confirm`, `disabled`) |
 | `non_cli_natural_language_approval_mode_by_channel` | `{}` | per-channel override map for natural-language approval mode |
@@ -878,6 +879,10 @@ Notes:
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
+- `command_context_rules` can narrow or override `allowed_commands` for matching commands:
+  - `action = "allow"` rules are restrictive when present for a command: at least one allow rule must match.
+  - `action = "deny"` rules explicitly block matching contexts.
+  - `allow_high_risk = true` allows a matching high-risk command to pass the hard block, but supervised mode still requires `approved=true`.
 - `file_read` blocks sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_reads = true` only for controlled debugging sessions.
 - `file_write` and `file_edit` block sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_writes = true` only for controlled break-glass sessions.
 - `file_read`, `file_write`, and `file_edit` refuse multiply-linked files (hard-link guard) to reduce workspace path bypass risk via hard-link escapes.
@@ -903,6 +908,7 @@ Notes:
   - `telegram:alice` allows only that channel+sender pair.
   - `telegram:*` allows any sender on Telegram.
   - `*:alice` allows `alice` on any channel.
+- By default, `process` is excluded on non-CLI channels alongside `shell`. To opt in intentionally, remove `"process"` from `[autonomy].non_cli_excluded_tools` in `config.toml`.
 - Use `/unapprove <tool>` to remove persisted approval from `autonomy.auto_approve`.
 - `/approve-pending` lists pending requests for the current sender+chat/channel scope.
 - If a tool remains unavailable after approval, check `autonomy.non_cli_excluded_tools` (runtime `/approvals` shows this list). Channel runtime reloads this list from `config.toml` automatically.
@@ -912,6 +918,18 @@ Notes:
 workspace_only = false
 forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
 allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+
+[[autonomy.command_context_rules]]
+command = "curl"
+action = "allow"
+allowed_domains = ["api.github.com", "*.example.internal"]
+allow_high_risk = true
+
+[[autonomy.command_context_rules]]
+command = "rm"
+action = "allow"
+allowed_path_prefixes = ["/tmp"]
+allow_high_risk = true
 ```
 
 ## `[memory]`

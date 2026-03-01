@@ -589,6 +589,40 @@ impl TelegramChannel {
         body
     }
 
+    fn build_approval_prompt_body(
+        chat_id: &str,
+        thread_id: Option<&str>,
+        request_id: &str,
+        tool_name: &str,
+        args_preview: &str,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": format!(
+                "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`",
+            ),
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {
+                        "text": "Approve",
+                        "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX}{request_id}")
+                    },
+                    {
+                        "text": "Deny",
+                        "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX}{request_id}")
+                    }
+                ]]
+            }
+        });
+
+        if let Some(thread_id) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(thread_id.to_string());
+        }
+
+        body
+    }
+
     fn extract_update_message_ack_target(
         update: &serde_json::Value,
     ) -> Option<(String, i64, AckReactionContextChatType, Option<String>)> {
@@ -3153,28 +3187,13 @@ impl Channel for TelegramChannel {
             raw_args
         };
 
-        let mut body = serde_json::json!({
-            "chat_id": chat_id,
-            "text": format!(
-                "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`",
-            ),
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {
-                        "text": "Approve",
-                        "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX}{request_id}")
-                    },
-                    {
-                        "text": "Deny",
-                        "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX}{request_id}")
-                    }
-                ]]
-            }
-        });
-
-        if let Some(thread_id) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(thread_id);
-        }
+        let body = Self::build_approval_prompt_body(
+            &chat_id,
+            thread_id.as_deref(),
+            request_id,
+            tool_name,
+            &args_preview,
+        );
 
         let response = self
             .http_client()
@@ -3652,6 +3671,24 @@ mod tests {
             ch.api_url("sendMessage"),
             "https://tapi.bale.ai/bot123:ABC/sendMessage"
         );
+    }
+
+    #[test]
+    fn approval_prompt_includes_markdown_parse_mode() {
+        let body = TelegramChannel::build_approval_prompt_body(
+            "12345",
+            Some("67890"),
+            "apr-1234",
+            "shell",
+            "{\"command\":\"echo hello\"}",
+        );
+
+        assert_eq!(body["parse_mode"], "Markdown");
+        assert_eq!(body["chat_id"], "12345");
+        assert_eq!(body["message_thread_id"], "67890");
+        assert!(body["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("`shell`")));
     }
 
     #[test]
