@@ -8,6 +8,24 @@ use std::fmt::Write;
 use std::path::Path;
 
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+const DATETIME_HEADER: &str = "## Current Date & Time\n\n";
+
+/// Replace the `## Current Date & Time` section in a system prompt with the current timestamp.
+pub fn refresh_prompt_datetime(prompt: &mut String) {
+    if let Some(start) = prompt.find(DATETIME_HEADER) {
+        let content_start = start + DATETIME_HEADER.len();
+        let content_end = prompt[content_start..]
+            .find('\n')
+            .map_or(prompt.len(), |i| content_start + i);
+        let now = Local::now();
+        let new_datetime = format!(
+            "{} ({})",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Z")
+        );
+        prompt.replace_range(content_start..content_end, &new_datetime);
+    }
+}
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
@@ -554,6 +572,33 @@ mod tests {
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         assert!(!output.contains("<tools>"));
+    }
+
+    #[test]
+    fn refresh_prompt_datetime_updates_timestamp() {
+        let mut prompt =
+            "## Runtime\n\nHost: test\n\n## Current Date & Time\n\n2000-01-01 00:00:00 (UTC)\n\n## Next Section".to_string();
+        super::refresh_prompt_datetime(&mut prompt);
+        // Old timestamp should be gone
+        assert!(!prompt.contains("2000-01-01"));
+        // Structure preserved
+        assert!(prompt.contains("## Current Date & Time\n\n"));
+        assert!(prompt.contains("\n\n## Next Section"));
+        // New timestamp present
+        let header = "## Current Date & Time\n\n";
+        let start = prompt.find(header).unwrap() + header.len();
+        let end = prompt[start..].find('\n').unwrap() + start;
+        let ts = &prompt[start..end];
+        assert!(ts.contains(" ("));
+        assert!(ts.ends_with(')'));
+    }
+
+    #[test]
+    fn refresh_prompt_datetime_noop_without_section() {
+        let mut prompt = "## Runtime\n\nHost: test".to_string();
+        let original = prompt.clone();
+        super::refresh_prompt_datetime(&mut prompt);
+        assert_eq!(prompt, original);
     }
 
     #[test]

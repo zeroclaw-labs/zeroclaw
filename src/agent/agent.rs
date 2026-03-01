@@ -486,6 +486,11 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+        } else {
+            // Refresh the datetime in the system prompt so the model sees the current time.
+            if let Some(ConversationMessage::Chat(ref mut sys_msg)) = self.history.first_mut() {
+                crate::agent::prompt::refresh_prompt_datetime(&mut sys_msg.content);
+            }
         }
 
         if self.auto_save {

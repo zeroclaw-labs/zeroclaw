@@ -2661,6 +2661,11 @@ pub async fn run(
                 format!("{context}[{now}] {user_input}")
             };
 
+            // Refresh the datetime in the system prompt so the model sees the current time.
+            if let Some(sys_msg) = history.first_mut() {
+                crate::agent::prompt::refresh_prompt_datetime(&mut sys_msg.content);
+            }
+
             history.push(ChatMessage::user(&enriched));
             interactive_turn += 1;
 
