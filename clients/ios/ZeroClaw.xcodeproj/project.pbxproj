@@ -11,7 +11,6 @@
 		A10000010000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000002 /* ContentView.swift */; };
 		A10000010000000000000003 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000003 /* ChatMessage.swift */; };
 		A10000010000000000000004 /* AgentStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000004 /* AgentStatus.swift */; };
-		A10000010000000000000005 /* ZeroClawBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000005 /* ZeroClawBridge.swift */; };
 		A10000010000000000000006 /* SettingsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000006 /* SettingsManager.swift */; };
 		A10000010000000000000007 /* AgentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000007 /* AgentService.swift */; };
 		A10000010000000000000008 /* ChatMessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000008 /* ChatMessageView.swift */; };
@@ -25,6 +24,24 @@
 		D86446DC2F53378F0032947D /* ZeroClawCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */; };
 		D86446DD2F53378F0032947D /* ZeroClawCore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		D86446E22F53389D0032947D /* zeroclaw_ios.swift in Sources */ = {isa = PBXBuildFile; fileRef = D86446E12F53389D0032947D /* zeroclaw_ios.swift */; };
+		B10000010000000000000001 /* GatewayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000001 /* GatewayClient.swift */; };
+		B10000010000000000000002 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000002 /* NotificationManager.swift */; };
+		B10000010000000000000003 /* BackgroundTaskManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000003 /* BackgroundTaskManager.swift */; };
+		B10000010000000000000004 /* PairingOnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000004 /* PairingOnboardingView.swift */; };
+		B10000010000000000000005 /* ZeroClawIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000005 /* ZeroClawIntents.swift */; };
+		B10000010000000000000006 /* ZeroClawShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000006 /* ZeroClawShortcuts.swift */; };
+		B10000010000000000000007 /* StatusDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000020000000000000007 /* StatusDetailView.swift */; };
+		C10000010000000000000001 /* GatewayModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000001 /* GatewayModels.swift */; };
+		C10000010000000000000002 /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000002 /* KeychainHelper.swift */; };
+		C10000010000000000000003 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000003 /* ChatStore.swift */; };
+		C10000010000000000000004 /* MarkdownView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000004 /* MarkdownView.swift */; };
+		C10000010000000000000005 /* ToolCallBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000005 /* ToolCallBubble.swift */; };
+		C10000010000000000000006 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000006 /* MemoryView.swift */; };
+		C10000010000000000000007 /* CronJobsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000007 /* CronJobsView.swift */; };
+		C10000010000000000000008 /* ToolsBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000008 /* ToolsBrowserView.swift */; };
+		C10000010000000000000009 /* CostView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000020000000000000009 /* CostView.swift */; };
+		C1000001000000000000000A /* PairedDevicesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1000002000000000000000A /* PairedDevicesView.swift */; };
+		C1000001000000000000000B /* IntegrationsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1000002000000000000000B /* IntegrationsView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,7 +73,6 @@
 		A10000020000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A10000020000000000000003 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
 		A10000020000000000000004 /* AgentStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStatus.swift; sourceTree = "<group>"; };
-		A10000020000000000000005 /* ZeroClawBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZeroClawBridge.swift; sourceTree = "<group>"; };
 		A10000020000000000000006 /* SettingsManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsManager.swift; sourceTree = "<group>"; };
 		A10000020000000000000007 /* AgentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentService.swift; sourceTree = "<group>"; };
 		A10000020000000000000008 /* ChatMessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessageView.swift; sourceTree = "<group>"; };
@@ -71,6 +87,24 @@
 		A10000060000000000000002 /* ZeroClawTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZeroClawTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		D86446DB2F53378F0032947D /* ZeroClawCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZeroClawCore.xcframework; path = Frameworks/ZeroClawCore.xcframework; sourceTree = "<group>"; };
 		D86446E12F53389D0032947D /* zeroclaw_ios.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = zeroclaw_ios.swift; path = ZeroClaw/Generated/zeroclaw_ios.swift; sourceTree = "<group>"; };
+		B10000020000000000000001 /* GatewayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayClient.swift; sourceTree = "<group>"; };
+		B10000020000000000000002 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		B10000020000000000000003 /* BackgroundTaskManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundTaskManager.swift; sourceTree = "<group>"; };
+		B10000020000000000000004 /* PairingOnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingOnboardingView.swift; sourceTree = "<group>"; };
+		B10000020000000000000007 /* StatusDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusDetailView.swift; sourceTree = "<group>"; };
+		B10000020000000000000005 /* ZeroClawIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZeroClawIntents.swift; sourceTree = "<group>"; };
+		B10000020000000000000006 /* ZeroClawShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZeroClawShortcuts.swift; sourceTree = "<group>"; };
+		C10000020000000000000001 /* GatewayModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayModels.swift; sourceTree = "<group>"; };
+		C10000020000000000000002 /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
+		C10000020000000000000003 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
+		C10000020000000000000004 /* MarkdownView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownView.swift; sourceTree = "<group>"; };
+		C10000020000000000000005 /* ToolCallBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCallBubble.swift; sourceTree = "<group>"; };
+		C10000020000000000000006 /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
+		C10000020000000000000007 /* CronJobsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CronJobsView.swift; sourceTree = "<group>"; };
+		C10000020000000000000008 /* ToolsBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolsBrowserView.swift; sourceTree = "<group>"; };
+		C10000020000000000000009 /* CostView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CostView.swift; sourceTree = "<group>"; };
+		C1000002000000000000000A /* PairedDevicesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairedDevicesView.swift; sourceTree = "<group>"; };
+		C1000002000000000000000B /* IntegrationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntegrationsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -111,6 +145,7 @@
 				A10000080000000000000003 /* Models */,
 				A10000080000000000000004 /* Services */,
 				A10000080000000000000005 /* Views */,
+				B10000080000000000000001 /* Intents */,
 				A10000080000000000000006 /* Theme */,
 				A1000002000000000000000E /* Assets.xcassets */,
 			);
@@ -122,6 +157,7 @@
 			children = (
 				A10000020000000000000003 /* ChatMessage.swift */,
 				A10000020000000000000004 /* AgentStatus.swift */,
+				C10000020000000000000001 /* GatewayModels.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -129,9 +165,13 @@
 		A10000080000000000000004 /* Services */ = {
 			isa = PBXGroup;
 			children = (
-				A10000020000000000000005 /* ZeroClawBridge.swift */,
-				A10000020000000000000006 /* SettingsManager.swift */,
+				B10000020000000000000001 /* GatewayClient.swift */,
 				A10000020000000000000007 /* AgentService.swift */,
+				A10000020000000000000006 /* SettingsManager.swift */,
+				C10000020000000000000002 /* KeychainHelper.swift */,
+				C10000020000000000000003 /* ChatStore.swift */,
+				B10000020000000000000002 /* NotificationManager.swift */,
+				B10000020000000000000003 /* BackgroundTaskManager.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -141,9 +181,19 @@
 			children = (
 				A10000020000000000000008 /* ChatMessageView.swift */,
 				A10000020000000000000009 /* ChatInputView.swift */,
+				C10000020000000000000004 /* MarkdownView.swift */,
+				C10000020000000000000005 /* ToolCallBubble.swift */,
 				A1000002000000000000000A /* StatusIndicatorView.swift */,
 				A1000002000000000000000B /* EmptyStateView.swift */,
+				B10000020000000000000004 /* PairingOnboardingView.swift */,
+				B10000020000000000000007 /* StatusDetailView.swift */,
 				A1000002000000000000000C /* SettingsView.swift */,
+				C10000020000000000000006 /* MemoryView.swift */,
+				C10000020000000000000007 /* CronJobsView.swift */,
+				C10000020000000000000008 /* ToolsBrowserView.swift */,
+				C10000020000000000000009 /* CostView.swift */,
+				C1000002000000000000000A /* PairedDevicesView.swift */,
+				C1000002000000000000000B /* IntegrationsView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -154,6 +204,15 @@
 				A1000002000000000000000D /* Theme.swift */,
 			);
 			path = Theme;
+			sourceTree = "<group>";
+		};
+		B10000080000000000000001 /* Intents */ = {
+			isa = PBXGroup;
+			children = (
+				B10000020000000000000005 /* ZeroClawIntents.swift */,
+				B10000020000000000000006 /* ZeroClawShortcuts.swift */,
+			);
+			path = Intents;
 			sourceTree = "<group>";
 		};
 		A10000080000000000000007 /* ZeroClawTests */ = {
@@ -277,7 +336,6 @@
 				A10000010000000000000002 /* ContentView.swift in Sources */,
 				A10000010000000000000003 /* ChatMessage.swift in Sources */,
 				A10000010000000000000004 /* AgentStatus.swift in Sources */,
-				A10000010000000000000005 /* ZeroClawBridge.swift in Sources */,
 				A10000010000000000000006 /* SettingsManager.swift in Sources */,
 				A10000010000000000000007 /* AgentService.swift in Sources */,
 				A10000010000000000000008 /* ChatMessageView.swift in Sources */,
@@ -287,6 +345,24 @@
 				A1000001000000000000000C /* SettingsView.swift in Sources */,
 				D86446E22F53389D0032947D /* zeroclaw_ios.swift in Sources */,
 				A1000001000000000000000D /* Theme.swift in Sources */,
+				B10000010000000000000001 /* GatewayClient.swift in Sources */,
+				B10000010000000000000002 /* NotificationManager.swift in Sources */,
+				B10000010000000000000003 /* BackgroundTaskManager.swift in Sources */,
+				B10000010000000000000004 /* PairingOnboardingView.swift in Sources */,
+				B10000010000000000000005 /* ZeroClawIntents.swift in Sources */,
+				B10000010000000000000006 /* ZeroClawShortcuts.swift in Sources */,
+				B10000010000000000000007 /* StatusDetailView.swift in Sources */,
+				C10000010000000000000001 /* GatewayModels.swift in Sources */,
+				C10000010000000000000002 /* KeychainHelper.swift in Sources */,
+				C10000010000000000000003 /* ChatStore.swift in Sources */,
+				C10000010000000000000004 /* MarkdownView.swift in Sources */,
+				C10000010000000000000005 /* ToolCallBubble.swift in Sources */,
+				C10000010000000000000006 /* MemoryView.swift in Sources */,
+				C10000010000000000000007 /* CronJobsView.swift in Sources */,
+				C10000010000000000000008 /* ToolsBrowserView.swift in Sources */,
+				C10000010000000000000009 /* CostView.swift in Sources */,
+				C1000001000000000000000A /* PairedDevicesView.swift in Sources */,
+				C1000001000000000000000B /* IntegrationsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -418,6 +494,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = FJPAF4M87L;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ZeroClaw/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = ZeroClaw;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -445,6 +522,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = FJPAF4M87L;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ZeroClaw/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = ZeroClaw;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
