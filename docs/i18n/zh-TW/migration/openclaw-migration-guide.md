@@ -273,10 +273,10 @@ python scripts/convert-openclaw-config.py ~/.openclaw/openclaw.json --dry-run
 - [ ] 設定 API 金鑰：`export ZEROCLAW_API_KEY='...'`
 - [ ] 建置：`cargo build --release`
 - [ ] 部署（Docker 或原生）
-- [ ] 配對：`curl -X POST http://host:port/pair -H 'X-Pairing-Code: ...'`
-- [ ] 驗證健康狀態：`curl http://host:port/health`
-- [ ] 測試 /api/chat：`curl -X POST http://host:port/api/chat -H 'Authorization: Bearer ...' -d '{"message":"hello"}'`
-- [ ] 測試 /v1/chat/completions：`curl -X POST http://host:port/v1/chat/completions -H 'Authorization: Bearer ...' -d '{"messages":[{"role":"user","content":"hello"}]}'`
+- [ ] 配對：`curl -X POST http://<host>:<port>/pair -H 'X-Pairing-Code: ...'`
+- [ ] 驗證健康狀態：`curl http://<host>:<port>/health`
+- [ ] 測試 /api/chat：`curl -X POST http://<host>:<port>/api/chat -H 'Authorization: Bearer ...' -d '{"message":"hello"}'`
+- [ ] 測試 /v1/chat/completions：`curl -X POST http://<host>:<port>/v1/chat/completions -H 'Authorization: Bearer ...' -d '{"messages":[{"role":"user","content":"hello"}]}'`
 - [ ] 更新呼叫端指向新主機
 - [ ] 監控日誌是否有錯誤
 
