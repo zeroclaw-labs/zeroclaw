@@ -13,6 +13,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 | Install and run ZeroClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
 | Bootstrap in one command | [one-click-bootstrap.md](one-click-bootstrap.md) |
 | Set up on Android (Termux/ADB) | [android-setup.md](android-setup.md) |
+| Set up on iOS (native SwiftUI client) | [ios-setup.md](ios-setup.md) |
 | Update or uninstall on macOS | [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md) |
 | Find commands by task | [commands-reference.md](commands-reference.md) |
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
