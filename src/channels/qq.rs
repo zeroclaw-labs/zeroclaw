@@ -18,7 +18,9 @@ const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
-    if !url.starts_with("https://") {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid URL '{url}': {e}"))?;
+    if parsed.scheme() != "https" {
         anyhow::bail!(
             "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
         );
@@ -522,10 +524,12 @@ impl QQChannel {
         op: &str,
     ) -> anyhow::Result<()> {
         ensure_https(url)?;
+        let parsed_url = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::anyhow!("Invalid URL '{url}' for QQ {op}: {e}"))?;
 
         let resp = self
             .http_client()
-            .post(url)
+            .post(parsed_url)
             .header("Authorization", format!("QQBot {token}"))
             .json(body)
             .send()
@@ -549,6 +553,8 @@ impl QQChannel {
     ) -> anyhow::Result<String> {
         ensure_https(files_url)?;
         ensure_https(media_url)?;
+        let parsed_files_url = reqwest::Url::parse(files_url)
+            .map_err(|e| anyhow::anyhow!("Invalid QQ files endpoint URL '{files_url}': {e}"))?;
 
         let upload_body = json!({
             "file_type": 1,
@@ -558,7 +564,7 @@ impl QQChannel {
 
         let resp = self
             .http_client()
-            .post(files_url)
+            .post(parsed_files_url)
             .header("Authorization", format!("QQBot {token}"))
             .json(&upload_body)
             .send()
@@ -589,6 +595,8 @@ impl QQChannel {
         file_data_base64: &str,
     ) -> anyhow::Result<String> {
         ensure_https(files_url)?;
+        let parsed_files_url = reqwest::Url::parse(files_url)
+            .map_err(|e| anyhow::anyhow!("Invalid QQ files endpoint URL '{files_url}': {e}"))?;
 
         let upload_body = json!({
             "file_type": 1,
@@ -598,7 +606,7 @@ impl QQChannel {
 
         let resp = self
             .http_client()
-            .post(files_url)
+            .post(parsed_files_url)
             .header("Authorization", format!("QQBot {token}"))
             .json(&upload_body)
             .send()
