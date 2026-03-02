@@ -107,6 +107,41 @@ jobs:
             - name: Check workspace
               run: cargo check --workspace --locked
 
+    msrv-check:
+        name: MSRV Check
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-22.04
+        timeout-minutes: 20
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - name: Resolve minimum supported Rust
+              id: msrv
+              run: |
+                  MSRV=$(awk -F'"' '/^rust-version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+                  if [ -z "$MSRV" ]; then
+                    echo "Could not resolve rust-version from Cargo.toml" >&2
+                    exit 1
+                  fi
+                  echo "msrv=$MSRV" >> "$GITHUB_OUTPUT"
+            - name: Self-heal Rust toolchain cache
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: ${{ steps.msrv.outputs.msrv }}
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-msrv-check
+                  cache-bin: false
+            - name: Check workspace against MSRV
+              run: cargo +${{ steps.msrv.outputs.msrv }} check --workspace --locked
+
     package-check:
         name: Package Check (${{ matrix.package }})
         needs: [changes]

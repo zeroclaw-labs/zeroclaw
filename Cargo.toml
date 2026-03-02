@@ -19,7 +19,7 @@ repository = "https://github.com/zeroclaw-labs/zeroclaw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
-rust-version = "1.87"
+rust-version = "1.86"
 
 [dependencies]
 # CLI - minimal and fast
@@ -171,7 +171,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 
 # WASM runtime for plugin execution
 # Keep this on a RustSec-patched line that remains compatible with the
-# workspace rust-version = "1.87".
+# workspace rust-version = "1.86".
 wasmtime = { version = "36.0.6", default-features = false, features = ["runtime", "cranelift"] }
 
 # Serial port for peripheral communication (STM32, etc.)

@@ -29,6 +29,7 @@ If you get stuck, open a draft PR early and ask questions in the description.
 # Clone the repo
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
+rustup install 1.86  # required for source builds and cargo install
 
 # Enable the pre-push hook (runs fmt, clippy, tests before every push)
 git config core.hooksPath .githooks

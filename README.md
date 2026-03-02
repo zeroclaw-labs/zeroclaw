@@ -105,6 +105,17 @@ cd zeroclaw
 cargo install zeroclaw
 ```
 
+### Rust version requirement
+
+`cargo install zeroclaw` and other source builds require Rust **1.86+** (MSRV), as declared in `Cargo.toml`.
+
+To install the required toolchain:
+
+```bash
+rustup install 1.86
+cd zeroclaw && rustup override set 1.86
+```
+
 ### First Run
 
 ```bash
