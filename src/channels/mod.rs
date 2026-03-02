@@ -2068,6 +2068,31 @@ async fn create_resilient_provider_nonblocking(
     .context("failed to join provider initialization task")?
 }
 
+async fn create_routed_provider_nonblocking(
+    provider_name: &str,
+    api_key: Option<String>,
+    api_url: Option<String>,
+    reliability: crate::config::ReliabilityConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
+    default_model: String,
+    provider_runtime_options: providers::ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let provider_name = provider_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        providers::create_routed_provider_with_options(
+            &provider_name,
+            api_key.as_deref(),
+            api_url.as_deref(),
+            &reliability,
+            &model_routes,
+            &default_model,
+            &provider_runtime_options,
+        )
+    })
+    .await
+    .context("failed to join routed provider initialization task")?
+}
+
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
     let mut response = String::new();
     let _ = writeln!(
@@ -5386,6 +5411,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     let provider_name = resolved_default_provider(&config);
+    let model = resolved_default_model(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -5399,11 +5425,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_support_vision: config.model_support_vision,
     };
     let provider: Arc<dyn Provider> = Arc::from(
-        create_resilient_provider_nonblocking(
+        create_routed_provider_nonblocking(
             &provider_name,
             config.api_key.clone(),
             config.api_url.clone(),
             config.reliability.clone(),
+            config.model_routes.clone(),
+            model.clone(),
             provider_runtime_options.clone(),
         )
         .await?,
@@ -5443,7 +5471,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
@@ -9932,6 +9959,40 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(defaults.query_classification.enabled);
         assert_eq!(defaults.query_classification.rules.len(), 1);
         assert_eq!(defaults.model_routes.len(), 1);
+
+        let mut store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.remove(&config_path);
+    }
+
+    #[tokio::test]
+    async fn start_channels_uses_model_routes_when_global_provider_key_is_missing() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut cfg = Config::default();
+        cfg.workspace_dir = workspace_dir;
+        cfg.config_path = temp.path().join("config.toml");
+        cfg.default_provider = None;
+        cfg.api_key = None;
+        cfg.default_model = Some("hint:fast".to_string());
+        cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.3-codex".to_string(),
+            max_tokens: Some(512),
+            api_key: Some("route-specific-key".to_string()),
+            transport: Some("sse".to_string()),
+        }];
+
+        let config_path = cfg.config_path.clone();
+        let result = start_channels(cfg).await;
+        assert!(
+            result.is_ok(),
+            "start_channels should support routed providers without global credentials: {result:?}"
+        );
 
         let mut store = runtime_config_store()
             .lock()
