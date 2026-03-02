@@ -133,6 +133,10 @@ impl PluginRegistry {
         self.manifests.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.manifests.is_empty()
+    }
+
     pub fn tools(&self) -> &[PluginToolManifest] {
         &self.manifest_tools
     }
@@ -228,6 +232,7 @@ mod tests {
     fn empty_registry() {
         let reg = PluginRegistry::new();
         assert_eq!(reg.active_count(), 0);
+        assert!(reg.is_empty());
         assert!(reg.plugins.is_empty());
         assert!(reg.tools.is_empty());
         assert!(reg.tools().is_empty());
@@ -285,6 +290,7 @@ mod tests {
             "provider_v2_for_replace_test",
         ));
 
+        assert!(!reg.is_empty());
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.tools().len(), 1);
         assert_eq!(reg.tools()[0].name, "tool_v2");

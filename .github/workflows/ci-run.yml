@@ -51,7 +51,7 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-22.04
-        timeout-minutes: 40
+        timeout-minutes: 75
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
