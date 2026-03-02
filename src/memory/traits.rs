@@ -27,7 +27,7 @@ impl std::fmt::Debug for MemoryEntry {
 }
 
 /// Memory categories for organization
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryCategory {
     /// Long-term facts, preferences, decisions
@@ -48,6 +48,12 @@ impl std::fmt::Display for MemoryCategory {
             Self::Conversation => write!(f, "conversation"),
             Self::Custom(name) => write!(f, "{name}"),
         }
+    }
+}
+
+impl serde::Serialize for MemoryCategory {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
     }
 }
 
