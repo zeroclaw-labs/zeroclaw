@@ -533,3 +533,9 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+## 13) CI / Self-Hosted Runner Gotchas
+
+- **Label changes via GitHub API require runner restart.** Adding/removing labels via `gh api repos/.../actions/runners/{id}/labels` does not take effect until the runner service is restarted (`./svc.sh stop && ./svc.sh start`). Jobs will remain queued despite matching labels if the runner hasn't been restarted.
+- Self-hosted runners for this repo require `[self-hosted, aws-india]` labels to pick up CI jobs (see `ci-run.yml`).
+- **Container actions only work on Linux.** macOS runners cannot execute container-based GitHub Actions (e.g., `cargo-deny-action`). Route container jobs to Linux runners only.
