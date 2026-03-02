@@ -1093,7 +1093,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario routes, classification rules, delegate profiles, and agent team/subagent orchestration switches"
+        "Manage default model settings, scenario routes, classification rules, delegate profiles, and agent team/subagent orchestration controls. Designed for natural-language runtime reconfiguration (enable/disable, strategy, and capacity tuning)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1226,7 +1226,7 @@ impl Tool for ModelRoutingConfigTool {
                 "max_team_agents": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Maximum number of delegate profiles activated for teams"
+                    "description": "Maximum number of delegate profiles activated for teams (positive integer, no hard-coded upper cap)"
                 },
                 "teams_strategy": {
                     "type": ["string", "null"],
@@ -1264,7 +1264,7 @@ impl Tool for ModelRoutingConfigTool {
                 "max_concurrent_subagents": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Maximum number of concurrently running background sub-agents"
+                    "description": "Maximum number of concurrently running background sub-agents (positive integer, no hard-coded upper cap)"
                 },
                 "subagents_strategy": {
                     "type": ["string", "null"],
@@ -1825,6 +1825,91 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("teams_strategy"));
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_accepts_large_capacity_values_without_hard_cap() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_team_agents": 512,
+                "max_concurrent_subagents": 256,
+                "subagents_queue_wait_ms": 0,
+                "subagents_queue_poll_ms": 25
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["max_agents"],
+            json!(512)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["max_concurrent"],
+            json!(256)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_wait_ms"],
+            json!(0)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_poll_ms"],
+            json!(25)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_rejects_zero_capacity_and_poll_interval() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let zero_team_agents = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_team_agents": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!zero_team_agents.success);
+        assert!(zero_team_agents
+            .error
+            .unwrap_or_default()
+            .contains("max_team_agents"));
+
+        let zero_subagents = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_concurrent_subagents": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!zero_subagents.success);
+        assert!(zero_subagents
+            .error
+            .unwrap_or_default()
+            .contains("max_concurrent_subagents"));
+
+        let zero_poll = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "subagents_queue_poll_ms": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!zero_poll.success);
+        assert!(zero_poll
+            .error
+            .unwrap_or_default()
+            .contains("subagents_queue_poll_ms"));
     }
 
     #[tokio::test]
