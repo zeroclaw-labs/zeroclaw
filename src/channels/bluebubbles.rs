@@ -261,19 +261,29 @@ impl BlueBubblesChannel {
         }
     }
 
-    /// Check if a group message from `chat_guid` is allowed under `group_policy`.
+    /// Check if a group message from `chat_guid` / `sender` is allowed under `group_policy`.
     ///
     /// - `Disabled` → always deny.
     /// - `Allowlist` → `group_allow_from` must contain the chat GUID.
-    /// - `Open` → allow all groups.
-    fn is_group_allowed(&self, chat_guid: &str) -> bool {
+    /// - `Open` → allow all groups, but still apply `allowed_senders` as a
+    ///   per-sender gate when configured, preserving backward-compat for
+    ///   deployments that relied on sender gating before policy fields were added.
+    fn is_group_allowed(&self, chat_guid: &str, sender: &str) -> bool {
         match self.group_policy {
             BlueBubblesGroupPolicy::Disabled => false,
             BlueBubblesGroupPolicy::Allowlist => self
                 .group_allow_from
                 .iter()
                 .any(|g| g == "*" || g.eq_ignore_ascii_case(chat_guid)),
-            BlueBubblesGroupPolicy::Open => true,
+            BlueBubblesGroupPolicy::Open => {
+                if self.allowed_senders.is_empty() {
+                    true
+                } else {
+                    self.allowed_senders
+                        .iter()
+                        .any(|a| a == "*" || a.eq_ignore_ascii_case(sender))
+                }
+            }
         }
     }
 
@@ -736,7 +746,7 @@ impl BlueBubblesChannel {
             .filter(|g| !g.is_empty())
             .unwrap_or_default();
         let allowed = if Self::is_group_chat(&chat_guid_for_policy) {
-            self.is_group_allowed(&chat_guid_for_policy)
+            self.is_group_allowed(&chat_guid_for_policy, &sender)
         } else {
             self.is_dm_allowed(&sender)
         };
@@ -860,7 +870,7 @@ impl BlueBubblesChannel {
 
         // Apply DM vs group policy to tapbacks.
         let allowed = if Self::is_group_chat(&reply_target) {
-            self.is_group_allowed(&reply_target)
+            self.is_group_allowed(&reply_target, &sender)
         } else {
             self.is_dm_allowed(&sender)
         };
@@ -980,14 +990,12 @@ impl BlueBubblesChannel {
 
         // Apply DM vs group policy gate.
         if Self::is_group_chat(&reply_target) {
-            if !self.is_group_allowed(&reply_target) {
-                tracing::debug!(
-                    "BlueBubbles: group message from {reply_target} denied by group_policy"
-                );
+            if !self.is_group_allowed(&reply_target, &sender) {
+                tracing::debug!("BlueBubbles: group message denied by group_policy");
                 return messages;
             }
         } else if !self.is_dm_allowed(&sender) {
-            tracing::debug!("BlueBubbles: DM from {sender} denied by dm_policy");
+            tracing::debug!("BlueBubbles: DM denied by dm_policy");
             return messages;
         }
 
@@ -1687,8 +1695,22 @@ mod tests {
     #[test]
     fn bluebubbles_group_policy_open_allows_any() {
         let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![]);
-        assert!(ch.is_group_allowed("iMessage;+;chat1"));
-        assert!(ch.is_group_allowed("iMessage;+;chat2"));
+        // Open + empty allowed_senders: any sender, any chat
+        assert!(ch.is_group_allowed("iMessage;+;chat1", "sender_a"));
+        assert!(ch.is_group_allowed("iMessage;+;chat2", "sender_b"));
+    }
+
+    #[test]
+    fn bluebubbles_group_policy_open_with_allowed_senders_filters_sender() {
+        let ch = BlueBubblesChannel::new(
+            "http://localhost".into(),
+            String::new(),
+            vec!["sender_a".into()],
+            vec![],
+        );
+        // Open + allowed_senders set: sender filter still applies for backward-compat
+        assert!(ch.is_group_allowed("iMessage;+;chat1", "sender_a"));
+        assert!(!ch.is_group_allowed("iMessage;+;chat1", "sender_b"));
     }
 
     #[test]
@@ -1700,7 +1722,7 @@ mod tests {
                 vec![],
                 true,
             );
-        assert!(!ch.is_group_allowed("iMessage;+;chat1"));
+        assert!(!ch.is_group_allowed("iMessage;+;chat1", "sender_a"));
     }
 
     #[test]
@@ -1712,8 +1734,8 @@ mod tests {
                 vec!["iMessage;+;chat_allowed".into()],
                 true,
             );
-        assert!(ch.is_group_allowed("iMessage;+;chat_allowed"));
-        assert!(!ch.is_group_allowed("iMessage;+;chat_other"));
+        assert!(ch.is_group_allowed("iMessage;+;chat_allowed", "sender_a"));
+        assert!(!ch.is_group_allowed("iMessage;+;chat_other", "sender_a"));
     }
 
     #[test]
@@ -1725,7 +1747,7 @@ mod tests {
                 vec![],
                 true,
             );
-        assert!(!ch.is_group_allowed("iMessage;+;any_group"));
+        assert!(!ch.is_group_allowed("iMessage;+;any_group", "sender_a"));
     }
 
     #[test]
@@ -1737,7 +1759,7 @@ mod tests {
                 vec!["*".into()],
                 true,
             );
-        assert!(ch.is_group_allowed("iMessage;+;any_group"));
+        assert!(ch.is_group_allowed("iMessage;+;any_group", "sender_a"));
     }
 
     #[test]
