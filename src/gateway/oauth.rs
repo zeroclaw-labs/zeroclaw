@@ -192,10 +192,14 @@ async fn start_google_oauth(state: &AppState) -> Response {
 
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
+    // Generate a one-time CSRF state token; stored with the verifier so the
+    // callback can validate it and reject replayed/forged callbacks.
+    let state_token = pkce_verifier();
 
-    // Store verifier for callback
+    // Store "state\nverifier" so the callback can validate both.
     let pkce_file = pkce_path(&dir, "google");
-    if let Err(e) = tokio::fs::write(&pkce_file, &verifier).await {
+    let pkce_payload = format!("{state_token}\n{verifier}");
+    if let Err(e) = tokio::fs::write(&pkce_file, &pkce_payload).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to store PKCE verifier: {e}"),
@@ -213,6 +217,7 @@ async fn start_google_oauth(state: &AppState) -> Response {
         ("prompt", "consent"),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),
+        ("state", state_token.as_str()),
     ];
 
     let url = format!(
@@ -265,11 +270,14 @@ async fn handle_google_callback(state: &AppState, query: OAuthCallback) -> Respo
     let dir = oauth_dir(state);
     let pkce_file = pkce_path(&dir, "google");
 
-    // Read and consume PKCE verifier
-    let verifier = match tokio::fs::read_to_string(&pkce_file).await {
-        Ok(v) => {
+    // Read and consume the stored "state\nverifier" payload.
+    let (expected_state, verifier) = match tokio::fs::read_to_string(&pkce_file).await {
+        Ok(payload) => {
             let _ = tokio::fs::remove_file(&pkce_file).await;
-            v
+            let mut parts = payload.splitn(2, '\n');
+            let st = parts.next().unwrap_or("").to_string();
+            let vf = parts.next().unwrap_or("").to_string();
+            (st, vf)
         }
         Err(_) => {
             return (
@@ -282,6 +290,18 @@ async fn handle_google_callback(state: &AppState, query: OAuthCallback) -> Respo
                 .into_response()
         }
     };
+
+    // Validate state to prevent CSRF / callback-injection attacks.
+    if query.state.as_deref() != Some(expected_state.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(error_page(
+                "OAuth Error",
+                "State mismatch — possible CSRF. Start the flow again at /auth/google",
+            )),
+        )
+            .into_response();
+    }
 
     let (client_id, client_secret) = {
         let cfg = state.config.lock();
@@ -457,8 +477,20 @@ pub async fn handle_auth_revoke(
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
+    // Allowlist service names before constructing any filesystem path.
+    let service = match service.as_str() {
+        "google" => "google",
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Unknown service: {service}") })),
+            )
+                .into_response()
+        }
+    };
+
     let dir = oauth_dir(&state);
-    let path = token_path(&dir, &service);
+    let path = token_path(&dir, service);
 
     if !path.exists() {
         return (
