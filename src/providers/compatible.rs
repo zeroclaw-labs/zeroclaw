@@ -3853,8 +3853,7 @@ mod tests {
             }),
         }];
 
-        let tools =
-            OpenAiCompatibleProvider::convert_tool_specs(Some(&specs), false).unwrap();
+        let tools = OpenAiCompatibleProvider::convert_tool_specs(Some(&specs), false).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "shell");
@@ -3875,8 +3874,7 @@ mod tests {
             }),
         }];
 
-        let tools =
-            OpenAiCompatibleProvider::convert_tool_specs(Some(&specs), true).unwrap();
+        let tools = OpenAiCompatibleProvider::convert_tool_specs(Some(&specs), true).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "shell");
