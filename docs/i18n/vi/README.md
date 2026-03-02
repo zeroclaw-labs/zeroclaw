@@ -94,6 +94,15 @@
 - Backlog thiếu hụt i18n: [i18n-gap-backlog.md](i18n-gap-backlog.md)
 - Snapshot kiểm toán tài liệu (2026-02-24): [docs-audit-2026-02-24.md](docs-audit-2026-02-24.md)
 
+## Yêu cầu phiên bản Rust
+
+`cargo install zeroclaw` và các luồng build từ source yêu cầu Rust **1.86+** (MSRV, khai báo trong `Cargo.toml`).
+
+```bash
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
+```
+
 ## Ngôn ngữ khác
 
 - English: [README.md](../../README.md)

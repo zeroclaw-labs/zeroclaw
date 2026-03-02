@@ -94,6 +94,15 @@
 - Snapshot ελέγχου τεκμηρίωσης (2026-02-24): [docs-audit-2026-02-24.md](docs-audit-2026-02-24.md)
 - Στιγμιότυπο διαχείρισης έργου: [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
 
+## Απαίτηση έκδοσης Rust
+
+Το `cargo install zeroclaw` και οι λοιπές source builds απαιτούν Rust **1.86+** (MSRV, όπως ορίζεται στο `Cargo.toml`).
+
+```bash
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
+```
+
 ## Άλλες γλώσσες
 
 - English: [../../README.md](../../README.md)

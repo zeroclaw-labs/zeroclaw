@@ -41,6 +41,15 @@
 - Вклад и CI: [../../contributing/README.md](../../contributing/README.md)
 - Единый TOC: [SUMMARY.md](SUMMARY.md)
 
+## Требование к версии Rust
+
+`cargo install zeroclaw` и другие сборки из исходников требуют Rust **1.86+** (MSRV, как указано в `Cargo.toml`).
+
+```bash
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
+```
+
 ## Другие языки
 
 - English: [../../README.md](../../README.md)

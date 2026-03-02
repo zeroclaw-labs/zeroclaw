@@ -41,6 +41,15 @@ Dernière mise à jour : **24 février 2026**.
 - Contribution / CI : [../../contributing/README.md](../../contributing/README.md)
 - Table des matières locale : [SUMMARY.md](SUMMARY.md)
 
+## Exigence de version Rust
+
+`cargo install zeroclaw` et les autres builds depuis les sources nécessitent Rust **1.86+** (MSRV, défini dans `Cargo.toml`).
+
+```bash
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
+```
+
 ## Autres langues
 
 - English: [../../README.md](../../README.md)

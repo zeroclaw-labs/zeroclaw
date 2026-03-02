@@ -41,6 +41,15 @@
 - コントリビュート / CI: [../../contributing/README.md](../../contributing/README.md)
 - 統合 TOC: [SUMMARY.md](SUMMARY.md)
 
+## Rust バージョン要件
+
+`cargo install zeroclaw` とソースビルドには Rust **1.86+**（MSRV、`Cargo.toml` 準拠）が必要です。
+
+```bash
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
+```
+
 ## 他言語
 
 - English: [../../README.md](../../README.md)

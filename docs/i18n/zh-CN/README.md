@@ -41,6 +41,15 @@
 - 贡献与 CI：[../../contributing/README.md](../../contributing/README.md)
 - 统一目录：[SUMMARY.md](SUMMARY.md)
 
+## Rust 版本要求
+
+`cargo install zeroclaw` 以及其他源码构建要求 Rust **1.86+**（MSRV，以 `Cargo.toml` 为准）。
+
+```bash
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
+```
+
 ## 其他语言
 
 - English: [../../README.md](../../README.md)
