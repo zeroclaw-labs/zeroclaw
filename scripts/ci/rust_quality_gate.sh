@@ -9,6 +9,8 @@ fi
 
 ensure_rust_component() {
     local component="$1"
+    # Some self-hosted runners start from minimal toolchain images.
+    # Install missing components deterministically before invoking cargo subcommands.
     if ! command -v rustup >/dev/null 2>&1; then
         return 0
     fi
