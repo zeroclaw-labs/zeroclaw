@@ -24,6 +24,39 @@ probe_rustc() {
     rustup run "${toolchain}" rustc --version >/dev/null 2>&1
 }
 
+probe_rustfmt() {
+    local toolchain="$1"
+    rustup run "${toolchain}" cargo fmt --version >/dev/null 2>&1
+}
+
+probe_rustdoc() {
+    local toolchain="$1"
+    rustup run "${toolchain}" rustdoc --version >/dev/null 2>&1
+}
+
+ensure_required_tooling() {
+    local toolchain="$1"
+
+    # Lint and doctest jobs require both rustfmt and rustdoc to be available.
+    rustup component add --toolchain "${toolchain}" rustfmt rust-docs || true
+
+    if ! probe_rustfmt "${toolchain}"; then
+        echo "::error::rustfmt is unavailable for toolchain ${toolchain}."
+        rustup component add --toolchain "${toolchain}" rustfmt || true
+        if ! probe_rustfmt "${toolchain}"; then
+            return 1
+        fi
+    fi
+
+    if ! probe_rustdoc "${toolchain}"; then
+        echo "::error::rustdoc is unavailable for toolchain ${toolchain}."
+        rustup component add --toolchain "${toolchain}" rust-docs || true
+        if ! probe_rustdoc "${toolchain}"; then
+            return 1
+        fi
+    fi
+}
+
 export_toolchain_for_next_steps() {
     local toolchain="$1"
     if [ -z "${GITHUB_ENV:-}" ]; then
@@ -93,6 +126,12 @@ fi
 
 if is_truthy "${strict_mode}" && [ "${selected_toolchain}" != "${requested_toolchain}" ]; then
     echo "::error::Strict mode enabled; refusing fallback toolchain ${selected_toolchain} (requested ${requested_toolchain})." >&2
+    exit 1
+fi
+
+if ! ensure_required_tooling "${selected_toolchain}"; then
+    echo "Required Rust tooling unavailable for ${selected_toolchain}" >&2
+    rustup toolchain list || true
     exit 1
 fi
 
