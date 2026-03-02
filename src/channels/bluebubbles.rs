@@ -2768,4 +2768,17 @@ mod tests {
         let ch = ch_with_chunking(Some(0), Some(BlueBubblesChunkMode::Length));
         assert_eq!(ch.chunk_content("hello world"), vec!["hello world"]);
     }
+
+    #[test]
+    fn chunk_content_length_mode_without_limit_is_noop() {
+        // chunk_mode = "length" without text_chunk_limit falls through to no-op.
+        // This is intentional: the gateway rejects limit=0 but allows limit=None
+        // (which disables chunking).  Operators who set chunk_mode without a limit
+        // get no chunking and no error — documented in config-reference.md.
+        let ch = ch_with_chunking(None, Some(BlueBubblesChunkMode::Length));
+        assert_eq!(
+            ch.chunk_content("hello world this is a longer message"),
+            vec!["hello world this is a longer message"]
+        );
+    }
 }

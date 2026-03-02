@@ -582,6 +582,7 @@ send_read_receipts = true
 # text_chunk_limit = 4000
 # Split strategy: "length" (word-boundary split) | "newline" (split on \n).
 # "newline" is self-sufficient without text_chunk_limit.
+# "newline" drops blank lines (consecutive \n); intentional paragraph breaks are collapsed.
 # chunk_mode = "length"
 ```
 
