@@ -300,6 +300,7 @@ function App() {
       <div className="app">
         <SetupWizard
           locale={locale}
+          onLocaleChange={handleLocaleChange}
           onComplete={() => setPage("login")}
         />
       </div>

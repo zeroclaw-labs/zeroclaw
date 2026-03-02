@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
 import { type Locale, t } from "../lib/i18n";
+import { setStoredLocale } from "../lib/i18n";
 import { apiClient } from "../lib/api";
 import { isTauri, isGatewayRunning, writeZeroClawConfig } from "../lib/tauri-bridge";
 
@@ -10,9 +11,12 @@ const wizardText: Record<Locale, Record<string, string>> = {
   en: {
     title: "Welcome to MoA",
     subtitle: "Let's set up your AI assistant",
+    step_language: "Language",
     step_provider: "AI Provider",
     step_apikey: "API Key",
     step_complete: "Ready!",
+    language_label: "Choose your language",
+    language_hint: "Select the language for the MoA interface",
     provider_label: "Choose your AI provider",
     provider_hint: "You can change this later in Settings",
     apikey_label: "Enter your API key",
@@ -24,10 +28,11 @@ const wizardText: Record<Locale, Record<string, string>> = {
     back: "Back",
     finish: "Start Chatting",
     checking_gateway: "Checking local AI engine...",
-    gateway_ready: "ZeroClaw is running",
-    gateway_not_ready: "ZeroClaw is starting...",
+    gateway_ready: "AI engine is running",
+    gateway_not_ready: "AI engine is starting...",
     setup_complete_title: "You're all set!",
-    setup_complete_desc: "MoA is ready to assist you. You can always change these settings later.",
+    setup_complete_desc: "MoA is ready to assist you. You can always change these settings later in the Settings page.",
+    setup_complete_settings_hint: "Channel configuration, voice settings, and memory sync can be set up in Settings.",
     provider_openrouter: "OpenRouter (Recommended)",
     provider_openrouter_desc: "Access 200+ models with one key",
     provider_anthropic: "Anthropic",
@@ -42,9 +47,12 @@ const wizardText: Record<Locale, Record<string, string>> = {
   ko: {
     title: "MoA에 오신 것을 환영합니다",
     subtitle: "AI 어시스턴트를 설정해 봅시다",
+    step_language: "언어",
     step_provider: "AI 제공자",
     step_apikey: "API 키",
     step_complete: "완료!",
+    language_label: "언어를 선택하세요",
+    language_hint: "MoA 인터페이스의 언어를 선택하세요",
     provider_label: "AI 제공자를 선택하세요",
     provider_hint: "나중에 설정에서 변경할 수 있습니다",
     apikey_label: "API 키를 입력하세요",
@@ -56,10 +64,11 @@ const wizardText: Record<Locale, Record<string, string>> = {
     back: "이전",
     finish: "채팅 시작",
     checking_gateway: "로컬 AI 엔진 확인 중...",
-    gateway_ready: "ZeroClaw 실행 중",
-    gateway_not_ready: "ZeroClaw 시작 중...",
+    gateway_ready: "AI 엔진 실행 중",
+    gateway_not_ready: "AI 엔진 시작 중...",
     setup_complete_title: "모든 준비가 완료되었습니다!",
-    setup_complete_desc: "MoA가 도와드릴 준비가 되었습니다. 설정은 언제든 변경할 수 있습니다.",
+    setup_complete_desc: "MoA가 도와드릴 준비가 되었습니다. 설정 페이지에서 언제든 변경할 수 있습니다.",
+    setup_complete_settings_hint: "채널 설정, 음성 설정, 메모리 동기화는 설정 페이지에서 구성할 수 있습니다.",
     provider_openrouter: "OpenRouter (추천)",
     provider_openrouter_desc: "하나의 키로 200개 이상의 모델 사용",
     provider_anthropic: "Anthropic",
@@ -77,6 +86,17 @@ function wt(key: string, locale: Locale): string {
   return wizardText[locale]?.[key] ?? wizardText.en[key] ?? key;
 }
 
+interface LanguageOption {
+  id: Locale;
+  label: string;
+  nativeLabel: string;
+}
+
+const LANGUAGES: LanguageOption[] = [
+  { id: "ko", label: "Korean", nativeLabel: "한국어" },
+  { id: "en", label: "English", nativeLabel: "English" },
+];
+
 interface Provider {
   id: string;
   nameKey: string;
@@ -93,19 +113,23 @@ const PROVIDERS: Provider[] = [
 
 interface SetupWizardProps {
   locale: Locale;
+  onLocaleChange?: (locale: Locale) => void;
   onComplete: () => void;
 }
 
-type Step = "provider" | "apikey" | "complete";
-const STEPS: Step[] = ["provider", "apikey", "complete"];
+type Step = "language" | "provider" | "apikey" | "complete";
+const STEPS: Step[] = ["language", "provider", "apikey", "complete"];
 
-export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
-  const [step, setStep] = useState<Step>("provider");
+export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardProps) {
+  const [step, setStep] = useState<Step>("language");
+  const [selectedLocale, setSelectedLocale] = useState<Locale>(locale);
   const [selectedProvider, setSelectedProvider] = useState<string>("openrouter");
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [gatewayStatus, setGatewayStatus] = useState<"checking" | "ready" | "starting">("checking");
 
+  // Use selectedLocale for wizard text so it updates immediately on language change
+  const wizardLocale = selectedLocale;
   const stepIndex = STEPS.indexOf(step);
 
   // Check gateway status when reaching complete step
@@ -126,7 +150,12 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
   }, []);
 
   const handleNext = useCallback(async () => {
-    if (step === "provider") {
+    if (step === "language") {
+      // Persist language choice
+      setStoredLocale(selectedLocale);
+      onLocaleChange?.(selectedLocale);
+      setStep("provider");
+    } else if (step === "provider") {
       if (selectedProvider === "ollama") {
         // Ollama doesn't need an API key — write config and skip to complete
         localStorage.setItem("moa_setup_provider", selectedProvider);
@@ -173,7 +202,7 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
       setStep("complete");
       checkGateway();
     }
-  }, [step, selectedProvider, apiKey, checkGateway]);
+  }, [step, selectedLocale, selectedProvider, apiKey, checkGateway, onLocaleChange]);
 
   const handleSkipApiKey = useCallback(async () => {
     localStorage.setItem("moa_setup_provider", selectedProvider);
@@ -187,7 +216,8 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
   }, [selectedProvider, checkGateway]);
 
   const handleBack = useCallback(() => {
-    if (step === "apikey") setStep("provider");
+    if (step === "provider") setStep("language");
+    else if (step === "apikey") setStep("provider");
     else if (step === "complete") setStep("apikey");
   }, [step]);
 
@@ -213,8 +243,8 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
               </defs>
             </svg>
           </div>
-          <h1>{wt("title", locale)}</h1>
-          <p>{wt("subtitle", locale)}</p>
+          <h1>{wt("title", wizardLocale)}</h1>
+          <p>{wt("subtitle", wizardLocale)}</p>
         </div>
 
         {/* Step indicator */}
@@ -226,7 +256,7 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
             >
               <span className="setup-step-number">{i + 1}</span>
               <span className="setup-step-label">
-                {wt(`step_${s}`, locale)}
+                {wt(`step_${s}`, wizardLocale)}
               </span>
             </div>
           ))}
@@ -234,10 +264,34 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
 
         {/* Content */}
         <div className="setup-wizard-content">
+          {step === "language" && (
+            <div className="setup-section">
+              <h2>{wt("language_label", wizardLocale)}</h2>
+              <p className="setup-hint">{wt("language_hint", wizardLocale)}</p>
+              <div className="setup-provider-list">
+                {LANGUAGES.map((lang) => (
+                  <button
+                    key={lang.id}
+                    className={`setup-provider-option ${selectedLocale === lang.id ? "selected" : ""}`}
+                    onClick={() => setSelectedLocale(lang.id)}
+                  >
+                    <div className="setup-provider-radio">
+                      <div className={`radio-dot ${selectedLocale === lang.id ? "checked" : ""}`} />
+                    </div>
+                    <div className="setup-provider-info">
+                      <span className="setup-provider-name">{lang.nativeLabel}</span>
+                      <span className="setup-provider-desc">{lang.label}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {step === "provider" && (
             <div className="setup-section">
-              <h2>{wt("provider_label", locale)}</h2>
-              <p className="setup-hint">{wt("provider_hint", locale)}</p>
+              <h2>{wt("provider_label", wizardLocale)}</h2>
+              <p className="setup-hint">{wt("provider_hint", wizardLocale)}</p>
               <div className="setup-provider-list">
                 {PROVIDERS.map((p) => (
                   <button
@@ -249,8 +303,8 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
                       <div className={`radio-dot ${selectedProvider === p.id ? "checked" : ""}`} />
                     </div>
                     <div className="setup-provider-info">
-                      <span className="setup-provider-name">{wt(p.nameKey, locale)}</span>
-                      <span className="setup-provider-desc">{wt(p.descKey, locale)}</span>
+                      <span className="setup-provider-name">{wt(p.nameKey, wizardLocale)}</span>
+                      <span className="setup-provider-desc">{wt(p.descKey, wizardLocale)}</span>
                     </div>
                   </button>
                 ))}
@@ -260,16 +314,16 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
 
           {step === "apikey" && (
             <div className="setup-section">
-              <h2>{wt("apikey_label", locale)}</h2>
+              <h2>{wt("apikey_label", wizardLocale)}</h2>
               <p className="setup-hint">
-                {apiKey.trim() ? wt("apikey_hint_with_key", locale) : wt("apikey_hint_no_key", locale)}
+                {apiKey.trim() ? wt("apikey_hint_with_key", wizardLocale) : wt("apikey_hint_no_key", wizardLocale)}
               </p>
               <div className="setup-apikey-input">
                 <input
                   type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={wt("apikey_placeholder", locale)}
+                  placeholder={wt("apikey_placeholder", wizardLocale)}
                   className="setup-input"
                   autoFocus
                 />
@@ -278,7 +332,7 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
                 className="setup-skip-btn"
                 onClick={handleSkipApiKey}
               >
-                {wt("skip_apikey", locale)}
+                {wt("skip_apikey", wizardLocale)}
               </button>
             </div>
           )}
@@ -291,14 +345,15 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
                   <path d="M20 32L28 40L44 24" stroke="#22c55e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </div>
-              <h2>{wt("setup_complete_title", locale)}</h2>
-              <p className="setup-hint">{wt("setup_complete_desc", locale)}</p>
+              <h2>{wt("setup_complete_title", wizardLocale)}</h2>
+              <p className="setup-hint">{wt("setup_complete_desc", wizardLocale)}</p>
+              <p className="setup-hint setup-settings-hint">{wt("setup_complete_settings_hint", wizardLocale)}</p>
               <div className="setup-gateway-status">
                 <div className={`gateway-indicator ${gatewayStatus}`} />
                 <span>
-                  {gatewayStatus === "checking" && wt("checking_gateway", locale)}
-                  {gatewayStatus === "ready" && wt("gateway_ready", locale)}
-                  {gatewayStatus === "starting" && wt("gateway_not_ready", locale)}
+                  {gatewayStatus === "checking" && wt("checking_gateway", wizardLocale)}
+                  {gatewayStatus === "ready" && wt("gateway_ready", wizardLocale)}
+                  {gatewayStatus === "starting" && wt("gateway_not_ready", wizardLocale)}
                 </span>
               </div>
             </div>
@@ -309,13 +364,18 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
         <div className="setup-wizard-nav">
           {stepIndex > 0 && step !== "complete" && (
             <button className="setup-nav-btn setup-nav-back" onClick={handleBack}>
-              {wt("back", locale)}
+              {wt("back", wizardLocale)}
             </button>
           )}
           <div className="setup-nav-spacer" />
+          {step === "language" && (
+            <button className="setup-nav-btn setup-nav-next" onClick={handleNext}>
+              {wt("next", wizardLocale)}
+            </button>
+          )}
           {step === "provider" && (
             <button className="setup-nav-btn setup-nav-next" onClick={handleNext}>
-              {wt("next", locale)}
+              {wt("next", wizardLocale)}
             </button>
           )}
           {step === "apikey" && (
@@ -324,12 +384,12 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
               onClick={handleNext}
               disabled={saving}
             >
-              {saving ? "..." : wt("next", locale)}
+              {saving ? "..." : wt("next", wizardLocale)}
             </button>
           )}
           {step === "complete" && (
             <button className="setup-nav-btn setup-nav-finish" onClick={handleFinish}>
-              {wt("finish", locale)}
+              {wt("finish", wizardLocale)}
             </button>
           )}
         </div>
