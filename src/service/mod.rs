@@ -1122,6 +1122,8 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
+    // Keep shell child behavior deterministic under CI wrappers that set ENV/BASH_ENV.
+    command.env_remove("ENV").env_remove("BASH_ENV");
     let output = command.output().context("Failed to spawn command")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1131,6 +1133,8 @@ fn run_checked(command: &mut Command) -> Result<()> {
 }
 
 fn run_capture(command: &mut Command) -> Result<String> {
+    // Keep shell child behavior deterministic under CI wrappers that set ENV/BASH_ENV.
+    command.env_remove("ENV").env_remove("BASH_ENV");
     let output = command.output().context("Failed to spawn command")?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
