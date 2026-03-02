@@ -5132,6 +5132,27 @@ pub struct BlueBubblesConfig {
     /// How to split long messages. `None` (default) disables chunking.
     #[serde(default)]
     pub chunk_mode: Option<BlueBubblesChunkMode>,
+    /// When `true`, require the bot's mention keyword in all group chats
+    /// before responding. Default: `false`.
+    #[serde(default)]
+    pub require_mention_in_groups: bool,
+    /// Keyword that must appear in a group message for the bot to respond.
+    /// Falls back to the first entry of `allowed_senders` when unset.
+    #[serde(default)]
+    pub mention_keyword: Option<String>,
+    /// Per-group overrides. Keys are chat GUIDs
+    /// (e.g. `"iMessage;+;chat1234"`). Absent keys inherit the global setting.
+    #[serde(default)]
+    pub groups: std::collections::HashMap<String, BlueBubblesGroupConfig>,
+}
+
+/// Per-group configuration overrides for a BlueBubbles group chat.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BlueBubblesGroupConfig {
+    /// Override `require_mention_in_groups` for this specific group.
+    /// `None` inherits the global setting; `true` requires mention; `false` disables it.
+    #[serde(default)]
+    pub require_mention: Option<bool>,
 }
 
 impl std::fmt::Debug for BlueBubblesConfig {
@@ -5163,6 +5184,9 @@ impl std::fmt::Debug for BlueBubblesConfig {
             .field("send_read_receipts", &self.send_read_receipts)
             .field("text_chunk_limit", &self.text_chunk_limit)
             .field("chunk_mode", &self.chunk_mode)
+            .field("require_mention_in_groups", &self.require_mention_in_groups)
+            .field("mention_keyword", &self.mention_keyword)
+            .field("groups", &self.groups)
             .finish()
     }
 }
@@ -9457,6 +9481,9 @@ mod tests {
             send_read_receipts: true,
             text_chunk_limit: None,
             chunk_mode: None,
+            require_mention_in_groups: false,
+            mention_keyword: None,
+            groups: std::collections::HashMap::new(),
         };
 
         let debug_output = format!("{cfg:?}");

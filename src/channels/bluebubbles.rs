@@ -1,5 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::config::schema::{BlueBubblesChunkMode, BlueBubblesDmPolicy, BlueBubblesGroupPolicy};
+use crate::config::schema::{
+    BlueBubblesChunkMode, BlueBubblesDmPolicy, BlueBubblesGroupConfig, BlueBubblesGroupPolicy,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -165,6 +167,12 @@ pub struct BlueBubblesChannel {
     text_chunk_limit: Option<usize>,
     /// Chunking strategy. `None` = no chunking.
     chunk_mode: Option<BlueBubblesChunkMode>,
+    /// Require mention keyword in group chats globally.
+    require_mention_in_groups: bool,
+    /// Keyword the bot must be mentioned by in group chats.
+    mention_keyword: Option<String>,
+    /// Per-group overrides: chat GUID → config. `None` require_mention inherits global.
+    group_configs: HashMap<String, BlueBubblesGroupConfig>,
 }
 
 impl BlueBubblesChannel {
@@ -190,6 +198,9 @@ impl BlueBubblesChannel {
             client,
             text_chunk_limit: None,
             chunk_mode: None,
+            require_mention_in_groups: false,
+            mention_keyword: None,
+            group_configs: HashMap::new(),
             from_me_cache: Mutex::new(FromMeCache::new()),
             typing_handles: Mutex::new(HashMap::new()),
             transcription: None,
@@ -267,6 +278,65 @@ impl BlueBubblesChannel {
                 chunks
             }
             _ => vec![text],
+        }
+    }
+
+    /// Configure group mention gating.
+    ///
+    /// When `require_mention_in_groups` is `true`, group messages that do not
+    /// contain `mention_keyword` (case-insensitive) are silently dropped.
+    /// Per-group overrides in `group_configs` take precedence over the global flag.
+    pub(crate) fn with_mention_gating(
+        mut self,
+        require_mention_in_groups: bool,
+        mention_keyword: Option<String>,
+        group_configs: HashMap<String, BlueBubblesGroupConfig>,
+    ) -> Self {
+        self.require_mention_in_groups = require_mention_in_groups;
+        self.mention_keyword = mention_keyword;
+        self.group_configs = group_configs;
+        self
+    }
+
+    /// Returns `true` when `text` must be dropped because a mention is required
+    /// in this group chat but the keyword is absent from the message.
+    ///
+    /// Always returns `false` for DM chats.
+    fn mention_required_but_missing(&self, chat_guid: &str, text: &str) -> bool {
+        if !Self::is_group_chat(chat_guid) {
+            return false;
+        }
+
+        // Per-group override takes precedence
+        let require = if let Some(cfg) = self.group_configs.get(chat_guid) {
+            match cfg.require_mention {
+                Some(v) => v,
+                None => self.require_mention_in_groups,
+            }
+        } else {
+            self.require_mention_in_groups
+        };
+
+        if !require {
+            return false;
+        }
+
+        // Resolve effective keyword: explicit > first allowed_sender > none (always block)
+        let keyword = self
+            .mention_keyword
+            .as_deref()
+            .or_else(|| self.allowed_senders.first().map(String::as_str));
+
+        match keyword {
+            Some(kw) => !text.to_ascii_lowercase().contains(&kw.to_ascii_lowercase()),
+            None => {
+                tracing::warn!(
+                    "BlueBubbles: require_mention_in_groups is true for {chat_guid} \
+                     but no mention_keyword or allowed_senders is configured — \
+                     all group messages will be silently dropped"
+                );
+                true
+            }
         }
     }
 
@@ -1090,6 +1160,15 @@ impl BlueBubblesChannel {
             tracing::debug!("BlueBubbles: skipping empty message");
             return messages;
         };
+
+        // Drop group messages that lack the required mention keyword
+        if self.mention_required_but_missing(&reply_target, &content) {
+            tracing::debug!(
+                "BlueBubbles: group message from {sender} in {reply_target} dropped \
+                 (mention keyword not found)"
+            );
+            return messages;
+        }
 
         // If the user is replying to a bot message, inject the original body
         // as context — matches OpenClaw's reply-context resolution.

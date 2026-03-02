@@ -587,6 +587,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                         bb.send_read_receipts,
                     )
                     .with_chunking(bb.text_chunk_limit, bb.chunk_mode)
+                    .with_mention_gating(
+                        bb.require_mention_in_groups,
+                        bb.mention_keyword.clone(),
+                        bb.groups.clone(),
+                    )
                     .with_transcription(config.transcription.clone()),
                 )
             })
