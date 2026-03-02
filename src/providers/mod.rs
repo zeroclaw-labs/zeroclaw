@@ -742,6 +742,7 @@ pub struct ProviderRuntimeOptions {
     pub reasoning_enabled: Option<bool>,
     pub reasoning_level: Option<String>,
     pub custom_provider_api_mode: Option<CompatibleApiMode>,
+    pub custom_provider_auth_header: Option<String>,
     pub max_tokens_override: Option<u32>,
     pub model_support_vision: Option<bool>,
 }
@@ -757,6 +758,7 @@ impl Default for ProviderRuntimeOptions {
             reasoning_enabled: None,
             reasoning_level: None,
             custom_provider_api_mode: None,
+            custom_provider_auth_header: None,
             max_tokens_override: None,
             model_support_vision: None,
         }
@@ -1095,6 +1097,36 @@ fn parse_custom_provider_url(
         _ => anyhow::bail!(
             "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
         ),
+    }
+}
+
+fn resolve_custom_provider_auth_style(options: &ProviderRuntimeOptions) -> AuthStyle {
+    let Some(header) = options
+        .custom_provider_auth_header
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return AuthStyle::Bearer;
+    };
+
+    if header.eq_ignore_ascii_case("authorization") {
+        return AuthStyle::Bearer;
+    }
+
+    if header.eq_ignore_ascii_case("x-api-key") {
+        return AuthStyle::XApiKey;
+    }
+
+    match reqwest::header::HeaderName::from_bytes(header.as_bytes()) {
+        Ok(_) => AuthStyle::Custom(header.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                header = %header,
+                "Ignoring invalid custom provider auth header and falling back to Bearer: {error}"
+            );
+            AuthStyle::Bearer
+        }
     }
 }
 
@@ -1488,11 +1520,12 @@ fn create_provider_with_url_and_options(
             let api_mode = options
                 .custom_provider_api_mode
                 .unwrap_or(CompatibleApiMode::OpenAiChatCompletions);
+            let auth_style = resolve_custom_provider_auth_style(options);
             Ok(Box::new(OpenAiCompatibleProvider::new_custom_with_mode(
                 "Custom",
                 &base_url,
                 key,
-                AuthStyle::Bearer,
+                auth_style,
                 true,
                 api_mode,
                 options.max_tokens_override,
@@ -2850,6 +2883,51 @@ mod tests {
     fn factory_custom_trims_whitespace() {
         let p = create_provider("custom:  https://my-llm.example.com  ", Some("key"));
         assert!(p.is_ok());
+    }
+
+    #[test]
+    fn custom_provider_auth_style_defaults_to_bearer() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::Bearer
+        ));
+    }
+
+    #[test]
+    fn custom_provider_auth_style_maps_x_api_key() {
+        let options = ProviderRuntimeOptions {
+            custom_provider_auth_header: Some("x-api-key".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::XApiKey
+        ));
+    }
+
+    #[test]
+    fn custom_provider_auth_style_maps_custom_header() {
+        let options = ProviderRuntimeOptions {
+            custom_provider_auth_header: Some("api-key".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::Custom(header) if header == "api-key"
+        ));
+    }
+
+    #[test]
+    fn custom_provider_auth_style_invalid_header_falls_back_to_bearer() {
+        let options = ProviderRuntimeOptions {
+            custom_provider_auth_header: Some("not a header".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::Bearer
+        ));
     }
 
     // ── Anthropic-compatible custom endpoints ─────────────────

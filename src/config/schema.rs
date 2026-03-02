@@ -403,6 +403,10 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional custom authentication header for `custom:` providers
+    /// (for example `api-key` for Azure OpenAI).
+    #[serde(default)]
+    pub auth_header: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
@@ -7734,6 +7738,10 @@ impl Config {
         }
     }
 
+    fn urls_match_ignoring_trailing_slash(lhs: &str, rhs: &str) -> bool {
+        lhs.trim().trim_end_matches('/') == rhs.trim().trim_end_matches('/')
+    }
+
     /// Resolve provider reasoning level with backward-compatible runtime alias.
     ///
     /// Priority:
@@ -7785,6 +7793,53 @@ impl Config {
     /// - `sse`
     pub fn effective_provider_transport(&self) -> Option<String> {
         Self::normalize_provider_transport(self.provider.transport.as_deref(), "provider.transport")
+    }
+
+    /// Resolve custom provider auth header from a matching `[model_providers.*]` profile.
+    ///
+    /// This is used when `default_provider = "custom:<url>"` and a profile with the
+    /// same `base_url` declares `auth_header` (for example `api-key` for Azure OpenAI).
+    pub fn effective_custom_provider_auth_header(&self) -> Option<String> {
+        let custom_provider_url = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .and_then(|provider| provider.strip_prefix("custom:"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        let mut profile_keys = self.model_providers.keys().collect::<Vec<_>>();
+        profile_keys.sort_unstable();
+
+        for profile_key in profile_keys {
+            let Some(profile) = self.model_providers.get(profile_key) else {
+                continue;
+            };
+
+            let Some(header) = profile
+                .auth_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            let Some(base_url) = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            if Self::urls_match_ignoring_trailing_slash(custom_provider_url, base_url) {
+                return Some(header.to_string());
+            }
+        }
+
+        None
     }
 
     fn lookup_model_provider_profile(
@@ -8558,6 +8613,18 @@ impl Config {
                     anyhow::bail!(
                         "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
                     );
+                }
+            }
+
+            if let Some(auth_header) = profile.auth_header.as_deref().map(str::trim) {
+                if !auth_header.is_empty() {
+                    reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).with_context(
+                        || {
+                            format!(
+                                "model_providers.{profile_name}.auth_header is invalid; expected a valid HTTP header name"
+                            )
+                        },
+                    )?;
                 }
             }
         }
@@ -12552,6 +12619,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: None,
                     api_key: None,
@@ -12573,6 +12641,73 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn model_provider_profile_surfaces_custom_auth_header_for_matching_custom_provider() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("azure".to_string()),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+            )
+        );
+        assert_eq!(
+            config.effective_custom_provider_auth_header().as_deref(),
+            Some("api-key")
+        );
+    }
+
+    #[test]
+    async fn model_provider_profile_custom_auth_header_requires_url_match() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("azure".to_string()),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/other-model/chat/completions?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        config.default_provider = Some(
+            "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                .to_string(),
+        );
+        assert!(config.effective_custom_provider_auth_header().is_none());
+    }
+
+    #[test]
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12582,6 +12717,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue".to_string()),
+                    auth_header: None,
                     wire_api: Some("responses".to_string()),
                     default_model: None,
                     api_key: None,
@@ -12646,6 +12782,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: Some("ws".to_string()),
                     default_model: None,
                     api_key: None,
@@ -12662,6 +12799,30 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn validate_rejects_invalid_model_provider_auth_header() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: Some("not a header".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("auth_header is invalid"));
+    }
+
+    #[test]
     async fn model_provider_profile_uses_profile_api_key_when_global_is_missing() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12672,6 +12833,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: None,
                     api_key: Some("profile-api-key".to_string()),
@@ -12696,6 +12858,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: Some("qwen-max".to_string()),
                     api_key: None,
