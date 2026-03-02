@@ -2450,7 +2450,11 @@ fn filter_tools_by_agent_allowlist(
 
     for name in allowed_tools {
         let trimmed = name.trim();
-        if !trimmed.is_empty() && !registered_names.contains(trimmed) {
+        if trimmed.is_empty() {
+            tracing::warn!("main agent: ignored blank entry in allowed_tools");
+            continue;
+        }
+        if !registered_names.contains(trimmed) {
             tracing::warn!(
                 "main agent: ignored non-existent tool in allowed_tools: \"{}\"",
                 trimmed
@@ -2541,7 +2545,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let all_tools = tools::all_tools_with_runtime(
+    let mut all_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2556,19 +2560,12 @@ pub async fn run(
         config.api_key.as_deref(),
         &config,
     );
-    let mut tools_registry =
-        filter_tools_by_agent_allowlist(all_tools, &config.agent.allowed_tools);
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        let filtered_peripheral_tools =
-            filter_tools_by_agent_allowlist(peripheral_tools, &config.agent.allowed_tools);
-        if !filtered_peripheral_tools.is_empty() {
-            tracing::info!(count = filtered_peripheral_tools.len(), "Peripheral tools added");
-            tools_registry.extend(filtered_peripheral_tools);
-        }
-    }
+    all_tools.extend(peripheral_tools);
+    let mut tools_registry =
+        filter_tools_by_agent_allowlist(all_tools, &config.agent.allowed_tools);
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -3177,7 +3174,7 @@ pub async fn process_message_with_session(
     } else {
         (None, None)
     };
-    let all_tools = tools::all_tools_with_runtime(
+    let mut all_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3192,15 +3189,12 @@ pub async fn process_message_with_session(
         config.api_key.as_deref(),
         &config,
     );
-    let mut tools_registry =
-        filter_tools_by_agent_allowlist(all_tools, &config.agent.allowed_tools);
+
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        let filtered_peripheral_tools =
-            filter_tools_by_agent_allowlist(peripheral_tools, &config.agent.allowed_tools);
-        tools_registry.extend(filtered_peripheral_tools);
-    }
+    all_tools.extend(peripheral_tools);
+    let mut tools_registry =
+        filter_tools_by_agent_allowlist(all_tools, &config.agent.allowed_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = crate::config::resolve_default_model_id(

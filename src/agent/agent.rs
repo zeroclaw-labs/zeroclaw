@@ -323,7 +323,11 @@ impl Agent {
 
             for name in &config.agent.allowed_tools {
                 let trimmed = name.trim();
-                if !trimmed.is_empty() && !registered_names.contains(trimmed) {
+                if trimmed.is_empty() {
+                    tracing::warn!("main agent: ignored blank entry in allowed_tools");
+                    continue;
+                }
+                if !registered_names.contains(trimmed) {
                     tracing::warn!(
                         "main agent: ignored non-existent tool in allowed_tools: \"{}\"",
                         trimmed
