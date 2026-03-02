@@ -51,7 +51,8 @@ impl MemoryLoader for DefaultMemoryLoader {
     ) -> anyhow::Result<String> {
         // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
         let fetch_limit = self.limit * RECALL_OVER_FETCH_FACTOR;
-        let mut entries = retrieval::enhanced_recall(memory, user_message, fetch_limit, None).await;
+        let mut entries =
+            retrieval::enhanced_recall(memory, user_message, fetch_limit, None).await?;
         if entries.is_empty() {
             return Ok(String::new());
         }

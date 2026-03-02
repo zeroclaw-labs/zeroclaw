@@ -35,8 +35,9 @@ pub(super) async fn build_context(
 
     // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
     let fetch_limit = CONTEXT_ENTRY_LIMIT * RECALL_OVER_FETCH_FACTOR;
-    let mut entries = retrieval::enhanced_recall(mem, user_msg, fetch_limit, session_id).await;
-    if !entries.is_empty() {
+    if let Ok(mut entries) =
+        retrieval::enhanced_recall(mem, user_msg, fetch_limit, session_id).await
+    {
         // Apply time decay: older non-Core memories score lower.
         decay::apply_time_decay(&mut entries, CONTEXT_DECAY_HALF_LIFE_DAYS);
 
@@ -231,7 +232,7 @@ mod tests {
                 category: MemoryCategory::Conversation,
                 timestamp: "now".into(),
                 session_id: None,
-                score: Some(0.9 - (idx as f64 * 0.01)),
+                score: Some(0.9 - (f64::from(idx) * 0.01)),
             })
             .collect::<Vec<_>>();
         let memory = MockMemory {

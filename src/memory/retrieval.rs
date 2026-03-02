@@ -8,18 +8,19 @@ const MIN_KEYWORD_LENGTH: usize = 4;
 
 /// Enhanced memory retrieval with multi-query expansion.
 ///
-/// 1. Runs the primary recall with the full query.
+/// 1. Runs the primary recall with the full query (errors propagate to caller).
 /// 2. For long messages, extracts significant keywords and runs a second recall,
 ///    merging results (deduplicated by key, keeping the higher score).
+///    Keyword expansion is best-effort — failures are silently ignored.
 /// 3. Returns the top `limit` entries sorted by score descending.
 pub async fn enhanced_recall(
     mem: &dyn Memory,
     query: &str,
     limit: usize,
     session_id: Option<&str>,
-) -> Vec<MemoryEntry> {
-    // Primary recall with full query
-    let mut results = mem.recall(query, limit, session_id).await.unwrap_or_default();
+) -> anyhow::Result<Vec<MemoryEntry>> {
+    // Primary recall with full query — errors propagate to caller.
+    let mut results = mem.recall(query, limit, session_id).await?;
 
     // Multi-query expansion for long messages
     if query.len() >= MIN_EXPANSION_LENGTH {
@@ -40,7 +41,7 @@ pub async fn enhanced_recall(
     });
     results.truncate(limit);
 
-    results
+    Ok(results)
 }
 
 /// Extract significant keywords (length >= 4) from a message.
@@ -146,15 +147,24 @@ mod tests {
     #[async_trait]
     impl Memory for MockMemory {
         async fn store(
-            &self, _k: &str, _c: &str, _cat: MemoryCategory, _s: Option<&str>,
+            &self,
+            _k: &str,
+            _c: &str,
+            _cat: MemoryCategory,
+            _s: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn recall(
-            &self, _query: &str, _limit: usize, _s: Option<&str>,
+            &self,
+            _query: &str,
+            _limit: usize,
+            _s: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             // First call returns primary results, second call returns keyword results
-            let n = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
                 Ok(self.primary.clone())
             } else {
@@ -165,7 +175,9 @@ mod tests {
             Ok(None)
         }
         async fn list(
-            &self, _c: Option<&MemoryCategory>, _s: Option<&str>,
+            &self,
+            _c: Option<&MemoryCategory>,
+            _s: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
@@ -209,7 +221,7 @@ mod tests {
 
         // Long query triggers expansion
         let query = "what database and programming language should we use for this project";
-        let results = enhanced_recall(&mem, query, 5, None).await;
+        let results = enhanced_recall(&mem, query, 5, None).await.unwrap();
 
         assert_eq!(results.len(), 2);
         // "db" has higher score (0.7), ranked first
@@ -246,7 +258,7 @@ mod tests {
 
         // Short query — no expansion, so "keyword" recall is what gets returned
         // (because our mock returns keyword results for short queries)
-        let results = enhanced_recall(&mem, "database?", 5, None).await;
+        let results = enhanced_recall(&mem, "database?", 5, None).await.unwrap();
 
         // Only keyword results returned (mock behavior), no merge
         assert_eq!(results.len(), 1);
@@ -263,7 +275,7 @@ mod tests {
                     category: MemoryCategory::Conversation,
                     timestamp: "now".into(),
                     session_id: None,
-                    score: Some(0.5 + i as f64 * 0.01),
+                    score: Some(0.5 + f64::from(i) * 0.01),
                 })
                 .collect(),
             keyword: vec![],
@@ -276,8 +288,69 @@ mod tests {
             3,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 3);
+    }
+
+    /// Mock that always fails on recall — used to verify error propagation.
+    struct FailingMockMemory;
+
+    #[async_trait]
+    impl Memory for FailingMockMemory {
+        async fn store(
+            &self,
+            _k: &str,
+            _c: &str,
+            _cat: MemoryCategory,
+            _s: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _s: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            anyhow::bail!("backend unavailable")
+        }
+        async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _c: Option<&MemoryCategory>,
+            _s: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            "failing-mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn enhanced_recall_propagates_primary_recall_error() {
+        let result = enhanced_recall(&FailingMockMemory, "test query", 5, None).await;
+        assert!(
+            result.is_err(),
+            "primary recall failure must propagate, not become empty vec"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("backend unavailable"),
+            "error message should surface: {err_msg}"
+        );
     }
 }
