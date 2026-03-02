@@ -26,7 +26,7 @@ impl BlueBubblesMessageTool {
             client: reqwest::ClientBuilder::new()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .expect("valid reqwest client config"),
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
