@@ -48,11 +48,31 @@ if command -v clang >/dev/null 2>&1; then
     exit 0
 fi
 
+resolve_cc_after_bootstrap() {
+    if command -v cc >/dev/null 2>&1; then
+        command -v cc
+        return 0
+    fi
+
+    local shim_dir="${RUNNER_TEMP:-/tmp}/cc-shim"
+    local shim_cc="${shim_dir}/cc"
+    if [ -x "${shim_cc}" ]; then
+        export PATH="${shim_dir}:${PATH}"
+        command -v cc
+        return 0
+    fi
+
+    return 1
+}
+
 # Prefer the resilient provisioning path (package manager + Zig fallback) used by CI Rust jobs.
 if [ -x "${script_dir}/ensure_cc.sh" ]; then
     if bash "${script_dir}/ensure_cc.sh"; then
-        configure_linker "$(command -v cc)"
-        exit 0
+        if cc_path="$(resolve_cc_after_bootstrap)"; then
+            configure_linker "${cc_path}"
+            exit 0
+        fi
+        echo "::warning::C toolchain bootstrap reported success but 'cc' is still unavailable in current step."
     fi
 fi
 
