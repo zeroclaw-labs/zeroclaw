@@ -585,6 +585,19 @@ send_read_receipts = true
 # "newline" drops blank lines (consecutive \n); intentional paragraph breaks are collapsed.
 # If splitting yields no non-empty chunks, the full original message is sent as-is.
 # chunk_mode = "length"
+
+# --- Group mention gating (optional) ---
+# Require the bot to be explicitly @mentioned in group chats before it responds.
+# Default: false (respond to all group messages that pass the group_policy check).
+# require_mention_in_groups = false
+# Keyword that counts as a mention. Defaults to the first entry in allowed_senders.
+# Required when allowed_senders is empty and require_mention_in_groups = true.
+# mention_keyword = "Hey Bot"
+
+# Per-group mention overrides (optional). Key = chat GUID, value = {require_mention}.
+# Overrides require_mention_in_groups for a specific group.
+# [channels_config.bluebubbles.groups."iMessage;+;chat-abc123"]
+# require_mention = false
 ```
 
 Policy behaviour:
