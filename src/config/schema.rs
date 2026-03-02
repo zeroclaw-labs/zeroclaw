@@ -4626,6 +4626,8 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+    /// Native streaming for channels that support draft updates directly.
+    On,
 }
 
 /// Progress verbosity for channels that support draft streaming.
@@ -10832,6 +10834,13 @@ tool_dispatcher = "xml"
             GroupReplyMode::AllMessages
         );
         assert!(parsed.group_reply_allowed_sender_ids().is_empty());
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_stream_mode_on() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"stream_mode":"on"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stream_mode, StreamMode::On);
     }
 
     #[test]
