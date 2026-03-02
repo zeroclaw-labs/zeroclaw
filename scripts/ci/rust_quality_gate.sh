@@ -7,6 +7,17 @@ if [ "${1:-}" = "--strict" ]; then
     MODE="strict"
 fi
 
+run_cargo_tool() {
+    local subcommand="$1"
+    shift
+
+    if [ -n "${RUSTUP_TOOLCHAIN:-}" ] && command -v rustup >/dev/null 2>&1; then
+        rustup run "${RUSTUP_TOOLCHAIN}" cargo "$subcommand" "$@"
+    else
+        cargo "$subcommand" "$@"
+    fi
+}
+
 ensure_cargo_subcommand_component() {
     local subcommand="$1"
     local toolchain="${RUSTUP_TOOLCHAIN:-}"
@@ -16,7 +27,7 @@ ensure_cargo_subcommand_component() {
         component="rustfmt"
     fi
 
-    if cargo "$subcommand" --version >/dev/null 2>&1; then
+    if run_cargo_tool "$subcommand" --version >/dev/null 2>&1; then
         return 0
     fi
 
@@ -35,13 +46,13 @@ ensure_cargo_subcommand_component() {
 
 ensure_cargo_subcommand_component "fmt"
 echo "==> rust quality: cargo fmt --all -- --check"
-cargo fmt --all -- --check
+run_cargo_tool fmt --all -- --check
 
 ensure_cargo_subcommand_component "clippy"
 if [ "$MODE" = "strict" ]; then
     echo "==> rust quality: cargo clippy --locked --all-targets -- -D warnings"
-    cargo clippy --locked --all-targets -- -D warnings
+    run_cargo_tool clippy --locked --all-targets -- -D warnings
 else
     echo "==> rust quality: cargo clippy --locked --all-targets -- -D clippy::correctness"
-    cargo clippy --locked --all-targets -- -D clippy::correctness
+    run_cargo_tool clippy --locked --all-targets -- -D clippy::correctness
 fi
