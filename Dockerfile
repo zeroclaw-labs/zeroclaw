@@ -15,6 +15,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs build.rs
 COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 COPY crates/zeroclaw-types/Cargo.toml crates/zeroclaw-types/Cargo.toml
 COPY crates/zeroclaw-core/Cargo.toml crates/zeroclaw-core/Cargo.toml
