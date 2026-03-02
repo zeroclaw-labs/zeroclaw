@@ -74,6 +74,57 @@ impl std::fmt::Display for WebsocketRequestError {
 
 impl std::error::Error for WebsocketRequestError {}
 
+fn websocket_waiting_for_events_timeout_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "OpenAI Codex websocket stream timed out after {}s waiting for events",
+        CODEX_WS_READ_TIMEOUT.as_secs()
+    ))
+}
+
+fn websocket_no_response_before_timeout_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "No response from OpenAI Codex websocket stream before timeout"
+    ))
+}
+
+fn websocket_no_response_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "No response from OpenAI Codex websocket stream"
+    ))
+}
+
+fn classify_websocket_read_timeout(
+    saw_delta: bool,
+    has_fallback_text: bool,
+) -> Result<bool, WebsocketRequestError> {
+    if saw_delta || has_fallback_text {
+        Ok(true)
+    } else {
+        Err(websocket_waiting_for_events_timeout_error())
+    }
+}
+
+fn finalize_websocket_text(
+    saw_delta: bool,
+    delta_accumulator: &str,
+    fallback_text: Option<String>,
+    timed_out: bool,
+) -> Result<String, WebsocketRequestError> {
+    if saw_delta {
+        return nonempty_preserve(Some(delta_accumulator)).ok_or_else(|| {
+            WebsocketRequestError::stream(anyhow::anyhow!("No response from OpenAI Codex"))
+        });
+    }
+    if let Some(text) = fallback_text {
+        return Ok(text);
+    }
+    if timed_out {
+        return Err(websocket_no_response_before_timeout_error());
+    }
+
+    Err(websocket_no_response_error())
+}
+
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
@@ -791,14 +842,11 @@ impl OpenAiCodexProvider {
                 Ok(frame) => frame,
                 Err(_) => {
                     let _ = ws_stream.close(None).await;
-                    if saw_delta || fallback_text.is_some() {
-                        timed_out = true;
-                        break;
-                    }
-                    return Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
-                        "OpenAI Codex websocket stream timed out after {}s waiting for events",
-                        CODEX_WS_READ_TIMEOUT.as_secs()
-                    )));
+                    timed_out = classify_websocket_read_timeout(
+                        saw_delta,
+                        fallback_text.is_some(),
+                    )?;
+                    break;
                 }
             };
 
@@ -872,23 +920,7 @@ impl OpenAiCodexProvider {
             }
         }
 
-        if saw_delta {
-            return nonempty_preserve(Some(&delta_accumulator)).ok_or_else(|| {
-                WebsocketRequestError::stream(anyhow::anyhow!("No response from OpenAI Codex"))
-            });
-        }
-        if let Some(text) = fallback_text {
-            return Ok(text);
-        }
-        if timed_out {
-            return Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
-                "No response from OpenAI Codex websocket stream before timeout"
-            )));
-        }
-
-        Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
-            "No response from OpenAI Codex websocket stream"
-        )))
+        finalize_websocket_text(saw_delta, &delta_accumulator, fallback_text, timed_out)
     }
 
     async fn send_responses_sse_request(
@@ -1588,6 +1620,35 @@ data: [DONE]
         assert_eq!(json[0]["type"], "input_text");
         assert_eq!(json[1]["type"], "input_image");
         assert_eq!(json[2]["type"], "input_image");
+    }
+
+    #[test]
+    fn websocket_initial_read_timeout_is_transport_unavailable() {
+        let err = classify_websocket_read_timeout(false, false)
+            .expect_err("no events before timeout should return transport-unavailable");
+        assert!(matches!(
+            err,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn websocket_no_response_before_timeout_is_transport_unavailable() {
+        let err = finalize_websocket_text(false, "", None, true)
+            .expect_err("timed out websocket without text should return transport-unavailable");
+        assert!(matches!(
+            err,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(err.to_string().contains("before timeout"));
+    }
+
+    #[test]
+    fn websocket_explicit_stream_failure_remains_stream_error() {
+        let err = WebsocketRequestError::stream(anyhow::anyhow!("socket frame decode failed"));
+        assert!(matches!(err, WebsocketRequestError::Stream(_)));
+        assert!(err.to_string().contains("socket frame decode failed"));
     }
 
     #[test]
