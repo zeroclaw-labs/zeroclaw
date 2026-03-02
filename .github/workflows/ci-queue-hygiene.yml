@@ -42,7 +42,7 @@ env:
 jobs:
     hygiene:
         name: Queue Hygiene
-        runs-on: [self-hosted, Linux, X64, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         timeout-minutes: 15
         steps:
             - name: Checkout
