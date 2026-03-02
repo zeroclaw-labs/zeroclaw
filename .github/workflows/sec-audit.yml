@@ -26,6 +26,10 @@ on:
             - "scripts/ci/emit_audit_event.py"
             - "scripts/ci/security_regression_tests.sh"
             - "scripts/ci/ensure_cc.sh"
+            - "scripts/ci/workflow_latency_report.py"
+            - ".github/workflows/sec-codeql.yml"
+            - ".github/workflows/ci-reproducible-build.yml"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-audit.yml"
     pull_request:
         branches: [dev, main]

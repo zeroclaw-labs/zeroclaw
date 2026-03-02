@@ -13,6 +13,7 @@ on:
             - ".github/codeql/**"
             - "scripts/ci/self_heal_rust_toolchain.sh"
             - "scripts/ci/ensure_cc.sh"
+            - "scripts/ci/workflow_latency_report.py"
             - ".github/workflows/sec-codeql.yml"
     pull_request:
         branches: [dev, main]
@@ -26,6 +27,7 @@ on:
             - ".github/codeql/**"
             - "scripts/ci/self_heal_rust_toolchain.sh"
             - "scripts/ci/ensure_cc.sh"
+            - "scripts/ci/workflow_latency_report.py"
             - ".github/workflows/sec-codeql.yml"
     merge_group:
         branches: [dev, main]
@@ -34,8 +36,8 @@ on:
     workflow_dispatch:
 
 concurrency:
-    group: codeql-${{ github.event.pull_request.number || github.ref || github.run_id }}
-    cancel-in-progress: true
+    group: codeql-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref || github.run_id }}
+    cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 permissions:
     contents: read
@@ -72,7 +74,7 @@ jobs:
               with:
                   languages: rust
                   config-file: ./.github/codeql/codeql-config.yml
-                  queries: security-and-quality
+                  queries: ${{ github.event_name == 'pull_request' && 'security-extended' || 'security-and-quality' }}
 
             - name: Set up Rust
               shell: bash
@@ -96,3 +98,48 @@ jobs:
               uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
               with:
                   category: "/language:rust"
+
+            - name: Generate workflow latency report
+              if: always()
+              continue-on-error: true
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > artifacts/workflow-run.json
+                  gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" > artifacts/workflow-jobs.json
+                  gh run list -R "${GITHUB_REPOSITORY}" --workflow "Sec CodeQL" --limit 40 \
+                    --json databaseId,status,conclusion,createdAt,updatedAt,url,event,headBranch > artifacts/workflow-history.json
+                  python3 scripts/ci/workflow_latency_report.py \
+                    --workflow-name "Sec CodeQL" \
+                    --current-run-json artifacts/workflow-run.json \
+                    --current-jobs-json artifacts/workflow-jobs.json \
+                    --history-runs-json artifacts/workflow-history.json \
+                    --step-name "Build" \
+                    --step-name "Perform CodeQL Analysis" \
+                    --output-json artifacts/workflow-latency.json \
+                    --output-md artifacts/workflow-latency.md
+
+            - name: Upload workflow latency artifact
+              if: always()
+              continue-on-error: true
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: sec-codeql-latency
+                  path: artifacts/workflow-latency*
+                  if-no-files-found: ignore
+                  retention-days: 14
+
+            - name: Publish latency summary
+              if: always()
+              continue-on-error: true
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/workflow-latency.md ]; then
+                    cat artifacts/workflow-latency.md >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Workflow latency summary missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi

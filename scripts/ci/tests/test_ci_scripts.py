@@ -4004,6 +4004,236 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("requires authentication token", proc.stderr.lower())
 
+    def test_workflow_latency_report_generates_queue_step_and_baseline_metrics(self) -> None:
+        run_json = self.tmp / "codeql-run.json"
+        jobs_json = self.tmp / "codeql-jobs.json"
+        history_json = self.tmp / "codeql-history.json"
+        output_json = self.tmp / "latency-report.json"
+        output_md = self.tmp / "latency-report.md"
+
+        run_json.write_text(
+            json.dumps(
+                {
+                    "id": 9001,
+                    "name": "Sec CodeQL",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": "2026-03-02T01:05:13Z",
+                    "run_started_at": "2026-03-02T01:05:13Z",
+                    "updated_at": "2026-03-02T01:26:17Z",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        jobs_json.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": 77,
+                            "name": "CodeQL Analysis",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "created_at": "2026-03-02T01:05:24Z",
+                            "started_at": "2026-03-02T01:05:32Z",
+                            "completed_at": "2026-03-02T01:26:17Z",
+                            "steps": [
+                                {
+                                    "name": "Build",
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                    "started_at": "2026-03-02T01:06:13Z",
+                                    "completed_at": "2026-03-02T01:11:51Z",
+                                },
+                                {
+                                    "name": "Perform CodeQL Analysis",
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                    "started_at": "2026-03-02T01:11:51Z",
+                                    "completed_at": "2026-03-02T01:26:10Z",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        history_json.write_text(
+            json.dumps(
+                [
+                    {
+                        "databaseId": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "createdAt": "2026-03-02T00:00:00Z",
+                        "updatedAt": "2026-03-02T00:20:00Z",
+                    },
+                    {
+                        "databaseId": 2,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "createdAt": "2026-03-02T00:10:00Z",
+                        "updatedAt": "2026-03-02T00:31:00Z",
+                    },
+                    {
+                        "databaseId": 3,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "createdAt": "2026-03-02T00:20:00Z",
+                        "updatedAt": "2026-03-02T00:40:00Z",
+                    },
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("workflow_latency_report.py"),
+                "--workflow-name",
+                "Sec CodeQL",
+                "--current-run-json",
+                str(run_json),
+                "--current-jobs-json",
+                str(jobs_json),
+                "--history-runs-json",
+                str(history_json),
+                "--step-name",
+                "Build",
+                "--step-name",
+                "Perform CodeQL Analysis",
+                "--output-json",
+                str(output_json),
+                "--output-md",
+                str(output_md),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["workflow_name"], "Sec CodeQL")
+        self.assertEqual(report["current"]["run_id"], 9001)
+        self.assertEqual(report["current"]["queue_delay_seconds"], 8)
+        self.assertEqual(report["current"]["execution_seconds"], 1245)
+        self.assertEqual(report["current"]["steps"]["Build"], 338)
+        self.assertEqual(report["current"]["steps"]["Perform CodeQL Analysis"], 859)
+        self.assertEqual(report["baseline"]["count"], 3)
+        self.assertEqual(report["baseline"]["p50_seconds"], 1200)
+        self.assertEqual(report["baseline"]["p90_seconds"], 1200)
+        self.assertEqual(report["baseline"]["max_seconds"], 1260)
+
+        markdown = output_md.read_text(encoding="utf-8")
+        self.assertIn("Workflow Latency Summary", markdown)
+        self.assertIn("Queue delay", markdown)
+        self.assertIn("Perform CodeQL Analysis", markdown)
+
+    def test_workflow_latency_report_accepts_workflow_runs_container(self) -> None:
+        run_json = self.tmp / "repro-run.json"
+        jobs_json = self.tmp / "repro-jobs.json"
+        history_json = self.tmp / "repro-history.json"
+        output_json = self.tmp / "repro-latency-report.json"
+        output_md = self.tmp / "repro-latency-report.md"
+
+        run_json.write_text(
+            json.dumps(
+                {
+                    "id": 1337,
+                    "name": "CI Reproducible Build",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": "2026-03-02T01:05:13Z",
+                    "run_started_at": "2026-03-02T01:05:13Z",
+                    "updated_at": "2026-03-02T01:22:00Z",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        jobs_json.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": 88,
+                            "name": "Reproducible Build Probe",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "created_at": "2026-03-02T01:05:31Z",
+                            "started_at": "2026-03-02T01:05:36Z",
+                            "completed_at": "2026-03-02T01:21:59Z",
+                            "steps": [
+                                {
+                                    "name": "Run reproducible build check",
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                    "started_at": "2026-03-02T01:05:53Z",
+                                    "completed_at": "2026-03-02T01:21:54Z",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        history_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 9,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "created_at": "2026-03-02T00:00:00Z",
+                            "updated_at": "2026-03-02T00:16:00Z",
+                        },
+                        {
+                            "id": 10,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "created_at": "2026-03-02T00:10:00Z",
+                            "updated_at": "2026-03-02T00:27:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("workflow_latency_report.py"),
+                "--workflow-name",
+                "CI Reproducible Build",
+                "--current-run-json",
+                str(run_json),
+                "--current-jobs-json",
+                str(jobs_json),
+                "--history-runs-json",
+                str(history_json),
+                "--step-name",
+                "Run reproducible build check",
+                "--output-json",
+                str(output_json),
+                "--output-md",
+                str(output_md),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(report["current"]["queue_delay_seconds"], 5)
+        self.assertEqual(report["current"]["steps"]["Run reproducible build check"], 961)
+        self.assertEqual(report["baseline"]["p50_seconds"], 960)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

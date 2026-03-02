@@ -13,6 +13,7 @@ on:
             - "scripts/ci/ensure_cc.sh"
             - "scripts/ci/reproducible_build_check.sh"
             - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/workflow_latency_report.py"
             - ".github/workflows/ci-reproducible-build.yml"
     pull_request:
         branches: [dev, main]
@@ -26,6 +27,7 @@ on:
             - "scripts/ci/ensure_cc.sh"
             - "scripts/ci/reproducible_build_check.sh"
             - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/workflow_latency_report.py"
             - ".github/workflows/ci-reproducible-build.yml"
     schedule:
         - cron: "45 5 * * 1" # Weekly Monday 05:45 UTC
@@ -43,8 +45,8 @@ on:
                 type: boolean
 
 concurrency:
-    group: repro-build-${{ github.event.pull_request.number || github.ref || github.run_id }}
-    cancel-in-progress: true
+    group: repro-build-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref || github.run_id }}
+    cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 permissions:
     contents: read
@@ -93,18 +95,62 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  fail_on_drift="false"
-                  allow_build_id_drift="true"
-                  if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-                    fail_on_drift="true"
-                  elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-                    fail_on_drift="${{ github.event.inputs.fail_on_drift || 'true' }}"
-                    allow_build_id_drift="${{ github.event.inputs.allow_build_id_drift || 'true' }}"
+                  mkdir -p artifacts
+                  if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+                    host_target="$(rustc -vV | sed -n 's/^host: //p')"
+                    profile="release-fast"
+                    binary_path="${CARGO_TARGET_DIR}/${host_target}/${profile}/zeroclaw"
+
+                    cargo clean
+                    cargo build --profile "${profile}" --locked --target "${host_target}" --verbose
+
+                    if [ ! -f "${binary_path}" ]; then
+                      echo "expected artifact not found: ${binary_path}" >&2
+                      exit 2
+                    fi
+
+                    sha="$(sha256sum "${binary_path}" | awk '{print $1}')"
+                    cat > artifacts/reproducible-build.json <<EOF
+                  {
+                    "schema_version": "zeroclaw.audit.v1",
+                    "event_type": "reproducible_build",
+                    "profile": "${profile}",
+                    "target": "${host_target}",
+                    "binary": "zeroclaw",
+                    "first_sha256": "${sha}",
+                    "second_sha256": "",
+                    "status": "quick_probe",
+                    "drift_reason": "pull_request_fast_path",
+                    "allow_build_id_drift": "true",
+                    "first_build_id": "",
+                    "second_build_id": ""
+                  }
+                  EOF
+
+                    cat > artifacts/reproducible-build.md <<EOF
+                  # Reproducible Build Check
+
+                  - Mode: \`quick_probe\`
+                  - Trigger: \`pull_request\`
+                  - Profile: \`${profile}\`
+                  - Target: \`${host_target}\`
+                  - Binary: \`zeroclaw\`
+                  - SHA256: \`${sha}\`
+                  EOF
+                  else
+                    fail_on_drift="false"
+                    allow_build_id_drift="true"
+                    if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+                      fail_on_drift="true"
+                    elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+                      fail_on_drift="${{ github.event.inputs.fail_on_drift || 'true' }}"
+                      allow_build_id_drift="${{ github.event.inputs.allow_build_id_drift || 'true' }}"
+                    fi
+                    FAIL_ON_DRIFT="$fail_on_drift" \
+                    ALLOW_BUILD_ID_DRIFT="$allow_build_id_drift" \
+                    OUTPUT_DIR="artifacts" \
+                    ./scripts/ci/reproducible_build_check.sh
                   fi
-                  FAIL_ON_DRIFT="$fail_on_drift" \
-                  ALLOW_BUILD_ID_DRIFT="$allow_build_id_drift" \
-                  OUTPUT_DIR="artifacts" \
-                  ./scripts/ci/reproducible_build_check.sh
 
             - name: Emit normalized audit event
               if: always()
@@ -146,4 +192,48 @@ jobs:
                     cat artifacts/reproducible-build.md >> "$GITHUB_STEP_SUMMARY"
                   else
                     echo "Reproducible build report missing." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+            - name: Generate workflow latency report
+              if: always()
+              continue-on-error: true
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > artifacts/workflow-run.json
+                  gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" > artifacts/workflow-jobs.json
+                  gh run list -R "${GITHUB_REPOSITORY}" --workflow "CI Reproducible Build" --limit 40 \
+                    --json databaseId,status,conclusion,createdAt,updatedAt,url,event,headBranch > artifacts/workflow-history.json
+                  python3 scripts/ci/workflow_latency_report.py \
+                    --workflow-name "CI Reproducible Build" \
+                    --current-run-json artifacts/workflow-run.json \
+                    --current-jobs-json artifacts/workflow-jobs.json \
+                    --history-runs-json artifacts/workflow-history.json \
+                    --step-name "Run reproducible build check" \
+                    --output-json artifacts/workflow-latency.json \
+                    --output-md artifacts/workflow-latency.md
+
+            - name: Upload workflow latency artifact
+              if: always()
+              continue-on-error: true
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: reproducible-build-latency
+                  path: artifacts/workflow-latency*
+                  if-no-files-found: ignore
+                  retention-days: 14
+
+            - name: Publish latency summary
+              if: always()
+              continue-on-error: true
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [ -f artifacts/workflow-latency.md ]; then
+                    cat artifacts/workflow-latency.md >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Workflow latency summary missing." >> "$GITHUB_STEP_SUMMARY"
                   fi
