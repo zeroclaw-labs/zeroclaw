@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports providers: DuckDuckGo (free), Brave, Firecrawl.
+/// Supports providers: DuckDuckGo (free), Brave, Firecrawl, SearXNG (self-hosted).
 pub struct WebSearchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
@@ -277,6 +277,89 @@ impl WebSearchTool {
     async fn search_firecrawl(&self, _query: &str) -> anyhow::Result<String> {
         anyhow::bail!("web_search provider 'firecrawl' requires Cargo feature 'firecrawl'")
     }
+
+    async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
+        let instance_url = self
+            .api_url
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SearXNG instance URL not configured. Set web_search.api_url to your SearXNG instance (e.g., 'https://search.example.com') in config.toml"))?;
+
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!(
+            "{}/search?q={}&format=json",
+            instance_url.trim_end_matches('/'),
+            encoded_query
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
+            .build()?;
+
+        let response = client
+            .get(&search_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("SearXNG search failed: {e}"))?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "SearXNG search failed with status {}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid SearXNG response JSON: {e}"))?;
+        self.parse_searxng_results(&parsed, query)
+    }
+
+    fn parse_searxng_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Invalid SearXNG API response: missing 'results' field")
+            })?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via SearXNG)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("No title");
+            let url = result
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let content = result
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !content.is_empty() {
+                lines.push(format!("   {}", content));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -351,8 +434,9 @@ impl Tool for WebSearchTool {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
             "firecrawl" => self.search_firecrawl(query).await?,
+            "searxng" => self.search_searxng(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo', 'brave', or 'firecrawl' in config.toml",
+                "Unknown search provider: '{}'. Set web_search.provider to 'duckduckgo', 'brave', 'firecrawl', or 'searxng' in config.toml",
                 self.provider
             ),
         };
@@ -588,5 +672,111 @@ mod tests {
         let result = tool.execute(json!({"query": "rust"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_searxng_without_api_url() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "searxng".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("instance URL"));
+    }
+
+    #[test]
+    fn test_parse_searxng_results_empty() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "searxng".to_string(),
+            None,
+            Some("https://search.example.com".to_string()),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = json!({"results": []});
+        let result = tool.parse_searxng_results(&json, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_searxng_results_with_data() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "searxng".to_string(),
+            None,
+            Some("https://search.example.com".to_string()),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = json!({
+            "results": [
+                {
+                    "title": "Example Title",
+                    "url": "https://example.com",
+                    "content": "Example description"
+                },
+                {
+                    "title": "Second Result",
+                    "url": "https://example.org",
+                    "content": ""
+                }
+            ]
+        });
+        let result = tool.parse_searxng_results(&json, "test").unwrap();
+        assert!(result.contains("Example Title"));
+        assert!(result.contains("https://example.com"));
+        assert!(result.contains("Example description"));
+        assert!(result.contains("Second Result"));
+        assert!(result.contains("https://example.org"));
+        assert!(result.contains("Search results for: test (via SearXNG)"));
+    }
+
+    #[test]
+    fn test_parse_searxng_results_missing_results_field() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "searxng".to_string(),
+            None,
+            Some("https://search.example.com".to_string()),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = json!({"query": "test"});
+        let result = tool.parse_searxng_results(&json, "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("results"));
+    }
+
+    #[test]
+    fn test_parse_searxng_results_defaults_for_missing_fields() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "searxng".to_string(),
+            None,
+            Some("https://search.example.com".to_string()),
+            5,
+            15,
+            "test".to_string(),
+        );
+        let json = json!({
+            "results": [
+                {
+                    "url": "https://example.com"
+                }
+            ]
+        });
+        let result = tool.parse_searxng_results(&json, "test").unwrap();
+        assert!(result.contains("No title"));
+        assert!(result.contains("https://example.com"));
     }
 }

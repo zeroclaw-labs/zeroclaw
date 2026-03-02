@@ -1368,13 +1368,13 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Generic provider API key (used by firecrawl and as fallback for brave)
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Optional provider API URL override (for self-hosted providers)
+    /// Optional provider API URL override (for self-hosted providers like SearXNG)
     #[serde(default)]
     pub api_url: Option<String>,
     /// Brave Search API key (required if provider is "brave")
