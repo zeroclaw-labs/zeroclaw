@@ -5467,10 +5467,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 let mut registered = 0usize;
                 for name in names {
                     if let Some(def) = registry.get_tool_def(&name).await {
+                        let server_env = registry.get_server_env(&name).await;
                         let wrapper = crate::tools::McpToolWrapper::new(
                             name,
                             def,
                             std::sync::Arc::clone(&registry),
+                            &server_env,
                         );
                         built_tools.push(Box::new(wrapper));
                         registered += 1;

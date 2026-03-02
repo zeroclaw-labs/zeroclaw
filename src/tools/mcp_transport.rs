@@ -142,13 +142,92 @@ impl McpTransportConn for StdioTransport {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OAuthTokenCache {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<u64>,
+    server_url: String,
+}
+
+impl OAuthTokenCache {
+    fn cache_dir() -> std::path::PathBuf {
+        directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".zeroclaw")
+            .join("mcp-oauth-tokens")
+    }
+
+    fn cache_path(server_name: &str) -> std::path::PathBuf {
+        let safe_name: String = server_name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Self::cache_dir().join(format!("{safe_name}.json"))
+    }
+
+    fn load(server_name: &str, server_url: &str) -> Option<Self> {
+        let path = Self::cache_path(server_name);
+        let contents = std::fs::read_to_string(path).ok()?;
+        let cache: Self = serde_json::from_str(&contents).ok()?;
+        if cache.server_url != server_url {
+            return None;
+        }
+        Some(cache)
+    }
+
+    fn save(&self, server_name: &str) {
+        let cache_dir = Self::cache_dir();
+        if let Err(err) = std::fs::create_dir_all(&cache_dir) {
+            tracing::warn!("Failed to create MCP OAuth cache dir: {err}");
+            return;
+        }
+
+        let path = Self::cache_path(server_name);
+        let serialized = match serde_json::to_string_pretty(self) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("Failed to serialize MCP OAuth token cache: {err}");
+                return;
+            }
+        };
+
+        if let Err(err) = std::fs::write(path, serialized) {
+            tracing::warn!("Failed to write MCP OAuth token cache: {err}");
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(expires_at) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                now >= expires_at.saturating_sub(60)
+            }
+            None => false,
+        }
+    }
+}
+
 // ── HTTP Transport ───────────────────────────────────────────────────────
 
 /// HTTP-based transport (POST requests).
 pub struct HttpTransport {
     url: String,
+    server_name: String,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 impl HttpTransport {
@@ -164,10 +243,19 @@ impl HttpTransport {
             .build()
             .context("failed to build HTTP client")?;
 
+        let (access_token, refresh_token) = match OAuthTokenCache::load(&config.name, &url) {
+            Some(cache) if !cache.is_expired() => (Some(cache.access_token), cache.refresh_token),
+            Some(cache) if cache.refresh_token.is_some() => (None, cache.refresh_token),
+            _ => (None, None),
+        };
+
         Ok(Self {
             url,
+            server_name: config.name.clone(),
             client,
             headers: config.headers.clone(),
+            access_token,
+            refresh_token,
         })
     }
 }
@@ -177,6 +265,61 @@ impl McpTransportConn for HttpTransport {
     async fn send_and_recv(&mut self, request: &JsonRpcRequest) -> Result<JsonRpcResponse> {
         let body = serde_json::to_string(request)?;
 
+        let resp = self.http_post(&body).await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                if let Some(refresh_token) = self.refresh_token.clone() {
+                    if let Ok(token_cache) =
+                        try_refresh_token(&self.client, &self.url, &refresh_token, &resp).await
+                    {
+                        self.access_token = Some(token_cache.access_token.clone());
+                        self.refresh_token = token_cache.refresh_token.clone();
+                        token_cache.save(&self.server_name);
+
+                        let retry_resp = self.http_post(&body).await?;
+                        if retry_resp.status().is_success() {
+                            return self.parse_response(retry_resp, request).await;
+                        }
+                    }
+                }
+
+                match perform_mcp_oauth_flow(&self.client, &self.url, &resp).await {
+                    Ok(token_cache) => {
+                        self.access_token = Some(token_cache.access_token.clone());
+                        self.refresh_token = token_cache.refresh_token.clone();
+                        token_cache.save(&self.server_name);
+                        let retry_resp = self.http_post(&body).await?;
+                        if !retry_resp.status().is_success() {
+                            bail!(
+                                "MCP server returned HTTP {} after OAuth",
+                                retry_resp.status()
+                            );
+                        }
+                        return self.parse_response(retry_resp, request).await;
+                    }
+                    Err(e) => {
+                        bail!("MCP server returned HTTP {status}: OAuth flow failed: {e:#}");
+                    }
+                }
+            }
+            bail!("MCP server returned HTTP {status}");
+        }
+
+        self.parse_response(resp, request).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl HttpTransport {
+    /// Build and send an HTTP POST to the MCP server, injecting auth + standard headers.
+    async fn http_post(&self, body: &str) -> Result<reqwest::Response> {
         let has_accept = self
             .headers
             .keys()
@@ -186,7 +329,7 @@ impl McpTransportConn for HttpTransport {
             .keys()
             .any(|k| k.eq_ignore_ascii_case("Content-Type"));
 
-        let mut req = self.client.post(&self.url).body(body);
+        let mut req = self.client.post(&self.url).body(body.to_string());
         if !has_content_type {
             req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
         }
@@ -196,16 +339,20 @@ impl McpTransportConn for HttpTransport {
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
-
-        let resp = req
-            .send()
-            .await
-            .context("HTTP request to MCP server failed")?;
-
-        if !resp.status().is_success() {
-            bail!("MCP server returned HTTP {}", resp.status());
+        if let Some(token) = &self.access_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
+        req.send()
+            .await
+            .context("HTTP request to MCP server failed")
+    }
 
+    /// Parse a successful MCP response (JSON or SSE-framed).
+    async fn parse_response(
+        &self,
+        resp: reqwest::Response,
+        request: &JsonRpcRequest,
+    ) -> Result<JsonRpcResponse> {
         if request.id.is_none() {
             return Ok(JsonRpcResponse {
                 jsonrpc: crate::tools::mcp_protocol::JSONRPC_VERSION.to_string(),
@@ -234,9 +381,489 @@ impl McpTransportConn for HttpTransport {
         let resp_text = resp.text().await.context("failed to read HTTP response")?;
         parse_jsonrpc_response_text(&resp_text)
     }
+}
 
-    async fn close(&mut self) -> Result<()> {
-        Ok(())
+// ── MCP OAuth (RFC 9728 → RFC 8414 → OAuth 2.1 PKCE) ────────────────────
+
+/// Callback port for the MCP OAuth loopback server.
+const MCP_OAUTH_CALLBACK_PORT: u16 = 1457;
+
+/// OAuth metadata discovered from the MCP server's authorization server.
+struct OAuthMetadata {
+    authorization_endpoint: String,
+    token_endpoint: String,
+    registration_endpoint: Option<String>,
+}
+
+async fn try_refresh_token(
+    client: &reqwest::Client,
+    server_url: &str,
+    refresh_token: &str,
+    resp: &reqwest::Response,
+) -> Result<OAuthTokenCache> {
+    let metadata = discover_oauth_metadata(client, server_url, resp).await?;
+    let creds = resolve_client_id(client, &metadata).await?;
+
+    if !metadata.token_endpoint.starts_with("https://") {
+        bail!("Refusing to send credentials to non-HTTPS token endpoint");
+    }
+
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("resource", server_url.to_string()),
+    ];
+    let mut req = client.post(&metadata.token_endpoint);
+
+    match creds.auth_method.as_str() {
+        "client_secret_basic" => {
+            let secret = creds
+                .client_secret
+                .as_deref()
+                .ok_or_else(|| anyhow!("client_secret_basic requires client_secret"))?;
+            req = req.basic_auth(&creds.client_id, Some(secret));
+        }
+        "client_secret_post" => {
+            let secret = creds
+                .client_secret
+                .as_ref()
+                .ok_or_else(|| anyhow!("client_secret_post requires client_secret"))?;
+            form.push(("client_id", creds.client_id.clone()));
+            form.push(("client_secret", secret.clone()));
+        }
+        "none" => {
+            form.push(("client_id", creds.client_id.clone()));
+        }
+        other => {
+            bail!("Unsupported token_endpoint_auth_method: {other}");
+        }
+    }
+
+    let token_resp = req
+        .form(&form)
+        .send()
+        .await
+        .context("Refresh token exchange request failed")?;
+    let status = token_resp.status();
+    let body = token_resp
+        .text()
+        .await
+        .context("Failed to read refresh token response")?;
+
+    if !status.is_success() {
+        bail!("Refresh token exchange failed (HTTP {status})");
+    }
+
+    let token_json: serde_json::Value =
+        serde_json::from_str(&body).context("Invalid refresh token response JSON")?;
+    let access_token = token_json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Refresh response missing access_token"))?
+        .to_string();
+    let refreshed_token = token_json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .or_else(|| Some(refresh_token.to_string()));
+    let expires_at = token_json
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+
+    Ok(OAuthTokenCache {
+        access_token,
+        refresh_token: refreshed_token,
+        expires_at,
+        server_url: server_url.to_string(),
+    })
+}
+
+/// Run the full MCP OAuth authorization code flow with PKCE (RFC 9728 → RFC 8414).
+async fn perform_mcp_oauth_flow(
+    client: &reqwest::Client,
+    server_url: &str,
+    resp: &reqwest::Response,
+) -> Result<OAuthTokenCache> {
+    use crate::auth::oauth_common::{generate_pkce_state, url_encode};
+    use tokio::net::TcpListener;
+
+    let metadata = discover_oauth_metadata(client, server_url, resp)
+        .await
+        .context("Failed to discover MCP OAuth endpoints")?;
+
+    tracing::info!(
+        authorization_endpoint = %metadata.authorization_endpoint,
+        token_endpoint = %metadata.token_endpoint,
+        "MCP OAuth metadata discovered"
+    );
+
+    let creds = resolve_client_id(client, &metadata).await?;
+
+    let pkce = generate_pkce_state();
+    let redirect_uri = format!("http://127.0.0.1:{MCP_OAUTH_CALLBACK_PORT}/callback");
+    let auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&resource={}",
+        metadata.authorization_endpoint,
+        url_encode(&creds.client_id),
+        url_encode(&redirect_uri),
+        url_encode(&pkce.state),
+        url_encode(&pkce.code_challenge),
+        url_encode(server_url),
+    );
+
+    // Bind listener before opening the browser to avoid racing the redirect.
+    let listener = TcpListener::bind(format!("127.0.0.1:{MCP_OAUTH_CALLBACK_PORT}"))
+        .await
+        .context("Failed to bind MCP OAuth callback listener")?;
+
+    eprintln!("\n🔑 MCP OAuth: Opening browser for authorization...");
+    eprintln!("   If the browser doesn't open, check the terminal for the authorization URL.\n");
+    tracing::debug!("MCP OAuth authorization URL prepared");
+
+    let _ = open_browser_url(&auth_url);
+
+    eprintln!("   Waiting for callback at {redirect_uri} ...");
+
+    let (code, received_state) =
+        tokio::time::timeout(Duration::from_secs(120), receive_oauth_callback(&listener))
+            .await
+            .context("OAuth callback timed out (120s)")?
+            .context("Failed to receive OAuth callback")?;
+
+    if received_state != pkce.state {
+        bail!("OAuth state mismatch — possible CSRF attack");
+    }
+
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", pkce.code_verifier),
+        ("resource", server_url.to_string()),
+    ];
+
+    if !metadata.token_endpoint.starts_with("https://") {
+        bail!("Refusing to send credentials to non-HTTPS token endpoint");
+    }
+
+    let mut req = client.post(&metadata.token_endpoint);
+
+    match creds.auth_method.as_str() {
+        "client_secret_basic" => {
+            let secret = creds
+                .client_secret
+                .as_deref()
+                .ok_or_else(|| anyhow!("client_secret_basic requires client_secret"))?;
+            req = req.basic_auth(&creds.client_id, Some(secret));
+        }
+        "client_secret_post" => {
+            let secret = creds
+                .client_secret
+                .as_ref()
+                .ok_or_else(|| anyhow!("client_secret_post requires client_secret"))?;
+            form.push(("client_id", creds.client_id.clone()));
+            form.push(("client_secret", secret.clone()));
+        }
+        "none" => {
+            form.push(("client_id", creds.client_id.clone()));
+        }
+        other => {
+            bail!("Unsupported token_endpoint_auth_method: {other}");
+        }
+    }
+
+    let token_resp = req
+        .form(&form)
+        .send()
+        .await
+        .context("Token exchange request failed")?;
+
+    let status = token_resp.status();
+    let body = token_resp
+        .text()
+        .await
+        .context("Failed to read token response")?;
+
+    if !status.is_success() {
+        bail!("Token exchange failed (HTTP {status})");
+    }
+
+    let token_json: serde_json::Value =
+        serde_json::from_str(&body).context("Invalid token response JSON")?;
+    let access_token = token_json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Token response missing access_token"))?
+        .to_string();
+    let refresh_token = token_json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let expires_at = token_json
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+
+    eprintln!("   ✅ MCP OAuth: Authenticated successfully\n");
+    Ok(OAuthTokenCache {
+        access_token,
+        refresh_token,
+        expires_at,
+        server_url: server_url.to_string(),
+    })
+}
+
+/// Discover OAuth metadata for an MCP server (RFC 9728 → RFC 8414).
+async fn discover_oauth_metadata(
+    client: &reqwest::Client,
+    server_url: &str,
+    resp: &reqwest::Response,
+) -> Result<OAuthMetadata> {
+    // Extract resource_metadata URL from WWW-Authenticate header.
+    let resource_metadata_url = resp
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|header| {
+            for part in header.split(',') {
+                let part = part.trim();
+                if let Some(idx) = part.find("resource_metadata=\"") {
+                    let start = idx + "resource_metadata=\"".len();
+                    let rest = &part[start..];
+                    return rest.strip_suffix('"').map(str::to_string);
+                }
+            }
+            None
+        });
+
+    let parsed = reqwest::Url::parse(server_url).context("Invalid MCP server URL")?;
+    let origin = format!("{}://{}", parsed.scheme(), parsed.authority());
+    let path = parsed.path().trim_end_matches('/');
+
+    let candidates: Vec<String> = if let Some(url) = resource_metadata_url {
+        let header_url = reqwest::Url::parse(&url).context("Invalid resource_metadata URL")?;
+        if header_url.scheme() != "https" {
+            bail!("Refusing non-HTTPS resource_metadata URL");
+        }
+        if header_url.host_str() != parsed.host_str()
+            || header_url.port_or_known_default() != parsed.port_or_known_default()
+        {
+            bail!("Refusing cross-origin resource_metadata URL");
+        }
+        vec![header_url.to_string()]
+    } else {
+        let mut urls = Vec::new();
+        if !path.is_empty() && path != "/" {
+            urls.push(format!(
+                "{origin}/.well-known/oauth-protected-resource{path}"
+            ));
+        }
+        urls.push(format!("{origin}/.well-known/oauth-protected-resource"));
+        urls
+    };
+
+    // Fetch Protected Resource Metadata → extract authorization_servers[0].
+    let mut auth_server: Option<String> = None;
+    for url in &candidates {
+        if let Ok(r) = client.get(url).send().await {
+            if r.status().is_success() {
+                if let Ok(json) = r.json::<serde_json::Value>().await {
+                    if let Some(servers) =
+                        json.get("authorization_servers").and_then(|v| v.as_array())
+                    {
+                        auth_server = servers.first().and_then(|v| v.as_str()).map(String::from);
+                    }
+                    if auth_server.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let auth_server =
+        auth_server.context("Could not discover authorization server from resource metadata")?;
+
+    if !auth_server.starts_with("https://") {
+        bail!("Refusing non-HTTPS authorization server URL: {auth_server}");
+    }
+
+    // Fetch Authorization Server Metadata (RFC 8414 / OIDC Discovery).
+    let as_parsed = reqwest::Url::parse(&auth_server)?;
+    let as_origin = format!("{}://{}", as_parsed.scheme(), as_parsed.authority());
+    let as_path = as_parsed.path().trim_end_matches('/');
+
+    let mut as_metadata_urls = Vec::new();
+    if !as_path.is_empty() && as_path != "/" {
+        as_metadata_urls.push(format!(
+            "{as_origin}/.well-known/oauth-authorization-server{as_path}"
+        ));
+        as_metadata_urls.push(format!(
+            "{as_origin}/.well-known/openid-configuration{as_path}"
+        ));
+    }
+    as_metadata_urls.push(format!(
+        "{as_origin}/.well-known/oauth-authorization-server"
+    ));
+    as_metadata_urls.push(format!("{as_origin}/.well-known/openid-configuration"));
+
+    for url in &as_metadata_urls {
+        if let Ok(r) = client.get(url).send().await {
+            if r.status().is_success() {
+                if let Ok(json) = r.json::<serde_json::Value>().await {
+                    if let (Some(authz), Some(token)) = (
+                        json.get("authorization_endpoint").and_then(|v| v.as_str()),
+                        json.get("token_endpoint").and_then(|v| v.as_str()),
+                    ) {
+                        let authz_url = reqwest::Url::parse(authz)
+                            .context("Invalid authorization_endpoint URL")?;
+                        let token_url =
+                            reqwest::Url::parse(token).context("Invalid token_endpoint URL")?;
+                        if authz_url.scheme() != "https" || token_url.scheme() != "https" {
+                            bail!("Refusing non-HTTPS OAuth endpoints");
+                        }
+                        return Ok(OAuthMetadata {
+                            authorization_endpoint: authz_url.to_string(),
+                            token_endpoint: token_url.to_string(),
+                            registration_endpoint: json
+                                .get("registration_endpoint")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    bail!("Could not discover OAuth authorization/token endpoints from {auth_server}")
+}
+
+/// Resolved OAuth client credentials.
+struct OAuthClientCreds {
+    client_id: String,
+    client_secret: Option<String>,
+    /// One of: "none", "client_secret_basic", "client_secret_post"
+    auth_method: String,
+}
+
+/// Determine client_id — use dynamic registration if available, else use server URL.
+async fn resolve_client_id(
+    client: &reqwest::Client,
+    metadata: &OAuthMetadata,
+) -> Result<OAuthClientCreds> {
+    if let Some(reg_endpoint) = &metadata.registration_endpoint {
+        let redirect_uri = format!("http://127.0.0.1:{MCP_OAUTH_CALLBACK_PORT}/callback");
+        let reg_body = serde_json::json!({
+            "client_name": "ZeroClaw MCP Client",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "client_secret_basic"
+        });
+
+        if let Ok(resp) = client.post(reg_endpoint).json(&reg_body).send().await {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(id) = json.get("client_id").and_then(|v| v.as_str()) {
+                        let secret = json
+                            .get("client_secret")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        let auth_method = json
+                            .get("token_endpoint_auth_method")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("client_secret_basic")
+                            .to_string();
+                        tracing::info!(
+                            client_id = id,
+                            auth_method = %auth_method,
+                            "MCP OAuth: dynamically registered"
+                        );
+                        return Ok(OAuthClientCreds {
+                            client_id: id.to_string(),
+                            client_secret: secret,
+                            auth_method,
+                        });
+                    }
+                }
+            }
+        }
+        tracing::warn!("MCP OAuth: dynamic registration failed, falling back to default client_id");
+    }
+
+    Ok(OAuthClientCreds {
+        client_id: "zeroclaw".to_string(),
+        client_secret: None,
+        auth_method: "none".to_string(),
+    })
+}
+
+/// Accept a single OAuth callback on the loopback listener, return (code, state).
+async fn receive_oauth_callback(listener: &tokio::net::TcpListener) -> Result<(String, String)> {
+    use crate::auth::oauth_common::parse_query_params;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .context("Failed to accept callback")?;
+    let mut buffer = vec![0u8; 4096];
+    let n = stream
+        .read(&mut buffer)
+        .await
+        .context("Failed to read callback")?;
+    let request = String::from_utf8_lossy(&buffer[..n]);
+
+    // Parse GET /callback?code=...&state=...
+    let first_line = request.lines().next().unwrap_or("");
+    let path = first_line.split_whitespace().nth(1).unwrap_or("");
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params = parse_query_params(query);
+
+    let code = params
+        .get("code")
+        .cloned()
+        .ok_or_else(|| anyhow!("Callback missing 'code' parameter"))?;
+    let state = params
+        .get("state")
+        .cloned()
+        .ok_or_else(|| anyhow!("Callback missing 'state' parameter"))?;
+
+    let html_response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+        <html><body><h1>Authenticated!</h1>\
+        <p>You can close this window and return to the terminal.</p></body></html>";
+    let _ = stream.write_all(html_response.as_bytes()).await;
+
+    Ok((code, state))
+}
+
+/// Best-effort browser open (cross-platform).
+fn open_browser_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
     }
 }
 
