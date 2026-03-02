@@ -1,5 +1,10 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = [
+    ".",
+    "crates/robot-kit",
+    "crates/zeroclaw-types",
+    "crates/zeroclaw-core",
+]
 resolver = "2"
 
 [package]
@@ -58,8 +63,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML to plain text conversion (web_fetch tool)
+# HTML to plain text / markdown conversion (web_fetch tool)
 nanohtml2text = "0.2"
+html2md = { package = "fast_html2md", version = "0.0.58", optional = true }
 
 # Zip archive extraction
 zip = { version = "8.1", default-features = false, features = ["deflate"] }
@@ -240,7 +246,7 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 # Optional provider feature flags used by cfg(feature = "...") guards.
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []
-web-fetch-html2md = []
+web-fetch-html2md = ["dep:html2md"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

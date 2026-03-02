@@ -74,6 +74,52 @@ jobs:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
 
+    workspace-check:
+        name: Workspace Check
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-22.04
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-workspace-check
+                  cache-bin: false
+            - name: Check workspace
+              run: cargo check --workspace --locked
+
+    package-check:
+        name: Package Check (${{ matrix.package }})
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-22.04
+        timeout-minutes: 25
+        strategy:
+            fail-fast: false
+            matrix:
+                package: [zeroclaw-types, zeroclaw-core]
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-package-check
+                  cache-bin: false
+            - name: Check package
+              run: cargo check -p ${{ matrix.package }} --locked
+
     test:
         name: Test
         needs: [changes]
@@ -297,7 +343,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
+        needs: [changes, lint, workspace-check, package-check, test, build, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
         runs-on: ubuntu-22.04
         steps:
             - name: Enforce required status
@@ -345,10 +391,14 @@ jobs:
 
                   # --- Rust change path ---
                   lint_result="${{ needs.lint.result }}"
+                  workspace_check_result="${{ needs.workspace-check.result }}"
+                  package_check_result="${{ needs.package-check.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
 
                   echo "lint=${lint_result}"
+                  echo "workspace-check=${workspace_check_result}"
+                  echo "package-check=${package_check_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
@@ -356,8 +406,8 @@ jobs:
 
                   check_pr_governance
 
-                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                    echo "Required CI jobs did not pass: lint=${lint_result} test=${test_result} build=${build_result}"
+                  if [ "$lint_result" != "success" ] || [ "$workspace_check_result" != "success" ] || [ "$package_check_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required CI jobs did not pass: lint=${lint_result} workspace-check=${workspace_check_result} package-check=${package_check_result} test=${test_result} build=${build_result}"
                     exit 1
                   fi
 
