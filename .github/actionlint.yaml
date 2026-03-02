@@ -6,5 +6,6 @@ self-hosted-runner:
         - aws-india
         - light
         - cpu40
+        - codeql
         - blacksmith-2vcpu-ubuntu-2404
         - hetzner

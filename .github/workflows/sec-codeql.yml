@@ -51,7 +51,7 @@ env:
 jobs:
     codeql:
         name: CodeQL Analysis
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, hetzner, codeql]
         timeout-minutes: 120
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
@@ -88,6 +88,12 @@ jobs:
             - name: Ensure cargo component
               shell: bash
               run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: sec-codeql-build
+                  cache-targets: true
+                  cache-bin: false
 
             - name: Build
               run: cargo build --workspace --all-targets --locked
