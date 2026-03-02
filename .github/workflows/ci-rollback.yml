@@ -48,7 +48,7 @@ on:
         - cron: "15 7 * * 1" # Weekly Monday 07:15 UTC
 
 concurrency:
-    group: ci-rollback-${{ github.event.inputs.branch || 'dev' }}
+    group: ci-rollback-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.branch || 'dev') || github.ref_name }}
     cancel-in-progress: false
 
 permissions:
@@ -77,7 +77,7 @@ jobs:
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
-                  ref: ${{ github.event.inputs.branch || 'dev' }}
+                  ref: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.branch || 'dev') || github.ref_name }}
 
             - name: Build rollback plan
               id: plan
@@ -86,7 +86,7 @@ jobs:
                   set -euo pipefail
                   mkdir -p artifacts
 
-                  branch_input="dev"
+                  branch_input="${GITHUB_REF_NAME}"
                   mode_input="dry-run"
                   target_ref_input=""
                   allow_non_ancestor="false"
