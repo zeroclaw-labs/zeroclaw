@@ -5127,6 +5127,7 @@ impl std::fmt::Debug for BlueBubblesConfig {
                 "webhook_secret",
                 &self.webhook_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("ignore_senders", &self.ignore_senders)
             .finish()
     }
 }
