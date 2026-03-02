@@ -945,7 +945,12 @@ mod tests {
 
     #[tokio::test]
     async fn output_recovers_from_poisoned_offsets_lock() {
-        let tool = make_tool();
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+        let tool = ProcessTool::new_with_syscall_detector(
+            test_security(),
+            test_runtime(),
+            Some(test_syscall_detector(&tmp)),
+        );
         let spawn_result = tool
             .execute(json!({
                 "action": "spawn",
