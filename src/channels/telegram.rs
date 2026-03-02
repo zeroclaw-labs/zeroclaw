@@ -2038,9 +2038,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 continue;
             }
 
-            let mut line_out = String::new();
-
-            // Handle code blocks (``` ... ```) - handled at text level below
             // Handle headers: ## Title → <b>Title</b>
             let stripped = line.trim_start_matches('#');
             let header_level = line.len() - stripped.len();
@@ -2050,33 +2047,56 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 continue;
             }
 
+            // Handle blockquotes: > text → <blockquote>text</blockquote>
+            let (is_blockquote, inline_line) = if let Some(rest) = trimmed_line.strip_prefix("> ") {
+                (true, rest)
+            } else if trimmed_line == ">" {
+                (true, "")
+            } else {
+                (false, *line)
+            };
+
+            let mut line_out = String::new();
+
             // Inline formatting
             let mut i = 0;
-            let bytes = line.as_bytes();
+            let bytes = inline_line.as_bytes();
             let len = bytes.len();
             while i < len {
-                // Bold: **text** or __text__
+                // Bold: **text**
                 if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-                    if let Some(end) = line[i + 2..].find("**") {
-                        let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
+                    if let Some(end) = inline_line[i + 2..].find("**") {
+                        let inner = Self::escape_html(&inline_line[i + 2..i + 2 + end]);
                         write!(line_out, "<b>{inner}</b>").unwrap();
                         i += 4 + end;
                         continue;
                     }
                 }
+                // Underline: __text__
                 if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
-                    if let Some(end) = line[i + 2..].find("__") {
-                        let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                        write!(line_out, "<b>{inner}</b>").unwrap();
+                    if let Some(end) = inline_line[i + 2..].find("__") {
+                        let inner = Self::escape_html(&inline_line[i + 2..i + 2 + end]);
+                        write!(line_out, "<u>{inner}</u>").unwrap();
                         i += 4 + end;
                         continue;
                     }
                 }
-                // Italic: *text* or _text_ (single)
+                // Italic: *text* (single asterisk)
                 if bytes[i] == b'*' && (i == 0 || bytes[i - 1] != b'*') {
-                    if let Some(end) = line[i + 1..].find('*') {
+                    if let Some(end) = inline_line[i + 1..].find('*') {
                         if end > 0 {
-                            let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
+                            let inner = Self::escape_html(&inline_line[i + 1..i + 1 + end]);
+                            write!(line_out, "<i>{inner}</i>").unwrap();
+                            i += 2 + end;
+                            continue;
+                        }
+                    }
+                }
+                // Italic: _text_ (single underscore)
+                if bytes[i] == b'_' && (i == 0 || bytes[i - 1] != b'_') {
+                    if let Some(end) = inline_line[i + 1..].find('_') {
+                        if end > 0 {
+                            let inner = Self::escape_html(&inline_line[i + 1..i + 1 + end]);
                             write!(line_out, "<i>{inner}</i>").unwrap();
                             i += 2 + end;
                             continue;
@@ -2085,8 +2105,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
                 // Inline code: `code`
                 if bytes[i] == b'`' && (i == 0 || bytes[i - 1] != b'`') {
-                    if let Some(end) = line[i + 1..].find('`') {
-                        let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
+                    if let Some(end) = inline_line[i + 1..].find('`') {
+                        let inner = Self::escape_html(&inline_line[i + 1..i + 1 + end]);
                         write!(line_out, "<code>{inner}</code>").unwrap();
                         i += 2 + end;
                         continue;
@@ -2094,12 +2114,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
                 // Markdown link: [text](url)
                 if bytes[i] == b'[' {
-                    if let Some(bracket_end) = line[i + 1..].find(']') {
-                        let text_part = &line[i + 1..i + 1 + bracket_end];
+                    if let Some(bracket_end) = inline_line[i + 1..].find(']') {
+                        let text_part = &inline_line[i + 1..i + 1 + bracket_end];
                         let after_bracket = i + 1 + bracket_end + 1; // position after ']'
                         if after_bracket < len && bytes[after_bracket] == b'(' {
-                            if let Some(paren_end) = line[after_bracket + 1..].find(')') {
-                                let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                            if let Some(paren_end) = inline_line[after_bracket + 1..].find(')') {
+                                let url =
+                                    &inline_line[after_bracket + 1..after_bracket + 1 + paren_end];
                                 if url.starts_with("http://") || url.starts_with("https://") {
                                     let text_html = Self::escape_html(text_part);
                                     let url_html = Self::escape_html(url);
@@ -2114,15 +2135,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
                 // Strikethrough: ~~text~~
                 if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
-                    if let Some(end) = line[i + 2..].find("~~") {
-                        let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
+                    if let Some(end) = inline_line[i + 2..].find("~~") {
+                        let inner = Self::escape_html(&inline_line[i + 2..i + 2 + end]);
                         write!(line_out, "<s>{inner}</s>").unwrap();
                         i += 4 + end;
                         continue;
                     }
                 }
+                // Spoiler: ||text||
+                if i + 1 < len && bytes[i] == b'|' && bytes[i + 1] == b'|' {
+                    if let Some(end) = inline_line[i + 2..].find("||") {
+                        let inner = Self::escape_html(&inline_line[i + 2..i + 2 + end]);
+                        write!(line_out, "<tg-spoiler>{inner}</tg-spoiler>").unwrap();
+                        i += 4 + end;
+                        continue;
+                    }
+                }
                 // Default: escape HTML entities
-                let ch = line[i..].chars().next().unwrap();
+                let ch = inline_line[i..].chars().next().unwrap();
                 match ch {
                     '<' => line_out.push_str("&lt;"),
                     '>' => line_out.push_str("&gt;"),
@@ -2133,7 +2163,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
                 i += ch.len_utf8();
             }
-            result_lines.push(line_out);
+            if is_blockquote {
+                result_lines.push(format!("<blockquote>{line_out}</blockquote>"));
+            } else {
+                result_lines.push(line_out);
+            }
         }
 
         // Second pass: handle ``` code blocks across lines
@@ -2900,7 +2934,8 @@ impl Channel for TelegramChannel {
         let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id_parsed,
-            "text": display_text,
+            "text": Self::markdown_to_telegram_html(display_text),
+            "parse_mode": "HTML",
         });
 
         let resp = self

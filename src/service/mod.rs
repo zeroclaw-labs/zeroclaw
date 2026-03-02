@@ -1121,7 +1121,15 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .join("zeroclaw.service"))
 }
 
+fn scrub_shell_startup_env(command: &mut Command) {
+    // CI providers may inject BASH_ENV/ENV to source transient bootstrap files.
+    // If those files disappear between steps, non-interactive shell commands emit
+    // startup errors that pollute stdout/stderr capture.
+    command.env_remove("BASH_ENV").env_remove("ENV");
+}
+
 fn run_checked(command: &mut Command) -> Result<()> {
+    scrub_shell_startup_env(command);
     let output = command.output().context("Failed to spawn command")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1131,6 +1139,7 @@ fn run_checked(command: &mut Command) -> Result<()> {
 }
 
 fn run_capture(command: &mut Command) -> Result<String> {
+    scrub_shell_startup_env(command);
     let output = command.output().context("Failed to spawn command")?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
@@ -1162,6 +1171,16 @@ mod tests {
     fn run_capture_reads_stdout() {
         let out = run_capture(Command::new("sh").args(["-lc", "echo hello"]))
             .expect("stdout capture should succeed");
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn run_capture_ignores_bash_env_noise() {
+        let mut cmd = Command::new("sh");
+        cmd.env("BASH_ENV", "/definitely/missing/ci-env")
+            .args(["-lc", "echo hello"]);
+        let out = run_capture(&mut cmd).expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
 
