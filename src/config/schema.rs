@@ -139,6 +139,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.browser",
     "tool.composio",
     "tool.http_request",
+    "tool.multimodal",
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",

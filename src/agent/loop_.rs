@@ -1146,8 +1146,12 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = multimodal::prepare_messages_for_provider_with_provider_hint(
+            history,
+            multimodal_config,
+            Some(provider_name),
+        )
+        .await?;
         let mut request_messages = prepared_messages.messages.clone();
         if let Some(prompt) = missing_tool_call_retry_prompt.take() {
             request_messages.push(ChatMessage::user(prompt));

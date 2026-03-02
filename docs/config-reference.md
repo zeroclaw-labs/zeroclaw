@@ -622,6 +622,11 @@ Notes:
 - Remote URL only when `allow_remote_fetch = true`
 - Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
 - When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+- In `proxy.scope = "services"` mode, remote image fetch uses service-key routing. For best compatibility include relevant selectors/keys such as:
+  - `channel.qq` (QQ media hosts like `multimedia.nt.qq.com.cn`)
+  - `tool.multimodal` (dedicated multimodal fetch path)
+  - `tool.http_request` (compatibility fallback path)
+  - `provider.*` or the active provider key (for example `provider.openai`)
 
 ## `[browser]`
 

@@ -1,10 +1,12 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::schema::QQEnvironment;
 use async_trait::async_trait;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -29,6 +31,11 @@ fn is_remote_media_url(url: &str) -> bool {
     trimmed.starts_with("https://") || trimmed.starts_with("http://")
 }
 
+fn is_data_image_uri(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    lower.starts_with("data:image/") && lower.contains(";base64,")
+}
+
 fn is_image_filename(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     lower.ends_with(".png")
@@ -40,6 +47,25 @@ fn is_image_filename(filename: &str) -> bool {
         || lower.ends_with(".heic")
         || lower.ends_with(".heif")
         || lower.ends_with(".svg")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutgoingImageTarget {
+    RemoteUrl(String),
+    LocalPath(String),
+    DataUri(String),
+}
+
+impl OutgoingImageTarget {
+    fn display_target(&self) -> &str {
+        match self {
+            Self::RemoteUrl(url) | Self::LocalPath(url) | Self::DataUri(url) => url,
+        }
+    }
+
+    fn is_inline_data(&self) -> bool {
+        matches!(self, Self::DataUri(_))
+    }
 }
 
 fn extract_image_marker_from_attachment(attachment: &serde_json::Value) -> Option<String> {
@@ -75,21 +101,97 @@ fn parse_image_marker_line(line: &str) -> Option<&str> {
     Some(marker)
 }
 
-fn parse_outgoing_content(content: &str) -> (String, Vec<String>) {
+fn parse_outgoing_image_target(
+    candidate: &str,
+    allow_extensionless_remote_url: bool,
+) -> Option<OutgoingImageTarget> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+
+    let normalized = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
+    let normalized = normalized.strip_prefix("file://").unwrap_or(normalized);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if is_data_image_uri(normalized) {
+        return Some(OutgoingImageTarget::DataUri(normalized.to_string()));
+    }
+
+    if is_remote_media_url(normalized) {
+        if allow_extensionless_remote_url || is_image_filename(normalized) {
+            return Some(OutgoingImageTarget::RemoteUrl(normalized.to_string()));
+        }
+        return None;
+    }
+
+    if !is_image_filename(normalized) {
+        return None;
+    }
+
+    let path = Path::new(normalized);
+    if !path.is_file() {
+        return None;
+    }
+
+    Some(OutgoingImageTarget::LocalPath(normalized.to_string()))
+}
+
+fn parse_outgoing_content(content: &str) -> (String, Vec<OutgoingImageTarget>) {
     let mut passthrough_lines = Vec::new();
-    let mut image_urls = Vec::new();
+    let mut image_targets = Vec::new();
 
     for line in content.lines() {
         if let Some(marker_target) = parse_image_marker_line(line) {
-            if is_remote_media_url(marker_target) {
-                image_urls.push(marker_target.to_string());
+            if let Some(parsed) = parse_outgoing_image_target(marker_target, true) {
+                image_targets.push(parsed);
                 continue;
             }
         }
+
+        if let Some(parsed) = parse_outgoing_image_target(line, false) {
+            if matches!(
+                parsed,
+                OutgoingImageTarget::LocalPath(_) | OutgoingImageTarget::DataUri(_)
+            ) {
+                image_targets.push(parsed);
+                continue;
+            }
+        }
+
         passthrough_lines.push(line);
     }
 
-    (passthrough_lines.join("\n").trim().to_string(), image_urls)
+    (
+        passthrough_lines.join("\n").trim().to_string(),
+        image_targets,
+    )
+}
+
+fn decode_data_image_payload(data_uri: &str) -> anyhow::Result<String> {
+    let trimmed = data_uri.trim();
+    let (header, payload) = trimmed
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("invalid data URI: missing comma separator"))?;
+
+    let lower_header = header.to_ascii_lowercase();
+    if !lower_header.starts_with("data:image/") {
+        anyhow::bail!("unsupported data URI mime (expected image/*): {header}");
+    }
+    if !lower_header.contains(";base64") {
+        anyhow::bail!("unsupported data URI encoding (expected base64): {header}");
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| anyhow::anyhow!("invalid data URI base64 payload: {e}"))?;
+    if decoded.is_empty() {
+        anyhow::bail!("image payload is empty");
+    }
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(decoded))
 }
 
 fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
@@ -480,6 +582,48 @@ impl QQChannel {
         Ok(file_info.to_string())
     }
 
+    async fn upload_media_file_data(
+        &self,
+        token: &str,
+        files_url: &str,
+        file_data_base64: &str,
+    ) -> anyhow::Result<String> {
+        ensure_https(files_url)?;
+
+        let upload_body = json!({
+            "file_type": 1,
+            "file_data": file_data_base64,
+            "srv_send_msg": false
+        });
+
+        let resp = self
+            .http_client()
+            .post(files_url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&upload_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("QQ upload media(file_data) failed ({status}): {sanitized}");
+        }
+
+        let payload: Value = resp.json().await?;
+        let file_info = payload
+            .get("file_info")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("QQ upload media(file_data) response missing file_info")
+            })?;
+
+        Ok(file_info.to_string())
+    }
+
     /// Fetch an access token from QQ's OAuth2 endpoint.
     async fn fetch_access_token(&self) -> anyhow::Result<(String, u64)> {
         let body = json!({
@@ -627,15 +771,68 @@ impl Channel for QQChannel {
             }
         }
 
-        for image_url in image_urls {
-            let file_info = self
-                .upload_media_file_info(&token, &files_url, &image_url)
-                .await?;
-            let media_body = build_media_message_body(&file_info, passive_msg_id, msg_seq);
-            self.post_json(&token, &message_url, &media_body, "send message")
-                .await?;
-            if passive_msg_id.is_some() {
-                msg_seq += 1;
+        for image_target in image_urls {
+            let file_info = match &image_target {
+                OutgoingImageTarget::RemoteUrl(image_url) => {
+                    self.upload_media_file_info(&token, &files_url, image_url)
+                        .await
+                }
+                OutgoingImageTarget::LocalPath(path) => match tokio::fs::read(path).await {
+                    Ok(bytes) => {
+                        if bytes.is_empty() {
+                            Err(anyhow::anyhow!("QQ local image payload is empty: {path}"))
+                        } else {
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                            self.upload_media_file_data(&token, &files_url, &encoded)
+                                .await
+                        }
+                    }
+                    Err(e) => Err(anyhow::anyhow!("QQ local image read failed ({path}): {e}")),
+                },
+                OutgoingImageTarget::DataUri(data_uri) => {
+                    match decode_data_image_payload(data_uri) {
+                        Ok(encoded) => {
+                            self.upload_media_file_data(&token, &files_url, &encoded)
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+            };
+
+            match file_info {
+                Ok(file_info) => {
+                    let media_body = build_media_message_body(&file_info, passive_msg_id, msg_seq);
+                    self.post_json(&token, &message_url, &media_body, "send message")
+                        .await?;
+                    if passive_msg_id.is_some() {
+                        msg_seq += 1;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "QQ: failed to upload image target '{}': {err}",
+                        if image_target.is_inline_data() {
+                            "[inline image data]"
+                        } else {
+                            image_target.display_target()
+                        }
+                    );
+                    let fallback_text = if image_target.is_inline_data() {
+                        "Image attachment upload failed".to_string()
+                    } else {
+                        format!("Image: {}", image_target.display_target())
+                    };
+                    if let Some(body) =
+                        build_text_message_body(&fallback_text, passive_msg_id, msg_seq)
+                    {
+                        self.post_json(&token, &message_url, &body, "send message")
+                            .await?;
+                        if passive_msg_id.is_some() {
+                            msg_seq += 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -1073,9 +1270,23 @@ allowed_users = ["user1"]
         assert_eq!(
             images,
             vec![
-                "https://cdn.example.com/a.png".to_string(),
-                "http://cdn.example.com/b.jpg".to_string()
+                OutgoingImageTarget::RemoteUrl("https://cdn.example.com/a.png".to_string()),
+                OutgoingImageTarget::RemoteUrl("http://cdn.example.com/b.jpg".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_accepts_marker_remote_url_without_extension() {
+        let input = "hello\n[IMAGE:https://multimedia.nt.qq.com.cn/download?appid=1406]\nbye";
+        let (text, images) = parse_outgoing_content(input);
+
+        assert_eq!(text, "hello\nbye");
+        assert_eq!(
+            images,
+            vec![OutgoingImageTarget::RemoteUrl(
+                "https://multimedia.nt.qq.com.cn/download?appid=1406".to_string()
+            )]
         );
     }
 
@@ -1086,6 +1297,38 @@ allowed_users = ["user1"]
 
         assert_eq!(text, "[IMAGE:/tmp/a.png]\nhello");
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_extracts_existing_local_path_lines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let local_path = temp.path().join("capture.png");
+        std::fs::write(&local_path, b"png-bytes").expect("write local image");
+
+        let input = format!("done\n{}\nnext", local_path.display());
+        let (text, images) = parse_outgoing_content(&input);
+
+        assert_eq!(text, "done\nnext");
+        assert_eq!(
+            images,
+            vec![OutgoingImageTarget::LocalPath(
+                local_path.display().to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_parse_outgoing_content_extracts_data_uri_markers() {
+        let input = "hello\n[IMAGE:data:image/png;base64,aGVsbG8=]\nbye";
+        let (text, images) = parse_outgoing_content(input);
+
+        assert_eq!(text, "hello\nbye");
+        assert_eq!(
+            images,
+            vec![OutgoingImageTarget::DataUri(
+                "data:image/png;base64,aGVsbG8=".to_string()
+            )]
+        );
     }
 
     #[test]

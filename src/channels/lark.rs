@@ -5,6 +5,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -301,6 +302,146 @@ fn parse_image_key_value(content: &serde_json::Value) -> Option<String> {
             .map(ToOwned::to_owned),
         serde_json::Value::String(raw) => parse_image_key(&raw),
         _ => None,
+    }
+}
+
+fn is_image_filename(path_like: &str) -> bool {
+    let normalized = path_like
+        .split('?')
+        .next()
+        .unwrap_or(path_like)
+        .split('#')
+        .next()
+        .unwrap_or(path_like)
+        .to_ascii_lowercase();
+
+    normalized.ends_with(".png")
+        || normalized.ends_with(".jpg")
+        || normalized.ends_with(".jpeg")
+        || normalized.ends_with(".gif")
+        || normalized.ends_with(".webp")
+        || normalized.ends_with(".bmp")
+        || normalized.ends_with(".heic")
+        || normalized.ends_with(".heif")
+        || normalized.ends_with(".svg")
+}
+
+fn parse_image_marker_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let marker = trimmed.strip_prefix("[IMAGE:")?.strip_suffix(']')?.trim();
+    if marker.is_empty() {
+        return None;
+    }
+    Some(marker)
+}
+
+fn is_data_image_uri(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    lower.starts_with("data:image/") && lower.contains(";base64,")
+}
+
+fn extract_local_image_path_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
+    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+    if candidate.is_empty() || candidate.contains('\0') {
+        return None;
+    }
+
+    if !is_image_filename(candidate) {
+        return None;
+    }
+
+    let path = Path::new(candidate);
+    if !path.is_file() {
+        return None;
+    }
+
+    Some(candidate.to_string())
+}
+
+fn parse_outgoing_content(content: &str) -> (String, Vec<String>) {
+    let mut text_lines = Vec::new();
+    let mut image_targets = Vec::new();
+
+    for line in content.lines() {
+        if let Some(marker_target) = parse_image_marker_line(line) {
+            image_targets.push(marker_target.to_string());
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if is_data_image_uri(trimmed) {
+            image_targets.push(trimmed.to_string());
+            continue;
+        }
+
+        if let Some(local_path) = extract_local_image_path_line(line) {
+            image_targets.push(local_path);
+            continue;
+        }
+
+        text_lines.push(line);
+    }
+
+    (text_lines.join("\n").trim().to_string(), image_targets)
+}
+
+fn decode_data_image_uri(source: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    let trimmed = source.trim();
+    let (header, payload) = trimmed
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("invalid data URI: missing comma separator"))?;
+
+    let lower_header = header.to_ascii_lowercase();
+    if !lower_header.starts_with("data:image/") {
+        anyhow::bail!("unsupported data URI mime (expected image/*): {header}");
+    }
+    if !lower_header.contains(";base64") {
+        anyhow::bail!("unsupported data URI encoding (expected base64): {header}");
+    }
+
+    let mime = header
+        .trim_start_matches("data:")
+        .split(';')
+        .next()
+        .unwrap_or("image/png")
+        .trim()
+        .to_ascii_lowercase();
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| anyhow::anyhow!("invalid data URI base64 payload: {e}"))?;
+    if bytes.is_empty() {
+        anyhow::bail!("image payload is empty");
+    }
+
+    Ok((bytes, mime))
+}
+
+fn image_extension_from_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        _ => "png",
+    }
+}
+
+fn display_image_target(target: &str) -> String {
+    let trimmed = target.trim();
+    if is_data_image_uri(trimmed) {
+        "[inline image data]".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1207,6 +1348,256 @@ impl LarkChannel {
         }
     }
 
+    fn image_upload_url(&self) -> String {
+        format!("{}/im/v1/images", self.api_base())
+    }
+
+    async fn send_image_once(
+        &self,
+        url: &str,
+        token: &str,
+        recipient: &str,
+        image_key: &str,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let content = serde_json::json!({ "image_key": image_key }).to_string();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "image",
+            "content": content,
+        });
+
+        self.send_text_once(url, token, &body).await
+    }
+
+    async fn upload_image_once(
+        &self,
+        url: &str,
+        token: &str,
+        bytes: Vec<u8>,
+        file_name: &str,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    async fn resolve_outgoing_image_target(
+        &self,
+        target: &str,
+    ) -> anyhow::Result<(Vec<u8>, String, String)> {
+        let trimmed = target.trim();
+
+        if is_data_image_uri(trimmed) {
+            let (bytes, mime) = decode_data_image_uri(trimmed)?;
+            let ext = image_extension_from_mime(&mime);
+            return Ok((bytes, format!("image.{ext}"), mime));
+        }
+
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let resp = self.http_client().get(trimmed).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let sanitized = crate::providers::sanitize_api_error(&body);
+                anyhow::bail!(
+                    "failed to fetch remote image {trimmed}: status={status}, body={sanitized}"
+                );
+            }
+
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .map(|value| value.to_ascii_lowercase());
+
+            let path_like = trimmed
+                .split('?')
+                .next()
+                .unwrap_or(trimmed)
+                .split('#')
+                .next()
+                .unwrap_or(trimmed);
+            let guessed_mime = mime_guess::from_path(path_like)
+                .first_raw()
+                .unwrap_or("image/png")
+                .to_string();
+
+            let mime = content_type.unwrap_or(guessed_mime);
+            if !mime.starts_with("image/") {
+                anyhow::bail!("remote target is not an image: {trimmed}");
+            }
+
+            let file_name = path_like
+                .rsplit('/')
+                .next()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("image.{}", image_extension_from_mime(&mime)));
+
+            let bytes = resp.bytes().await?.to_vec();
+            if bytes.is_empty() {
+                anyhow::bail!("remote image payload is empty: {trimmed}");
+            }
+
+            return Ok((bytes, file_name, mime));
+        }
+
+        let local_path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        let path = Path::new(local_path);
+        if !path.is_file() {
+            anyhow::bail!("local image path not found: {local_path}");
+        }
+
+        let mime = mime_guess::from_path(path)
+            .first_raw()
+            .unwrap_or("image/png")
+            .to_string();
+        if !mime.starts_with("image/") {
+            anyhow::bail!("local image path is not an image: {local_path}");
+        }
+
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read local image {local_path}: {e}"))?;
+        if bytes.is_empty() {
+            anyhow::bail!("local image payload is empty: {local_path}");
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("image.{}", image_extension_from_mime(&mime)));
+
+        Ok((bytes, file_name, mime))
+    }
+
+    async fn send_text_with_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self.send_text_once(url, &token, body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) = self.send_text_once(url, &new_token, body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                let sanitized = sanitize_lark_body(&retry_response);
+                anyhow::bail!(
+                    "Lark send failed after token refresh: status={retry_status}, body={sanitized}"
+                );
+            }
+
+            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            return Ok(());
+        }
+
+        ensure_lark_send_success(status, &response, "without token refresh")?;
+        Ok(())
+    }
+
+    async fn send_image_target_with_retry(
+        &self,
+        message_url: &str,
+        recipient: &str,
+        image_target: &str,
+    ) -> anyhow::Result<()> {
+        let upload_url = self.image_upload_url();
+        let (image_bytes, file_name, _mime) =
+            self.resolve_outgoing_image_target(image_target).await?;
+
+        let mut token = self.get_tenant_access_token().await?;
+        let (status, mut upload_response) = self
+            .upload_image_once(&upload_url, &token, image_bytes.clone(), &file_name)
+            .await?;
+
+        if should_refresh_lark_tenant_token(status, &upload_response) {
+            self.invalidate_token().await;
+            token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) = self
+                .upload_image_once(&upload_url, &token, image_bytes, &file_name)
+                .await?;
+            upload_response = retry_response;
+
+            if should_refresh_lark_tenant_token(retry_status, &upload_response) {
+                let sanitized = sanitize_lark_body(&upload_response);
+                anyhow::bail!(
+                    "Lark image upload failed after token refresh: status={retry_status}, body={sanitized}"
+                );
+            }
+
+            ensure_lark_send_success(
+                retry_status,
+                &upload_response,
+                "image upload after token refresh",
+            )?;
+        } else {
+            ensure_lark_send_success(
+                status,
+                &upload_response,
+                "image upload without token refresh",
+            )?;
+        }
+
+        let image_key = upload_response
+            .pointer("/data/image_key")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Lark image upload response missing data.image_key"))?;
+
+        let (send_status, send_response) = self
+            .send_image_once(message_url, &token, recipient, image_key)
+            .await?;
+        if should_refresh_lark_tenant_token(send_status, &send_response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) = self
+                .send_image_once(message_url, &new_token, recipient, image_key)
+                .await?;
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                let sanitized = sanitize_lark_body(&retry_response);
+                anyhow::bail!(
+                    "Lark image send failed after token refresh: status={retry_status}, body={sanitized}"
+                );
+            }
+            ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "image send after token refresh",
+            )?;
+            return Ok(());
+        }
+
+        ensure_lark_send_success(
+            send_status,
+            &send_response,
+            "image send without token refresh",
+        )?;
+        Ok(())
+    }
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -1509,37 +1900,41 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
+        let (text_content, image_targets) = parse_outgoing_content(&message.content);
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
-
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
-
-        if should_refresh_lark_tenant_token(status, &response) {
-            // Token expired/invalid, invalidate and retry once.
-            self.invalidate_token().await;
-            let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
-
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                let sanitized = sanitize_lark_body(&retry_response);
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={sanitized}"
-                );
-            }
-
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            return Ok(());
+        if !text_content.is_empty() {
+            let content = serde_json::json!({ "text": text_content }).to_string();
+            let body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "text",
+                "content": content,
+            });
+            self.send_text_with_retry(&url, &body).await?;
         }
 
-        ensure_lark_send_success(status, &response, "without token refresh")?;
+        for image_target in image_targets {
+            if let Err(err) = self
+                .send_image_target_with_retry(&url, &message.recipient, &image_target)
+                .await
+            {
+                tracing::warn!(
+                    "Lark image send failed for target '{}': {err}",
+                    display_image_target(&image_target)
+                );
+                let fallback = serde_json::json!({
+                    "text": format!("Image: {}", display_image_target(&image_target))
+                })
+                .to_string();
+                let body = serde_json::json!({
+                    "receive_id": message.recipient,
+                    "msg_type": "text",
+                    "content": fallback,
+                });
+                let _ = self.send_text_with_retry(&url, &body).await;
+            }
+        }
+
         Ok(())
     }
 
@@ -2115,6 +2510,38 @@ mod tests {
     fn lark_channel_name() {
         let ch = make_channel();
         assert_eq!(ch.name(), "lark");
+    }
+
+    #[test]
+    fn lark_parse_outgoing_content_extracts_image_markers_and_local_path_lines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image_path = temp.path().join("capture.png");
+        std::fs::write(&image_path, b"png-bytes").expect("write image");
+
+        let input = format!(
+            "处理好了\n[IMAGE:https://cdn.example.com/a.png]\n{}\n/path/does/not/exist.png",
+            image_path.display()
+        );
+        let (text, images) = parse_outgoing_content(&input);
+
+        assert_eq!(text, "处理好了\n/path/does/not/exist.png");
+        assert_eq!(
+            images,
+            vec![
+                "https://cdn.example.com/a.png".to_string(),
+                image_path.display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn lark_parse_outgoing_content_extracts_data_uri_lines() {
+        let data_uri = "data:image/png;base64,aGVsbG8=";
+        let input = format!("这是一张图\n{data_uri}");
+        let (text, images) = parse_outgoing_content(&input);
+
+        assert_eq!(text, "这是一张图");
+        assert_eq!(images, vec![data_uri.to_string()]);
     }
 
     #[test]

@@ -8,6 +8,10 @@ use std::path::Path;
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const OPTIMIZED_IMAGE_MAX_DIMENSION: u32 = 512;
 const OPTIMIZED_IMAGE_TARGET_BYTES: usize = 256 * 1024;
+const REMOTE_FETCH_MULTIMODAL_SERVICE_KEY: &str = "tool.multimodal";
+const REMOTE_FETCH_TOOL_SERVICE_KEY: &str = "tool.http_request";
+const REMOTE_FETCH_QQ_SERVICE_KEY: &str = "channel.qq";
+const REMOTE_FETCH_LEGACY_SERVICE_KEY: &str = "provider.ollama";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -119,6 +123,14 @@ pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
+    prepare_messages_for_provider_with_provider_hint(messages, config, None).await
+}
+
+pub async fn prepare_messages_for_provider_with_provider_hint(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    provider_hint: Option<&str>,
+) -> anyhow::Result<PreparedMessages> {
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
@@ -138,8 +150,6 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
-
     let mut normalized_messages = Vec::with_capacity(messages.len());
     for message in messages {
         if message.role != "user" {
@@ -156,7 +166,7 @@ pub async fn prepare_messages_for_provider(
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in refs {
             let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
+                normalize_image_reference(&reference, config, max_bytes, provider_hint).await?;
             normalized_refs.push(data_uri);
         }
 
@@ -198,7 +208,7 @@ async fn normalize_image_reference(
     source: &str,
     config: &MultimodalConfig,
     max_bytes: usize,
-    remote_client: &Client,
+    provider_hint: Option<&str>,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
         return normalize_data_uri(source, max_bytes).await;
@@ -212,7 +222,7 @@ async fn normalize_image_reference(
             .into());
         }
 
-        return normalize_remote_image(source, max_bytes, remote_client).await;
+        return normalize_remote_image(source, max_bytes, provider_hint).await;
     }
 
     normalize_local_image(source, max_bytes).await
@@ -268,22 +278,57 @@ async fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<St
 async fn normalize_remote_image(
     source: &str,
     max_bytes: usize,
+    provider_hint: Option<&str>,
+) -> anyhow::Result<String> {
+    let service_keys = build_remote_fetch_service_keys(source, provider_hint);
+    let mut failures = Vec::new();
+
+    for service_key in service_keys {
+        let client = build_runtime_proxy_client_with_timeouts(&service_key, 30, 10);
+        match normalize_remote_image_once(source, max_bytes, &client).await {
+            Ok(normalized) => return Ok(normalized),
+            Err(error) => {
+                let reason = error.to_string();
+                tracing::debug!(
+                    service_key = %service_key,
+                    source = %source,
+                    "multimodal remote fetch attempt failed: {reason}"
+                );
+                failures.push(format!("{service_key}: {reason}"));
+            }
+        }
+    }
+
+    Err(MultimodalError::RemoteFetchFailed {
+        input: source.to_string(),
+        reason: format!(
+            "{}; hint: when proxy.scope='services', include one of channel.qq/tool.multimodal/tool.http_request/provider.* as needed",
+            failures.join(" | ")
+        ),
+    }
+    .into())
+}
+
+async fn normalize_remote_image_once(
+    source: &str,
+    max_bytes: usize,
     remote_client: &Client,
 ) -> anyhow::Result<String> {
-    let response = remote_client.get(source).send().await.map_err(|error| {
-        MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: error.to_string(),
-        }
-    })?;
+    let mut request = remote_client
+        .get(source)
+        .header(reqwest::header::USER_AGENT, "ZeroClaw/1.0");
+    if source_looks_like_qq_media(source) {
+        request = request.header(reqwest::header::REFERER, "https://qq.com/");
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("error sending request for url ({source}): {error}"))?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: format!("HTTP {status}"),
-        }
-        .into());
+        anyhow::bail!("HTTP {status}");
     }
 
     if let Some(content_length) = response.content_length() {
@@ -300,10 +345,7 @@ async fn normalize_remote_image(
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: error.to_string(),
-        })?;
+        .map_err(|error| anyhow::anyhow!("failed to read response body: {error}"))?;
 
     validate_size(source, bytes.len(), max_bytes)?;
 
@@ -323,6 +365,72 @@ async fn normalize_remote_image(
         "data:{optimized_mime};base64,{}",
         STANDARD.encode(optimized_bytes)
     ))
+}
+
+fn normalize_provider_service_key_hint(provider_hint: Option<&str>) -> Option<String> {
+    let raw = provider_hint
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())?
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    let candidate = if raw.starts_with("provider.") {
+        raw
+    } else {
+        format!("provider.{raw}")
+    };
+
+    if !candidate
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+    {
+        return None;
+    }
+
+    Some(candidate)
+}
+
+fn source_looks_like_qq_media(source: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(source) else {
+        return false;
+    };
+
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    let host = host.to_ascii_lowercase();
+    host == "multimedia.nt.qq.com.cn" || host.ends_with(".qq.com.cn") || host.ends_with(".qq.com")
+}
+
+fn push_service_key_once(keys: &mut Vec<String>, key: String) {
+    if !key.trim().is_empty() && !keys.iter().any(|existing| existing == &key) {
+        keys.push(key);
+    }
+}
+
+fn build_remote_fetch_service_keys(source: &str, provider_hint: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+
+    if source_looks_like_qq_media(source) {
+        push_service_key_once(&mut keys, REMOTE_FETCH_QQ_SERVICE_KEY.to_string());
+    }
+
+    if let Some(provider_service_key) = normalize_provider_service_key_hint(provider_hint) {
+        push_service_key_once(&mut keys, provider_service_key);
+    }
+
+    push_service_key_once(&mut keys, REMOTE_FETCH_MULTIMODAL_SERVICE_KEY.to_string());
+    push_service_key_once(&mut keys, REMOTE_FETCH_TOOL_SERVICE_KEY.to_string());
+    push_service_key_once(&mut keys, REMOTE_FETCH_LEGACY_SERVICE_KEY.to_string());
+    keys
 }
 
 async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
@@ -679,6 +787,63 @@ mod tests {
         let optimized_image = image::load_from_memory(&optimized_bytes).expect("decode optimized");
         assert!(optimized_image.width() <= OPTIMIZED_IMAGE_MAX_DIMENSION);
         assert!(optimized_image.height() <= OPTIMIZED_IMAGE_MAX_DIMENSION);
+    }
+
+    #[test]
+    fn normalize_provider_service_key_hint_builds_provider_prefix() {
+        assert_eq!(
+            normalize_provider_service_key_hint(Some("openai")),
+            Some("provider.openai".to_string())
+        );
+        assert_eq!(
+            normalize_provider_service_key_hint(Some("provider.gemini")),
+            Some("provider.gemini".to_string())
+        );
+        assert_eq!(normalize_provider_service_key_hint(Some("   ")), None);
+        assert_eq!(normalize_provider_service_key_hint(None), None);
+        assert_eq!(
+            normalize_provider_service_key_hint(Some("openai#fast-route")),
+            Some("provider.openai".to_string())
+        );
+        assert_eq!(
+            normalize_provider_service_key_hint(Some("provider.gemini#img")),
+            Some("provider.gemini".to_string())
+        );
+        assert_eq!(
+            normalize_provider_service_key_hint(Some("custom:https://api.example.com/v1")),
+            None
+        );
+    }
+
+    #[test]
+    fn build_remote_fetch_service_keys_prefers_qq_channel_for_qq_media_hosts() {
+        let keys = build_remote_fetch_service_keys(
+            "https://multimedia.nt.qq.com.cn/download?appid=1406",
+            Some("openai"),
+        );
+        assert_eq!(
+            keys,
+            vec![
+                "channel.qq".to_string(),
+                "provider.openai".to_string(),
+                "tool.multimodal".to_string(),
+                "tool.http_request".to_string(),
+                "provider.ollama".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_remote_fetch_service_keys_deduplicates_service_candidates() {
+        let keys = build_remote_fetch_service_keys("https://example.com/a.png", Some("ollama"));
+        assert_eq!(
+            keys,
+            vec![
+                "provider.ollama".to_string(),
+                "tool.multimodal".to_string(),
+                "tool.http_request".to_string(),
+            ]
+        );
     }
 
     #[test]
