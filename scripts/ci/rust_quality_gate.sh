@@ -32,10 +32,23 @@ ensure_rust_component rustfmt
 ensure_rust_component clippy
 
 run_cargo() {
+    local cargo_bin=""
+
+    if [ -n "${CARGO:-}" ] && [ -x "${CARGO}" ]; then
+        cargo_bin="${CARGO}"
+    elif command -v cargo >/dev/null 2>&1; then
+        cargo_bin="$(command -v cargo)"
+    fi
+
+    if [ -z "${cargo_bin}" ]; then
+        echo "error: cargo executable not found (CARGO='${CARGO:-}')" >&2
+        return 127
+    fi
+
     if command -v rustup >/dev/null 2>&1 && [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
-        rustup run "${RUSTUP_TOOLCHAIN}" cargo "$@"
+        rustup run "${RUSTUP_TOOLCHAIN}" "${cargo_bin}" "$@"
     else
-        cargo "$@"
+        "${cargo_bin}" "$@"
     fi
 }
 
