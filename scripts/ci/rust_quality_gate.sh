@@ -31,13 +31,21 @@ ensure_rust_component() {
 ensure_rust_component rustfmt
 ensure_rust_component clippy
 
+run_cargo() {
+    if command -v rustup >/dev/null 2>&1 && [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
+        rustup run "${RUSTUP_TOOLCHAIN}" cargo "$@"
+    else
+        cargo "$@"
+    fi
+}
+
 echo "==> rust quality: cargo fmt --all -- --check"
-cargo fmt --all -- --check
+run_cargo fmt --all -- --check
 
 if [ "$MODE" = "strict" ]; then
     echo "==> rust quality: cargo clippy --locked --all-targets -- -D warnings"
-    cargo clippy --locked --all-targets -- -D warnings
+    run_cargo clippy --locked --all-targets -- -D warnings
 else
     echo "==> rust quality: cargo clippy --locked --all-targets -- -D clippy::correctness"
-    cargo clippy --locked --all-targets -- -D clippy::correctness
+    run_cargo clippy --locked --all-targets -- -D clippy::correctness
 fi
