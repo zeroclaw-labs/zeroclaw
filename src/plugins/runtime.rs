@@ -479,7 +479,7 @@ mod tests {
 id = "{id}"
 version = "1.0.0"
 module_path = "plugins/{id}.wasm"
-wit_packages = ["zeroclaw:tools@1.0.0"]
+wit_packages = ["zeroclaw:tools@1.0.0", "zeroclaw:providers@1.0.0"]
 providers = ["{provider}"]
 
 [[tools]]

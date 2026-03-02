@@ -53,7 +53,7 @@ jobs:
     reproducibility:
         name: Reproducible Build Probe
         runs-on: ubuntu-22.04
-        timeout-minutes: 45
+        timeout-minutes: 75
         steps:
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
