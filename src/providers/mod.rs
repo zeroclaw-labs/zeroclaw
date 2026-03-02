@@ -844,17 +844,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 /// Sanitize API error text by scrubbing secrets and truncating length.
 pub fn sanitize_api_error(input: &str) -> String {
     let scrubbed = scrub_secret_patterns(input);
-
-    if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
-        return scrubbed;
-    }
-
-    let mut end = MAX_API_ERROR_CHARS;
-    while end > 0 && !scrubbed.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    format!("{}...", &scrubbed[..end])
+    crate::util::truncate_with_ellipsis(&scrubbed, MAX_API_ERROR_CHARS)
 }
 
 /// True when HTTP status indicates request-shape/schema rejection for native tools.
@@ -3654,5 +3644,21 @@ providers = ["demo-plugin-provider"]
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);
         assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn sanitize_truncates_long_error() {
+        let long = "a".repeat(400);
+        let result = sanitize_api_error(&long);
+        assert!(result.len() <= MAX_API_ERROR_CHARS + 3);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn sanitize_truncates_after_scrub() {
+        let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains("sk-abcdef123456"));
+        assert!(result.len() <= MAX_API_ERROR_CHARS + 3);
     }
 }
