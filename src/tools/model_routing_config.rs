@@ -1880,12 +1880,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!zero_team_agents.success);
-        assert!(
-            zero_team_agents
-                .error
-                .unwrap_or_default()
-                .contains("max_team_agents")
-        );
+        assert!(zero_team_agents
+            .error
+            .unwrap_or_default()
+            .contains("max_team_agents"));
 
         let zero_subagents = tool
             .execute(json!({
@@ -1895,12 +1893,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!zero_subagents.success);
-        assert!(
-            zero_subagents
-                .error
-                .unwrap_or_default()
-                .contains("max_concurrent_subagents")
-        );
+        assert!(zero_subagents
+            .error
+            .unwrap_or_default()
+            .contains("max_concurrent_subagents"));
 
         let zero_poll = tool
             .execute(json!({
@@ -1910,12 +1906,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!zero_poll.success);
-        assert!(
-            zero_poll
-                .error
-                .unwrap_or_default()
-                .contains("subagents_queue_poll_ms")
-        );
+        assert!(zero_poll
+            .error
+            .unwrap_or_default()
+            .contains("subagents_queue_poll_ms"));
     }
 
     #[tokio::test]
