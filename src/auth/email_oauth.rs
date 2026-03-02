@@ -201,7 +201,9 @@ pub async fn refresh_access_token(
 
     Ok(TokenSet {
         access_token: token_response.access_token,
-        refresh_token: token_response.refresh_token,
+        refresh_token: token_response
+            .refresh_token
+            .or_else(|| Some(refresh_token.to_string())),
         id_token: token_response.id_token,
         expires_at,
         token_type: token_response.token_type.or_else(|| Some("Bearer".into())),
@@ -292,7 +294,10 @@ pub async fn poll_device_code_tokens(
             .context("Failed to poll device code")?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .context("Failed to read device code poll response body")?;
 
         if status.is_success() {
             let token_response: TokenResponse =
@@ -312,25 +317,28 @@ pub async fn poll_device_code_tokens(
             });
         }
 
-        if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&body) {
-            match err.error.as_str() {
-                "authorization_pending" => {}
-                "slow_down" => {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                "access_denied" => {
-                    anyhow::bail!("User denied authorization");
-                }
-                "expired_token" => {
-                    anyhow::bail!("Device code expired");
-                }
-                _ => {
-                    anyhow::bail!(
-                        "Google OAuth error: {} - {}",
-                        err.error,
-                        err.error_description.unwrap_or_default()
-                    );
-                }
+        let err: OAuthErrorResponse = serde_json::from_str(&body).context(format!(
+            "Device code poll returned non-JSON error (HTTP {}): {}",
+            status, body
+        ))?;
+
+        match err.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            "access_denied" => {
+                anyhow::bail!("User denied authorization");
+            }
+            "expired_token" => {
+                anyhow::bail!("Device code expired");
+            }
+            _ => {
+                anyhow::bail!(
+                    "Google OAuth error: {} - {}",
+                    err.error,
+                    err.error_description.unwrap_or_default()
+                );
             }
         }
     }
@@ -348,45 +356,38 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
     };
 
     println!("Waiting for callback at http://localhost:1457/auth/callback ...");
-    println!("(Or paste the full callback URL / authorization code here if running remotely)");
+    println!("(Or paste the full callback URL / authorization code below if running remotely)");
 
-    tokio::select! {
-        accept_result = async {
-            tokio::time::timeout(timeout, listener.accept()).await
-        } => {
-            match accept_result {
-                Ok(Ok((mut stream, _))) => {
-                    let mut buffer = vec![0u8; 4096];
-                    let n = stream
-                        .read(&mut buffer)
-                        .await
-                        .context("Failed to read from callback connection")?;
+    let accept_result = tokio::time::timeout(timeout, listener.accept()).await;
 
-                    let request = String::from_utf8_lossy(&buffer[..n]);
-                    let (code, state) = parse_callback_request(&request)?;
+    match accept_result {
+        Ok(Ok((mut stream, _))) => {
+            let mut buffer = vec![0u8; 4096];
+            let n = stream
+                .read(&mut buffer)
+                .await
+                .context("Failed to read from callback connection")?;
 
-                    if state != expected_state {
-                        let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n\
-                             <html><body><h1>State mismatch</h1><p>Please try again.</p></body></html>";
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        anyhow::bail!("OAuth state mismatch");
-                    }
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            let (code, state) = parse_callback_request(&request)?;
 
-                    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-                         <html><body><h1>Success!</h1><p>You can close this window and return to the terminal.</p></body></html>";
-                    let _ = stream.write_all(response.as_bytes()).await;
-
-                    Ok(code)
-                }
-                Ok(Err(e)) => Err(anyhow::anyhow!("Failed to accept connection: {e}")),
-                Err(_) => {
-                    eprintln!("\nCallback timeout. Falling back to manual input.");
-                    receive_code_from_stdin(expected_state).await
-                }
+            if state != expected_state {
+                let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n\
+                     <html><body><h1>State mismatch</h1><p>Please try again.</p></body></html>";
+                let _ = stream.write_all(response.as_bytes()).await;
+                anyhow::bail!("OAuth state mismatch");
             }
+
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+                 <html><body><h1>Success!</h1><p>You can close this window and return to the terminal.</p></body></html>";
+            let _ = stream.write_all(response.as_bytes()).await;
+
+            Ok(code)
         }
-        stdin_result = receive_code_from_stdin(expected_state) => {
-            stdin_result
+        Ok(Err(e)) => Err(anyhow::anyhow!("Failed to accept connection: {e}")),
+        Err(_) => {
+            eprintln!("\nCallback timeout. Falling back to manual input.");
+            receive_code_from_stdin(expected_state).await
         }
     }
 }
@@ -457,19 +458,25 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
 
     if let Some(code) = params.get("code") {
         if let Some(expected) = expected_state {
-            if let Some(actual) = params.get("state") {
-                if actual != expected {
-                    anyhow::bail!(
-                        "OAuth state mismatch: expected {}, got {}",
-                        expected, actual
-                    );
-                }
+            let actual = params
+                .get("state")
+                .ok_or_else(|| anyhow::anyhow!("OAuth state parameter missing from redirect"))?;
+            if actual != expected {
+                anyhow::bail!(
+                    "OAuth state mismatch: expected {}, got {}",
+                    expected,
+                    actual
+                );
             }
         }
         return Ok(code.clone());
     }
 
-    if trimmed.len() > 10 && !trimmed.contains(' ') && !trimmed.contains('&') {
+    if expected_state.is_none()
+        && trimmed.len() > 10
+        && !trimmed.contains(' ')
+        && !trimmed.contains('&')
+    {
         return Ok(trimmed.to_string());
     }
 

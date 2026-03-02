@@ -236,7 +236,12 @@ impl EmailChannel {
         let Some(auth_service) = self.auth_service.as_ref() else {
             return false;
         };
-        let Ok(Some(profile)) = auth_service.get_profile("email", None).await else {
+        let profile_override = if self.config.oauth_profile == "default" {
+            None
+        } else {
+            Some(self.config.oauth_profile.as_str())
+        };
+        let Ok(Some(profile)) = auth_service.get_profile("email", profile_override).await else {
             return false;
         };
         let Some(token_set) = profile.token_set.as_ref() else {
@@ -358,7 +363,7 @@ impl EmailChannel {
         debug!("IMAP client created, authenticating");
 
         // Authenticate based on method
-        let mut session = match self.config.auth_method {
+        let session = match self.config.auth_method {
             EmailAuthMethod::Password => client
                 .login(&self.config.username, &self.config.password)
                 .await
@@ -367,8 +372,7 @@ impl EmailChannel {
                 debug!("Fetching OAuth access token");
                 let access_token = self.get_access_token().await?;
                 debug!(
-                    "Got access token ({}... len={}), sending XOAUTH2 AUTHENTICATE command for user={}",
-                    &access_token[..access_token.len().min(20)],
+                    "Got access token (len={}), sending XOAUTH2 AUTHENTICATE command for user={}",
                     access_token.len(),
                     self.config.username
                 );
@@ -376,16 +380,18 @@ impl EmailChannel {
                     user: self.config.username.clone(),
                     access_token,
                 };
-                match timeout(Duration::from_secs(30), client.authenticate("XOAUTH2", auth)).await
+                match timeout(
+                    Duration::from_secs(30),
+                    client.authenticate("XOAUTH2", auth),
+                )
+                .await
                 {
                     Ok(Ok(session)) => session,
                     Ok(Err((e, _))) => {
                         return Err(anyhow!("IMAP XOAUTH2 authentication failed: {}", e));
                     }
                     Err(_) => {
-                        return Err(anyhow!(
-                            "IMAP XOAUTH2 authentication timed out after 30s"
-                        ));
+                        return Err(anyhow!("IMAP XOAUTH2 authentication timed out after 30s"));
                     }
                 }
             }
