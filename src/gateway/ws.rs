@@ -29,6 +29,7 @@ const EMPTY_WS_RESPONSE_FALLBACK: &str =
 const WS_HISTORY_MEMORY_KEY_PREFIX: &str = "gateway_ws_history";
 const MAX_WS_PERSISTED_TURNS: usize = 128;
 const MAX_WS_SESSION_ID_LEN: usize = 128;
+const WS_SUBPROTOCOL: &str = "zeroclaw.v1";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WsQueryParams {
@@ -405,7 +406,8 @@ pub async fn handle_ws_chat(
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.protocols([WS_SUBPROTOCOL])
+        .on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
