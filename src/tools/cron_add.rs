@@ -543,7 +543,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
-                "schedule": { "kind": "every", "every_ms": 300000 },
+                "schedule": { "kind": "every", "every_ms": 300_000 },
                 "job_type": "agent",
                 "prompt": "Send me a recurring status update"
             }))
@@ -610,7 +610,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
-                "schedule": { "kind": "every", "every_ms": 300000 },
+                "schedule": { "kind": "every", "every_ms": 300_000 },
                 "job_type": "agent",
                 "prompt": "Share a heartbeat summary",
                 "recurring_confirmed": true

@@ -8736,10 +8736,10 @@ impl Config {
             let normalized = value.trim().to_ascii_lowercase();
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => {
-                    self.security.url_access.require_first_visit_approval = true
+                    self.security.url_access.require_first_visit_approval = true;
                 }
                 "0" | "false" | "no" | "off" => {
-                    self.security.url_access.require_first_visit_approval = false
+                    self.security.url_access.require_first_visit_approval = false;
                 }
                 _ => {}
             }
@@ -8751,10 +8751,10 @@ impl Config {
             let normalized = value.trim().to_ascii_lowercase();
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => {
-                    self.security.url_access.enforce_domain_allowlist = true
+                    self.security.url_access.enforce_domain_allowlist = true;
                 }
                 "0" | "false" | "no" | "off" => {
-                    self.security.url_access.enforce_domain_allowlist = false
+                    self.security.url_access.enforce_domain_allowlist = false;
                 }
                 _ => {}
             }

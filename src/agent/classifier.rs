@@ -29,7 +29,7 @@ pub fn classify_with_decision(
     let len = message.len();
 
     let mut rules: Vec<_> = config.rules.iter().collect();
-    rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    rules.sort_by_key(|b| std::cmp::Reverse(b.priority));
 
     for rule in rules {
         // Length constraints

@@ -130,7 +130,7 @@ impl ChannelAckConfigTool {
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
-            None | Some("") | Some("direct") => Ok(AckReactionContextChatType::Direct),
+            None | Some("" | "direct") => Ok(AckReactionContextChatType::Direct),
             Some("group") => Ok(AckReactionContextChatType::Group),
             Some(other) => anyhow::bail!("Invalid chat_type '{other}'. Use direct|group"),
         }

@@ -464,6 +464,7 @@ impl Tool for WebSearchConfigTool {
         })
     }
 
+    #[allow(clippy::large_futures)]
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")

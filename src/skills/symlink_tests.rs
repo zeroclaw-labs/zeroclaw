@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::config::Config;
-    use crate::skills::{handle_command, load_skills_with_config, skills_dir};
-    use crate::SkillCommands;
+    use crate::skills::skills_dir;
     use std::path::Path;
     use tempfile::TempDir;
 

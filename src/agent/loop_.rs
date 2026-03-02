@@ -364,7 +364,7 @@ where
 }
 
 fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
-    interval > 0 && counter > 0 && counter % interval == 0
+    interval > 0 && counter > 0 && counter.is_multiple_of(interval)
 }
 
 fn should_emit_verbose_progress(mode: ProgressMode) -> bool {
@@ -375,6 +375,7 @@ fn should_emit_tool_progress(mode: ProgressMode) -> bool {
     mode != ProgressMode::Off
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn estimate_prompt_tokens(
     messages: &[ChatMessage],
     tools: Option<&[crate::tools::ToolSpec]>,
@@ -429,6 +430,7 @@ fn lookup_model_pricing(
     (3.0, 15.0)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn estimate_request_cost_usd(
     context: &CostEnforcementContext,
     provider: &str,
@@ -2809,6 +2811,7 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
+#[allow(clippy::large_futures)]
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     process_message_with_session(config, message, None).await
 }

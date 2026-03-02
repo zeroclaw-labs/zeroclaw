@@ -1,4 +1,5 @@
 #![warn(clippy::all, clippy::pedantic)]
+#![feature(windows_by_handle)]
 #![forbid(unsafe_code)]
 #![allow(
     clippy::assigning_clones,

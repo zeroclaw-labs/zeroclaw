@@ -322,7 +322,7 @@ impl Tool for SwitchProviderTool {
             .unwrap_or("user request");
 
         // Load config from disk (without env overrides), update, and save
-        let save_result = async {
+        let save_result = Box::pin(async {
             let mut cfg = self.load_config_without_env()?;
             let previous_provider = cfg.default_provider.clone();
             let previous_model = cfg.default_model.clone();
@@ -334,7 +334,7 @@ impl Tool for SwitchProviderTool {
 
             cfg.save().await?;
             Ok::<_, anyhow::Error>((previous_provider, previous_model))
-        }
+        })
         .await;
 
         match save_result {

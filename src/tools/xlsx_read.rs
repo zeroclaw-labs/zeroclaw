@@ -690,7 +690,9 @@ mod tests {
 
     /// Build a minimal valid XLSX (ZIP) in memory with one sheet containing
     /// the given rows. Each inner `Vec<&str>` is a row of cell values.
+    #[allow(clippy::cast_possible_truncation)]
     fn minimal_xlsx_bytes(rows: &[Vec<&str>]) -> Vec<u8> {
+        use std::fmt::Write as FmtWrite;
         use std::io::Write;
 
         // Build shared strings from all unique cell values.
@@ -705,7 +707,7 @@ mod tests {
 
         let mut ss_entries = String::new();
         for val in &all_values {
-            ss_entries.push_str(&format!("<si><t>{val}</t></si>"));
+            let _ = write!(ss_entries, "<si><t>{val}</t></si>");
         }
         let shared_strings_xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -717,14 +719,14 @@ mod tests {
         // Build sheet XML.
         let mut sheet_rows = String::new();
         for (r_idx, row) in rows.iter().enumerate() {
-            sheet_rows.push_str(&format!(r#"<row r="{}">"#, r_idx + 1));
+            let _ = write!(sheet_rows, r#"<row r="{}">"#, r_idx + 1);
             for (c_idx, cell) in row.iter().enumerate() {
                 let col_letter = (b'A' + c_idx as u8) as char;
                 let cell_ref = format!("{}{}", col_letter, r_idx + 1);
                 let ss_idx = all_values.iter().position(|v| v == cell).unwrap();
-                sheet_rows.push_str(&format!(r#"<c r="{cell_ref}" t="s"><v>{ss_idx}</v></c>"#));
+                let _ = write!(sheet_rows, r#"<c r="{cell_ref}" t="s"><v>{ss_idx}</v></c>"#);
             }
-            sheet_rows.push_str("</row>");
+            let _ = write!(sheet_rows, "</row>");
         }
         let sheet_xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -766,12 +768,14 @@ mod tests {
     }
 
     /// Build an XLSX with two sheets.
+    #[allow(clippy::cast_possible_truncation)]
     fn two_sheet_xlsx_bytes(
         sheet1_name: &str,
         sheet1_rows: &[Vec<&str>],
         sheet2_name: &str,
         sheet2_rows: &[Vec<&str>],
     ) -> Vec<u8> {
+        use std::fmt::Write as FmtWrite;
         use std::io::Write;
 
         // Collect all unique values across both sheets.
@@ -788,7 +792,7 @@ mod tests {
 
         let mut ss_entries = String::new();
         for val in &all_values {
-            ss_entries.push_str(&format!("<si><t>{val}</t></si>"));
+            let _ = write!(ss_entries, "<si><t>{val}</t></si>");
         }
         let shared_strings_xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -800,14 +804,14 @@ mod tests {
         let build_sheet = |rows: &[Vec<&str>]| -> String {
             let mut sheet_rows = String::new();
             for (r_idx, row) in rows.iter().enumerate() {
-                sheet_rows.push_str(&format!(r#"<row r="{}">"#, r_idx + 1));
+                let _ = write!(sheet_rows, r#"<row r="{}">"#, r_idx + 1);
                 for (c_idx, cell) in row.iter().enumerate() {
                     let col_letter = (b'A' + c_idx as u8) as char;
                     let cell_ref = format!("{}{}", col_letter, r_idx + 1);
                     let ss_idx = all_values.iter().position(|v| v == cell).unwrap();
-                    sheet_rows.push_str(&format!(r#"<c r="{cell_ref}" t="s"><v>{ss_idx}</v></c>"#));
+                    let _ = write!(sheet_rows, r#"<c r="{cell_ref}" t="s"><v>{ss_idx}</v></c>"#);
                 }
-                sheet_rows.push_str("</row>");
+                let _ = write!(sheet_rows, "</row>");
             }
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
