@@ -643,20 +643,22 @@ fn is_high_risk_base_command(base: &str) -> bool {
 }
 
 impl SecurityPolicy {
-    fn path_matches_rule_prefix(&self, candidate: &str, prefix: &str) -> bool {
-        let candidate_path = expand_user_path(candidate);
-        let prefix_path = expand_user_path(prefix);
+    /// Resolve a user-supplied path argument using the same semantics as
+    /// `is_path_allowed` (including `~` expansion).
+    ///
+    /// Absolute inputs remain absolute; relative inputs are workspace-relative.
+    pub fn resolve_user_supplied_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
+    }
 
-        let normalized_candidate = if candidate_path.is_absolute() {
-            candidate_path
-        } else {
-            self.workspace_dir.join(candidate_path)
-        };
-        let normalized_prefix = if prefix_path.is_absolute() {
-            prefix_path
-        } else {
-            self.workspace_dir.join(prefix_path)
-        };
+    fn path_matches_rule_prefix(&self, candidate: &str, prefix: &str) -> bool {
+        let normalized_candidate = self.resolve_user_supplied_path(candidate);
+        let normalized_prefix = self.resolve_user_supplied_path(prefix);
 
         normalized_candidate.starts_with(&normalized_prefix)
     }
@@ -2010,6 +2012,29 @@ mod tests {
         let p = default_policy();
         assert!(p.is_path_allowed(".gitignore"));
         assert!(p.is_path_allowed(".env"));
+    }
+
+    #[test]
+    fn resolve_user_supplied_path_joins_workspace_for_relative_inputs() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_resolve_user_path_relative");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            p.resolve_user_supplied_path("src/main.rs"),
+            workspace.join("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_user_supplied_path_expands_home_tilde() {
+        let p = default_policy();
+        let expected = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join("notes/todo.txt");
+        assert_eq!(p.resolve_user_supplied_path("~/notes/todo.txt"), expected);
     }
 
     // ── from_config ─────────────────────────────────────────

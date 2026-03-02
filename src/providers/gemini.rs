@@ -6,7 +6,9 @@
 
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
+use crate::providers::traits::{
+    ChatMessage, ChatResponse, NormalizedStopReason, Provider, TokenUsage,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -190,6 +192,8 @@ struct InternalGenerateContentResponse {
 struct Candidate {
     #[serde(default)]
     content: Option<CandidateContent>,
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,7 +1009,12 @@ impl GeminiProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+    ) -> anyhow::Result<(
+        Option<String>,
+        Option<TokenUsage>,
+        Option<NormalizedStopReason>,
+        Option<String>,
+    )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -1198,14 +1207,18 @@ impl GeminiProvider {
             output_tokens: u.candidates_token_count,
         });
 
-        let text = result
+        let candidate = result
             .candidates
             .and_then(|c| c.into_iter().next())
-            .and_then(|c| c.content)
-            .and_then(|c| c.effective_text())
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+        let raw_stop_reason = candidate.finish_reason.clone();
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_gemini_finish_reason);
 
-        Ok((text, usage))
+        let text = candidate.content.and_then(|c| c.effective_text());
+
+        Ok((text, usage, stop_reason, raw_stop_reason))
     }
 }
 
@@ -1230,9 +1243,10 @@ impl Provider for GeminiProvider {
             parts: Self::build_user_parts(message),
         }];
 
-        let (text, _usage) = self
+        let (text_opt, _usage, _stop_reason, _raw_stop_reason) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
+        let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
         Ok(text)
     }
 
@@ -1280,9 +1294,10 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text, _usage) = self
+        let (text_opt, _usage, _stop_reason, _raw_stop_reason) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
+        let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
         Ok(text)
     }
 
@@ -1323,16 +1338,18 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text, usage) = self
+        let (text, usage, stop_reason, raw_stop_reason) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
 
         Ok(ChatResponse {
-            text: Some(text),
+            text,
             tool_calls: Vec::new(),
             usage,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         })
     }
 

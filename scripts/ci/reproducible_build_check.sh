@@ -6,16 +6,17 @@ set -euo pipefail
 # - Compare artifact SHA256
 # - Emit JSON + markdown artifacts for auditability
 
-PROFILE="${PROFILE:-release-fast}"
+PROFILE="${PROFILE:-release}"
 BINARY_NAME="${BINARY_NAME:-zeroclaw}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts}"
 FAIL_ON_DRIFT="${FAIL_ON_DRIFT:-false}"
 ALLOW_BUILD_ID_DRIFT="${ALLOW_BUILD_ID_DRIFT:-true}"
+TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
 
 mkdir -p "${OUTPUT_DIR}"
 
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
-artifact_path="target/${host_target}/${PROFILE}/${BINARY_NAME}"
+artifact_path="${TARGET_ROOT}/${host_target}/${PROFILE}/${BINARY_NAME}"
 
 sha256_file() {
   local file="$1"

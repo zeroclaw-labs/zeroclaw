@@ -881,6 +881,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -893,6 +895,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 })
             }
         }
@@ -928,6 +932,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             })
         }
     }

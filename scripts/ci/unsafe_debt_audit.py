@@ -9,10 +9,14 @@ import json
 import re
 import subprocess
 import sys
-import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore
 
 
 @dataclass(frozen=True)

@@ -52,6 +52,10 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-22.04
         timeout-minutes: 75
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -59,12 +63,18 @@ jobs:
             - name: Self-heal Rust toolchain cache
               shell: bash
               run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
             - name: Ensure C toolchain for Rust builds
               run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
@@ -128,8 +138,15 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-22.04
         timeout-minutes: 120
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
             - name: Self-heal Rust toolchain cache
               shell: bash
               run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
@@ -138,6 +155,9 @@ jobs:
                   toolchain: 1.92.0
             - name: Ensure C toolchain for Rust builds
               run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
@@ -197,9 +217,16 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-22.04
         timeout-minutes: 90
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
 
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
             - name: Self-heal Rust toolchain cache
               shell: bash
               run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
@@ -208,6 +235,9 @@ jobs:
                   toolchain: 1.92.0
             - name: Ensure C toolchain for Rust builds
               run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-build

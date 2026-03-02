@@ -33,6 +33,20 @@ set -euo pipefail
 BIN="${1:?Usage: check_binary_size.sh <binary_path> [label]}"
 LABEL="${2:-}"
 
+if [ ! -f "$BIN" ] && [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  if [[ "$BIN" == target/* ]]; then
+    alt_bin="${CARGO_TARGET_DIR}/${BIN#target/}"
+    if [ -f "$alt_bin" ]; then
+      BIN="$alt_bin"
+    fi
+  elif [[ "$BIN" != /* ]]; then
+    alt_bin="${CARGO_TARGET_DIR}/${BIN}"
+    if [ -f "$alt_bin" ]; then
+      BIN="$alt_bin"
+    fi
+  fi
+fi
+
 if [ ! -f "$BIN" ]; then
   echo "::error::Binary not found at $BIN"
   exit 1
