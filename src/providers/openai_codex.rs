@@ -74,6 +74,7 @@ impl std::fmt::Display for WebsocketRequestError {
 
 impl std::error::Error for WebsocketRequestError {}
 
+/// Timeout before any websocket event arrived.
 fn websocket_waiting_for_events_timeout_error() -> WebsocketRequestError {
     WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
         "OpenAI Codex websocket stream timed out after {}s waiting for events",
@@ -81,18 +82,21 @@ fn websocket_waiting_for_events_timeout_error() -> WebsocketRequestError {
     ))
 }
 
+/// Timeout after at least one websocket event but before any text output.
 fn websocket_no_response_before_timeout_error() -> WebsocketRequestError {
     WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
         "No response from OpenAI Codex websocket stream before timeout"
     ))
 }
 
+/// Websocket stream ended without any response text.
 fn websocket_no_response_error() -> WebsocketRequestError {
     WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
         "No response from OpenAI Codex websocket stream"
     ))
 }
 
+/// Normalizes explicit websocket frame/event failures to stream-classified errors.
 fn websocket_stream_classification_error<E>(error: E) -> WebsocketRequestError
 where
     E: Into<anyhow::Error>,
@@ -100,6 +104,7 @@ where
     WebsocketRequestError::stream(error)
 }
 
+/// Classifies read-timeout state to either transport-unavailable or timed-out completion.
 fn classify_websocket_read_timeout(
     saw_any_event: bool,
     saw_delta: bool,
@@ -112,6 +117,7 @@ fn classify_websocket_read_timeout(
     }
 }
 
+/// Resolves terminal websocket state into either output text or a classified error.
 fn finalize_websocket_text(
     saw_delta: bool,
     delta_accumulator: &str,
