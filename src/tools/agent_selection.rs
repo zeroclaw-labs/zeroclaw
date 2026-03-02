@@ -2,7 +2,6 @@ use super::agent_load_tracker::AgentLoadSnapshot;
 use crate::config::{AgentLoadBalanceStrategy, DelegateAgentConfig};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasher;
 
 /// Result of resolving which delegate profile should execute a task.
 #[derive(Debug, Clone)]
@@ -34,6 +33,7 @@ impl Default for AgentSelectionPolicy {
 
 /// Select an agent either explicitly (`requested_agent`) or automatically
 /// (lexical match over task/context and agent metadata).
+#[allow(clippy::implicit_hasher)]
 pub fn select_agent(
     agents: &HashMap<String, DelegateAgentConfig>,
     requested_agent: Option<&str>,
@@ -55,8 +55,9 @@ pub fn select_agent(
 }
 
 /// Select an agent using optional runtime load snapshots and policy controls.
+#[allow(clippy::implicit_hasher)]
 pub fn select_agent_with_load(
-    agents: &HashMap<String, DelegateAgentConfig, impl BuildHasher>,
+    agents: &HashMap<String, DelegateAgentConfig>,
     requested_agent: Option<&str>,
     task: &str,
     context: &str,

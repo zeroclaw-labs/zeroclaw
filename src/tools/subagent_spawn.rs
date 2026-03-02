@@ -119,7 +119,7 @@ impl SubAgentSpawnTool {
                 if settings.queue_wait_ms == 0 {
                     return Err(running);
                 }
-                session = returned;
+                session = *returned;
             }
         }
 
@@ -135,7 +135,7 @@ impl SubAgentSpawnTool {
                 Ok(()) => return Ok(()),
                 Err((running, returned)) => {
                     last_running = running;
-                    session = returned;
+                    session = *returned;
                 }
             }
         }
@@ -654,6 +654,7 @@ mod tests {
         agents
     }
 
+    #[allow(clippy::fn_params_excessive_bools)]
     fn write_runtime_orchestration_config(
         path: &std::path::Path,
         teams_enabled: bool,

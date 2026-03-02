@@ -919,6 +919,7 @@ mod tests {
         agents
     }
 
+    #[allow(clippy::fn_params_excessive_bools)]
     fn write_runtime_orchestration_config(
         path: &std::path::Path,
         teams_enabled: bool,

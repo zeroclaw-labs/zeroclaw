@@ -646,14 +646,14 @@ impl ModelRoutingConfigTool {
         match teams_recent_selection_penalty_update {
             MaybeSet::Set(value) => cfg.agent.teams.recent_selection_penalty = value,
             MaybeSet::Null => {
-                cfg.agent.teams.recent_selection_penalty = team_defaults.recent_selection_penalty
+                cfg.agent.teams.recent_selection_penalty = team_defaults.recent_selection_penalty;
             }
             MaybeSet::Unset => {}
         }
         match teams_recent_failure_penalty_update {
             MaybeSet::Set(value) => cfg.agent.teams.recent_failure_penalty = value,
             MaybeSet::Null => {
-                cfg.agent.teams.recent_failure_penalty = team_defaults.recent_failure_penalty
+                cfg.agent.teams.recent_failure_penalty = team_defaults.recent_failure_penalty;
             }
             MaybeSet::Unset => {}
         }
@@ -677,14 +677,14 @@ impl ModelRoutingConfigTool {
         match subagents_load_window_secs_update {
             MaybeSet::Set(value) => cfg.agent.subagents.load_window_secs = value,
             MaybeSet::Null => {
-                cfg.agent.subagents.load_window_secs = subagent_defaults.load_window_secs
+                cfg.agent.subagents.load_window_secs = subagent_defaults.load_window_secs;
             }
             MaybeSet::Unset => {}
         }
         match subagents_inflight_penalty_update {
             MaybeSet::Set(value) => cfg.agent.subagents.inflight_penalty = value,
             MaybeSet::Null => {
-                cfg.agent.subagents.inflight_penalty = subagent_defaults.inflight_penalty
+                cfg.agent.subagents.inflight_penalty = subagent_defaults.inflight_penalty;
             }
             MaybeSet::Unset => {}
         }
@@ -692,7 +692,7 @@ impl ModelRoutingConfigTool {
             MaybeSet::Set(value) => cfg.agent.subagents.recent_selection_penalty = value,
             MaybeSet::Null => {
                 cfg.agent.subagents.recent_selection_penalty =
-                    subagent_defaults.recent_selection_penalty
+                    subagent_defaults.recent_selection_penalty;
             }
             MaybeSet::Unset => {}
         }
@@ -700,7 +700,7 @@ impl ModelRoutingConfigTool {
             MaybeSet::Set(value) => cfg.agent.subagents.recent_failure_penalty = value,
             MaybeSet::Null => {
                 cfg.agent.subagents.recent_failure_penalty =
-                    subagent_defaults.recent_failure_penalty
+                    subagent_defaults.recent_failure_penalty;
             }
             MaybeSet::Unset => {}
         }
@@ -1306,6 +1306,7 @@ impl Tool for ModelRoutingConfigTool {
         })
     }
 
+    #[allow(clippy::large_futures)]
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")
@@ -1353,6 +1354,7 @@ impl Tool for ModelRoutingConfigTool {
 }
 
 #[cfg(test)]
+#[allow(clippy::large_futures)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
