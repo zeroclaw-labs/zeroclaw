@@ -68,7 +68,7 @@ nanohtml2text = "0.2"
 html2md = { package = "fast_html2md", version = "0.0.58", optional = true }
 
 # Zip archive extraction
-zip = { version = "8.1", default-features = false, features = ["deflate"] }
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 # XML parsing (DOCX text extraction)
 quick-xml = "0.37"
@@ -123,7 +123,7 @@ cron = "0.15"
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
-rustyline = "17.0"
+rustyline = { version = "17.0", default-features = false }
 console = "0.16"
 
 # Hardware discovery (device path globbing)
