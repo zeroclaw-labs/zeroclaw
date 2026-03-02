@@ -28,7 +28,7 @@ env:
 
 jobs:
     no-tabs:
-        runs-on: ubuntu-22.04
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 10
         steps:
             - name: Normalize git global hooks config
@@ -67,7 +67,7 @@ jobs:
                   PY
 
     actionlint:
-        runs-on: ubuntu-22.04
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 10
         steps:
             - name: Normalize git global hooks config

@@ -17,7 +17,7 @@ permissions:
 jobs:
   update-notice:
     name: Update NOTICE with new contributors
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
     timeout-minutes: 20
     steps:
       - name: Checkout repository

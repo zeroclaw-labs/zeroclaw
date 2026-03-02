@@ -51,7 +51,7 @@ env:
 jobs:
     codeql:
         name: CodeQL Analysis
-        runs-on: ubuntu-22.04
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 120
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo

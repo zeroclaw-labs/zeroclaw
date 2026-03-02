@@ -27,7 +27,7 @@ jobs:
     if: >-
       (github.event_name == 'issues' &&
       (github.event.action == 'opened' || github.event.action == 'reopened'))
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
     permissions:
       contents: read
       issues: write
@@ -46,7 +46,7 @@ jobs:
             await script({ github, context, core });
   first-interaction:
     if: github.event.action == 'opened'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
     permissions:
       issues: write
       pull-requests: write
@@ -77,7 +77,7 @@ jobs:
 
   labeled-routes:
     if: github.event.action == 'labeled'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
     permissions:
       contents: read
       issues: write

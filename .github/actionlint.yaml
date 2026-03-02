@@ -4,3 +4,5 @@ self-hosted-runner:
         - X64
         - racknerd
         - aws-india
+        - blacksmith-2vcpu-ubuntu-2404
+        - hetzner

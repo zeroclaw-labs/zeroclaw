@@ -51,7 +51,7 @@ env:
 jobs:
     resolve-profile:
         name: Resolve Matrix Profile
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         outputs:
             profile: ${{ steps.resolve.outputs.profile }}
             lane_job_prefix: ${{ steps.resolve.outputs.lane_job_prefix }}
@@ -127,7 +127,7 @@ jobs:
             github.event_name != 'pull_request' ||
             contains(github.event.pull_request.labels.*.name, 'ci:full') ||
             contains(github.event.pull_request.labels.*.name, 'ci:feature-matrix')
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: ${{ fromJSON(needs.resolve-profile.outputs.lane_timeout_minutes) }}
         strategy:
             fail-fast: false
@@ -278,7 +278,7 @@ jobs:
         name: ${{ needs.resolve-profile.outputs.summary_job_name }}
         needs: [resolve-profile, feature-check]
         if: always()
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
