@@ -579,7 +579,8 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
@@ -587,8 +588,11 @@ async fn run_job_command_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
-    {
+        // Keep shell execution deterministic in CI by dropping startup-hook env vars.
+        .env_remove("BASH_ENV")
+        .env_remove("ENV");
+
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return (false, format!("spawn error: {e}")),
     };
@@ -639,6 +643,12 @@ mod tests {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
             std::env::remove_var(key);
+            Self { key, original }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -704,6 +714,22 @@ mod tests {
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_ignores_bash_env_noise() {
+        let _env = env_lock().await;
+        let _guard = EnvGuard::set("BASH_ENV", "/definitely/missing/ci-env");
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("echo scheduler-ok");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(output.contains("scheduler-ok"));
+        assert!(!output.contains("cannot open"));
     }
 
     #[tokio::test]
