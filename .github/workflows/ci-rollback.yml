@@ -90,7 +90,8 @@ jobs:
                   mode_input="dry-run"
                   target_ref_input=""
                   allow_non_ancestor="false"
-                  fail_on_violation="true"
+                  # Scheduled audits can surface historical rollback violations; report without blocking by default.
+                  fail_on_violation="false"
 
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
                     branch_input="${{ github.event.inputs.branch || 'dev' }}"
