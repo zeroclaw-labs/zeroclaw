@@ -104,16 +104,21 @@ where
     WebsocketRequestError::stream(error)
 }
 
-/// Classifies read-timeout state to either transport-unavailable or timed-out completion.
+/// Classifies read-timeout state:
+/// - `Err` => no websocket events were observed (waiting-for-events timeout)
+/// - `Ok(false)` => timed out without any response text after at least one event
+/// - `Ok(true)` => timed out after response text signals were observed
 fn classify_websocket_read_timeout(
     saw_any_event: bool,
     saw_delta: bool,
     has_fallback_text: bool,
 ) -> Result<bool, WebsocketRequestError> {
-    if saw_any_event || saw_delta || has_fallback_text {
+    if !saw_any_event {
+        Err(websocket_waiting_for_events_timeout_error())
+    } else if saw_delta || has_fallback_text {
         Ok(true)
     } else {
-        Err(websocket_waiting_for_events_timeout_error())
+        Ok(false)
     }
 }
 
@@ -857,11 +862,12 @@ impl OpenAiCodexProvider {
                 Ok(frame) => frame,
                 Err(_) => {
                     let _ = ws_stream.close(None).await;
-                    timed_out = classify_websocket_read_timeout(
+                    let timed_out_with_response = classify_websocket_read_timeout(
                         saw_any_event,
                         saw_delta,
                         fallback_text.is_some(),
                     )?;
+                    timed_out = !timed_out_with_response;
                     break;
                 }
             };
@@ -1652,10 +1658,10 @@ data: [DONE]
     }
 
     #[test]
-    fn websocket_timeout_after_non_text_event_is_timed_out_state() {
-        let timed_out = classify_websocket_read_timeout(true, false, false)
-            .expect("non-text events before timeout should mark timed_out");
-        assert!(timed_out);
+    fn websocket_timeout_after_non_text_event_has_no_response_signal() {
+        let timed_out_with_response = classify_websocket_read_timeout(true, false, false)
+            .expect("non-text events before timeout should classify without waiting-timeout");
+        assert!(!timed_out_with_response);
     }
 
     #[test]
