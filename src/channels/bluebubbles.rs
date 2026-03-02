@@ -843,14 +843,14 @@ impl BlueBubblesChannel {
         };
 
         if self.is_sender_ignored(&sender) {
-            tracing::debug!("BlueBubbles: ignoring message from ignored sender: {sender}");
+            tracing::debug!("BlueBubbles: ignoring message from ignored sender");
             return messages;
         }
 
         if !self.is_sender_allowed(&sender) {
             tracing::warn!(
-                "BlueBubbles: ignoring message from unauthorized sender: {sender}. \
-                Add to channels.bluebubbles.allowed_senders in config.toml, \
+                "BlueBubbles: ignoring message from unauthorized sender. \
+                Add the sender to channels.bluebubbles.allowed_senders in config.toml, \
                 or use \"*\" to allow all senders."
             );
             return messages;
