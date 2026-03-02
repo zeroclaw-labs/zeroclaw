@@ -297,8 +297,14 @@ impl BlueBubblesChannel {
         group_configs: HashMap<String, BlueBubblesGroupConfig>,
     ) -> Self {
         if require_mention_in_groups {
-            let has_keyword =
-                mention_keyword.is_some() || self.allowed_senders.iter().any(|s| s.as_str() != "*");
+            // A blank mention_keyword ("" or "  ") is treated as absent — it would match
+            // every message after trim and silently disable gating, which is surprising.
+            let effective_keyword = mention_keyword
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty());
+            let has_keyword = effective_keyword.is_some()
+                || self.allowed_senders.iter().any(|s| s.as_str() != "*");
             if !has_keyword {
                 tracing::warn!(
                     "BlueBubbles: require_mention_in_groups is true but no \
@@ -307,8 +313,11 @@ impl BlueBubblesChannel {
                 );
             }
         }
-        // Pre-lowercase the keyword to avoid allocation on every inbound message.
-        self.mention_keyword = mention_keyword.map(|kw| kw.to_ascii_lowercase());
+        // Pre-lowercase the (trimmed) keyword to avoid allocation on every inbound message.
+        // An empty or whitespace-only mention_keyword is discarded (treated as absent).
+        self.mention_keyword = mention_keyword
+            .map(|kw| kw.trim().to_ascii_lowercase())
+            .filter(|kw| !kw.is_empty());
         self.require_mention_in_groups = require_mention_in_groups;
         self.group_configs = group_configs;
         self
@@ -917,6 +926,15 @@ impl BlueBubblesChannel {
             return self.parse_webhook_payload(payload);
         }
 
+        // Apply mention gate before starting the typing indicator.  Voice notes
+        // can never contain a keyword in their raw bytes; check using an empty
+        // string as the text so the gate acts solely on the group-policy flag /
+        // per-group override.  If the gate fires here the message will be
+        // silently dropped and no typing side-effect will reach the user.
+        if self.mention_required_but_missing(&chat_guid_for_policy, "") {
+            return self.parse_webhook_payload(payload);
+        }
+
         // Start typing indicator before whisper runs — transcription can take >30 s
         // and without this the user sees no feedback during the slow CPU phase.
         // Capture guid once so we can stop typing on all exit paths.
@@ -1049,6 +1067,12 @@ impl BlueBubblesChannel {
         if !allowed {
             return vec![];
         }
+
+        // Tapbacks intentionally bypass mention gating: reactions are contextual
+        // actions on existing messages and carry no user-typed text.  A mention
+        // keyword can never appear inside a tapback, so silently dropping them
+        // would break the agent's awareness of reactions in gated groups.
+        // DM/group policy (above) remains enforced.
 
         // If the reacted-to message was from the bot, include a quoted excerpt.
         // `lookup_reply_context` returns None for unknown or empty GUIDs, so no
