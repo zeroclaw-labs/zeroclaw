@@ -3320,7 +3320,7 @@ providers = ["demo-plugin-provider"]
     fn sanitize_truncates_long_error() {
         let long = "a".repeat(400);
         let result = sanitize_api_error(&long);
-        assert!(result.len() <= 203);
+        assert!(result.len() <= MAX_API_ERROR_CHARS + 3);
         assert!(result.ends_with("..."));
     }
 
@@ -3329,7 +3329,7 @@ providers = ["demo-plugin-provider"]
         let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
         let result = sanitize_api_error(&input);
         assert!(!result.contains("sk-abcdef123456"));
-        assert!(result.len() <= 203);
+        assert!(result.len() <= MAX_API_ERROR_CHARS + 3);
     }
 
     #[test]
@@ -3644,21 +3644,5 @@ providers = ["demo-plugin-provider"]
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);
         assert!(provider.is_ok());
-    }
-
-    #[test]
-    fn sanitize_truncates_long_error() {
-        let long = "a".repeat(400);
-        let result = sanitize_api_error(&long);
-        assert!(result.len() <= MAX_API_ERROR_CHARS + 3);
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn sanitize_truncates_after_scrub() {
-        let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
-        let result = sanitize_api_error(&input);
-        assert!(!result.contains("sk-abcdef123456"));
-        assert!(result.len() <= MAX_API_ERROR_CHARS + 3);
     }
 }
