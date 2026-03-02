@@ -1926,8 +1926,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
                         if pending.profile != profile {
                             bail!(
-                                "{} pending={}, requested={}",
-                                PROFILE_MISMATCH_PREFIX,
+                                "Pending login profile mismatch: pending={}, requested={}",
                                 pending.profile,
                                 profile
                             );
@@ -1975,7 +1974,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     .await;
 
                     if let Err(e) = result {
-                        if e.to_string().starts_with(PROFILE_MISMATCH_PREFIX) {
+                        if e.to_string().starts_with("Pending login profile mismatch") {
                             clear_pending_oauth_login(config, "email");
                             eprintln!("Error: {}", e);
                             eprintln!(
