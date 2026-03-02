@@ -553,6 +553,118 @@ pub async fn handle_api_cost(
     }
 }
 
+// ── Billing / Credits ────────────────────────────────────────────
+
+/// GET /api/credits/balance — current credit balance for the user
+pub async fn handle_api_credits_balance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref pm) = state.payment_manager else {
+        return Json(serde_json::json!({"balance": 0, "enabled": false})).into_response();
+    };
+
+    // Use device ID as user identifier for local gateway
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+
+    let pm_guard = pm.lock();
+    match pm_guard.get_balance(&user_id) {
+        Ok(balance) => {
+            Json(serde_json::json!({"balance": balance, "enabled": true})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get balance: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/credits/packages — available credit packages
+pub async fn handle_api_credits_packages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let packages: Vec<serde_json::Value> = crate::billing::payment::CREDIT_PACKAGES
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "price_krw": p.price_krw,
+                "credits": p.credits,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({"packages": packages})).into_response()
+}
+
+/// POST /api/credits/purchase — initiate credit purchase
+pub async fn handle_api_credits_purchase(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment system not configured"})),
+        )
+            .into_response();
+    };
+
+    let package_id = body["package_id"].as_str().unwrap_or("").to_string();
+
+    if package_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing package_id"})),
+        )
+            .into_response();
+    }
+
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+
+    let pm_guard = pm.lock();
+    match pm_guard.initiate_payment(&user_id, &package_id) {
+        Ok((record, kakao_req)) => Json(serde_json::json!({
+            "status": "pending",
+            "transaction_id": record.transaction_id,
+            "package_id": record.package_id,
+            "amount_krw": record.amount_krw,
+            "credits": record.credits,
+            "payment_url": kakao_req.approval_url,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Payment initiation failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/cli-tools — discovered CLI tools
 pub async fn handle_api_cli_tools(
     State(state): State<AppState>,

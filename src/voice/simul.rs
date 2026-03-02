@@ -315,22 +315,14 @@ impl SegmentationEngine {
                     let end = i + c.len_utf8();
                     // Skip trailing space if present
                     let after = &text[end..];
-                    let boundary = if after.starts_with(' ') {
-                        end + 1
-                    } else {
-                        end
-                    };
+                    let boundary = if after.starts_with(' ') { end + 1 } else { end };
                     best = Some(boundary);
                 }
                 // Comma / clause break (weaker boundary)
                 ',' | '、' | ';' | '；' | ':' | '：' => {
                     let end = i + c.len_utf8();
                     let after = &text[end..];
-                    let boundary = if after.starts_with(' ') {
-                        end + 1
-                    } else {
-                        end
-                    };
+                    let boundary = if after.starts_with(' ') { end + 1 } else { end };
                     // Only use comma boundary if we have enough text after last commit
                     if end >= self.config.min_commit_chars {
                         best = Some(boundary);

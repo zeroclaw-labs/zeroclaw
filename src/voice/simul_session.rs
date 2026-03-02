@@ -133,13 +133,8 @@ impl SimulSession {
         let event_tx_events = event_tx.clone();
         let sid_events = session_id_clone.clone();
         tokio::spawn(async move {
-            Self::event_processor(
-                live_for_events,
-                seg_for_events,
-                event_tx_events,
-                sid_events,
-            )
-            .await;
+            Self::event_processor(live_for_events, seg_for_events, event_tx_events, sid_events)
+                .await;
         });
 
         // Spawn tick timer for silence-based commits
@@ -208,10 +203,7 @@ impl SimulSession {
     // ── Internal: audio forwarder ─────────────────────────────────
 
     /// Receives PCM audio from the client and forwards to Gemini Live.
-    async fn audio_forwarder(
-        mut audio_rx: mpsc::Receiver<Vec<u8>>,
-        live: Arc<GeminiLiveSession>,
-    ) {
+    async fn audio_forwarder(mut audio_rx: mpsc::Receiver<Vec<u8>>, live: Arc<GeminiLiveSession>) {
         while let Some(pcm) = audio_rx.recv().await {
             if let Err(e) = live.send_audio(&pcm).await {
                 tracing::warn!(error = %e, "Failed to forward audio to Gemini Live");

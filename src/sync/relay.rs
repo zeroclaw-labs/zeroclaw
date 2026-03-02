@@ -283,12 +283,10 @@ impl RelayClient {
         let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
 
         // Take the outbound receiver (only the first connect() call gets it)
-        let mut outbound_rx = self
-            .outbound_rx
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("RelayClient already connected (outbound_rx taken)"))?;
+        let mut outbound_rx =
+            self.outbound_rx.lock().await.take().ok_or_else(|| {
+                anyhow::anyhow!("RelayClient already connected (outbound_rx taken)")
+            })?;
 
         // Clone the inbound sender for the receive task
         let inbound_tx = self.inbound_tx.clone();

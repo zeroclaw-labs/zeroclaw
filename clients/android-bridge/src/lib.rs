@@ -146,9 +146,7 @@ impl ZeroClawController {
             .clone();
 
         // Check if gateway is already running
-        let is_running = runtime().block_on(async {
-            check_gateway_health(&gateway_url).await
-        });
+        let is_running = runtime().block_on(async { check_gateway_health(&gateway_url).await });
 
         if is_running {
             let mut status = self.status.lock().map_err(|_| ZeroClawError::LockError)?;
@@ -267,9 +265,7 @@ impl ZeroClawController {
             .unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
 
         // Send to local gateway via HTTP
-        let result = runtime().block_on(async {
-            send_to_gateway(&gateway_url, &content).await
-        });
+        let result = runtime().block_on(async { send_to_gateway(&gateway_url, &content).await });
 
         // Restore status
         if let Ok(mut status) = self.status.lock() {
@@ -304,10 +300,7 @@ impl ZeroClawController {
 
     /// Get conversation history
     pub fn get_messages(&self) -> Vec<ChatMessage> {
-        self.messages
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default()
+        self.messages.lock().map(|m| m.clone()).unwrap_or_default()
     }
 
     /// Clear conversation history
@@ -443,10 +436,7 @@ fn find_zeroclaw_binary(data_dir: &str) -> Option<String> {
     }
 
     // Also check PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("zeroclaw")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("zeroclaw").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {

@@ -46,11 +46,7 @@ pub async fn handle_ws_sync(
         let token =
             extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
         if !state.pairing.is_authenticated(&token) {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized",
-            )
-                .into_response();
+            return (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
 
@@ -74,8 +70,8 @@ async fn handle_sync_socket(
     socket: WebSocket,
     coordinator: std::sync::Arc<crate::sync::SyncCoordinator>,
 ) {
+    use futures_util::{SinkExt, StreamExt};
     let (mut sender, mut receiver) = socket.split();
-    use futures_util::SinkExt;
 
     tracing::info!(
         device_id = %coordinator.device_id(),
@@ -105,8 +101,7 @@ async fn handle_sync_socket(
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            _ => continue,
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => continue,
         };
 
         if text.is_empty() {
@@ -559,7 +554,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
         }));
 
         // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
-        match super::run_gateway_chat_with_tools(&state, &content, Some(&ws_session_id)).await {
+        match Box::pin(super::run_gateway_chat_with_tools(
+            &state,
+            &content,
+            Some(&ws_session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 let leak_guard_cfg = { state.config.lock().security.outbound_leak_guard.clone() };
                 let safe_response = finalize_ws_response(
@@ -696,13 +697,13 @@ pub async fn handle_ws_voice(
 /// Server -> Client: {"type":"session_ended","sessionId":"...","totalSegments":5}
 /// ```
 async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
-    use base64::Engine;
     use crate::voice::{
         events::{ClientMessage, ServerMessage},
+        pipeline::{Domain, Formality, LanguageCode},
         simul::SegmentationConfig,
         simul_session::{SimulSession, SimulSessionConfig},
-        pipeline::{Domain, Formality, LanguageCode},
     };
+    use base64::Engine;
 
     // Read voice config for session defaults
     let voice_config = {
@@ -731,7 +732,9 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     message: format!("Invalid message: {e}"),
                 };
                 let _ = socket
-                    .send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&err).unwrap_or_default().into(),
+                    ))
                     .await;
                 continue;
             }
@@ -756,10 +759,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                 }
 
                 // Resolve API key
-                let api_key = voice_config
-                    .gemini_api_key
-                    .clone()
-                    .unwrap_or_default();
+                let api_key = voice_config.gemini_api_key.clone().unwrap_or_default();
                 if api_key.is_empty() {
                     let err = ServerMessage::Error {
                         session_id: session_id.clone(),
@@ -767,22 +767,22 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                         message: "Gemini API key not configured".into(),
                     };
                     let _ = socket
-                        .send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into()))
+                        .send(Message::Text(
+                            serde_json::to_string(&err).unwrap_or_default().into(),
+                        ))
                         .await;
                     continue;
                 }
 
                 // Parse language codes
-                let src_lang = LanguageCode::from_str_code(&source_lang)
-                    .unwrap_or_else(|| {
-                        LanguageCode::from_str_code(&voice_config.default_source_language)
-                            .unwrap_or(LanguageCode::Ko)
-                    });
-                let tgt_lang = LanguageCode::from_str_code(&target_lang)
-                    .unwrap_or_else(|| {
-                        LanguageCode::from_str_code(&voice_config.default_target_language)
-                            .unwrap_or(LanguageCode::En)
-                    });
+                let src_lang = LanguageCode::from_str_code(&source_lang).unwrap_or_else(|| {
+                    LanguageCode::from_str_code(&voice_config.default_source_language)
+                        .unwrap_or(LanguageCode::Ko)
+                });
+                let tgt_lang = LanguageCode::from_str_code(&target_lang).unwrap_or_else(|| {
+                    LanguageCode::from_str_code(&voice_config.default_target_language)
+                        .unwrap_or(LanguageCode::En)
+                });
 
                 // Parse optional domain/formality
                 let domain_val = domain
@@ -869,7 +869,12 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                         // without restructuring. Let's restructure the loop.
 
                         // Break into the voice session event loop
-                        voice_session_loop(&mut socket, active_session.as_ref().unwrap(), &mut ws_rx).await;
+                        voice_session_loop(
+                            &mut socket,
+                            active_session.as_ref().unwrap(),
+                            &mut ws_rx,
+                        )
+                        .await;
 
                         // Session ended — cleanup
                         if let Some(session) = active_session.take() {
@@ -888,7 +893,9 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                             message: format!("Failed to start session: {e}"),
                         };
                         let _ = socket
-                            .send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into()))
+                            .send(Message::Text(
+                                serde_json::to_string(&err).unwrap_or_default().into(),
+                            ))
                             .await;
                     }
                 }
@@ -896,7 +903,8 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
 
             ClientMessage::AudioChunk { pcm16le, .. } => {
                 if let Some(ref session) = active_session {
-                    if let Ok(pcm_data) = base64::engine::general_purpose::STANDARD.decode(&pcm16le) {
+                    if let Ok(pcm_data) = base64::engine::general_purpose::STANDARD.decode(&pcm16le)
+                    {
                         if let Err(e) = session.send_audio(pcm_data).await {
                             tracing::warn!(error = %e, "Failed to send audio to session");
                         }
@@ -938,8 +946,8 @@ async fn voice_session_loop(
     session: &crate::voice::simul_session::SimulSession,
     relay_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) {
-    use base64::Engine;
     use crate::voice::events::{ClientMessage, ServerMessage};
+    use base64::Engine;
 
     loop {
         tokio::select! {

@@ -535,13 +535,20 @@ async fn is_gateway_reachable(url: &str) -> bool {
     client.get(format!("{url}/health")).send().await.is_ok()
 }
 
-/// Launch the bundled ZeroClaw binary as a sidecar process.
+/// Maximum number of automatic restart attempts for the sidecar process.
+const MAX_SIDECAR_RETRIES: u32 = 3;
+
+/// Maximum time to wait for the gateway health endpoint (30 seconds).
+const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
+
+/// Launch the bundled runtime as a sidecar process.
 ///
-/// MoA = ZeroClaw launcher. This is the core of what MoA does:
-/// 1. Check if ZeroClaw is already running (user may have started it manually)
+/// MoA treats its backend runtime as an internal implementation detail:
+/// 1. Check if a gateway is already running (development/manual start)
 /// 2. If not, launch the bundled sidecar binary with `gateway` command
-/// 3. Wait until the gateway health endpoint responds
-/// 4. Mark gateway_running = true
+/// 3. Wait until the gateway health endpoint responds (30s timeout)
+/// 4. On failure, auto-retry up to 3 times before marking as failed
+/// 5. Mark gateway_running = true on success
 fn spawn_zeroclaw_gateway(app: &tauri::App) {
     let gateway_url = format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}");
     let state = app.state::<AppState>();
@@ -553,69 +560,58 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
     tauri::async_runtime::spawn(async move {
         // Step 1: Check if gateway is already running
         if is_gateway_reachable(&gateway_url).await {
-            eprintln!("[MoA] ZeroClaw gateway already running at {gateway_url}");
+            eprintln!("[MoA] Gateway already running at {gateway_url}");
             gateway_running.store(true, Ordering::SeqCst);
             return;
         }
 
-        // Step 2: Launch ZeroClaw sidecar
-        let spawn_result = match sidecar_result {
-            Ok(sidecar) => sidecar
-                .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
-                .spawn(),
-            Err(_) => {
-                eprintln!("[MoA] Sidecar binary not found. Trying system zeroclaw...");
-                // Fall back: try to find zeroclaw on system PATH.
-                // This supports development mode where zeroclaw is `cargo install`-ed.
-                match std::process::Command::new("zeroclaw")
+        // Step 2: Launch with auto-retry (up to MAX_SIDECAR_RETRIES attempts)
+        for attempt in 1..=MAX_SIDECAR_RETRIES {
+            eprintln!("[MoA] Starting backend service (attempt {attempt}/{MAX_SIDECAR_RETRIES})...");
+
+            let launched = match &sidecar_result {
+                Ok(sidecar) => sidecar
                     .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
                     .spawn()
-                {
-                    Ok(_child) => {
-                        eprintln!("[MoA] Launched zeroclaw from system PATH");
-                        // Wait for gateway readiness
-                        for i in 0..30 {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            if is_gateway_reachable(&gateway_url).await {
-                                eprintln!("[MoA] ZeroClaw gateway ready after {}ms", (i + 1) * 500);
-                                gateway_running.store(true, Ordering::SeqCst);
-                                return;
-                            }
-                        }
-                        eprintln!("[MoA] Warning: ZeroClaw launched but gateway not responding");
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("[MoA] Failed to find zeroclaw binary: {e}");
-                        eprintln!("[MoA] Please install ZeroClaw: cargo install --path .");
-                        return;
-                    }
+                    .is_ok(),
+                Err(_) => {
+                    // Fall back: try to find binary on system PATH (development mode)
+                    std::process::Command::new("zeroclaw")
+                        .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .is_ok()
+                }
+            };
+
+            if !launched {
+                eprintln!("[MoA] Failed to start backend service (attempt {attempt})");
+                if attempt < MAX_SIDECAR_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                continue;
+            }
+
+            // Step 3: Wait for gateway health (up to GATEWAY_READY_TIMEOUT_MS)
+            let poll_interval_ms = 500;
+            let max_polls = GATEWAY_READY_TIMEOUT_MS / poll_interval_ms;
+            for i in 0..max_polls {
+                tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                if is_gateway_reachable(&gateway_url).await {
+                    eprintln!("[MoA] Backend service ready after {}ms", (i + 1) * poll_interval_ms);
+                    gateway_running.store(true, Ordering::SeqCst);
+                    return;
                 }
             }
-        };
 
-        match spawn_result {
-            Ok((_rx, _child)) => {
-                eprintln!("[MoA] ZeroClaw sidecar launched, waiting for gateway...");
-
-                // Step 3: Wait for gateway health (up to 15 seconds)
-                for i in 0..30 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if is_gateway_reachable(&gateway_url).await {
-                        eprintln!("[MoA] ZeroClaw gateway ready after {}ms", (i + 1) * 500);
-                        gateway_running.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                }
-                eprintln!("[MoA] Warning: ZeroClaw sidecar started but gateway not responding after 15s");
-            }
-            Err(e) => {
-                eprintln!("[MoA] Failed to launch ZeroClaw sidecar: {e}");
-                eprintln!("[MoA] Start ZeroClaw manually: zeroclaw gateway");
+            eprintln!("[MoA] Backend service not responding after {GATEWAY_READY_TIMEOUT_MS}ms (attempt {attempt})");
+            if attempt < MAX_SIDECAR_RETRIES {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
+
+        eprintln!("[MoA] Error: Backend service failed to start after {MAX_SIDECAR_RETRIES} attempts");
     });
 }
 

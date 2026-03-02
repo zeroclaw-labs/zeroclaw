@@ -55,8 +55,11 @@ impl GeminiReviewer {
             for r in &ctx.prior_reviews {
                 s.push_str(&format!(
                     "\n### {} ({}): {}\n{}\n",
-                    r.reviewer_id, r.verdict.label(), r.summary,
-                    r.findings.iter()
+                    r.reviewer_id,
+                    r.verdict.label(),
+                    r.summary,
+                    r.findings
+                        .iter()
                         .map(|f| format!("- [{}] {}: {}", f.severity, f.category, f.description))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -153,7 +156,11 @@ impl GeminiFinding {
             },
             file_path: self.file_path,
             line_range: self.line_range.and_then(|v| {
-                if v.len() >= 2 { Some((v[0], v[1])) } else { None }
+                if v.len() >= 2 {
+                    Some((v[0], v[1]))
+                } else {
+                    None
+                }
             }),
             category: self.category,
             description: self.description,
@@ -189,7 +196,8 @@ impl CodeReviewer for GeminiReviewer {
         });
 
         let url = format!("{}?key={}", self.endpoint, self.api_key);
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .json(&payload)
@@ -209,8 +217,8 @@ impl CodeReviewer for GeminiReviewer {
             .unwrap_or("{}");
 
         // Parse the JSON response
-        let parsed: GeminiReviewResponse = serde_json::from_str(text)
-            .unwrap_or_else(|_| GeminiReviewResponse {
+        let parsed: GeminiReviewResponse =
+            serde_json::from_str(text).unwrap_or_else(|_| GeminiReviewResponse {
                 summary: format!("Raw review: {}", &text[..text.len().min(200)]),
                 verdict: "comment".into(),
                 architecture_alignment: None,
@@ -228,7 +236,11 @@ impl CodeReviewer for GeminiReviewer {
             model: self.model.clone(),
             summary: parsed.summary,
             verdict,
-            findings: parsed.findings.into_iter().map(GeminiFinding::into_review_finding).collect(),
+            findings: parsed
+                .findings
+                .into_iter()
+                .map(GeminiFinding::into_review_finding)
+                .collect(),
             architecture_alignment: parsed.architecture_alignment,
             duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })
@@ -272,7 +284,10 @@ impl ClaudeReviewer {
             for r in &ctx.prior_reviews {
                 s.push_str(&format!(
                     "\n### {} ({}) — {}: {}\n",
-                    r.reviewer_id, r.model, r.verdict.label(), r.summary,
+                    r.reviewer_id,
+                    r.model,
+                    r.verdict.label(),
+                    r.summary,
                 ));
                 for f in &r.findings {
                     s.push_str(&format!(
@@ -365,7 +380,8 @@ impl CodeReviewer for ClaudeReviewer {
             }]
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -382,15 +398,13 @@ impl CodeReviewer for ClaudeReviewer {
         }
 
         let body: serde_json::Value = resp.json().await?;
-        let text = body["content"][0]["text"]
-            .as_str()
-            .unwrap_or("{}");
+        let text = body["content"][0]["text"].as_str().unwrap_or("{}");
 
         // Extract JSON from potential markdown code block
         let json_str = extract_json_block(text);
 
-        let parsed: GeminiReviewResponse = serde_json::from_str(json_str)
-            .unwrap_or_else(|_| GeminiReviewResponse {
+        let parsed: GeminiReviewResponse =
+            serde_json::from_str(json_str).unwrap_or_else(|_| GeminiReviewResponse {
                 summary: format!("Raw review: {}", &text[..text.len().min(200)]),
                 verdict: "comment".into(),
                 architecture_alignment: None,
@@ -408,7 +422,11 @@ impl CodeReviewer for ClaudeReviewer {
             model: self.model.clone(),
             summary: parsed.summary,
             verdict,
-            findings: parsed.findings.into_iter().map(GeminiFinding::into_review_finding).collect(),
+            findings: parsed
+                .findings
+                .into_iter()
+                .map(GeminiFinding::into_review_finding)
+                .collect(),
             architecture_alignment: parsed.architecture_alignment,
             duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })

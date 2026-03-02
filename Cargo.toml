@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = [".", "crates/robot-kit", "clients/android-bridge", "clients/ios-bridge"]
 resolver = "2"
 
 [package]

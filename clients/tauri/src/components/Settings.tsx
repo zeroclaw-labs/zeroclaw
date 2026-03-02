@@ -50,10 +50,18 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     }
     if (isLoggedIn) {
       apiClient.getDevices().then(setDevices).catch(() => {});
-      // Load credit balance
-      apiClient.getCreditBalance?.()
-        .then((b: number) => setCreditBalance(b))
-        .catch(() => setCreditBalance(null));
+      // Load credit balance (try local gateway first, then relay)
+      fetch(`${apiClient.getServerUrl()}/api/credits/balance`, {
+        headers: { Authorization: `Bearer ${apiClient.getToken?.() || ""}` },
+      })
+        .then((r) => r.ok ? r.json() : null)
+        .then((d) => setCreditBalance(d?.balance ?? null))
+        .catch(() => {
+          // Fallback to relay server
+          apiClient.getCreditBalance?.()
+            .then((b: number) => setCreditBalance(b))
+            .catch(() => setCreditBalance(null));
+        });
     }
   }, [inTauri, isLoggedIn]);
 
@@ -389,9 +397,29 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                       key={pkg.id}
                       className="settings-btn settings-btn-secondary"
                       style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "8px 4px", fontSize: 12 }}
-                      onClick={() => {
-                        // TODO: Wire to Kakao Pay payment flow
-                        setMessage({ type: "success", text: `${pkg.name} - ${locale === "ko" ? "\uACB0\uC81C \uAE30\uB2A5 \uC900\uBE44 \uC911" : "Payment coming soon"}` });
+                      onClick={async () => {
+                        try {
+                          const res = await fetch(`${apiClient.getServerUrl()}/api/credits/purchase`, {
+                            method: "POST",
+                            headers: {
+                              "Content-Type": "application/json",
+                              "Authorization": `Bearer ${apiClient.getToken?.() || ""}`,
+                            },
+                            body: JSON.stringify({ package_id: pkg.id }),
+                          });
+                          if (!res.ok) {
+                            const err = await res.text().catch(() => "");
+                            setMessage({ type: "error", text: err || (locale === "ko" ? "\uACB0\uC81C \uC2E4\uD328" : "Payment failed") });
+                          } else {
+                            const data = await res.json();
+                            if (data.payment_url) {
+                              window.open(data.payment_url, "_blank");
+                            }
+                            setMessage({ type: "success", text: locale === "ko" ? "\uACB0\uC81C \uC694\uCCAD \uC644\uB8CC" : "Payment initiated" });
+                          }
+                        } catch {
+                          setMessage({ type: "success", text: `${pkg.name} - ${locale === "ko" ? "\uACB0\uC81C \uAE30\uB2A5 \uC900\uBE44 \uC911" : "Payment coming soon"}` });
+                        }
                         clearMessage();
                       }}
                     >

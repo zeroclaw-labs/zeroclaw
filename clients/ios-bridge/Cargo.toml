@@ -1,0 +1,37 @@
+[package]
+name = "zeroclaw-ios-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "iOS C-FFI bridge for ZeroClaw (static library)"
+
+[lib]
+crate-type = ["staticlib"]
+name = "zeroclaw_ios"
+
+[dependencies]
+# Note: zeroclaw dep commented out until we integrate properly
+# zeroclaw = { path = "../.." }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
+anyhow = "1"
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = "1"
+# HTTP client for gateway communication
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Minimal tracing for mobile
+tracing = { version = "0.1", default-features = false }
+
+# ============================================
+# BINARY SIZE OPTIMIZATION
+# ============================================
+# Target: <5MB static library for ARM64
+
+[profile.release]
+opt-level = "z"          # Smallest binary
+lto = true               # Link-time optimization
+codegen-units = 1        # Better optimization
+panic = "abort"          # No unwinding = smaller binary
+strip = true             # Strip symbols
+
+[profile.release.package."*"]
+opt-level = "z"

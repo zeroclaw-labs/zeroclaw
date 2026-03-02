@@ -14,6 +14,7 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
+use crate::billing::PaymentManager;
 use crate::channels::{
     BlueBubblesChannel, Channel, GitHubChannel, LinqChannel, NextcloudTalkChannel, QQChannel,
     SendMessage, WatiChannel, WhatsAppChannel,
@@ -354,6 +355,12 @@ pub struct AppState {
     /// Sync coordinator for cross-device memory synchronization (Layer 2 + 3).
     /// Present only when config.sync.enabled == true.
     pub sync_coordinator: Option<Arc<crate::sync::SyncCoordinator>>,
+    /// Relay client for cross-device delta exchange (Layer 1 TTL relay).
+    /// Present only when config.sync.enabled == true AND config.sync.relay_url is set.
+    pub relay_client: Option<Arc<crate::sync::RelayClient>>,
+    /// Payment manager for credit-based billing (Kakao Pay).
+    /// Wrapped in Mutex because rusqlite::Connection is not Sync.
+    pub payment_manager: Option<Arc<Mutex<PaymentManager>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -415,10 +422,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 &config.workspace_dir,
                 config.api_key.as_deref(),
             )?;
-            let engine = crate::memory::sync::SyncEngine::new(
-                &config.workspace_dir,
-                true,
-            )?;
+            let engine = crate::memory::sync::SyncEngine::new(&config.workspace_dir, true)?;
             let engine = Arc::new(parking_lot::Mutex::new(engine));
             let synced = Arc::new(crate::memory::synced::SyncedMemory::new(
                 Arc::from(base),
@@ -428,10 +432,58 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 synced.clone(),
                 config.sync.batch_size,
             ));
-            tracing::info!(
-                device_id = %synced.device_id(),
-                "Gateway memory initialized with sync enabled"
-            );
+            // Wire up RelayClient for cross-device sync via external relay server
+            if let Some(ref relay_url) = config.sync.relay_url {
+                let device_id = synced.device_id();
+                let relay = Arc::new(crate::sync::RelayClient::new(
+                    relay_url.clone(),
+                    device_id.clone(),
+                    device_id.clone(), // user_id defaults to device_id
+                ));
+                let relay_for_task = relay.clone();
+                let coord_for_task = coordinator.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = relay_for_task.connect().await {
+                        tracing::warn!("Relay connection failed (will retry on next message): {e}");
+                        return;
+                    }
+                    tracing::info!("Relay client connected, starting inbound delta loop");
+                    // Receive loop: relay entries → coordinator
+                    while let Some(entry) = relay_for_task.recv().await {
+                        let responses = coord_for_task
+                            .handle_message(
+                                &serde_json::json!({
+                                    "RelayNotify": {
+                                        "from_device_id": entry.sender_device_id,
+                                        "encrypted_payload": entry.encrypted_payload,
+                                        "nonce": entry.nonce,
+                                    }
+                                })
+                                .to_string(),
+                            )
+                            .await;
+                        // Forward any response messages back through relay
+                        for resp in responses {
+                            if let Ok(re) =
+                                serde_json::from_str::<crate::sync::relay::RelayEntry>(&resp)
+                            {
+                                let _ = relay_for_task.store(re).await;
+                            }
+                        }
+                    }
+                    tracing::info!("Relay inbound loop ended");
+                });
+                tracing::info!(
+                    device_id = %synced.device_id(),
+                    relay_url = %relay_url,
+                    "Gateway memory initialized with sync + relay enabled"
+                );
+            } else {
+                tracing::info!(
+                    device_id = %synced.device_id(),
+                    "Gateway memory initialized with sync enabled (no relay)"
+                );
+            }
             (synced as Arc<dyn Memory>, Some(coordinator))
         } else {
             let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
@@ -489,6 +541,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     } else {
         None
+    };
+
+    // Payment manager for credit-based billing
+    let payment_manager = {
+        let kakao_admin_key = std::env::var("KAKAO_ADMIN_KEY").ok();
+        let callback_base = format!("http://{}:{}", config.gateway.host, config.gateway.port);
+        match PaymentManager::new(
+            &config.workspace_dir,
+            kakao_admin_key.clone(),
+            &callback_base,
+            kakao_admin_key.is_some(),
+        ) {
+            Ok(pm) => Some(Arc::new(Mutex::new(pm))),
+            Err(e) => {
+                tracing::warn!("Failed to initialize payment manager: {e}");
+                None
+            }
+        }
     };
 
     // SSE broadcast channel for real-time events
@@ -798,6 +868,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
         voice_sessions,
         sync_coordinator,
+        relay_client: None, // RelayClient runs as background task, not stored in AppState
+        payment_manager,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -846,7 +918,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
-        .route("/api/config/api-key", put(api::handle_api_config_api_key_put))
+        .route(
+            "/api/config/api-key",
+            put(api::handle_api_config_api_key_put),
+        )
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
@@ -865,6 +940,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             delete(api::handle_api_pairing_device_revoke),
         )
         .route("/api/cost", get(api::handle_api_cost))
+        // ── Billing / credits ──
+        .route("/api/credits/balance", get(api::handle_api_credits_balance))
+        .route(
+            "/api/credits/packages",
+            get(api::handle_api_credits_packages),
+        )
+        .route(
+            "/api/credits/purchase",
+            post(api::handle_api_credits_purchase),
+        )
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/node-control", post(handle_node_control))

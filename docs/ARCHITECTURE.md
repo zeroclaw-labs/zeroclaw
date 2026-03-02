@@ -890,7 +890,7 @@ These are **mandatory constraints**, not guidelines:
 | **Voice/Interp** | Gemini 2.5 Flash Native Audio (Live API) |
 | **Coding review** | Claude Opus 4.6 + Gemini 3.1 Pro |
 | **Relay server** | Railway (WebSocket relay, no persistent storage) |
-| **Encryption** | ChaCha20-Poly1305, HKDF key derivation |
+| **Encryption** | AES-256-GCM (vault, sync), ChaCha20-Poly1305 (secrets), HKDF key derivation |
 | **CI** | GitHub Actions |
 
 ---
@@ -913,26 +913,35 @@ These are **mandatory constraints**, not guidelines:
 - [x] Credit-based billing system
 - [x] Architecture documentation (this document)
 
+### Recently Completed (2026-03-02)
+
+- [x] KakaoTalk channel implementation (550+ lines, full send/listen/webhook)
+- [x] E2E encrypted memory sync (patent implementation — SyncCoordinator + SyncEngine)
+- [x] RelayClient wire-up to gateway (cross-device delta exchange via WebSocket)
+- [x] Web chat WebSocket streaming (client + server /ws/chat endpoint)
+- [x] WebSocket gateway endpoint for voice interpretation (/ws/voice)
+- [x] Coding review refactored to use ReviewPipeline (structured consensus)
+- [x] Tauri sidecar auto-retry UX (3 attempts, 30s timeout, transparent to user)
+
 ### In Progress / Planned
 
-- [ ] KakaoTalk channel implementation
-- [ ] E2E encrypted memory sync (patent implementation)
-- [ ] Railway relay server setup (5-minute TTL buffer)
+- [ ] Railway relay server deployment (5-minute TTL buffer)
 - [ ] Offline reconciliation / peer-to-peer full sync
-- [ ] Tauri desktop app with bundled ZeroClaw sidecar (Windows, macOS, Linux)
-- [ ] Tauri mobile app with bundled ZeroClaw runtime (iOS, Android)
+- [ ] Tauri desktop app with bundled sidecar (Windows, macOS, Linux)
+- [ ] Tauri mobile app with bundled runtime (iOS, Android)
 - [ ] One-click installer with first-run GUI setup wizard
 - [ ] Unified auto-updater (Tauri updater — frontend + sidecar atomically)
-- [ ] Web chat interface for remote MoA access
 - [ ] User settings page (API key input, device management)
 - [ ] Operator API key fallback with 2x credit billing
-- [ ] WebSocket gateway endpoint for voice interpretation
+- [ ] Credit balance display in app UI
 - [ ] Gatekeeper SLM integration (Ollama-based local inference)
 - [ ] Channel-specific voice features (KakaoTalk, Telegram, Discord)
 - [ ] Multi-user simultaneous interpretation (conference mode)
 - [ ] Coding sandbox integration with review pipeline
 - [ ] Automated fix-apply from review findings
 - [ ] Image/Video/Music generation tool integrations
+- [ ] iOS native bridge (Swift-Rust FFI)
+- [ ] Android NDK sidecar build
 
 ---
 

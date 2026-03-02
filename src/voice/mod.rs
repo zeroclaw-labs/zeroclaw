@@ -49,6 +49,8 @@ pub enum VoiceEvent {
 }
 
 #[allow(unused_imports)]
+pub use events::{ClientMessage, InterpretationMode, ServerMessage};
+#[allow(unused_imports)]
 pub use gemini_live::{ConnectionState, GeminiLiveSession, VadConfig, VadSensitivity};
 #[allow(unused_imports)]
 pub use openai_realtime::OpenAiRealtimeSession;
@@ -57,8 +59,6 @@ pub use pipeline::{
     Domain, Formality, InterpreterConfig, InterpreterSession, InterpreterStats, InterpreterStatus,
     LanguageCode, VoiceProvider, VoiceProviderKind, VoiceSessionManager,
 };
-#[allow(unused_imports)]
-pub use events::{ClientMessage, InterpretationMode, ServerMessage};
 #[allow(unused_imports)]
 pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
 #[allow(unused_imports)]

@@ -244,7 +244,6 @@ mod tests {
     use crate::plugins::manifest::PluginManifest;
     use crate::plugins::traits::{Plugin, PluginApi};
 
-
     struct OkPlugin {
         manifest: PluginManifest,
     }

@@ -1,4 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::coding::pipeline::{PipelineConfig, ReviewPipeline};
+use crate::coding::traits::ReviewContext;
 use crate::config::schema::{CostEnforcementMode, ModelPricing};
 use crate::config::{Config, ProgressMode};
 use crate::cost::{BudgetCheck, CostTracker, UsagePeriod};
@@ -705,10 +707,7 @@ const CODING_MEMORY_TOOLS: &[&str] = &[
 ///
 /// This scans assistant messages for tool_call JSON blocks and corresponding
 /// tool_result XML blocks in the history, then saves coding-related ones.
-async fn save_coding_memory_from_history(
-    new_messages: &[ChatMessage],
-    mem: &Arc<dyn Memory>,
-) {
+async fn save_coding_memory_from_history(new_messages: &[ChatMessage], mem: &Arc<dyn Memory>) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Collect tool results from user messages (XML format: <tool_result name="...">...</tool_result>)
@@ -733,9 +732,7 @@ async fn save_coding_memory_from_history(
             } else {
                 output.to_string()
             };
-            coding_entries.push(format!(
-                "[{now}] {tool_name}\nOutput: {output_preview}"
-            ));
+            coding_entries.push(format!("[{now}] {tool_name}\nOutput: {output_preview}"));
         }
     }
 
@@ -754,6 +751,9 @@ async fn save_coding_memory_from_history(
 /// code-related content, this function sends the response through a
 /// secondary review model (Gemini for architecture review, optionally
 /// followed by a Claude validation pass).
+///
+/// Delegates to `ReviewPipeline` for structured multi-model review with
+/// consensus merging, severity classification, and deduplication.
 ///
 /// Returns the original response augmented with review feedback,
 /// or the original response unchanged if review is disabled/fails.
@@ -797,146 +797,60 @@ async fn run_coding_review(
         .filter(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .collect();
-    let context_summary = if context_msgs.is_empty() {
+    let description = if context_msgs.is_empty() {
         String::new()
     } else {
-        format!("\n\nUser's recent requests:\n{}", context_msgs.join("\n---\n"))
+        format!("User's recent requests:\n{}", context_msgs.join("\n---\n"))
     };
 
-    // ── Gemini Review (primary) ──────────────────────────────────
-    let gemini_key = coding_config
-        .gemini_api_key
-        .clone()
-        .or_else(|| std::env::var("GEMINI_API_KEY").ok());
-
-    let gemini_review = if let Some(api_key) = gemini_key {
-        let review_prompt = format!(
-            "You are a senior code reviewer. Review the following code response for:\n\
-             1. Correctness and potential bugs\n\
-             2. Security vulnerabilities\n\
-             3. Performance concerns\n\
-             4. Best practices adherence\n\n\
-             Be concise. Only flag real issues, not style preferences.\n\
-             If the code looks good, say \"LGTM\" with a brief reason.\n\
-             {context_summary}\n\n\
-             Code to review:\n{review_content}"
-        );
-
-        match providers::create_provider("google", Some(&api_key)) {
-            Ok(reviewer) => {
-                let review_messages = vec![ChatMessage::user(&review_prompt)];
-                match reviewer
-                    .chat(
-                        ChatRequest {
-                            messages: &review_messages,
-                            tools: &[],
-                        },
-                        &coding_config.gemini_model,
-                        0.3,
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        tracing::info!(
-                            model = %coding_config.gemini_model,
-                            "Coding review: Gemini review complete"
-                        );
-                        Some(result.text)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Coding review: Gemini review failed: {e}");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Coding review: Failed to create Gemini provider: {e}");
-                None
-            }
-        }
-    } else {
-        tracing::debug!("Coding review: No Gemini API key, skipping primary review");
-        None
-    };
-
-    // ── Claude Review (secondary, optional) ──────────────────────
-    let claude_review = if coding_config.enable_secondary_review {
-        let claude_key = coding_config
+    // Build the ReviewPipeline from config (respects API key availability)
+    let pipeline_config = PipelineConfig {
+        gemini_api_key: coding_config
+            .gemini_api_key
+            .clone()
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
+        gemini_model: coding_config.gemini_model.clone(),
+        claude_api_key: coding_config
             .claude_api_key
             .clone()
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
-
-        if let (Some(api_key), Some(gemini_feedback)) = (claude_key, &gemini_review) {
-            let validation_prompt = format!(
-                "A code reviewer provided the following feedback. \
-                 Validate their review — confirm valid points, dismiss false positives, \
-                 and add any critical issues they missed. Be very concise.\n\n\
-                 Review feedback:\n{gemini_feedback}\n\n\
-                 Original code:\n{review_content}"
-            );
-
-            match providers::create_provider("anthropic", Some(&api_key)) {
-                Ok(validator) => {
-                    let validation_messages = vec![ChatMessage::user(&validation_prompt)];
-                    match validator
-                        .chat(
-                            ChatRequest {
-                                messages: &validation_messages,
-                                tools: &[],
-                            },
-                            &coding_config.claude_model,
-                            0.3,
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            tracing::info!(
-                                model = %coding_config.claude_model,
-                                "Coding review: Claude validation complete"
-                            );
-                            Some(result.text)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Coding review: Claude validation failed: {e}");
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Coding review: Failed to create Claude provider: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
+        claude_model: coding_config.claude_model.clone(),
+        enable_secondary_review: coding_config.enable_secondary_review,
     };
 
-    // ── Compose final response with review feedback ──────────────
-    if gemini_review.is_none() && claude_review.is_none() {
+    let pipeline = ReviewPipeline::from_config(&pipeline_config);
+    if pipeline.is_empty() {
+        tracing::debug!("Coding review: No API keys available, skipping review");
         return None;
     }
 
-    let mut augmented = response.to_string();
-    augmented.push_str("\n\n---\n**Code Review**\n");
+    // Load architecture context (CLAUDE.md) if available
+    let architecture_context = std::fs::read_to_string("CLAUDE.md").unwrap_or_default();
 
-    if let Some(gemini) = &gemini_review {
-        augmented.push_str(&format!(
-            "\n_Reviewer ({})_:\n{}\n",
-            coding_config.gemini_model, gemini
-        ));
+    let ctx = ReviewContext {
+        diff: review_content,
+        changed_files: vec![],
+        architecture_context,
+        title: "Code response review".into(),
+        description,
+        prior_reviews: vec![],
+    };
+
+    match pipeline.run(&ctx).await {
+        Ok(report) => {
+            if report.reviews.is_empty() {
+                return None;
+            }
+            let mut augmented = response.to_string();
+            augmented.push_str("\n\n---\n");
+            augmented.push_str(&report.to_markdown());
+            Some(augmented)
+        }
+        Err(e) => {
+            tracing::warn!("Coding review pipeline failed: {e}");
+            None
+        }
     }
-
-    if let Some(claude) = &claude_review {
-        augmented.push_str(&format!(
-            "\n_Validator ({})_:\n{}\n",
-            coding_config.claude_model, claude
-        ));
-    }
-
-    Some(augmented)
 }
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -2449,7 +2363,10 @@ pub async fn run(
             &config.workspace_dir,
             config.api_key.as_deref(),
         )?;
-        tracing::info!(backend = synced_mem.name(), "Memory initialized (sync enabled)");
+        tracing::info!(
+            backend = synced_mem.name(),
+            "Memory initialized (sync enabled)"
+        );
         (synced_mem, engine)
     } else {
         let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
