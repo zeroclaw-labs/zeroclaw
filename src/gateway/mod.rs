@@ -1068,9 +1068,16 @@ async fn prepare_gateway_messages_for_provider(
     messages.push(ChatMessage::system(system_prompt));
     messages.extend(user_messages);
 
-    let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared =
-        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
+    let (multimodal_config, provider_hint) = {
+        let config = state.config.lock();
+        (config.multimodal.clone(), config.default_provider.clone())
+    };
+    let prepared = crate::multimodal::prepare_messages_for_provider_with_provider_hint(
+        &messages,
+        &multimodal_config,
+        provider_hint.as_deref(),
+    )
+    .await?;
 
     Ok(prepared.messages)
 }
