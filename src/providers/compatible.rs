@@ -395,7 +395,7 @@ impl OpenAiCompatibleProvider {
         tools
             .iter()
             .filter_map(|tool| {
-                let function = tool.get("function")?;
+                let function = tool.get("function").unwrap_or(tool);
                 let name = function.get("name")?.as_str()?.trim();
                 if name.is_empty() {
                     return None;
