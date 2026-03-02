@@ -203,9 +203,12 @@ impl Tool for AgentsListTool {
             .filter_map(|r| r.ok())
             .collect();
 
+        let output = serde_json::to_string_pretty(&rows)
+            .map_err(|error| anyhow::anyhow!("failed to serialize agent list: {error}"))?;
+
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&rows).unwrap_or_default(),
+            output,
             error: None,
         })
     }
@@ -370,9 +373,12 @@ impl Tool for AgentsInboxTool {
             rusqlite::params![agent_id],
         );
 
+        let output = serde_json::to_string_pretty(&messages)
+            .map_err(|error| anyhow::anyhow!("failed to serialize inbox messages: {error}"))?;
+
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&messages).unwrap_or_default(),
+            output,
             error: None,
         })
     }
@@ -443,17 +449,21 @@ impl Tool for StateGetTool {
             .ok();
 
         match result {
-            Some((value, owner, updated_at)) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
+            Some((value, owner, updated_at)) => {
+                let output = serde_json::to_string_pretty(&json!({
                     "key": key,
                     "value": value,
                     "owner": owner,
-                    "updated_at": updated_at
+                    "updated_at": updated_at,
                 }))
-                .unwrap_or_default(),
-                error: None,
-            }),
+                .map_err(|error| anyhow::anyhow!("failed to serialize state value: {error}"))?;
+
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             None => Ok(ToolResult {
                 success: true,
                 output: format!("Key '{key}' not found"),
