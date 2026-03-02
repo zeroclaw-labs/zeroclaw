@@ -318,14 +318,10 @@ impl BlueBubblesChannel {
             .send()
             .await
         {
-            Err(e) => tracing::warn!(
-                "BlueBubbles mark_read failed for {chat_guid}: {}",
-                e.without_url()
-            ),
-            Ok(resp) if !resp.status().is_success() => tracing::warn!(
-                "BlueBubbles mark_read got {} for {chat_guid}",
-                resp.status()
-            ),
+            Err(e) => tracing::warn!("BlueBubbles mark_read failed: {}", e.without_url()),
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::warn!("BlueBubbles mark_read got {}", resp.status())
+            }
             Ok(_) => {}
         }
     }
@@ -1000,7 +996,7 @@ impl BlueBubblesChannel {
         }
 
         let Some(mut content) = Self::extract_content(data) else {
-            tracing::debug!("BlueBubbles: skipping empty message from {sender}");
+            tracing::debug!("BlueBubbles: skipping empty message");
             return messages;
         };
 

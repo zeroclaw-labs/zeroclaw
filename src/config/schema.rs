@@ -7630,16 +7630,28 @@ impl Config {
 
         // BlueBubbles policy validation
         if let Some(bb) = &self.channels_config.bluebubbles {
-            if bb.dm_policy == BlueBubblesDmPolicy::Allowlist && bb.allowed_senders.is_empty() {
-                anyhow::bail!(
-                    "channels_config.bluebubbles.dm_policy = \"allowlist\" requires at least one entry in allowed_senders"
-                );
-            }
-            if bb.group_policy == BlueBubblesGroupPolicy::Allowlist
-                && bb.group_allow_from.is_empty()
+            // Check for empty or whitespace-only list under Allowlist mode — both
+            // conditions produce a silent deny-all at runtime, so we fail fast here.
+            let senders_empty = bb
+                .allowed_senders
+                .iter()
+                .all(|s| s.trim().is_empty());
+            if bb.dm_policy == BlueBubblesDmPolicy::Allowlist
+                && (bb.allowed_senders.is_empty() || senders_empty)
             {
                 anyhow::bail!(
-                    "channels_config.bluebubbles.group_policy = \"allowlist\" requires at least one entry in group_allow_from"
+                    "channels_config.bluebubbles.dm_policy = \"allowlist\" requires at least one non-blank entry in allowed_senders"
+                );
+            }
+            let group_empty = bb
+                .group_allow_from
+                .iter()
+                .all(|s| s.trim().is_empty());
+            if bb.group_policy == BlueBubblesGroupPolicy::Allowlist
+                && (bb.group_allow_from.is_empty() || group_empty)
+            {
+                anyhow::bail!(
+                    "channels_config.bluebubbles.group_policy = \"allowlist\" requires at least one non-blank entry in group_allow_from"
                 );
             }
         }
