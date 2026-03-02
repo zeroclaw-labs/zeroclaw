@@ -24,6 +24,11 @@ probe_rustc() {
     rustup run "${toolchain}" rustc --version >/dev/null 2>&1
 }
 
+probe_rustdoc() {
+    local toolchain="$1"
+    rustup run "${toolchain}" rustdoc --version >/dev/null 2>&1
+}
+
 export_toolchain_for_next_steps() {
     local toolchain="$1"
     if [ -z "${GITHUB_ENV:-}" ]; then
@@ -70,21 +75,26 @@ fi
 
 if ! probe_cargo "${requested_toolchain}"; then
     echo "cargo is unavailable for ${requested_toolchain}; reinstalling toolchain profile..."
-    rustup toolchain install "${requested_toolchain}" --profile default
+    rustup toolchain install "${requested_toolchain}" --profile default --force
     rustup component add cargo --toolchain "${requested_toolchain}" || true
 fi
 
-if ! probe_cargo "${requested_toolchain}"; then
+if ! probe_rustdoc "${requested_toolchain}"; then
+    echo "rustdoc is unavailable for ${requested_toolchain}; reinstalling toolchain profile..."
+    rustup toolchain install "${requested_toolchain}" --profile default --force
+fi
+
+if ! probe_cargo "${requested_toolchain}" || ! probe_rustdoc "${requested_toolchain}"; then
     if is_truthy "${strict_mode}"; then
-        echo "::error::Strict mode enabled; cargo is unavailable for requested toolchain ${requested_toolchain}." >&2
+        echo "::error::Strict mode enabled; required Rust toolchain binaries are unavailable for ${requested_toolchain} (cargo/rustdoc)." >&2
         rustup toolchain list || true
         exit 1
     fi
-    echo "::warning::Falling back to ${fallback_toolchain} because ${requested_toolchain} cargo remains unavailable."
-    rustup toolchain install "${fallback_toolchain}" --profile default
+    echo "::warning::Falling back to ${fallback_toolchain} because ${requested_toolchain} remains unhealthy (cargo/rustdoc)."
+    rustup toolchain install "${fallback_toolchain}" --profile default --force
     rustup component add cargo --toolchain "${fallback_toolchain}" || true
-    if ! probe_cargo "${fallback_toolchain}"; then
-        echo "No usable cargo found for ${requested_toolchain} or ${fallback_toolchain}" >&2
+    if ! probe_cargo "${fallback_toolchain}" || ! probe_rustdoc "${fallback_toolchain}"; then
+        echo "No usable rust toolchain core binaries found for ${requested_toolchain} or ${fallback_toolchain}" >&2
         rustup toolchain list || true
         exit 1
     fi
@@ -105,3 +115,4 @@ export_toolchain_for_next_steps "${selected_toolchain}"
 echo "Using Rust toolchain: ${selected_toolchain}"
 rustup run "${selected_toolchain}" rustc --version
 rustup run "${selected_toolchain}" cargo --version
+rustup run "${selected_toolchain}" rustdoc --version

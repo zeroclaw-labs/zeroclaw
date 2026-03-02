@@ -80,6 +80,14 @@ jobs:
               run: |
                   rustup component add rustfmt --toolchain 1.92.0
                   rustup component add clippy --toolchain 1.92.0
+                  if ! rustup run 1.92.0 cargo fmt --version >/dev/null 2>&1; then
+                    echo "cargo fmt is missing despite rustfmt component metadata; forcing toolchain repair."
+                    rustup toolchain install 1.92.0 --profile default --force
+                    rustup component add rustfmt --toolchain 1.92.0
+                    rustup component add clippy --toolchain 1.92.0
+                  fi
+                  rustup run 1.92.0 cargo fmt --version
+                  rustup run 1.92.0 cargo clippy --version
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
