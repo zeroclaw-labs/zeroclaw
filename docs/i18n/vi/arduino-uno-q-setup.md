@@ -22,7 +22,7 @@ Build với `--features hardware` (hoặc features mặc định) để bao gồ
 ## Yêu cầu trước khi bắt đầu
 
 - Arduino Uno Q đã cấu hình WiFi
-- Arduino App Lab đã cài trên Mac (để thiết lập và triển khai lần đầu)
+- Arduino App Lab đã cài trên máy tính (để thiết lập và triển khai lần đầu)
 - API key cho LLM (OpenRouter, v.v.)
 
 ---
