@@ -616,7 +616,12 @@ impl Tool for ChannelAckConfigTool {
                         {"type": "null"}
                     ]
                 },
-                "rules": {"type": ["array", "null"]},
+                "rules": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "object"}},
+                        {"type": "null"}
+                    ]
+                },
                 "rule": {"type": "object"},
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},
