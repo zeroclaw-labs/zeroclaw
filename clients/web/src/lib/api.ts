@@ -76,6 +76,7 @@ export class MoAClient {
   }
 
   disconnect(): void {
+    this.disconnectWebSocket();
     this.token = null;
     if (typeof window !== "undefined") {
       localStorage.removeItem(STORAGE_KEY_TOKEN);
@@ -151,6 +152,113 @@ export class MoAClient {
     }
 
     return await res.json();
+  }
+
+  // ── WebSocket streaming chat ─────────────────────────────────
+
+  private ws: WebSocket | null = null;
+  private wsSessionId: string | null = null;
+  private wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Build the WebSocket URL from the current server URL. */
+  private getWsUrl(): string {
+    const base = this.serverUrl.replace(/^http/, "ws");
+    const params = new URLSearchParams();
+    if (this.token) params.set("token", this.token);
+    if (this.wsSessionId) params.set("session_id", this.wsSessionId);
+    return `${base}/ws/chat?${params.toString()}`;
+  }
+
+  /** Connect to the /ws/chat WebSocket endpoint. */
+  connectWebSocket(callbacks: {
+    onChunk?: (text: string) => void;
+    onDone?: (fullResponse: string) => void;
+    onHistory?: (messages: { role: string; content: string }[]) => void;
+    onError?: (error: string) => void;
+    onOpen?: () => void;
+    onClose?: () => void;
+  }): void {
+    if (this.ws && this.ws.readyState <= WebSocket.OPEN) {
+      return; // Already connected or connecting
+    }
+    if (!this.token) {
+      callbacks.onError?.("Not authenticated");
+      return;
+    }
+
+    if (!this.wsSessionId) {
+      this.wsSessionId = generateId();
+    }
+
+    const url = this.getWsUrl();
+    this.ws = new WebSocket(url);
+
+    this.ws.onopen = () => {
+      callbacks.onOpen?.();
+    };
+
+    this.ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        switch (msg.type) {
+          case "chunk":
+            callbacks.onChunk?.(msg.content || "");
+            break;
+          case "done":
+            callbacks.onDone?.(msg.full_response || "");
+            break;
+          case "history":
+            if (msg.session_id) this.wsSessionId = msg.session_id;
+            callbacks.onHistory?.(msg.messages || []);
+            break;
+          case "error":
+            callbacks.onError?.(msg.message || "Unknown error");
+            break;
+        }
+      } catch {
+        // Non-JSON frame, ignore
+      }
+    };
+
+    this.ws.onclose = () => {
+      callbacks.onClose?.();
+      // Auto-reconnect after 2 seconds
+      this.wsReconnectTimer = setTimeout(() => {
+        if (this.token) {
+          this.connectWebSocket(callbacks);
+        }
+      }, 2000);
+    };
+
+    this.ws.onerror = () => {
+      // onerror is always followed by onclose, so reconnect happens there
+    };
+  }
+
+  /** Send a message over the WebSocket connection. */
+  sendWsMessage(message: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("WebSocket not connected");
+    }
+    this.ws.send(JSON.stringify({ type: "message", content: message }));
+  }
+
+  /** Disconnect the WebSocket. */
+  disconnectWebSocket(): void {
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.onclose = null; // Prevent auto-reconnect
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  /** Whether the WebSocket is currently connected. */
+  isWsConnected(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
   async healthCheck(): Promise<HealthResponse> {

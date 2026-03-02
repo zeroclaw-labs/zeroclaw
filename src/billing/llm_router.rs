@@ -231,13 +231,8 @@ mod tests {
     fn record_usage_user_key_no_credit_deduction() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(tmp.path(), true).unwrap();
-        let payment = PaymentManager::new(
-            tmp.path(),
-            None,
-            "https://zeroclaw.example.com",
-            true,
-        )
-        .unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
 
         // User key → no credit deduction even without balance
         let result = record_usage(
@@ -261,13 +256,8 @@ mod tests {
     fn record_usage_operator_key_deducts_credits() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(tmp.path(), true).unwrap();
-        let payment = PaymentManager::new(
-            tmp.path(),
-            None,
-            "https://zeroclaw.example.com",
-            true,
-        )
-        .unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
 
         // Give user some credits first
         let (record, _) = payment
@@ -299,13 +289,8 @@ mod tests {
     fn record_usage_operator_key_insufficient_credits_fails() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(tmp.path(), true).unwrap();
-        let payment = PaymentManager::new(
-            tmp.path(),
-            None,
-            "https://zeroclaw.example.com",
-            true,
-        )
-        .unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
 
         // No credits → should fail
         let result = record_usage(

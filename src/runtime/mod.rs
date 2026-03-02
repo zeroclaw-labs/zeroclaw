@@ -30,10 +30,14 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
             "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
         ),
         other if other.trim().is_empty() => {
-            anyhow::bail!("runtime.kind cannot be empty. Supported values: native, docker, wasm, mobile")
+            anyhow::bail!(
+                "runtime.kind cannot be empty. Supported values: native, docker, wasm, mobile"
+            )
         }
         other => {
-            anyhow::bail!("Unknown runtime kind '{other}'. Supported values: native, docker, wasm, mobile")
+            anyhow::bail!(
+                "Unknown runtime kind '{other}'. Supported values: native, docker, wasm, mobile"
+            )
         }
     }
 }

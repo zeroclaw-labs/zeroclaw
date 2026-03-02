@@ -17,6 +17,19 @@ rustflags = ["-C", "link-arg=-static"]
 [target.armv6l-unknown-linux-musleabihf]
 rustflags = ["-C", "link-arg=-static"]
 
+# iOS targets — static library for in-process ZeroClaw bridge.
+# Device (ARM64): minimum iOS 14.0.
+[target.aarch64-apple-ios]
+rustflags = ["-C", "link-arg=-miphoneos-version-min=14.0"]
+
+# Simulator (Apple Silicon): minimum iOS 14.0.
+[target.aarch64-apple-ios-sim]
+rustflags = ["-C", "link-arg=-mios-simulator-version-min=14.0"]
+
+# Simulator (Intel): minimum iOS 14.0.
+[target.x86_64-apple-ios]
+rustflags = ["-C", "link-arg=-mios-simulator-version-min=14.0"]
+
 # Android targets (Termux-native defaults).
 # CI/NDK cross builds can override these via CARGO_TARGET_*_LINKER.
 [target.armv7-linux-androideabi]

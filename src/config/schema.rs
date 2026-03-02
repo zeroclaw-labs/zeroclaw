@@ -14544,7 +14544,6 @@ pub struct VoiceConfig {
     pub prefix_padding_ms: u32,
 
     // ── Simultaneous interpretation settings ──────────────────────
-
     /// Default interpretation mode: "simul", "consecutive", or "bidirectional".
     #[serde(default = "default_voice_interp_mode")]
     pub default_interp_mode: String,

@@ -227,9 +227,7 @@ fn compute_consensus_verdict(reviews: &[ReviewReport]) -> ReviewVerdict {
     let has_request_changes = reviews
         .iter()
         .any(|r| r.verdict == ReviewVerdict::RequestChanges);
-    let all_approve = reviews
-        .iter()
-        .all(|r| r.verdict == ReviewVerdict::Approve);
+    let all_approve = reviews.iter().all(|r| r.verdict == ReviewVerdict::Approve);
 
     if has_request_changes {
         ReviewVerdict::RequestChanges
@@ -244,8 +242,14 @@ fn compute_consensus_verdict(reviews: &[ReviewReport]) -> ReviewVerdict {
 fn build_consensus_summary(reviews: &[ReviewReport], merged: &[ReviewFinding]) -> String {
     let reviewer_count = reviews.len();
     let total_findings = merged.len();
-    let critical = merged.iter().filter(|f| f.severity == Severity::Critical).count();
-    let high = merged.iter().filter(|f| f.severity == Severity::High).count();
+    let critical = merged
+        .iter()
+        .filter(|f| f.severity == Severity::Critical)
+        .count();
+    let high = merged
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .count();
 
     if total_findings == 0 {
         format!(
@@ -305,12 +309,20 @@ mod tests {
             make_report(
                 "reviewer-a",
                 ReviewVerdict::Comment,
-                vec![make_finding(Severity::Medium, "security", Some("src/lib.rs"))],
+                vec![make_finding(
+                    Severity::Medium,
+                    "security",
+                    Some("src/lib.rs"),
+                )],
             ),
             make_report(
                 "reviewer-b",
                 ReviewVerdict::Comment,
-                vec![make_finding(Severity::Critical, "security", Some("src/lib.rs"))],
+                vec![make_finding(
+                    Severity::Critical,
+                    "security",
+                    Some("src/lib.rs"),
+                )],
             ),
         ];
 
@@ -341,7 +353,10 @@ mod tests {
             make_report("a", ReviewVerdict::Approve, vec![]),
             make_report("b", ReviewVerdict::RequestChanges, vec![]),
         ];
-        assert_eq!(compute_consensus_verdict(&reviews), ReviewVerdict::RequestChanges);
+        assert_eq!(
+            compute_consensus_verdict(&reviews),
+            ReviewVerdict::RequestChanges
+        );
     }
 
     #[test]

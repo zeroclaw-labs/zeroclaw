@@ -83,7 +83,10 @@ pub struct ReviewReport {
 impl ReviewReport {
     /// Count findings by severity.
     pub fn count_by_severity(&self, severity: Severity) -> usize {
-        self.findings.iter().filter(|f| f.severity == severity).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == severity)
+            .count()
     }
 
     /// Whether this report has any critical or high severity findings.
@@ -97,7 +100,10 @@ impl ReviewReport {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
 
-        md.push_str(&format!("### Review by `{}` ({})\n\n", self.reviewer_id, self.model));
+        md.push_str(&format!(
+            "### Review by `{}` ({})\n\n",
+            self.reviewer_id, self.model
+        ));
         md.push_str(&format!("**Verdict**: {}\n\n", self.verdict.label()));
         md.push_str(&format!("**Summary**: {}\n\n", self.summary));
 
@@ -226,10 +232,26 @@ impl ConsensusReport {
         // Merged findings summary
         if !self.merged_findings.is_empty() {
             md.push_str("---\n\n### Merged Findings\n\n");
-            let critical = self.merged_findings.iter().filter(|f| f.severity == Severity::Critical).count();
-            let high = self.merged_findings.iter().filter(|f| f.severity == Severity::High).count();
-            let medium = self.merged_findings.iter().filter(|f| f.severity == Severity::Medium).count();
-            let low = self.merged_findings.iter().filter(|f| f.severity == Severity::Low).count();
+            let critical = self
+                .merged_findings
+                .iter()
+                .filter(|f| f.severity == Severity::Critical)
+                .count();
+            let high = self
+                .merged_findings
+                .iter()
+                .filter(|f| f.severity == Severity::High)
+                .count();
+            let medium = self
+                .merged_findings
+                .iter()
+                .filter(|f| f.severity == Severity::Medium)
+                .count();
+            let low = self
+                .merged_findings
+                .iter()
+                .filter(|f| f.severity == Severity::Low)
+                .count();
 
             md.push_str(&format!(
                 "Critical: {} | High: {} | Medium: {} | Low: {}\n",
@@ -286,16 +308,14 @@ mod tests {
             model: "test".into(),
             summary: "Issues found".into(),
             verdict: ReviewVerdict::RequestChanges,
-            findings: vec![
-                ReviewFinding {
-                    severity: Severity::Critical,
-                    file_path: None,
-                    line_range: None,
-                    category: "security".into(),
-                    description: "SQL injection vulnerability".into(),
-                    suggestion: Some("Use parameterized queries".into()),
-                },
-            ],
+            findings: vec![ReviewFinding {
+                severity: Severity::Critical,
+                file_path: None,
+                line_range: None,
+                category: "security".into(),
+                description: "SQL injection vulnerability".into(),
+                suggestion: Some("Use parameterized queries".into()),
+            }],
             architecture_alignment: None,
             duration_ms: 500,
         };

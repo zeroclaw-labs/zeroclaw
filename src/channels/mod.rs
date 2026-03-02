@@ -4911,7 +4911,11 @@ fn collect_configured_channels(
     if let Some(ref im) = config.channels_config.imessage {
         channels.push(ConfiguredChannel {
             display_name: "iMessage",
-            channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone(), None, None)),
+            channel: Arc::new(IMessageChannel::new(
+                im.allowed_contacts.clone(),
+                None,
+                None,
+            )),
         });
     }
 

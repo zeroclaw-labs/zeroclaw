@@ -434,10 +434,7 @@ pub fn create_synced_memory(
     let base = create_memory(config, workspace_dir, api_key)?;
 
     if sync_config.enabled {
-        let engine = sync::SyncEngine::new(
-            workspace_dir,
-            true,
-        )?;
+        let engine = sync::SyncEngine::new(workspace_dir, true)?;
         let engine = Arc::new(parking_lot::Mutex::new(engine));
         let base_arc: Arc<dyn Memory> = Arc::from(base);
         let synced = SyncedMemory::new(base_arc, engine.clone());

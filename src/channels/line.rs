@@ -137,7 +137,9 @@ impl LineChannel {
                                 if let Err(e) = pairing::persist_channel_allowlist("line", &uid) {
                                     tracing::error!("LINE: failed to persist pairing: {e}");
                                 }
-                            }).await.ok();
+                            })
+                            .await
+                            .ok();
                         });
                         // Fall through to process message
                     } else {
