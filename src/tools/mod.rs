@@ -634,8 +634,8 @@ pub fn all_tools_with_runtime(
     // BlueBubbles group management tools (enabled when BB channel is configured)
     if let Some(bb) = root_config.channels_config.bluebubbles.as_ref() {
         let server_url = bb.server_url.trim().to_string();
-        let password = bb.password.clone();
-        if !server_url.is_empty() {
+        let password = bb.password.trim().to_string();
+        if !server_url.is_empty() && !password.is_empty() {
             tool_arcs.push(Arc::new(BlueBubblesGroupTool::new(server_url, password)));
         }
     }
