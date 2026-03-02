@@ -208,9 +208,9 @@ dependencies = [
 
 [[package]]
 name = "ar_archive_writer"
-version = "0.5.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eb93bbb63b9c227414f6eb3a0adfddca591a8ce1e9b60661bb08969b87e340b"
+checksum = "3219abbb81fdcb1a976d794ea40cd8567b67c4e8f93bdcd077a40a0905f133e8"
 dependencies = [
  "object 0.37.3",
 ]
