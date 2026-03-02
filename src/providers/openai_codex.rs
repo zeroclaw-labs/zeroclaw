@@ -795,7 +795,7 @@ impl OpenAiCodexProvider {
                         timed_out = true;
                         break;
                     }
-                    return Err(WebsocketRequestError::stream(anyhow::anyhow!(
+                    return Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
                         "OpenAI Codex websocket stream timed out after {}s waiting for events",
                         CODEX_WS_READ_TIMEOUT.as_secs()
                     )));
@@ -881,12 +881,12 @@ impl OpenAiCodexProvider {
             return Ok(text);
         }
         if timed_out {
-            return Err(WebsocketRequestError::stream(anyhow::anyhow!(
+            return Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
                 "No response from OpenAI Codex websocket stream before timeout"
             )));
         }
 
-        Err(WebsocketRequestError::stream(anyhow::anyhow!(
+        Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
             "No response from OpenAI Codex websocket stream"
         )))
     }
