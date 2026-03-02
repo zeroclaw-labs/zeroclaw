@@ -29,7 +29,7 @@ env:
 jobs:
     integration-tests:
         name: Integration / E2E Tests
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -37,5 +37,22 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Runner preflight (compiler + disk)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  echo "Runner: ${RUNNER_NAME:-unknown} (${RUNNER_OS:-unknown}/${RUNNER_ARCH:-unknown})"
+                  if ! command -v cc >/dev/null 2>&1; then
+                    echo "::error::Missing 'cc' compiler on runner. Install build-essential (Debian/Ubuntu) or equivalent."
+                    exit 1
+                  fi
+                  cc --version | head -n1
+                  free_kb="$(df -Pk . | awk 'NR==2 {print $4}')"
+                  min_kb=$((10 * 1024 * 1024))
+                  if [ "${free_kb}" -lt "${min_kb}" ]; then
+                    echo "::error::Insufficient disk space on runner (<10 GiB free)."
+                    df -h .
+                    exit 1
+                  fi
             - name: Run integration / E2E tests
               run: cargo test --test agent_e2e --locked --verbose

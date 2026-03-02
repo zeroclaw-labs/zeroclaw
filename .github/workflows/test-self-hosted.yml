@@ -2,19 +2,81 @@ name: Test Self-Hosted Runner
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: read
 
 jobs:
-  test-runner:
-    runs-on: self-hosted
+  runner-health:
+    name: Runner Health / self-hosted aws-india
+    runs-on: [self-hosted, aws-india]
+    timeout-minutes: 10
     steps:
       - name: Check runner info
         run: |
           echo "Runner: $(hostname)"
           echo "OS: $(uname -a)"
+          echo "User: $(whoami)"
+          if command -v rustc >/dev/null 2>&1; then
+            echo "Rust: $(rustc --version)"
+          else
+            echo "Rust: <not installed>"
+          fi
+          if command -v cargo >/dev/null 2>&1; then
+            echo "Cargo: $(cargo --version)"
+          else
+            echo "Cargo: <not installed>"
+          fi
+          if command -v cc >/dev/null 2>&1; then
+            echo "CC: $(cc --version | head -n1)"
+          else
+            echo "CC: <not installed>"
+          fi
+          if command -v gcc >/dev/null 2>&1; then
+            echo "GCC: $(gcc --version | head -n1)"
+          else
+            echo "GCC: <not installed>"
+          fi
+          if command -v clang >/dev/null 2>&1; then
+            echo "Clang: $(clang --version | head -n1)"
+          else
+            echo "Clang: <not installed>"
+          fi
           if command -v docker >/dev/null 2>&1; then
             echo "Docker: $(docker --version)"
           else
             echo "Docker: <not installed>"
+          fi
+      - name: Verify compiler + disk prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+
+          if ! command -v cc >/dev/null 2>&1; then
+            echo "::error::Missing 'cc'. Install build-essential (or gcc/clang + symlink)."
+            failed=1
+          fi
+
+          free_kb="$(df -Pk . | awk 'NR==2 {print $4}')"
+          min_kb=$((10 * 1024 * 1024))
+          if [ "${free_kb}" -lt "${min_kb}" ]; then
+            echo "::error::Disk free below 10 GiB; clean runner workspace/cache."
+            df -h .
+            failed=1
+          fi
+
+          inode_used_pct="$(df -Pi . | awk 'NR==2 {gsub(/%/, "", $5); print $5}')"
+          if [ "${inode_used_pct}" -ge 95 ]; then
+            echo "::error::Inode usage >=95%; clean files to avoid ENOSPC."
+            df -i .
+            failed=1
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
           fi
       - name: Test Docker
         shell: bash
