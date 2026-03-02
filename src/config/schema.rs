@@ -6806,6 +6806,9 @@ impl Config {
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
+            if let Some(ref mut pinggy) = config.tunnel.pinggy {
+                decrypt_optional_secret(&store, &mut pinggy.token, "config.tunnel.pinggy.token")?;
+            }
             decrypt_optional_secret(
                 &store,
                 &mut config.microsoft365.client_secret,
@@ -8085,6 +8088,9 @@ impl Config {
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
+        if let Some(ref mut pinggy) = config_to_save.tunnel.pinggy {
+            encrypt_optional_secret(&store, &mut pinggy.token, "config.tunnel.pinggy.token")?;
+        }
         encrypt_optional_secret(
             &store,
             &mut config_to_save.microsoft365.client_secret,

@@ -164,7 +164,7 @@ impl Tunnel for PinggyTunnel {
         let mut guard = self.proc.lock().await;
         match guard.as_mut() {
             Some(tp) => match tp.child.try_wait() {
-                Ok(None) => true,  // still running
+                Ok(None) => true,     // still running
                 Ok(Some(_)) => false, // exited
                 Err(_) => false,
             },
