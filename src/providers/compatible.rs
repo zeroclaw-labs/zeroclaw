@@ -1570,19 +1570,29 @@ impl OpenAiCompatibleProvider {
 
     fn convert_tool_specs(
         tools: Option<&[crate::tools::ToolSpec]>,
+        for_responses: bool,
     ) -> Option<Vec<serde_json::Value>> {
         tools.map(|items| {
             items
                 .iter()
                 .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
+                    if for_responses {
+                        serde_json::json!({
+                            "type": "function",
                             "name": tool.name,
                             "description": tool.description,
                             "parameters": tool.parameters,
-                        }
-                    })
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.parameters,
+                            }
+                        })
+                    }
                 })
                 .collect()
         })
@@ -2331,8 +2341,8 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let tools = Self::convert_tool_specs(request.tools);
-        let response_tools = tools.clone();
+        let tools = Self::convert_tool_specs(request.tools, false);
+        let response_tools = Self::convert_tool_specs(request.tools, true);
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
@@ -3829,6 +3839,50 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "shell");
         assert_eq!(tools[0]["function"]["description"], "Run shell command");
         assert_eq!(tools[0]["function"]["parameters"]["required"][0], "command");
+    }
+
+    #[test]
+    fn convert_tool_specs_chat_completions_nests_function() {
+        let specs = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+        }];
+
+        let tools =
+            OpenAiCompatibleProvider::convert_tool_specs(Some(&specs), false).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "shell");
+        assert_eq!(tools[0]["function"]["description"], "Run shell command");
+        // top-level should not have name/description directly
+        assert!(tools[0].get("name").is_none());
+    }
+
+    #[test]
+    fn convert_tool_specs_responses_api_uses_flat_format() {
+        let specs = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+        }];
+
+        let tools =
+            OpenAiCompatibleProvider::convert_tool_specs(Some(&specs), true).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "shell");
+        assert_eq!(tools[0]["description"], "Run shell command");
+        // should not have a nested "function" key
+        assert!(tools[0].get("function").is_none());
     }
 
     #[test]
