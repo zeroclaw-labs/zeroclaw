@@ -253,8 +253,7 @@ impl ProcessTool {
 
         for entry in processes.values() {
             let status = {
-                let mut child =
-                    recover_mutex_lock(&entry.child, "process child state during list");
+                let mut child = recover_mutex_lock(&entry.child, "process child state during list");
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         format!("exited ({})", status.code().unwrap_or(-1))
