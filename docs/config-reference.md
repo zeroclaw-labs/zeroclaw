@@ -320,6 +320,7 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `request_timeout_secs` | `300` | HTTP request timeout in seconds for all gateway endpoints |
 
 ## `[autonomy]`
 
