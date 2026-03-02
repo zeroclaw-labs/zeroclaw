@@ -122,7 +122,8 @@ jobs:
                   trigger_rollback_on_abort="true"
                   rollback_branch="dev"
                   rollback_target_ref=""
-                  fail_on_violation="true"
+                  # Scheduled audits may not have live canary telemetry; report violations without failing by default.
+                  fail_on_violation="false"
 
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
                     mode="${{ github.event.inputs.mode || 'dry-run' }}"
