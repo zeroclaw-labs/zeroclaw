@@ -2925,7 +2925,7 @@ mod tests {
         .await
         .expect("anthropic route should not fail on a false-negative vision capability probe");
 
-        assert_eq!(result, "vision-ok");
+        assert_eq!(result.text, "vision-ok");
     }
 
     #[tokio::test]
@@ -3206,7 +3206,7 @@ mod tests {
         .await
         .expect("tool loop should complete with denied tool execution");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             max_active.load(Ordering::SeqCst),
             0,
@@ -3288,7 +3288,7 @@ mod tests {
         .expect("tool loop should continue after non-cli approval");
 
         approval_task.await.expect("approval task should complete");
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             max_active.load(Ordering::SeqCst),
             1,
@@ -3345,7 +3345,7 @@ mod tests {
         .await
         .expect("tool loop should consume one-time allow-all token");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             max_active.load(Ordering::SeqCst),
             1,
@@ -3400,7 +3400,7 @@ mod tests {
         .await
         .expect("tool loop should complete with blocked tool execution");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             max_active.load(Ordering::SeqCst),
             0,
@@ -3579,7 +3579,7 @@ mod tests {
         .await
         .expect("loop should recover after one deferred-action reply");
 
-        assert_eq!(result, "done after tool");
+        assert_eq!(result.text, "done after tool");
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             1,

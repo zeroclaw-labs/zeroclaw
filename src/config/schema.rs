@@ -2732,7 +2732,6 @@ fn default_auto_approve() -> Vec<String> {
         "file_read".into(),
         "memory_recall".into(),
         "glob_search".into(),
-        "shell".into(),
     ]
 }
 

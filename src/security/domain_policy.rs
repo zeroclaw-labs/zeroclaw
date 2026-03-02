@@ -89,19 +89,30 @@ impl DomainPolicyStore {
     }
 
     fn matches_list(&self, host: &str, kind: DomainListKind) -> bool {
+        // Fail closed: on any DB error, deny for Deny-list queries (return true)
+        // and deny for Allow-list queries too (return false = not allowed).
+        // Both outcomes block the request, satisfying deny-by-default.
+        let fail_closed = matches!(kind, DomainListKind::Deny);
+
         let Some(host) = normalize_host(host) else {
-            return false;
+            return fail_closed;
         };
 
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare("SELECT domain FROM domain_policy WHERE list_type = ?1") {
             Ok(stmt) => stmt,
-            Err(_) => return false,
+            Err(err) => {
+                tracing::warn!(kind = kind.as_str(), %err, "domain_policy: DB prepare failed; failing closed");
+                return fail_closed;
+            }
         };
 
         let rows = match stmt.query_map(params![kind.as_str()], |row| row.get::<_, String>(0)) {
             Ok(rows) => rows,
-            Err(_) => return false,
+            Err(err) => {
+                tracing::warn!(kind = kind.as_str(), %err, "domain_policy: DB query failed; failing closed");
+                return fail_closed;
+            }
         };
 
         for pattern in rows.flatten() {
@@ -124,7 +135,9 @@ pub fn init_runtime_domain_policy(
 ) -> Result<Arc<DomainPolicyStore>> {
     let store = DomainPolicyStore::open(workspace_dir)?;
     store.seed_allowlist(seed_allowlist, "config")?;
-    let _ = DOMAIN_POLICY_STORE.set(Arc::clone(&store));
+    if DOMAIN_POLICY_STORE.set(Arc::clone(&store)).is_err() {
+        tracing::warn!("domain_policy: runtime store already initialized; new store will not replace the global");
+    }
     Ok(store)
 }
 

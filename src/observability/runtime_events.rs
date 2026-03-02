@@ -54,10 +54,9 @@ fn map_event_to_json(event: &ObserverEvent) -> Option<serde_json::Value> {
             "tool": tool,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }),
-        ObserverEvent::Error { component, message } => json!({
+        ObserverEvent::Error { component, .. } => json!({
             "type": "error",
             "component": component,
-            "message": message,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }),
         ObserverEvent::AgentStart { provider, model } => json!({

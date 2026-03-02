@@ -1652,7 +1652,24 @@ fn fetch_live_models_for_provider(
     };
 
     let models = match provider_name {
-        "openai-codex" => codex_models_catalog(),
+        "openai-codex" => {
+            if let Some(endpoint) =
+                resolve_live_models_endpoint(requested_provider_name, provider_api_url)
+            {
+                let allow_unauthenticated =
+                    allows_unauthenticated_model_fetch(requested_provider_name);
+                match fetch_openai_compatible_models(
+                    &endpoint,
+                    api_key.as_deref(),
+                    allow_unauthenticated,
+                ) {
+                    Ok(models) if !models.is_empty() => models,
+                    _ => codex_models_catalog(),
+                }
+            } else {
+                codex_models_catalog()
+            }
+        }
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,

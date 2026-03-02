@@ -57,8 +57,8 @@ const TELEGRAM_RUNTIME_COMMANDS: &[(&str, &str)] = &[
     ("providers", "List providers or switch provider"),
     ("models", "List models or switch model"),
     ("think", "Set reasoning mode/effort"),
-    ("approve-domain", "Approve domain for browser/http"),
-    ("deny-domain", "Block domain for browser/http"),
+    ("approve_domain", "Approve domain for browser/http"),
+    ("deny_domain", "Block domain for browser/http"),
     ("abort", "Abort current execution"),
     ("restart", "Restart managed ZeroClaw service"),
 ];

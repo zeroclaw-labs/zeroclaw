@@ -856,8 +856,7 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
     tracing::debug!(
         status = %status,
         body_bytes = bytes.len(),
-        body = %body.chars().take(500).collect::<String>(),
-        "OpenAI Codex raw response body"
+        "OpenAI Codex response received"
     );
 
     if let Some(text) = parse_sse_text(&body)? {
@@ -891,8 +890,7 @@ async fn decode_responses_body_with_metadata(
     tracing::debug!(
         status = %status,
         body_bytes = bytes.len(),
-        body = %body.chars().take(500).collect::<String>(),
-        "OpenAI Codex raw response body"
+        "OpenAI Codex response received"
     );
     let sse_rate_limit_summary = parse_sse_rate_limit_summary(&body);
 

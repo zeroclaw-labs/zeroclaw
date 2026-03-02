@@ -89,12 +89,6 @@ pub async fn transcribe_audio(
                 .map(|key| key.trim().to_string())
                 .filter(|key| !key.is_empty())
         })
-        .or_else(|| {
-            std::env::var("API_KEY")
-                .ok()
-                .map(|key| key.trim().to_string())
-                .filter(|key| !key.is_empty())
-        })
         .context(
             "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable",
         )?;
