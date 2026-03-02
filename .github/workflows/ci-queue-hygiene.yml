@@ -2,7 +2,7 @@ name: CI Queue Hygiene
 
 on:
     schedule:
-        - cron: "*/15 * * * *"
+        - cron: "*/5 * * * *"
     workflow_dispatch:
         inputs:
             apply:
@@ -59,7 +59,7 @@ jobs:
 
                   status_scope="queued"
                   max_cancel="120"
-                  apply_mode="false"
+                  apply_mode="true"
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
                     status_scope="${{ github.event.inputs.status || 'queued' }}"
                     max_cancel="${{ github.event.inputs.max_cancel || '120' }}"
@@ -78,6 +78,7 @@ jobs:
                     --dedupe-workflow "PR Auto Responder"
                     --dedupe-workflow "Workflow Sanity"
                     --dedupe-workflow "PR Label Policy Check"
+                    --priority-branch-prefix "release/"
                     --dedupe-include-non-pr
                     --non-pr-key branch
                     --output-json artifacts/queue-hygiene-report.json
