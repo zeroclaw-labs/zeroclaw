@@ -20,6 +20,7 @@ pub mod apply_patch;
 pub mod auth_profile;
 pub mod bg_run;
 pub mod bluebubbles_group;
+pub mod bluebubbles_send_attachment;
 pub mod browser;
 pub mod browser_open;
 pub mod channel_ack_config;
@@ -91,6 +92,7 @@ pub use bg_run::{
     format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
 };
 pub use bluebubbles_group::BlueBubblesGroupTool;
+pub use bluebubbles_send_attachment::BlueBubblesSendAttachmentTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use channel_ack_config::ChannelAckConfigTool;
@@ -631,15 +633,19 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // BlueBubbles group management tools (enabled when BB channel is configured)
+    // BlueBubbles tools (enabled when BB channel is configured)
     if let Some(bb) = root_config.channels_config.bluebubbles.as_ref() {
         let server_url = bb.server_url.trim().to_string();
         // Keep raw password for auth; trim only to check for empty.
         let password = bb.password.clone();
         if !server_url.is_empty() && !password.trim().is_empty() {
-            match BlueBubblesGroupTool::new(security.clone(), server_url, password) {
+            match BlueBubblesGroupTool::new(security.clone(), server_url.clone(), password.clone()) {
                 Ok(tool) => tool_arcs.push(Arc::new(tool)),
                 Err(e) => tracing::error!("Failed to initialize BlueBubblesGroupTool: {e}"),
+            }
+            match BlueBubblesSendAttachmentTool::new(security.clone(), server_url, password) {
+                Ok(tool) => tool_arcs.push(Arc::new(tool)),
+                Err(e) => tracing::error!("Failed to initialize BlueBubblesSendAttachmentTool: {e}"),
             }
         }
     }
