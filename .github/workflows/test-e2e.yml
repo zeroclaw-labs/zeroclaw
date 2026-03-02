@@ -14,7 +14,7 @@ on:
     workflow_dispatch:
 
 concurrency:
-    group: e2e-${{ github.event.pull_request.number || github.sha }}
+    group: test-e2e-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
     cancel-in-progress: true
 
 permissions:

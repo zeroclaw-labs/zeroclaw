@@ -99,7 +99,7 @@ Duy trì các quy tắc branch protection sau trên `main`:
 - Yêu cầu check `CI Required Gate`.
 - Yêu cầu review pull request trước khi merge.
 - Yêu cầu review CODEOWNERS cho các đường dẫn được bảo vệ.
-- Với `.github/workflows/**`, yêu cầu phê duyệt từ owner qua `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) và giới hạn quyền bypass branch/ruleset cho org owner.
+- Với các đường dẫn CI/CD được quản trị (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**` và tài liệu CI governance), yêu cầu review phê duyệt tường minh từ `@chumyin` qua `CI Required Gate`.
 - Hủy bỏ approval cũ khi có commit mới được đẩy lên.
 - Hạn chế force-push trên các branch được bảo vệ.
 

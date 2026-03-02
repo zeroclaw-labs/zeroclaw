@@ -7,8 +7,18 @@
 
 use crate::hooks::HookHandler;
 use crate::tools::traits::Tool;
+use serde::{Deserialize, Serialize};
 
 use super::manifest::PluginManifest;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginCapability {
+    Hooks,
+    Tools,
+    Providers,
+    /// Permission to modify tool results via the `tool_result_persist` hook.
+    ModifyToolResults,
+}
 
 /// Context passed to a plugin during registration.
 ///
@@ -121,6 +131,11 @@ mod tests {
                 description: None,
                 version: None,
                 config_schema: None,
+                capabilities: vec![],
+                module_path: String::new(),
+                wit_packages: vec![],
+                tools: vec![],
+                providers: vec![],
             },
         };
         let mut api = PluginApi {

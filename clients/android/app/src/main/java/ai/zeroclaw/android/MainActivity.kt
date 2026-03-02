@@ -34,7 +34,7 @@ fun ZeroClawApp() {
     var agentStatus by remember { mutableStateOf(AgentStatus.Stopped) }
     var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
     var inputText by remember { mutableStateOf("") }
-    
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -88,7 +88,7 @@ fun StatusIndicator(status: AgentStatus) {
         AgentStatus.Stopped -> MaterialTheme.colorScheme.outline to "Stopped"
         AgentStatus.Error -> MaterialTheme.colorScheme.error to "Error"
     }
-    
+
     Surface(
         color = color.copy(alpha = 0.2f),
         shape = MaterialTheme.shapes.small
@@ -128,7 +128,7 @@ fun EmptyState(status: AgentStatus, onStart: () -> Unit) {
             textAlign = TextAlign.Center
         )
         Spacer(modifier = Modifier.height(32.dp))
-        
+
         if (status == AgentStatus.Stopped) {
             Button(onClick = onStart) {
                 Text("Start Agent")
@@ -180,11 +180,11 @@ fun ChatMessageList(messages: List<ChatMessage>, modifier: Modifier = Modifier) 
 @Composable
 fun ChatBubble(message: ChatMessage) {
     val alignment = if (message.isUser) Alignment.End else Alignment.Start
-    val color = if (message.isUser) 
-        MaterialTheme.colorScheme.primaryContainer 
-    else 
+    val color = if (message.isUser)
+        MaterialTheme.colorScheme.primaryContainer
+    else
         MaterialTheme.colorScheme.surfaceVariant
-    
+
     Box(
         modifier = Modifier.fillMaxWidth(),
         contentAlignment = if (message.isUser) Alignment.CenterEnd else Alignment.CenterStart

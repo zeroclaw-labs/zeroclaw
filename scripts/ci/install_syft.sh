@@ -31,6 +31,20 @@ ARCHIVE="syft_${VERSION#v}_${os_name}_${arch_name}.tar.gz"
 CHECKSUMS="syft_${VERSION#v}_checksums.txt"
 BASE_URL="https://github.com/anchore/syft/releases/download/${VERSION}"
 
+verify_sha256() {
+  local checksum_file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$checksum_file"
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "$checksum_file"
+    return
+  fi
+  echo "Neither sha256sum nor shasum is available for checksum verification." >&2
+  exit 127
+}
+
 mkdir -p "${BIN_DIR}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -45,7 +59,7 @@ if [ ! -s "${tmp_dir}/syft.sha256" ]; then
 fi
 (
   cd "${tmp_dir}"
-  sha256sum -c syft.sha256
+  verify_sha256 syft.sha256
 )
 
 tar -xzf "${tmp_dir}/${ARCHIVE}" -C "${tmp_dir}" syft

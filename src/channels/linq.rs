@@ -400,8 +400,7 @@ impl Channel for LinqChannel {
 /// The signature is sent in `X-Webhook-Signature` (hex-encoded) and the
 /// timestamp in `X-Webhook-Timestamp`. Reject timestamps older than 300s.
 pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signature: &str) -> bool {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use ring::hmac;
 
     // Reject stale timestamps (>300s old)
     if let Ok(ts) = timestamp.parse::<i64>() {
@@ -417,10 +416,6 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
 
     // Compute HMAC-SHA256 over "{timestamp}.{body}"
     let message = format!("{timestamp}.{body}");
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(message.as_bytes());
     let signature_hex = signature
         .trim()
         .strip_prefix("sha256=")
@@ -430,8 +425,8 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
         return false;
     };
 
-    // Constant-time comparison via HMAC verify.
-    mac.verify_slice(&provided).is_ok()
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    hmac::verify(&key, message.as_bytes(), &provided).is_ok()
 }
 
 #[cfg(test)]

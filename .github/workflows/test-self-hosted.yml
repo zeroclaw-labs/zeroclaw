@@ -1,0 +1,28 @@
+name: Test Self-Hosted Runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-runner:
+    runs-on: self-hosted
+    steps:
+      - name: Check runner info
+        run: |
+          echo "Runner: $(hostname)"
+          echo "OS: $(uname -a)"
+          if command -v docker >/dev/null 2>&1; then
+            echo "Docker: $(docker --version)"
+          else
+            echo "Docker: <not installed>"
+          fi
+      - name: Test Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::notice::Docker is not installed on this self-hosted runner. Skipping docker smoke test."
+            exit 0
+          fi
+
+          docker run --rm hello-world

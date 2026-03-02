@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! __SKILL_NAME__ — ZeroClaw Skill (Rust / WASI)
 //!
 //! Performs arithmetic: add, subtract, multiply, divide.

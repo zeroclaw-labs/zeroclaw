@@ -1167,6 +1167,7 @@ mod tests {
             model: String::new(),
             max_tokens: None,
             api_key: None,
+            transport: None,
         }];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);

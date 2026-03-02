@@ -20,6 +20,13 @@ If both exist, your shell `PATH` order decides which one runs.
 
 ## 2) Update on macOS
 
+Quick way to get install-method-specific guidance:
+
+```bash
+zeroclaw update --instructions
+zeroclaw update --check
+```
+
 ### A) Homebrew install
 
 ```bash
@@ -51,6 +58,13 @@ zeroclaw --version
 Re-run your download/install flow with the latest release asset, then verify:
 
 ```bash
+zeroclaw --version
+```
+
+You can also use the built-in updater for manual/local installs:
+
+```bash
+zeroclaw update
 zeroclaw --version
 ```
 

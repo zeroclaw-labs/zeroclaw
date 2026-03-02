@@ -1,8 +1,10 @@
 #[cfg(feature = "channel-lark")]
 use crate::channels::LarkChannel;
+#[cfg(feature = "channel-matrix")]
+use crate::channels::MatrixChannel;
 use crate::channels::{
-    Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
-    TelegramChannel, WhatsAppChannel,
+    Channel, DingTalkChannel, DiscordChannel, EmailChannel, MattermostChannel, NapcatChannel,
+    QQChannel, SendMessage, SlackChannel, TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -21,6 +23,10 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+
+pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
+    output.trim().eq_ignore_ascii_case("NO_REPLY")
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -173,7 +179,7 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
+            Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
@@ -181,7 +187,8 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
-            )
+                None,
+            ))
             .await
         }
     };
@@ -292,6 +299,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
     }
+    if is_no_reply_sentinel(output) {
+        tracing::debug!(
+            "Cron job '{}' returned NO_REPLY sentinel; skipping announce delivery",
+            job.id
+        );
+        return Ok(());
+    }
 
     let channel = delivery
         .channel
@@ -323,6 +337,7 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
+                tg.ack_enabled,
             )
             .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
@@ -353,6 +368,7 @@ pub(crate) async fn deliver_announcement(
                 sl.bot_token.clone(),
                 sl.app_token.clone(),
                 sl.channel_id.clone(),
+                sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
@@ -373,6 +389,19 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        "dingtalk" => {
+            let dt = config
+                .channels_config
+                .dingtalk
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("dingtalk channel not configured"))?;
+            let channel = DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                dt.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
         "qq" => {
             let qq = config
                 .channels_config
@@ -385,6 +414,15 @@ pub(crate) async fn deliver_announcement(
                 qq.allowed_users.clone(),
                 qq.environment.clone(),
             );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "napcat" => {
+            let napcat_cfg = config
+                .channels_config
+                .napcat
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("napcat channel not configured"))?;
+            let channel = NapcatChannel::from_config(napcat_cfg.clone())?;
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "whatsapp_web" | "whatsapp" => {
@@ -452,6 +490,30 @@ pub(crate) async fn deliver_announcement(
                 .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
             let channel = EmailChannel::new(email.clone());
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "matrix" => {
+            #[cfg(feature = "channel-matrix")]
+            {
+                // NOTE: uses the basic constructor without session hints (user_id/device_id).
+                // Plain (non-E2EE) Matrix rooms work fine. Encrypted-room delivery is not
+                // supported in cron mode; use start_channels for full E2EE listener sessions.
+                let mx = config
+                    .channels_config
+                    .matrix
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+                let channel = MatrixChannel::new(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-matrix"))]
+            {
+                anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -1134,6 +1196,31 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_skips_no_reply_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("invalid".into()),
+            to: Some("target".into()),
+            best_effort: true,
+        };
+
+        assert!(deliver_if_configured(&config, &job, "  no_reply  ")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn no_reply_sentinel_matching_is_trimmed_and_case_insensitive() {
+        assert!(is_no_reply_sentinel("NO_REPLY"));
+        assert!(is_no_reply_sentinel("  no_reply  "));
+        assert!(!is_no_reply_sentinel("NO_REPLY please"));
+        assert!(!is_no_reply_sentinel(""));
     }
 
     #[tokio::test]

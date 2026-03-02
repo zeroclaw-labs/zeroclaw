@@ -23,6 +23,7 @@ pub mod audit;
 pub mod bubblewrap;
 pub mod detect;
 pub mod docker;
+pub mod file_link_guard;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
@@ -39,6 +40,7 @@ pub mod policy;
 pub mod prompt_guard;
 pub mod roles;
 pub mod secrets;
+pub mod sensitive_paths;
 pub mod syscall_anomaly;
 pub mod traits;
 

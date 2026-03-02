@@ -1,0 +1,111 @@
+# Android CI Workflow
+# 
+# This workflow builds the Android client and native Rust library.
+# Place in .github/workflows/ci-android.yml when ready for CI.
+
+name: Android Build
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'clients/android/**'
+      - 'clients/android-bridge/**'
+  pull_request:
+    paths:
+      - 'clients/android/**'
+      - 'clients/android-bridge/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-native:
+    name: Build Native Library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+      
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+      
+      - name: Build native library
+        run: |
+          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -o clients/android/app/src/main/jniLibs \
+            build --release -p zeroclaw-android-bridge
+      
+      - name: Upload native libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs
+          path: clients/android/app/src/main/jniLibs/
+
+  build-android:
+    name: Build Android APK
+    needs: build-native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: native-libs
+          path: clients/android/app/src/main/jniLibs/
+      
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+      
+      - name: Build Debug APK
+        working-directory: clients/android
+        run: ./gradlew assembleDebug
+      
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-debug-apk
+          path: clients/android/app/build/outputs/apk/debug/*.apk
+
+  lint:
+    name: Lint Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+      
+      - name: Run Lint
+        working-directory: clients/android
+        run: ./gradlew lint
+      
+      - name: Upload Lint Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: clients/android/app/build/reports/lint-results-*.html

@@ -90,6 +90,29 @@ pub fn url_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// Detect if a URL or code appears truncated.
+///
+/// Returns a helpful hint message if truncation is detected, otherwise None.
+pub fn detect_url_truncation(input: &str, expected_state_len: usize) -> Option<String> {
+    // Check if input looks incomplete - ends with & but missing typical parameters
+    if input.ends_with('&') && !input.contains("scope=") {
+        return Some("URL appears truncated (ends with & but missing parameters)".to_string());
+    }
+
+    let params = parse_query_params(input);
+    if let Some(state_value) = params.get("state") {
+        if state_value.len() < expected_state_len.saturating_sub(5) {
+            return Some(format!(
+                "State parameter is shorter than expected (got {}, expected ~{})",
+                state_value.len(),
+                expected_state_len
+            ));
+        }
+    }
+
+    None
+}
+
 /// Parse URL query parameters into a BTreeMap.
 ///
 /// Handles URL-encoded keys and values.
@@ -179,5 +202,28 @@ mod tests {
         let s = random_base64url(32);
         // base64url encodes 3 bytes to 4 chars, so 32 bytes = ~43 chars
         assert!(s.len() >= 42);
+    }
+
+    #[test]
+    fn detect_url_truncation_incomplete_url() {
+        let input = "http://localhost:1455/auth/callback?code=abc&";
+        let hint = detect_url_truncation(input, 32);
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn detect_url_truncation_short_state() {
+        let input = "code=abc&state=xyz";
+        let hint = detect_url_truncation(input, 32);
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("shorter than expected"));
+    }
+
+    #[test]
+    fn detect_url_truncation_valid_url() {
+        let input = "code=abc123&state=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6";
+        let hint = detect_url_truncation(input, 36);
+        assert!(hint.is_none());
     }
 }

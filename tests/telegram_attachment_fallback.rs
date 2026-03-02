@@ -28,7 +28,7 @@ async fn start_mock_server_or_skip() -> Option<MockServer> {
 
 /// Helper: create a TelegramChannel pointing at a mock server.
 fn test_channel(mock_url: &str) -> TelegramChannel {
-    TelegramChannel::new("TEST_TOKEN".into(), vec!["*".into()], false)
+    TelegramChannel::new("TEST_TOKEN".into(), vec!["*".into()], false, false)
         .with_api_base(mock_url.to_string())
 }
 

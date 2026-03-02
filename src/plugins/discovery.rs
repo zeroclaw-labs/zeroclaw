@@ -5,7 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::manifest::{load_manifest, ManifestLoadResult, PluginManifest, PLUGIN_MANIFEST_FILENAME};
+use super::manifest::{
+    load_manifest, ManifestLoadResult, PluginManifest, PLUGIN_MANIFEST_FILENAME,
+};
 use super::registry::{DiagnosticLevel, PluginDiagnostic, PluginOrigin};
 
 /// A discovered plugin before loading.
@@ -79,10 +81,7 @@ fn scan_dir(dir: &Path, origin: PluginOrigin) -> (Vec<DiscoveredPlugin>, Vec<Plu
 /// 2. Global: `~/.zeroclaw/extensions/`
 /// 3. Workspace: `<workspace>/.zeroclaw/extensions/`
 /// 4. Extra paths from config `[plugins] load_paths`
-pub fn discover_plugins(
-    workspace_dir: Option<&Path>,
-    extra_paths: &[PathBuf],
-) -> DiscoveryResult {
+pub fn discover_plugins(workspace_dir: Option<&Path>, extra_paths: &[PathBuf]) -> DiscoveryResult {
     let mut all_plugins = Vec::new();
     let mut all_diagnostics = Vec::new();
 
@@ -127,7 +126,7 @@ pub fn discover_plugins(
     let mut deduped: Vec<DiscoveredPlugin> = Vec::with_capacity(seen.len());
     // Collect in insertion order of the winning index
     let mut indices: Vec<usize> = seen.values().copied().collect();
-    indices.sort();
+    indices.sort_unstable();
     for i in indices {
         deduped.push(all_plugins.swap_remove(i));
     }
@@ -183,10 +182,7 @@ version = "0.1.0"
         make_plugin_dir(&ext_dir, "custom-one");
 
         let result = discover_plugins(None, &[ext_dir]);
-        assert!(result
-            .plugins
-            .iter()
-            .any(|p| p.manifest.id == "custom-one"));
+        assert!(result.plugins.iter().any(|p| p.manifest.id == "custom-one"));
     }
 
     #[test]

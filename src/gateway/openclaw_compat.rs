@@ -93,11 +93,9 @@ pub async fn handle_api_chat(
     // ── Auth: require at least one layer for non-loopback ──
     if !state.pairing.require_pairing()
         && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
+        && !super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
     {
-        tracing::warn!(
-            "/api/chat: rejected unauthenticated non-loopback request"
-        );
+        tracing::warn!("/api/chat: rejected unauthenticated non-loopback request");
         let err = serde_json::json!({
             "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local access"
         });
@@ -133,6 +131,11 @@ pub async fn handle_api_chat(
     };
 
     let message = chat_body.message.trim();
+    let session_id = chat_body
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if message.is_empty() {
         let err = serde_json::json!({ "error": "Message cannot be empty" });
         return (StatusCode::BAD_REQUEST, Json(err));
@@ -143,7 +146,7 @@ pub async fn handle_api_chat(
         let key = api_chat_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(&key, message, MemoryCategory::Conversation, session_id)
             .await;
     }
 
@@ -152,7 +155,11 @@ pub async fn handle_api_chat(
         message.to_string()
     } else {
         let recent: Vec<&String> = chat_body.context.iter().rev().take(10).rev().collect();
-        let context_block = recent.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join("\n");
+        let context_block = recent
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n");
         format!(
             "Recent conversation context:\n{}\n\nCurrent message:\n{}",
             context_block, message
@@ -184,10 +191,14 @@ pub async fn handle_api_chat(
         });
 
     // ── Run the full agent loop ──
-    match run_gateway_chat_with_tools(&state, &enriched_message).await {
+    match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
         Ok(response) => {
-            let safe_response =
-                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+            let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
+            let safe_response = sanitize_gateway_response(
+                &response,
+                state.tools_registry_exec.as_ref(),
+                &leak_guard_cfg,
+            );
             let duration = started_at.elapsed();
 
             state
@@ -372,7 +383,7 @@ pub async fn handle_v1_chat_completions_with_tools(
     // ── Auth: require at least one layer for non-loopback ──
     if !state.pairing.require_pairing()
         && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
+        && !super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
     {
         tracing::warn!(
             "/v1/chat/completions (compat): rejected unauthenticated non-loopback request"
@@ -395,7 +406,9 @@ pub async fn handle_v1_chat_completions_with_tools(
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if !state.pairing.is_authenticated(token) {
-            tracing::warn!("/v1/chat/completions (compat): rejected — not paired / invalid bearer token");
+            tracing::warn!(
+                "/v1/chat/completions (compat): rejected — not paired / invalid bearer token"
+            );
             let err = serde_json::json!({
                 "error": {
                     "message": "Invalid API key. Pair first via POST /pair, then use Authorization: Bearer <token>",
@@ -481,7 +494,11 @@ pub async fn handle_v1_chat_completions_with_tools(
         .rev()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .map(|m| {
-            let role_label = if m.role == "user" { "User" } else { "Assistant" };
+            let role_label = if m.role == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
             format!("{}: {}", role_label, m.content)
         })
         .collect();
@@ -495,7 +512,11 @@ pub async fn handle_v1_chat_completions_with_tools(
             .take(MAX_CONTEXT_MESSAGES)
             .rev()
             .collect();
-        let context_block = recent.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join("\n");
+        let context_block = recent
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n");
         format!(
             "Recent conversation context:\n{}\n\nCurrent message:\n{}",
             context_block, message
@@ -503,6 +524,11 @@ pub async fn handle_v1_chat_completions_with_tools(
     };
 
     let is_stream = request.stream.unwrap_or(false);
+    let session_id = request
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let request_id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', ""));
     let created = unix_timestamp();
 
@@ -511,7 +537,7 @@ pub async fn handle_v1_chat_completions_with_tools(
         let key = api_chat_memory_key();
         let _ = state
             .mem
-            .store(&key, &message, MemoryCategory::Conversation, None)
+            .store(&key, &message, MemoryCategory::Conversation, session_id)
             .await;
     }
 
@@ -546,9 +572,14 @@ pub async fn handle_v1_chat_completions_with_tools(
     );
 
     // ── Run the full agent loop ──
-    let reply = match run_gateway_chat_with_tools(&state, &enriched_message).await {
+    let reply = match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
         Ok(response) => {
-            let safe = sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+            let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
+            let safe = sanitize_gateway_response(
+                &response,
+                state.tools_registry_exec.as_ref(),
+                &leak_guard_cfg,
+            );
             let duration = started_at.elapsed();
 
             state
@@ -617,9 +648,7 @@ pub async fn handle_v1_chat_completions_with_tools(
         }
     };
 
-    let model_name = request
-        .model
-        .unwrap_or_else(|| state.model.clone());
+    let model_name = request.model.unwrap_or_else(|| state.model.clone());
 
     #[allow(clippy::cast_possible_truncation)]
     let prompt_tokens = (enriched_message.len() / 4) as u32;
@@ -844,14 +873,20 @@ mod tests {
     fn api_chat_body_rejects_missing_message() {
         let json = r#"{"session_id": "s1"}"#;
         let result: Result<ApiChatBody, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "missing `message` field should fail deserialization");
+        assert!(
+            result.is_err(),
+            "missing `message` field should fail deserialization"
+        );
     }
 
     #[test]
     fn oai_request_rejects_empty_messages() {
         let json = r#"{"messages": []}"#;
         let req: OaiChatRequest = serde_json::from_str(json).unwrap();
-        assert!(req.messages.is_empty(), "empty messages should parse but be caught by handler");
+        assert!(
+            req.messages.is_empty(),
+            "empty messages should parse but be caught by handler"
+        );
     }
 
     #[test]
@@ -892,7 +927,17 @@ mod tests {
             .skip(1)
             .rev()
             .filter(|m| m.role == "user" || m.role == "assistant")
-            .map(|m| format!("{}: {}", if m.role == "user" { "User" } else { "Assistant" }, m.content))
+            .map(|m| {
+                format!(
+                    "{}: {}",
+                    if m.role == "user" {
+                        "User"
+                    } else {
+                        "Assistant"
+                    },
+                    m.content
+                )
+            })
             .collect();
 
         assert_eq!(context_messages.len(), 2);

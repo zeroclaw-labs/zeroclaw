@@ -61,6 +61,7 @@ impl Provider for MockProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             });
         }
         Ok(guard.remove(0))
@@ -183,6 +184,7 @@ fn text_response(text: &str) -> ChatResponse {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }
 }
 
@@ -192,6 +194,7 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
         tool_calls: calls,
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }
 }
 
@@ -361,6 +364,7 @@ async fn agent_handles_empty_provider_response() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }]));
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
@@ -376,6 +380,7 @@ async fn agent_handles_none_text_response() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }]));
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
@@ -446,5 +451,143 @@ async fn agent_handles_sequential_tool_then_text() {
     assert!(
         !response.is_empty(),
         "should produce final text after tool execution"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TG4.6: Loop detection
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// No-progress repeat: provider returns same tool call every turn with identical
+/// output (EchoTool with fixed input).  Loop detection should stop early.
+#[tokio::test]
+async fn loop_detection_no_progress_repeat_stops_early() {
+    let responses: Vec<ChatResponse> = (0..10)
+        .map(|i| {
+            tool_response(vec![ToolCall {
+                id: format!("tc_{i}"),
+                name: "echo".into(),
+                arguments: r#"{"message": "same"}"#.into(),
+            }])
+        })
+        .collect();
+
+    let provider = Box::new(MockProvider::new(responses));
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let result = agent.turn("repeat forever").await;
+    assert!(result.is_err(), "should error due to loop detection");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("detected loop pattern"),
+        "error should mention loop pattern: {err_msg}"
+    );
+}
+
+/// Repeated calls with *different* outputs should NOT trigger loop detection.
+/// EchoTool returns the input, so varying inputs → varying outputs = progress.
+#[tokio::test]
+async fn loop_detection_different_outputs_no_false_positive() {
+    let mut responses: Vec<ChatResponse> = (0..5)
+        .map(|i| {
+            tool_response(vec![ToolCall {
+                id: format!("tc_{i}"),
+                name: "echo".into(),
+                arguments: format!(r#"{{"message": "msg_{i}"}}"#),
+            }])
+        })
+        .collect();
+    responses.push(text_response("All done"));
+
+    let provider = Box::new(MockProvider::new(responses));
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let result = agent.turn("varying calls").await;
+    assert!(
+        result.is_ok(),
+        "should complete normally with varying outputs: {:?}",
+        result.err()
+    );
+}
+
+/// Ping-pong: alternating between two tools with fixed input/output.
+#[tokio::test]
+async fn loop_detection_ping_pong_stops_early() {
+    // A-B-A-B-A-B pattern (3 cycles, threshold=2)
+    let mut responses: Vec<ChatResponse> = Vec::new();
+    for i in 0..6 {
+        let (name, args) = if i % 2 == 0 {
+            ("echo", r#"{"message": "ping"}"#)
+        } else {
+            ("echo", r#"{"message": "pong"}"#)
+        };
+        responses.push(tool_response(vec![ToolCall {
+            id: format!("tc_{i}"),
+            name: name.into(),
+            arguments: args.into(),
+        }]));
+    }
+
+    // Note: ping-pong detection works when tool names differ OR args differ.
+    // Here we use same tool with different args, which counts as different signatures.
+    let provider = Box::new(MockProvider::new(responses));
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let result = agent.turn("ping pong").await;
+    // The detector should fire (warning then hard stop) within the iterations
+    assert!(
+        result.is_err(),
+        "should error due to ping-pong loop detection"
+    );
+}
+
+/// Consecutive failures trigger loop detection.
+#[tokio::test]
+async fn loop_detection_failure_streak_stops_early() {
+    let responses: Vec<ChatResponse> = (0..10)
+        .map(|i| {
+            tool_response(vec![ToolCall {
+                id: format!("tc_{i}"),
+                name: "failing_tool".into(),
+                arguments: "{}".into(),
+            }])
+        })
+        .collect();
+
+    let provider = Box::new(MockProvider::new(responses));
+    let mut agent = build_agent(provider, vec![Box::new(FailingTool)]);
+    let result = agent.turn("keep failing").await;
+    assert!(
+        result.is_err(),
+        "should error due to failure streak detection"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("detected loop pattern"),
+        "error should mention loop pattern: {err_msg}"
+    );
+}
+
+/// Normal varied tool usage should not trigger any detection.
+#[tokio::test]
+async fn loop_detection_normal_flow_no_false_positive() {
+    let responses = vec![
+        tool_response(vec![ToolCall {
+            id: "tc1".into(),
+            name: "echo".into(),
+            arguments: r#"{"message": "hello"}"#.into(),
+        }]),
+        tool_response(vec![ToolCall {
+            id: "tc2".into(),
+            name: "echo".into(),
+            arguments: r#"{"message": "world"}"#.into(),
+        }]),
+        text_response("Final answer"),
+    ];
+
+    let provider = Box::new(MockProvider::new(responses));
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let result = agent.turn("normal usage").await;
+    assert!(
+        result.is_ok(),
+        "normal varied flow should complete: {:?}",
+        result.err()
     );
 }

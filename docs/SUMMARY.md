@@ -2,7 +2,7 @@
 
 This file is the canonical table of contents for the documentation system.
 
-Last refreshed: **February 25, 2026**.
+Last refreshed: **February 28, 2026**.
 
 ## Language Entry
 
@@ -41,6 +41,7 @@ Last refreshed: **February 25, 2026**.
 
 - [reference/README.md](reference/README.md)
 - [commands-reference.md](commands-reference.md)
+- [cron-scheduling.md](cron-scheduling.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
 - [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
@@ -76,6 +77,7 @@ Last refreshed: **February 25, 2026**.
 ### 5) Hardware & Peripherals
 
 - [hardware/README.md](hardware/README.md)
+- [hardware/raspberry-pi-zero-w-build.md](hardware/raspberry-pi-zero-w-build.md)
 - [hardware-peripherals-design.md](hardware-peripherals-design.md)
 - [adding-boards-and-tools.md](adding-boards-and-tools.md)
 - [nucleo-setup.md](nucleo-setup.md)
@@ -108,5 +110,8 @@ Last refreshed: **February 25, 2026**.
 - [project/README.md](project/README.md)
 - [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
 - [docs-audit-2026-02-24.md](docs-audit-2026-02-24.md)
+- [project/m4-5-rfi-spike-2026-02-28.md](project/m4-5-rfi-spike-2026-02-28.md)
+- [project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md](project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md)
+- [project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md](project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md)
 - [i18n-gap-backlog.md](i18n-gap-backlog.md)
 - [docs-inventory.md](docs-inventory.md)

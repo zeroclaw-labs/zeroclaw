@@ -1,0 +1,9 @@
+[package]
+name = "zeroclaw-types"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Foundational shared types for staged multi-crate extraction."
+
+[lib]
+path = "src/lib.rs"

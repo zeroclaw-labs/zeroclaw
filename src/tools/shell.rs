@@ -18,6 +18,17 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cutoff = max_bytes;
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    text.truncate(cutoff);
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -220,11 +231,11 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(floor_char_boundary_compat(&stdout, MAX_OUTPUT_BYTES));
+                    truncate_utf8_to_max_bytes(&mut stdout, MAX_OUTPUT_BYTES);
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(floor_char_boundary_compat(&stderr, MAX_OUTPUT_BYTES));
+                    truncate_utf8_to_max_bytes(&mut stderr, MAX_OUTPUT_BYTES);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 
@@ -737,10 +748,17 @@ mod tests {
     async fn shell_captures_stderr_output() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
         let result = tool
-            .execute(json!({"command": "echo error_msg >&2"}))
+            .execute(json!({"command": "cat __nonexistent_stderr_capture_file__"}))
             .await
             .unwrap();
-        assert!(result.error.as_deref().unwrap_or("").contains("error_msg"));
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|msg| !msg.trim().is_empty()),
+            "expected non-empty stderr in error field"
+        );
     }
 
     #[tokio::test]
