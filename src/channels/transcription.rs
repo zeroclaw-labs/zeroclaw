@@ -138,21 +138,28 @@ async fn transcribe_with_whisper_cpp(
         tokio::fs::remove_file(tmp).await.ok();
     }
 
-    let output = result?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let output = match result {
+        Ok(o) => o,
+        Err(e) => {
+            // Clean up out_dir before propagating the error (timeout or spawn failure).
+            let _ = tokio::fs::remove_dir_all(&out_dir).await;
+            return Err(e);
+        }
+    };
+    // Log metadata only — stdout/stderr may contain transcript content.
     tracing::debug!(
-        "whisper-cli exit={:?} stdout={:?} stderr={:?}",
+        "whisper-cli exit={:?} stdout_bytes={} stderr_bytes={}",
         output.status.code(),
-        stdout.trim(),
-        stderr.trim()
+        output.stdout.len(),
+        output.stderr.len()
     );
 
     if !output.status.success() {
         let _ = tokio::fs::remove_dir_all(&out_dir).await;
         anyhow::bail!(
-            "whisper-cli failed (exit {:?}): {stderr}",
-            output.status.code()
+            "whisper-cli failed (exit {:?}): {} bytes of stderr",
+            output.status.code(),
+            output.stderr.len()
         );
     }
 
@@ -197,17 +204,28 @@ async fn transcribe_with_python_whisper(file_path: &str) -> anyhow::Result<Strin
         file_path,
     ]);
     whisper_cmd.kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(120), whisper_cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("whisper CLI timed out after 120s"))?
-        .context("whisper CLI error")?;
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_secs(120), whisper_cmd.output()).await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+                return Err(anyhow::anyhow!("whisper CLI error: {e}"));
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+                return Err(anyhow::anyhow!("whisper CLI timed out after 120s"));
+            }
+        };
 
     if !output.status.success() {
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            tracing::debug!("whisper stderr: {stderr}");
-        }
+        // Log byte counts only — stderr may contain transcript fragments.
+        tracing::debug!(
+            "whisper CLI failed: exit={:?} stderr_bytes={}",
+            output.status.code(),
+            output.stderr.len()
+        );
         anyhow::bail!("whisper CLI failed (exit {:?})", output.status.code());
     }
 

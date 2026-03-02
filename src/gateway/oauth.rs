@@ -141,6 +141,14 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
+/// Shared HTTP client for all OAuth provider calls with a 30-second timeout.
+fn oauth_http_client() -> reqwest::Client {
+    reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 /// GET /auth/{service} — initiate OAuth flow.
@@ -165,7 +173,7 @@ pub async fn handle_auth_start(
 }
 
 async fn start_google_oauth(state: &AppState) -> Response {
-    let (client_id, _) = {
+    let (client_id, client_secret) = {
         let cfg = state.config.lock();
         (
             cfg.oauth.google.client_id.clone(),
@@ -173,7 +181,7 @@ async fn start_google_oauth(state: &AppState) -> Response {
         )
     };
 
-    if client_id.is_empty() {
+    if client_id.is_empty() || client_secret.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Google OAuth not configured. Set [oauth.google] client_id and client_secret in config.toml",
@@ -205,6 +213,13 @@ async fn start_google_oauth(state: &AppState) -> Response {
             format!("Failed to store PKCE verifier: {e}"),
         )
             .into_response();
+    }
+    // Apply restrictive permissions so the PKCE state is not world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(&pkce_file, perms);
     }
 
     let redirect_uri = callback_url(state, "google");
@@ -314,7 +329,7 @@ async fn handle_google_callback(state: &AppState, query: OAuthCallback) -> Respo
     let redirect_uri = callback_url(state, "google");
 
     // Exchange code for tokens
-    let client = reqwest::Client::new();
+    let client = oauth_http_client();
     let resp = client
         .post(GOOGLE_TOKEN_URL)
         .form(&[
@@ -421,7 +436,7 @@ async fn handle_google_callback(state: &AppState, query: OAuthCallback) -> Respo
 }
 
 async fn fetch_google_email(access_token: &str) -> Option<String> {
-    let client = reqwest::Client::new();
+    let client = oauth_http_client();
     let resp = client
         .get("https://www.googleapis.com/oauth2/v2/userinfo")
         .bearer_auth(access_token)
@@ -518,12 +533,16 @@ pub async fn handle_auth_revoke(
 }
 
 async fn revoke_google_token(access_token: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    client
+    let client = oauth_http_client();
+    let resp = client
         .post("https://oauth2.googleapis.com/revoke")
         .query(&[("token", access_token)])
         .send()
         .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        tracing::warn!("Google token revocation returned non-success status: {status}");
+    }
     Ok(())
 }
 
@@ -543,7 +562,7 @@ pub async fn refresh_google_token(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No refresh_token stored. Reconnect at /auth/google"))?;
 
-    let client = reqwest::Client::new();
+    let client = oauth_http_client();
     let resp = client
         .post(GOOGLE_TOKEN_URL)
         .form(&[
@@ -613,9 +632,11 @@ impl IntoResponse for Html {
 }
 
 fn success_page(title: &str, message: &str) -> String {
+    let title_escaped = html_escape(title);
+    let message_escaped = html_escape(message);
     format!(
-        r#"<!DOCTYPE html><html><head><title>{title}</title></head><body>
-<h2>✅ {title}</h2><p>{message}</p>
+        r#"<!DOCTYPE html><html><head><title>{title_escaped}</title></head><body>
+<h2>✅ {title_escaped}</h2><p>{message_escaped}</p>
 <p><a href="/auth/status">View connected services</a></p>
 </body></html>"#
     )

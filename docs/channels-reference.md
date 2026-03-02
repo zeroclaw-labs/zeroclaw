@@ -3,6 +3,7 @@
 This document is the canonical reference for channel configuration in ZeroClaw.
 
 For encrypted Matrix rooms, also read the dedicated runbook:
+
 - [Matrix E2EE Guide](./matrix-e2ee-guide.md)
 
 ## Quick Paths
@@ -47,6 +48,7 @@ while remaining channels continue running.
 When running `zeroclaw channel start` (or daemon mode), runtime commands include:
 
 Telegram/Discord sender-scoped model routing:
+
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
@@ -54,6 +56,7 @@ Telegram/Discord sender-scoped model routing:
 - `/new` — clear conversation history and start a fresh session
 
 Supervised tool approvals (all non-CLI channels):
+
 - `/approve-request <tool-name>` — create a pending approval request
 - `/approve-confirm <request-id>` — confirm pending request (same sender + same chat/channel only)
 - `/approve-allow <request-id>` — approve the current pending runtime execution request once (no policy persistence)
@@ -70,9 +73,9 @@ Notes:
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 - Natural-language approval intents are supported with strict parsing and policy control:
-  - `direct` mode (default): `授权工具 shell` grants immediately.
-  - `request_confirm` mode: `授权工具 shell` creates pending request, then confirm with request ID.
-  - `disabled` mode: approval-management must use slash commands.
+    - `direct` mode (default): `授权工具 shell` grants immediately.
+    - `request_confirm` mode: `授权工具 shell` creates pending request, then confirm with request ID.
+    - `disabled` mode: approval-management must use slash commands.
 - You can override natural-language approval mode per channel via `[autonomy].non_cli_natural_language_approval_mode_by_channel`.
 - Approval commands are intercepted before LLM execution, so the model cannot self-escalate permissions through tool calls.
 - You can restrict who can use approval-management commands via `[autonomy].non_cli_approval_approvers`.
@@ -85,11 +88,11 @@ Notes:
 
 ZeroClaw supports multimodal input through inline message markers:
 
-- Syntax: ``[IMAGE:<source>]``
+- Syntax: `[IMAGE:<source>]`
 - `<source>` can be:
-  - Local file path
-  - Data URI (`data:image/...;base64,...`)
-  - Remote URL only when `[multimodal].allow_remote_fetch = true`
+    - Local file path
+    - Data URI (`data:image/...;base64,...`)
+    - Remote URL only when `[multimodal].allow_remote_fetch = true`
 
 Operational notes:
 
@@ -128,29 +131,29 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 
 ## 2. Delivery Modes at a Glance
 
-| Channel | Receive mode | Public inbound port required? |
-|---|---|---|
-| CLI | local stdin/stdout | No |
-| Telegram | polling | No |
-| Discord | gateway/websocket | No |
-| Slack | events API | No (token-based channel flow) |
-| Mattermost | polling | No |
-| Matrix | sync API (supports E2EE) | No |
-| Signal | signal-cli HTTP bridge | No (local bridge endpoint) |
-| WhatsApp | webhook (Cloud API) or websocket (Web mode) | Cloud API: Yes (public HTTPS callback), Web mode: No |
-| Nextcloud Talk | webhook (`/nextcloud-talk`) | Yes (public HTTPS callback) |
-| Webhook | gateway endpoint (`/webhook`) | Usually yes |
-| Email | IMAP polling + SMTP send | No |
-| IRC | IRC socket | No |
-| Lark | websocket (default) or webhook | Webhook mode only |
-| Feishu | websocket (default) or webhook | Webhook mode only |
-| DingTalk | stream mode | No |
-| QQ | bot gateway | No |
-| Napcat | websocket receive + HTTP send (OneBot) | No (typically local/LAN) |
-| Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
-| iMessage | local integration | No |
-| ACP | stdio (JSON-RPC 2.0) | No |
-| Nostr | relay websocket (NIP-04 / NIP-17) | No |
+| Channel        | Receive mode                                | Public inbound port required?                        |
+| -------------- | ------------------------------------------- | ---------------------------------------------------- |
+| CLI            | local stdin/stdout                          | No                                                   |
+| Telegram       | polling                                     | No                                                   |
+| Discord        | gateway/websocket                           | No                                                   |
+| Slack          | events API                                  | No (token-based channel flow)                        |
+| Mattermost     | polling                                     | No                                                   |
+| Matrix         | sync API (supports E2EE)                    | No                                                   |
+| Signal         | signal-cli HTTP bridge                      | No (local bridge endpoint)                           |
+| WhatsApp       | webhook (Cloud API) or websocket (Web mode) | Cloud API: Yes (public HTTPS callback), Web mode: No |
+| Nextcloud Talk | webhook (`/nextcloud-talk`)                 | Yes (public HTTPS callback)                          |
+| Webhook        | gateway endpoint (`/webhook`)               | Usually yes                                          |
+| Email          | IMAP polling + SMTP send                    | No                                                   |
+| IRC            | IRC socket                                  | No                                                   |
+| Lark           | websocket (default) or webhook              | Webhook mode only                                    |
+| Feishu         | websocket (default) or webhook              | Webhook mode only                                    |
+| DingTalk       | stream mode                                 | No                                                   |
+| QQ             | bot gateway                                 | No                                                   |
+| Napcat         | websocket receive + HTTP send (OneBot)      | No (typically local/LAN)                             |
+| Linq           | webhook (`/linq`)                           | Yes (public HTTPS callback)                          |
+| iMessage       | BlueBubbles webhook (`/bluebubbles`)        | Yes (reachable from BlueBubbles server)              |
+| ACP            | stdio (JSON-RPC 2.0)                        | No                                                   |
+| Nostr          | relay websocket (NIP-04 / NIP-17)           | No                                                   |
 
 ---
 
@@ -496,8 +499,8 @@ Notes:
 - Inbound messages are consumed from Napcat's WebSocket stream.
 - Outbound sends use OneBot-compatible HTTP endpoints (`send_private_msg` / `send_group_msg`).
 - Recipients:
-  - `user:<qq_user_id>` for private messages
-  - `group:<qq_group_id>` for group messages
+    - `user:<qq_user_id>` for private messages
+    - `group:<qq_group_id>` for group messages
 - Outbound reply chaining uses incoming message ids via CQ reply tags.
 
 ### 4.17 Nextcloud Talk
@@ -558,6 +561,7 @@ allowed_users = ["*"]  # empty = deny all, "*" = allow all
 ```
 
 Notes:
+
 - ACP uses JSON-RPC 2.0 protocol over stdio with newline-delimited messages.
 - Requires `opencode` binary in PATH or specified via `opencode_path`.
 - The channel starts OpenCode subprocess via `opencode acp` command.
@@ -589,11 +593,12 @@ If a channel appears connected but does not respond:
 2. Confirm bot account membership/permissions in target room/channel.
 3. Confirm tokens/secrets are valid (and not expired/revoked).
 4. Confirm transport mode assumptions:
-   - polling/websocket channels do not need public inbound HTTP
-   - webhook channels do need reachable HTTPS callback
+    - polling/websocket channels do not need public inbound HTTP
+    - webhook channels do need reachable HTTPS callback
 5. Restart `zeroclaw daemon` after config changes.
 
 For Matrix encrypted rooms specifically, use:
+
 - [Matrix E2EE Guide](./matrix-e2ee-guide.md)
 
 ---
@@ -616,25 +621,25 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 
 ### 7.2 Keyword table
 
-| Component | Startup / healthy signal | Authorization / policy signal | Transport / failure signal |
-|---|---|---|---|
-| Telegram | `Telegram channel listening for messages...` | `Telegram: ignoring message from unauthorized user:` | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):` |
-| Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
-| Slack | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:` |
-| Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
-| Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
-| Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
-| WhatsApp (channel) | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
-| Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
-| Email | `Email polling every ...` / `Email sent to ...` | `Blocked email from ...` | `Email poll failed:` / `Email poll task panicked:` |
-| IRC | `IRC channel connecting to ...` / `IRC registered as ...` | (allowlist checks are enforced by `allowed_users`) | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
-| Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
-| DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
-| QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
-| Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
-| iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
-| ACP | `ACP channel started` | `ACP: ignoring message from unauthorized user:` | `ACP process exited unexpectedly:` / `ACP JSON-RPC timeout:` / `ACP process spawn failed:` |
-| Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |
+| Component                    | Startup / healthy signal                                                                                        | Authorization / policy signal                                                                                                                                                         | Transport / failure signal                                                                                                |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Telegram                     | `Telegram channel listening for messages...`                                                                    | `Telegram: ignoring message from unauthorized user:`                                                                                                                                  | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):`                                     |
+| Discord                      | `Discord: connected and identified`                                                                             | `Discord: ignoring message from unauthorized user:`                                                                                                                                   | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)`                                         |
+| Slack                        | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:`                                                                                                                                     | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:`                                            |
+| Mattermost                   | `Mattermost channel listening on`                                                                               | `Mattermost: ignoring message from unauthorized user:`                                                                                                                                | `Mattermost poll error:` / `Mattermost parse error:`                                                                      |
+| Matrix                       | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:`  | `Matrix sync error: ... retrying...`                                                                                      |
+| Signal                       | `Signal channel listening via SSE on`                                                                           | (allowlist checks are enforced by `allowed_from`)                                                                                                                                     | `Signal SSE returned ...` / `Signal SSE connect error:`                                                                   |
+| WhatsApp (channel)           | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully`                               | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list`                                                                         | `WhatsApp send failed:` / `WhatsApp Web stream error:`                                                                    |
+| Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully`                                                                        | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:`                                                                                               |
+| Email                        | `Email polling every ...` / `Email sent to ...`                                                                 | `Blocked email from ...`                                                                                                                                                              | `Email poll failed:` / `Email poll task panicked:`                                                                        |
+| IRC                          | `IRC channel connecting to ...` / `IRC registered as ...`                                                       | (allowlist checks are enforced by `allowed_users`)                                                                                                                                    | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
+| Lark / Feishu                | `Lark: WS connected` / `Lark event callback server listening on`                                                | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:`                                                                                     | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:`                      |
+| DingTalk                     | `DingTalk: connected and listening for messages...`                                                             | `DingTalk: ignoring message from unauthorized user:`                                                                                                                                  | `DingTalk WebSocket error:` / `DingTalk: message channel closed`                                                          |
+| QQ                           | `QQ: connected and identified`                                                                                  | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:`                                                                             | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed`                    |
+| Nextcloud Talk (gateway)     | `POST /nextcloud-talk — Nextcloud Talk bot webhook`                                                             | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:`                                                                  | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:`                                                   |
+| iMessage                     | `iMessage channel listening (AppleScript bridge)...`                                                            | (contact allowlist enforced by `allowed_contacts`)                                                                                                                                    | `iMessage poll error:`                                                                                                    |
+| ACP                          | `ACP channel started`                                                                                           | `ACP: ignoring message from unauthorized user:`                                                                                                                                       | `ACP process exited unexpectedly:` / `ACP JSON-RPC timeout:` / `ACP process spawn failed:`                                |
+| Nostr                        | `Nostr channel listening as npub1...`                                                                           | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:`                                                               | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down`                 |
 
 ### 7.3 Runtime supervisor keywords
 

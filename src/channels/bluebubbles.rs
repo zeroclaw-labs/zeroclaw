@@ -506,7 +506,10 @@ impl BlueBubblesChannel {
                 anyhow::bail!("BB attachment too large ({len} bytes, max {MAX_BYTES})");
             }
         }
-        let bytes = resp.bytes().await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow::anyhow!("BB attachment body read failed: {}", e.without_url()))?;
         if bytes.len() > MAX_BYTES {
             anyhow::bail!(
                 "BB attachment too large ({} bytes, max {MAX_BYTES})",
@@ -647,7 +650,23 @@ impl BlueBubblesChannel {
                         format!("{existing}\n[Voice] {transcript}")
                     };
                     obj.insert("text".into(), serde_json::Value::String(new_text));
-                    obj.insert("attachments".into(), serde_json::Value::Array(vec![]));
+                    // Remove only audio attachments; preserve non-audio (images, files)
+                    // so parse_webhook_payload retains their [IMAGE:…] / placeholder context.
+                    if let Some(atts) = obj.get("attachments").and_then(|a| a.as_array()) {
+                        let non_audio: Vec<serde_json::Value> = atts
+                            .iter()
+                            .filter(|a| {
+                                let mime = a
+                                    .get("mimeType")
+                                    .or_else(|| a.get("mime_type"))
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("");
+                                !mime.starts_with("audio/")
+                            })
+                            .cloned()
+                            .collect();
+                        obj.insert("attachments".into(), serde_json::Value::Array(non_audio));
+                    }
                 }
                 let enriched_payload = serde_json::json!({"type": "new-message", "data": enriched});
                 self.parse_webhook_payload(&enriched_payload)
