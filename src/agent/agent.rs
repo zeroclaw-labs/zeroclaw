@@ -288,7 +288,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let all_tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -303,6 +303,36 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+        let tools = if config.agent.allowed_tools.is_empty() {
+            all_tools
+        } else {
+            let allowed: std::collections::HashSet<_> = config
+                .agent
+                .allowed_tools
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .collect();
+
+            let filtered: Vec<_> = all_tools
+                .into_iter()
+                .filter(|tool| allowed.contains(tool.name()))
+                .collect();
+            let registered_names: std::collections::HashSet<_> =
+                filtered.iter().map(|tool| tool.name()).collect();
+
+            for name in &config.agent.allowed_tools {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() && !registered_names.contains(trimmed) {
+                    tracing::warn!(
+                        "main agent: ignored non-existent tool in allowed_tools: \"{}\"",
+                        trimmed
+                    );
+                }
+            }
+
+            filtered
+        };
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 

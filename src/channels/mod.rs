@@ -1194,6 +1194,40 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .clone()
 }
 
+fn filter_tools_by_agent_allowlist(
+    tools: Vec<Box<dyn Tool>>,
+    allowed_tools: &[String],
+) -> Vec<Box<dyn Tool>> {
+    if allowed_tools.is_empty() {
+        return tools;
+    }
+
+    let allowed: std::collections::HashSet<_> = allowed_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let filtered: Vec<_> = tools
+        .into_iter()
+        .filter(|tool| allowed.contains(tool.name()))
+        .collect();
+    let registered_names: std::collections::HashSet<_> =
+        filtered.iter().map(|tool| tool.name()).collect();
+
+    for name in allowed_tools {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !registered_names.contains(trimmed) {
+            tracing::warn!(
+                "main agent: ignored non-existent tool in allowed_tools: \"{}\"",
+                trimmed
+            );
+        }
+    }
+
+    filtered
+}
+
 fn filtered_tool_specs_for_runtime(
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
@@ -5489,6 +5523,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
+    built_tools = filter_tools_by_agent_allowlist(built_tools, &config.agent.allowed_tools);
     let tools_registry = Arc::new(built_tools);
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
@@ -5566,6 +5601,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "subagent_manage",
             "Manage a background sub-agent: 'status' to check progress/output, 'kill' to cancel a running session.",
         ));
+    }
+
+    if !config.agent.allowed_tools.is_empty() {
+        let allowed: std::collections::HashSet<_> = config
+            .agent
+            .allowed_tools
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .collect();
+        tool_descs.retain(|(name, _)| allowed.contains(*name));
     }
 
     // Filter out tools excluded for non-CLI channels so the system prompt
