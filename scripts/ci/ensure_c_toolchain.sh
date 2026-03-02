@@ -46,12 +46,28 @@ if command -v clang >/dev/null 2>&1; then
     exit 0
 fi
 
-if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    echo "C compiler not found. Installing build-essential via apt..."
-    sudo apt-get update
-    sudo apt-get install -y build-essential
-    configure_linker "$(command -v cc)"
-    exit 0
+if command -v apt-get >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ] || (command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1); then
+        echo "C compiler not found. Installing build-essential via apt..."
+        if [ "$(id -u)" -eq 0 ]; then
+            apt-get update
+            apt-get install -y build-essential
+        else
+            sudo -n apt-get update
+            sudo -n apt-get install -y build-essential
+        fi
+        configure_linker "$(command -v cc)"
+        exit 0
+    fi
+    echo "No passwordless sudo available for apt install; falling back to portable toolchain bootstrap."
+fi
+
+if [ -x "./scripts/ci/ensure_cc.sh" ]; then
+    ./scripts/ci/ensure_cc.sh
+    if command -v cc >/dev/null 2>&1; then
+        configure_linker "$(command -v cc)"
+        exit 0
+    fi
 fi
 
 echo "No usable C compiler found (cc/gcc/clang)." >&2
