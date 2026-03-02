@@ -816,6 +816,22 @@ fn default_agent_teams_max_agents() -> usize {
     32
 }
 
+fn default_agent_teams_load_window_secs() -> usize {
+    120
+}
+
+fn default_agent_teams_inflight_penalty() -> usize {
+    8
+}
+
+fn default_agent_teams_recent_selection_penalty() -> usize {
+    2
+}
+
+fn default_agent_teams_recent_failure_penalty() -> usize {
+    12
+}
+
 fn default_subagents_enabled() -> bool {
     true
 }
@@ -826,6 +842,43 @@ fn default_subagents_auto_activate() -> bool {
 
 fn default_subagents_max_concurrent() -> usize {
     10
+}
+
+fn default_subagents_load_window_secs() -> usize {
+    180
+}
+
+fn default_subagents_inflight_penalty() -> usize {
+    10
+}
+
+fn default_subagents_recent_selection_penalty() -> usize {
+    3
+}
+
+fn default_subagents_recent_failure_penalty() -> usize {
+    16
+}
+
+fn default_subagents_queue_wait_ms() -> usize {
+    15_000
+}
+
+fn default_subagents_queue_poll_ms() -> usize {
+    200
+}
+
+/// Runtime load-balancing strategy for team/subagent orchestration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoadBalanceStrategy {
+    /// Preserve lexical/metadata scoring priority only.
+    Semantic,
+    /// Blend semantic score with runtime load and recent outcomes.
+    #[default]
+    Adaptive,
+    /// Prioritize least-loaded healthy agents before semantic tie-breakers.
+    LeastLoaded,
 }
 
 /// Delegate coordination runtime configuration (`[coordination]` section).
@@ -881,6 +934,21 @@ pub struct AgentTeamsConfig {
     /// Maximum number of delegate profiles activated as team members.
     #[serde(default = "default_agent_teams_max_agents")]
     pub max_agents: usize,
+    /// Runtime strategy used for automatic team-agent selection.
+    #[serde(default)]
+    pub strategy: AgentLoadBalanceStrategy,
+    /// Sliding window (seconds) used to compute recent load/failure signals.
+    #[serde(default = "default_agent_teams_load_window_secs")]
+    pub load_window_secs: usize,
+    /// Penalty multiplier applied to each currently in-flight task.
+    #[serde(default = "default_agent_teams_inflight_penalty")]
+    pub inflight_penalty: usize,
+    /// Penalty multiplier applied to recent assignment count in load window.
+    #[serde(default = "default_agent_teams_recent_selection_penalty")]
+    pub recent_selection_penalty: usize,
+    /// Penalty multiplier applied to recent failure count in load window.
+    #[serde(default = "default_agent_teams_recent_failure_penalty")]
+    pub recent_failure_penalty: usize,
 }
 
 impl Default for AgentTeamsConfig {
@@ -889,6 +957,11 @@ impl Default for AgentTeamsConfig {
             enabled: default_agent_teams_enabled(),
             auto_activate: default_agent_teams_auto_activate(),
             max_agents: default_agent_teams_max_agents(),
+            strategy: AgentLoadBalanceStrategy::default(),
+            load_window_secs: default_agent_teams_load_window_secs(),
+            inflight_penalty: default_agent_teams_inflight_penalty(),
+            recent_selection_penalty: default_agent_teams_recent_selection_penalty(),
+            recent_failure_penalty: default_agent_teams_recent_failure_penalty(),
         }
     }
 }
@@ -908,6 +981,28 @@ pub struct SubAgentsConfig {
     /// Maximum number of concurrently running background sub-agents.
     #[serde(default = "default_subagents_max_concurrent")]
     pub max_concurrent: usize,
+    /// Runtime strategy used for automatic sub-agent selection.
+    #[serde(default)]
+    pub strategy: AgentLoadBalanceStrategy,
+    /// Sliding window (seconds) used to compute recent load/failure signals.
+    #[serde(default = "default_subagents_load_window_secs")]
+    pub load_window_secs: usize,
+    /// Penalty multiplier applied to each currently in-flight task.
+    #[serde(default = "default_subagents_inflight_penalty")]
+    pub inflight_penalty: usize,
+    /// Penalty multiplier applied to recent assignment count in load window.
+    #[serde(default = "default_subagents_recent_selection_penalty")]
+    pub recent_selection_penalty: usize,
+    /// Penalty multiplier applied to recent failure count in load window.
+    #[serde(default = "default_subagents_recent_failure_penalty")]
+    pub recent_failure_penalty: usize,
+    /// When at concurrency limit, wait this long for a slot before failing.
+    /// Set to `0` for immediate fail-fast behavior.
+    #[serde(default = "default_subagents_queue_wait_ms")]
+    pub queue_wait_ms: usize,
+    /// Poll interval while waiting for a concurrency slot.
+    #[serde(default = "default_subagents_queue_poll_ms")]
+    pub queue_poll_ms: usize,
 }
 
 impl Default for SubAgentsConfig {
@@ -916,6 +1011,13 @@ impl Default for SubAgentsConfig {
             enabled: default_subagents_enabled(),
             auto_activate: default_subagents_auto_activate(),
             max_concurrent: default_subagents_max_concurrent(),
+            strategy: AgentLoadBalanceStrategy::default(),
+            load_window_secs: default_subagents_load_window_secs(),
+            inflight_penalty: default_subagents_inflight_penalty(),
+            recent_selection_penalty: default_subagents_recent_selection_penalty(),
+            recent_failure_penalty: default_subagents_recent_failure_penalty(),
+            queue_wait_ms: default_subagents_queue_wait_ms(),
+            queue_poll_ms: default_subagents_queue_poll_ms(),
         }
     }
 }
@@ -8401,8 +8503,17 @@ impl Config {
         if self.agent.teams.max_agents == 0 {
             anyhow::bail!("agent.teams.max_agents must be greater than 0");
         }
+        if self.agent.teams.load_window_secs == 0 {
+            anyhow::bail!("agent.teams.load_window_secs must be greater than 0");
+        }
         if self.agent.subagents.max_concurrent == 0 {
             anyhow::bail!("agent.subagents.max_concurrent must be greater than 0");
+        }
+        if self.agent.subagents.load_window_secs == 0 {
+            anyhow::bail!("agent.subagents.load_window_secs must be greater than 0");
+        }
+        if self.agent.subagents.queue_poll_ms == 0 {
+            anyhow::bail!("agent.subagents.queue_poll_ms must be greater than 0");
         }
 
         // WASM config
@@ -14377,9 +14488,27 @@ sensitivity = 0.9
         assert!(config.agent.teams.enabled);
         assert!(config.agent.teams.auto_activate);
         assert_eq!(config.agent.teams.max_agents, 32);
+        assert_eq!(
+            config.agent.teams.strategy,
+            AgentLoadBalanceStrategy::Adaptive
+        );
+        assert_eq!(config.agent.teams.load_window_secs, 120);
+        assert_eq!(config.agent.teams.inflight_penalty, 8);
+        assert_eq!(config.agent.teams.recent_selection_penalty, 2);
+        assert_eq!(config.agent.teams.recent_failure_penalty, 12);
         assert!(config.agent.subagents.enabled);
         assert!(config.agent.subagents.auto_activate);
         assert_eq!(config.agent.subagents.max_concurrent, 10);
+        assert_eq!(
+            config.agent.subagents.strategy,
+            AgentLoadBalanceStrategy::Adaptive
+        );
+        assert_eq!(config.agent.subagents.load_window_secs, 180);
+        assert_eq!(config.agent.subagents.inflight_penalty, 10);
+        assert_eq!(config.agent.subagents.recent_selection_penalty, 3);
+        assert_eq!(config.agent.subagents.recent_failure_penalty, 16);
+        assert_eq!(config.agent.subagents.queue_wait_ms, 15_000);
+        assert_eq!(config.agent.subagents.queue_poll_ms, 200);
     }
 
     #[test]
@@ -14394,9 +14523,21 @@ sensitivity = 0.9
         config.agent.teams.enabled = false;
         config.agent.teams.auto_activate = false;
         config.agent.teams.max_agents = 7;
+        config.agent.teams.strategy = AgentLoadBalanceStrategy::LeastLoaded;
+        config.agent.teams.load_window_secs = 90;
+        config.agent.teams.inflight_penalty = 6;
+        config.agent.teams.recent_selection_penalty = 1;
+        config.agent.teams.recent_failure_penalty = 4;
         config.agent.subagents.enabled = true;
         config.agent.subagents.auto_activate = false;
         config.agent.subagents.max_concurrent = 4;
+        config.agent.subagents.strategy = AgentLoadBalanceStrategy::Semantic;
+        config.agent.subagents.load_window_secs = 45;
+        config.agent.subagents.inflight_penalty = 5;
+        config.agent.subagents.recent_selection_penalty = 2;
+        config.agent.subagents.recent_failure_penalty = 9;
+        config.agent.subagents.queue_wait_ms = 1_000;
+        config.agent.subagents.queue_poll_ms = 50;
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -14409,9 +14550,27 @@ sensitivity = 0.9
         assert!(!parsed.agent.teams.enabled);
         assert!(!parsed.agent.teams.auto_activate);
         assert_eq!(parsed.agent.teams.max_agents, 7);
+        assert_eq!(
+            parsed.agent.teams.strategy,
+            AgentLoadBalanceStrategy::LeastLoaded
+        );
+        assert_eq!(parsed.agent.teams.load_window_secs, 90);
+        assert_eq!(parsed.agent.teams.inflight_penalty, 6);
+        assert_eq!(parsed.agent.teams.recent_selection_penalty, 1);
+        assert_eq!(parsed.agent.teams.recent_failure_penalty, 4);
         assert!(parsed.agent.subagents.enabled);
         assert!(!parsed.agent.subagents.auto_activate);
         assert_eq!(parsed.agent.subagents.max_concurrent, 4);
+        assert_eq!(
+            parsed.agent.subagents.strategy,
+            AgentLoadBalanceStrategy::Semantic
+        );
+        assert_eq!(parsed.agent.subagents.load_window_secs, 45);
+        assert_eq!(parsed.agent.subagents.inflight_penalty, 5);
+        assert_eq!(parsed.agent.subagents.recent_selection_penalty, 2);
+        assert_eq!(parsed.agent.subagents.recent_failure_penalty, 9);
+        assert_eq!(parsed.agent.subagents.queue_wait_ms, 1_000);
+        assert_eq!(parsed.agent.subagents.queue_poll_ms, 50);
     }
 
     #[test]
@@ -14468,6 +14627,27 @@ sensitivity = 0.9
             .validate()
             .expect_err("expected subagent concurrency validation failure");
         assert!(err.to_string().contains("agent.subagents.max_concurrent"));
+
+        let mut config = Config::default();
+        config.agent.teams.load_window_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("expected team load window validation failure");
+        assert!(err.to_string().contains("agent.teams.load_window_secs"));
+
+        let mut config = Config::default();
+        config.agent.subagents.load_window_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("expected subagent load window validation failure");
+        assert!(err.to_string().contains("agent.subagents.load_window_secs"));
+
+        let mut config = Config::default();
+        config.agent.subagents.queue_poll_ms = 0;
+        let err = config
+            .validate()
+            .expect_err("expected subagent queue poll validation failure");
+        assert!(err.to_string().contains("agent.subagents.queue_poll_ms"));
     }
 
     #[test]

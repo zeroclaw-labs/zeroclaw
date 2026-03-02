@@ -1,8 +1,9 @@
-use super::agent_selection::select_agent;
+use super::agent_load_tracker::AgentLoadTracker;
+use super::agent_selection::{select_agent_with_load, AgentSelectionPolicy};
 use super::orchestration_settings::load_orchestration_settings;
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
-use crate::config::DelegateAgentConfig;
+use crate::config::{AgentTeamsConfig, DelegateAgentConfig};
 use crate::coordination::{CoordinationEnvelope, CoordinationPayload, InMemoryMessageBus};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
@@ -46,12 +47,10 @@ pub struct DelegateTool {
     coordination_bus: Option<InMemoryMessageBus>,
     /// Logical lead agent identity used in coordination trace events.
     coordination_lead_agent: String,
-    /// Whether to automatically select an agent when `agent` is omitted or `auto`.
-    auto_activate: bool,
-    /// Whether team delegation is currently enabled.
-    teams_enabled: bool,
-    /// Maximum active team agent profiles considered for automatic selection.
-    max_team_agents: usize,
+    /// Team orchestration and load-balance settings.
+    team_settings: AgentTeamsConfig,
+    /// Shared runtime load tracker across delegate/subagent tools.
+    load_tracker: AgentLoadTracker,
     /// Optional runtime config file path for hot-reloaded orchestration settings.
     runtime_config_path: Option<PathBuf>,
 }
@@ -87,9 +86,8 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
-            auto_activate: true,
-            teams_enabled: true,
-            max_team_agents: usize::MAX,
+            team_settings: AgentTeamsConfig::default(),
+            load_tracker: AgentLoadTracker::new(),
             runtime_config_path: None,
         }
     }
@@ -130,9 +128,8 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
-            auto_activate: true,
-            teams_enabled: true,
-            max_team_agents: usize::MAX,
+            team_settings: AgentTeamsConfig::default(),
+            load_tracker: AgentLoadTracker::new(),
             runtime_config_path: None,
         }
     }
@@ -151,7 +148,7 @@ impl DelegateTool {
 
     /// Set whether agent selection can auto-resolve from task/context.
     pub fn with_auto_activate(mut self, auto_activate: bool) -> Self {
-        self.auto_activate = auto_activate;
+        self.team_settings.auto_activate = auto_activate;
         self
     }
 
@@ -163,10 +160,16 @@ impl DelegateTool {
         max_team_agents: usize,
         runtime_config_path: Option<PathBuf>,
     ) -> Self {
-        self.teams_enabled = teams_enabled;
-        self.auto_activate = auto_activate;
-        self.max_team_agents = max_team_agents.max(1);
+        self.team_settings.enabled = teams_enabled;
+        self.team_settings.auto_activate = auto_activate;
+        self.team_settings.max_agents = max_team_agents.max(1);
         self.runtime_config_path = runtime_config_path;
+        self
+    }
+
+    /// Reuse a shared runtime load tracker.
+    pub fn with_load_tracker(mut self, load_tracker: AgentLoadTracker) -> Self {
+        self.load_tracker = load_tracker;
         self
     }
 
@@ -207,17 +210,17 @@ impl DelegateTool {
         self.coordination_bus.clone()
     }
 
-    fn runtime_team_settings(&self) -> (bool, bool, usize) {
-        let mut teams_enabled = self.teams_enabled;
-        let mut auto_activate = self.auto_activate;
-        let mut max_team_agents = self.max_team_agents.max(1);
+    fn runtime_team_settings(&self) -> AgentTeamsConfig {
+        let mut settings = self.team_settings.clone();
+        settings.max_agents = settings.max_agents.max(1);
+        settings.load_window_secs = settings.load_window_secs.max(1);
 
         if let Some(path) = self.runtime_config_path.as_deref() {
             match load_orchestration_settings(path) {
                 Ok((teams, _subagents)) => {
-                    teams_enabled = teams.enabled;
-                    auto_activate = teams.auto_activate;
-                    max_team_agents = teams.max_agents.max(1);
+                    settings = teams;
+                    settings.max_agents = settings.max_agents.max(1);
+                    settings.load_window_secs = settings.load_window_secs.max(1);
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -228,7 +231,7 @@ impl DelegateTool {
             }
         }
 
-        (teams_enabled, auto_activate, max_team_agents)
+        settings
     }
 }
 
@@ -300,8 +303,8 @@ impl Tool for DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
-        let (teams_enabled, auto_activate, max_team_agents) = self.runtime_team_settings();
-        if !teams_enabled {
+        let team_settings = self.runtime_team_settings();
+        if !team_settings.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -312,13 +315,26 @@ impl Tool for DelegateTool {
             });
         }
 
-        let selection = match select_agent(
+        let load_window_secs = u64::try_from(team_settings.load_window_secs).unwrap_or(1);
+        let load_snapshot = self
+            .load_tracker
+            .snapshot(Duration::from_secs(load_window_secs.max(1)));
+        let selection_policy = AgentSelectionPolicy {
+            strategy: team_settings.strategy,
+            inflight_penalty: team_settings.inflight_penalty,
+            recent_selection_penalty: team_settings.recent_selection_penalty,
+            recent_failure_penalty: team_settings.recent_failure_penalty,
+        };
+
+        let selection = match select_agent_with_load(
             self.agents.as_ref(),
             requested_agent,
             prompt,
             context,
-            auto_activate,
-            Some(max_team_agents),
+            team_settings.auto_activate,
+            Some(team_settings.max_agents),
+            Some(&load_snapshot),
+            selection_policy,
         ) {
             Ok(selection) => selection,
             Err(error) => {
@@ -363,6 +379,7 @@ impl Tool for DelegateTool {
             });
         }
 
+        let mut load_lease = self.load_tracker.start(agent_name);
         let coordination_trace =
             self.start_coordination_trace(agent_name, prompt, context, agent_config);
 
@@ -391,6 +408,7 @@ impl Tool for DelegateTool {
                     false,
                     &error_message,
                 );
+                load_lease.mark_failure();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -434,6 +452,11 @@ impl Tool for DelegateTool {
                 result.success,
                 summary,
             );
+            if result.success {
+                load_lease.mark_success();
+            } else {
+                load_lease.mark_failure();
+            }
 
             return Ok(result);
         }
@@ -461,6 +484,7 @@ impl Tool for DelegateTool {
                     false,
                     &timeout_message,
                 );
+                load_lease.mark_failure();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -481,6 +505,7 @@ impl Tool for DelegateTool {
                     model = agent_config.model
                 );
                 self.finish_coordination_trace(agent_name, &coordination_trace, true, &output);
+                load_lease.mark_success();
 
                 Ok(ToolResult {
                     success: true,
@@ -496,6 +521,7 @@ impl Tool for DelegateTool {
                     false,
                     &failure_message,
                 );
+                load_lease.mark_failure();
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),

@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agent_load_tracker;
 pub mod agent_selection;
 pub mod agents_ipc;
 pub mod apply_patch;
@@ -86,6 +87,7 @@ pub mod web_search_config;
 pub mod web_search_tool;
 pub mod xlsx_read;
 
+pub use agent_load_tracker::AgentLoadTracker;
 pub use apply_patch::ApplyPatchTool;
 #[allow(unused_imports)]
 pub use bg_run::{
@@ -563,6 +565,7 @@ pub fn all_tools_with_runtime(
         };
         let runtime_config_path = Some(root_config.config_path.clone());
         let parent_tools = Arc::new(tool_arcs.clone());
+        let load_tracker = AgentLoadTracker::new();
         let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents.clone(),
             delegate_fallback_credential.clone(),
@@ -571,6 +574,7 @@ pub fn all_tools_with_runtime(
         )
         .with_parent_tools(parent_tools.clone())
         .with_multimodal_config(root_config.multimodal.clone())
+        .with_load_tracker(load_tracker.clone())
         .with_runtime_team_settings(
             root_config.agent.teams.enabled,
             root_config.agent.teams.auto_activate,
@@ -623,19 +627,22 @@ pub fn all_tools_with_runtime(
         }
 
         let subagent_registry = Arc::new(SubAgentRegistry::new());
-        tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
-            all_agents,
-            delegate_fallback_credential,
-            security.clone(),
-            provider_runtime_options,
-            subagent_registry.clone(),
-            parent_tools,
-            root_config.multimodal.clone(),
-            root_config.agent.subagents.enabled,
-            root_config.agent.subagents.max_concurrent,
-            root_config.agent.subagents.auto_activate,
-            runtime_config_path,
-        )));
+        tool_arcs.push(Arc::new(
+            SubAgentSpawnTool::new(
+                all_agents,
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+                subagent_registry.clone(),
+                parent_tools,
+                root_config.multimodal.clone(),
+                root_config.agent.subagents.enabled,
+                root_config.agent.subagents.max_concurrent,
+                root_config.agent.subagents.auto_activate,
+                runtime_config_path,
+            )
+            .with_load_tracker(load_tracker),
+        ));
         tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
         tool_arcs.push(Arc::new(SubAgentManageTool::new(
             subagent_registry,

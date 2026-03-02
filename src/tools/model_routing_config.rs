@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{
-    AgentTeamsConfig, ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig,
-    SubAgentsConfig,
+    AgentLoadBalanceStrategy, AgentTeamsConfig, ClassificationRule, Config, DelegateAgentConfig,
+    ModelRouteConfig, SubAgentsConfig,
 };
 use crate::providers::has_provider_credential;
 use crate::security::SecurityPolicy;
@@ -241,6 +241,42 @@ impl ModelRoutingConfigTool {
         Ok(Some(value))
     }
 
+    fn parse_load_strategy(raw: &str, field: &str) -> anyhow::Result<AgentLoadBalanceStrategy> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "semantic" | "score_first" | "scored" => Ok(AgentLoadBalanceStrategy::Semantic),
+            "adaptive" | "balanced" | "load_adaptive" => Ok(AgentLoadBalanceStrategy::Adaptive),
+            "least_loaded" | "leastload" | "least_load" => {
+                Ok(AgentLoadBalanceStrategy::LeastLoaded)
+            }
+            _ => anyhow::bail!("'{field}' must be one of: semantic, adaptive, least_loaded"),
+        }
+    }
+
+    fn parse_optional_load_strategy_update(
+        args: &Value,
+        field: &str,
+    ) -> anyhow::Result<MaybeSet<AgentLoadBalanceStrategy>> {
+        let Some(raw) = args.get(field) else {
+            return Ok(MaybeSet::Unset);
+        };
+
+        if raw.is_null() {
+            return Ok(MaybeSet::Null);
+        }
+
+        let value = raw
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
+            .trim();
+
+        if value.is_empty() {
+            return Ok(MaybeSet::Null);
+        }
+
+        Ok(MaybeSet::Set(Self::parse_load_strategy(value, field)?))
+    }
+
     fn scenario_row(route: &ModelRouteConfig, rule: Option<&ClassificationRule>) -> Value {
         let classification = rule.map(|r| {
             json!({
@@ -336,11 +372,23 @@ impl ModelRoutingConfigTool {
                     "enabled": cfg.agent.teams.enabled,
                     "auto_activate": cfg.agent.teams.auto_activate,
                     "max_agents": cfg.agent.teams.max_agents,
+                    "strategy": cfg.agent.teams.strategy,
+                    "load_window_secs": cfg.agent.teams.load_window_secs,
+                    "inflight_penalty": cfg.agent.teams.inflight_penalty,
+                    "recent_selection_penalty": cfg.agent.teams.recent_selection_penalty,
+                    "recent_failure_penalty": cfg.agent.teams.recent_failure_penalty,
                 },
                 "subagents": {
                     "enabled": cfg.agent.subagents.enabled,
                     "auto_activate": cfg.agent.subagents.auto_activate,
                     "max_concurrent": cfg.agent.subagents.max_concurrent,
+                    "strategy": cfg.agent.subagents.strategy,
+                    "load_window_secs": cfg.agent.subagents.load_window_secs,
+                    "inflight_penalty": cfg.agent.subagents.inflight_penalty,
+                    "recent_selection_penalty": cfg.agent.subagents.recent_selection_penalty,
+                    "recent_failure_penalty": cfg.agent.subagents.recent_failure_penalty,
+                    "queue_wait_ms": cfg.agent.subagents.queue_wait_ms,
+                    "queue_poll_ms": cfg.agent.subagents.queue_poll_ms,
                 }
             }
         })
@@ -426,9 +474,21 @@ impl ModelRoutingConfigTool {
                         "teams_enabled": true,
                         "teams_auto_activate": true,
                         "max_team_agents": 12,
+                        "teams_strategy": "adaptive",
+                        "teams_load_window_secs": 120,
+                        "teams_inflight_penalty": 8,
+                        "teams_recent_selection_penalty": 2,
+                        "teams_recent_failure_penalty": 12,
                         "subagents_enabled": true,
                         "subagents_auto_activate": true,
-                        "max_concurrent_subagents": 4
+                        "max_concurrent_subagents": 4,
+                        "subagents_strategy": "adaptive",
+                        "subagents_load_window_secs": 180,
+                        "subagents_inflight_penalty": 10,
+                        "subagents_recent_selection_penalty": 3,
+                        "subagents_recent_failure_penalty": 16,
+                        "subagents_queue_wait_ms": 15000,
+                        "subagents_queue_poll_ms": 200
                     }
                 }
             }))?,
@@ -492,23 +552,64 @@ impl ModelRoutingConfigTool {
         let teams_enabled = Self::parse_optional_bool(args, "teams_enabled")?;
         let teams_auto_activate = Self::parse_optional_bool(args, "teams_auto_activate")?;
         let max_team_agents_update = Self::parse_optional_usize_update(args, "max_team_agents")?;
+        let teams_strategy_update =
+            Self::parse_optional_load_strategy_update(args, "teams_strategy")?;
+        let teams_load_window_secs_update =
+            Self::parse_optional_usize_update(args, "teams_load_window_secs")?;
+        let teams_inflight_penalty_update =
+            Self::parse_optional_usize_update(args, "teams_inflight_penalty")?;
+        let teams_recent_selection_penalty_update =
+            Self::parse_optional_usize_update(args, "teams_recent_selection_penalty")?;
+        let teams_recent_failure_penalty_update =
+            Self::parse_optional_usize_update(args, "teams_recent_failure_penalty")?;
 
         let subagents_enabled = Self::parse_optional_bool(args, "subagents_enabled")?;
         let subagents_auto_activate = Self::parse_optional_bool(args, "subagents_auto_activate")?;
         let max_concurrent_subagents_update =
             Self::parse_optional_usize_update(args, "max_concurrent_subagents")?;
+        let subagents_strategy_update =
+            Self::parse_optional_load_strategy_update(args, "subagents_strategy")?;
+        let subagents_load_window_secs_update =
+            Self::parse_optional_usize_update(args, "subagents_load_window_secs")?;
+        let subagents_inflight_penalty_update =
+            Self::parse_optional_usize_update(args, "subagents_inflight_penalty")?;
+        let subagents_recent_selection_penalty_update =
+            Self::parse_optional_usize_update(args, "subagents_recent_selection_penalty")?;
+        let subagents_recent_failure_penalty_update =
+            Self::parse_optional_usize_update(args, "subagents_recent_failure_penalty")?;
+        let subagents_queue_wait_ms_update =
+            Self::parse_optional_usize_update(args, "subagents_queue_wait_ms")?;
+        let subagents_queue_poll_ms_update =
+            Self::parse_optional_usize_update(args, "subagents_queue_poll_ms")?;
 
         let any_update = teams_enabled.is_some()
             || teams_auto_activate.is_some()
             || subagents_enabled.is_some()
             || subagents_auto_activate.is_some()
             || !matches!(max_team_agents_update, MaybeSet::Unset)
-            || !matches!(max_concurrent_subagents_update, MaybeSet::Unset);
+            || !matches!(teams_strategy_update, MaybeSet::Unset)
+            || !matches!(teams_load_window_secs_update, MaybeSet::Unset)
+            || !matches!(teams_inflight_penalty_update, MaybeSet::Unset)
+            || !matches!(teams_recent_selection_penalty_update, MaybeSet::Unset)
+            || !matches!(teams_recent_failure_penalty_update, MaybeSet::Unset)
+            || !matches!(max_concurrent_subagents_update, MaybeSet::Unset)
+            || !matches!(subagents_strategy_update, MaybeSet::Unset)
+            || !matches!(subagents_load_window_secs_update, MaybeSet::Unset)
+            || !matches!(subagents_inflight_penalty_update, MaybeSet::Unset)
+            || !matches!(subagents_recent_selection_penalty_update, MaybeSet::Unset)
+            || !matches!(subagents_recent_failure_penalty_update, MaybeSet::Unset)
+            || !matches!(subagents_queue_wait_ms_update, MaybeSet::Unset)
+            || !matches!(subagents_queue_poll_ms_update, MaybeSet::Unset);
         if !any_update {
             anyhow::bail!(
                 "set_orchestration requires at least one field: \
                  teams_enabled, teams_auto_activate, max_team_agents, \
-                 subagents_enabled, subagents_auto_activate, max_concurrent_subagents"
+                 teams_strategy, teams_load_window_secs, teams_inflight_penalty, \
+                 teams_recent_selection_penalty, teams_recent_failure_penalty, \
+                 subagents_enabled, subagents_auto_activate, max_concurrent_subagents, \
+                 subagents_strategy, subagents_load_window_secs, subagents_inflight_penalty, \
+                 subagents_recent_selection_penalty, subagents_recent_failure_penalty, \
+                 subagents_queue_wait_ms, subagents_queue_poll_ms"
             );
         }
 
@@ -527,6 +628,35 @@ impl ModelRoutingConfigTool {
             MaybeSet::Null => cfg.agent.teams.max_agents = team_defaults.max_agents,
             MaybeSet::Unset => {}
         }
+        match teams_strategy_update {
+            MaybeSet::Set(value) => cfg.agent.teams.strategy = value,
+            MaybeSet::Null => cfg.agent.teams.strategy = team_defaults.strategy,
+            MaybeSet::Unset => {}
+        }
+        match teams_load_window_secs_update {
+            MaybeSet::Set(value) => cfg.agent.teams.load_window_secs = value,
+            MaybeSet::Null => cfg.agent.teams.load_window_secs = team_defaults.load_window_secs,
+            MaybeSet::Unset => {}
+        }
+        match teams_inflight_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.teams.inflight_penalty = value,
+            MaybeSet::Null => cfg.agent.teams.inflight_penalty = team_defaults.inflight_penalty,
+            MaybeSet::Unset => {}
+        }
+        match teams_recent_selection_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.teams.recent_selection_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.teams.recent_selection_penalty = team_defaults.recent_selection_penalty
+            }
+            MaybeSet::Unset => {}
+        }
+        match teams_recent_failure_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.teams.recent_failure_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.teams.recent_failure_penalty = team_defaults.recent_failure_penalty
+            }
+            MaybeSet::Unset => {}
+        }
 
         if let Some(value) = subagents_enabled {
             cfg.agent.subagents.enabled = value;
@@ -539,12 +669,66 @@ impl ModelRoutingConfigTool {
             MaybeSet::Null => cfg.agent.subagents.max_concurrent = subagent_defaults.max_concurrent,
             MaybeSet::Unset => {}
         }
+        match subagents_strategy_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.strategy = value,
+            MaybeSet::Null => cfg.agent.subagents.strategy = subagent_defaults.strategy,
+            MaybeSet::Unset => {}
+        }
+        match subagents_load_window_secs_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.load_window_secs = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.load_window_secs = subagent_defaults.load_window_secs
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_inflight_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.inflight_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.inflight_penalty = subagent_defaults.inflight_penalty
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_recent_selection_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.recent_selection_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.recent_selection_penalty =
+                    subagent_defaults.recent_selection_penalty
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_recent_failure_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.recent_failure_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.recent_failure_penalty =
+                    subagent_defaults.recent_failure_penalty
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_queue_wait_ms_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.queue_wait_ms = value,
+            MaybeSet::Null => cfg.agent.subagents.queue_wait_ms = subagent_defaults.queue_wait_ms,
+            MaybeSet::Unset => {}
+        }
+        match subagents_queue_poll_ms_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.queue_poll_ms = value,
+            MaybeSet::Null => cfg.agent.subagents.queue_poll_ms = subagent_defaults.queue_poll_ms,
+            MaybeSet::Unset => {}
+        }
 
         if cfg.agent.teams.max_agents == 0 {
             anyhow::bail!("'max_team_agents' must be greater than 0");
         }
+        if cfg.agent.teams.load_window_secs == 0 {
+            anyhow::bail!("'teams_load_window_secs' must be greater than 0");
+        }
         if cfg.agent.subagents.max_concurrent == 0 {
             anyhow::bail!("'max_concurrent_subagents' must be greater than 0");
+        }
+        if cfg.agent.subagents.load_window_secs == 0 {
+            anyhow::bail!("'subagents_load_window_secs' must be greater than 0");
+        }
+        if cfg.agent.subagents.queue_poll_ms == 0 {
+            anyhow::bail!("'subagents_queue_poll_ms' must be greater than 0");
         }
 
         cfg.save().await?;
@@ -1044,6 +1228,31 @@ impl Tool for ModelRoutingConfigTool {
                     "minimum": 1,
                     "description": "Maximum number of delegate profiles activated for teams"
                 },
+                "teams_strategy": {
+                    "type": ["string", "null"],
+                    "enum": ["semantic", "adaptive", "least_loaded", null],
+                    "description": "Team auto-selection strategy"
+                },
+                "teams_load_window_secs": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Recent-event window for team load balancing (seconds)"
+                },
+                "teams_inflight_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Team score penalty per in-flight task"
+                },
+                "teams_recent_selection_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Team score penalty per recent assignment in the load window"
+                },
+                "teams_recent_failure_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Team score penalty per recent failure in the load window"
+                },
                 "subagents_enabled": {
                     "type": "boolean",
                     "description": "Enable/disable background sub-agent tools"
@@ -1056,6 +1265,41 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "description": "Maximum number of concurrently running background sub-agents"
+                },
+                "subagents_strategy": {
+                    "type": ["string", "null"],
+                    "enum": ["semantic", "adaptive", "least_loaded", null],
+                    "description": "Sub-agent auto-selection strategy"
+                },
+                "subagents_load_window_secs": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Recent-event window for sub-agent load balancing (seconds)"
+                },
+                "subagents_inflight_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Sub-agent score penalty per in-flight task"
+                },
+                "subagents_recent_selection_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Sub-agent score penalty per recent assignment in the load window"
+                },
+                "subagents_recent_failure_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Sub-agent score penalty per recent failure in the load window"
+                },
+                "subagents_queue_wait_ms": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "How long to wait for sub-agent capacity before failing (milliseconds)"
+                },
+                "subagents_queue_poll_ms": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Poll interval while waiting for sub-agent capacity (milliseconds)"
                 }
             },
             "additionalProperties": false
@@ -1416,9 +1660,21 @@ mod tests {
                 "teams_enabled": false,
                 "teams_auto_activate": false,
                 "max_team_agents": 5,
+                "teams_strategy": "least_loaded",
+                "teams_load_window_secs": 90,
+                "teams_inflight_penalty": 6,
+                "teams_recent_selection_penalty": 2,
+                "teams_recent_failure_penalty": 14,
                 "subagents_enabled": true,
                 "subagents_auto_activate": false,
-                "max_concurrent_subagents": 3
+                "max_concurrent_subagents": 3,
+                "subagents_strategy": "semantic",
+                "subagents_load_window_secs": 60,
+                "subagents_inflight_penalty": 4,
+                "subagents_recent_selection_penalty": 1,
+                "subagents_recent_failure_penalty": 9,
+                "subagents_queue_wait_ms": 500,
+                "subagents_queue_poll_ms": 20
             }))
             .await
             .unwrap();
@@ -1441,6 +1697,26 @@ mod tests {
             json!(5)
         );
         assert_eq!(
+            output["agent_orchestration"]["teams"]["strategy"],
+            json!("least_loaded")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["load_window_secs"],
+            json!(90)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["inflight_penalty"],
+            json!(6)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["recent_selection_penalty"],
+            json!(2)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["recent_failure_penalty"],
+            json!(14)
+        );
+        assert_eq!(
             output["agent_orchestration"]["subagents"]["enabled"],
             json!(true)
         );
@@ -1452,12 +1728,52 @@ mod tests {
             output["agent_orchestration"]["subagents"]["max_concurrent"],
             json!(3)
         );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["strategy"],
+            json!("semantic")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["load_window_secs"],
+            json!(60)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["inflight_penalty"],
+            json!(4)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["recent_selection_penalty"],
+            json!(1)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["recent_failure_penalty"],
+            json!(9)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_wait_ms"],
+            json!(500)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_poll_ms"],
+            json!(20)
+        );
 
         let reset = tool
             .execute(json!({
                 "action": "set_orchestration",
                 "max_team_agents": null,
-                "max_concurrent_subagents": null
+                "teams_strategy": null,
+                "teams_load_window_secs": null,
+                "teams_inflight_penalty": null,
+                "teams_recent_selection_penalty": null,
+                "teams_recent_failure_penalty": null,
+                "max_concurrent_subagents": null,
+                "subagents_strategy": null,
+                "subagents_load_window_secs": null,
+                "subagents_inflight_penalty": null,
+                "subagents_recent_selection_penalty": null,
+                "subagents_recent_failure_penalty": null,
+                "subagents_queue_wait_ms": null,
+                "subagents_queue_poll_ms": null
             }))
             .await
             .unwrap();
@@ -1473,6 +1789,40 @@ mod tests {
             output["agent_orchestration"]["subagents"]["max_concurrent"],
             json!(10)
         );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["strategy"],
+            json!("adaptive")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["strategy"],
+            json!("adaptive")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_wait_ms"],
+            json!(15000)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_poll_ms"],
+            json!(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_rejects_invalid_strategy() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(config, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "teams_strategy": "randomized"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("teams_strategy"));
     }
 
     #[tokio::test]

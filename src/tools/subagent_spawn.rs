@@ -4,11 +4,12 @@
 //! asynchronously via `tokio::spawn`, returning a session ID immediately.
 //! See `AGENTS.md` §7.3 for the tool change playbook.
 
-use super::agent_selection::select_agent;
+use super::agent_load_tracker::AgentLoadTracker;
+use super::agent_selection::{select_agent_with_load, AgentSelectionPolicy};
 use super::orchestration_settings::load_orchestration_settings;
 use super::subagent_registry::{SubAgentRegistry, SubAgentSession, SubAgentStatus};
 use super::traits::{Tool, ToolResult};
-use crate::config::DelegateAgentConfig;
+use crate::config::{DelegateAgentConfig, SubAgentsConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
@@ -35,9 +36,8 @@ pub struct SubAgentSpawnTool {
     registry: Arc<SubAgentRegistry>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     multimodal_config: crate::config::MultimodalConfig,
-    subagents_enabled: bool,
-    max_concurrent_subagents: usize,
-    auto_activate: bool,
+    subagent_settings: SubAgentsConfig,
+    load_tracker: AgentLoadTracker,
     runtime_config_path: Option<PathBuf>,
 }
 
@@ -56,6 +56,11 @@ impl SubAgentSpawnTool {
         auto_activate: bool,
         runtime_config_path: Option<PathBuf>,
     ) -> Self {
+        let mut subagent_settings = SubAgentsConfig::default();
+        subagent_settings.enabled = subagents_enabled;
+        subagent_settings.max_concurrent = max_concurrent_subagents.max(1);
+        subagent_settings.auto_activate = auto_activate;
+
         Self {
             agents: Arc::new(agents),
             security,
@@ -64,24 +69,31 @@ impl SubAgentSpawnTool {
             registry,
             parent_tools,
             multimodal_config,
-            subagents_enabled,
-            max_concurrent_subagents,
-            auto_activate,
+            subagent_settings,
+            load_tracker: AgentLoadTracker::new(),
             runtime_config_path,
         }
     }
 
-    fn runtime_subagent_settings(&self) -> (bool, bool, usize) {
-        let mut enabled = self.subagents_enabled;
-        let mut auto_activate = self.auto_activate;
-        let mut max_concurrent = self.max_concurrent_subagents.max(1);
+    /// Reuse a shared runtime load tracker.
+    pub fn with_load_tracker(mut self, load_tracker: AgentLoadTracker) -> Self {
+        self.load_tracker = load_tracker;
+        self
+    }
+
+    fn runtime_subagent_settings(&self) -> SubAgentsConfig {
+        let mut settings = self.subagent_settings.clone();
+        settings.max_concurrent = settings.max_concurrent.max(1);
+        settings.load_window_secs = settings.load_window_secs.max(1);
+        settings.queue_poll_ms = settings.queue_poll_ms.max(1);
 
         if let Some(path) = self.runtime_config_path.as_deref() {
             match load_orchestration_settings(path) {
                 Ok((_teams, subagents)) => {
-                    enabled = subagents.enabled;
-                    auto_activate = subagents.auto_activate;
-                    max_concurrent = subagents.max_concurrent.max(1);
+                    settings = subagents;
+                    settings.max_concurrent = settings.max_concurrent.max(1);
+                    settings.load_window_secs = settings.load_window_secs.max(1);
+                    settings.queue_poll_ms = settings.queue_poll_ms.max(1);
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -92,7 +104,43 @@ impl SubAgentSpawnTool {
             }
         }
 
-        (enabled, auto_activate, max_concurrent)
+        settings
+    }
+
+    async fn wait_for_slot_and_insert(
+        &self,
+        mut session: SubAgentSession,
+        settings: &SubAgentsConfig,
+    ) -> Result<(), usize> {
+        let max_concurrent = settings.max_concurrent.max(1);
+        match self.registry.try_insert(session, max_concurrent) {
+            Ok(()) => return Ok(()),
+            Err((running, returned)) => {
+                if settings.queue_wait_ms == 0 {
+                    return Err(running);
+                }
+                session = returned;
+            }
+        }
+
+        let poll_ms = settings.queue_poll_ms.max(1);
+        let wait_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(u64::try_from(settings.queue_wait_ms).unwrap_or(u64::MAX));
+        let poll_duration = Duration::from_millis(u64::try_from(poll_ms).unwrap_or(1));
+        let mut last_running = self.registry.running_count();
+
+        while tokio::time::Instant::now() < wait_deadline {
+            tokio::time::sleep(poll_duration).await;
+            match self.registry.try_insert(session, max_concurrent) {
+                Ok(()) => return Ok(()),
+                Err((running, returned)) => {
+                    last_running = running;
+                    session = returned;
+                }
+            }
+        }
+
+        Err(last_running)
     }
 }
 
@@ -163,9 +211,8 @@ impl Tool for SubAgentSpawnTool {
             .map(str::trim)
             .unwrap_or("");
 
-        let (subagents_enabled, auto_activate, max_concurrent_subagents) =
-            self.runtime_subagent_settings();
-        if !subagents_enabled {
+        let subagent_settings = self.runtime_subagent_settings();
+        if !subagent_settings.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -188,13 +235,26 @@ impl Tool for SubAgentSpawnTool {
             });
         }
 
-        let selection = match select_agent(
+        let load_window_secs = u64::try_from(subagent_settings.load_window_secs).unwrap_or(1);
+        let load_snapshot = self
+            .load_tracker
+            .snapshot(Duration::from_secs(load_window_secs.max(1)));
+        let selection_policy = AgentSelectionPolicy {
+            strategy: subagent_settings.strategy,
+            inflight_penalty: subagent_settings.inflight_penalty,
+            recent_selection_penalty: subagent_settings.recent_selection_penalty,
+            recent_failure_penalty: subagent_settings.recent_failure_penalty,
+        };
+
+        let selection = match select_agent_with_load(
             self.agents.as_ref(),
             requested_agent,
             task,
             context,
-            auto_activate,
+            subagent_settings.auto_activate,
             None,
+            Some(&load_snapshot),
+            selection_policy,
         ) {
             Ok(selection) => selection,
             Err(error) => {
@@ -229,6 +289,7 @@ impl Tool for SubAgentSpawnTool {
         ) {
             Ok(p) => p,
             Err(e) => {
+                self.load_tracker.record_failure(&agent_name);
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -255,6 +316,7 @@ impl Tool for SubAgentSpawnTool {
         let is_agentic = agent_config.agentic;
         let parent_tools = self.parent_tools.clone();
         let multimodal_config = self.multimodal_config.clone();
+        let mut load_lease = self.load_tracker.start(&agent_name_owned);
 
         // Atomically check concurrent limit and register session to prevent race conditions.
         let session = SubAgentSession {
@@ -267,14 +329,18 @@ impl Tool for SubAgentSpawnTool {
             result: None,
             handle: None,
         };
-        if let Err(_running) = self.registry.try_insert(session, max_concurrent_subagents) {
+        if let Err(running) = self
+            .wait_for_slot_and_insert(session, &subagent_settings)
+            .await
+        {
+            load_lease.mark_failure();
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Maximum concurrent sub-agents reached ({}). \
-                     Wait for running agents to complete or kill some.",
-                    max_concurrent_subagents
+                    "Maximum concurrent sub-agents reached ({limit}), currently running {running}. \
+                     Wait for running agents to complete, tune queue_wait_ms/queue_poll_ms, or kill some.",
+                    limit = subagent_settings.max_concurrent
                 )),
             });
         }
@@ -282,6 +348,7 @@ impl Tool for SubAgentSpawnTool {
         // Clone what we need for the spawned task
         let registry = self.registry.clone();
         let sid = session_id.clone();
+        let mut bg_load_lease = load_lease;
 
         let handle = tokio::spawn(async move {
             let result = if is_agentic {
@@ -303,6 +370,7 @@ impl Tool for SubAgentSpawnTool {
                 Ok(tool_result) => {
                     if tool_result.success {
                         registry.complete(&sid, tool_result);
+                        bg_load_lease.mark_success();
                     } else {
                         registry.fail(
                             &sid,
@@ -310,10 +378,12 @@ impl Tool for SubAgentSpawnTool {
                                 .error
                                 .unwrap_or_else(|| "Unknown error".to_string()),
                         );
+                        bg_load_lease.mark_failure();
                     }
                 }
                 Err(e) => {
                     registry.fail(&sid, format!("Agent '{agent_name_owned}' error: {e}"));
+                    bg_load_lease.mark_failure();
                 }
             }
         });
@@ -328,7 +398,9 @@ impl Tool for SubAgentSpawnTool {
                 "agent": agent_name,
                 "selection_mode": selection.selection_mode,
                 "selection_score": selection.score,
-                "max_concurrent": max_concurrent_subagents,
+                "max_concurrent": subagent_settings.max_concurrent,
+                "queue_wait_ms": subagent_settings.queue_wait_ms,
+                "queue_poll_ms": subagent_settings.queue_poll_ms,
                 "status": "running",
                 "message": "Sub-agent spawned in background. Use subagent_list or subagent_manage to check progress."
             })
@@ -606,6 +678,8 @@ max_agents = {teams_max_agents}
 enabled = {subagents_enabled}
 auto_activate = {subagents_auto_activate}
 max_concurrent = {subagents_max_concurrent}
+queue_wait_ms = 0
+queue_poll_ms = 10
 "#
         );
         std::fs::write(path, contents).unwrap();
@@ -834,6 +908,9 @@ max_concurrent = {subagents_max_concurrent}
     async fn spawn_respects_concurrent_limit() {
         let max_concurrent = 3usize;
         let registry = Arc::new(SubAgentRegistry::new());
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_runtime_orchestration_config(&config_path, true, true, 8, true, true, max_concurrent);
 
         // Fill up the registry with running sessions
         for i in 0..max_concurrent {
@@ -860,7 +937,7 @@ max_concurrent = {subagents_max_concurrent}
             true,
             max_concurrent,
             true,
-            None,
+            Some(config_path),
         );
 
         let result = tool
