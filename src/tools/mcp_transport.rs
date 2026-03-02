@@ -25,7 +25,7 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
 
 /// Header name for MCP session ID (set by server, echoed by client).
-const HEADER_MCP_SESSION_ID: &str = "Mcp-Session-Id";
+const HEADER_MCP_SESSION_ID: &str = "MCP-Session-Id";
 
 // ── Transport Trait ──────────────────────────────────────────────────────
 
@@ -188,18 +188,18 @@ impl McpTransportConn for HttpTransport {
             .await
             .context("HTTP request to MCP server failed")?;
 
+        if !resp.status().is_success() {
+            bail!("MCP server returned HTTP {}", resp.status());
+        }
+
         if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
             if let Ok(id_str) = session_id.to_str() {
                 if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
-                    tracing::debug!("MCP HTTP: captured session id {}", id_str);
+                    tracing::debug!("MCP HTTP: captured session id <redacted>");
                 }
                 self.headers
                     .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
             }
-        }
-
-        if !resp.status().is_success() {
-            bail!("MCP server returned HTTP {}", resp.status());
         }
 
         if request.id.is_none() {
@@ -301,19 +301,6 @@ impl SseTransport {
         let req = apply_mcp_headers(req, &self.headers, false);
 
         let resp = req.send().await.context("SSE GET to MCP server failed")?;
-        if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
-            if let Ok(id_str) = session_id.to_str() {
-                if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
-                    tracing::debug!(
-                        "MCP SSE `{}`: captured session id {}",
-                        self.server_name,
-                        id_str
-                    );
-                }
-                self.headers
-                    .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
-            }
-        }
         if resp.status() == reqwest::StatusCode::NOT_FOUND
             || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
         {
@@ -322,6 +309,18 @@ impl SseTransport {
         }
         if !resp.status().is_success() {
             return Err(anyhow!("MCP server returned HTTP {}", resp.status()));
+        }
+        if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
+            if let Ok(id_str) = session_id.to_str() {
+                if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
+                    tracing::debug!(
+                        "MCP SSE `{}`: captured session id <redacted>",
+                        self.server_name,
+                    );
+                }
+                self.headers
+                    .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
+            }
         }
         let is_event_stream = resp
             .headers()
@@ -767,19 +766,6 @@ impl McpTransportConn for SseTransport {
             let req = apply_mcp_headers(req, &self.headers, true);
 
             let resp = req.send().await.context("SSE POST to MCP server failed")?;
-            if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
-                if let Ok(id_str) = session_id.to_str() {
-                    if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
-                        tracing::debug!(
-                            "MCP SSE `{}`: captured session id {}",
-                            self.server_name,
-                            id_str
-                        );
-                    }
-                    self.headers
-                        .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
-                }
-            }
             let status = resp.status();
             last_status = Some(status);
 
@@ -792,6 +778,19 @@ impl McpTransportConn for SseTransport {
 
             if !status.is_success() {
                 break;
+            }
+
+            if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
+                if let Ok(id_str) = session_id.to_str() {
+                    if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
+                        tracing::debug!(
+                            "MCP SSE `{}`: captured session id <redacted>",
+                            self.server_name,
+                        );
+                    }
+                    self.headers
+                        .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
+                }
             }
 
             if request.id.is_none() {
@@ -1008,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn test_header_mcp_session_id_constant() {
+    fn header_mcp_session_id_matches_protocol_format() {
         assert_eq!(HEADER_MCP_SESSION_ID, "Mcp-Session-Id");
     }
 }
