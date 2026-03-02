@@ -70,7 +70,7 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
 # Build (~15–30 phút trên Uno Q)
-cargo build --release
+cargo build --release --features hardware
 
 # Cài đặt
 sudo cp target/release/zeroclaw /usr/local/bin/
@@ -130,7 +130,7 @@ allowed_users = ["*"]
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 allow_public_bind = false
 
 [agent]
@@ -145,7 +145,7 @@ compact_context = true
 ssh arduino@<UNO_Q_IP>
 
 # Chạy daemon (Telegram polling hoạt động qua WiFi)
-zeroclaw daemon --host 127.0.0.1 --port 3000
+zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 **Tại bước này:** Telegram chat hoạt động. Gửi tin nhắn tới bot — ZeroClaw phản hồi. Chưa có GPIO.
@@ -184,7 +184,7 @@ transport = "bridge"
 ### 5.3 Chạy ZeroClaw
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 3000
+zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 Giờ khi bạn nhắn tin cho Telegram bot *"Turn on the LED"* hoặc *"Set pin 13 high"*, ZeroClaw dùng `gpio_write` qua Bridge.
@@ -200,10 +200,10 @@ Giờ khi bạn nhắn tin cho Telegram bot *"Turn on the LED"* hoặc *"Set pin
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
-| 6 | `cargo build --release --no-default-features` |
+| 6 | `cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
 | 8 | Chỉnh sửa `~/.zeroclaw/config.toml` (thêm Telegram bot_token) |
-| 9 | `zeroclaw daemon --host 127.0.0.1 --port 3000` |
+| 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Nhắn tin cho Telegram bot — nó phản hồi |
 
 ---
