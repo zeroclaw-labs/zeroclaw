@@ -1008,6 +1008,6 @@ mod tests {
 
     #[test]
     fn header_mcp_session_id_matches_protocol_format() {
-        assert_eq!(HEADER_MCP_SESSION_ID, "Mcp-Session-Id");
+        assert_eq!(HEADER_MCP_SESSION_ID, "MCP-Session-Id");
     }
 }
