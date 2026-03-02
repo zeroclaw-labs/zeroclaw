@@ -2,6 +2,7 @@ use super::agent_load_tracker::AgentLoadSnapshot;
 use crate::config::{AgentLoadBalanceStrategy, DelegateAgentConfig};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 /// Result of resolving which delegate profile should execute a task.
 #[derive(Debug, Clone)]
