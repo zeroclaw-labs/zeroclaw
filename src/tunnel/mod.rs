@@ -141,7 +141,6 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
                 .ok_or_else(|| anyhow::anyhow!("tunnel.provider = \"pinggy\" but [tunnel.pinggy] section is missing"))?;
             Ok(Some(Box::new(PinggyTunnel::new(
                 pg.token.clone(),
-                pg.domain.clone(),
                 pg.region.clone(),
             ))))
         }
@@ -297,7 +296,6 @@ mod tests {
             provider: "pinggy".into(),
             pinggy: Some(PinggyTunnelConfig {
                 token: Some("tok".into()),
-                domain: None,
                 region: None,
             }),
             ..TunnelConfig::default()
@@ -472,20 +470,20 @@ mod tests {
 
     #[test]
     fn pinggy_tunnel_name() {
-        let t = PinggyTunnel::new(Some("tok".into()), None, None);
+        let t = PinggyTunnel::new(Some("tok".into()), None);
         assert_eq!(t.name(), "pinggy");
         assert!(t.public_url().is_none());
     }
 
     #[test]
     fn pinggy_without_token() {
-        let t = PinggyTunnel::new(None, None, None);
+        let t = PinggyTunnel::new(None, None);
         assert_eq!(t.name(), "pinggy");
     }
 
     #[tokio::test]
     async fn pinggy_health_false_before_start() {
-        let tunnel = PinggyTunnel::new(None, None, None);
+        let tunnel = PinggyTunnel::new(None, None);
         assert!(!tunnel.health_check().await);
     }
 }
