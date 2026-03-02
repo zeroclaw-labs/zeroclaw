@@ -1556,7 +1556,7 @@ mod tests {
     fn make_channel() -> BlueBubblesChannel {
         BlueBubblesChannel::new(
             "http://localhost:1234".into(),
-            "test-password".into(),
+            String::new(),
             vec!["+1_234_567_890".into()],
             vec![],
         )
@@ -1566,7 +1566,7 @@ mod tests {
     fn make_open_channel() -> BlueBubblesChannel {
         BlueBubblesChannel::new(
             "http://localhost:1234".into(),
-            "pw".into(),
+            String::new(),
             vec!["*".into()],
             vec![],
         )
@@ -1596,9 +1596,13 @@ mod tests {
     #[test]
     fn bluebubbles_sender_allowed_empty_list_allows_all() {
         // Empty allowlist = no restriction (matches OpenClaw behaviour)
-        let ch =
-            BlueBubblesChannel::new("http://localhost:1234".into(), "pw".into(), vec![], vec![])
-                .expect("test HTTP client build");
+        let ch = BlueBubblesChannel::new(
+            "http://localhost:1234".into(),
+            String::new(),
+            vec![],
+            vec![],
+        )
+        .expect("test HTTP client build");
         assert!(ch.is_sender_allowed("+1_234_567_890"));
         assert!(ch.is_sender_allowed("anyone@example.com"));
     }
@@ -1617,7 +1621,7 @@ mod tests {
     #[test]
     fn bluebubbles_dm_policy_open_empty_allows_all() {
         // Open + empty allowed_senders = allow everyone (legacy behaviour)
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![]);
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![]);
         assert!(ch.is_dm_allowed("+1_555_000_0001"));
     }
 
@@ -1625,7 +1629,7 @@ mod tests {
     fn bluebubbles_dm_policy_open_with_list_filters() {
         let ch = BlueBubblesChannel::new(
             "http://localhost".into(),
-            "pw".into(),
+            String::new(),
             vec!["+1_555_000_0001".into()],
             vec![],
         );
@@ -1635,7 +1639,7 @@ mod tests {
 
     #[test]
     fn bluebubbles_dm_policy_allowlist_empty_denies_all() {
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![])
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![])
             .with_policies(
                 BlueBubblesDmPolicy::Allowlist,
                 BlueBubblesGroupPolicy::Open,
@@ -1649,7 +1653,7 @@ mod tests {
     fn bluebubbles_dm_policy_allowlist_matches() {
         let ch = BlueBubblesChannel::new(
             "http://localhost".into(),
-            "pw".into(),
+            String::new(),
             vec!["+1_555_000_0001".into()],
             vec![],
         )
@@ -1667,7 +1671,7 @@ mod tests {
     fn bluebubbles_dm_policy_disabled_denies_all() {
         let ch = BlueBubblesChannel::new(
             "http://localhost".into(),
-            "pw".into(),
+            String::new(),
             vec!["*".into()],
             vec![],
         )
@@ -1682,14 +1686,14 @@ mod tests {
 
     #[test]
     fn bluebubbles_group_policy_open_allows_any() {
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![]);
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![]);
         assert!(ch.is_group_allowed("iMessage;+;chat1"));
         assert!(ch.is_group_allowed("iMessage;+;chat2"));
     }
 
     #[test]
     fn bluebubbles_group_policy_disabled_denies_all() {
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![])
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![])
             .with_policies(
                 BlueBubblesDmPolicy::Open,
                 BlueBubblesGroupPolicy::Disabled,
@@ -1701,7 +1705,7 @@ mod tests {
 
     #[test]
     fn bluebubbles_group_policy_allowlist_filters() {
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![])
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![])
             .with_policies(
                 BlueBubblesDmPolicy::Open,
                 BlueBubblesGroupPolicy::Allowlist,
@@ -1714,7 +1718,7 @@ mod tests {
 
     #[test]
     fn bluebubbles_group_policy_allowlist_empty_denies_all() {
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![])
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![])
             .with_policies(
                 BlueBubblesDmPolicy::Open,
                 BlueBubblesGroupPolicy::Allowlist,
@@ -1726,7 +1730,7 @@ mod tests {
 
     #[test]
     fn bluebubbles_group_policy_allowlist_wildcard() {
-        let ch = BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![])
+        let ch = BlueBubblesChannel::new("http://localhost".into(), String::new(), vec![], vec![])
             .with_policies(
                 BlueBubblesDmPolicy::Open,
                 BlueBubblesGroupPolicy::Allowlist,
@@ -1740,7 +1744,7 @@ mod tests {
     fn bluebubbles_server_url_trailing_slash_trimmed() {
         let ch = BlueBubblesChannel::new(
             "http://localhost:1234/".into(),
-            "pw".into(),
+            String::new(),
             vec!["*".into()],
             vec![],
         )
@@ -2013,7 +2017,7 @@ mod tests {
     fn bluebubbles_parse_email_handle() {
         let ch = BlueBubblesChannel::new(
             "http://localhost:1234".into(),
-            "pw".into(),
+            String::new(),
             vec!["user@example.com".into()],
             vec![],
         )
@@ -2298,7 +2302,7 @@ mod tests {
     fn bluebubbles_ignore_sender_exact() {
         let ch = BlueBubblesChannel::new(
             "http://localhost:1234".into(),
-            "pw".into(),
+            String::new(),
             vec!["*".into()],
             vec!["+1_999_000_0000".into()],
         )
@@ -2312,7 +2316,7 @@ mod tests {
         // A sender in both ignore_senders and allowed_senders must be dropped.
         let ch = BlueBubblesChannel::new(
             "http://localhost:1234".into(),
-            "pw".into(),
+            String::new(),
             vec!["+1_999_000_0000".into()],
             vec!["+1_999_000_0000".into()],
         )
