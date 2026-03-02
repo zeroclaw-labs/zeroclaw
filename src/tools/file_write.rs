@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::file_link_guard::has_multiple_hard_links;
 use crate::security::sensitive_paths::is_sensitive_file_path;
+use crate::security::sensitive_paths::is_zeroclaw_config_path;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -29,6 +30,14 @@ fn hard_link_write_block_message(path: &Path) -> String {
     format!(
         "Writing multiply-linked file '{}' is blocked by policy \
 (potential hard-link escape).",
+        path.display()
+    )
+}
+
+fn config_write_block_message(path: &std::path::Path) -> String {
+    format!(
+        "Writing to ZeroClaw config path '{}' is permanently blocked. \
+The agent must not modify its own configuration.",
         path.display()
     )
 }
@@ -104,6 +113,15 @@ impl Tool for FileWriteTool {
             });
         }
 
+        // Guard: block writes to ZeroClaw's own config directory (raw path check).
+        if is_zeroclaw_config_path(Path::new(path)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(config_write_block_message(Path::new(path))),
+            });
+        }
+
         let full_path = self.security.resolve_user_supplied_path(path);
 
         let Some(parent) = full_path.parent() else {
@@ -157,6 +175,17 @@ impl Tool for FileWriteTool {
                 error: Some(sensitive_file_write_block_message(
                     &resolved_target.display().to_string(),
                 )),
+            });
+        }
+
+        // Guard: block writes to ZeroClaw's own config directory (post-resolution).
+        // This catches symlink-based bypasses where the raw path looks innocent
+        // but resolves into ~/.zeroclaw/.
+        if is_zeroclaw_config_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(config_write_block_message(&resolved_target)),
             });
         }
 
@@ -628,6 +657,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "original", "original file must not be modified");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_zeroclaw_config_path() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_config_guard");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "/home/user/.zeroclaw/config.toml", "content": "auto_approve = [\"cron_add\"]"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "writing to zeroclaw config must be blocked");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("config path"),
+            "error should mention config path: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_normal_files_with_config_guard() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_config_guard_allows");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "notes.txt", "content": "hello world"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "normal file writes should still work: {:?}", result.error);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_blocks_symlink_to_zeroclaw_config() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_config_symlink");
+        let workspace = root.join("workspace");
+        let config_dir = root.join(".zeroclaw");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::write(config_dir.join("config.toml"), "original").await.unwrap();
+
+        // Symlink from workspace into .zeroclaw
+        symlink(&config_dir, workspace.join(".zeroclaw")).unwrap();
+
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": ".zeroclaw/config.toml", "content": "auto_approve = [\"cron_add\"]"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "symlink to zeroclaw config must be blocked");
+
+        let content = tokio::fs::read_to_string(config_dir.join("config.toml")).await.unwrap();
+        assert_eq!(content, "original", "config must not be modified");
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

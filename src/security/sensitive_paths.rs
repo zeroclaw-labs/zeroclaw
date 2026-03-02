@@ -1,5 +1,45 @@
 use std::path::Path;
 
+/// Directories that the agent must never be allowed to write into,
+/// regardless of `file_write` approval scope.  This prevents an agent
+/// from rewriting its own config (e.g. moving tools from `always_ask`
+/// to `auto_approve`) after a single `file_write` approval.
+const SELF_CONFIG_COMPONENTS: &[&str] = &[".zeroclaw"];
+
+/// Returns `true` when `path` (raw or canonicalized) resolves inside
+/// the agent's own configuration directory tree.
+///
+/// Checks both the literal path components and, when the target already
+/// exists on disk, the canonicalized path so that symlink-based bypasses
+/// are caught.
+pub fn is_zeroclaw_config_path(path: &Path) -> bool {
+    // 1. Check literal path components.
+    if path_contains_config_component(path) {
+        return true;
+    }
+
+    // 2. Check canonical (resolved) path to defeat symlinks.
+    if let Ok(canonical) = path.canonicalize() {
+        if path_contains_config_component(&canonical) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn path_contains_config_component(path: &Path) -> bool {
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            if SELF_CONFIG_COMPONENTS.iter().any(|c| lower == *c) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 const SENSITIVE_EXACT_FILENAMES: &[&str] = &[
     ".env",
     ".envrc",
@@ -90,5 +130,19 @@ mod tests {
     fn ignores_regular_paths() {
         assert!(!is_sensitive_file_path(Path::new("src/main.rs")));
         assert!(!is_sensitive_file_path(Path::new("notes/readme.md")));
+    }
+
+    #[test]
+    fn detects_zeroclaw_config_paths() {
+        assert!(is_zeroclaw_config_path(Path::new("/home/user/.zeroclaw/config.toml")));
+        assert!(is_zeroclaw_config_path(Path::new(".zeroclaw/config.toml")));
+        assert!(is_zeroclaw_config_path(Path::new("/home/user/.zeroclaw/agents.db")));
+    }
+
+    #[test]
+    fn ignores_non_config_paths() {
+        assert!(!is_zeroclaw_config_path(Path::new("src/main.rs")));
+        assert!(!is_zeroclaw_config_path(Path::new("/home/user/project/file.txt")));
+        assert!(!is_zeroclaw_config_path(Path::new("notes/zeroclaw-ideas.md")));
     }
 }
