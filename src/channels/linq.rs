@@ -226,7 +226,7 @@ impl LinqChannel {
             .and_then(|t| {
                 chrono::DateTime::parse_from_rfc3339(t)
                     .ok()
-                    .map(|dt| u64::try_from(dt.timestamp()).unwrap_or_default())
+                    .and_then(|dt| u64::try_from(dt.timestamp()).ok())
             })
             .unwrap_or_else(|| {
                 std::time::SystemTime::now()

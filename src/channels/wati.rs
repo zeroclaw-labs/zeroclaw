@@ -134,7 +134,7 @@ impl WatiChannel {
                 } else if let Some(s) = t.as_str() {
                     chrono::DateTime::parse_from_rfc3339(s)
                         .ok()
-                        .map(|dt| u64::try_from(dt.timestamp()).unwrap_or_default())
+                        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
                         .unwrap_or_else(|| {
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)

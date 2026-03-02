@@ -112,8 +112,8 @@ cargo install zeroclaw
 To install the required toolchain:
 
 ```bash
-rustup install 1.86
-cd zeroclaw && rustup override set 1.86
+rustup toolchain install 1.86
+cargo +1.86 install zeroclaw
 ```
 
 ### First Run
