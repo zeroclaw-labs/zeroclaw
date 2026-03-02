@@ -9,8 +9,8 @@ fi
 
 ensure_rust_component() {
     local component="$1"
-    # Some self-hosted runners start from minimal toolchain images.
-    # Install missing components deterministically before invoking cargo subcommands.
+    # Some self-hosted runners start from partial toolchain images.
+    # `rustup component add` is idempotent and guarantees host components are present.
     if ! command -v rustup >/dev/null 2>&1; then
         return 0
     fi
@@ -20,11 +20,7 @@ ensure_rust_component() {
         toolchain_args=(--toolchain "${RUSTUP_TOOLCHAIN}")
     fi
 
-    if rustup component list "${toolchain_args[@]}" | grep -Eq "^${component}(-[[:alnum:]_\\-]+)? \\(installed\\)$"; then
-        return 0
-    fi
-
-    echo "==> rust quality: installing missing component '${component}'"
+    echo "==> rust quality: ensuring component '${component}'"
     rustup component add "${component}" "${toolchain_args[@]}"
 }
 
