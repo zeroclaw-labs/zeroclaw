@@ -521,8 +521,11 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
-    fn image_download_url(&self, image_key: &str) -> String {
-        format!("{}/im/v1/images/{image_key}", self.api_base())
+    fn image_resource_url(&self, message_id: &str, image_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{image_key}",
+            self.api_base()
+        )
     }
 
     fn resolved_bot_open_id(&self) -> Option<String> {
@@ -574,19 +577,27 @@ impl LarkChannel {
         true
     }
 
-    async fn fetch_image_marker(&self, image_key: &str) -> anyhow::Result<String> {
+    async fn fetch_image_marker(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> anyhow::Result<String> {
+        if message_id.trim().is_empty() {
+            anyhow::bail!("empty message_id");
+        }
         if image_key.trim().is_empty() {
             anyhow::bail!("empty image_key");
         }
 
         let mut token = self.get_tenant_access_token().await?;
         let mut retried = false;
-        let url = self.image_download_url(image_key);
+        let url = self.image_resource_url(message_id, image_key);
 
         loop {
             let response = self
                 .http_client()
                 .get(&url)
+                .query(&[("type", "image")])
                 .header("Authorization", format!("Bearer {token}"))
                 .send()
                 .await?;
@@ -956,7 +967,10 @@ impl LarkChannel {
                         },
                         "image" => {
                             let text = if let Some(image_key) = parse_image_key_value(&lark_msg.content) {
-                                match self.fetch_image_marker(&image_key).await {
+                                match self
+                                    .fetch_image_marker(&lark_msg.message_id, &image_key)
+                                    .await
+                                {
                                     Ok(marker) => marker,
                                     Err(error) => {
                                         tracing::warn!(
@@ -1414,11 +1428,19 @@ impl LarkChannel {
             },
             "image" => {
                 let text = if let Some(image_key) = parse_image_key_value(&content) {
-                    match self.fetch_image_marker(&image_key).await {
-                        Ok(marker) => marker,
-                        Err(error) => {
+                    match message_id {
+                        Some(mid) => match self.fetch_image_marker(mid, &image_key).await {
+                            Ok(marker) => marker,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Lark webhook: failed to download image {image_key}: {error}"
+                                );
+                                LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string()
+                            }
+                        },
+                        None => {
                             tracing::warn!(
-                                "Lark webhook: failed to download image {image_key}: {error}"
+                                "Lark webhook: image message missing message_id; using fallback text"
                             );
                             LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string()
                         }
@@ -2972,6 +2994,33 @@ mod tests {
         assert_eq!(
             ch_feishu.message_reaction_url("om_test_message_id"),
             "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
+        );
+    }
+
+    #[test]
+    fn lark_image_resource_url_matches_region() {
+        let ch_lark = make_channel();
+        assert_eq!(
+            ch_lark.image_resource_url("om_test_message_id", "img_v3_test"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/resources/img_v3_test"
+        );
+
+        let feishu_cfg = crate::config::schema::FeishuConfig {
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            group_reply: None,
+            receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
+            port: Some(9898),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
+        };
+        let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
+        assert_eq!(
+            ch_feishu.image_resource_url("om_test_message_id", "img_v3_test"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/resources/img_v3_test"
         );
     }
 

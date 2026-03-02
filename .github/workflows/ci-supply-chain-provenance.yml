@@ -8,6 +8,7 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_cc.sh"
             - "scripts/ci/generate_provenance.py"
             - ".github/workflows/ci-supply-chain-provenance.yml"
     workflow_dispatch:
@@ -46,12 +47,8 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+                  ./scripts/ci/ensure_cc.sh
                   echo "Runner: ${RUNNER_NAME:-unknown} (${RUNNER_OS:-unknown}/${RUNNER_ARCH:-unknown})"
-                  if ! command -v cc >/dev/null 2>&1; then
-                    echo "::error::Missing 'cc' compiler on runner. Install build-essential (Debian/Ubuntu) or equivalent."
-                    exit 1
-                  fi
-                  cc --version | head -n1
                   free_kb="$(df -Pk . | awk 'NR==2 {print $4}')"
                   min_kb=$((10 * 1024 * 1024))
                   if [ "${free_kb}" -lt "${min_kb}" ]; then

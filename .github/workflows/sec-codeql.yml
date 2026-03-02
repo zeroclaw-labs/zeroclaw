@@ -10,6 +10,7 @@ on:
             - "crates/**"
             - ".github/codeql/**"
             - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
     pull_request:
         branches: [dev, main]
@@ -20,6 +21,7 @@ on:
             - "crates/**"
             - ".github/codeql/**"
             - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
     merge_group:
         branches: [dev, main]
@@ -68,6 +70,9 @@ jobs:
               uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
 
             - name: Build
               run: cargo build --workspace --all-targets --locked
