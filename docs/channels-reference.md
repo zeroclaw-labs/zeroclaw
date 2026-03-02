@@ -73,8 +73,8 @@ Notes:
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 - Natural-language approval intents are supported with strict parsing and policy control:
-    - `direct` mode (default): `授权工具 shell` grants immediately.
-    - `request_confirm` mode: `授权工具 shell` creates pending request, then confirm with request ID.
+    - `direct` mode (default): `approve tool shell` grants immediately.
+    - `request_confirm` mode: `approve tool shell` creates pending request, then confirm with request ID.
     - `disabled` mode: approval-management must use slash commands.
 - You can override natural-language approval mode per channel via `[autonomy].non_cli_natural_language_approval_mode_by_channel`.
 - Approval commands are intercepted before LLM execution, so the model cannot self-escalate permissions through tool calls.
