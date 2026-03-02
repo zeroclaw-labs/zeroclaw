@@ -16,11 +16,12 @@ use crate::providers::ChatMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        RawQuery, State, WebSocketUpgrade,
+        ConnectInfo, RawQuery, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap},
     response::IntoResponse,
 };
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 const EMPTY_WS_RESPONSE_FALLBACK: &str =
@@ -333,25 +334,71 @@ fn build_ws_system_prompt(
     prompt
 }
 
+fn refresh_ws_history_system_prompt_datetime(history: &mut [ChatMessage]) {
+    if let Some(system_message) = history.first_mut() {
+        if system_message.role == "system" {
+            crate::agent::prompt::refresh_prompt_datetime(&mut system_message.content);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsAuthRejection {
+    MissingPairingToken,
+    NonLocalWithoutAuthLayer,
+}
+
+fn evaluate_ws_auth(
+    pairing_required: bool,
+    is_loopback_request: bool,
+    has_valid_pairing_token: bool,
+) -> Option<WsAuthRejection> {
+    if pairing_required {
+        return (!has_valid_pairing_token).then_some(WsAuthRejection::MissingPairingToken);
+    }
+
+    if !is_loopback_request && !has_valid_pairing_token {
+        return Some(WsAuthRejection::NonLocalWithoutAuthLayer);
+    }
+
+    None
+}
+
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let query_params = parse_ws_query_params(query.as_deref());
-    // Auth via Authorization header or websocket protocol token.
-    if state.pairing.require_pairing() {
-        let token =
-            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
-        if !state.pairing.is_authenticated(&token) {
+    let token =
+        extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+    let has_valid_pairing_token = !token.is_empty() && state.pairing.is_authenticated(&token);
+    let is_loopback_request =
+        super::is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+
+    match evaluate_ws_auth(
+        state.pairing.require_pairing(),
+        is_loopback_request,
+        has_valid_pairing_token,
+    ) {
+        Some(WsAuthRejection::MissingPairingToken) => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
             )
                 .into_response();
         }
+        Some(WsAuthRejection::NonLocalWithoutAuthLayer) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — enable gateway pairing or provide a valid paired bearer token for non-local /ws/chat access",
+            )
+                .into_response();
+        }
+        None => {}
     }
 
     let session_id = query_params
@@ -432,6 +479,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             let _ = socket.send(Message::Text(err.to_string().into())).await;
             continue;
         }
+
+        refresh_ws_history_system_prompt_datetime(&mut history);
 
         // Add user message to history
         history.push(ChatMessage::user(&content));
@@ -663,6 +712,17 @@ mod tests {
     }
 
     #[test]
+    fn refresh_ws_history_system_prompt_datetime_updates_only_system_entry() {
+        let mut history = vec![
+            ChatMessage::system("## Current Date & Time\n\n2000-01-01 00:00:00 (UTC)\n"),
+            ChatMessage::user("hello"),
+        ];
+        refresh_ws_history_system_prompt_datetime(&mut history);
+        assert!(!history[0].content.contains("2000-01-01 00:00:00 (UTC)"));
+        assert_eq!(history[1].content, "hello");
+    }
+
+    #[test]
     fn restore_chat_history_applies_system_prompt_once() {
         let turns = vec![
             WsHistoryTurn {
@@ -683,6 +743,29 @@ mod tests {
         assert_eq!(restored[1].content, "u1");
         assert_eq!(restored[2].role, "assistant");
         assert_eq!(restored[2].content, "a1");
+    }
+
+    #[test]
+    fn evaluate_ws_auth_requires_pairing_token_when_pairing_is_enabled() {
+        assert_eq!(
+            evaluate_ws_auth(true, true, false),
+            Some(WsAuthRejection::MissingPairingToken)
+        );
+        assert_eq!(evaluate_ws_auth(true, false, true), None);
+    }
+
+    #[test]
+    fn evaluate_ws_auth_rejects_public_without_auth_layer_when_pairing_disabled() {
+        assert_eq!(
+            evaluate_ws_auth(false, false, false),
+            Some(WsAuthRejection::NonLocalWithoutAuthLayer)
+        );
+    }
+
+    #[test]
+    fn evaluate_ws_auth_allows_loopback_or_valid_token_when_pairing_disabled() {
+        assert_eq!(evaluate_ws_auth(false, true, false), None);
+        assert_eq!(evaluate_ws_auth(false, false, true), None);
     }
 
     struct MockScheduleTool;

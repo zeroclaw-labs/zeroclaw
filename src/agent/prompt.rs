@@ -8,6 +8,26 @@ use std::fmt::Write;
 use std::path::Path;
 
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+const DATETIME_HEADER: &str = "## Current Date & Time\n\n";
+
+/// Refresh the `## Current Date & Time` section in an existing system prompt.
+/// Long-lived sessions keep a stable system prompt; this updates only the
+/// timestamp payload so per-turn "current time" answers stay accurate.
+pub fn refresh_prompt_datetime(prompt: &mut String) {
+    let Some(section_start) = prompt.find(DATETIME_HEADER) else {
+        return;
+    };
+
+    let content_start = section_start + DATETIME_HEADER.len();
+    let content_end = prompt[content_start..]
+        .find('\n')
+        .map(|offset| content_start + offset)
+        .unwrap_or(prompt.len());
+
+    let now = Local::now();
+    let replacement = format!("{} ({})", now.format("%Y-%m-%d %H:%M:%S"), now.format("%Z"));
+    prompt.replace_range(content_start..content_end, &replacement);
+}
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
@@ -554,6 +574,35 @@ mod tests {
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         assert!(!output.contains("<tools>"));
+    }
+
+    #[test]
+    fn refresh_prompt_datetime_updates_timestamp_in_place() {
+        let mut prompt = "## Runtime\n\nHost: test\n\n## Current Date & Time\n\n2000-01-01 00:00:00 (UTC)\n\n## Next Section".to_string();
+        super::refresh_prompt_datetime(&mut prompt);
+
+        assert!(prompt.contains("## Current Date & Time\n\n"));
+        assert!(prompt.contains("\n\n## Next Section"));
+        assert!(!prompt.contains("2000-01-01 00:00:00 (UTC)"));
+
+        let payload_start =
+            prompt.find("## Current Date & Time\n\n").unwrap() + "## Current Date & Time\n\n".len();
+        let payload_end = prompt[payload_start..]
+            .find('\n')
+            .map(|offset| payload_start + offset)
+            .unwrap_or(prompt.len());
+        let payload = &prompt[payload_start..payload_end];
+        assert!(payload.chars().any(|c| c.is_ascii_digit()));
+        assert!(payload.contains(" ("));
+        assert!(payload.ends_with(')'));
+    }
+
+    #[test]
+    fn refresh_prompt_datetime_noops_when_section_missing() {
+        let mut prompt = "## Runtime\n\nHost: test".to_string();
+        let original = prompt.clone();
+        super::refresh_prompt_datetime(&mut prompt);
+        assert_eq!(prompt, original);
     }
 
     #[test]

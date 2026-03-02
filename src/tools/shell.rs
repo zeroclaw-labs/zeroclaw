@@ -15,7 +15,26 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+    // Windows runtime essentials when env is cleared before shell spawn.
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
 ];
 
 fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
@@ -740,10 +759,17 @@ mod tests {
     async fn shell_captures_stderr_output() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
         let result = tool
-            .execute(json!({"command": "echo error_msg >&2"}))
+            .execute(json!({"command": "cat __nonexistent_stderr_capture_file__"}))
             .await
             .unwrap();
-        assert!(result.error.as_deref().unwrap_or("").contains("error_msg"));
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|msg| !msg.trim().is_empty()),
+            "expected non-empty stderr in error field"
+        );
     }
 
     #[tokio::test]

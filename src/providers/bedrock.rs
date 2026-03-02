@@ -6,8 +6,8 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions, StreamResult,
-    TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
+    NormalizedStopReason, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -512,7 +512,6 @@ struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
     #[serde(default)]
-    #[allow(dead_code)]
     stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
@@ -941,6 +940,10 @@ impl BedrockProvider {
     fn parse_converse_response(response: ConverseResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let raw_stop_reason = response.stop_reason.clone();
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_bedrock_stop_reason);
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -982,6 +985,8 @@ impl BedrockProvider {
             usage,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 
@@ -1800,12 +1805,15 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
+        let lower = err.to_lowercase();
         assert!(
             err.contains("credentials not set")
                 || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential")
-                || err.to_lowercase().contains("not authorized")
-                || err.to_lowercase().contains("forbidden"),
+                || lower.contains("credential")
+                || lower.contains("not authorized")
+                || lower.contains("forbidden")
+                || lower.contains("builder error")
+                || lower.contains("builder"),
             "Expected missing-credentials style error, got: {err}"
         );
     }

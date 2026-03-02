@@ -77,6 +77,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "cohere" => "command-a-03-2025",
         "moonshot" => "kimi-k2.5",
+        "stepfun" => "step-3.5-flash",
         "hunyuan" => "hunyuan-t1-latest",
         "glm" | "zai" => "glm-5",
         "minimax" => "MiniMax-M2.5",
@@ -138,6 +139,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.browser",
     "tool.composio",
     "tool.http_request",
+    "tool.multimodal",
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",
@@ -453,6 +455,15 @@ pub struct DelegateAgentConfig {
     /// Optional API key override
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Whether this delegate profile is active for selection/invocation.
+    #[serde(default = "default_delegate_agent_enabled")]
+    pub enabled: bool,
+    /// Optional capability tags used by automatic agent selection.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Priority hint for automatic agent selection (higher wins on ties).
+    #[serde(default)]
+    pub priority: i32,
     /// Temperature override
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -478,6 +489,10 @@ fn default_max_tool_iterations() -> usize {
     10
 }
 
+fn default_delegate_agent_enabled() -> bool {
+    true
+}
+
 impl std::fmt::Debug for DelegateAgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DelegateAgentConfig")
@@ -485,6 +500,9 @@ impl std::fmt::Debug for DelegateAgentConfig {
             .field("model", &self.model)
             .field("system_prompt", &self.system_prompt)
             .field("api_key_configured", &self.api_key.is_some())
+            .field("enabled", &self.enabled)
+            .field("capabilities", &self.capabilities)
+            .field("priority", &self.priority)
             .field("temperature", &self.temperature)
             .field("max_depth", &self.max_depth)
             .field("agentic", &self.agentic)
@@ -787,6 +805,83 @@ fn default_coordination_max_seen_message_ids() -> usize {
     4096
 }
 
+fn default_agent_teams_enabled() -> bool {
+    true
+}
+
+fn default_agent_teams_auto_activate() -> bool {
+    true
+}
+
+fn default_agent_teams_max_agents() -> usize {
+    32
+}
+
+fn default_agent_teams_load_window_secs() -> usize {
+    120
+}
+
+fn default_agent_teams_inflight_penalty() -> usize {
+    8
+}
+
+fn default_agent_teams_recent_selection_penalty() -> usize {
+    2
+}
+
+fn default_agent_teams_recent_failure_penalty() -> usize {
+    12
+}
+
+fn default_subagents_enabled() -> bool {
+    true
+}
+
+fn default_subagents_auto_activate() -> bool {
+    true
+}
+
+fn default_subagents_max_concurrent() -> usize {
+    10
+}
+
+fn default_subagents_load_window_secs() -> usize {
+    180
+}
+
+fn default_subagents_inflight_penalty() -> usize {
+    10
+}
+
+fn default_subagents_recent_selection_penalty() -> usize {
+    3
+}
+
+fn default_subagents_recent_failure_penalty() -> usize {
+    16
+}
+
+fn default_subagents_queue_wait_ms() -> usize {
+    15_000
+}
+
+fn default_subagents_queue_poll_ms() -> usize {
+    200
+}
+
+/// Runtime load-balancing strategy for team/subagent orchestration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoadBalanceStrategy {
+    /// Preserve lexical/metadata scoring priority only.
+    Semantic,
+    /// Blend semantic score with runtime load and recent outcomes.
+    #[default]
+    Adaptive,
+    /// Prioritize least-loaded healthy agents before semantic tie-breakers.
+    LeastLoaded,
+}
+
 /// Delegate coordination runtime configuration (`[coordination]` section).
 ///
 /// Controls typed delegate message-bus integration used by `delegate` and
@@ -826,6 +921,108 @@ impl Default for CoordinationConfig {
     }
 }
 
+/// Agent-team orchestration controls (`[agent.teams]` section).
+///
+/// This governs synchronous delegation (`delegate`) and team-wide coordination.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTeamsConfig {
+    /// Enable agent-team delegation tools.
+    #[serde(default = "default_agent_teams_enabled")]
+    pub enabled: bool,
+    /// Allow automatic team-agent selection when a specific agent is not given.
+    #[serde(default = "default_agent_teams_auto_activate")]
+    pub auto_activate: bool,
+    /// Maximum number of delegate profiles activated as team members.
+    #[serde(default = "default_agent_teams_max_agents")]
+    pub max_agents: usize,
+    /// Runtime strategy used for automatic team-agent selection.
+    #[serde(default)]
+    pub strategy: AgentLoadBalanceStrategy,
+    /// Sliding window (seconds) used to compute recent load/failure signals.
+    #[serde(default = "default_agent_teams_load_window_secs")]
+    pub load_window_secs: usize,
+    /// Penalty multiplier applied to each currently in-flight task.
+    #[serde(default = "default_agent_teams_inflight_penalty")]
+    pub inflight_penalty: usize,
+    /// Penalty multiplier applied to recent assignment count in load window.
+    #[serde(default = "default_agent_teams_recent_selection_penalty")]
+    pub recent_selection_penalty: usize,
+    /// Penalty multiplier applied to recent failure count in load window.
+    #[serde(default = "default_agent_teams_recent_failure_penalty")]
+    pub recent_failure_penalty: usize,
+}
+
+impl Default for AgentTeamsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_teams_enabled(),
+            auto_activate: default_agent_teams_auto_activate(),
+            max_agents: default_agent_teams_max_agents(),
+            strategy: AgentLoadBalanceStrategy::default(),
+            load_window_secs: default_agent_teams_load_window_secs(),
+            inflight_penalty: default_agent_teams_inflight_penalty(),
+            recent_selection_penalty: default_agent_teams_recent_selection_penalty(),
+            recent_failure_penalty: default_agent_teams_recent_failure_penalty(),
+        }
+    }
+}
+
+/// Background sub-agent orchestration controls (`[agent.subagents]` section).
+///
+/// This governs asynchronous delegation (`subagent_spawn`, `subagent_list`,
+/// `subagent_manage`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SubAgentsConfig {
+    /// Enable background sub-agent tools.
+    #[serde(default = "default_subagents_enabled")]
+    pub enabled: bool,
+    /// Allow automatic sub-agent selection when a specific agent is not given.
+    #[serde(default = "default_subagents_auto_activate")]
+    pub auto_activate: bool,
+    /// Maximum number of concurrently running background sub-agents.
+    #[serde(default = "default_subagents_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Runtime strategy used for automatic sub-agent selection.
+    #[serde(default)]
+    pub strategy: AgentLoadBalanceStrategy,
+    /// Sliding window (seconds) used to compute recent load/failure signals.
+    #[serde(default = "default_subagents_load_window_secs")]
+    pub load_window_secs: usize,
+    /// Penalty multiplier applied to each currently in-flight task.
+    #[serde(default = "default_subagents_inflight_penalty")]
+    pub inflight_penalty: usize,
+    /// Penalty multiplier applied to recent assignment count in load window.
+    #[serde(default = "default_subagents_recent_selection_penalty")]
+    pub recent_selection_penalty: usize,
+    /// Penalty multiplier applied to recent failure count in load window.
+    #[serde(default = "default_subagents_recent_failure_penalty")]
+    pub recent_failure_penalty: usize,
+    /// When at concurrency limit, wait this long for a slot before failing.
+    /// Set to `0` for immediate fail-fast behavior.
+    #[serde(default = "default_subagents_queue_wait_ms")]
+    pub queue_wait_ms: usize,
+    /// Poll interval while waiting for a concurrency slot.
+    #[serde(default = "default_subagents_queue_poll_ms")]
+    pub queue_poll_ms: usize,
+}
+
+impl Default for SubAgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_subagents_enabled(),
+            auto_activate: default_subagents_auto_activate(),
+            max_concurrent: default_subagents_max_concurrent(),
+            strategy: AgentLoadBalanceStrategy::default(),
+            load_window_secs: default_subagents_load_window_secs(),
+            inflight_penalty: default_subagents_inflight_penalty(),
+            recent_selection_penalty: default_subagents_recent_selection_penalty(),
+            recent_failure_penalty: default_subagents_recent_failure_penalty(),
+            queue_wait_ms: default_subagents_queue_wait_ms(),
+            queue_poll_ms: default_subagents_queue_poll_ms(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -847,6 +1044,12 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Agent-team runtime controls for synchronous delegation.
+    #[serde(default)]
+    pub teams: AgentTeamsConfig,
+    /// Sub-agent runtime controls for background delegation.
+    #[serde(default)]
+    pub subagents: SubAgentsConfig,
     /// Loop detection: no-progress repeat threshold.
     /// Triggers when the same tool+args produces identical output this many times.
     /// Set to `0` to disable. Default: `3`.
@@ -976,6 +1179,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            teams: AgentTeamsConfig::default(),
+            subagents: SubAgentsConfig::default(),
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
             loop_detection_ping_pong_cycles: default_loop_detection_ping_pong_cycles(),
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
@@ -3134,6 +3339,67 @@ pub enum NonCliNaturalLanguageApprovalMode {
     Direct,
 }
 
+/// Action to apply when a command-context rule matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandContextRuleAction {
+    /// Matching context is explicitly allowed.
+    #[default]
+    Allow,
+    /// Matching context is explicitly denied.
+    Deny,
+}
+
+/// Context-aware allow/deny rule for shell commands.
+///
+/// Rules are evaluated per command segment. Command matching accepts command
+/// names (`curl`), explicit paths (`/usr/bin/curl`), and wildcard (`*`).
+///
+/// Matching semantics:
+/// - `action = "deny"`: if all constraints match, the segment is rejected.
+/// - `action = "allow"`: if at least one allow rule exists for a command,
+///   segments must match at least one of those allow rules.
+///
+/// Constraints are optional:
+/// - `allowed_domains`: require URL arguments to match these hosts/patterns.
+/// - `allowed_path_prefixes`: require path-like arguments to stay under these prefixes.
+/// - `denied_path_prefixes`: for deny rules, match when any path-like argument
+///   is under these prefixes; for allow rules, require path arguments not to hit
+///   these prefixes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct CommandContextRuleConfig {
+    /// Command name/path pattern (`git`, `/usr/bin/curl`, or `*`).
+    pub command: String,
+
+    /// Rule action (`allow` | `deny`). Defaults to `allow`.
+    #[serde(default)]
+    pub action: CommandContextRuleAction,
+
+    /// Allowed host patterns for URL arguments.
+    ///
+    /// Supports exact hosts (`api.example.com`) and wildcard suffixes (`*.example.com`).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+
+    /// Allowed path prefixes for path-like arguments.
+    ///
+    /// Prefixes may be absolute, `~/...`, or workspace-relative.
+    #[serde(default)]
+    pub allowed_path_prefixes: Vec<String>,
+
+    /// Denied path prefixes for path-like arguments.
+    ///
+    /// Prefixes may be absolute, `~/...`, or workspace-relative.
+    #[serde(default)]
+    pub denied_path_prefixes: Vec<String>,
+
+    /// Permit high-risk commands when this allow rule matches.
+    ///
+    /// The command still requires explicit `approved=true` in supervised mode.
+    #[serde(default)]
+    pub allow_high_risk: bool,
+}
+
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
@@ -3147,6 +3413,13 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
+
+    /// Context-aware shell command allow/deny rules.
+    ///
+    /// These rules are evaluated per command segment and can narrow or override
+    /// global `allowed_commands` behavior for matching commands.
+    #[serde(default)]
+    pub command_context_rules: Vec<CommandContextRuleConfig>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
@@ -3251,6 +3524,7 @@ fn default_always_ask() -> Vec<String> {
 fn default_non_cli_excluded_tools() -> Vec<String> {
     [
         "shell",
+        "process",
         "file_write",
         "file_edit",
         "git_operations",
@@ -3298,6 +3572,10 @@ impl Default for AutonomyConfig {
                 "git".into(),
                 "npm".into(),
                 "cargo".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
                 "ls".into(),
                 "cat".into(),
                 "grep".into(),
@@ -3309,6 +3587,7 @@ impl Default for AutonomyConfig {
                 "tail".into(),
                 "date".into(),
             ],
+            command_context_rules: Vec::new(),
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -3330,8 +3609,8 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_actions_per_hour: 100,
+            max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -5064,19 +5343,40 @@ impl ChannelConfig for BlueBubblesConfig {
 }
 
 /// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WatiConfig {
     /// WATI API token (Bearer auth).
     pub api_token: String,
     /// WATI API base URL (default: https://live-mt-server.wati.io).
     #[serde(default = "default_wati_api_url")]
     pub api_url: String,
+    /// Shared secret for WATI webhook authentication.
+    ///
+    /// Supports `X-Hub-Signature-256` HMAC verification and Bearer-token fallback.
+    /// Can also be set via `ZEROCLAW_WATI_WEBHOOK_SECRET`.
+    /// Default: `None` (unset).
+    /// Compatibility/migration: additive key for existing deployments; set this
+    /// before enabling inbound WATI webhooks. Remove (or set null) to roll back.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
     /// Tenant ID for multi-channel setups (optional).
     #[serde(default)]
     pub tenant_id: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all.
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+}
+
+impl std::fmt::Debug for WatiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatiConfig")
+            .field("api_token", &"[REDACTED]")
+            .field("api_url", &self.api_url)
+            .field("webhook_secret", &"[REDACTED]")
+            .field("tenant_id", &self.tenant_id)
+            .field("allowed_numbers", &self.allowed_numbers)
+            .finish()
+    }
 }
 
 fn default_wati_api_url() -> String {
@@ -6258,6 +6558,61 @@ async fn load_persisted_workspace_dirs(
     } else {
         default_config_dir.join(parsed_dir)
     };
+
+    // Guard: ignore stale marker paths that no longer exist.
+    let config_meta = match fs::metadata(&config_dir).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::warn!(
+                "Ignoring active workspace marker {} because config_dir {} is missing: {error}",
+                state_path.display(),
+                config_dir.display()
+            );
+            return Ok(None);
+        }
+    };
+    if !config_meta.is_dir() {
+        tracing::warn!(
+            "Ignoring active workspace marker {} because config_dir {} is not a directory",
+            state_path.display(),
+            config_dir.display()
+        );
+        return Ok(None);
+    }
+
+    // Guard: marker must point to an initialized config profile.
+    let config_toml_path = config_dir.join("config.toml");
+    let config_toml_meta = match fs::metadata(&config_toml_path).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::warn!(
+                "Ignoring active workspace marker {} because {} is missing: {error}",
+                state_path.display(),
+                config_toml_path.display()
+            );
+            return Ok(None);
+        }
+    };
+    if !config_toml_meta.is_file() {
+        tracing::warn!(
+            "Ignoring active workspace marker {} because {} is not a file",
+            state_path.display(),
+            config_toml_path.display()
+        );
+        return Ok(None);
+    }
+
+    // Guard: if the default config location is not temporary, reject marker paths
+    // that point into OS temp storage (typically stale ephemeral sessions).
+    if !is_temp_directory(default_config_dir) && is_temp_directory(&config_dir) {
+        tracing::warn!(
+            "Ignoring active workspace marker {} because config_dir {} points to a temp directory",
+            state_path.display(),
+            config_dir.display()
+        );
+        return Ok(None);
+    }
+
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
@@ -6606,6 +6961,18 @@ fn decrypt_channel_secrets(
             "config.channels_config.linq.signing_secret",
         )?;
     }
+    if let Some(ref mut wati) = channels.wati {
+        decrypt_secret(
+            store,
+            &mut wati.api_token,
+            "config.channels_config.wati.api_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut wati.webhook_secret,
+            "config.channels_config.wati.webhook_secret",
+        )?;
+    }
     if let Some(ref mut github) = channels.github {
         decrypt_secret(
             store,
@@ -6797,6 +7164,18 @@ fn encrypt_channel_secrets(
             store,
             &mut linq.signing_secret,
             "config.channels_config.linq.signing_secret",
+        )?;
+    }
+    if let Some(ref mut wati) = channels.wati {
+        encrypt_secret(
+            store,
+            &mut wati.api_token,
+            "config.channels_config.wati.api_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut wati.webhook_secret,
+            "config.channels_config.wati.webhook_secret",
         )?;
     }
     if let Some(ref mut github) = channels.github {
@@ -7031,6 +7410,75 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     Ok(())
 }
 
+fn legacy_feishu_table(raw_toml: &toml::Value) -> Option<&toml::map::Map<String, toml::Value>> {
+    raw_toml
+        .get("channels_config")?
+        .as_table()?
+        .get("feishu")?
+        .as_table()
+}
+
+fn extract_legacy_feishu_mention_only(raw_toml: &toml::Value) -> Option<bool> {
+    legacy_feishu_table(raw_toml)?
+        .get("mention_only")
+        .and_then(toml::Value::as_bool)
+}
+
+fn has_legacy_feishu_mention_only(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("mention_only"))
+        .is_some()
+}
+
+fn has_legacy_feishu_use_feishu(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("use_feishu"))
+        .is_some()
+}
+
+fn apply_feishu_legacy_compat(
+    config: &mut Config,
+    legacy_feishu_mention_only: Option<bool>,
+    legacy_feishu_use_feishu_present: bool,
+    saw_legacy_feishu_mention_only_path: bool,
+    saw_legacy_feishu_use_feishu_path: bool,
+) {
+    // Backward compatibility: users sometimes migrate config snippets from
+    // [channels_config.lark] to [channels_config.feishu] and keep old keys.
+    if let Some(feishu_cfg) = config.channels_config.feishu.as_mut() {
+        if let Some(legacy_mention_only) = legacy_feishu_mention_only {
+            if feishu_cfg.group_reply.is_none() {
+                let mapped_mode = if legacy_mention_only {
+                    GroupReplyMode::MentionOnly
+                } else {
+                    GroupReplyMode::AllMessages
+                };
+                feishu_cfg.group_reply = Some(GroupReplyConfig {
+                    mode: Some(mapped_mode),
+                    allowed_sender_ids: Vec::new(),
+                });
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is deprecated; mapped to [channels_config.feishu.group_reply].mode."
+                );
+            } else if saw_legacy_feishu_mention_only_path {
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is ignored because [channels_config.feishu.group_reply] is already set."
+                );
+            }
+        } else if saw_legacy_feishu_mention_only_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].mention_only is invalid; expected boolean."
+            );
+        }
+
+        if legacy_feishu_use_feishu_present || saw_legacy_feishu_use_feishu_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].use_feishu is redundant and ignored; [channels_config.feishu] always uses Feishu endpoints."
+            );
+        }
+    }
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -7069,24 +7517,23 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
-            let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
-                |path| {
-                    ignored_paths.push(path.to_string());
-                },
-            )
-            .context("Failed to deserialize config file")?;
+            // Parse raw TOML first so legacy compatibility rewrites can be applied after
+            // deserialization.
+            let raw_toml: toml::Value =
+                toml::from_str(&contents).context("Failed to parse config file")?;
+            let legacy_feishu_mention_only = extract_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_mention_only_present = has_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_use_feishu_present = has_legacy_feishu_use_feishu(&raw_toml);
+            let mut config: Config =
+                toml::from_str(&contents).context("Failed to deserialize config file")?;
 
-            // Warn about each unknown config key
-            for path in ignored_paths {
-                tracing::warn!(
-                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
-                    path
-                );
-            }
+            apply_feishu_legacy_compat(
+                &mut config,
+                legacy_feishu_mention_only,
+                legacy_feishu_use_feishu_present,
+                legacy_feishu_mention_only_present,
+                legacy_feishu_use_feishu_present,
+            );
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -7444,6 +7891,61 @@ impl Config {
                 anyhow::bail!(
                     "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                 );
+            }
+        }
+        for (i, rule) in self.autonomy.command_context_rules.iter().enumerate() {
+            let command = rule.command.trim();
+            if command.is_empty() {
+                anyhow::bail!("autonomy.command_context_rules[{i}].command must not be empty");
+            }
+            if !command
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | '*'))
+            {
+                anyhow::bail!(
+                    "autonomy.command_context_rules[{i}].command contains invalid characters: {command}"
+                );
+            }
+
+            for (j, domain) in rule.allowed_domains.iter().enumerate() {
+                let normalized = domain.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not be empty"
+                    );
+                }
+                if normalized.chars().any(char::is_whitespace) {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not contain whitespace"
+                    );
+                }
+            }
+
+            for (j, prefix) in rule.allowed_path_prefixes.iter().enumerate() {
+                let normalized = prefix.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not be empty"
+                    );
+                }
+                if normalized.contains('\0') {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not contain null bytes"
+                    );
+                }
+            }
+            for (j, prefix) in rule.denied_path_prefixes.iter().enumerate() {
+                let normalized = prefix.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not be empty"
+                    );
+                }
+                if normalized.contains('\0') {
+                    anyhow::bail!(
+                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not contain null bytes"
+                    );
+                }
             }
         }
         let mut seen_non_cli_excluded = std::collections::HashSet::new();
@@ -8043,6 +8545,21 @@ impl Config {
         }
         if self.coordination.max_seen_message_ids == 0 {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
+        }
+        if self.agent.teams.max_agents == 0 {
+            anyhow::bail!("agent.teams.max_agents must be greater than 0");
+        }
+        if self.agent.teams.load_window_secs == 0 {
+            anyhow::bail!("agent.teams.load_window_secs must be greater than 0");
+        }
+        if self.agent.subagents.max_concurrent == 0 {
+            anyhow::bail!("agent.subagents.max_concurrent must be greater than 0");
+        }
+        if self.agent.subagents.load_window_secs == 0 {
+            anyhow::bail!("agent.subagents.load_window_secs must be greater than 0");
+        }
+        if self.agent.subagents.queue_poll_ms == 0 {
+            anyhow::bail!("agent.subagents.queue_poll_ms must be greater than 0");
         }
 
         // WASM config
@@ -9096,6 +9613,9 @@ mod tests {
                 model: "model-test".into(),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -9223,16 +9743,20 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
+        assert!(a.allowed_commands.contains(&"mkdir".to_string()));
+        assert!(a.allowed_commands.contains(&"touch".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
-        assert_eq!(a.max_cost_per_day_cents, 500);
+        assert_eq!(a.max_actions_per_hour, 100);
+        assert_eq!(a.max_cost_per_day_cents, 1000);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+        assert!(a.command_context_rules.is_empty());
         assert!(!a.allow_sensitive_file_reads);
         assert!(!a.allow_sensitive_file_writes);
         assert!(a.non_cli_excluded_tools.contains(&"shell".to_string()));
+        assert!(a.non_cli_excluded_tools.contains(&"process".to_string()));
         assert!(a.non_cli_excluded_tools.contains(&"delegate".to_string()));
     }
 
@@ -9261,10 +9785,51 @@ allowed_roots = []
             !parsed.allow_sensitive_file_writes,
             "Missing allow_sensitive_file_writes must default to false"
         );
+        assert!(
+            parsed.command_context_rules.is_empty(),
+            "Missing command_context_rules must default to empty"
+        );
         assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(parsed
             .non_cli_excluded_tools
+            .contains(&"process".to_string()));
+        assert!(parsed
+            .non_cli_excluded_tools
             .contains(&"browser".to_string()));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_command_context_rule_command() {
+        let mut cfg = Config::default();
+        cfg.autonomy.command_context_rules = vec![CommandContextRuleConfig {
+            command: "curl;rm".into(),
+            action: CommandContextRuleAction::Allow,
+            allowed_domains: vec![],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.command_context_rules[0].command"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_empty_command_context_rule_domain() {
+        let mut cfg = Config::default();
+        cfg.autonomy.command_context_rules = vec![CommandContextRuleConfig {
+            command: "curl".into(),
+            action: CommandContextRuleAction::Allow,
+            allowed_domains: vec!["   ".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: true,
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.command_context_rules[0].allowed_domains[0]"));
     }
 
     #[test]
@@ -9462,6 +10027,7 @@ ws_url = "ws://127.0.0.1:3002"
                 level: AutonomyLevel::Full,
                 workspace_only: false,
                 allowed_commands: vec!["docker".into()],
+                command_context_rules: vec![],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
@@ -10007,6 +10573,9 @@ tool_dispatcher = "xml"
                 model: "model-test".into(),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -11817,6 +12386,9 @@ provider_api = "not-a-real-mode"
         let openai = resolve_default_model_id(None, Some("openai"));
         assert_eq!(openai, "gpt-5.2");
 
+        let stepfun = resolve_default_model_id(None, Some("stepfun"));
+        assert_eq!(stepfun, "step-3.5-flash");
+
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
     }
@@ -11828,6 +12400,12 @@ provider_api = "not-a-real-mode"
 
         let google_alias = resolve_default_model_id(None, Some("google-gemini"));
         assert_eq!(google_alias, "gemini-2.5-pro");
+
+        let step_alias = resolve_default_model_id(None, Some("step"));
+        assert_eq!(step_alias, "step-3.5-flash");
+
+        let step_ai_alias = resolve_default_model_id(None, Some("step-ai"));
+        assert_eq!(step_ai_alias, "step-3.5-flash");
     }
 
     #[test]
@@ -12092,6 +12670,13 @@ provider_api = "not-a-real-mode"
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         fs::create_dir_all(&default_config_dir).await.unwrap();
+        fs::create_dir_all(&marker_config_dir).await.unwrap();
+        fs::write(
+            marker_config_dir.join("config.toml"),
+            "default_model = \"marker-profile\"\n",
+        )
+        .await
+        .unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
         };
@@ -12109,6 +12694,114 @@ provider_api = "not-a-real-mode"
         assert_eq!(resolved_workspace_dir, marker_config_dir.join("workspace"));
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_ignores_marker_when_config_dir_missing() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let marker_config_dir = default_config_dir.join("profiles").join("missing-alpha");
+        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        fs::create_dir_all(&default_config_dir).await.unwrap();
+        let state = ActiveWorkspaceState {
+            config_dir: marker_config_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(&state_path, toml::to_string(&state).unwrap())
+            .await
+            .unwrap();
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(config_dir, default_config_dir);
+        assert_eq!(resolved_workspace_dir, default_workspace_dir);
+
+        let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_ignores_marker_when_config_toml_missing() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let marker_config_dir = default_config_dir.join("profiles").join("alpha-no-config");
+        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        fs::create_dir_all(&default_config_dir).await.unwrap();
+        fs::create_dir_all(&marker_config_dir).await.unwrap();
+        let state = ActiveWorkspaceState {
+            config_dir: marker_config_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(&state_path, toml::to_string(&state).unwrap())
+            .await
+            .unwrap();
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(config_dir, default_config_dir);
+        assert_eq!(resolved_workspace_dir, default_workspace_dir);
+
+        let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_ignores_temp_marker_outside_temp_default_root() {
+        let _env_guard = env_override_lock().await;
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let non_temp_root = base.join(format!("zeroclaw_marker_guard_{}", uuid::Uuid::new_v4()));
+        let default_config_dir = non_temp_root.join(".zeroclaw");
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let marker_config_dir = std::env::temp_dir().join(format!(
+            "zeroclaw_temp_marker_profile_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        if is_temp_directory(&default_config_dir) {
+            // Extremely uncommon environment; skip this guard-specific test.
+            return;
+        }
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        fs::create_dir_all(&default_config_dir).await.unwrap();
+        fs::create_dir_all(&marker_config_dir).await.unwrap();
+        fs::write(
+            marker_config_dir.join("config.toml"),
+            "default_model = \"temp-marker\"\n",
+        )
+        .await
+        .unwrap();
+        let state = ActiveWorkspaceState {
+            config_dir: marker_config_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(&state_path, toml::to_string(&state).unwrap())
+            .await
+            .unwrap();
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(config_dir, default_config_dir);
+        assert_eq!(resolved_workspace_dir, default_workspace_dir);
+
+        let _ = fs::remove_dir_all(non_temp_root).await;
+        let _ = fs::remove_dir_all(marker_config_dir).await;
     }
 
     #[test]
@@ -13110,6 +13803,83 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn feishu_legacy_key_extractors_detect_compat_fields() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+[channels_config.feishu]
+app_id = "cli_123"
+app_secret = "secret"
+mention_only = true
+use_feishu = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_legacy_feishu_mention_only(&raw), Some(true));
+        assert!(has_legacy_feishu_mention_only(&raw));
+        assert!(has_legacy_feishu_use_feishu(&raw));
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_maps_to_group_reply_mode() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_does_not_override_group_reply() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: Some(GroupReplyConfig {
+                mode: Some(GroupReplyMode::AllMessages),
+                allowed_sender_ids: vec![],
+            }),
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+    }
+
+    #[test]
     async fn qq_config_defaults_to_webhook_receive_mode() {
         let json = r#"{"app_id":"123","app_secret":"secret"}"#;
         let parsed: QQConfig = serde_json::from_str(json).unwrap();
@@ -13761,6 +14531,30 @@ sensitivity = 0.9
         assert_eq!(config.coordination.max_dead_letters, 256);
         assert_eq!(config.coordination.max_context_entries, 512);
         assert_eq!(config.coordination.max_seen_message_ids, 4096);
+        assert!(config.agent.teams.enabled);
+        assert!(config.agent.teams.auto_activate);
+        assert_eq!(config.agent.teams.max_agents, 32);
+        assert_eq!(
+            config.agent.teams.strategy,
+            AgentLoadBalanceStrategy::Adaptive
+        );
+        assert_eq!(config.agent.teams.load_window_secs, 120);
+        assert_eq!(config.agent.teams.inflight_penalty, 8);
+        assert_eq!(config.agent.teams.recent_selection_penalty, 2);
+        assert_eq!(config.agent.teams.recent_failure_penalty, 12);
+        assert!(config.agent.subagents.enabled);
+        assert!(config.agent.subagents.auto_activate);
+        assert_eq!(config.agent.subagents.max_concurrent, 10);
+        assert_eq!(
+            config.agent.subagents.strategy,
+            AgentLoadBalanceStrategy::Adaptive
+        );
+        assert_eq!(config.agent.subagents.load_window_secs, 180);
+        assert_eq!(config.agent.subagents.inflight_penalty, 10);
+        assert_eq!(config.agent.subagents.recent_selection_penalty, 3);
+        assert_eq!(config.agent.subagents.recent_failure_penalty, 16);
+        assert_eq!(config.agent.subagents.queue_wait_ms, 15_000);
+        assert_eq!(config.agent.subagents.queue_poll_ms, 200);
     }
 
     #[test]
@@ -13772,6 +14566,24 @@ sensitivity = 0.9
         config.coordination.max_dead_letters = 64;
         config.coordination.max_context_entries = 32;
         config.coordination.max_seen_message_ids = 1024;
+        config.agent.teams.enabled = false;
+        config.agent.teams.auto_activate = false;
+        config.agent.teams.max_agents = 7;
+        config.agent.teams.strategy = AgentLoadBalanceStrategy::LeastLoaded;
+        config.agent.teams.load_window_secs = 90;
+        config.agent.teams.inflight_penalty = 6;
+        config.agent.teams.recent_selection_penalty = 1;
+        config.agent.teams.recent_failure_penalty = 4;
+        config.agent.subagents.enabled = true;
+        config.agent.subagents.auto_activate = false;
+        config.agent.subagents.max_concurrent = 4;
+        config.agent.subagents.strategy = AgentLoadBalanceStrategy::Semantic;
+        config.agent.subagents.load_window_secs = 45;
+        config.agent.subagents.inflight_penalty = 5;
+        config.agent.subagents.recent_selection_penalty = 2;
+        config.agent.subagents.recent_failure_penalty = 9;
+        config.agent.subagents.queue_wait_ms = 1_000;
+        config.agent.subagents.queue_poll_ms = 50;
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -13781,6 +14593,30 @@ sensitivity = 0.9
         assert_eq!(parsed.coordination.max_dead_letters, 64);
         assert_eq!(parsed.coordination.max_context_entries, 32);
         assert_eq!(parsed.coordination.max_seen_message_ids, 1024);
+        assert!(!parsed.agent.teams.enabled);
+        assert!(!parsed.agent.teams.auto_activate);
+        assert_eq!(parsed.agent.teams.max_agents, 7);
+        assert_eq!(
+            parsed.agent.teams.strategy,
+            AgentLoadBalanceStrategy::LeastLoaded
+        );
+        assert_eq!(parsed.agent.teams.load_window_secs, 90);
+        assert_eq!(parsed.agent.teams.inflight_penalty, 6);
+        assert_eq!(parsed.agent.teams.recent_selection_penalty, 1);
+        assert_eq!(parsed.agent.teams.recent_failure_penalty, 4);
+        assert!(parsed.agent.subagents.enabled);
+        assert!(!parsed.agent.subagents.auto_activate);
+        assert_eq!(parsed.agent.subagents.max_concurrent, 4);
+        assert_eq!(
+            parsed.agent.subagents.strategy,
+            AgentLoadBalanceStrategy::Semantic
+        );
+        assert_eq!(parsed.agent.subagents.load_window_secs, 45);
+        assert_eq!(parsed.agent.subagents.inflight_penalty, 5);
+        assert_eq!(parsed.agent.subagents.recent_selection_penalty, 2);
+        assert_eq!(parsed.agent.subagents.recent_failure_penalty, 9);
+        assert_eq!(parsed.agent.subagents.queue_wait_ms, 1_000);
+        assert_eq!(parsed.agent.subagents.queue_poll_ms, 50);
     }
 
     #[test]
@@ -13823,6 +14659,41 @@ sensitivity = 0.9
             .validate()
             .expect_err("expected coordination lead-agent validation failure");
         assert!(err.to_string().contains("coordination.lead_agent"));
+
+        let mut config = Config::default();
+        config.agent.teams.max_agents = 0;
+        let err = config
+            .validate()
+            .expect_err("expected team-size validation failure");
+        assert!(err.to_string().contains("agent.teams.max_agents"));
+
+        let mut config = Config::default();
+        config.agent.subagents.max_concurrent = 0;
+        let err = config
+            .validate()
+            .expect_err("expected subagent concurrency validation failure");
+        assert!(err.to_string().contains("agent.subagents.max_concurrent"));
+
+        let mut config = Config::default();
+        config.agent.teams.load_window_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("expected team load window validation failure");
+        assert!(err.to_string().contains("agent.teams.load_window_secs"));
+
+        let mut config = Config::default();
+        config.agent.subagents.load_window_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("expected subagent load window validation failure");
+        assert!(err.to_string().contains("agent.subagents.load_window_secs"));
+
+        let mut config = Config::default();
+        config.agent.subagents.queue_poll_ms = 0;
+        let err = config
+            .validate()
+            .expect_err("expected subagent queue poll validation failure");
+        assert!(err.to_string().contains("agent.subagents.queue_poll_ms"));
     }
 
     #[test]

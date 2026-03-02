@@ -15,6 +15,7 @@ pub struct PrometheusObserver {
     tokens_output_total: IntCounterVec,
     tool_calls: IntCounterVec,
     channel_messages: IntCounterVec,
+    webhook_auth_failures: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
 
@@ -71,6 +72,15 @@ impl PrometheusObserver {
             &["channel", "direction"],
         )
         .context("failed to create zeroclaw_channel_messages_total counter")?;
+
+        let webhook_auth_failures = IntCounterVec::new(
+            prometheus::Opts::new(
+                "zeroclaw_webhook_auth_failures_total",
+                "Total webhook authentication failures",
+            ),
+            &["channel", "signature", "bearer"],
+        )
+        .context("failed to create zeroclaw_webhook_auth_failures_total counter")?;
 
         let heartbeat_ticks =
             prometheus::IntCounter::new("zeroclaw_heartbeat_ticks_total", "Total heartbeat ticks")
@@ -149,6 +159,9 @@ impl PrometheusObserver {
             .register(Box::new(channel_messages.clone()))
             .context("failed to register zeroclaw_channel_messages_total counter")?;
         registry
+            .register(Box::new(webhook_auth_failures.clone()))
+            .context("failed to register zeroclaw_webhook_auth_failures_total counter")?;
+        registry
             .register(Box::new(heartbeat_ticks.clone()))
             .context("failed to register zeroclaw_heartbeat_ticks_total counter")?;
         registry
@@ -181,6 +194,7 @@ impl PrometheusObserver {
             tokens_output_total,
             tool_calls,
             channel_messages,
+            webhook_auth_failures,
             heartbeat_ticks,
             errors,
             agent_duration,
@@ -267,6 +281,15 @@ impl Observer for PrometheusObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages
                     .with_label_values(&[channel, direction])
+                    .inc();
+            }
+            ObserverEvent::WebhookAuthFailure {
+                channel,
+                signature,
+                bearer,
+            } => {
+                self.webhook_auth_failures
+                    .with_label_values(&[channel, signature, bearer])
                     .inc();
             }
             ObserverEvent::HeartbeatTick => {
@@ -360,6 +383,11 @@ mod tests {
             channel: "telegram".into(),
             direction: "inbound".into(),
         });
+        obs.record_event(&ObserverEvent::WebhookAuthFailure {
+            channel: "wati".into(),
+            signature: "invalid".into(),
+            bearer: "missing".into(),
+        });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
             component: "provider".into(),
@@ -389,12 +417,18 @@ mod tests {
             duration: Duration::from_millis(100),
             success: true,
         });
+        obs.record_event(&ObserverEvent::WebhookAuthFailure {
+            channel: "wati".into(),
+            signature: "invalid".into(),
+            bearer: "missing".into(),
+        });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
 
         let output = obs.encode();
         assert!(output.contains("zeroclaw_agent_starts_total"));
         assert!(output.contains("zeroclaw_tool_calls_total"));
+        assert!(output.contains("zeroclaw_webhook_auth_failures_total"));
         assert!(output.contains("zeroclaw_heartbeat_ticks_total"));
         assert!(output.contains("zeroclaw_request_latency_seconds"));
     }

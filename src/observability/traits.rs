@@ -56,6 +56,15 @@ pub enum ObserverEvent {
         /// `"inbound"` or `"outbound"`.
         direction: String,
     },
+    /// Webhook authentication failure with non-sensitive auth states.
+    WebhookAuthFailure {
+        /// Channel name (e.g., `"wati"`, `"whatsapp"`).
+        channel: String,
+        /// Signature auth status (`"missing"`, `"invalid"`, `"valid"`).
+        signature: String,
+        /// Bearer auth status (`"missing"`, `"invalid"`, `"valid"`).
+        bearer: String,
+    },
     /// Periodic heartbeat tick from the runtime keep-alive loop.
     HeartbeatTick,
     /// An error occurred in a named component.

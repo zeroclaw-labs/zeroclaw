@@ -1,11 +1,17 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = [
+    ".",
+    "crates/robot-kit",
+    "crates/zeroclaw-types",
+    "crates/zeroclaw-core",
+]
 resolver = "2"
 
 [package]
 name = "zeroclaw"
 version = "0.1.7"
 edition = "2021"
+build = "build.rs"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
@@ -34,7 +40,6 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-serde_ignored = "0.1"
 
 # Config
 directories = "6.0"
@@ -58,8 +63,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML to plain text conversion (web_fetch tool)
+# HTML to plain text / markdown conversion (web_fetch tool)
 nanohtml2text = "0.2"
+html2md = { package = "fast_html2md", version = "0.0.58", optional = true }
 
 # Zip archive extraction
 zip = { version = "8.1", default-features = false, features = ["deflate"] }
@@ -163,6 +169,11 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
+# WASM runtime for plugin execution
+# Keep this on a RustSec-patched line that remains compatible with the
+# workspace rust-version = "1.87".
+wasmtime = { version = "36.0.6", default-features = false, features = ["runtime", "cranelift"] }
+
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
 
@@ -180,7 +191,6 @@ tempfile = "3.14"
 
 # WASM plugin runtime (optional, enable with --features wasm-tools)
 # Uses WASI stdio protocol — tools read JSON from stdin, write JSON to stdout.
-wasmtime = { version = "36.0.6", optional = true, default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "36.0.6", optional = true, default-features = false, features = ["preview1"] }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
@@ -230,13 +240,13 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # wasm-tools = WASM plugin engine for dynamically-loaded tool packages (WASI stdio protocol)
 # Runtime implementation is active on Linux/macOS/Windows; unsupported targets use stubs.
-wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
+wasm-tools = ["dep:wasmtime-wasi"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 # Optional provider feature flags used by cfg(feature = "...") guards.
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []
-web-fetch-html2md = []
+web-fetch-html2md = ["dep:html2md"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
@@ -248,8 +258,9 @@ panic = "abort"      # Reduce binary size
 
 [profile.release-fast]
 inherits = "release"
-codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
-                     # Use: cargo build --profile release-fast
+# Keep release-fast under CI binary size safeguard (20MB hard gate).
+# Using 1 codegen unit preserves release-level size characteristics.
+codegen-units = 1
 
 [profile.dist]
 inherits = "release"

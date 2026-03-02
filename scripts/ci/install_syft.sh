@@ -7,6 +7,33 @@ set -euo pipefail
 BIN_DIR="${1:-${RUNNER_TEMP:-/tmp}/bin}"
 VERSION="${2:-${SYFT_VERSION:-v1.42.1}}"
 
+download_file() {
+  local url="$1"
+  local output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sSfL "${url}" -o "${output}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${output}" "${url}"
+  else
+    echo "Missing downloader: install curl or wget" >&2
+    return 1
+  fi
+}
+
+verify_sha256() {
+  local checksum_file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "${checksum_file}"
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "${checksum_file}"
+    return
+  fi
+  echo "Neither sha256sum nor shasum is available for checksum verification." >&2
+  exit 127
+}
+
 os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$os_name" in
   linux|darwin) ;;
@@ -35,8 +62,8 @@ mkdir -p "${BIN_DIR}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
-curl -sSfL "${BASE_URL}/${ARCHIVE}" -o "${tmp_dir}/${ARCHIVE}"
-curl -sSfL "${BASE_URL}/${CHECKSUMS}" -o "${tmp_dir}/${CHECKSUMS}"
+download_file "${BASE_URL}/${ARCHIVE}" "${tmp_dir}/${ARCHIVE}"
+download_file "${BASE_URL}/${CHECKSUMS}" "${tmp_dir}/${CHECKSUMS}"
 
 awk -v target="${ARCHIVE}" '$2 == target {print $1 "  " $2}' "${tmp_dir}/${CHECKSUMS}" > "${tmp_dir}/syft.sha256"
 if [ ! -s "${tmp_dir}/syft.sha256" ]; then
@@ -45,7 +72,7 @@ if [ ! -s "${tmp_dir}/syft.sha256" ]; then
 fi
 (
   cd "${tmp_dir}"
-  sha256sum -c syft.sha256
+  verify_sha256 syft.sha256
 )
 
 tar -xzf "${tmp_dir}/${ARCHIVE}" -C "${tmp_dir}" syft

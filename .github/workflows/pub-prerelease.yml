@@ -43,7 +43,7 @@ env:
 jobs:
     prerelease-guard:
         name: Pre-release Guard
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 20
         outputs:
             release_tag: ${{ steps.vars.outputs.release_tag }}
@@ -177,7 +177,7 @@ jobs:
         needs: [prerelease-guard]
         # Keep GNU Linux prerelease artifacts on Ubuntu 22.04 so runtime GLIBC
         # symbols remain compatible with Debian 12 / Ubuntu 22.04 hosts.
-        runs-on: ubuntu-22.04
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 45
         steps:
             - name: Checkout tag
@@ -239,7 +239,7 @@ jobs:
         name: Publish GitHub Pre-release
         needs: [prerelease-guard, build-prerelease]
         if: needs.prerelease-guard.outputs.ready_to_publish == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 15
         steps:
             - name: Download prerelease artifacts

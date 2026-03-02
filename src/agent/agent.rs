@@ -243,6 +243,10 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    pub fn tool_specs(&self) -> &[ToolSpec] {
+        &self.tool_specs
+    }
+
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
     }
@@ -486,6 +490,10 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+        } else if let Some(ConversationMessage::Chat(system_msg)) = self.history.first_mut() {
+            if system_msg.role == "system" {
+                crate::agent::prompt::refresh_prompt_datetime(&mut system_msg.content);
+            }
         }
 
         if self.auto_save {
@@ -796,6 +804,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -834,6 +844,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -874,6 +886,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             }]),
         });
 
@@ -915,6 +929,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
@@ -922,6 +938,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 },
             ]),
         });
@@ -964,6 +982,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             }]),
             seen_models: seen_models.clone(),
         });

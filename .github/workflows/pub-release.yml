@@ -47,7 +47,7 @@ env:
 jobs:
     prepare:
         name: Prepare Release Context
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         outputs:
             release_ref: ${{ steps.vars.outputs.release_ref }}
             release_tag: ${{ steps.vars.outputs.release_tag }}
@@ -170,14 +170,14 @@ jobs:
                 include:
                     # Keep GNU Linux release artifacts on Ubuntu 22.04 to preserve
                     # a broadly compatible GLIBC baseline for user distributions.
-                    - os: ubuntu-22.04
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: x86_64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: self-hosted
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: x86_64-unknown-linux-musl
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -185,14 +185,14 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: ubuntu-22.04
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: aarch64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-aarch64-linux-gnu
                       linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
                       linker: aarch64-linux-gnu-gcc
-                    - os: self-hosted
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: aarch64-unknown-linux-musl
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -200,14 +200,14 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: ubuntu-22.04
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: armv7-unknown-linux-gnueabihf
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-arm-linux-gnueabihf
                       linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
                       linker: arm-linux-gnueabihf-gcc
-                    - os: self-hosted
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: armv7-linux-androideabi
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -216,7 +216,7 @@ jobs:
                       linker: ""
                       android_ndk: true
                       android_api: 21
-                    - os: self-hosted
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: aarch64-linux-android
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -225,7 +225,7 @@ jobs:
                       linker: ""
                       android_ndk: true
                       android_api: 21
-                    - os: self-hosted
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: x86_64-unknown-freebsd
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -233,21 +233,21 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: macos-15-intel
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: x86_64-apple-darwin
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: macos-14
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: aarch64-apple-darwin
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: windows-latest
+                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
                       target: x86_64-pc-windows-msvc
                       artifact: zeroclaw.exe
                       archive_ext: zip
@@ -386,7 +386,7 @@ jobs:
     verify-artifacts:
         name: Verify Artifact Set
         needs: [prepare, build-release]
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -447,7 +447,7 @@ jobs:
         name: Publish Release
         if: needs.prepare.outputs.publish_release == 'true'
         needs: [prepare, verify-artifacts]
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

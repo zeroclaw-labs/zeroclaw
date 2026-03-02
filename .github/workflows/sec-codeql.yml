@@ -8,7 +8,11 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
             - ".github/codeql/**"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
     pull_request:
         branches: [dev, main]
@@ -17,7 +21,11 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
             - ".github/codeql/**"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
     merge_group:
         branches: [dev, main]
@@ -43,13 +51,21 @@ env:
 jobs:
     codeql:
         name: CodeQL Analysis
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 60
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 120
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
 
             - name: Initialize CodeQL
               uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
@@ -59,9 +75,19 @@ jobs:
                   queries: security-and-quality
 
             - name: Set up Rust
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+
+            - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
 
             - name: Build
               run: cargo build --workspace --all-targets --locked

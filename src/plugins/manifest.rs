@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -13,6 +14,17 @@ use super::traits::PluginCapability;
 const SUPPORTED_WIT_MAJOR: u64 = 1;
 const SUPPORTED_WIT_PACKAGES: [&str; 3] =
     ["zeroclaw:hooks", "zeroclaw:tools", "zeroclaw:providers"];
+
+/// Validation profile for plugin manifests.
+///
+/// Runtime uses `RuntimeWasm` today (strict; requires module path).
+/// `SchemaOnly` exists so future non-WASM plugin forms can validate metadata
+/// without forcing a fake module path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestValidationProfile {
+    RuntimeWasm,
+    SchemaOnly,
+}
 
 /// Filename plugins must use for their manifest.
 pub const PLUGIN_MANIFEST_FILENAME: &str = "zeroclaw.plugin.toml";
@@ -48,7 +60,8 @@ pub struct PluginManifest {
     /// Declared capability set for this plugin.
     #[serde(default)]
     pub capabilities: Vec<PluginCapability>,
-    /// Optional module path used by WASM-oriented plugin runtimes.
+    /// WASM module path used by runtime execution.
+    /// Required in runtime validation; optional in schema-only validation.
     #[serde(default)]
     pub module_path: String,
     /// Declared WIT package contracts the plugin expects.
@@ -129,7 +142,18 @@ fn parse_wit_package_version(input: &str) -> anyhow::Result<(&str, u64)> {
     Ok((package, major))
 }
 
-pub fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
+fn required_wit_package_for_capability(capability: &PluginCapability) -> &'static str {
+    match capability {
+        PluginCapability::Hooks | PluginCapability::ModifyToolResults => "zeroclaw:hooks",
+        PluginCapability::Tools => "zeroclaw:tools",
+        PluginCapability::Providers => "zeroclaw:providers",
+    }
+}
+
+pub fn validate_manifest_with_profile(
+    manifest: &PluginManifest,
+    profile: ManifestValidationProfile,
+) -> anyhow::Result<()> {
     if manifest.id.trim().is_empty() {
         anyhow::bail!("plugin id cannot be empty");
     }
@@ -138,9 +162,12 @@ pub fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
             anyhow::bail!("plugin version cannot be empty");
         }
     }
-    if manifest.module_path.trim().is_empty() {
+    if matches!(profile, ManifestValidationProfile::RuntimeWasm)
+        && manifest.module_path.trim().is_empty()
+    {
         anyhow::bail!("plugin module_path cannot be empty");
     }
+    let mut declared_wit_packages = HashSet::new();
     for wit_pkg in &manifest.wit_packages {
         let (package, major) = parse_wit_package_version(wit_pkg)?;
         if !SUPPORTED_WIT_PACKAGES.contains(&package) {
@@ -151,6 +178,32 @@ pub fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
                 "incompatible wit major version for '{package}': expected {SUPPORTED_WIT_MAJOR}, got {major}"
             );
         }
+        declared_wit_packages.insert(package.to_string());
+    }
+    if manifest
+        .capabilities
+        .contains(&PluginCapability::ModifyToolResults)
+        && !manifest.capabilities.contains(&PluginCapability::Hooks)
+    {
+        anyhow::bail!(
+            "plugin capability 'ModifyToolResults' requires declaring 'Hooks' capability"
+        );
+    }
+    for capability in &manifest.capabilities {
+        let required_package = required_wit_package_for_capability(capability);
+        if !declared_wit_packages.contains(required_package) {
+            anyhow::bail!(
+                "plugin capability '{capability:?}' requires wit package '{required_package}@{SUPPORTED_WIT_MAJOR}.x'"
+            );
+        }
+    }
+    if !manifest.tools.is_empty() && !declared_wit_packages.contains("zeroclaw:tools") {
+        anyhow::bail!("plugin tools require wit package 'zeroclaw:tools@{SUPPORTED_WIT_MAJOR}.x'");
+    }
+    if !manifest.providers.is_empty() && !declared_wit_packages.contains("zeroclaw:providers") {
+        anyhow::bail!(
+            "plugin providers require wit package 'zeroclaw:providers@{SUPPORTED_WIT_MAJOR}.x'"
+        );
     }
     for tool in &manifest.tools {
         if tool.name.trim().is_empty() {
@@ -166,6 +219,10 @@ pub fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
+    validate_manifest_with_profile(manifest, ManifestValidationProfile::RuntimeWasm)
 }
 
 impl PluginManifest {
@@ -286,6 +343,118 @@ id = "  "
             wit_packages: vec!["zeroclaw:unknown@1.0.0".into()],
             tools: vec![],
             providers: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_empty_module_path() {
+        let manifest = PluginManifest {
+            id: "demo".into(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".into()),
+            config_schema: None,
+            capabilities: vec![],
+            module_path: "   ".into(),
+            wit_packages: vec!["zeroclaw:hooks@1.0.0".into()],
+            tools: vec![],
+            providers: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn schema_only_validation_allows_empty_module_path() {
+        let manifest = PluginManifest {
+            id: "demo".into(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".into()),
+            config_schema: None,
+            capabilities: vec![],
+            module_path: "   ".into(),
+            wit_packages: vec![],
+            tools: vec![],
+            providers: vec![],
+        };
+        assert!(
+            validate_manifest_with_profile(&manifest, ManifestValidationProfile::SchemaOnly)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_capability_without_matching_wit_package() {
+        let manifest = PluginManifest {
+            id: "demo".into(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".into()),
+            config_schema: None,
+            capabilities: vec![PluginCapability::Tools],
+            module_path: "plugins/demo.wasm".into(),
+            wit_packages: vec!["zeroclaw:hooks@1.0.0".into()],
+            tools: vec![],
+            providers: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_modify_tool_results_without_hooks_capability() {
+        let manifest = PluginManifest {
+            id: "demo".into(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".into()),
+            config_schema: None,
+            capabilities: vec![PluginCapability::ModifyToolResults],
+            module_path: "plugins/demo.wasm".into(),
+            wit_packages: vec!["zeroclaw:hooks@1.0.0".into()],
+            tools: vec![],
+            providers: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_tools_without_tools_wit_package() {
+        let manifest = PluginManifest {
+            id: "demo".into(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".into()),
+            config_schema: None,
+            capabilities: vec![],
+            module_path: "plugins/demo.wasm".into(),
+            wit_packages: vec!["zeroclaw:hooks@1.0.0".into()],
+            tools: vec![PluginToolManifest {
+                name: "demo_tool".into(),
+                description: "demo tool".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            }],
+            providers: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_providers_without_providers_wit_package() {
+        let manifest = PluginManifest {
+            id: "demo".into(),
+            name: None,
+            description: None,
+            version: Some("1.0.0".into()),
+            config_schema: None,
+            capabilities: vec![],
+            module_path: "plugins/demo.wasm".into(),
+            wit_packages: vec!["zeroclaw:hooks@1.0.0".into()],
+            tools: vec![],
+            providers: vec!["demo_provider".into()],
         };
         assert!(validate_manifest(&manifest).is_err());
     }
