@@ -93,11 +93,19 @@ fn websocket_no_response_error() -> WebsocketRequestError {
     ))
 }
 
+fn websocket_stream_classification_error<E>(error: E) -> WebsocketRequestError
+where
+    E: Into<anyhow::Error>,
+{
+    WebsocketRequestError::stream(error)
+}
+
 fn classify_websocket_read_timeout(
+    saw_any_event: bool,
     saw_delta: bool,
     has_fallback_text: bool,
 ) -> Result<bool, WebsocketRequestError> {
-    if saw_delta || has_fallback_text {
+    if saw_any_event || saw_delta || has_fallback_text {
         Ok(true)
     } else {
         Err(websocket_waiting_for_events_timeout_error())
@@ -836,6 +844,7 @@ impl OpenAiCodexProvider {
         let mut delta_accumulator = String::new();
         let mut fallback_text: Option<String> = None;
         let mut timed_out = false;
+        let mut saw_any_event = false;
 
         loop {
             let frame = match timeout(CODEX_WS_READ_TIMEOUT, ws_stream.next()).await {
@@ -843,6 +852,7 @@ impl OpenAiCodexProvider {
                 Err(_) => {
                     let _ = ws_stream.close(None).await;
                     timed_out = classify_websocket_read_timeout(
+                        saw_any_event,
                         saw_delta,
                         fallback_text.is_some(),
                     )?;
@@ -853,32 +863,34 @@ impl OpenAiCodexProvider {
             let Some(frame) = frame else {
                 break;
             };
-            let frame = frame.map_err(WebsocketRequestError::stream)?;
+            let frame = frame.map_err(websocket_stream_classification_error)?;
             let event: Value = match frame {
                 WsMessage::Text(text) => {
-                    serde_json::from_str(text.as_ref()).map_err(WebsocketRequestError::stream)?
+                    serde_json::from_str(text.as_ref())
+                        .map_err(websocket_stream_classification_error)?
                 }
                 WsMessage::Binary(binary) => {
                     let text = String::from_utf8(binary.to_vec()).map_err(|error| {
-                        WebsocketRequestError::stream(anyhow::anyhow!(
+                        websocket_stream_classification_error(anyhow::anyhow!(
                             "invalid UTF-8 websocket frame from OpenAI Codex: {error}"
                         ))
                     })?;
-                    serde_json::from_str(&text).map_err(WebsocketRequestError::stream)?
+                    serde_json::from_str(&text).map_err(websocket_stream_classification_error)?
                 }
                 WsMessage::Ping(payload) => {
                     ws_stream
                         .send(WsMessage::Pong(payload))
                         .await
-                        .map_err(WebsocketRequestError::stream)?;
+                        .map_err(websocket_stream_classification_error)?;
                     continue;
                 }
                 WsMessage::Close(_) => break,
                 _ => continue,
             };
+            saw_any_event = true;
 
             if let Some(message) = extract_stream_error_message(&event) {
-                return Err(WebsocketRequestError::stream(anyhow::anyhow!(
+                return Err(websocket_stream_classification_error(anyhow::anyhow!(
                     "OpenAI Codex websocket stream error: {message}"
                 )));
             }
@@ -908,7 +920,7 @@ impl OpenAiCodexProvider {
                 if saw_delta {
                     let _ = ws_stream.close(None).await;
                     return nonempty_preserve(Some(&delta_accumulator)).ok_or_else(|| {
-                        WebsocketRequestError::stream(anyhow::anyhow!(
+                        websocket_stream_classification_error(anyhow::anyhow!(
                             "No response from OpenAI Codex"
                         ))
                     });
@@ -1624,13 +1636,20 @@ data: [DONE]
 
     #[test]
     fn websocket_initial_read_timeout_is_transport_unavailable() {
-        let err = classify_websocket_read_timeout(false, false)
+        let err = classify_websocket_read_timeout(false, false, false)
             .expect_err("no events before timeout should return transport-unavailable");
         assert!(matches!(
             err,
             WebsocketRequestError::TransportUnavailable(_)
         ));
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn websocket_timeout_after_non_text_event_is_timed_out_state() {
+        let timed_out = classify_websocket_read_timeout(true, false, false)
+            .expect("non-text events before timeout should mark timed_out");
+        assert!(timed_out);
     }
 
     #[test]
@@ -1646,7 +1665,9 @@ data: [DONE]
 
     #[test]
     fn websocket_explicit_stream_failure_remains_stream_error() {
-        let err = WebsocketRequestError::stream(anyhow::anyhow!("socket frame decode failed"));
+        let err = websocket_stream_classification_error(anyhow::anyhow!(
+            "socket frame decode failed"
+        ));
         assert!(matches!(err, WebsocketRequestError::Stream(_)));
         assert!(err.to_string().contains("socket frame decode failed"));
     }
