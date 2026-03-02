@@ -176,8 +176,10 @@ const DEFAULT_MODEL_NAME: &str = "anthropic/claude-sonnet-4.6";
 pub enum ProviderApiMode {
     /// Default behavior: `/chat/completions` first, optional `/responses`
     /// fallback when supported.
+    #[serde(alias = "openai-chat-completions")]
     OpenAiChatCompletions,
     /// Responses-first behavior: call `/responses` directly.
+    #[serde(alias = "openai-responses")]
     OpenAiResponses,
 }
 
@@ -12596,6 +12598,18 @@ requires_openai_auth = true
         assert!(err.to_string().contains(
             "provider_api is only valid when default_provider uses the custom:<url> format"
         ));
+    }
+
+    #[test]
+    async fn provider_api_accepts_openai_responses_alias() {
+        let toml = r#"
+default_provider = "custom:https://example.com/v1"
+default_model = "gpt-4o"
+provider_api = "openai-responses"
+"#;
+        let parsed = toml::from_str::<Config>(toml)
+            .expect("openai-responses alias should deserialize successfully");
+        assert_eq!(parsed.provider_api, Some(ProviderApiMode::OpenAiResponses));
     }
 
     #[test]
