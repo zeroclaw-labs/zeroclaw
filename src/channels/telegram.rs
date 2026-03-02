@@ -2053,7 +2053,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             } else if trimmed_line == ">" {
                 (true, "")
             } else {
-                (false, line)
+                (false, *line)
             };
 
             let mut line_out = String::new();
