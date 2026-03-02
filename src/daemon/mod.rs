@@ -7,6 +7,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+/// Grace period before force-aborting component tasks on shutdown.
+const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 15;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // Pre-flight: check if port is already in use by another zeroclaw daemon
@@ -106,19 +108,67 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
-    println!("   Ctrl+C to stop");
+    if cfg!(unix) {
+        println!("   Send SIGINT (Ctrl+C) or SIGTERM to stop");
+    } else {
+        println!("   Ctrl+C to stop");
+    }
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await;
+    tracing::info!("Shutdown signal received, starting graceful shutdown");
     crate::health::mark_component_error("daemon", "shutdown requested");
 
-    for handle in &handles {
-        handle.abort();
-    }
-    for handle in handles {
-        let _ = handle.await;
+    // Grace period: let in-flight work finish before force-aborting.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_GRACE_PERIOD_SECS);
+    loop {
+        // Remove already-finished handles.
+        handles.retain(|h| !h.is_finished());
+        if handles.is_empty() {
+            tracing::info!("All components exited cleanly");
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "Grace period expired, force-aborting {} remaining component(s)",
+                handles.len()
+            );
+            for handle in &handles {
+                handle.abort();
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     Ok(())
+}
+
+/// Wait for a shutdown signal (SIGINT or SIGTERM on Unix, SIGINT only elsewhere).
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received SIGINT");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for Ctrl+C");
+        tracing::info!("Received SIGINT");
+    }
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
