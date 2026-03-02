@@ -543,9 +543,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or Email/Gmail)
     Login {
-        /// Provider (`openai-codex` or `gemini`)
+        /// Provider (`openai-codex`, `gemini`, or `email`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -1664,9 +1664,138 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Active profile for openai-codex: {profile}");
                     Ok(())
                 }
+                "email" => {
+                    // Email/Gmail XOAUTH2 OAuth flow
+                    let email_cfg = config.channels_config.email.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No [channels_config.email] section found in config.\n\
+                                Add oauth_client_id and oauth_client_secret to your email config."
+                        )
+                    })?;
+                    let client_id = email_cfg.oauth_client_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "oauth_client_id is required in [channels_config.email] for OAuth login"
+                        )
+                    })?;
+                    let client_secret =
+                        email_cfg.oauth_client_secret.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "oauth_client_secret is required in [channels_config.email] for OAuth login"
+                            )
+                        })?;
+
+                    if device_code {
+                        match auth::email_oauth::start_device_code_flow(&client, client_id).await {
+                            Ok(device) => {
+                                println!("Gmail device-code login started.");
+                                println!("Visit: {}", device.verification_uri);
+                                println!("Code:  {}", device.user_code);
+                                if let Some(uri_complete) = &device.verification_uri_complete {
+                                    println!("Fast link: {uri_complete}");
+                                }
+
+                                let token_set = auth::email_oauth::poll_device_code_tokens(
+                                    &client,
+                                    &device,
+                                    client_id,
+                                    client_secret,
+                                )
+                                .await?;
+                                let account_id = token_set.id_token.as_deref().and_then(
+                                    auth::email_oauth::extract_account_email_from_id_token,
+                                );
+
+                                auth_service
+                                    .store_email_tokens(&profile, token_set, account_id, true)
+                                    .await?;
+
+                                println!("Saved profile {profile}");
+                                println!("Active profile for email: {profile}");
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                if err_msg.contains("403")
+                                    || err_msg.contains("Forbidden")
+                                    || err_msg.contains("Cloudflare")
+                                {
+                                    println!(
+                                        "Device-code flow is blocked by Cloudflare protection."
+                                    );
+                                    println!("   This is normal for server environments.");
+                                    println!("   Switching to browser authorization flow...");
+                                } else if err_msg.contains("invalid_client") {
+                                    println!("OAuth client configuration error: {}", err_msg);
+                                    println!(
+                                        "   Check your oauth_client_id and oauth_client_secret in email config"
+                                    );
+                                } else {
+                                    println!("Device-code flow unavailable: {}", err_msg);
+                                    println!("   Falling back to browser flow.");
+                                }
+                            }
+                        }
+                    }
+
+                    let pkce = auth::email_oauth::generate_pkce_state();
+                    let authorize_url = auth::email_oauth::build_authorize_url(client_id, &pkce);
+
+                    let pending = PendingOAuthLogin {
+                        provider: "email".to_string(),
+                        profile: profile.clone(),
+                        code_verifier: pkce.code_verifier.clone(),
+                        state: pkce.state.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    save_pending_oauth_login(config, &pending)?;
+
+                    println!("Open this URL in your browser and authorize Gmail access:");
+                    println!("{authorize_url}");
+                    println!();
+
+                    let code = match auth::email_oauth::receive_loopback_code(
+                        &pkce.state,
+                        std::time::Duration::from_secs(180),
+                    )
+                    .await
+                    {
+                        Ok(code) => {
+                            clear_pending_oauth_login(config, "email");
+                            code
+                        }
+                        Err(e) => {
+                            println!("Callback capture failed: {e}");
+                            println!(
+                                "Run `zeroclaw auth paste-redirect --provider email --profile {profile}`"
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                    let token_set = auth::email_oauth::exchange_code_for_tokens(
+                        &client,
+                        &code,
+                        &pkce,
+                        client_id,
+                        client_secret,
+                    )
+                    .await?;
+                    let account_id = token_set
+                        .id_token
+                        .as_deref()
+                        .and_then(auth::email_oauth::extract_account_email_from_id_token);
+
+                    auth_service
+                        .store_email_tokens(&profile, token_set, account_id, true)
+                        .await?;
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for email: {profile}");
+                    Ok(())
+                }
                 _ => {
                     bail!(
-                        "`auth login` supports --provider openai-codex or gemini, got: {provider}"
+                        "`auth login` supports --provider openai-codex, gemini, or email, got: {provider}"
                     );
                 }
             }
@@ -1771,8 +1900,102 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Saved profile {profile}");
                     println!("Active profile for gemini: {profile}");
                 }
+                "email" => {
+                    let email_cfg = config.channels_config.email.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("No [channels_config.email] section found in config.")
+                    })?;
+                    let client_id = email_cfg.oauth_client_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("oauth_client_id is required in email config")
+                    })?;
+                    let client_secret =
+                        email_cfg.oauth_client_secret.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("oauth_client_secret is required in email config")
+                        })?;
+
+                    let result = async {
+                        let pending =
+                            load_pending_oauth_login(config, "email")?.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "No pending email login found.\n\n\
+                                Please start the login flow first:\n   \
+                                zeroclaw auth login --provider email --profile {}\n\n\
+                                Then paste the callback URL or code here.",
+                                    profile
+                                )
+                            })?;
+
+                        if pending.profile != profile {
+                            bail!(
+                                "{} pending={}, requested={}",
+                                PROFILE_MISMATCH_PREFIX,
+                                pending.profile,
+                                profile
+                            );
+                        }
+
+                        let redirect_input = match input {
+                            Some(value) => value,
+                            None => read_plain_input("Paste redirect URL or OAuth code")?,
+                        };
+
+                        let code = auth::email_oauth::parse_code_from_redirect(
+                            &redirect_input,
+                            Some(&pending.state),
+                        )?;
+
+                        let pkce = auth::email_oauth::PkceState {
+                            code_verifier: pending.code_verifier.clone(),
+                            code_challenge: String::new(),
+                            state: pending.state.clone(),
+                        };
+
+                        let client = reqwest::Client::new();
+                        let token_set = auth::email_oauth::exchange_code_for_tokens(
+                            &client,
+                            &code,
+                            &pkce,
+                            client_id,
+                            client_secret,
+                        )
+                        .await?;
+                        let account_id = token_set
+                            .id_token
+                            .as_deref()
+                            .and_then(auth::email_oauth::extract_account_email_from_id_token);
+
+                        auth_service
+                            .store_email_tokens(&profile, token_set, account_id, true)
+                            .await?;
+                        clear_pending_oauth_login(config, "email");
+
+                        println!("Saved profile {profile}");
+                        println!("Active profile for email: {profile}");
+                        Ok(())
+                    }
+                    .await;
+
+                    if let Err(e) = result {
+                        if e.to_string().starts_with(PROFILE_MISMATCH_PREFIX) {
+                            clear_pending_oauth_login(config, "email");
+                            eprintln!("Error: {}", e);
+                            eprintln!(
+                                "\nTip: A previous login attempt was for a different profile."
+                            );
+                            eprintln!("   The pending auth file has been cleared.");
+                            eprintln!("   Please start fresh with:");
+                            eprintln!(
+                                "   zeroclaw auth login --provider email --profile {}",
+                                profile
+                            );
+                            std::process::exit(1);
+                        }
+                        return Err(e);
+                    }
+                }
                 _ => {
-                    bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
+                    bail!(
+                        "`auth paste-redirect` supports --provider openai-codex, gemini, or email"
+                    );
                 }
             }
             Ok(())
