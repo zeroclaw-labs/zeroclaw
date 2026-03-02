@@ -45,6 +45,7 @@ impl AckChannel {
     }
 }
 
+/// Inspect and update ACK emoji reaction policies for supported channels.
 pub struct ChannelAckConfigTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
