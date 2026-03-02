@@ -120,15 +120,6 @@ fn default_true() -> bool {
 fn default_oauth_profile() -> String {
     "default".into()
 }
-fn default_imap_id_name() -> String {
-    "zeroclaw".into()
-}
-fn default_imap_id_version() -> String {
-    env!("CARGO_PKG_VERSION").into()
-}
-fn default_imap_id_vendor() -> String {
-    "zeroclaw-labs".into()
-}
 
 impl Default for EmailConfig {
     fn default() -> Self {
