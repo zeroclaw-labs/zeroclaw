@@ -74,14 +74,20 @@ fn pkce_path(dir: &PathBuf, service: &str) -> PathBuf {
 }
 
 async fn ensure_oauth_dir(dir: &PathBuf) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(dir).await?;
-    // Set restrictive permissions on Unix
+    // On Unix, use DirBuilder::mode() so the directory is created with restrictive
+    // permissions atomically, eliminating the create-then-chmod TOCTOU window.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(dir, perms)?;
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking panicked creating oauth dir: {e}"))??;
     }
+    #[cfg(not(unix))]
+    tokio::fs::create_dir_all(dir).await?;
     Ok(())
 }
 
@@ -91,15 +97,19 @@ async fn read_token(path: &PathBuf) -> Option<OAuthTokenFile> {
 }
 
 async fn write_token(path: &PathBuf, token: &OAuthTokenFile) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
     let json = serde_json::to_string_pretty(token)?;
-    tokio::fs::write(path, json).await?;
-    // Set restrictive permissions on Unix
+    // Open with mode(0o600) at creation time to avoid the write-then-chmod TOCTOU
+    // window.  On non-Unix platforms, fall back to a plain write.
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
     }
+    let mut file = opts.open(path).await?;
+    file.write_all(json.as_bytes()).await?;
     Ok(())
 }
 
@@ -205,21 +215,36 @@ async fn start_google_oauth(state: &AppState) -> Response {
     let state_token = pkce_verifier();
 
     // Store "state\nverifier" so the callback can validate both.
+    // Use mode(0o600) at creation time to avoid the write-then-chmod TOCTOU window.
     let pkce_file = pkce_path(&dir, "google");
     let pkce_payload = format!("{state_token}\n{verifier}");
-    if let Err(e) = tokio::fs::write(&pkce_file, &pkce_payload).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to store PKCE verifier: {e}"),
-        )
-            .into_response();
-    }
-    // Apply restrictive permissions so the PKCE state is not world-readable.
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&pkce_file, perms);
+        use tokio::io::AsyncWriteExt as _;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        match opts.open(&pkce_file).await {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(pkce_payload.as_bytes()).await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to store PKCE verifier: {e}"),
+                    )
+                        .into_response();
+                }
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to store PKCE verifier: {e}"),
+                )
+                    .into_response();
+            }
+        }
     }
 
     let redirect_uri = callback_url(state, "google");

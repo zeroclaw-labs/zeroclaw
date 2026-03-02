@@ -24,6 +24,7 @@ Selected allowlist patterns:
 - `sigstore/cosign-installer@*`
 - `Checkmarx/vorpal-reviewdog-github-action@*`
 - `Swatinem/rust-cache@*`
+- `anthropics/claude-code-action@*`
 
 ## Change Control Export
 
@@ -87,6 +88,10 @@ Latest sweep notes:
     - Added allowlist pattern: `rustsec/audit-check@*`
     - Replaced inline `cargo install cargo-audit` execution with pinned `rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998` in `security.yml`
     - Supersedes floating-version proposal in #588 while keeping action source policy explicit
+- 2026-03-02: Added automated PR review workflow using `anthropics/claude-code-action`
+    - Added allowlist pattern: `anthropics/claude-code-action@*`
+    - Workflow uses pinned source: `anthropics/claude-code-action@220272d38887a1caed373da96a9ffdb0919c26cc` (v1)
+    - Purpose: automated PR review on open/reopen and `@claude` trigger comments
 
 ## Rollback
 
