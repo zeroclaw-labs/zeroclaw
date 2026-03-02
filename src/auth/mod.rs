@@ -1,4 +1,5 @@
 pub mod anthropic_token;
+pub mod email_oauth;
 pub mod gemini_oauth;
 pub mod oauth_common;
 pub mod openai_oauth;
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const GEMINI_PROVIDER: &str = "gemini";
+const EMAIL_PROVIDER: &str = "email";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
@@ -345,6 +347,123 @@ impl AuthService {
     ) -> Result<Option<AuthProfile>> {
         self.get_profile(GEMINI_PROVIDER, profile_override).await
     }
+
+    pub async fn store_email_tokens(
+        &self,
+        profile_name: &str,
+        token_set: crate::auth::profiles::TokenSet,
+        account_id: Option<String>,
+        set_active: bool,
+    ) -> Result<AuthProfile> {
+        let mut profile = AuthProfile::new_oauth(EMAIL_PROVIDER, profile_name, token_set);
+        profile.account_id = account_id;
+        self.store
+            .upsert_profile(profile.clone(), set_active)
+            .await?;
+        Ok(profile)
+    }
+
+    /// Get a valid email OAuth access token, refreshing if necessary.
+    ///
+    /// Returns `None` if no email profile exists.
+    /// `client_id` and `client_secret` are required for token refresh since
+    /// email OAuth credentials come from user config, not environment.
+    pub async fn get_valid_email_access_token(
+        &self,
+        profile_override: Option<&str>,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<Option<String>> {
+        let data = self.store.load().await?;
+        let Some(profile_id) = select_profile_id(&data, EMAIL_PROVIDER, profile_override) else {
+            return Ok(None);
+        };
+
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(token_set) = profile.token_set.as_ref() else {
+            anyhow::bail!("Email auth profile is not OAuth-based: {profile_id}");
+        };
+
+        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(token_set.access_token.clone()));
+        }
+
+        let Some(refresh_token) = token_set.refresh_token.clone() else {
+            return Ok(Some(token_set.access_token.clone()));
+        };
+
+        let refresh_lock = refresh_lock_for_profile(&profile_id);
+        let _guard = refresh_lock.lock().await;
+
+        // Re-load after waiting for lock to avoid duplicate refreshes.
+        let data = self.store.load().await?;
+        let Some(latest_profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
+            anyhow::bail!("Email auth profile is missing token set: {profile_id}");
+        };
+
+        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(latest_tokens.access_token.clone()));
+        }
+
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+
+        if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
+            anyhow::bail!(
+                "Email token refresh is in backoff for {remaining}s due to previous failures"
+            );
+        }
+
+        let mut refreshed = match refresh_email_access_token_with_retries(
+            &self.client,
+            &refresh_token,
+            client_id,
+            client_secret,
+        )
+        .await
+        {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+        };
+        if refreshed.refresh_token.is_none() {
+            refreshed
+                .refresh_token
+                .clone_from(&latest_tokens.refresh_token);
+        }
+
+        let account_id = refreshed
+            .id_token
+            .as_deref()
+            .and_then(email_oauth::extract_account_email_from_id_token)
+            .or_else(|| latest_profile.account_id.clone());
+
+        let updated = self
+            .store
+            .update_profile(&profile_id, |profile| {
+                profile.kind = AuthProfileKind::OAuth;
+                profile.token_set = Some(refreshed.clone());
+                profile.account_id.clone_from(&account_id);
+                Ok(())
+            })
+            .await?;
+
+        Ok(updated.token_set.map(|t| t.access_token))
+    }
 }
 
 pub fn normalize_provider(provider: &str) -> Result<String> {
@@ -353,6 +472,7 @@ pub fn normalize_provider(provider: &str) -> Result<String> {
         "openai-codex" | "openai_codex" | "codex" => Ok(OPENAI_CODEX_PROVIDER.to_string()),
         "anthropic" | "claude" | "claude-code" => Ok(ANTHROPIC_PROVIDER.to_string()),
         "gemini" | "google" | "vertex" => Ok(GEMINI_PROVIDER.to_string()),
+        "email" | "gmail" | "email-oauth" => Ok(EMAIL_PROVIDER.to_string()),
         other if !other.is_empty() => Ok(other.to_string()),
         _ => anyhow::bail!("Provider name cannot be empty"),
     }
@@ -470,6 +590,42 @@ async fn refresh_gemini_access_token_with_retries(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini token refresh failed")))
 }
 
+async fn refresh_email_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<TokenSet> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
+        match email_oauth::refresh_access_token(client, refresh_token, client_id, client_secret)
+            .await
+        {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
+                    retry = should_retry,
+                    error = %err,
+                    "Email token refresh failed"
+                );
+                last_error = Some(err);
+                if should_retry {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Email token refresh failed")))
+}
+
 fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
 
@@ -518,6 +674,13 @@ mod tests {
         assert_eq!(normalize_provider("codex").unwrap(), "openai-codex");
         assert_eq!(normalize_provider("claude").unwrap(), "anthropic");
         assert_eq!(normalize_provider("openai").unwrap(), "openai");
+    }
+
+    #[test]
+    fn normalize_provider_email_aliases() {
+        assert_eq!(normalize_provider("email").unwrap(), "email");
+        assert_eq!(normalize_provider("gmail").unwrap(), "email");
+        assert_eq!(normalize_provider("email-oauth").unwrap(), "email");
     }
 
     #[test]
