@@ -2886,6 +2886,10 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
+    /// Optional per-fallback provider API keys keyed by fallback entry name.
+    /// This allows distinct credentials for multiple `custom:<url>` endpoints.
+    #[serde(default)]
+    pub fallback_api_keys: std::collections::HashMap<String, String>,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
@@ -2941,6 +2945,7 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
@@ -5057,6 +5062,21 @@ fn decrypt_vec_secrets(
     Ok(())
 }
 
+fn decrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .decrypt(value)
+                .with_context(|| format!("Failed to decrypt {field_name}.{key}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -5097,6 +5117,21 @@ fn encrypt_vec_secrets(
             *value = store
                 .encrypt(value)
                 .with_context(|| format!("Failed to encrypt {field_name}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if !crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .encrypt(value)
+                .with_context(|| format!("Failed to encrypt {field_name}.{key}"))?;
         }
     }
     Ok(())
@@ -5700,6 +5735,11 @@ impl Config {
                 &store,
                 &mut config.reliability.api_keys,
                 "config.reliability.api_keys",
+            )?;
+            decrypt_map_secrets(
+                &store,
+                &mut config.reliability.fallback_api_keys,
+                "config.reliability.fallback_api_keys",
             )?;
             decrypt_vec_secrets(
                 &store,
@@ -6541,6 +6581,11 @@ impl Config {
             &store,
             &mut config_to_save.reliability.api_keys,
             "config.reliability.api_keys",
+        )?;
+        encrypt_map_secrets(
+            &store,
+            &mut config_to_save.reliability.fallback_api_keys,
+            "config.reliability.fallback_api_keys",
         )?;
         encrypt_vec_secrets(
             &store,
@@ -7542,6 +7587,10 @@ tool_dispatcher = "xml"
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
+        config.reliability.fallback_api_keys.insert(
+            "custom:https://api-a.example.com/v1".into(),
+            "fallback-a-credential".into(),
+        );
         config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
         config.channels_config.telegram = Some(TelegramConfig {
             bot_token: "telegram-credential".into(),
@@ -7648,6 +7697,16 @@ tool_dispatcher = "xml"
         let reliability_key = &stored.reliability.api_keys[0];
         assert!(crate::security::SecretStore::is_encrypted(reliability_key));
         assert_eq!(store.decrypt(reliability_key).unwrap(), "backup-credential");
+        let fallback_key = stored
+            .reliability
+            .fallback_api_keys
+            .get("custom:https://api-a.example.com/v1")
+            .expect("fallback key should exist");
+        assert!(crate::security::SecretStore::is_encrypted(fallback_key));
+        assert_eq!(
+            store.decrypt(fallback_key).unwrap(),
+            "fallback-a-credential"
+        );
 
         let paired_token = &stored.gateway.paired_tokens[0];
         assert!(crate::security::SecretStore::is_encrypted(paired_token));
