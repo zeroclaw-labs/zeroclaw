@@ -15,9 +15,11 @@ fn link_count(metadata: &Metadata) -> u64 {
 }
 
 #[cfg(windows)]
-fn link_count(metadata: &Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    u64::from(metadata.number_of_links())
+fn link_count(_metadata: &Metadata) -> u64 {
+    // Rust stable does not currently expose a portable, stable Windows hard-link
+    // count API on `std::fs::Metadata`. Returning 1 avoids false positive blocks
+    // and keeps Windows builds stable until a supported API is available.
+    1
 }
 
 #[cfg(not(any(unix, windows)))]

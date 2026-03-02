@@ -18,7 +18,7 @@ For first-time setup and quick orientation.
 | I want guided prompts | `zeroclaw onboard --interactive` |
 | Config exists, just fix channels | `zeroclaw onboard --channels-only` |
 | Config exists, I intentionally want full overwrite | `zeroclaw onboard --force` |
-| Using subscription auth | See [Subscription Auth](../../README.md#subscription-auth-openai-codex--claude-code) |
+| Using OpenAI Codex subscription auth | See [OpenAI Codex OAuth Quick Setup](#openai-codex-oauth-quick-setup) |
 
 ## Onboarding and Validation
 
@@ -27,6 +27,50 @@ For first-time setup and quick orientation.
 - Existing config protection: reruns require explicit confirmation (or `--force` in non-interactive flows)
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).
 - Validate environment: `zeroclaw status` + `zeroclaw doctor`
+
+## OpenAI Codex OAuth Quick Setup
+
+Use this path when you want `openai-codex` with subscription OAuth credentials (no API key required).
+
+1. Authenticate:
+
+```bash
+zeroclaw auth login --provider openai-codex
+```
+
+2. Verify auth material is loaded:
+
+```bash
+zeroclaw auth status --provider openai-codex
+```
+
+3. Set provider/model defaults:
+
+```toml
+default_provider = "openai-codex"
+default_model = "gpt-5.3-codex"
+default_temperature = 0.2
+
+[provider]
+transport = "auto"
+reasoning_level = "high"
+```
+
+4. Optional stable fallback model (if your account/region does not currently expose `gpt-5.3-codex`):
+
+```toml
+default_model = "gpt-5.2-codex"
+```
+
+5. Start chat:
+
+```bash
+zeroclaw chat
+```
+
+Notes:
+- You do not need to define a custom `[model_providers."openai-codex"]` block for normal OAuth usage.
+- If you see raw `<tool_call>` tags in output, first verify you are on the built-in `openai-codex` provider path above and not a custom OpenAI-compatible provider override.
 
 ## Next
 
