@@ -5740,18 +5740,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         // Preserve startup perplexity filter config to ensure policy is not weakened
         // when runtime store lookup misses.
         startup_perplexity_filter: config.security.perplexity_filter.clone(),
-        // WASM skill tools are sandboxed by the WASM engine and cannot access the
-        // host filesystem, network, or shell. Pre-approve them so they are not
-        // denied on non-CLI channels (which have no interactive stdin to prompt).
         approval_manager: {
-            let mut autonomy = config.autonomy.clone();
-            let skills_dir = workspace.join("skills");
-            for name in tools::wasm_tool::wasm_tool_names_from_skills(&skills_dir) {
-                if !autonomy.auto_approve.contains(&name) {
-                    autonomy.auto_approve.push(name);
-                }
-            }
-            Arc::new(ApprovalManager::from_config(&autonomy))
+            // Keep approval policy provenance-bound to static config. Do not
+            // auto-approve tool names from untrusted manifest files.
+            Arc::new(ApprovalManager::from_config(&config.autonomy))
         },
         safety_heartbeat: if config.agent.safety_heartbeat_interval > 0 {
             Some(SafetyHeartbeatConfig {
