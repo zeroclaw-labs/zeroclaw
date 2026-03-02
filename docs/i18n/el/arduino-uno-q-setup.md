@@ -31,14 +31,14 @@
 
 ### 1.1 Ρυθμίστε το Uno Q μέσω App Lab
 
-1. Κατεβάστε το [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (αρχείο tar.gz στο Linux).
+1. Κατεβάστε το [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) — διατίθεται για macOS και Linux (στο Linux: πακέτο tar.gz).
 2. Συνδέστε το Uno Q μέσω USB, ενεργοποιήστε το.
 3. Ανοίξτε το App Lab, συνδεθείτε με την πλακέτα.
 4. Ακολουθήστε τον οδηγό ρύθμισης:
    - Ορίστε όνομα χρήστη και κωδικό πρόσβασης (για SSH)
    - Ρυθμίστε το WiFi (SSID, κωδικό πρόσβασης)
    - Εφαρμόστε ενημερώσεις firmware
-5. Σημειώστε τη διεύθυνση IP που εμφανίζεται (π.χ. `arduino@192.168.1.42`) ή βρείτε τη αργότερα μέσω `ip addr show` στο τερματικό του App Lab.
+5. Σημειώστε τη διεύθυνση IP που εμφανίζεται (π.χ. `arduino@192.168.1.42`) ή βρείτε την αργότερα μέσω `ip addr show` στο τερματικό του App Lab.
 
 ### 1.2 Επαληθεύστε την πρόσβαση SSH
 
@@ -49,7 +49,7 @@ ssh arduino@<UNO_Q_IP>
 
 ---
 
-## Φάση 2: Εγκατάστειλη του ZeroClaw στο Uno Q
+## Φάση 2: Εγκατάσταση του ZeroClaw στο Uno Q
 
 ### Επιλογή A: Build στη Συσκευή (Απλούστερο, ~20–40 λεπτά)
 
@@ -72,7 +72,7 @@ cd zeroclaw
 # Build (~15–30 λεπτά στο Uno Q)
 cargo build --release --features hardware
 
-# Εγκατάστειλη
+# Εγκατάσταση
 sudo cp target/release/zeroclaw /usr/local/bin/
 ```
 
@@ -210,8 +210,8 @@ zeroclaw daemon --host 127.0.0.1 --port 42617
 
 ## Αντιμετώπιση προβλημάτων
 
-- **"command not found: zeroclaw"** — Χρησιμοποιήστε τη πλήρη διαδρομή: `/usr/local/bin/zeroclaw` ή βεβαιωθείτε ότι το `~/.cargo/bin` είναι στο PATH.
-- **Το Telegram δεν απαντα** — Ελέγξτε το bot_token, allowed_users και ότι το Uno Q έχει internet (WiFi).
+- **"command not found: zeroclaw"** — Χρησιμοποιήστε την πλήρη διαδρομή: `/usr/local/bin/zeroclaw` ή βεβαιωθείτε ότι το `~/.cargo/bin` είναι στο PATH.
+- **Το Telegram δεν απαντά** — Ελέγξτε το bot_token, allowed_users και ότι το Uno Q έχει internet (WiFi).
 - **Out of memory** — Κρατήστε τα features ελάχιστα (`--features hardware` για Uno Q); εξετάστε `compact_context = true`.
 - **Εντολές GPIO αγνοούνται** — Βεβαιωθείτε ότι η εφαρμογή Bridge εκτελείται (`zeroclaw peripheral setup-uno-q` την αναπτύσσει και ξεκινά). Το Config πρέπει να έχει `board = "arduino-uno-q"` και `transport = "bridge"`.
 - **Πάροχος LLM (GLM/Zhipu)** — Χρησιμοποιήστε `default_provider = "glm"` ή `"zhipu"` με `GLM_API_KEY` στο env ή config. Το ZeroClaw χρησιμοποιεί το σωστό endpoint v4.
