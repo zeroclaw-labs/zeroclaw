@@ -1737,11 +1737,12 @@ pub async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            let missing_tool_call_signal =
+                parse_issue_detected || looks_like_deferred_action_without_tool_call(&display_text);
             let missing_tool_call_followthrough = !missing_tool_call_retry_used
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
-                && (parse_issue_detected
-                    || looks_like_deferred_action_without_tool_call(&display_text));
+                && missing_tool_call_signal;
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
                 missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
@@ -1777,6 +1778,25 @@ pub async fn run_tool_call_loop(
                 }
 
                 continue;
+            }
+
+            if missing_tool_call_retry_used && !tool_specs.is_empty() && missing_tool_call_signal {
+                runtime_trace::record_event(
+                    "tool_call_followthrough_failed",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(active_model.as_str()),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("llm response still implied follow-up action but emitted no tool call after retry"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                    }),
+                );
+                anyhow::bail!(
+                    "Model deferred action without emitting a tool call after retry; refusing to return unverified completion."
+                );
             }
 
             runtime_trace::record_event(
@@ -4510,6 +4530,58 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "the fallback retry should lead to an actual tool execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_errors_when_deferred_action_repeats_without_tool_call() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I'll check that right away.",
+            "Let me inspect that in detail now.",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please check the workspace"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("second deferred response without tool call should hard-fail");
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("deferred action without emitting a tool call"),
+            "unexpected error text: {err_text}"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "tool should not execute when model never emits a tool call"
         );
     }
 

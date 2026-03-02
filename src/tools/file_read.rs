@@ -108,7 +108,7 @@ impl Tool for FileReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_user_supplied_path(path);
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -303,6 +303,18 @@ mod tests {
         })
     }
 
+    fn test_security_allows_outside_workspace(
+        workspace: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn file_read_name() {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()));
@@ -383,6 +395,36 @@ mod tests {
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_read_expands_tilde_path_consistently_with_policy() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME should be available for tilde expansion tests");
+        let target_rel = format!("zeroclaw_tilde_read_{}.txt", uuid::Uuid::new_v4());
+        let target_path = home.join(&target_rel);
+        let _ = tokio::fs::remove_file(&target_path).await;
+        tokio::fs::write(&target_path, "tilde-read").await.unwrap();
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_read_tilde_workspace");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let tool = FileReadTool::new(test_security_allows_outside_workspace(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": format!("~/{}", target_rel)}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "tilde path read should succeed when policy allows outside workspace: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("1: tilde-read"));
+
+        let _ = tokio::fs::remove_file(&target_path).await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
     #[tokio::test]
