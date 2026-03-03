@@ -28,6 +28,7 @@ const HASH_ITERATIONS: u32 = 100_000;
 pub struct User {
     pub id: String,
     pub username: String,
+    pub email: Option<String>,
     pub created_at: i64,
 }
 
@@ -118,6 +119,12 @@ impl AuthStore {
             let _ = conn.execute_batch("ALTER TABLE devices ADD COLUMN pairing_code_hash TEXT;");
         }
 
+        // Migration: add email column to users table if missing
+        let has_email: bool = conn.prepare("SELECT email FROM users LIMIT 0").is_ok();
+        if !has_email {
+            let _ = conn.execute_batch("ALTER TABLE users ADD COLUMN email TEXT;");
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
             session_ttl_secs: session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
@@ -166,14 +173,14 @@ impl AuthStore {
     /// Returns the `User` on success.
     pub fn authenticate(&self, username: &str, password: &str) -> Result<User> {
         let conn = self.conn.lock();
-        let row: Result<(String, String, String, i64), _> = conn.query_row(
-            "SELECT id, password_hash, salt, created_at FROM users WHERE username = ?1 COLLATE NOCASE",
+        let row: Result<(String, String, String, Option<String>, i64), _> = conn.query_row(
+            "SELECT id, password_hash, salt, email, created_at FROM users WHERE username = ?1 COLLATE NOCASE",
             rusqlite::params![username.trim()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         );
 
         match row {
-            Ok((id, stored_hash, salt, created_at)) => {
+            Ok((id, stored_hash, salt, email, created_at)) => {
                 let attempt_hash = hash_password(password, &salt);
                 if !constant_time_eq(stored_hash.as_bytes(), attempt_hash.as_bytes()) {
                     bail!("Invalid username or password");
@@ -181,6 +188,7 @@ impl AuthStore {
                 Ok(User {
                     id,
                     username: username.trim().to_string(),
+                    email,
                     created_at,
                 })
             }
@@ -197,13 +205,14 @@ impl AuthStore {
     pub fn get_user(&self, user_id: &str) -> Result<Option<User>> {
         let conn = self.conn.lock();
         let row = conn.query_row(
-            "SELECT id, username, created_at FROM users WHERE id = ?1",
+            "SELECT id, username, email, created_at FROM users WHERE id = ?1",
             rusqlite::params![user_id],
             |row| {
                 Ok(User {
                     id: row.get(0)?,
                     username: row.get(1)?,
-                    created_at: row.get(2)?,
+                    email: row.get(2)?,
+                    created_at: row.get(3)?,
                 })
             },
         );
@@ -460,6 +469,38 @@ impl AuthStore {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    // ── User Email Management ────────────────────────────────────────
+
+    /// Set or update the email address for a user.
+    pub fn set_user_email(&self, user_id: &str, email: &str) -> Result<()> {
+        let trimmed = email.trim();
+        if trimmed.is_empty() {
+            bail!("Email cannot be empty");
+        }
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE users SET email = ?1 WHERE id = ?2",
+            rusqlite::params![trimmed, user_id],
+        )?;
+        if updated == 0 {
+            bail!("User not found");
+        }
+        Ok(())
+    }
+
+    /// Get the email address for a user. Returns None if not set.
+    pub fn get_user_email(&self, user_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let email: Option<String> = conn
+            .query_row(
+                "SELECT email FROM users WHERE id = ?1",
+                rusqlite::params![user_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("User not found"))?;
+        Ok(email)
+    }
+
     // ── Channel Linking ─────────────────────────────────────────────
 
     /// Ensure the channel_links table exists (safe to call multiple times).
@@ -499,7 +540,7 @@ impl AuthStore {
     pub fn find_channel_link(&self, channel: &str, platform_uid: &str) -> Result<Option<User>> {
         let conn = self.conn.lock();
         let row = conn.query_row(
-            "SELECT u.id, u.username, u.created_at
+            "SELECT u.id, u.username, u.email, u.created_at
              FROM channel_links cl
              JOIN users u ON cl.user_id = u.id
              WHERE cl.channel = ?1 AND cl.platform_uid = ?2",
@@ -508,7 +549,8 @@ impl AuthStore {
                 Ok(User {
                     id: row.get(0)?,
                     username: row.get(1)?,
-                    created_at: row.get(2)?,
+                    email: row.get(2)?,
+                    created_at: row.get(3)?,
                 })
             },
         );
