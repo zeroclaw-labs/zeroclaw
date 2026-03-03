@@ -86,6 +86,349 @@ const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
 const STEPFUN_BASE_URL: &str = "https://api.stepfun.com/v1";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
+#[derive(Clone, Debug)]
+pub struct ProviderDescriptor {
+    pub canonical_name: &'static str,
+    pub display_name: &'static str,
+    pub base_url: Option<&'static str>,
+    pub auth_style: AuthStyle,
+    pub supports_vision: bool,
+    pub no_responses_fallback: bool,
+    pub merge_system_into_user: bool,
+    pub user_agent: Option<&'static str>,
+}
+
+fn canonical_registry_name(name: &str) -> &str {
+    match name {
+        "tencent" => "hunyuan",
+        "lm-studio" => "lmstudio",
+        "llama.cpp" => "llamacpp",
+        "vercel-ai" => "vercel",
+        "cloudflare-ai" => "cloudflare",
+        "opencode-zen" => "opencode",
+        "grok" => "xai",
+        "together-ai" => "together",
+        "fireworks-ai" => "fireworks",
+        "nvidia-nim" | "build.nvidia.com" => "nvidia",
+        _ => name,
+    }
+}
+
+static PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
+    ProviderDescriptor {
+        canonical_name: "venice",
+        display_name: "Venice",
+        base_url: Some("https://api.venice.ai"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "vercel",
+        display_name: "Vercel AI Gateway",
+        base_url: Some(VERCEL_AI_GATEWAY_BASE_URL),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "cloudflare",
+        display_name: "Cloudflare AI Gateway",
+        base_url: Some("https://gateway.ai.cloudflare.com/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "synthetic",
+        display_name: "Synthetic",
+        base_url: Some("https://api.synthetic.new/openai/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "opencode",
+        display_name: "OpenCode Zen",
+        base_url: Some("https://opencode.ai/zen/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "hunyuan",
+        display_name: "Hunyuan",
+        base_url: Some("https://api.hunyuan.cloud.tencent.com/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "groq",
+        display_name: "Groq",
+        base_url: Some("https://api.groq.com/openai/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "mistral",
+        display_name: "Mistral",
+        base_url: Some("https://api.mistral.ai/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "xai",
+        display_name: "xAI",
+        base_url: Some("https://api.x.ai"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "deepseek",
+        display_name: "DeepSeek",
+        base_url: Some("https://api.deepseek.com"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "together",
+        display_name: "Together AI",
+        base_url: Some("https://api.together.xyz"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "fireworks",
+        display_name: "Fireworks AI",
+        base_url: Some("https://api.fireworks.ai/inference/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "novita",
+        display_name: "Novita AI",
+        base_url: Some("https://api.novita.ai/openai"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "perplexity",
+        display_name: "Perplexity",
+        base_url: Some("https://api.perplexity.ai"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "cohere",
+        display_name: "Cohere",
+        base_url: Some("https://api.cohere.com/compatibility"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "lmstudio",
+        display_name: "LM Studio",
+        base_url: Some("http://localhost:1234/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "llamacpp",
+        display_name: "llama.cpp",
+        base_url: Some("http://localhost:8080/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "sglang",
+        display_name: "SGLang",
+        base_url: Some("http://localhost:30000/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "vllm",
+        display_name: "vLLM",
+        base_url: Some("http://localhost:8000/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "osaurus",
+        display_name: "Osaurus",
+        base_url: Some("http://localhost:1337/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "nvidia",
+        display_name: "NVIDIA NIM",
+        base_url: Some("https://integrate.api.nvidia.com/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: true,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+    ProviderDescriptor {
+        canonical_name: "astrai",
+        display_name: "Astrai",
+        base_url: Some("https://as-trai.com/v1"),
+        auth_style: AuthStyle::Bearer,
+        supports_vision: false,
+        no_responses_fallback: false,
+        merge_system_into_user: false,
+        user_agent: None,
+    },
+];
+
+pub fn get_provider_descriptor(name: &str) -> Option<&'static ProviderDescriptor> {
+    let canonical = canonical_registry_name(name);
+    PROVIDER_REGISTRY
+        .iter()
+        .find(|p| p.canonical_name == canonical)
+}
+
+pub fn list_registered_compatible_providers() -> Vec<&'static ProviderDescriptor> {
+    PROVIDER_REGISTRY.iter().collect()
+}
+
+#[deprecated(
+    note = "Use list_registered_compatible_providers; this lists compatible providers only"
+)]
+pub fn list_all_providers() -> Vec<&'static ProviderDescriptor> {
+    list_registered_compatible_providers()
+}
+
+fn try_create_from_registry(name: &str, key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
+    let descriptor = get_provider_descriptor(name)
+        .ok_or_else(|| anyhow::anyhow!("No provider descriptor for '{name}'"))?;
+    let base_url = descriptor.base_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Descriptor '{}' is missing base_url",
+            descriptor.canonical_name
+        )
+    })?;
+    if descriptor.no_responses_fallback && descriptor.merge_system_into_user {
+        debug_assert!(
+            !(descriptor.no_responses_fallback && descriptor.merge_system_into_user),
+            "ProviderDescriptor '{}' has incompatible flags",
+            descriptor.canonical_name
+        );
+        anyhow::bail!(
+            "ProviderDescriptor '{}' has incompatible flags",
+            descriptor.canonical_name
+        );
+    }
+
+    let provider = if descriptor.no_responses_fallback {
+        OpenAiCompatibleProvider::new_no_responses_fallback(
+            descriptor.display_name,
+            base_url,
+            key,
+            descriptor.auth_style.clone(),
+        )
+    } else if descriptor.merge_system_into_user {
+        OpenAiCompatibleProvider::new_merge_system_into_user(
+            descriptor.display_name,
+            base_url,
+            key,
+            descriptor.auth_style.clone(),
+        )
+    } else if descriptor.supports_vision {
+        if let Some(ua) = descriptor.user_agent {
+            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+                descriptor.display_name,
+                base_url,
+                key,
+                descriptor.auth_style.clone(),
+                ua,
+                true,
+            )
+        } else {
+            OpenAiCompatibleProvider::new_with_vision(
+                descriptor.display_name,
+                base_url,
+                key,
+                descriptor.auth_style.clone(),
+                true,
+            )
+        }
+    } else if let Some(ua) = descriptor.user_agent {
+        OpenAiCompatibleProvider::new_with_user_agent(
+            descriptor.display_name,
+            base_url,
+            key,
+            descriptor.auth_style.clone(),
+            ua,
+        )
+    } else {
+        OpenAiCompatibleProvider::new(
+            descriptor.display_name,
+            base_url,
+            key,
+            descriptor.auth_style.clone(),
+        )
+    };
+
+    Ok(Box::new(provider))
+}
+
 struct PluginProvider {
     name: String,
 }
@@ -966,6 +1309,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "xai" | "grok" => vec!["XAI_API_KEY"],
         "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
+        "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
@@ -1226,24 +1570,9 @@ fn create_provider_with_url_and_options(
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Venice",
-            "https://api.venice.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Vercel AI Gateway",
-            VERCEL_AI_GATEWAY_BASE_URL,
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Cloudflare AI Gateway",
-            "https://gateway.ai.cloudflare.com/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "venice" => try_create_from_registry("venice", key),
+        "vercel" | "vercel-ai" => try_create_from_registry("vercel", key),
+        "cloudflare" | "cloudflare-ai" => try_create_from_registry("cloudflare", key),
         name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Moonshot",
             moonshot_base_url(name).expect("checked in guard"),
@@ -1259,18 +1588,8 @@ fn create_provider_with_url_and_options(
                 "KimiCLI/0.77",
             )))
         }
-        "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Synthetic",
-            "https://api.synthetic.new/openai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "OpenCode Zen",
-            "https://opencode.ai/zen/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "synthetic" => try_create_from_registry("synthetic", key),
+        "opencode" | "opencode-zen" => try_create_from_registry("opencode", key),
         name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
@@ -1317,12 +1636,7 @@ fn create_provider_with_url_and_options(
                 ),
             ))
         }
-        "hunyuan" | "tencent" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Hunyuan",
-            "https://api.hunyuan.cloud.tencent.com/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "hunyuan" | "tencent" => try_create_from_registry("hunyuan", key),
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan",
             "https://aip.baidubce.com",
@@ -1361,60 +1675,15 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Groq",
-            "https://api.groq.com/openai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Mistral",
-            "https://api.mistral.ai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "xAI",
-            "https://api.x.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "DeepSeek",
-            "https://api.deepseek.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "together" | "together-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Together AI",
-            "https://api.together.xyz",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Fireworks AI",
-            "https://api.fireworks.ai/inference/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Novita AI",
-            "https://api.novita.ai/openai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Perplexity",
-            "https://api.perplexity.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Cohere",
-            "https://api.cohere.com/compatibility",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "groq" => try_create_from_registry("groq", key),
+        "mistral" => try_create_from_registry("mistral", key),
+        "xai" | "grok" => try_create_from_registry("xai", key),
+        "deepseek" => try_create_from_registry("deepseek", key),
+        "together" | "together-ai" => try_create_from_registry("together", key),
+        "fireworks" | "fireworks-ai" => try_create_from_registry("fireworks", key),
+        "novita" => try_create_from_registry("novita", key),
+        "perplexity" => try_create_from_registry("perplexity", key),
+        "cohere" => try_create_from_registry("cohere", key),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "cursor" => Ok(Box::new(cursor::CursorProvider::new())),
         "lmstudio" | "lm-studio" => {
@@ -1485,22 +1754,10 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )))
         }
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
-            OpenAiCompatibleProvider::new_no_responses_fallback(
-                "NVIDIA NIM",
-                "https://integrate.api.nvidia.com/v1",
-                key,
-                AuthStyle::Bearer,
-            ),
-        )),
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => try_create_from_registry("nvidia", key),
 
         // ── AI inference routers ─────────────────────────────
-        "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Astrai",
-            "https://as-trai.com/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "astrai" => try_create_from_registry("astrai", key),
 
         // ── Cloud AI endpoints ───────────────────────────────
         "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
@@ -2049,6 +2306,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "novita",
+            display_name: "Novita AI",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
             name: "perplexity",
             display_name: "Perplexity",
             aliases: &[],
@@ -2230,6 +2493,15 @@ mod tests {
 
         let resolved = resolve_provider_credential("step-ai", None);
         assert_eq!(resolved.as_deref(), Some("step-fallback"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_novita_env_key() {
+        let _env_lock = env_lock();
+        let _novita_guard = EnvGuard::set("NOVITA_API_KEY", Some("novita-key"));
+
+        let resolved = resolve_provider_credential("novita", None);
+        assert_eq!(resolved.as_deref(), Some("novita-key"));
     }
 
     #[test]
@@ -2432,6 +2704,44 @@ mod tests {
         assert_eq!(canonical_china_provider_name("hunyuan"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("tencent"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("openai"), None);
+    }
+
+    #[test]
+    fn provider_descriptor_lookup_supports_factory_aliases() {
+        let alias_pairs = [
+            ("vercel-ai", "vercel"),
+            ("cloudflare-ai", "cloudflare"),
+            ("opencode-zen", "opencode"),
+            ("grok", "xai"),
+            ("together-ai", "together"),
+            ("fireworks-ai", "fireworks"),
+            ("nvidia-nim", "nvidia"),
+            ("build.nvidia.com", "nvidia"),
+            ("tencent", "hunyuan"),
+            ("lm-studio", "lmstudio"),
+            ("llama.cpp", "llamacpp"),
+        ];
+
+        for (alias, canonical) in alias_pairs {
+            let descriptor =
+                get_provider_descriptor(alias).unwrap_or_else(|| panic!("missing alias: {alias}"));
+            assert_eq!(descriptor.canonical_name, canonical);
+        }
+    }
+
+    #[test]
+    fn deprecated_list_all_providers_matches_registered_list() {
+        let registered = list_registered_compatible_providers();
+        #[allow(deprecated)]
+        let legacy = list_all_providers();
+        assert_eq!(legacy.len(), registered.len());
+        assert_eq!(
+            legacy.iter().map(|d| d.canonical_name).collect::<Vec<_>>(),
+            registered
+                .iter()
+                .map(|d| d.canonical_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3232,6 +3542,7 @@ providers = ["demo-plugin-provider"]
             "deepseek",
             "together",
             "fireworks",
+            "novita",
             "perplexity",
             "cohere",
             "copilot",
