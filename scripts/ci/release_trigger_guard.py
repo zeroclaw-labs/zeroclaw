@@ -183,12 +183,23 @@ def main() -> int:
                 )
 
         origin_url = args.origin_url.strip() or f"https://github.com/{args.repository}.git"
-        ls_remote = subprocess.run(
-            ["git", "ls-remote", "--tags", origin_url],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+
+        # Prefer ls-remote from repo_root (inherits checkout auth headers) over
+        # a bare URL which fails on private repos.
+        if (repo_root / ".git").exists():
+            ls_remote = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-remote", "--tags", "origin"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            ls_remote = subprocess.run(
+                ["git", "ls-remote", "--tags", origin_url],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         if ls_remote.returncode != 0:
             violations.append(f"Failed to list origin tags from `{origin_url}`: {ls_remote.stderr.strip()}")
         else:
@@ -225,6 +236,21 @@ def main() -> int:
                 try:
                     run_git(["init", "-q"], cwd=tmp_repo)
                     run_git(["remote", "add", "origin", origin_url], cwd=tmp_repo)
+                    # Propagate auth extraheader from checkout so fetch works
+                    # on private repos where bare URL access is forbidden.
+                    if (repo_root / ".git").exists():
+                        try:
+                            extraheader = run_git(
+                                ["config", "--get", "http.https://github.com/.extraheader"],
+                                cwd=repo_root,
+                            )
+                            if extraheader:
+                                run_git(
+                                    ["config", "http.https://github.com/.extraheader", extraheader],
+                                    cwd=tmp_repo,
+                                )
+                        except RuntimeError:
+                            pass  # No extraheader configured; proceed without it.
                     run_git(
                         [
                             "fetch",

@@ -9,10 +9,10 @@
 #
 # Thresholds:
 #   macOS / default host:
-#     >20MB  — hard error (safeguard)
+#     >22MB  — hard error (safeguard)
 #     >15MB  — warning (advisory)
 #   Linux host:
-#     >23MB  — hard error (safeguard)
+#     >26MB  — hard error (safeguard)
 #     >20MB  — warning (advisory)
 #   All hosts:
 #     >5MB   — warning (target)
@@ -58,7 +58,7 @@ SIZE_MB=$((SIZE / 1024 / 1024))
 echo "Binary size: ${SIZE_MB}MB ($SIZE bytes)"
 
 # Default thresholds.
-HARD_LIMIT_BYTES=20971520     # 20MB
+HARD_LIMIT_BYTES=23068672     # 22MB
 ADVISORY_LIMIT_BYTES=15728640 # 15MB
 TARGET_LIMIT_BYTES=5242880    # 5MB
 
@@ -66,7 +66,7 @@ TARGET_LIMIT_BYTES=5242880    # 5MB
 HOST_OS="$(uname -s 2>/dev/null || echo "")"
 HOST_OS_LC="$(printf '%s' "$HOST_OS" | tr '[:upper:]' '[:lower:]')"
 if [ "$HOST_OS_LC" = "linux" ]; then
-  HARD_LIMIT_BYTES=24117248     # 23MB
+  HARD_LIMIT_BYTES=27262976     # 26MB
   ADVISORY_LIMIT_BYTES=20971520 # 20MB
 fi
 

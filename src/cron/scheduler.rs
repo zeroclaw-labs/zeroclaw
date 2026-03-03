@@ -469,13 +469,25 @@ pub(crate) async fn deliver_announcement(
         "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
-                let feishu = config
-                    .channels_config
-                    .feishu
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
-                let channel = LarkChannel::from_feishu_config(feishu);
-                channel.send(&SendMessage::new(output, target)).await?;
+                // Try [channels_config.feishu] first, then fall back to [channels_config.lark] with use_feishu=true
+                if let Some(feishu_cfg) = &config.channels_config.feishu {
+                    let channel = LarkChannel::from_feishu_config(feishu_cfg);
+                    channel.send(&SendMessage::new(output, target)).await?;
+                } else if let Some(lark_cfg) = &config.channels_config.lark {
+                    if lark_cfg.use_feishu {
+                        let channel = LarkChannel::from_config(lark_cfg);
+                        channel.send(&SendMessage::new(output, target)).await?;
+                    } else {
+                        anyhow::bail!(
+                            "feishu channel not configured: [channels_config.feishu] is missing \
+                             and [channels_config.lark] exists but use_feishu=false"
+                        );
+                    }
+                } else {
+                    anyhow::bail!("feishu channel not configured: \
+                                   neither [channels_config.feishu] nor [channels_config.lark] \
+                                   with use_feishu=true is configured");
+                }
             }
             #[cfg(not(feature = "channel-lark"))]
             {
