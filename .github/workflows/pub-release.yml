@@ -106,7 +106,35 @@ jobs:
                   } >> "$GITHUB_STEP_SUMMARY"
 
             - name: Checkout
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+            - name: Install gh CLI
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if command -v gh &>/dev/null; then
+                    echo "gh already available: $(gh --version | head -1)"
+                    exit 0
+                  fi
+                  echo "Installing gh CLI..."
+                  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                    | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+                  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+                    | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+                  for i in {1..60}; do
+                    if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+                      || sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+                      || sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+                      echo "apt/dpkg locked; waiting ($i/60)..."
+                      sleep 5
+                    else
+                      break
+                    fi
+                  done
+                  sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 update -qq
+                  sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 install -y gh
+              env:
+                  GH_TOKEN: ${{ github.token }}
 
             - name: Validate release trigger and authorization guard
               shell: bash
@@ -127,6 +155,8 @@ jobs:
                     --output-json artifacts/release-trigger-guard.json \
                     --output-md artifacts/release-trigger-guard.md \
                     --fail-on-violation
+              env:
+                  GH_TOKEN: ${{ github.token }}
 
             - name: Emit release trigger audit event
               if: always()
@@ -164,6 +194,10 @@ jobs:
         needs: [prepare]
         runs-on: ${{ matrix.os }}
         timeout-minutes: 40
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.target }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.target }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/target
         strategy:
             fail-fast: false
             matrix:
@@ -233,21 +267,21 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+                    - os: macos-15-intel
                       target: x86_64-apple-darwin
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+                    - os: macos-14
                       target: aarch64-apple-darwin
                       artifact: zeroclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+                    - os: windows-latest
                       target: x86_64-pc-windows-msvc
                       artifact: zeroclaw.exe
                       archive_ext: zip
@@ -260,6 +294,10 @@ jobs:
               with:
                   ref: ${{ needs.prepare.outputs.release_ref }}
 
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
@@ -270,14 +308,38 @@ jobs:
 
             - name: Install cross for cross-built targets
               if: matrix.use_cross
+              shell: bash
               run: |
-                  cargo install cross --git https://github.com/cross-rs/cross
+                  set -euo pipefail
+                  echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+                  cargo install cross --locked --version 0.2.5
+                  command -v cross
+                  cross --version
 
             - name: Install cross-compilation toolchain (Linux)
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
               run: |
-                  sudo apt-get update -qq
-                  sudo apt-get install -y "${{ matrix.cross_compiler }}"
+                  set -euo pipefail
+                  for i in {1..60}; do
+                    if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+                      || sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+                      || sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+                      echo "apt/dpkg locked; waiting ($i/60)..."
+                      sleep 5
+                    else
+                      break
+                    fi
+                  done
+                  sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 update -qq
+                  sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 install -y "${{ matrix.cross_compiler }}"
+                  # Install matching libc dev headers for cross targets
+                  # (required by ring/aws-lc-sys C compilation)
+                  case "${{ matrix.target }}" in
+                    armv7-unknown-linux-gnueabihf)
+                      sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 install -y libc6-dev-armhf-cross ;;
+                    aarch64-unknown-linux-gnu)
+                      sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 install -y libc6-dev-arm64-cross ;;
+                  esac
 
             - name: Setup Android NDK
               if: matrix.android_ndk
@@ -290,8 +352,18 @@ jobs:
                   NDK_ROOT="${RUNNER_TEMP}/android-ndk"
                   NDK_HOME="${NDK_ROOT}/android-ndk-${NDK_VERSION}"
 
-                  sudo apt-get update -qq
-                  sudo apt-get install -y unzip
+                  for i in {1..60}; do
+                    if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+                      || sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+                      || sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+                      echo "apt/dpkg locked; waiting ($i/60)..."
+                      sleep 5
+                    else
+                      break
+                    fi
+                  done
+                  sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 update -qq
+                  sudo apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 install -y unzip
 
                   mkdir -p "${NDK_ROOT}"
                   curl -fsSL "${NDK_URL}" -o "${RUNNER_TEMP}/${NDK_ZIP}"
@@ -362,6 +434,10 @@ jobs:
 
             - name: Check binary size (Unix)
               if: runner.os != 'Windows'
+              env:
+                  BINARY_SIZE_HARD_LIMIT_MB: 28
+                  BINARY_SIZE_ADVISORY_MB: 20
+                  BINARY_SIZE_TARGET_MB: 5
               run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release-fast/${{ matrix.artifact }}" "${{ matrix.target }}"
 
             - name: Package (Unix)

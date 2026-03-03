@@ -170,6 +170,20 @@ jobs:
                   set -euo pipefail
                   mkdir -p artifacts
 
+                  toolchain_bin=""
+                  if [ -n "${CARGO:-}" ]; then
+                    toolchain_bin="$(dirname "${CARGO}")"
+                  elif [ -n "${RUSTC:-}" ]; then
+                    toolchain_bin="$(dirname "${RUSTC}")"
+                  fi
+
+                  if [ -n "${toolchain_bin}" ] && [ -d "${toolchain_bin}" ]; then
+                    case ":$PATH:" in
+                      *":${toolchain_bin}:"*) ;;
+                      *) export PATH="${toolchain_bin}:$PATH" ;;
+                    esac
+                  fi
+
                   if cargo test --locked --verbose; then
                     echo '{"flake_suspected":false,"status":"success"}' > artifacts/flake-probe.json
                     exit 0
