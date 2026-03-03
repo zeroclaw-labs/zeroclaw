@@ -155,6 +155,30 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Check whether a chat JID is allowed by the `allowed_groups` policy.
+///
+/// Tokens are evaluated as a union:
+/// - `"*"` — allow all chats (groups and DMs)
+/// - `"dm"` — allow direct messages
+/// - explicit JID — allow the matching group (prefix or full JID match)
+///
+/// An empty `allowed_groups` slice should be treated as "allow all" by the
+/// caller; this function assumes the list is non-empty.
+#[cfg(feature = "whatsapp-web")]
+fn is_chat_allowed(chat: &str, sender: &str, allowed_groups: &[String]) -> bool {
+    let chat_prefix = chat.split('@').next().unwrap_or("");
+    let is_dm = chat.ends_with("@s.whatsapp.net") || chat_prefix == sender;
+
+    let allow_all = allowed_groups.iter().any(|g| g == "*");
+    let allow_dm = allowed_groups.iter().any(|g| g == "dm");
+    let explicit_match = allowed_groups.iter().any(|g| {
+        let g_id = g.split('@').next().unwrap_or("");
+        g_id == chat_prefix || g == chat
+    });
+
+    allow_all || (is_dm && allow_dm) || explicit_match
+}
+
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
@@ -179,6 +203,8 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// Allowed group JIDs, "dm" for DMs only, "*" for all groups, or empty for all chats
+    allowed_groups: Vec<String>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -202,12 +228,14 @@ impl WhatsAppWebChannel {
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        allowed_groups: Vec<String>,
     ) -> Self {
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            allowed_groups,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -519,6 +547,7 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let allowed_groups = self.allowed_groups.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
@@ -527,6 +556,7 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, _client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let allowed_groups = allowed_groups.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -550,6 +580,16 @@ impl Channel for WhatsAppWebChannel {
                             };
 
                             if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
+                                if !allowed_groups.is_empty()
+                                    && !is_chat_allowed(&chat, &sender, &allowed_groups)
+                                {
+                                    tracing::debug!(
+                                        "WhatsApp Web: chat {} not in allowed_groups, ignoring message from {}",
+                                        chat, normalized
+                                    );
+                                    return;
+                                }
+
                                 let trimmed = text.trim();
                                 if trimmed.is_empty() {
                                     tracing::debug!(
@@ -739,6 +779,7 @@ impl WhatsAppWebChannel {
         _pair_phone: Option<String>,
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
+        _allowed_groups: Vec<String>,
     ) -> Self {
         Self { _private: () }
     }
@@ -795,6 +836,7 @@ mod tests {
             None,
             None,
             vec!["+1234567890".into()],
+            vec![],
         )
     }
 
@@ -816,7 +858,8 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
+        let ch =
+            WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()], vec![]);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -824,7 +867,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
+        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![], vec![]);
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
@@ -915,5 +958,90 @@ mod tests {
         let (text, attachments) = parse_wa_attachment_markers(msg);
         assert_eq!(text, "Check [UNKNOWN:/foo] out");
         assert!(attachments.is_empty());
+    }
+
+    // ── allowed_groups policy matrix ───────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_wildcard_allows_all() {
+        let groups = vec!["*".into()];
+        assert!(is_chat_allowed("120363@g.us", "sender1", &groups));
+        assert!(is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_dm_only() {
+        let groups = vec!["dm".into()];
+        assert!(is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+        assert!(!is_chat_allowed("120363@g.us", "sender1", &groups));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_explicit_jid() {
+        let groups = vec!["120363407513744860@g.us".into()];
+        assert!(is_chat_allowed(
+            "120363407513744860@g.us",
+            "sender1",
+            &groups
+        ));
+        assert!(!is_chat_allowed("999999@g.us", "sender1", &groups));
+        // Explicit JID list also allows DMs (union with implicit DM pass-through
+        // is NOT enabled — only listed entries match)
+        assert!(!is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_dm_plus_explicit_jid() {
+        // This is the case that was broken before the fix: "dm" must not
+        // short-circuit and reject the explicit group JID.
+        let groups = vec!["120363407513744860@g.us".into(), "dm".into()];
+        assert!(is_chat_allowed(
+            "120363407513744860@g.us",
+            "sender1",
+            &groups
+        ));
+        assert!(is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+        assert!(!is_chat_allowed("999999@g.us", "sender1", &groups));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_prefix_match_across_jid_suffixes() {
+        // Same numeric prefix with @g.us config should match @lid at runtime
+        let groups = vec!["120363407513744860@g.us".into()];
+        assert!(is_chat_allowed(
+            "120363407513744860@lid",
+            "sender1",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_dm_detection_lid_format() {
+        // When sender prefix matches chat prefix, it's a DM even with @lid suffix
+        let groups = vec!["dm".into()];
+        assert!(is_chat_allowed("sender1@lid", "sender1", &groups));
+        assert!(!is_chat_allowed("othergroup@lid", "sender1", &groups));
     }
 }
