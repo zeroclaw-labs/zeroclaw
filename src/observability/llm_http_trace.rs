@@ -175,7 +175,19 @@ fn request_body_preview(request: &reqwest::Request) -> Value {
             let raw = String::from_utf8_lossy(bytes);
             if let Ok(mut value) = serde_json::from_str::<Value>(&raw) {
                 sanitize_json_value_in_place(&mut value);
-                value
+                // Serialize to check total size
+                if let Ok(serialized) = serde_json::to_string(&value) {
+                    if serialized.len() > BODY_PREVIEW_LIMIT {
+                        // Exceeds limit - return truncated string preview
+                        Value::String(sanitize_text_preview(&serialized, BODY_PREVIEW_LIMIT))
+                    } else {
+                        // Within limit - return sanitized JSON
+                        value
+                    }
+                } else {
+                    // Fallback if serialization fails
+                    value
+                }
             } else {
                 Value::String(sanitize_text_preview(&raw, BODY_PREVIEW_LIMIT))
             }
