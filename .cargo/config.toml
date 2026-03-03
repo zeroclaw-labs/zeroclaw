@@ -25,6 +25,17 @@ linker = "clang"
 [target.aarch64-linux-android]
 linker = "clang"
 
+# HarmonyOS targets (aarch64-linux-ohos)
+# Requires OHOS_NDK_HOME environment variable pointing to the HarmonyOS NDK native directory.
+# Example: OHOS_NDK_HOME=/path/to/commandline-tools/sdk/default/openharmony/native
+[target.aarch64-linux-ohos]
+linker = "clang"
+rustflags = [
+  "-C", "link-arg=--target=aarch64-linux-ohos",
+  "-C", "link-arg=-fuse-ld=lld",
+  "-C", "panic=abort",
+]
+
 # Windows targets — increase stack size for large JsonSchema derives
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-args=/STACK:8388608"]

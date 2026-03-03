@@ -1,0 +1,33 @@
+{
+  "arch": "aarch64",
+  "os": "linux",
+  "env": "ohos",
+  "vendor": "unknown",
+  "target-family": ["unix"],
+  "llvm-target": "aarch64-linux-ohos",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "linker-flavor": "gnu-cc",
+  "linker": "clang",
+  "cpu": "generic",
+  "features": "+v8a",
+  "max-atomic-width": 128,
+  "panic-strategy": "abort",
+  "position-independent-executables": true,
+  "relro-level": "full",
+  "target-endian": "little",
+  "target-pointer-width": 64,
+  "crt-objects-fallback": "false",
+  "supported-sanitizers": ["address", "leak", "memory", "thread"],
+  "pre-link-args": {
+    "gnu-cc": [
+      "--target=aarch64-linux-ohos",
+      "-D__MUSL__"
+    ]
+  },
+  "post-link-args": {
+    "gnu-cc": [
+      "-lc",
+      "-lc++_shared"
+    ]
+  }
+}
