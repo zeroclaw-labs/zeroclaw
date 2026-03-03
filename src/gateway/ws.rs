@@ -942,23 +942,16 @@ Reminder set successfully."#;
             workspace_dir: tmp.path().to_path_buf(),
             ..crate::config::Config::default()
         };
-        let config_state =
-            std::sync::Arc::new(parking_lot::Mutex::new(config));
+        let config_state = std::sync::Arc::new(parking_lot::Mutex::new(config));
         let mem = std::sync::Arc::new(
             crate::memory::SqliteMemory::new(tmp.path()).expect("sqlite memory"),
         );
-        let pairing = std::sync::Arc::new(
-            crate::security::PairingGuard::new(false, &[]),
-        );
-        let rate_limiter = std::sync::Arc::new(
-            super::super::GatewayRateLimiter::new(60, 60, 1024),
-        );
-        let idempotency_store = std::sync::Arc::new(
-            super::super::IdempotencyStore::new(
-                std::time::Duration::from_secs(60),
-                1024,
-            ),
-        );
+        let pairing = std::sync::Arc::new(crate::security::PairingGuard::new(false, &[]));
+        let rate_limiter = std::sync::Arc::new(super::super::GatewayRateLimiter::new(60, 60, 1024));
+        let idempotency_store = std::sync::Arc::new(super::super::IdempotencyStore::new(
+            std::time::Duration::from_secs(60),
+            1024,
+        ));
         let observer: std::sync::Arc<dyn crate::observability::Observer> =
             std::sync::Arc::new(crate::observability::NoopObserver);
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
@@ -1045,10 +1038,9 @@ Reminder set successfully."#;
             .body(())
             .expect("build request");
 
-        let (ws_stream, response) =
-            tokio_tungstenite::connect_async(request)
-                .await
-                .expect("WebSocket handshake should succeed with matching subprotocol");
+        let (ws_stream, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("WebSocket handshake should succeed with matching subprotocol");
 
         // Verify 101 Switching Protocols (implicit — connect_async would fail otherwise).
         assert_eq!(
