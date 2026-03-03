@@ -2338,7 +2338,10 @@ fn resolve_interactive_onboarding_mode(
         return Ok(InteractiveOnboardingMode::FullOnboarding);
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+        || std::env::var("ZEROCLAW_TEST_NON_INTERACTIVE").is_ok()
+    {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -2381,7 +2384,10 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+        || std::env::var("ZEROCLAW_TEST_NON_INTERACTIVE").is_ok()
+    {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -7010,6 +7016,8 @@ mod tests {
         tokio::fs::write(&config_path, "default_provider = \"openrouter\"\n")
             .await
             .unwrap();
+
+        let _non_interactive = EnvVarGuard::set("ZEROCLAW_TEST_NON_INTERACTIVE", "1");
 
         let err = run_quick_setup_with_clean_env(
             Some("sk-existing"),

@@ -913,4 +913,204 @@ Reminder set successfully."#;
         let result = finalize_ws_response("", &history, &tools, &leak_guard);
         assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
     }
+
+    // ── Integration tests: WebSocket subprotocol handshake ───────────────
+
+    /// Minimal mock provider for integration tests.
+    struct WsTestProvider;
+
+    #[async_trait]
+    impl crate::providers::Provider for WsTestProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("test-response".to_string())
+        }
+    }
+
+    /// Build a minimal `AppState` suitable for WebSocket handshake tests.
+    ///
+    /// Uses in-memory/temp storage and no-op implementations so security
+    /// checks pass for loopback connections while keeping the test lightweight.
+    fn build_test_app_state() -> super::super::AppState {
+        let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+        let config = crate::config::Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..crate::config::Config::default()
+        };
+        let config_state =
+            std::sync::Arc::new(parking_lot::Mutex::new(config));
+        let mem = std::sync::Arc::new(
+            crate::memory::SqliteMemory::new(tmp.path()).expect("sqlite memory"),
+        );
+        let pairing = std::sync::Arc::new(
+            crate::security::PairingGuard::new(false, &[]),
+        );
+        let rate_limiter = std::sync::Arc::new(
+            super::super::GatewayRateLimiter::new(60, 60, 1024),
+        );
+        let idempotency_store = std::sync::Arc::new(
+            super::super::IdempotencyStore::new(
+                std::time::Duration::from_secs(60),
+                1024,
+            ),
+        );
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+        let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        // Leak the TempDir so the directory lives for the duration of the tests.
+        // This is acceptable in test code to avoid lifetime issues.
+        std::mem::forget(tmp);
+
+        super::super::AppState {
+            config: config_state,
+            provider: std::sync::Arc::new(WsTestProvider),
+            model: "test-model".to_string(),
+            temperature: 0.7,
+            mem,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing,
+            trust_forwarded_headers: false,
+            rate_limiter,
+            idempotency_store,
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            wati_webhook_secret: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer,
+            tools_registry: std::sync::Arc::new(Vec::new()),
+            tools_registry_exec: std::sync::Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 0,
+            cost_tracker: None,
+            event_tx,
+        }
+    }
+
+    /// Spin up a one-shot test server on a random port and return its address.
+    async fn start_test_ws_server() -> std::net::SocketAddr {
+        use axum::{extract::connect_info::IntoMakeServiceWithConnectInfo, Router};
+
+        let state = build_test_app_state();
+        let app = Router::new()
+            .route("/ws/chat", axum::routing::get(super::handle_ws_chat))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("test server");
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_accepts_expected_subprotocol() {
+        let addr = start_test_ws_server().await;
+        let url = format!("ws://{addr}/ws/chat");
+
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(&url)
+            .header("Host", addr.to_string())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .header("Sec-WebSocket-Protocol", WS_SUBPROTOCOL)
+            .body(())
+            .expect("build request");
+
+        let (ws_stream, response) =
+            tokio_tungstenite::connect_async(request)
+                .await
+                .expect("WebSocket handshake should succeed with matching subprotocol");
+
+        // Verify 101 Switching Protocols (implicit — connect_async would fail otherwise).
+        assert_eq!(
+            response.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+            "Expected 101 Switching Protocols",
+        );
+
+        // Verify the negotiated subprotocol matches WS_SUBPROTOCOL.
+        let negotiated = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            negotiated, WS_SUBPROTOCOL,
+            "Server should select {WS_SUBPROTOCOL} subprotocol",
+        );
+
+        drop(ws_stream);
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_rejects_mismatched_subprotocol() {
+        let addr = start_test_ws_server().await;
+        let url = format!("ws://{addr}/ws/chat");
+
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(&url)
+            .header("Host", addr.to_string())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .header("Sec-WebSocket-Protocol", "wrong.protocol")
+            .body(())
+            .expect("build request");
+
+        // When the client requests only a subprotocol the server doesn't support,
+        // the behaviour varies by implementation. axum/tungstenite may still upgrade
+        // but will NOT echo back any Sec-WebSocket-Protocol header, or the handshake
+        // may fail entirely. Either outcome is acceptable for this regression test.
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((_ws_stream, response)) => {
+                // Upgrade succeeded — verify the server did NOT negotiate the wrong protocol.
+                let negotiated = response
+                    .headers()
+                    .get("Sec-WebSocket-Protocol")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                assert_ne!(
+                    negotiated, "wrong.protocol",
+                    "Server must not negotiate an unsupported subprotocol",
+                );
+            }
+            Err(_) => {
+                // Handshake failed — this is also acceptable as the server rightfully
+                // rejected a client that offered no compatible subprotocol.
+            }
+        }
+    }
 }
