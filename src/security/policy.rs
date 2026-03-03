@@ -134,6 +134,47 @@ pub struct SecurityPolicy {
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
+        let mut forbidden_paths: Vec<String> = vec![
+            // System directories (blocked even when workspace_only=false)
+            "/etc".into(),
+            "/root".into(),
+            "/home".into(),
+            "/usr".into(),
+            "/bin".into(),
+            "/sbin".into(),
+            "/lib".into(),
+            "/opt".into(),
+            "/boot".into(),
+            "/dev".into(),
+            "/proc".into(),
+            "/sys".into(),
+            "/var".into(),
+            "/tmp".into(),
+            "/mnt".into(),
+            // Sensitive dotfiles (both slash styles for cross-platform coverage)
+            "~/.ssh".into(),
+            "~/.gnupg".into(),
+            "~/.aws".into(),
+            "~/.config".into(),
+        ];
+
+        #[cfg(windows)]
+        {
+            // Windows system directories — prefer env vars so the drive letter
+            // is not hard-coded; fall back to the conventional C:\ paths.
+            forbidden_paths.extend([
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+                std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into()),
+                std::env::var("ProgramW6432").unwrap_or_else(|_| "C:\\Program Files".into()),
+                std::env::var("ProgramFiles(x86)")
+                    .unwrap_or_else(|_| "C:\\Program Files (x86)".into()),
+                // Windows-style sensitive user directories
+                "~\\AppData".into(),
+                "~\\.ssh".into(),
+                "~\\.aws".into(),
+            ]);
+        }
+
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
@@ -158,29 +199,7 @@ impl Default for SecurityPolicy {
                 "date".into(),
             ],
             command_context_rules: Vec::new(),
-            forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "/mnt".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            forbidden_paths,
             allowed_roots: Vec::new(),
             max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
@@ -195,7 +214,9 @@ impl Default for SecurityPolicy {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -205,7 +226,7 @@ fn expand_user_path(path: &str) -> PathBuf {
         }
     }
 
-    if let Some(stripped) = path.strip_prefix("~/") {
+    if let Some(stripped) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         if let Some(home) = home_dir() {
             return home.join(stripped);
         }
@@ -528,13 +549,29 @@ fn strip_wrapping_quotes(token: &str) -> &str {
 }
 
 fn looks_like_path(candidate: &str) -> bool {
-    candidate.starts_with('/')
+    // Unix-style paths
+    if candidate.starts_with('/')
         || candidate.starts_with("./")
         || candidate.starts_with("../")
         || candidate.starts_with('~')
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
+    {
+        return true;
+    }
+    // Windows-style paths: backslash-relative, UNC (\\server\share), and
+    // drive-letter absolute (C:\path or C:path).
+    candidate.starts_with('\\')
+        || candidate.starts_with(".\\")
+        || candidate.starts_with("..\\")
+        || candidate.contains('\\')
+        || (candidate.len() >= 2
+            && candidate
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_alphabetic())
+            && candidate.as_bytes()[1] == b':')
 }
 
 fn attached_short_option_value(token: &str) -> Option<&str> {
@@ -652,7 +689,7 @@ impl SecurityPolicy {
     /// Absolute inputs remain absolute; relative inputs are workspace-relative.
     pub fn resolve_user_supplied_path(&self, path: &str) -> PathBuf {
         let expanded = expand_user_path(path);
-        if expanded.is_absolute() {
+        if expanded.is_absolute() || expanded.has_root() {
             expanded
         } else {
             self.workspace_dir.join(expanded)
@@ -890,10 +927,13 @@ impl SecurityPolicy {
             return Err("command contains disallowed redirection syntax".into());
         }
 
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
+        if command.split_whitespace().any(|w| {
+            let token = strip_wrapping_quotes(w).trim();
+            let raw_base = token.rsplit(['/', '\\']).next().unwrap_or("");
+            let lowered = raw_base.to_ascii_lowercase();
+            let base = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+            base == "tee"
+        }) {
             return Err("command contains disallowed tee usage".into());
         }
 
@@ -911,7 +951,11 @@ impl SecurityPolicy {
             let cmd_part = skip_env_assignments(segment);
             let mut words = cmd_part.split_whitespace();
             let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("").trim();
+            let raw_base = executable.rsplit(['/', '\\']).next().unwrap_or("").trim();
+            let base_cmd = raw_base
+                .strip_suffix(".exe")
+                .or_else(|| raw_base.strip_suffix(".EXE"))
+                .unwrap_or(raw_base);
 
             if base_cmd.is_empty() {
                 continue;
@@ -982,11 +1026,15 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base = base_raw
-                .rsplit('/')
+            let base_lower = base_raw
+                .rsplit(['/', '\\'])
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            let base = base_lower
+                .strip_suffix(".exe")
+                .unwrap_or(&base_lower)
+                .to_string();
 
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
@@ -1348,15 +1396,22 @@ impl SecurityPolicy {
 
         // Reject "~user" forms because the shell expands them at runtime and
         // they can escape workspace policy.
-        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+        if path.starts_with('~')
+            && path != "~"
+            && !path.starts_with("~/")
+            && !path.starts_with("~\\")
+        {
             return false;
         }
 
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
+        // Block rooted paths (absolute or drive-relative) when workspace_only is set.
+        // Use has_root() rather than is_absolute() so that Unix-style /path and
+        // Windows drive-relative \path are both caught on Windows, where is_absolute()
+        // requires a drive letter prefix (e.g. C:\).
+        if self.workspace_only && expanded_path.has_root() {
             return false;
         }
 
@@ -1373,6 +1428,9 @@ impl SecurityPolicy {
 
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
+    /// Note: This always restricts paths to workspace + allowed_roots, regardless
+    /// of the workspace_only setting. The workspace_only flag only affects whether
+    /// absolute paths are allowed in the initial path input (is_path_allowed).
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -1403,12 +1461,7 @@ impl SecurityPolicy {
             }
         }
 
-        // When workspace_only is disabled the user explicitly opted out of
-        // workspace confinement after forbidden-path checks are applied.
-        if !self.workspace_only {
-            return true;
-        }
-
+        // Path must be in workspace or allowed_roots
         false
     }
 
@@ -1582,7 +1635,7 @@ impl SecurityPolicy {
                 .iter()
                 .map(|root| {
                     let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
+                    if expanded.is_absolute() || expanded.has_root() {
                         expanded
                     } else {
                         workspace_dir.join(expanded)
@@ -2111,8 +2164,7 @@ mod tests {
     #[test]
     fn resolve_user_supplied_path_expands_home_tilde() {
         let p = default_policy();
-        let expected = std::env::var_os("HOME")
-            .map(PathBuf::from)
+        let expected = super::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join("notes/todo.txt");
         assert_eq!(p.resolve_user_supplied_path("~/notes/todo.txt"), expected);
@@ -2162,11 +2214,9 @@ mod tests {
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
 
-        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join("Desktop")
-        } else {
-            PathBuf::from("~/Desktop")
-        };
+        let expected_home_root = super::home_dir()
+            .map(|h| h.join("Desktop"))
+            .unwrap_or_else(|| PathBuf::from("~/Desktop"));
 
         assert_eq!(policy.allowed_roots[0], expected_home_root);
         assert_eq!(policy.allowed_roots[1], workspace.join("shared-data"));
@@ -2765,28 +2815,50 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_false_allows_resolved_outside_workspace() {
+    fn workspace_only_false_still_restricts_to_workspace_and_allowed_roots() {
         let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false");
         let _ = std::fs::create_dir_all(&workspace);
         let canonical_workspace = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.clone());
 
+        // Create a temp directory to use as allowed_roots
+        let allowed_root = std::env::temp_dir().join("zeroclaw_test_allowed_root");
+        let _ = std::fs::create_dir_all(&allowed_root);
+        let canonical_allowed_root = allowed_root
+            .canonicalize()
+            .unwrap_or_else(|_| allowed_root.clone());
+
         let p = SecurityPolicy {
             workspace_dir: canonical_workspace.clone(),
             workspace_only: false,
+            allowed_roots: vec![canonical_allowed_root.clone()],
             forbidden_paths: vec!["/etc".into(), "/var".into()],
             ..SecurityPolicy::default()
         };
 
-        // Path outside workspace should be allowed when workspace_only=false
+        // Path inside workspace — allowed
+        let inside = canonical_workspace.join("subdir");
+        assert!(
+            p.is_resolved_path_allowed(&inside),
+            "path inside workspace must be allowed"
+        );
+
+        // Path in allowed_roots — allowed
+        let in_allowed = canonical_allowed_root.join("file.txt");
+        assert!(
+            p.is_resolved_path_allowed(&in_allowed),
+            "path in allowed_roots must be allowed"
+        );
+
+        // Path outside workspace and allowed_roots — blocked even with workspace_only=false
         let outside = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/home"))
             .join("zeroclaw_outside_ws");
         assert!(
-            p.is_resolved_path_allowed(&outside),
-            "workspace_only=false must allow resolved paths outside workspace"
+            !p.is_resolved_path_allowed(&outside),
+            "workspace_only=false must still block paths outside workspace and allowed_roots"
         );
 
         // Forbidden paths must still be blocked even with workspace_only=false
@@ -2800,6 +2872,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&allowed_root);
     }
 
     #[test]
@@ -3182,5 +3255,43 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    // ── Windows-specific path tests ─────────────────────────────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rooted_paths_blocked_when_workspace_only() {
+        let p = default_policy();
+        // Backslash-rooted paths should be blocked
+        assert!(!p.is_path_allowed("\\Windows\\System32"));
+        // Drive-letter absolute paths should be blocked
+        assert!(!p.is_path_allowed("C:\\Windows\\System32"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_looks_like_path_detects_drive_letters() {
+        // Drive-letter paths should be recognized as paths
+        assert!(super::looks_like_path("C:\\Windows\\System32"));
+        assert!(super::looks_like_path("D:\\Users\\test"));
+        // Relative with drive letter
+        assert!(super::looks_like_path("C:file.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_expand_user_path_handles_backslash_tilde() {
+        let expanded = super::expand_user_path("~\\Documents");
+        // Should expand to userprofile\Documents
+        assert!(expanded.to_string_lossy().contains("Documents"));
+    }
+
+    #[test]
+    fn command_injection_tee_exe_blocked() {
+        let p = default_policy();
+        // Tee.exe variants should be blocked
+        assert!(!p.is_command_allowed("tee.exe file.txt"));
+        assert!(!p.is_command_allowed("echo data | C:\\Windows\\System32\\tee.exe out.txt"));
     }
 }
