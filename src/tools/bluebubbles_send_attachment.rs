@@ -15,15 +15,19 @@ pub struct BlueBubblesSendAttachmentTool {
 }
 
 impl BlueBubblesSendAttachmentTool {
-    pub fn new(server_url: String, password: String) -> Self {
-        Self {
+    pub fn new(server_url: String, password: String) -> anyhow::Result<Self> {
+        Ok(Self {
             server_url: server_url.trim_end_matches('/').to_string(),
             password,
             client: reqwest::ClientBuilder::new()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        }
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to build BlueBubblesSendAttachmentTool HTTP client: {e}"
+                    )
+                })?,
+        })
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -98,7 +102,7 @@ impl Tool for BlueBubblesSendAttachmentTool {
                 })
             }
         };
-        const MAX_ATTACHMENT_B64_LEN: usize = 50 * 1024 * 1024; // 50 MiB base64 input
+        const MAX_ATTACHMENT_B64_LEN: usize = 34 * 1024 * 1024; // ~25 MiB decoded (base64 overhead ~4/3)
         let data_b64 = match args.get("data_base64").and_then(|v| v.as_str()) {
             Some(b) if !b.is_empty() => {
                 if b.len() > MAX_ATTACHMENT_B64_LEN {
@@ -178,16 +182,26 @@ impl Tool for BlueBubblesSendAttachmentTool {
             form = form.text("isAudioMessage", "true");
         }
 
-        let resp = self
+        let resp = match self
             .client
             .post(&url)
             .query(&[("password", &self.password)])
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("BB send_attachment request failed: {}", e.without_url())
-            })?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "BB send_attachment request failed: {}",
+                        e.without_url()
+                    )),
+                })
+            }
+        };
 
         if resp.status().is_success() {
             Ok(ToolResult {
