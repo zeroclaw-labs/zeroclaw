@@ -88,7 +88,9 @@ Notes:
 - Alias values `opentelemetry` and `otlp` map to the same OTel backend.
 - Runtime traces are intended for debugging tool-call failures and malformed model tool payloads. They can contain model output text, so keep this disabled by default on shared hosts.
 - `runtime_trace_record_http` is effective only when `runtime_trace_mode` is `rolling` or `full`.
-- HTTP trace payloads redact common sensitive fields (for example Authorization headers and token-like query/body fields), but still treat trace files as sensitive operational data.
+  - HTTP trace payloads redact common sensitive fields (for example Authorization headers and token-like query/body fields), but still treat trace files as sensitive operational data.
+  - Requests/responses/header values are truncated if too large. However, high-volume LLM traffic with large responses can still significantly increase memory usage and trace file size.
+  - Consider disabling HTTP tracing in production environments.
 - Query runtime traces with:
   - `zeroclaw doctor traces --limit 20`
   - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
