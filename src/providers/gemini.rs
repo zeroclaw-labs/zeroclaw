@@ -1398,12 +1398,12 @@ impl Provider for GeminiProvider {
                         "https://generativelanguage.googleapis.com/v1beta/models".to_string()
                     };
 
-                    crate::observability::llm_http_trace::send_with_middleware(
-                        "provider.gemini",
-                        self.http_client().get(&url),
-                    )
-                    .await?
-                    .error_for_status()?;
+                    // not recording because there might be the api key in url
+                    self.http_client()
+                        .get(&url)
+                        .send()
+                        .await?
+                        .error_for_status()?;
                 }
             }
         }

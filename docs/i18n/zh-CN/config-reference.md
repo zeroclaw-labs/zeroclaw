@@ -16,4 +16,4 @@
 
 - 配置键保持英文，避免本地化改写键名。
 - 生产行为以英文原文定义为准。
-- 新增配置：`observability.runtime_trace_record_http`，用于记录 LLM HTTP 请求/响应明细（`llm_http_request` / `llm_http_response`），详见英文原文。
+- 新增配置：`observability.runtime_trace_record_http`，用于记录 LLM HTTP 请求/响应明细（`llm_http_request` / `llm_http_response`），默认值 `false`，仅在 `runtime_trace_mode` 为 `rolling` 或 `full` 时生效，详见英文原文。

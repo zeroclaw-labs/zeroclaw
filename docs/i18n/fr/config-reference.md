@@ -21,4 +21,4 @@ Source anglaise:
 
 - Ajout de `provider.reasoning_level` (OpenAI Codex `/responses`). Voir la source anglaise pour les détails.
 - Valeur par défaut de `agent.max_tool_iterations` augmentée à `20` (fallback sûr si `0`).
-- Ajout de `observability.runtime_trace_record_http` pour tracer les détails HTTP LLM (`llm_http_request` / `llm_http_response`). Référence canonique: `docs/config-reference.md`.
+- Ajout de `observability.runtime_trace_record_http` pour tracer les détails HTTP LLM (`llm_http_request` / `llm_http_response`) ; par défaut `false` ; effet uniquement lorsque `runtime_trace_mode` est `rolling` ou `full`. Référence canonique: `docs/config-reference.md`.

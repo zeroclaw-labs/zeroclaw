@@ -305,8 +305,9 @@ fn response_content_payload_from_bytes(bytes: &[u8], max_bytes: usize) -> (Value
 }
 
 fn is_sensitive_header(header: &HeaderName) -> bool {
+    let key = header.as_str().to_ascii_lowercase();
     matches!(
-        header.as_str().to_ascii_lowercase().as_str(),
+        key.as_str(),
         "authorization"
             | "proxy-authorization"
             | "cookie"
@@ -314,7 +315,9 @@ fn is_sensitive_header(header: &HeaderName) -> bool {
             | "x-api-key"
             | "api-key"
             | "x-auth-token"
-    )
+    ) || key.contains("api-key")
+        || key.contains("access-token")
+        || key.contains("session-token")
 }
 
 fn is_sensitive_query_key(key: &str) -> bool {

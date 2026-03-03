@@ -92,7 +92,7 @@ Notes:
 - Query runtime traces with:
   - `zeroclaw doctor traces --limit 20`
   - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
-  - `zeroclaw doctor traces --event llm_http_response --contains \"5xx\"`
+  - `zeroclaw doctor traces --event llm_http_response --contains \"500\"`
   - `zeroclaw doctor traces --id <trace-id>`
 
 Example:

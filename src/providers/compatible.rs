@@ -2539,7 +2539,11 @@ impl Provider for OpenAiCompatibleProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Provider(e.to_string()))).await;
+                    let stream_error = match e.downcast::<reqwest::Error>() {
+                        Ok(http_err) => StreamError::Http(http_err),
+                        Err(other) => StreamError::Provider(other.to_string()),
+                    };
+                    let _ = tx.send(Err(stream_error)).await;
                     return;
                 }
             };

@@ -16,4 +16,4 @@
 
 - 設定キー名は英語のまま保持します。
 - 実行時挙動の定義は英語版原文を優先します。
-- 追加キー: `observability.runtime_trace_record_http`（LLM の HTTP リクエスト/レスポンス詳細を `llm_http_request` / `llm_http_response` として記録）。詳細は英語版を参照してください。
+- 追加キー: `observability.runtime_trace_record_http`（LLM の HTTP リクエスト/レスポンス詳細を `llm_http_request` / `llm_http_response` として記録）。デフォルト値 `false`、`runtime_trace_mode` が `rolling` または `full` の場合のみ有効。詳細は英語版を参照してください。
