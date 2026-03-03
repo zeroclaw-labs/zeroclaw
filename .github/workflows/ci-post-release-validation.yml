@@ -11,7 +11,7 @@ permissions:
 jobs:
     validate:
         name: Validate Published Release
-        runs-on: ubuntu-22.04
+        runs-on: blacksmith-4vcpu-ubuntu-2204
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
