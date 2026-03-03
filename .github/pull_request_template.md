@@ -76,7 +76,7 @@ cargo test
 ## i18n Follow-Through (required when docs or user-facing wording changes)
 
 - i18n follow-through triggered? (`Yes/No`)
-- If `Yes`, locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`)? (`Yes/No`)
+- If `Yes`, locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`)? (`Yes/No`)
 - If `Yes`, localized runtime-contract docs updated where equivalents exist (minimum for `fr`/`vi`: `commands-reference`, `config-reference`, `troubleshooting`)? (`Yes/No/N.A.`)
 - If `Yes`, Vietnamese canonical docs under `docs/i18n/vi/**` synced and compatibility shims under `docs/*.vi.md` validated? (`Yes/No/N.A.`)
 - If any `No`/`N.A.`, link follow-up issue/PR and explain scope decision:

@@ -17,7 +17,7 @@ Welcome — contributions of all sizes are valued. If this is your first contrib
    - Fork the repository and clone your fork
    - Create a feature branch (`git checkout -b fix/my-change`)
    - Make your changes and run `cargo fmt && cargo clippy && cargo test`
-   - Open a PR against `dev` using the PR template
+   - Open a PR against `main` using the PR template
 
 4. **Start with Track A.** ZeroClaw uses three [collaboration tracks](#collaboration-tracks-risk-based) (A/B/C) based on risk. First-time contributors should target **Track A** (docs, tests, chore) — these require lighter review and are the fastest path to a merged PR.
 
@@ -357,7 +357,6 @@ Create `src/providers/your_provider.rs`:
 
 ```rust
 use async_trait::async_trait;
-use anyhow::Result;
 use crate::providers::traits::Provider;
 
 pub struct YourProvider {
@@ -376,7 +375,13 @@ impl YourProvider {
 
 #[async_trait]
 impl Provider for YourProvider {
-    async fn chat(&self, message: &str, model: &str, temperature: f64) -> Result<String> {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
         // Your API call here
         todo!()
     }
@@ -395,9 +400,8 @@ Create `src/channels/your_channel.rs`:
 
 ```rust
 use async_trait::async_trait;
-use anyhow::Result;
 use tokio::sync::mpsc;
-use crate::channels::traits::{Channel, ChannelMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 
 pub struct YourChannel { /* config fields */ }
 
@@ -405,17 +409,18 @@ pub struct YourChannel { /* config fields */ }
 impl Channel for YourChannel {
     fn name(&self) -> &str { "your_channel" }
 
-    async fn send(&self, message: &str, recipient: &str) -> Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Send message via your platform
         todo!()
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // Listen for incoming messages, forward to tx
         todo!()
     }
 
-    async fn health_check(&self) -> bool { true }
+    // Optional: override health_check, start_typing, stop_typing,
+    // draft updates, reactions, etc. — see Channel trait for defaults.
 }
 ```
 
@@ -438,6 +443,10 @@ impl Observer for YourObserver {
     }
 
     fn name(&self) -> &str { "your_observer" }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+
+    // Optional: override flush() for buffered backends.
 }
 ```
 
@@ -537,7 +546,7 @@ Recommended scope keys in commit titles:
 - Require review approval for non-trivial changes.
 - Require CODEOWNERS review for protected paths.
 - Use risk labels to determine review depth, scope labels (`core`, `provider`, `channel`, `security`, etc.) to route ownership, and module labels (`<module>:<component>`, e.g. `channel:telegram`, `provider:kimi`, `tool:shell`) to route subsystem expertise.
-- Contributor tier labels are auto-applied on PRs and issues by merged PR count: `experienced contributor` (>=10), `principal contributor` (>=20), `distinguished contributor` (>=50). Treat them as read-only automation labels; manual edits are auto-corrected.
+- Contributor tier labels are auto-applied on PRs and issues by merged PR count: `trusted contributor` (>=5), `experienced contributor` (>=10), `principal contributor` (>=20), `distinguished contributor` (>=50). Treat them as read-only automation labels; manual edits are auto-corrected.
 - Prefer squash merge with conventional commit title.
 - Revert fast on regressions; re-land with tests.
 
