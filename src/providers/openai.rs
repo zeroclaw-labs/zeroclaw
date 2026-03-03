@@ -355,13 +355,14 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens_override,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openai",
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -397,13 +398,14 @@ impl Provider for OpenAiProvider {
             tools,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openai",
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&native_request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -465,13 +467,14 @@ impl Provider for OpenAiProvider {
             tools: native_tools,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openai",
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&native_request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -499,12 +502,14 @@ impl Provider for OpenAiProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
-                .get(format!("{}/models", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .send()
-                .await?
-                .error_for_status()?;
+            crate::observability::llm_http_trace::send_with_middleware(
+                "provider.openai",
+                self.http_client()
+                    .get(format!("{}/models", self.base_url))
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
+            .await?
+            .error_for_status()?;
         }
         Ok(())
     }

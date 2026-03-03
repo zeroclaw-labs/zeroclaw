@@ -182,13 +182,14 @@ impl Provider for GlmProvider {
 
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
-            .http_client()
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.glm",
+            self.http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
-            .json(&request)
-            .send()
-            .await?;
+            .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let error = response.text().await?;
@@ -229,13 +230,14 @@ impl Provider for GlmProvider {
 
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
-            .client
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.glm",
+            self.client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
-            .json(&request)
-            .send()
-            .await?;
+            .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let error = response.text().await?;
@@ -261,12 +263,13 @@ impl Provider for GlmProvider {
         let token = self.generate_token()?;
         let url = format!("{}/chat/completions", self.base_url);
         // GET will likely return 405 but establishes the TLS + HTTP/2 connection pool.
-        let _ = self
-            .client
+        let _ = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.glm",
+            self.client
             .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await?;
+            .header("Authorization", format!("Bearer {token}")),
+        )
+        .await?;
         Ok(())
     }
 }

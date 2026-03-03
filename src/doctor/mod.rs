@@ -412,6 +412,7 @@ pub fn run_traces(
 
     println!();
     println!("Use `zeroclaw doctor traces --id <trace-id>` to inspect a full event payload.");
+    println!("Tip: `zeroclaw doctor traces --event llm_http_response --limit 20` for LLM HTTP diagnostics.");
     Ok(())
 }
 
