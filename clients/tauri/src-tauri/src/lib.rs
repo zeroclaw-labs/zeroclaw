@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 
 // ── State ────────────────────────────────────────────────────────
@@ -542,6 +542,14 @@ const MAX_SIDECAR_RETRIES: u32 = 3;
 /// Maximum time to wait for the gateway health endpoint (30 seconds).
 const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
 
+/// Emit a gateway status event to the frontend so it can display progress.
+fn emit_gateway_status(app_handle: &tauri::AppHandle, status: &str, message: &str) {
+    let _ = app_handle.emit(
+        "gateway-status",
+        serde_json::json!({ "status": status, "message": message }),
+    );
+}
+
 /// Launch the bundled runtime as a sidecar process.
 ///
 /// MoA treats its backend runtime as an internal implementation detail:
@@ -550,6 +558,11 @@ const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
 /// 3. Wait until the gateway health endpoint responds (30s timeout)
 /// 4. On failure, auto-retry up to 3 times before marking as failed
 /// 5. Mark gateway_running = true on success
+///
+/// Emits `gateway-status` events to the frontend for user feedback:
+/// - `{ status: "starting", message: "..." }` — launch in progress
+/// - `{ status: "ready", message: "..." }` — gateway is responding
+/// - `{ status: "failed", message: "..." }` — all attempts exhausted
 fn spawn_zeroclaw_gateway(app: &tauri::App) {
     let gateway_url = format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}");
     let state = app.state::<AppState>();
@@ -558,35 +571,56 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
 
     tauri::async_runtime::spawn(async move {
         // Step 1: Check if gateway is already running
+        emit_gateway_status(&app_handle, "starting", "Checking for running gateway...");
         if is_gateway_reachable(&gateway_url).await {
             eprintln!("[MoA] Gateway already running at {gateway_url}");
             gateway_running.store(true, Ordering::SeqCst);
+            emit_gateway_status(&app_handle, "ready", "Gateway connected");
             return;
         }
 
         // Step 2: Launch with auto-retry (up to MAX_SIDECAR_RETRIES attempts)
         for attempt in 1..=MAX_SIDECAR_RETRIES {
             eprintln!("[MoA] Starting backend service (attempt {attempt}/{MAX_SIDECAR_RETRIES})...");
+            emit_gateway_status(
+                &app_handle,
+                "starting",
+                &format!("Starting backend service (attempt {attempt}/{MAX_SIDECAR_RETRIES})..."),
+            );
 
             // Create a fresh sidecar command each attempt (Command is consumed on spawn)
-            let launched = match app_handle.shell().sidecar("zeroclaw") {
-                Ok(sidecar) => sidecar
-                    .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
-                    .spawn()
-                    .is_ok(),
-                Err(_) => {
+            let launch_result = match app_handle.shell().sidecar("zeroclaw") {
+                Ok(sidecar) => {
+                    match sidecar
+                        .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
+                        .spawn()
+                    {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(format!("Sidecar spawn failed: {e}")),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[MoA] Sidecar not found ({e}), trying system PATH...");
                     // Fall back: try to find binary on system PATH (development mode)
-                    std::process::Command::new("zeroclaw")
+                    match std::process::Command::new("zeroclaw")
                         .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
                         .spawn()
-                        .is_ok()
+                    {
+                        Ok(_) => Ok(()),
+                        Err(e2) => Err(format!("System PATH fallback failed: {e2}")),
+                    }
                 }
             };
 
-            if !launched {
-                eprintln!("[MoA] Failed to start backend service (attempt {attempt})");
+            if let Err(ref err) = launch_result {
+                eprintln!("[MoA] Failed to start backend service (attempt {attempt}): {err}");
+                emit_gateway_status(
+                    &app_handle,
+                    "starting",
+                    &format!("Retrying... ({attempt}/{MAX_SIDECAR_RETRIES})"),
+                );
                 if attempt < MAX_SIDECAR_RETRIES {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
@@ -601,6 +635,7 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
                 if is_gateway_reachable(&gateway_url).await {
                     eprintln!("[MoA] Backend service ready after {}ms", (i + 1) * poll_interval_ms);
                     gateway_running.store(true, Ordering::SeqCst);
+                    emit_gateway_status(&app_handle, "ready", "Backend service ready");
                     return;
                 }
             }
@@ -612,6 +647,11 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
         }
 
         eprintln!("[MoA] Error: Backend service failed to start after {MAX_SIDECAR_RETRIES} attempts");
+        emit_gateway_status(
+            &app_handle,
+            "failed",
+            "Backend service failed to start. Please ensure ZeroClaw is installed or check the logs.",
+        );
     });
 }
 

@@ -7,6 +7,7 @@ import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
+import { GatewayStatus } from "./components/GatewayStatus";
 import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
@@ -36,6 +37,9 @@ function App() {
   const [sidebarChannels, setSidebarChannels] = useState<string[]>([]);
   const [sidebarTools, setSidebarTools] = useState<ToolInfo[]>([]);
   const lifecycleCleanup = useRef<(() => void) | null>(null);
+  // In Tauri mode, wait for the ZeroClaw gateway to be ready before
+  // allowing the user to interact with auth/chat screens.
+  const [gatewayReady, setGatewayReady] = useState(!isTauri());
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
@@ -47,8 +51,11 @@ function App() {
     setActiveChatId(activeChatId);
   }, [activeChatId]);
 
-  // Check auth on startup — show setup wizard for first-time users
+  // Check auth on startup — show setup wizard for first-time users.
+  // In Tauri mode, wait for the gateway to be ready before proceeding.
   useEffect(() => {
+    if (!gatewayReady) return;
+
     const setupComplete = localStorage.getItem("moa_setup_complete");
     if (!setupComplete) {
       setPage("setup");
@@ -89,7 +96,7 @@ function App() {
     return () => {
       lifecycleCleanup.current?.();
     };
-  }, []);
+  }, [gatewayReady]);
 
   // Fetch sidebar data (devices, channels, tools) when connected
   useEffect(() => {
@@ -292,7 +299,19 @@ function App() {
     setPage("login");
   }, []);
 
+  // Stable callback for GatewayStatus
+  const handleGatewayReady = useCallback(() => setGatewayReady(true), []);
+
   // ── Render ─────────────────────────────────────────────────────
+
+  // Show gateway startup overlay while waiting for backend (Tauri only)
+  if (!gatewayReady) {
+    return (
+      <div className="app">
+        <GatewayStatus onReady={handleGatewayReady} />
+      </div>
+    );
+  }
 
   // First-time setup wizard (no sidebar)
   if (page === "setup") {

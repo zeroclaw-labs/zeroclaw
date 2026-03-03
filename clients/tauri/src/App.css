@@ -2300,3 +2300,8 @@ html, body {
     gap: 20px;
   }
 }
+
+/* Gateway startup spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
