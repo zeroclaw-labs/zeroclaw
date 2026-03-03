@@ -994,6 +994,7 @@ Reminder set successfully."#;
     }
 
     /// Spin up a one-shot test server on a random port and return its address.
+    /// The server signals readiness via a oneshot channel before returning the address.
     async fn start_test_ws_server() -> std::net::SocketAddr {
         use axum::{extract::connect_info::IntoMakeServiceWithConnectInfo, Router};
 
@@ -1007,7 +1008,13 @@ Reminder set successfully."#;
             .expect("bind test listener");
         let addr = listener.local_addr().expect("local addr");
 
+        // Create a oneshot channel to signal when the server is ready
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
         tokio::spawn(async move {
+            // Signal that the server is about to start accepting connections
+            let _ = ready_tx.send(());
+
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1015,6 +1022,9 @@ Reminder set successfully."#;
             .await
             .expect("test server");
         });
+
+        // Wait for the server to signal it's ready before returning the address
+        ready_rx.await.expect("server ready signal");
 
         addr
     }
@@ -1099,9 +1109,30 @@ Reminder set successfully."#;
                     "Server must not negotiate an unsupported subprotocol",
                 );
             }
-            Err(_) => {
-                // Handshake failed — this is also acceptable as the server rightfully
-                // rejected a client that offered no compatible subprotocol.
+            Err(tokio_tungstenite::tungstenite::Error::Http(_)) => {
+                // HTTP error (e.g., 400 Bad Request) — the server rejected the handshake
+                // due to subprotocol mismatch. This is acceptable.
+            }
+            Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                tokio_tungstenite::tungstenite::error::ProtocolError::SecWebSocketSubProtocolError(
+                    _,
+                ),
+            )) => {
+                // Subprotocol negotiation failed — this is the expected behavior when the
+                // client requests an unsupported subprotocol. This is acceptable.
+            }
+            Err(tokio_tungstenite::tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Connection-establishment failures are retryable; for this test we
+                // accept them as the server may not be fully ready despite the ready signal.
+                panic!("Connection failed: {e}. This may indicate a race condition or infrastructure issue.");
+            }
+            Err(e) => {
+                // Surface any other unexpected error variants so infrastructure failures
+                // are not silently ignored.
+                panic!("Unexpected WebSocket error: {e:?}");
             }
         }
     }
