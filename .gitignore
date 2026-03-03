@@ -16,6 +16,7 @@ site/public/docs-content/
 gh-pages/
 
 .idea
+.claude
 
 # Environment files (may contain secrets)
 .env
