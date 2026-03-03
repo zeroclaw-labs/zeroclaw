@@ -73,6 +73,9 @@ pub enum CompatibleApiMode {
     OpenAiChatCompletions,
     /// Responses-first mode: call `/responses` directly.
     OpenAiResponses,
+    /// Gemini-compatible mode: uses chat-completions format but applies
+    /// Gemini-safe schema transformations and omits `tool_choice`.
+    GeminiCompat,
 }
 
 impl OpenAiCompatibleProvider {
@@ -1153,6 +1156,32 @@ impl OpenAiCompatibleProvider {
         self.api_mode == CompatibleApiMode::OpenAiResponses
     }
 
+    /// Check if Gemini-compatible schema cleaning should be applied.
+    ///
+    /// True when either:
+    /// - `api_mode` is explicitly set to `GeminiCompat` (via config), or
+    /// - the model name starts with `gemini` (auto-detection for `custom:` providers).
+    fn needs_gemini_compat(&self, model: &str) -> bool {
+        self.api_mode == CompatibleApiMode::GeminiCompat
+            || model
+                .rsplit('/')
+                .next()
+                .unwrap_or(model)
+                .starts_with("gemini")
+    }
+
+    /// Apply Gemini-safe schema transformations to serialized tool definitions.
+    fn sanitize_tools_for_gemini(tools: &mut [serde_json::Value]) {
+        for tool in tools.iter_mut() {
+            if let Some(params) = tool
+                .get_mut("function")
+                .and_then(|f| f.get_mut("parameters"))
+            {
+                *params = crate::tools::schema::SchemaCleanr::clean_for_gemini(params.take());
+            }
+        }
+    }
+
     fn chat_completions_fallback_provider(&self) -> Self {
         let mut provider = self.clone();
         provider.api_mode = CompatibleApiMode::OpenAiChatCompletions;
@@ -2184,18 +2213,24 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect();
 
+        let gemini_compat = self.needs_gemini_compat(model);
+        let mut tools_vec: Vec<serde_json::Value> = tools.to_vec();
+        if gemini_compat && !tools_vec.is_empty() {
+            Self::sanitize_tools_for_gemini(&mut tools_vec);
+        }
+
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
             temperature,
             max_tokens: self.effective_max_tokens(),
             stream: Some(false),
-            tools: if tools.is_empty() {
+            tools: if tools_vec.is_empty() {
                 None
             } else {
-                Some(tools.to_vec())
+                Some(tools_vec.clone())
             },
-            tool_choice: if tools.is_empty() {
+            tool_choice: if tools_vec.is_empty() || gemini_compat {
                 None
             } else {
                 Some("auto".to_string())
@@ -2208,7 +2243,7 @@ impl Provider for OpenAiCompatibleProvider {
                     credential,
                     &effective_messages,
                     model,
-                    (!tools.is_empty()).then(|| tools.to_vec()),
+                    (!tools_vec.is_empty()).then(|| tools_vec),
                     temperature,
                 )
                 .await;
@@ -2331,12 +2366,23 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let tools = Self::convert_tool_specs(request.tools);
+        let gemini_compat = self.needs_gemini_compat(model);
+        let mut tools = Self::convert_tool_specs(request.tools);
+        if gemini_compat {
+            if let Some(ref mut tool_vec) = tools {
+                Self::sanitize_tools_for_gemini(tool_vec);
+            }
+        }
         let response_tools = tools.clone();
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
             request.messages.to_vec()
+        };
+        let tool_choice = if gemini_compat {
+            None
+        } else {
+            tools.as_ref().map(|_| "auto".to_string())
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -2347,7 +2393,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             max_tokens: self.effective_max_tokens(),
             stream: Some(false),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice,
             tools,
         };
 
@@ -2733,6 +2779,36 @@ mod tests {
 
         assert!(provider.should_use_responses_mode());
         assert_eq!(provider.effective_max_tokens(), Some(2048));
+    }
+
+    #[test]
+    fn gemini_compat_activates_by_config_or_model_name() {
+        let explicit = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            "https://proxy.example.com",
+            Some("key"),
+            AuthStyle::Bearer,
+            true,
+            CompatibleApiMode::GeminiCompat,
+            None,
+        );
+        assert!(explicit.needs_gemini_compat("any-model"));
+        assert!(explicit.needs_gemini_compat("gpt-4o"));
+
+        let auto = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            "https://proxy.example.com",
+            Some("key"),
+            AuthStyle::Bearer,
+            true,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
+        );
+        assert!(auto.needs_gemini_compat("gemini-2.5-flash"));
+        assert!(auto.needs_gemini_compat("gemini-2.5-pro"));
+        assert!(auto.needs_gemini_compat("google/gemini-2.5-flash"));
+        assert!(!auto.needs_gemini_compat("gpt-4o"));
+        assert!(!auto.needs_gemini_compat("claude-sonnet-4-6"));
     }
 
     #[tokio::test]

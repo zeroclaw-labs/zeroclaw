@@ -172,6 +172,11 @@ pub enum ProviderApiMode {
     OpenAiChatCompletions,
     /// Responses-first behavior: call `/responses` directly.
     OpenAiResponses,
+    /// Gemini-compatible mode: uses `/chat/completions` format but applies
+    /// Gemini-safe schema transformations to tool definitions and omits
+    /// `tool_choice` from requests. Use with `custom:` providers that proxy
+    /// to Google Gemini API or Vertex AI.
+    GeminiCompat,
 }
 
 impl ProviderApiMode {
@@ -183,6 +188,7 @@ impl ProviderApiMode {
             Self::OpenAiResponses => {
                 crate::providers::compatible::CompatibleApiMode::OpenAiResponses
             }
+            Self::GeminiCompat => crate::providers::compatible::CompatibleApiMode::GeminiCompat,
         }
     }
 }
@@ -7372,6 +7378,7 @@ fn normalize_wire_api(raw: &str) -> Option<&'static str> {
         "chat_completions" | "chat-completions" | "chat" | "chatcompletions" => {
             Some("chat_completions")
         }
+        "gemini_compat" | "gemini-compat" | "geminicompat" | "gemini" => Some("gemini_compat"),
         _ => None,
     }
 }
@@ -7892,6 +7899,20 @@ impl Config {
 
         if normalized_wire_api == Some("responses") {
             self.default_provider = Some("openai-codex".to_string());
+            return;
+        }
+
+        if normalized_wire_api == Some("gemini_compat") {
+            self.provider_api = Some(ProviderApiMode::GeminiCompat);
+            if let Some(profile_name) = profile_name {
+                if !profile_name.eq_ignore_ascii_case(&profile_key) {
+                    self.default_provider = Some(profile_name.to_string());
+                    return;
+                }
+            }
+            if let Some(base_url) = base_url {
+                self.default_provider = Some(format!("custom:{base_url}"));
+            }
             return;
         }
 
@@ -8532,7 +8553,7 @@ impl Config {
             if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim) {
                 if !wire_api.is_empty() && normalize_wire_api(wire_api).is_none() {
                     anyhow::bail!(
-                        "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                        "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions, gemini_compat"
                     );
                 }
             }

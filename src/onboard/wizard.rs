@@ -6841,6 +6841,7 @@ mod tests {
         home: &Path,
     ) -> Result<Config> {
         let _env_guard = env_lock().lock().await;
+        let _home_env = EnvVarGuard::set("HOME", home.to_string_lossy().as_ref());
         let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
@@ -7073,6 +7074,7 @@ mod tests {
         let workspace_dir = workspace_root.join("workspace");
         let expected_config_path = workspace_root.join(".zeroclaw").join("config.toml");
 
+        let _home_env = EnvVarGuard::set("HOME", tmp.path().to_string_lossy().as_ref());
         let _workspace_env = EnvVarGuard::set(
             "ZEROCLAW_WORKSPACE",
             workspace_dir.to_string_lossy().as_ref(),

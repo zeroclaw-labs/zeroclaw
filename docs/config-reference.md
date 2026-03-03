@@ -26,7 +26,7 @@ CLI commands for config inspection and modification:
 | Key | Default | Notes |
 |---|---|---|
 | `default_provider` | `openrouter` | provider ID or alias |
-| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
+| `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions`, `openai-responses`, or `gemini-compat` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 | `model_support_vision` | unset (`None`) | Vision support override for active provider/model |
@@ -46,7 +46,7 @@ Use named profiles to map a logical provider id to a provider name/base URL and 
 |---|---|---|
 | `name` | unset | Optional provider id override (for example `openai`, `openai-codex`) |
 | `base_url` | unset | Optional OpenAI-compatible endpoint URL |
-| `wire_api` | unset | Optional protocol mode: `responses` or `chat_completions` |
+| `wire_api` | unset | Optional protocol mode: `responses`, `chat_completions`, or `gemini_compat` |
 | `model` | unset | Optional profile-scoped default model |
 | `api_key` | unset | Optional profile-scoped API key (used when top-level `api_key` is empty) |
 | `requires_openai_auth` | `false` | Load OpenAI auth material (`OPENAI_API_KEY` / Codex auth file) |
@@ -68,6 +68,40 @@ base_url = "https://api.example.com/v1"
 wire_api = "chat_completions"
 model = "qwen-max"
 api_key = "sk-profile-key"
+```
+
+### Gemini-compatible proxy
+
+When using a `custom:` provider that proxies to Google Gemini API or Vertex AI,
+ZeroClaw automatically applies Gemini-safe tool schema transformations and omits
+`tool_choice` from requests when the model name starts with `gemini` (e.g.
+`gemini-2.5-flash`, `google/gemini-2.5-pro`).
+
+No extra configuration is needed for the common case:
+
+```toml
+default_provider = "custom:https://gemini-proxy.example.com/v1"
+default_model = "gemini-2.5-flash"
+api_key = "your-api-key"
+```
+
+For proxies that use non-standard model names, force Gemini compatibility explicitly
+via `provider_api = "gemini-compat"` (top-level) or `wire_api = "gemini_compat"`
+(per-profile):
+
+```toml
+# Option A: top-level provider_api
+default_provider = "custom:https://gemini-proxy.example.com/v1"
+provider_api = "gemini-compat"
+default_model = "my-custom-model-name"
+api_key = "your-api-key"
+
+# Option B: per-profile wire_api
+[model_providers.gemini-proxy]
+base_url = "https://gemini-proxy.example.com/v1"
+wire_api = "gemini_compat"
+model = "my-custom-model-name"
+api_key = "your-api-key"
 ```
 
 ## `[observability]`

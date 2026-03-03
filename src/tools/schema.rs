@@ -83,6 +83,8 @@ pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
     "maxProperties",
     // Non-standard
     "examples", // OpenAPI keyword, not JSON Schema
+    // Gemini does not support default values in tool parameter schemas
+    "default",
 ];
 
 /// Keywords that should be preserved during cleaning (metadata).
@@ -258,6 +260,18 @@ impl SchemaCleanr {
                     let cleaned_value = Self::clean_type_array(value);
                     cleaned.insert(key, cleaned_value);
                 }
+                // Remove null values from enum arrays (Gemini rejects null enum members)
+                "enum" if strategy == CleaningStrategy::Gemini => {
+                    if let Value::Array(items) = value {
+                        let non_null: Vec<Value> =
+                            items.into_iter().filter(|v| !v.is_null()).collect();
+                        if !non_null.is_empty() {
+                            cleaned.insert(key, Value::Array(non_null));
+                        }
+                    } else {
+                        cleaned.insert(key, value);
+                    }
+                }
                 // Recursively clean nested schemas
                 "properties" => {
                     let cleaned_value = Self::clean_properties(value, defs, strategy, ref_stack);
@@ -284,6 +298,27 @@ impl SchemaCleanr {
             }
         }
 
+        // Gemini structural requirements: object types must have properties,
+        // array types must have items.
+        if strategy == CleaningStrategy::Gemini {
+            if cleaned.get("type").and_then(Value::as_str) == Some("object")
+                && !cleaned.contains_key("properties")
+            {
+                let mut placeholder = Map::new();
+                placeholder.insert(
+                    "_placeholder".to_string(),
+                    json!({"type": "string", "description": "unused"}),
+                );
+                cleaned.insert("properties".to_string(), Value::Object(placeholder));
+            }
+
+            if cleaned.get("type").and_then(Value::as_str) == Some("array")
+                && !cleaned.contains_key("items")
+            {
+                cleaned.insert("items".to_string(), json!({"type": "string"}));
+            }
+        }
+
         Value::Object(cleaned)
     }
 
@@ -298,7 +333,7 @@ impl SchemaCleanr {
         // Prevent circular references
         if ref_stack.contains(ref_value) {
             tracing::warn!("Circular $ref detected: {}", ref_value);
-            return Self::preserve_meta(obj, Value::Object(Map::new()));
+            return Self::preserve_meta(obj, Value::Object(Map::new()), strategy);
         }
 
         // Try to resolve local ref (#/$defs/Name or #/definitions/Name)
@@ -307,13 +342,13 @@ impl SchemaCleanr {
                 ref_stack.insert(ref_value.to_string());
                 let cleaned = Self::clean_with_defs(definition.clone(), defs, strategy, ref_stack);
                 ref_stack.remove(ref_value);
-                return Self::preserve_meta(obj, cleaned);
+                return Self::preserve_meta(obj, cleaned, strategy);
             }
         }
 
         // Can't resolve: return empty object with metadata
         tracing::warn!("Cannot resolve $ref: {}", ref_value);
-        Self::preserve_meta(obj, Value::Object(Map::new()))
+        Self::preserve_meta(obj, Value::Object(Map::new()), strategy)
     }
 
     /// Parse a local JSON Pointer ref (#/$defs/Name).
@@ -385,12 +420,22 @@ impl SchemaCleanr {
 
         // If only one variant remains after stripping nulls, return it
         if non_null.len() == 1 {
-            return Some(Self::preserve_meta(obj, non_null[0].clone()));
+            return Some(Self::preserve_meta(obj, non_null[0].clone(), strategy));
         }
 
         // Try to flatten to enum if all variants are literals
         if let Some(enum_value) = Self::try_flatten_literal_union(&non_null) {
-            return Some(Self::preserve_meta(obj, enum_value));
+            return Some(Self::preserve_meta(obj, enum_value, strategy));
+        }
+
+        // Gemini does not support anyOf/oneOf at all — pick the first non-null
+        // candidate or fall back to a plain string type.
+        if strategy == CleaningStrategy::Gemini {
+            let result = non_null
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| json!({"type": "string"}));
+            return Some(Self::preserve_meta(obj, result, strategy));
         }
 
         None
@@ -523,9 +568,19 @@ impl SchemaCleanr {
     }
 
     /// Preserve metadata (description, title, default) from source to target.
-    fn preserve_meta(source: &Map<String, Value>, mut target: Value) -> Value {
+    /// Strategy-aware: Gemini strips `default` since it rejects that keyword.
+    fn preserve_meta(
+        source: &Map<String, Value>,
+        mut target: Value,
+        strategy: CleaningStrategy,
+    ) -> Value {
         if let Value::Object(target_obj) = &mut target {
+            let unsupported: HashSet<&str> =
+                strategy.unsupported_keywords().iter().copied().collect();
             for &key in SCHEMA_META_KEYS {
+                if unsupported.contains(key) {
+                    continue;
+                }
                 if let Some(value) = source.get(key) {
                     target_obj.insert(key.to_string(), value.clone());
                 }
@@ -647,12 +702,17 @@ mod tests {
             }
         });
 
-        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+        let cleaned = SchemaCleanr::clean_for_gemini(schema.clone());
 
         assert_eq!(cleaned["type"], "string");
         assert_eq!(cleaned["description"], "User's name");
         assert_eq!(cleaned["title"], "Name Field");
-        assert_eq!(cleaned["default"], "Anonymous");
+        // Gemini strategy strips `default`
+        assert!(cleaned.get("default").is_none());
+
+        // OpenAI strategy preserves `default`
+        let cleaned_openai = SchemaCleanr::clean_for_openai(schema);
+        assert_eq!(cleaned_openai["default"], "Anonymous");
     }
 
     #[test]
@@ -791,7 +851,35 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_type_when_non_simplifiable_union_exists() {
+    fn test_skip_type_when_non_simplifiable_union_exists_openai() {
+        // OpenAI preserves non-simplifiable oneOf as-is
+        let schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "b": { "type": "number" }
+                    }
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_openai(schema);
+
+        assert!(cleaned.get("type").is_none());
+        assert!(cleaned.get("oneOf").is_some());
+    }
+
+    #[test]
+    fn test_gemini_picks_first_from_non_simplifiable_union() {
+        // Gemini does not support oneOf/anyOf — picks the first candidate
         let schema = json!({
             "type": "object",
             "oneOf": [
@@ -812,8 +900,140 @@ mod tests {
 
         let cleaned = SchemaCleanr::clean_for_gemini(schema);
 
-        assert!(cleaned.get("type").is_none());
-        assert!(cleaned.get("oneOf").is_some());
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("oneOf").is_none());
+        assert_eq!(cleaned["properties"]["a"]["type"], "string");
+    }
+
+    #[test]
+    fn test_gemini_removes_null_from_enum() {
+        let schema = json!({
+            "type": "string",
+            "enum": ["semantic", "adaptive", "least_loaded", null]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        let enum_values = cleaned["enum"].as_array().unwrap();
+        assert_eq!(enum_values.len(), 3);
+        assert!(!enum_values.contains(&Value::Null));
+        assert!(enum_values.contains(&json!("semantic")));
+    }
+
+    #[test]
+    fn test_gemini_object_requires_properties() {
+        let schema = json!({
+            "type": "object"
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert!(cleaned.get("properties").is_some());
+        assert!(cleaned["properties"].is_object());
+    }
+
+    #[test]
+    fn test_gemini_array_requires_items() {
+        let schema = json!({
+            "type": "array"
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert!(cleaned.get("items").is_some());
+        assert_eq!(cleaned["items"]["type"], "string");
+    }
+
+    #[test]
+    fn test_gemini_non_simplifiable_anyof_picks_first() {
+        let schema = json!({
+            "anyOf": [
+                {"type": "string"},
+                {"items": {"type": "string"}, "type": "array"}
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        // Should pick the first non-null candidate
+        assert_eq!(cleaned["type"], "string");
+        assert!(cleaned.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_gemini_removes_default_keyword() {
+        let schema = json!({
+            "type": "string",
+            "default": "get",
+            "description": "HTTP method"
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "string");
+        assert_eq!(cleaned["description"], "HTTP method");
+        assert!(cleaned.get("default").is_none());
+    }
+
+    #[test]
+    fn test_gemini_removes_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string"}
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert!(cleaned.get("additionalProperties").is_none());
+        assert_eq!(cleaned["properties"]["name"]["type"], "string");
+    }
+
+    #[test]
+    fn test_gemini_full_tool_schema_sanitization() {
+        // Simulates a real ZeroClaw tool schema with multiple Gemini-incompatible constructs
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "strategy": {
+                    "type": ["string", "null"],
+                    "enum": ["semantic", "adaptive", "least_loaded", null],
+                    "default": "semantic"
+                },
+                "targets": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"items": {"type": "string"}, "type": "array"}
+                    ]
+                },
+                "config": {
+                    "type": "object"
+                }
+            },
+            "required": ["strategy"]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        // additionalProperties removed
+        assert!(cleaned.get("additionalProperties").is_none());
+        // nullable type array simplified
+        assert_eq!(cleaned["properties"]["strategy"]["type"], "string");
+        // null removed from enum
+        let enum_values = cleaned["properties"]["strategy"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(!enum_values.contains(&Value::Null));
+        assert_eq!(enum_values.len(), 3);
+        // default removed
+        assert!(cleaned["properties"]["strategy"].get("default").is_none());
+        // anyOf simplified to first candidate
+        assert_eq!(cleaned["properties"]["targets"]["type"], "string");
+        // empty object gets placeholder properties
+        assert!(cleaned["properties"]["config"].get("properties").is_some());
     }
 
     #[test]
