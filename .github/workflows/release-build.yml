@@ -1,0 +1,103 @@
+name: Production Release Build
+
+on:
+    push:
+        branches: ["main"]
+        tags: ["v*"]
+    workflow_dispatch:
+
+concurrency:
+    group: production-release-build-${{ github.ref || github.run_id }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+    CARGO_TERM_COLOR: always
+
+jobs:
+    build-and-test:
+        name: Build and Test (Linux x86_64)
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 120
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: rustfmt, clippy
+
+            - name: Ensure C toolchain for Rust builds
+              shell: bash
+              run: ./scripts/ci/ensure_cc.sh
+
+            - name: Ensure cargo component
+              shell: bash
+              env:
+                  ENSURE_CARGO_COMPONENT_STRICT: "true"
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+
+            - name: Ensure rustfmt and clippy components
+              shell: bash
+              run: rustup component add rustfmt clippy --toolchain 1.92.0
+
+            - name: Activate toolchain binaries on PATH
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  toolchain_bin="$(dirname "$(rustup which --toolchain 1.92.0 cargo)")"
+                  echo "$toolchain_bin" >> "$GITHUB_PATH"
+
+            - name: Cache Cargo registry and target
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: production-release-build
+                  shared-key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+                  cache-targets: true
+                  cache-bin: false
+
+            - name: Rust quality gates
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cargo fmt --all -- --check
+                  cargo clippy --locked --all-targets -- -D warnings
+                  cargo test --locked --verbose
+
+            - name: Build production binary (canonical)
+              shell: bash
+              run: cargo build --release --locked
+
+            - name: Prepare artifact bundle
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  cp target/release/zeroclaw artifacts/zeroclaw
+                  sha256sum artifacts/zeroclaw > artifacts/zeroclaw.sha256
+
+            - name: Upload production artifact
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: zeroclaw-linux-amd64
+                  path: |
+                      artifacts/zeroclaw
+                      artifacts/zeroclaw.sha256
+                  if-no-files-found: error
+                  retention-days: 21
