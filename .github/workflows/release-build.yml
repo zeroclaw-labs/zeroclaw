@@ -53,6 +53,10 @@ jobs:
                   ENSURE_CARGO_COMPONENT_STRICT: "true"
               run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
 
+            - name: Ensure rustfmt and clippy components
+              shell: bash
+              run: rustup component add rustfmt clippy --toolchain 1.92.0
+
             - name: Cache Cargo registry and target
               uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
