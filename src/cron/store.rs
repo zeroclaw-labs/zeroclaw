@@ -648,12 +648,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let job = add_job(&config, "* * * * *", "echo due").unwrap();
+        let now = Utc::now();
+        let scheduled_at = now + ChronoDuration::minutes(1);
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::At { at: scheduled_at },
+            "echo due",
+        )
+        .unwrap();
 
-        let due_now = due_jobs(&config, Utc::now()).unwrap();
+        let due_now = due_jobs(&config, now).unwrap();
         assert!(due_now.is_empty(), "new job should not be due immediately");
 
-        let far_future = Utc::now() + ChronoDuration::days(365);
+        let far_future = scheduled_at + ChronoDuration::seconds(1);
         let due_future = due_jobs(&config, far_future).unwrap();
         assert_eq!(due_future.len(), 1, "job should be due in far future");
 
