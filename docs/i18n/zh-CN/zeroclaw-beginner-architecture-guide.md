@@ -1,345 +1,541 @@
-# ZeroClaw 初学者功能、架构与原理解析
+# ZeroClaw 初学者详细教程：功能、架构、原理与改造实战
 
-> 目标读者：第一次接触 ZeroClaw，希望后续能做二次开发与架构改造的同学。
+> 面向人群：第一次接触 ZeroClaw，目标是从“能用”走到“能改”。
+> 
+> 教程目标：帮你建立完整心智模型，并给出可直接执行的学习与改造路径。
+
+---
+
+## 0. 如何使用本教程
+
+建议按“读一节、做一节”的节奏推进，不要一次性读完。
+
+- **阶段 A（理解）**：第 1~5 章，建立总体认知。
+- **阶段 B（上手）**：第 6~9 章，跑通并定位核心代码。
+- **阶段 C（改造）**：第 10~14 章，做一次安全可回滚的扩展。
+
+你可以把这份文档当作“主导航页”，配合以下参考文档：
+
+- 命令参考：`docs/commands-reference.md`
+- 配置参考：`docs/config-reference.md`
+- Provider 参考：`docs/providers-reference.md`
+- Channel 参考：`docs/channels-reference.md`
+- 运维手册：`docs/operations-runbook.md`
+
+---
 
 ## 1. 项目定位（一句话）
 
-ZeroClaw 是一个 **Rust 实现、Trait 驱动、可插拔的智能体运行时框架**：把模型（Provider）、通信入口（Channel）、能力（Tool）、记忆（Memory）、执行环境（Runtime）拆成稳定接口，再通过工厂组装成可运行的 Agent。
+ZeroClaw 是一个 **Trait 驱动 + 工厂组装 + 安全默认收敛** 的 Rust 智能体运行时。
 
-核心入口与总路由：
+你可以把它理解成：
+
+- `Provider` = 大模型接入层
+- `Channel` = 消息入口/出口
+- `Tool` = 行动能力（读写文件、shell、web、硬件等）
+- `Memory` = 长短期记忆
+- `RuntimeAdapter` = 运行环境能力边界
+- `Agent loop` = 统一调度中枢
+
+关键入口：
 
 - CLI 入口：`src/main.rs`
-- 模块导出：`src/lib.rs`
+- 核心导出：`src/lib.rs`
 - 配置契约：`src/config/schema.rs`
 
 ---
 
-## 2. 这个项目“能做什么”（功能视角）
+## 2. 项目核心功能地图（先知道“它能做什么”）
 
-从使用者视角，ZeroClaw 主要提供以下能力：
+### 2.1 运行形态
 
-### 2.1 Agent 运行与编排
+- 命令行交互：`zeroclaw agent`
+- HTTP 网关：`zeroclaw gateway`
+- 守护进程：`zeroclaw daemon`
+- 服务化：`zeroclaw service ...`
 
-- 交互式对话与单轮问答（`zeroclaw agent`）
-- 工具调用循环（LLM -> tool call -> 执行 -> 回灌 -> 继续推理）
-- 多智能体委派 / 子智能体并发（delegate / subagent）
+### 2.2 功能面
 
-参考：`docs/commands-reference.md`、`src/agent/loop_.rs`
+- 多模型统一接入（OpenAI/Anthropic/Gemini/Ollama/...）
+- 多渠道消息输入输出（Telegram/Discord/Slack/...）
+- 工具调用闭环（模型决策 + 工具执行 + 结果回灌）
+- 可切换记忆后端（sqlite/markdown/postgres/qdrant/none）
+- 可观测与可靠性（事件、指标、重试、回退、循环检测）
+- 安全策略（权限、自主等级、审批、路径约束、风险控制）
 
-### 2.2 多模型 Provider 抽象
-
-- 支持 OpenAI / Anthropic / Gemini / Ollama / OpenRouter / Bedrock 等
-- Provider 可路由、可重试、可回退（resilient / routed provider）
-- 统一消息与停止原因归一化（stop reason normalization）
-
-参考：`src/providers/mod.rs`、`src/providers/traits.rs`、`docs/providers-reference.md`
-
-### 2.3 多渠道 Channel 接入
-
-- CLI、Telegram、Discord、Slack、Mattermost、Matrix、Email、IRC 等
-- 每个渠道统一 `send/listen/health_check` 契约
-- 支持草稿更新、线程回复、审批提示等渠道语义
-
-参考：`src/channels/mod.rs`、`src/channels/traits.rs`、`docs/channels-reference.md`
-
-### 2.4 工具系统（Tool Surface）
-
-- 文件、Shell、Web、Browser、MCP、Cron、Memory、硬件等能力封装为 Tool
-- LLM 通过 JSON Schema 感知可调用函数
-- Tool 结果统一为 `ToolResult`
-
-参考：`src/tools/traits.rs`、`src/tools/mod.rs`、`src/tools/*.rs`
-
-### 2.5 记忆系统（Memory）
-
-- 支持 sqlite / lucid / markdown / postgres / qdrant / none 等后端
-- 统一 `store/recall/get/list/forget` 接口
-- 支持向量与混合检索相关能力
-
-参考：`src/memory/traits.rs`、`src/memory/mod.rs`、`docs/config-reference.md`
-
-### 2.6 网关、守护与运维
-
-- `gateway` 提供 webhook / SSE / WS / OpenAI 兼容接口
-- `daemon` 管理长运行模式
-- `doctor/status/service` 支持诊断与服务化运行
-
-参考：`src/gateway/`、`src/daemon/`、`docs/operations-runbook.md`
-
-### 2.7 安全与治理
-
-- 自主等级（read_only / supervised / full）
-- 命令风险分级、路径约束、审批机制、敏感路径防护
-- OTP、审计、紧急停止（estop）等安全机制
-
-参考：`src/security/policy.rs`、`src/security/`、`docs/security/README.md`
-
-### 2.8 硬件与外设（Peripheral）
-
-- 通过 Peripheral trait 将 MCU/SBC 能力暴露为 Tool
-- 支持串口/桥接/特定板卡能力扩展
-
-参考：`src/peripherals/traits.rs`、`src/peripherals/mod.rs`、`docs/hardware-peripherals-design.md`
+你看到的“功能很多”，本质来自同一个设计：**统一 trait + 模块化实现 + 配置驱动组装**。
 
 ---
 
-## 3. 架构总览（模块分层）
+## 3. 架构总览：四层模型（必须掌握）
 
-可将项目理解为四层：
+### 3.1 四层分解
 
-1. **接口层（Trait Contracts）**
-   - `Provider`、`Channel`、`Tool`、`Memory`、`Observer`、`RuntimeAdapter`、`Peripheral`
-2. **实现层（Concrete Implementations）**
-   - 各 provider/channel/tool/memory/runtime/peripheral 的具体实现
+1. **接口层（Contracts）**
+   - 代码：`src/*/traits.rs`
+   - 作用：定义稳定能力边界。
+2. **实现层（Implementations）**
+   - 代码：`src/providers/*.rs`、`src/channels/*.rs`、`src/tools/*.rs` 等
+   - 作用：每个具体平台/能力的实现细节。
 3. **组装层（Factory + Config Wiring）**
-   - 依据配置创建对应实现并注入 Agent
-4. **编排层（Agent Loop + Gateway/Daemon）**
-   - 驱动完整运行时生命周期与外部接入
+   - 代码：`src/providers/mod.rs`、`src/memory/mod.rs`、`src/channels/mod.rs`、`src/tools/mod.rs`
+   - 作用：按配置创建并组合实现。
+4. **编排层（Orchestration）**
+   - 代码：`src/agent/loop_.rs`、`src/daemon/`、`src/gateway/`
+   - 作用：驱动运行时生命周期。
 
-目录到功能的映射（重点）：
+### 3.2 目录到职责速查
 
-- `src/agent/`：智能体主循环、提示词组装、工具调度
-- `src/providers/`：模型提供方抽象与路由
-- `src/channels/`：消息渠道适配
-- `src/tools/`：工具执行面
-- `src/memory/`：记忆后端与检索
-- `src/security/`：策略与防护
-- `src/runtime/`：执行环境适配
-- `src/observability/`：可观测性事件与指标
-- `src/gateway/`：HTTP/Webhook/SSE/WS 网关
+- `src/agent/`：对话编排、工具循环、提示词构造、调度
+- `src/providers/`：模型协议适配、路由、可靠性封装
+- `src/channels/`：平台消息协议适配
+- `src/tools/`：工具定义与执行
+- `src/memory/`：记忆读写、检索与后端抽象
+- `src/security/`：策略、权限、审计、防护
+- `src/runtime/`：执行环境能力声明（shell/fs/long-running）
+- `src/observability/`：事件、指标、日志/otel/prometheus
+- `src/gateway/`：webhook/SSE/WS/OpenAI 兼容入口
+- `src/peripherals/`：硬件板卡能力接入
 
 ---
 
-## 4. 核心设计原理（为什么这么设计）
+## 4. 关键设计原理（理解“为什么这样做”）
 
-### 4.1 Trait 驱动：把“变化”隔离到边界
+### 4.1 Trait-first：稳定边界优先
 
-项目把最容易变化的部分（模型、渠道、工具、存储、运行环境）都抽象成 Trait。
+优势：
 
-好处：
+- 新能力通常不需要改主循环
+- 可以替换实现而不破坏调用方
+- 便于单测与模拟（mock）
 
-- 新增能力通常只需“实现 trait + 工厂注册”
-- 主流程（Agent loop）保持稳定
-- 易于测试（可注入 mock 实现）
+典型路径：**新增能力 = 实现 trait + 在 `mod.rs` 工厂注册**。
 
-### 4.2 工厂装配：运行时按配置拼装能力
+### 4.2 配置即行为
 
-- `providers/mod.rs` 负责 provider 创建、路由与可靠性包装
-- `memory/mod.rs` 根据 backend 类型构造具体存储
-- channels/tools/peripherals 采用同类模式
+`src/config/schema.rs` 是运行契约：
 
-这让 ZeroClaw 从“固定应用”变成“可配置运行时”。
+- 改配置，运行行为即变化
+- CLI / daemon / gateway 共享同一套配置语义
+- 配置字段要当“公开 API”维护
 
-### 4.3 编排优先：Agent loop 是真正中枢
+### 4.3 编排中枢最小化
 
-`src/agent/loop_.rs` 的主循环控制：
+`src/agent/loop_.rs` 目标是保持“流程稳定、逻辑明确”：
 
-- 发送模型请求
-- 解析 tool call
-- 执行工具（支持并行）
-- 将工具结果回灌模型
-- 检测死循环并中断
-- 达到终态后返回最终文本
+- 发送请求
+- 解析工具调用
+- 执行工具
+- 回灌结果
+- 检查停止条件
 
-这就是项目“智能体行为”的核心原理。
+复杂性尽量下沉到 provider/tool/channel 的具体实现中。
 
-### 4.4 安全默认收敛
+### 4.4 默认安全保守
 
-从策略实现看，默认是可控且保守的：
+`src/security/policy.rs` 展示了安全默认值：
 
-- 默认 `supervised` 自主等级
+- 默认 `supervised`
 - 高风险命令可阻断
-- 文件路径与命令白名单/上下文规则约束
-- 关键动作审批与频率限制
+- 路径访问可限制
+- 可要求审批
 
-这使其更适合真实环境中的长期运行。
-
----
-
-## 5. 运行原理（从一条消息到最终回复）
-
-以下是简化执行链路：
-
-1. **输入进入系统**
-   - 可能来自 CLI、Channel、Gateway
-2. **构建上下文**
-   - 加载配置、记忆、系统提示词、可用工具规格
-3. **调用 Provider**
-   - 发送消息列表和工具 schema
-4. **模型返回**
-   - 可能是文本、可能是一个或多个 tool calls
-5. **工具调度执行**
-   - 分派到对应 Tool 实现，收集 `ToolResult`
-6. **结果回灌模型继续推理**
-   - 直到模型返回最终答案或达到安全/迭代边界
-7. **输出与落盘**
-   - 返回渠道；必要时写入 memory 与观测数据
-
-可把它理解为“LLM 计划 -> Tool 执行 -> LLM 反思”的闭环。
+这决定了 ZeroClaw 更偏“可控生产运行”，而不是“无约束黑盒代理”。
 
 ---
 
-## 6. 关键接口速览（改造时最先看）
+## 5. 运行原理（从一条输入到一条输出）
 
-### 6.1 Provider
+下面是一次完整 turn 的简化时序：
 
-文件：`src/providers/traits.rs`
+1. **输入接入**：来自 CLI 或 channel/gateway。
+2. **上下文构建**：系统提示词 + 历史 + 记忆 + 可用工具 schema。
+3. **Provider 请求**：发送统一消息结构给模型。
+4. **模型响应判定**：
+   - 直接文本 -> 结束
+   - tool calls -> 进入执行
+5. **工具执行**：串行/并行执行工具，汇总 `ToolResult`。
+6. **结果回灌**：把 tool 输出作为后续上下文继续请求模型。
+7. **循环控制**：迭代上限、循环检测、异常处理。
+8. **输出下发与记录**：发送至 channel，写入 memory，记录 observability。
 
-重点关注：
+关键代码：`src/agent/loop_.rs`。
 
-- 消息结构：`ChatMessage`
+---
+
+## 6. 七大核心 Trait 教程式解读
+
+> 这一章是“改造前必读”。
+
+### 6.1 `Provider`（`src/providers/traits.rs`）
+
+你要关注 4 件事：
+
+- 输入模型：`ChatMessage` / `ChatRequest`
+- 输出模型：`ChatResponse`
 - 工具调用：`ToolCall`
-- 响应结构：`ChatResponse`（含文本、工具调用、token 使用、stop reason）
+- 停止原因归一：`NormalizedStopReason`
 
-### 6.2 Channel
+理解要点：
 
-文件：`src/channels/traits.rs`
+- Provider 不是“只返回文本”，它可能驱动工具调用。
+- 如果你新增 provider，必须保证工具调用语义与 stop reason 兼容主循环。
 
-重点关注：
+### 6.2 `Channel`（`src/channels/traits.rs`）
 
-- `send` / `listen` / `health_check`
-- 草稿更新与线程语义（draft/thread）
-- 审批提示发送 `send_approval_prompt`
+关键方法：
 
-### 6.3 Tool
+- `send`
+- `listen`
+- `health_check`
+- `send_approval_prompt`（默认有降级实现）
 
-文件：`src/tools/traits.rs`
+理解要点：
 
-重点关注：
+- `listen` 是长运行输入流。
+- 不同平台差异（thread、draft、typing）在 channel 内部吸收。
 
-- `parameters_schema()`：给 LLM 的 JSON Schema
-- `execute(args)`：真正执行动作
-- `ToolResult`：统一结果封装
+### 6.3 `Tool`（`src/tools/traits.rs`）
 
-### 6.4 Memory
+关键方法：
 
-文件：`src/memory/traits.rs`
+- `parameters_schema()`：告诉模型参数结构
+- `execute(args)`：真正动作执行
+- `spec()`：统一生成工具声明
 
-重点关注：
+理解要点：
 
-- `store` / `recall` / `forget`
-- `MemoryCategory` 与 session 作用域
+- Tool 是“行动原子能力”。
+- 参数 schema 质量直接影响模型调用正确率。
 
-### 6.5 RuntimeAdapter
+### 6.4 `Memory`（`src/memory/traits.rs`）
 
-文件：`src/runtime/traits.rs`
+关键方法：
 
-重点关注：
+- `store` / `recall` / `get` / `list` / `forget`
 
-- `has_shell_access` / `has_filesystem_access`
+理解要点：
+
+- 记忆分类是行为语义，不只是存储字段。
+- 后端替换应保持接口一致，避免上层感知差异。
+
+### 6.5 `Observer`（`src/observability/traits.rs`）
+
+关键对象：
+
+- `ObserverEvent`
+- `ObserverMetric`
+
+理解要点：
+
+- 可观测是运行时稳定性的“神经系统”。
+- 上报时要避免泄露敏感内容。
+
+### 6.6 `RuntimeAdapter`（`src/runtime/traits.rs`）
+
+关键能力：
+
+- `has_shell_access`
+- `has_filesystem_access`
 - `supports_long_running`
 - `build_shell_command`
 
-这决定了同一套 Agent 在不同运行环境中的能力边界。
+理解要点：
+
+- RuntimeAdapter 决定“这台环境能做什么”。
+- 对工具能力开关有直接影响。
+
+### 6.7 `Peripheral`（`src/peripherals/traits.rs`）
+
+关键方法：
+
+- `connect` / `disconnect` / `health_check`
+- `tools()`
+
+理解要点：
+
+- 硬件能力通过工具暴露给 agent。
+- 外设属于可插拔行动层，不应污染主流程。
 
 ---
 
-## 7. 可观测性与可靠性机制
+## 7. 从 CLI 命令理解系统（最实用）
 
-可观测性：
+### 7.1 新手最小命令集
 
-- 统一事件模型：`ObserverEvent`
-- 统一指标模型：`ObserverMetric`
-- 可接入日志、Prometheus、OpenTelemetry 等后端
+```bash
+zeroclaw onboard
+zeroclaw status
+zeroclaw doctor
+zeroclaw agent
+```
 
-可靠性：
+用途：
 
-- Provider 层重试/回退
-- 工具循环迭代上限
-- 循环检测（无进展、ping-pong、失败连击）
+- `onboard`：初始化配置
+- `status`：看当前运行配置摘要
+- `doctor`：看系统健康
+- `agent`：进入核心对话循环
 
-参考：`src/observability/traits.rs`、`src/providers/reliable.rs`、`src/agent/loop_.rs`
+### 7.2 运维常用命令集
 
----
+```bash
+zeroclaw channel list
+zeroclaw channel doctor
+zeroclaw gateway
+zeroclaw daemon
+zeroclaw service status
+```
 
-## 8. 初学者“改造入口”建议（按收益排序）
-
-### 8.1 最容易上手：新增 Tool
-
-适合练习：
-
-1. 在 `src/tools/` 新建一个工具实现 `Tool`
-2. 在工具注册流程中挂载
-3. 用本地 CLI 测试工具调用链
-
-价值：最快理解 LLM 与执行系统如何联动。
-
-### 8.2 中等难度：新增 Provider 或 Channel
-
-- Provider：实现 `Provider` trait + 工厂注册
-- Channel：实现 `Channel` trait + 监听与发送语义对齐
-
-价值：理解抽象边界与协议差异处理。
-
-### 8.3 进阶改造：Memory / Runtime / Security
-
-- Memory：新后端接入（如专用向量库）
-- Runtime：新执行环境能力声明
-- Security：策略增强与审批流改造
-
-价值：影响系统级行为，但风险更高，需要更完整测试策略。
+建议先在本地前台跑通，再转 service。
 
 ---
 
-## 9. 推荐学习路径（7 天版本）
+## 8. 配置驱动实战：哪些字段最关键
 
-### Day 1：先跑通
+先阅读：`docs/config-reference.md` + `src/config/schema.rs`。
 
-- 阅读：`README.md`
-- 执行：`zeroclaw onboard`、`zeroclaw agent`
+### 8.1 你必须先理解的配置域
 
-### Day 2：看契约
+- Provider：默认模型/地址/鉴权
+- Agent：工具迭代上限、循环检测
+- Security：autonomy、审批、风险控制
+- Memory：后端类型和连接参数
+- Channel：平台 token、allowlist、回复策略
+- Runtime：执行环境能力
 
-- 阅读所有 `*/traits.rs`
-- 目标：搞清每个子系统“最小接口”
+### 8.2 配置改造原则
 
-### Day 3：看主循环
-
-- 重点阅读：`src/agent/loop_.rs`
-- 目标：理解一次 turn 如何闭环
-
-### Day 4：看配置驱动
-
-- 阅读：`src/config/schema.rs` 与 `docs/config-reference.md`
-- 目标：理解“配置就是运行时契约”
-
-### Day 5：看安全边界
-
-- 阅读：`src/security/policy.rs`、`docs/security/README.md`
-- 目标：知道哪些动作会被限制/审批
-
-### Day 6：做一个小改造
-
-- 新增简单 Tool（只读型最佳）
-- 让 Agent 成功调用并返回结果
-
-### Day 7：复盘与重构计划
-
-- 写下改造目标、影响模块、回滚方案
-- 再进入较大改造（Provider/Memory/Runtime）
+- 一次只改一个逻辑点
+- 先 `status` 再 `doctor`
+- 对高风险配置（security/runtime/gateway）先准备回滚方案
 
 ---
 
-## 10. 改造前检查清单（实用）
+## 9. 安全模型教程（必须单独学习）
 
-- 是否优先采用“实现 Trait + 工厂注册”，而不是改主流程？
-- 是否触及高风险目录（`security/`、`runtime/`、`gateway/`、`tools/`）？
-- 是否明确了配置兼容性与迁移策略？
-- 是否有最小可回滚变更单元？
-- 是否有对应验证命令（fmt/clippy/test 或子集）？
+重点文件：`src/security/policy.rs`。
+
+### 9.1 自主等级心智模型
+
+- `read_only`：观察优先
+- `supervised`：默认，危险动作可要求审批
+- `full`：策略边界内自动执行
+
+### 9.2 安全边界常见项
+
+- 命令允许列表与上下文规则
+- 禁止路径与工作区约束
+- 敏感读写限制
+- 动作频率限制
+
+### 9.3 新手常见误区
+
+- 误以为“工具可用 = 一定能执行”
+- 忽略运行时与安全策略的双重限制
+- 在未评估风险前直接提高 autonomy
 
 ---
 
-## 11. 总结
+## 10. 改造实战 A：新增一个最小 Tool（推荐第一练）
 
-如果你把 ZeroClaw 看成“可插拔智能体操作系统”，会更容易理解它：
+> 目标：在不触碰高风险模块的情况下，完成一次完整扩展。
 
-- Trait 是内核接口
-- Factory 是装配器
-- Agent loop 是调度器
-- Provider/Tool/Channel/Memory 是可替换外设
-- Security/Runtime/Observability 是稳定运行的护栏
+### 10.1 设计目标
 
-对初学者最稳的改造策略是：
+实现一个只读工具，例如 `workspace_summary`：
 
-**先从 Tool 扩展入手 -> 再做 Provider/Channel 适配 -> 最后再碰 Runtime/Security 这类系统级改造。**
+- 输入：可选目录
+- 输出：目录下文件数量、Rust 文件数量
+- 风险：低（只读）
+
+### 10.2 实现步骤
+
+1. 在 `src/tools/` 增加工具文件，实现 `Tool` trait。
+2. 定义清晰的 `parameters_schema()`。
+3. 在工具注册流程中挂载（查看 `src/tools/mod.rs` 现有模式）。
+4. 通过 `zeroclaw agent` 触发工具调用路径验证。
+
+### 10.3 验证清单
+
+- 参数缺失/类型错误时，是否返回显式错误？
+- 输出是否结构化且可读？
+- 不应写文件、不应越权读敏感路径。
+
+---
+
+## 11. 改造实战 B：新增 Provider（中阶）
+
+> 目标：理解“协议适配 + 工厂注册 + 失败路径”的标准流程。
+
+### 11.1 实现清单
+
+1. 新建 `src/providers/<name>.rs`。
+2. 实现 `Provider` trait。
+3. 在 `src/providers/mod.rs` 的创建流程注册 key。
+4. 对 stop reason/tool call 做兼容映射。
+
+### 11.2 高风险点
+
+- API 错误格式不统一导致解析失败
+- 工具调用字段兼容问题
+- 未处理超时、429、重试退避
+
+建议先做最小功能，再做可靠性增强。
+
+---
+
+## 12. 改造实战 C：新增 Channel（中阶）
+
+### 12.1 最小可运行要求
+
+- `listen` 能稳定产出 `ChannelMessage`
+- `send` 能输出回复
+- `health_check` 能反映真实可用性
+
+### 12.2 平台差异注意点
+
+- 线程消息语义（thread）
+- webhook 与轮询模式差异
+- allowlist 与 mention 触发策略
+
+参考：`docs/channels-reference.md`、`src/channels/traits.rs`
+
+---
+
+## 13. 可靠性与可观测：把“能跑”变成“稳定跑”
+
+### 13.1 可靠性关键机制
+
+- Provider 重试与回退（`src/providers/reliable.rs`）
+- 工具循环迭代上限（`src/agent/loop_.rs`）
+- 循环检测（无进展 / ping-pong / 失败连击）
+
+### 13.2 可观测关键机制
+
+- 事件：`ObserverEvent`
+- 指标：`ObserverMetric`
+
+实践建议：
+
+- 新增功能时，至少保证错误可定位（组件、原因、上下文摘要）。
+- 日志里不要带敏感 token 或原始秘密数据。
+
+---
+
+## 14. 推荐学习计划（升级版 14 天）
+
+### 第 1~3 天：建立基础
+
+- 跑通 `onboard/status/doctor/agent`
+- 阅读 `README.md`、`docs/commands-reference.md`
+
+### 第 4~6 天：读架构与契约
+
+- 读 `src/*/traits.rs`
+- 读 `src/agent/loop_.rs`
+- 画出你自己的“消息流图”
+
+### 第 7~9 天：做第一个扩展
+
+- 新增一个只读 tool
+- 完整验证异常路径
+
+### 第 10~12 天：读安全与运维
+
+- 读 `src/security/policy.rs`
+- 读 `docs/operations-runbook.md`
+- 用守护模式试跑
+
+### 第 13~14 天：准备中阶改造
+
+- 在 Provider 或 Channel 里选择一个扩展方向
+- 写下设计、风险、回滚、验证计划
+
+---
+
+## 15. 改造前后检查单（可复制）
+
+### 15.1 改造前
+
+- 我修改的是哪一层？（trait / impl / factory / orchestration）
+- 是否可通过“新增实现 + 注册”完成，而非重写核心？
+- 是否涉及高风险目录（`security/`、`runtime/`、`gateway/`、`tools/`）？
+
+### 15.2 改造后
+
+- 命令行为是否与文档一致？
+- 异常路径是否显式报错？
+- 默认配置是否仍然安全？
+- 是否容易回滚（单一责任、最小改动）？
+
+---
+
+## 16. 常见问题（FAQ）
+
+### Q1：为什么我加了 Tool，模型却不调用？
+
+先检查：
+
+- `parameters_schema()` 是否可被模型理解
+- 工具描述是否过于模糊
+- 工具是否真的注册到了运行时（检查初始化路径）
+
+### Q2：为什么 channel 配好了但没响应？
+
+先跑：
+
+- `zeroclaw channel doctor`
+- 检查 allowlist 是否放行
+- 检查 webhook/polling 模式与 token 是否匹配
+
+### Q3：为什么工具循环提前停止？
+
+可能原因：
+
+- 达到 `max_tool_iterations`
+- 触发 loop detection
+- 某工具连续失败导致模型无法推进
+
+排查入口：`src/agent/loop_.rs` + 相关日志。
+
+---
+
+## 17. 你下一步最该做什么
+
+如果你现在是初学者，建议立刻做这三件事：
+
+1. 用 `zeroclaw agent` 跑一个真实任务，观察是否触发工具调用。
+2. 打开 `src/agent/loop_.rs`，按本教程第 5 章对照阅读一遍。
+3. 做一次“只读 tool 扩展”练习（第 10 章）。
+
+完成这三步后，你就从“会用 ZeroClaw”进入“能改 ZeroClaw”的阶段了。
+
+---
+
+## 18. 附录：高价值源码阅读清单
+
+按优先级排序：
+
+1. `src/agent/loop_.rs`
+2. `src/providers/traits.rs`
+3. `src/tools/traits.rs`
+4. `src/channels/traits.rs`
+5. `src/memory/traits.rs`
+6. `src/runtime/traits.rs`
+7. `src/security/policy.rs`
+8. `src/providers/mod.rs`
+9. `src/tools/mod.rs`
+10. `src/config/schema.rs`
+
+---
+
+### 结语
+
+ZeroClaw 的学习曲线看似陡峭，实则非常工程化：
+
+- 先掌握 trait 契约
+- 再理解工厂注册
+- 最后进入编排和安全边界
+
+只要坚持“最小变更 + 明确验证 + 可回滚”，你会很快具备稳定改造这个项目的能力。
