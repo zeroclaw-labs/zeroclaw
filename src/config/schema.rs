@@ -11236,6 +11236,33 @@ channel_id = "C123"
     }
 
     #[test]
+    async fn channels_slack_group_reply_toml_nested_table_deserializes() {
+        let toml_str = r#"
+cli = true
+
+[slack]
+bot_token = "xoxb-tok"
+app_token = "xapp-tok"
+channel_id = "C123"
+allowed_users = ["*"]
+
+[slack.group_reply]
+mode = "mention_only"
+allowed_sender_ids = ["U111", "U222"]
+"#;
+        let parsed: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        let slack = parsed.slack.expect("slack config should exist");
+        assert_eq!(
+            slack.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            slack.group_reply_allowed_sender_ids(),
+            vec!["U111".to_string(), "U222".to_string()]
+        );
+    }
+
+    #[test]
     async fn mattermost_group_reply_mode_falls_back_to_legacy_mention_only() {
         let json = r#"{
             "url":"https://mm.example.com",
