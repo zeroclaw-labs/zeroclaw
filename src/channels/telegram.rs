@@ -621,6 +621,32 @@ impl TelegramChannel {
             .contains(&Self::native_draft_key(chat_id, draft_id))
     }
 
+    fn consume_native_draft_finalize(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        message_id: &str,
+    ) -> bool {
+        if self.stream_mode != StreamMode::On || !Self::is_private_chat_target(chat_id, thread_id) {
+            return false;
+        }
+
+        match message_id.parse::<i64>() {
+            Ok(draft_id) if self.unregister_native_draft(chat_id, draft_id) => true,
+            // If the in-memory registry entry is missing, still treat the
+            // known native draft id as native so final content is delivered.
+            Ok(TELEGRAM_NATIVE_DRAFT_ID) => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    draft_id = TELEGRAM_NATIVE_DRAFT_ID,
+                    "Telegram native draft registry missing during finalize; sending final content directly"
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
     async fn send_message_draft(
         &self,
         chat_id: &str,
@@ -2996,7 +3022,14 @@ impl Channel for TelegramChannel {
                     .send_message_draft(&chat_id, parsed_draft_id, display_text)
                     .await
                 {
-                    tracing::debug!("Telegram sendMessageDraft update failed: {error}");
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        draft_id = parsed_draft_id,
+                        "Telegram sendMessageDraft update failed: {error}"
+                    );
+                    return Err(error).context(format!(
+                        "Telegram sendMessageDraft update failed for chat {chat_id} draft_id {parsed_draft_id}"
+                    ));
                 }
                 return Ok(None);
             }
@@ -3060,16 +3093,8 @@ impl Channel for TelegramChannel {
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
-        let is_native_draft = if self.stream_mode == StreamMode::On
-            && Self::is_private_chat_target(&chat_id, thread_id.as_deref())
-        {
-            message_id
-                .parse::<i64>()
-                .ok()
-                .is_some_and(|draft_id| self.unregister_native_draft(&chat_id, draft_id))
-        } else {
-            false
-        };
+        let is_native_draft =
+            self.consume_native_draft_finalize(&chat_id, thread_id.as_deref(), message_id);
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
@@ -3822,6 +3847,38 @@ mod tests {
             .update_draft("123", "not-a-number", &long_emoji_text)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_draft_native_failure_propagates_error() {
+        let ch = TelegramChannel::new("TEST_TOKEN".into(), vec!["*".into()], false, true)
+            .with_streaming(StreamMode::On, 0)
+            // Closed local port guarantees fast, deterministic connection failure.
+            .with_api_base("http://127.0.0.1:9".to_string());
+        ch.register_native_draft("12345", TELEGRAM_NATIVE_DRAFT_ID);
+
+        let err = ch
+            .update_draft("12345", "1", "stream update")
+            .await
+            .expect_err("native sendMessageDraft failure should propagate")
+            .to_string();
+        assert!(err.contains("sendMessageDraft update failed"));
+        assert!(ch.has_native_draft("12345", TELEGRAM_NATIVE_DRAFT_ID));
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_missing_native_registry_empty_text_succeeds() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
+            .with_streaming(StreamMode::On, 0)
+            .with_api_base("http://127.0.0.1:9".to_string());
+
+        assert!(!ch.has_native_draft("12345", TELEGRAM_NATIVE_DRAFT_ID));
+        let result = ch.finalize_draft("12345", "1", "").await;
+        assert!(
+            result.is_ok(),
+            "native finalize fallback should no-op: {result:?}"
+        );
+        assert!(!ch.has_native_draft("12345", TELEGRAM_NATIVE_DRAFT_ID));
     }
 
     #[tokio::test]

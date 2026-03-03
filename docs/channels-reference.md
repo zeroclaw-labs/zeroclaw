@@ -219,7 +219,7 @@ Telegram notes:
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
 - `ack_enabled = false` disables the emoji reaction (⚡️, 👌, 👀, 🔥, 👍) sent to incoming messages as acknowledgment.
-- `stream_mode = "on"` uses Telegram's native `sendMessageDraft` flow for private chats. Non-private chats automatically fall back to `partial`.
+- `stream_mode = "on"` uses Telegram's native `sendMessageDraft` flow for private chats. Non-private chats, or runtime `sendMessageDraft` API failures, automatically fall back to `partial`.
 
 ### 4.2 Discord
 
