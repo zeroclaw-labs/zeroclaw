@@ -7632,10 +7632,7 @@ impl Config {
         if let Some(bb) = &self.channels_config.bluebubbles {
             // Check for empty or whitespace-only list under Allowlist mode — both
             // conditions produce a silent deny-all at runtime, so we fail fast here.
-            let senders_empty = bb
-                .allowed_senders
-                .iter()
-                .all(|s| s.trim().is_empty());
+            let senders_empty = bb.allowed_senders.iter().all(|s| s.trim().is_empty());
             if bb.dm_policy == BlueBubblesDmPolicy::Allowlist
                 && (bb.allowed_senders.is_empty() || senders_empty)
             {
@@ -7643,10 +7640,7 @@ impl Config {
                     "channels_config.bluebubbles.dm_policy = \"allowlist\" requires at least one non-blank entry in allowed_senders"
                 );
             }
-            let group_empty = bb
-                .group_allow_from
-                .iter()
-                .all(|s| s.trim().is_empty());
+            let group_empty = bb.group_allow_from.iter().all(|s| s.trim().is_empty());
             if bb.group_policy == BlueBubblesGroupPolicy::Allowlist
                 && (bb.group_allow_from.is_empty() || group_empty)
             {
