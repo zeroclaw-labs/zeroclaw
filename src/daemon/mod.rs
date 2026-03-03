@@ -3,10 +3,15 @@ use anyhow::{bail, Result};
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+
+/// Grace period after shutdown signal before force-aborting component tasks.
+/// Allows in-flight requests and channel messages to complete.
+const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 15;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // Pre-flight: check if port is already in use by another zeroclaw daemon
@@ -25,6 +30,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         );
     }
 
+    // Shutdown signal: sender stays here, receivers go to supervisors
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -39,7 +47,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut handles: Vec<JoinHandle<()>> =
+        vec![spawn_state_writer(config.clone(), shutdown_rx.clone())];
 
     {
         let gateway_cfg = config.clone();
@@ -48,6 +57,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "gateway",
             initial_backoff,
             max_backoff,
+            shutdown_rx.clone(),
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
@@ -63,6 +73,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 "channels",
                 initial_backoff,
                 max_backoff,
+                shutdown_rx.clone(),
                 move || {
                     let cfg = channels_cfg.clone();
                     async move { Box::pin(crate::channels::start_channels(cfg)).await }
@@ -80,6 +91,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "heartbeat",
             initial_backoff,
             max_backoff,
+            shutdown_rx.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
                 async move { Box::pin(run_heartbeat_worker(cfg)).await }
@@ -93,6 +105,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "scheduler",
             initial_backoff,
             max_backoff,
+            shutdown_rx.clone(),
             move || {
                 let cfg = scheduler_cfg.clone();
                 async move { crate::cron::scheduler::run(cfg).await }
@@ -106,16 +119,59 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
-    println!("   Ctrl+C to stop");
+    #[cfg(unix)]
+    println!("   Send SIGINT (Ctrl+C) or SIGTERM to stop");
+    #[cfg(not(unix))]
+    println!("   Press Ctrl+C to stop");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
+    tracing::info!("Shutdown signal received, starting graceful shutdown");
     crate::health::mark_component_error("daemon", "shutdown requested");
 
-    for handle in &handles {
-        handle.abort();
+    // Signal all supervisors/state-writer to stop their loops
+    if shutdown_tx.send(true).is_err() {
+        tracing::warn!("Shutdown broadcast failed: no active component receivers");
     }
-    for handle in handles {
-        let _ = handle.await;
+
+    // Give components a grace period to finish in-flight work
+    tracing::info!(
+        "Waiting up to {SHUTDOWN_GRACE_PERIOD_SECS}s for components to finish in-flight work"
+    );
+    let grace_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_GRACE_PERIOD_SECS);
+    let mut remaining = handles;
+
+    // Poll until all handles finish or the deadline expires
+    loop {
+        let mut i = 0;
+        while i < remaining.len() {
+            if remaining[i].is_finished() {
+                let handle = remaining.swap_remove(i);
+                if let Err(e) = handle.await {
+                    tracing::error!("Component task panicked during shutdown: {e}");
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if remaining.is_empty() {
+            tracing::info!("All components stopped cleanly");
+            break;
+        }
+        if tokio::time::Instant::now() >= grace_deadline {
+            tracing::warn!(
+                "Grace period expired with {} components still running, aborting",
+                remaining.len()
+            );
+            for handle in &remaining {
+                handle.abort();
+            }
+            for handle in remaining {
+                let _ = handle.await;
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     Ok(())
@@ -129,7 +185,80 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
-fn spawn_state_writer(config: Config) -> JoinHandle<()> {
+/// Wait for either SIGINT (Ctrl+C) or SIGTERM (Kubernetes pod termination).
+///
+/// On Unix, listens for both signals concurrently and returns on whichever
+/// arrives first. On non-Unix platforms, falls back to SIGINT only.
+async fn wait_for_shutdown_signal() -> Result<()> {
+    wait_for_shutdown_signal_inner(None).await
+}
+
+/// Inner implementation that accepts an optional readiness notifier.
+///
+/// When `ready` is `Some`, the sender is fired once all signal handlers have
+/// been registered — this lets tests deterministically wait for handler
+/// installation instead of relying on timing-based sleeps.
+async fn wait_for_shutdown_signal_inner(
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("failed to register SIGTERM handler: {e}"))?;
+
+        // Signal that handlers are installed before blocking on signals.
+        if let Some(tx) = ready {
+            let _ = tx.send(());
+        }
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|e| anyhow::anyhow!("failed to listen for SIGINT: {e}"))?;
+                tracing::info!("Received SIGINT");
+            }
+            sig = sigterm.recv() => {
+                if sig.is_none() {
+                    anyhow::bail!("SIGTERM signal stream closed unexpectedly");
+                }
+                tracing::info!("Received SIGTERM");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Signal readiness before blocking (no extra handlers to register).
+        if let Some(tx) = ready {
+            let _ = tx.send(());
+        }
+
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to listen for Ctrl+C: {e}"))?;
+        tracing::info!("Received SIGINT");
+    }
+    Ok(())
+}
+
+async fn write_snapshot(path: &std::path::Path) {
+    let mut json = crate::health::snapshot_json();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "written_at".into(),
+            serde_json::json!(Utc::now().to_rfc3339()),
+        );
+    }
+    match serde_json::to_vec_pretty(&json) {
+        Ok(data) => {
+            if let Err(e) = tokio::fs::write(path, data).await {
+                tracing::warn!("Failed to write daemon state file {}: {e}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize daemon state snapshot: {e}"),
+    }
+}
+
+fn spawn_state_writer(config: Config, mut shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
@@ -138,16 +267,16 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
 
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
-            interval.tick().await;
-            let mut json = crate::health::snapshot_json();
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "written_at".into(),
-                    serde_json::json!(Utc::now().to_rfc3339()),
-                );
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("State writer stopping due to shutdown");
+                    write_snapshot(&path).await;
+                    break;
+                }
+                _ = interval.tick() => {
+                    write_snapshot(&path).await;
+                }
             }
-            let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-            let _ = tokio::fs::write(&path, data).await;
         }
     })
 }
@@ -156,6 +285,7 @@ fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    mut shutdown_rx: watch::Receiver<bool>,
     mut run_component: F,
 ) -> JoinHandle<()>
 where
@@ -167,24 +297,41 @@ where
         let max_backoff = max_backoff_secs.max(backoff);
 
         loop {
+            if *shutdown_rx.borrow() {
+                tracing::info!("Supervisor '{name}' stopping due to shutdown");
+                break;
+            }
             crate::health::mark_component_ok(name);
-            match run_component().await {
-                Ok(()) => {
-                    crate::health::mark_component_error(name, "component exited unexpectedly");
-                    tracing::warn!("Daemon component '{name}' exited unexpectedly");
-                    // Clean exit — reset backoff since the component ran successfully
-                    backoff = initial_backoff_secs.max(1);
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("Supervisor '{name}' stopping due to shutdown");
+                    break;
                 }
-                Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
-                    tracing::error!("Daemon component '{name}' failed: {e}");
+                result = run_component() => match result {
+                    Ok(()) => {
+                        crate::health::mark_component_error(name, "component exited unexpectedly");
+                        tracing::warn!("Daemon component '{name}' exited unexpectedly");
+                        // Clean exit — reset backoff since the component ran successfully
+                        backoff = initial_backoff_secs.max(1);
+                    }
+                    Err(e) => {
+                        crate::health::mark_component_error(name, e.to_string());
+                        tracing::error!("Daemon component '{name}' failed: {e}");
+                    }
                 }
             }
 
             crate::health::bump_component_restart(name);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            // Double backoff AFTER sleeping so first error uses initial_backoff
-            backoff = backoff.saturating_mul(2).min(max_backoff);
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("Supervisor '{name}' stopping during backoff due to shutdown");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {
+                    // Double backoff AFTER sleeping so first error uses initial_backoff
+                    backoff = backoff.saturating_mul(2).min(max_backoff);
+                }
+            }
         }
     })
 }
@@ -446,7 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
+        let (_tx, rx) = watch::channel(false);
+        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, rx, || async {
             anyhow::bail!("boom")
         });
 
@@ -466,7 +614,8 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
-        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, || async { Ok(()) });
+        let (_tx, rx) = watch::channel(false);
+        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, rx, || async { Ok(()) });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -719,5 +868,74 @@ mod tests {
 
         let err = heartbeat_delivery_target(&config).unwrap_err();
         assert!(err.to_string().contains("configured for cloud mode"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_shutdown_signal_responds_to_sigterm() {
+        use std::process;
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let handle = tokio::spawn(async {
+            wait_for_shutdown_signal_inner(Some(ready_tx))
+                .await
+                .unwrap();
+        });
+
+        // Wait until signal handlers are installed (deterministic, no sleep)
+        ready_rx
+            .await
+            .expect("ready channel dropped before signalling");
+
+        // Send SIGTERM to our own process
+        let pid = process::id();
+        let status = std::process::Command::new("kill")
+            .args(["-s", "TERM", &pid.to_string()])
+            .status()
+            .expect("failed to send SIGTERM");
+        assert!(status.success(), "kill exited unsuccessfully: {status}");
+
+        // Should return promptly
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("shutdown signal handler did not return in time");
+        assert!(result.is_ok(), "shutdown signal task panicked");
+    }
+
+    #[tokio::test]
+    async fn supervisor_stops_on_shutdown_signal() {
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_component_supervisor("daemon-test-shutdown", 1, 1, rx, || async {
+            // Simulate a long-running component
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        // Give the supervisor time to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send shutdown signal
+        let _ = tx.send(true);
+
+        // Supervisor should stop within a reasonable time (not 60s)
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("supervisor did not stop after shutdown signal");
+        assert!(result.is_ok(), "supervisor task panicked");
+    }
+
+    #[test]
+    fn shutdown_grace_period_is_reasonable() {
+        // Ensure the grace period is between 5 and 30 seconds
+        // (Kubernetes default terminationGracePeriodSeconds is 30)
+        assert!(
+            SHUTDOWN_GRACE_PERIOD_SECS >= 5,
+            "grace period too short for in-flight requests"
+        );
+        assert!(
+            SHUTDOWN_GRACE_PERIOD_SECS <= 30,
+            "grace period exceeds default Kubernetes terminationGracePeriodSeconds"
+        );
     }
 }
