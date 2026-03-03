@@ -37,7 +37,7 @@ impl Tunnel for PinggyTunnel {
             _ => "free.pinggy.io",
         };
         let server_host = match self.region.as_deref() {
-            Some(r) if !r.is_empty() => format!("{r}.{base}"),
+            Some(r) if !r.is_empty() => format!("{}.{base}", r.to_ascii_lowercase()),
             _ => base.into(),
         };
 
@@ -84,30 +84,29 @@ impl Tunnel for PinggyTunnel {
         let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
         let mut public_url = String::new();
 
-        // Track stream state independently so EOF on one stream does not
-        // abort reading the other — the URL may arrive on either stream.
+        // Tag each stream line so we know which stream produced EOF.
+        enum StreamLine {
+            Stdout(std::io::Result<Option<String>>),
+            Stderr(std::io::Result<Option<String>>),
+        }
+
         let mut stdout_done = false;
         let mut stderr_done = false;
 
         // Wait up to 15s for the tunnel URL to appear on either stream
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
         while tokio::time::Instant::now() < deadline && !(stdout_done && stderr_done) {
-            let line = tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
-                if stdout_done {
-                    return stderr_lines.next_line().await;
-                }
-                if stderr_done {
-                    return stdout_lines.next_line().await;
-                }
+            let stream_line = tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
                 tokio::select! {
-                    l = stdout_lines.next_line() => l,
-                    l = stderr_lines.next_line() => l,
+                    biased;
+                    l = stdout_lines.next_line(), if !stdout_done => StreamLine::Stdout(l),
+                    l = stderr_lines.next_line(), if !stderr_done => StreamLine::Stderr(l),
                 }
             })
             .await;
 
-            match line {
-                Ok(Ok(Some(l))) => {
+            match stream_line {
+                Ok(StreamLine::Stdout(Ok(Some(l)))) | Ok(StreamLine::Stderr(Ok(Some(l)))) => {
                     tracing::debug!("pinggy: {l}");
                     // Pinggy prints tunnel URLs like: https://xxxxx.a.free.pinggy.link
                     // Skip non-tunnel URLs (e.g. dashboard.pinggy.io promo links).
@@ -123,20 +122,11 @@ impl Tunnel for PinggyTunnel {
                         }
                     }
                 }
-                Ok(Ok(None)) => {
-                    // One stream closed — mark it done but keep reading the other.
-                    // We cannot determine which stream returned None from the
-                    // select!, so mark both as potentially done if both were open.
-                    // In practice, once we get None the select! will no longer
-                    // return for that branch, so subsequent iterations read the
-                    // remaining stream directly.
-                    if !stdout_done {
-                        stdout_done = true;
-                    } else {
-                        stderr_done = true;
-                    }
+                Ok(StreamLine::Stdout(Ok(None))) => stdout_done = true,
+                Ok(StreamLine::Stderr(Ok(None))) => stderr_done = true,
+                Ok(StreamLine::Stdout(Err(e))) | Ok(StreamLine::Stderr(Err(e))) => {
+                    bail!("Error reading pinggy output: {e}")
                 }
-                Ok(Err(e)) => bail!("Error reading pinggy output: {e}"),
                 Err(_) => {} // timeout — retry
             }
         }

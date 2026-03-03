@@ -7598,7 +7598,7 @@ impl Config {
             }
         }
 
-        // Pinggy tunnel region
+        // Pinggy tunnel region — validate allowed values (case-insensitive, auto-lowercased at runtime).
         if let Some(ref pinggy) = self.tunnel.pinggy {
             if let Some(ref region) = pinggy.region {
                 let r = region.trim().to_ascii_lowercase();
