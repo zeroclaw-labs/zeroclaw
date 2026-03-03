@@ -579,7 +579,7 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let mut command = Command::new("sh");
+    let mut command = Command::new("/bin/sh");
     command
         .arg("-lc")
         .arg(&job.command)
