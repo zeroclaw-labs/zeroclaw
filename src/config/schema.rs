@@ -5185,7 +5185,10 @@ impl std::fmt::Debug for BlueBubblesConfig {
             .field("text_chunk_limit", &self.text_chunk_limit)
             .field("chunk_mode", &self.chunk_mode)
             .field("require_mention_in_groups", &self.require_mention_in_groups)
-            .field("mention_keyword", &self.mention_keyword)
+            .field(
+                "mention_keyword",
+                &self.mention_keyword.as_ref().map(|_| "[SET]"),
+            )
             .field("groups", &format!("[{} items]", self.groups.len()))
             .finish()
     }
@@ -14405,6 +14408,9 @@ reserve_percent = 15
             send_read_receipts: true,
             text_chunk_limit: None,
             chunk_mode: None,
+            require_mention_in_groups: false,
+            mention_keyword: None,
+            groups: std::collections::HashMap::new(),
         });
         let err = config
             .validate()
@@ -14430,6 +14436,9 @@ reserve_percent = 15
             send_read_receipts: true,
             text_chunk_limit: None,
             chunk_mode: None,
+            require_mention_in_groups: false,
+            mention_keyword: None,
+            groups: std::collections::HashMap::new(),
         });
         let err = config.validate().expect_err(
             "allowlist group_policy with empty group_allow_from should fail validation",
