@@ -1,6 +1,7 @@
 //! Multiline input widget with sanitization helpers.
 
 use crate::tui::state::{InputMode, TuiState};
+use crate::tui::widgets::sanitize::sanitize_text;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -9,12 +10,7 @@ use ratatui::{
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 
 pub fn sanitize_input(raw: &str) -> String {
-    let stripped = strip_ansi_escapes::strip_str(raw);
-    let filtered: String = stripped
-        .chars()
-        .filter(|&ch| ch == '\n' || ch == '\t' || (!ch.is_control() && !is_c1_control(ch)))
-        .collect();
-    truncate_to_max_bytes(filtered, MAX_INPUT_BYTES)
+    truncate_to_max_bytes(sanitize_text(raw), MAX_INPUT_BYTES)
 }
 
 pub fn append_sanitized_input(buffer: &mut String, raw: &str) {
@@ -67,10 +63,6 @@ fn truncate_to_max_bytes(value: String, max_bytes: usize) -> String {
         cut -= 1;
     }
     value[..cut].to_string()
-}
-
-fn is_c1_control(ch: char) -> bool {
-    (0x80..=0x9f).contains(&(ch as u32))
 }
 
 fn cursor_position(area: Rect, content: &str) -> Position {

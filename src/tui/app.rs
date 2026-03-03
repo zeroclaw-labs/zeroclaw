@@ -173,7 +173,6 @@ async fn run_loop(
             if let Some(cancel) = active_request_cancel.take() {
                 cancel.cancel();
             }
-            active_request_id = None;
             break;
         }
     }

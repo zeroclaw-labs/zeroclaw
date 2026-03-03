@@ -2,6 +2,7 @@
 
 pub mod chat;
 pub mod input;
+pub mod sanitize;
 pub mod status;
 pub mod tools;
 

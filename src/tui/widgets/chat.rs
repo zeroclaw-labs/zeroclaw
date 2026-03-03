@@ -1,17 +1,14 @@
 //! Chat history panel.
 
 use crate::tui::state::{TuiRole, TuiState};
+use crate::tui::widgets::sanitize::sanitize_text;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 pub fn sanitize_display(text: &str) -> String {
-    let stripped = strip_ansi_escapes::strip_str(text);
-    stripped
-        .chars()
-        .filter(|&ch| ch == '\n' || ch == '\t' || (!ch.is_control() && !is_c1_control(ch)))
-        .collect()
+    sanitize_text(text)
 }
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -60,10 +57,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     frame.render_widget(paragraph, area);
-}
-
-fn is_c1_control(ch: char) -> bool {
-    (0x80..=0x9f).contains(&(ch as u32))
 }
 
 #[cfg(test)]
