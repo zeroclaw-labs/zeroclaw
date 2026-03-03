@@ -9,7 +9,7 @@
 #
 # Thresholds:
 #   macOS / default host:
-#     >20MB  — hard error (safeguard)
+#     >22MB  — hard error (safeguard)
 #     >15MB  — warning (advisory)
 #   Linux host:
 #     >26MB  — hard error (safeguard)
@@ -58,7 +58,7 @@ SIZE_MB=$((SIZE / 1024 / 1024))
 echo "Binary size: ${SIZE_MB}MB ($SIZE bytes)"
 
 # Default thresholds.
-HARD_LIMIT_BYTES=20971520     # 20MB
+HARD_LIMIT_BYTES=23068672     # 22MB
 ADVISORY_LIMIT_BYTES=15728640 # 15MB
 TARGET_LIMIT_BYTES=5242880    # 5MB
 

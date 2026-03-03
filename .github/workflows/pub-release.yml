@@ -144,6 +144,8 @@ jobs:
                     --output-json artifacts/release-trigger-guard.json \
                     --output-md artifacts/release-trigger-guard.md \
                     --fail-on-violation
+              env:
+                  GH_TOKEN: ${{ github.token }}
 
             - name: Emit release trigger audit event
               if: always()
