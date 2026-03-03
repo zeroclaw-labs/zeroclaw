@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::security::SecurityPolicy;
 use crate::tools::traits::{Tool, ToolResult};
 
 /// Send a media file (image, audio, document) via iMessage through BlueBubbles.
@@ -9,14 +12,20 @@ use crate::tools::traits::{Tool, ToolResult};
 /// multipart upload to the BB Private API. Supports optional captions and
 /// voice-memo marking.
 pub struct BlueBubblesSendAttachmentTool {
+    security: Arc<SecurityPolicy>,
     server_url: String,
     password: String,
     client: reqwest::Client,
 }
 
 impl BlueBubblesSendAttachmentTool {
-    pub fn new(server_url: String, password: String) -> anyhow::Result<Self> {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        server_url: String,
+        password: String,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
+            security,
             server_url: server_url.trim_end_matches('/').to_string(),
             password,
             client: reqwest::ClientBuilder::new()
@@ -82,6 +91,20 @@ impl Tool for BlueBubblesSendAttachmentTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: read-only autonomy level".into()),
+            });
+        }
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+            });
+        }
         let chat_guid = match args.get("chat_guid").and_then(|v| v.as_str()) {
             Some(g) if !g.trim().is_empty() => g.trim().to_string(),
             _ => {
@@ -103,7 +126,11 @@ impl Tool for BlueBubblesSendAttachmentTool {
             }
         };
         const MAX_ATTACHMENT_B64_LEN: usize = 34 * 1024 * 1024; // ~25 MiB decoded (base64 overhead ~4/3)
-        let data_b64 = match args.get("data_base64").and_then(|v| v.as_str()) {
+        let data_b64 = match args
+            .get("data_base64")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+        {
             Some(b) if !b.is_empty() => {
                 if b.len() > MAX_ATTACHMENT_B64_LEN {
                     return Ok(ToolResult {
@@ -127,6 +154,8 @@ impl Tool for BlueBubblesSendAttachmentTool {
         let mime_type = args
             .get("mime_type")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
             .unwrap_or("application/octet-stream")
             .to_string();
         let caption = args
