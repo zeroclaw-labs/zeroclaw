@@ -151,7 +151,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | QQ             | bot gateway                                 | No                                                   |
 | Napcat         | websocket receive + HTTP send (OneBot)      | No (typically local/LAN)                             |
 | Linq           | webhook (`/linq`)                           | Yes (public HTTPS callback)                          |
-| iMessage       | BlueBubbles webhook (`/bluebubbles`)        | Yes (reachable from BlueBubbles server)              |
+| BlueBubbles    | BlueBubbles webhook (`/bluebubbles`)        | Yes (reachable from BlueBubbles server)              |
 | ACP            | stdio (JSON-RPC 2.0)                        | No                                                   |
 | Nostr          | relay websocket (NIP-04 / NIP-17)           | No                                                   |
 
