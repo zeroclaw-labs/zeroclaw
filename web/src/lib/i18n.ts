@@ -7,6 +7,8 @@ import { getStatus } from './api';
 
 export type Locale = 'en' | 'tr' | 'zh-CN';
 
+const LOCALE_STORAGE_KEY = 'zeroclaw_ui_locale';
+
 const translations: Record<Locale, Record<string, string>> = {
   en: {
     // Navigation
@@ -156,6 +158,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_success': 'Pairing successful!',
     'auth.pairing_failed': 'Pairing failed. Please try again.',
     'auth.enter_code': 'Enter your pairing code to connect to the agent.',
+    'auth.code_placeholder': '6-digit code',
+    'auth.pairing_in_progress': 'Pairing...',
 
     // Common
     'common.loading': 'Loading...',
@@ -340,6 +344,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_success': 'Eslestirme basarili!',
     'auth.pairing_failed': 'Eslestirme basarisiz. Lutfen tekrar deneyin.',
     'auth.enter_code': 'Ajana baglanmak icin eslestirme kodunuzu girin.',
+    'auth.code_placeholder': '6 haneli kod',
+    'auth.pairing_in_progress': 'Eslestiriliyor...',
 
     // Common
     'common.loading': 'Yukleniyor...',
@@ -524,6 +530,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_success': '配对成功！',
     'auth.pairing_failed': '配对失败，请重试。',
     'auth.enter_code': '输入配对码以连接到智能体。',
+    'auth.code_placeholder': '6 位配对码',
+    'auth.pairing_in_progress': '配对中...',
 
     // Common
     'common.loading': '加载中...',
@@ -565,7 +573,29 @@ const translations: Record<Locale, Record<string, string>> = {
 // Current locale state
 // ---------------------------------------------------------------------------
 
-let currentLocale: Locale = 'en';
+function normalizeLocale(locale: string | undefined): Locale {
+  const lowered = locale?.toLowerCase();
+  if (lowered?.startsWith('tr')) return 'tr';
+  if (lowered === 'zh' || lowered?.startsWith('zh-')) return 'zh-CN';
+  return 'en';
+}
+
+function getInitialLocale(): Locale {
+  if (typeof window !== 'undefined') {
+    const stored = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+    if (stored === 'en' || stored === 'tr' || stored === 'zh-CN') {
+      return stored;
+    }
+  }
+
+  if (typeof navigator !== 'undefined') {
+    return normalizeLocale(navigator.language);
+  }
+
+  return 'en';
+}
+
+let currentLocale: Locale = getInitialLocale();
 
 export function getLocale(): Locale {
   return currentLocale;
@@ -573,6 +603,10 @@ export function getLocale(): Locale {
 
 export function setLocale(locale: Locale): void {
   currentLocale = locale;
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,13 +632,6 @@ export function tLocale(key: string, locale: Locale): string {
 // ---------------------------------------------------------------------------
 // React hook
 // ---------------------------------------------------------------------------
-
-function normalizeLocale(locale: string | undefined): Locale {
-  const lowered = locale?.toLowerCase();
-  if (lowered?.startsWith('tr')) return 'tr';
-  if (lowered === 'zh' || lowered?.startsWith('zh-')) return 'zh-CN';
-  return 'en';
-}
 
 /**
  * React hook that fetches the locale from /api/status on mount and keeps the
