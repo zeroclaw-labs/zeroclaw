@@ -3885,6 +3885,15 @@ or tune thresholds in config.",
                 {
                     let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                 }
+                // Swap 👀 → ✅ before returning so the reaction doesn't stay stuck
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+                        .await;
+                    let _ = channel
+                        .add_reaction(&msg.reply_target, &msg.id, "\u{2705}")
+                        .await;
+                }
                 return;
             }
 
