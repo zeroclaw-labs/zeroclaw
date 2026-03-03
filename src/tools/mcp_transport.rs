@@ -23,6 +23,8 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 
 /// Default media type for MCP JSON-RPC request bodies.
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
+/// Streamable HTTP session header used to preserve MCP server state.
+const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 // ── Transport Trait ──────────────────────────────────────────────────────
 
@@ -149,6 +151,7 @@ pub struct HttpTransport {
     url: String,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    session_id: Option<String>,
 }
 
 impl HttpTransport {
@@ -168,7 +171,27 @@ impl HttpTransport {
             url,
             client,
             headers: config.headers.clone(),
+            session_id: None,
         })
+    }
+
+    fn apply_session_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(session_id) = self.session_id.as_deref() {
+            req.header(MCP_SESSION_ID_HEADER, session_id)
+        } else {
+            req
+        }
+    }
+
+    fn update_session_id_from_headers(&mut self, headers: &reqwest::header::HeaderMap) {
+        if let Some(session_id) = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            self.session_id = Some(session_id.to_string());
+        }
     }
 }
 
@@ -193,6 +216,7 @@ impl McpTransportConn for HttpTransport {
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }
+        req = self.apply_session_header(req);
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
@@ -205,6 +229,8 @@ impl McpTransportConn for HttpTransport {
         if !resp.status().is_success() {
             bail!("MCP server returned HTTP {}", resp.status());
         }
+
+        self.update_session_id_from_headers(resp.headers());
 
         if request.id.is_none() {
             return Ok(JsonRpcResponse {
@@ -987,5 +1013,47 @@ mod tests {
     #[test]
     fn test_parse_jsonrpc_response_text_rejects_empty_payload() {
         assert!(parse_jsonrpc_response_text(" \n\t ").is_err());
+    }
+
+    #[test]
+    fn http_transport_updates_session_id_from_response_headers() {
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some("http://localhost/mcp".into()),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("mcp-session-id"),
+            reqwest::header::HeaderValue::from_static("session-abc"),
+        );
+        transport.update_session_id_from_headers(&headers);
+        assert_eq!(transport.session_id.as_deref(), Some("session-abc"));
+    }
+
+    #[test]
+    fn http_transport_injects_session_id_header_when_available() {
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some("http://localhost/mcp".into()),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        transport.session_id = Some("session-xyz".to_string());
+
+        let req = transport
+            .apply_session_header(reqwest::Client::new().post("http://localhost/mcp"))
+            .build()
+            .expect("build request");
+        assert_eq!(
+            req.headers()
+                .get(MCP_SESSION_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("session-xyz")
+        );
     }
 }
