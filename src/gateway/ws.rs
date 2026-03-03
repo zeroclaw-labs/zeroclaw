@@ -624,6 +624,35 @@ mod tests {
     }
 
     #[test]
+    fn extract_ws_bearer_token_reads_query_parameter_token() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            extract_ws_bearer_token(&headers, Some("query-token")).as_deref(),
+            Some("query-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_bearer_token_priority_order() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer auth-header-token"),
+        );
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("zeroclaw.v1, bearer.protocol-token"),
+        );
+
+        // Authorization header should take priority over query parameter
+        assert_eq!(
+            extract_ws_bearer_token(&headers, Some("query-token")).as_deref(),
+            Some("auth-header-token")
+        );
+    }
+
+    #[test]
     fn extract_ws_bearer_token_rejects_empty_tokens() {
         let mut headers = HeaderMap::new();
         headers.insert(

@@ -247,6 +247,7 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []
 web-fetch-html2md = ["dep:html2md"]
+web-fetch-plaintext = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size

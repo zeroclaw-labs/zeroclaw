@@ -36,7 +36,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     "TMP",
     "PATHEXT",
 ];
-
 fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
     if text.len() <= max_bytes {
         return;
@@ -46,6 +45,354 @@ fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
         cutoff -= 1;
     }
     text.truncate(cutoff);
+}
+
+/// Get exit code explanation
+fn get_exit_code_explanation(exit_code: i32) -> Option<String> {
+    if std::env::consts::OS == "windows" {
+        match exit_code {
+            -65536 => Some("PowerShell internal error: usually due to execution policy restrictions, syntax errors, or module loading failures".to_string()),
+            -196608 => Some("PowerShell startup failure: configuration file corruption or permission issues".to_string()),
+            1 => Some("Command execution failed: usually due to syntax errors or command not found".to_string()),
+            -1 => Some("Process terminated abnormally: may have been terminated by system or encountered fatal error".to_string()),
+            code if code < 0 => Some(format!("PowerShell internal error code: {} (possibly memory access error or system-level error)", code)),
+            _ => None,
+        }
+    } else {
+        match exit_code {
+            1 => Some("Command execution failed".to_string()),
+            2 => Some("Command not found or insufficient permissions".to_string()),
+            126 => Some("Command exists but cannot execute (permission issue)".to_string()),
+            127 => Some("Command not found".to_string()),
+            128..=255 => Some(format!("Command terminated by signal: signal number {}", exit_code - 128)),
+            _ => None,
+        }
+    }
+}
+
+/// Decode Windows command output, handle Chinese character encoding issues
+fn decode_windows_output(output: &[u8]) -> String {
+    // First try UTF-8 decoding
+    if let Ok(utf8_str) = String::from_utf8(output.to_vec()) {
+        return utf8_str;
+    }
+    
+    // Detect possible encoding types
+    let (encoding_type, _confidence) = detect_encoding(output);
+    
+    match encoding_type {
+        EncodingType::Utf8 => String::from_utf8_lossy(output).to_string(),
+        EncodingType::Utf16Le => decode_utf16le(output),
+        EncodingType::Utf16Be => decode_utf16be(output),
+        EncodingType::Gbk => decode_gbk_simple(output),
+        EncodingType::Latin1 => output.iter().map(|&b| b as char).collect(),
+        EncodingType::Binary => format!("[Binary data: {} bytes]", output.len()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EncodingType {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Gbk,
+    Latin1,
+    Binary,
+}
+
+/// Simple encoding detection
+fn detect_encoding(data: &[u8]) -> (EncodingType, f32) {
+    if data.is_empty() {
+        return (EncodingType::Utf8, 1.0);
+    }
+    
+    // Check UTF-16 LE BOM (common in PowerShell)
+    if data.starts_with(b"\xFF\xFE") {
+        return (EncodingType::Utf16Le, 1.0);
+    }
+    
+    // Check UTF-16 BE BOM
+    if data.starts_with(b"\xFE\xFF") {
+        return (EncodingType::Utf16Be, 1.0);
+    }
+    
+    // Check UTF-8 BOM
+    if data.starts_with(b"\xEF\xBB\xBF") {
+        return (EncodingType::Utf8, 1.0);
+    }
+    
+    // Detect UTF-16 LE pattern (ASCII characters + 00 bytes)
+    let utf16le_patterns = detect_utf16le_patterns(data);
+    if utf16le_patterns > data.len() / 4 {
+        return (EncodingType::Utf16Le, 0.9);
+    }
+    
+    // Check if valid UTF-8
+    let mut valid_utf8_count = 0;
+    let mut total_chars = 0;
+    let mut i = 0;
+    
+    while i < data.len() {
+        if data[i] < 0x80 {
+            valid_utf8_count += 1;
+            total_chars += 1;
+            i += 1;
+        } else if i + 1 < data.len() && (data[i] & 0xE0) == 0xC0 {
+            // 2-byte UTF-8
+            if (data[i + 1] & 0xC0) == 0x80 {
+                valid_utf8_count += 1;
+                total_chars += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if i + 2 < data.len() && (data[i] & 0xF0) == 0xE0 {
+            // 3-byte UTF-8
+            if (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80 {
+                valid_utf8_count += 1;
+                total_chars += 1;
+                i += 3;
+            } else {
+                i += 1;
+            }
+        } else if i + 3 < data.len() && (data[i] & 0xF8) == 0xF0 {
+            // 4-byte UTF-8
+            if (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80 && (data[i + 3] & 0xC0) == 0x80 {
+                valid_utf8_count += 1;
+                total_chars += 1;
+                i += 4;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    
+    let utf8_ratio = if total_chars > 0 { valid_utf8_count as f32 / total_chars as f32 } else { 0.0 };
+    
+    if utf8_ratio > 0.9 {
+        return (EncodingType::Utf8, utf8_ratio);
+    }
+    
+    // Detect GBK pattern (common Chinese encoding)
+    let gbk_patterns = count_gbk_patterns(data);
+    if gbk_patterns > data.len() / 4 {
+        return (EncodingType::Gbk, 0.8);
+    }
+    
+    // Check if mainly printable ASCII
+    let printable_ascii = data.iter().filter(|&&b| b >= 0x20 && b <= 0x7E).count();
+    let printable_ratio = printable_ascii as f32 / data.len() as f32;
+    
+    if printable_ratio > 0.7 {
+        return (EncodingType::Latin1, printable_ratio);
+    }
+    
+    // Detect binary data
+    let null_bytes = data.iter().filter(|&&b| b == 0).count();
+    let high_bytes = data.iter().filter(|&&b| b > 0x80).count();
+    
+    if null_bytes > data.len() / 10 || high_bytes > data.len() / 2 {
+        return (EncodingType::Binary, 0.9);
+    }
+    
+    // Default to Latin1
+    (EncodingType::Latin1, 0.5)
+}
+
+/// Detect UTF-16 LE pattern (ASCII characters + 00 bytes)
+fn detect_utf16le_patterns(data: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    
+    while i + 1 < data.len() {
+        // ASCII character + 00 byte pattern
+        if data[i] >= 0x20 && data[i] <= 0x7E && data[i + 1] == 0x00 {
+            count += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    
+    count
+}
+
+/// Decode UTF-16 LE encoding
+fn decode_utf16le(data: &[u8]) -> String {
+    if data.len() % 2 != 0 {
+        // If not even length, try removing the last byte first
+        return decode_utf16le(&data[..data.len() - 1]);
+    }
+    
+    let u16_data: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    
+    String::from_utf16(&u16_data).unwrap_or_else(|_| {
+        // If UTF-16 decoding fails, fall back to displaying readable characters
+        let mut result = String::new();
+        for chunk in data.chunks_exact(2) {
+            let code_unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if code_unit < 0x80 && code_unit >= 0x20 {
+                result.push(code_unit as u8 as char);
+            } else if code_unit == 0 {
+                // Null character, skip
+                continue;
+            } else {
+                result.push_str(&format!("[U+{:04X}]", code_unit));
+            }
+        }
+        result
+    })
+}
+
+/// Decode UTF-16 BE encoding
+fn decode_utf16be(data: &[u8]) -> String {
+    if data.len() % 2 != 0 {
+        // If not even length, try removing the last byte first
+        return decode_utf16be(&data[..data.len() - 1]);
+    }
+    
+    let u16_data: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect();
+    
+    String::from_utf16(&u16_data).unwrap_or_else(|_| {
+        // If UTF-16 decoding fails, fall back to displaying readable characters
+        let mut result = String::new();
+        for chunk in data.chunks_exact(2) {
+            let code_unit = u16::from_be_bytes([chunk[0], chunk[1]]);
+            if code_unit < 0x80 && code_unit >= 0x20 {
+                result.push(code_unit as u8 as char);
+            } else if code_unit == 0 {
+                // Null character, skip
+                continue;
+            } else {
+                result.push_str(&format!("[U+{:04X}]", code_unit));
+            }
+        }
+        result
+    })
+}
+
+/// Simple GBK pattern detection
+fn count_gbk_patterns(data: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    
+    while i < data.len().saturating_sub(1) {
+        let high = data[i];
+        let low = data[i + 1];
+        
+        // GBK double-byte character range
+        if (high >= 0x81 && high <= 0xFE) && (low >= 0x40 && low <= 0xFE && low != 0x7F) {
+            count += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    
+    count
+}
+
+/// Improved GBK decoding, preserve more readable information
+fn decode_gbk_simple(data: &[u8]) -> String {
+    let mut result = String::new();
+    let mut i = 0;
+    let mut gbk_chars = 0;
+    let mut total_processed = 0;
+    
+    while i < data.len() {
+        if data[i] < 0x80 {
+            // ASCII character, add directly
+            result.push(data[i] as char);
+            i += 1;
+            total_processed += 1;
+        } else if i + 1 < data.len() {
+            let high = data[i];
+            let low = data[i + 1];
+            
+            if (high >= 0x81 && high <= 0xFE) && (low >= 0x40 && low <= 0xFE && low != 0x7F) {
+                // GBK double-byte character
+                gbk_chars += 1;
+                
+                // Try to identify common PowerShell error patterns
+                if is_likely_powershell_error(high, low) {
+                    result.push_str("[PS-ERROR]");
+                } else if is_likely_chinese_char(high, low) {
+                    // Chinese character, describe in Chinese
+                    result.push_str("[中文]");
+                } else {
+                    // Other GBK characters, show encoding info
+                    result.push_str(&format!("[GBK:{:02X}{:02X}]", high, low));
+                }
+                i += 2;
+                total_processed += 2;
+            } else {
+                // Unrecognized double-byte, show raw info
+                result.push_str(&format!("[{:02X}{:02X}]", high, low));
+                i += 1;
+                total_processed += 1;
+            }
+        } else {
+            // Remaining single byte
+            result.push_str(&format!("[{:02X}]", data[i]));
+            i += 1;
+            total_processed += 1;
+        }
+    }
+    
+    // If too many GBK characters, add statistics
+    if gbk_chars > 5 {
+        result.push_str(&format!("\n[Encoding info: {} GBK characters, total bytes:{}]", gbk_chars, total_processed));
+    }
+    
+    result
+}
+
+/// Detect if likely PowerShell error information
+fn is_likely_powershell_error(high: u8, low: u8) -> bool {
+    // Common PowerShell error byte patterns (based on experience)
+    matches!((high, low), 
+        (0x57, 0x69) | // "Wi" (Windows)
+        (0x50, 0x6F) | // "Po" (PowerShell)
+        (0x45, 0x72) | // "Er" (Error)
+        (0x65, 0x78) | // "ex" (exception)
+        (0x43, 0x6F) | // "Co" (Console)
+        (0x4F, 0x75) | // "Ou" (Output)
+        (0x45, 0x6E) | // "En" (Encoding)
+        (0x54, 0x65) | // "Te" (Text)
+        (0x46, 0x61) | // "Fa" (Failed)
+        (0x4E, 0x6F) | // "No" (Not)
+        (0x43, 0x61) | // "Ca" (Cannot)
+        (0x55, 0x6E) | // "Un" (Unknown)
+        (0x52, 0x65) | // "Re" (Required)
+        (0x4D, 0x65) | // "Me" (Message)
+        (0x53, 0x79) | // "Sy" (System)
+        (0x54, 0x79) | // "Ty" (Type)
+        (0x46, 0x6F) | // "Fo" (For)
+        (0x49, 0x6E) | // "In" (In)
+        (0x41, 0x74) | // "At" (At)
+        (0x42, 0x79) | // "By" (By)
+        (0x54, 0x68) | // "Th" (The)
+        (0x4F, 0x66) | // "Of" (Of)
+        (0x41, 0x6E) | // "An" (And)
+        (0x4F, 0x72) | // "Or" (Or)
+        (0x49, 0x73) | // "Is" (Is)
+        (0x49, 0x74) | // "It" (It)
+        (0x54, 0x6F)   // "To" (To)
+    )
+}
+
+/// Detect if likely Chinese character
+fn is_likely_chinese_char(high: u8, low: u8) -> bool {
+    // GB2312 Chinese character range
+    (high >= 0xB0 && high <= 0xF7) && (low >= 0xA1 && low <= 0xFE)
 }
 
 /// Shell command execution tool with sandboxing
@@ -143,16 +490,62 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        let current_os = std::env::consts::OS;
+        if current_os == "windows" {
+            "Execute PowerShell commands on Windows with UTF-8 encoding support for Chinese characters. \
+            Supports file operations, system management, web requests, and PowerShell-specific cmdlets. \
+            Automatically handles encoding issues for better Chinese character display."
+        } else {
+            "Execute bash/sh commands on Linux/macOS. Supports standard Unix utilities, file operations, \
+            process management, and shell scripting. Uses the system default shell interpreter."
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let current_os = std::env::consts::OS;
+        let (shell_name, examples) = if current_os == "windows" {
+            (
+                "PowerShell",
+                vec![
+                    "Get-ChildItem",
+                    "Get-Content file.txt",
+                    "Invoke-WebRequest -Uri 'https://api.example.com' -UseBasicParsing",
+                    "Get-Process | Where-Object {$_.CPU -gt 100}",
+                    "$PSVersionTable",
+                    "Get-ExecutionPolicy"
+                ]
+            )
+        } else {
+            (
+                "bash/sh",
+                vec![
+                    "ls -la",
+                    "cat file.txt",
+                    "curl https://api.example.com",
+                    "ps aux | grep process",
+                    "echo $SHELL",
+                    "which python3"
+                ]
+            )
+        };
+        
+        let description = format!(
+            "The {} command to execute. \
+            \\n\\nPlatform: {} \
+            \\n\\nExamples:\\n{} \
+            \\n\\nNote: On Windows, this tool uses PowerShell with UTF-8 encoding support for Chinese characters. \
+            On Linux/macOS, it uses bash/sh.",
+            shell_name,
+            current_os,
+            examples.iter().map(|ex| format!("  - {}", ex)).collect::<Vec<_>>().join("\\n")
+        );
+        
         json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": description
                 },
                 "approved": {
                     "type": "boolean",
@@ -217,6 +610,7 @@ impl Tool for ShellTool {
         {
             Ok(cmd) => cmd,
             Err(e) => {
+                println!("\nFailed to build runtime command: {e}\n");
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -237,8 +631,18 @@ impl Tool for ShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                // Choose appropriate encoding handling based on operating system
+                let (mut stdout, mut stderr) = if std::env::consts::OS == "windows" {
+                    // Try multiple encoding methods on Windows
+                    let stdout = decode_windows_output(&output.stdout);
+                    let stderr = decode_windows_output(&output.stderr);
+                    (stdout, stderr)
+                } else {
+                    // Unix/Linux systems use UTF-8
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    (stdout, stderr)
+                };
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
@@ -249,7 +653,6 @@ impl Tool for ShellTool {
                     truncate_utf8_to_max_bytes(&mut stderr, MAX_OUTPUT_BYTES);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
-
                 if let Some(detector) = &self.syscall_detector {
                     let _ = detector.inspect_command_output(
                         &command,
@@ -257,6 +660,46 @@ impl Tool for ShellTool {
                         &stderr,
                         output.status.code(),
                     );
+                }
+
+                // Detailed logging of command execution results for debugging
+                let exit_code = output.status.code().unwrap_or(-1);
+                
+                // Detect encoding issues
+                let has_encoding_issues = stderr.contains('■') || stderr.contains('�') || 
+                                          stderr.chars().any(|c| c as u32 > 0xFFFD);
+                
+                if has_encoding_issues {
+                    println!("Command '{}' produced output with potential encoding issues (exit code: {})", command, exit_code);
+                    println!("Warning: Command output contains encoding artifacts. Raw stderr (hex): {:02x?}", &output.stderr[..output.stderr.len().min(100)]);
+                }
+                
+                println!(
+                    "Shell command executed: '{}' | Exit code: {} | stdout: {} bytes | stderr: {} bytes | encoding_issues: {}",
+                    command, exit_code, stdout.len(), stderr.len(), has_encoding_issues
+                );
+                
+                // Display exit code explanation
+                if let Some(explanation) = get_exit_code_explanation(exit_code) {
+                    println!("Exit code explanation: {}", explanation);
+                }
+                
+                if !stderr.is_empty() {
+                    println!("Command produced stderr output: {}", &stderr);
+                }
+                
+                if !output.status.success() && stderr.is_empty() {
+                    println!("Command failed without stderr output: '{}' (exit code: {})", command, exit_code);
+                    
+                    // Provide suggestions for PowerShell-specific errors
+                    if std::env::consts::OS == "windows" && exit_code == -65536 {
+                        println!("PowerShell -65536 error suggestions:");
+                        println!("  1. Check execution policy: Get-ExecutionPolicy");
+                        println!("  2. Try running as administrator");
+                        println!("  3. Check PowerShell version: $PSVersionTable");
+                        println!("  4. Verify command syntax is correct");
+                        println!("  5. Check if antivirus software is blocking execution");
+                    }
                 }
 
                 Ok(ToolResult {
@@ -269,11 +712,13 @@ impl Tool for ShellTool {
                     },
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
+            Ok(Err(e)) => {
+                println!("\nFailed to execute command: {e}\n");
+                return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
-            }),
+            })},
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -24,3 +24,9 @@ linker = "clang"
 
 [target.aarch64-linux-android]
 linker = "clang"
+
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "link-args=/STACK:16777216"]
+[build]
+incremental = true
+rustflags=["-C","codegen-units=16"]

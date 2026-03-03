@@ -977,6 +977,15 @@ impl SecurityPolicy {
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
+            // If command is in allowlist, treat as low risk
+            if self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_allowlist_entry_match(allowed, base_raw, &base))
+            {
+                continue;
+            }
+
             // High-risk commands
             if is_high_risk_base_command(base.as_str()) {
                 return CommandRiskLevel::High;
@@ -1899,6 +1908,50 @@ mod tests {
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
         );
+    }
+
+    #[test]
+    fn allowed_commands_are_low_risk() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["curl".into(), "wget".into(), "python3".into()],
+            ..SecurityPolicy::default()
+        };
+        
+        // These commands are high-risk by default but should be low-risk in allowed_commands
+        assert_eq!(p.command_risk_level("curl https://api.example.com"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("wget https://example.com/file.txt"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("python3 script.py"), CommandRiskLevel::Low);
+        
+        // Commands not in allowed_commands maintain their original risk level
+        assert_eq!(p.command_risk_level("nc -l 8080"), CommandRiskLevel::High);
+        assert_eq!(p.command_risk_level("ssh user@host"), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn curl_in_allowed_commands_is_low_risk() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["curl".into()],
+            ..SecurityPolicy::default()
+        };
+        
+        // curl should be low-risk when in allowed_commands
+        assert_eq!(p.command_risk_level("curl https://api.open-meteo.com"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("curl -X GET https://httpbin.org/get"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("curl -s -o output.txt https://example.com"), CommandRiskLevel::Low);
+    }
+
+    #[test]
+    fn wildcard_allows_all_commands_as_low_risk() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        
+        // Wildcard allows all commands, all should be low-risk
+        assert_eq!(p.command_risk_level("curl https://api.example.com"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("wget https://example.com"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("rm -rf /tmp/test"), CommandRiskLevel::Low); // Note: Although risk is low, validate_command_execution will still prevent high-risk operations
+        assert_eq!(p.command_risk_level("python3 script.py"), CommandRiskLevel::Low);
     }
 
     #[test]
