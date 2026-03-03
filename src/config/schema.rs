@@ -1044,6 +1044,11 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Tool allowlist for the main agent.
+    /// When empty or unset: all available tools are loaded.
+    /// When set: only the specified tool names are available.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
     /// Agent-team runtime controls for synchronous delegation.
     #[serde(default)]
     pub teams: AgentTeamsConfig,
@@ -1179,6 +1184,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            allowed_tools: Vec::new(),
             teams: AgentTeamsConfig::default(),
             subagents: SubAgentsConfig::default(),
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),

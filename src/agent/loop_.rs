@@ -2427,6 +2427,64 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
+fn filter_tools_by_agent_allowlist(
+    tools: Vec<Box<dyn Tool>>,
+    allowed_tools: &[String],
+) -> Vec<Box<dyn Tool>> {
+    if allowed_tools.is_empty() {
+        return tools;
+    }
+
+    let allowed: std::collections::HashSet<_> = allowed_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let filtered: Vec<_> = tools
+        .into_iter()
+        .filter(|tool| allowed.contains(tool.name()))
+        .collect();
+    let registered_names: std::collections::HashSet<_> =
+        filtered.iter().map(|tool| tool.name()).collect();
+
+    for name in allowed_tools {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            tracing::warn!("main agent: ignored blank entry in allowed_tools");
+            continue;
+        }
+        if !registered_names.contains(trimmed) {
+            tracing::warn!(
+                "main agent: ignored non-existent tool in allowed_tools: \"{}\"",
+                trimmed
+            );
+        }
+    }
+
+    filtered
+}
+
+fn filter_tool_descs_by_agent_allowlist<'a>(
+    tool_descs: Vec<(&'a str, &'a str)>,
+    allowed_tools: &[String],
+) -> Vec<(&'a str, &'a str)> {
+    if allowed_tools.is_empty() {
+        return tool_descs;
+    }
+
+    let allowed: std::collections::HashSet<_> = allowed_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    tool_descs
+        .into_iter()
+        .filter(|(name, _)| allowed.contains(*name))
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 /// Run the agent loop with the given configuration.
 ///
@@ -2487,7 +2545,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let mut all_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2505,10 +2563,9 @@ pub async fn run(
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
-    }
+    all_tools.extend(peripheral_tools);
+    let mut tools_registry =
+        filter_tools_by_agent_allowlist(all_tools, &config.agent.allowed_tools);
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -2697,6 +2754,8 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    tool_descs = filter_tool_descs_by_agent_allowlist(tool_descs, &config.agent.allowed_tools);
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3115,7 +3174,7 @@ pub async fn process_message_with_session(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let mut all_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3130,9 +3189,12 @@ pub async fn process_message_with_session(
         config.api_key.as_deref(),
         &config,
     );
+
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
+    all_tools.extend(peripheral_tools);
+    let mut tools_registry =
+        filter_tools_by_agent_allowlist(all_tools, &config.agent.allowed_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = crate::config::resolve_default_model_id(
@@ -3234,6 +3296,8 @@ pub async fn process_message_with_session(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    tool_descs = filter_tool_descs_by_agent_allowlist(tool_descs, &config.agent.allowed_tools);
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
