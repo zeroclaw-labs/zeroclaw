@@ -3050,11 +3050,28 @@ pub(crate) enum ChannelSanitizationResult {
     },
 }
 
+/// Check if response is the HEARTBEAT_OK sentinel (issue #2513)
+/// Matches the daemon implementation to ensure consistency across code paths
+fn is_heartbeat_ok_sentinel(output: &str) -> bool {
+    const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
+    output
+        .trim()
+        .get(..HEARTBEAT_OK.len())
+        .map(|prefix| prefix.eq_ignore_ascii_case(HEARTBEAT_OK))
+        .unwrap_or(false)
+}
+
 pub(crate) fn sanitize_channel_response(
     response: &str,
     tools: &[Box<dyn Tool>],
     leak_guard: &crate::config::OutboundLeakGuardConfig,
 ) -> ChannelSanitizationResult {
+    // Suppress HEARTBEAT_OK sentinel in channel replies (issue #2513)
+    // This matches the daemon heartbeat path which already filters this sentinel
+    if is_heartbeat_ok_sentinel(response) {
+        return ChannelSanitizationResult::Sanitized(String::new());
+    }
+
     let without_tool_tags = strip_tool_call_tags(response);
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -11796,6 +11813,54 @@ BTC is currently around $65,000 based on latest tool output."#;
 
         assert!(result.contains("AKIAABCDEFGHIJKLMNOP"));
         assert!(!result.contains("[REDACTED_AWS_CREDENTIAL]"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_suppresses_heartbeat_ok_sentinel() {
+        // Test for issue #2513: HEARTBEAT_OK should be suppressed in channel replies
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+
+        // Exact match
+        let result = sanitize_channel_response("HEARTBEAT_OK", &tools, &leak_guard);
+        let ChannelSanitizationResult::Sanitized(result) = result else {
+            panic!("expected sanitized output");
+        };
+        assert_eq!(result, "", "HEARTBEAT_OK should be suppressed to empty string");
+
+        // With whitespace
+        let result = sanitize_channel_response("  HEARTBEAT_OK  \n", &tools, &leak_guard);
+        let ChannelSanitizationResult::Sanitized(result) = result else {
+            panic!("expected sanitized output");
+        };
+        assert_eq!(result, "", "HEARTBEAT_OK with whitespace should be suppressed");
+
+        // Case insensitive
+        let result = sanitize_channel_response("heartbeat_ok", &tools, &leak_guard);
+        let ChannelSanitizationResult::Sanitized(result) = result else {
+            panic!("expected sanitized output");
+        };
+        assert_eq!(result, "", "heartbeat_ok (lowercase) should be suppressed");
+
+        // Normal text should pass through
+        let result = sanitize_channel_response("Normal message", &tools, &leak_guard);
+        let ChannelSanitizationResult::Sanitized(result) = result else {
+            panic!("expected sanitized output");
+        };
+        assert_eq!(result, "Normal message");
+    }
+
+    #[test]
+    fn is_heartbeat_ok_sentinel_detects_variations() {
+        // Test the helper function directly
+        assert!(is_heartbeat_ok_sentinel("HEARTBEAT_OK"));
+        assert!(is_heartbeat_ok_sentinel("  HEARTBEAT_OK  "));
+        assert!(is_heartbeat_ok_sentinel("heartbeat_ok"));
+        assert!(is_heartbeat_ok_sentinel("Heartbeat_Ok"));
+        assert!(is_heartbeat_ok_sentinel("HEARTBEAT_OK\n"));
+        assert!(!is_heartbeat_ok_sentinel("HEARTBEAT_OK with more text"));
+        assert!(!is_heartbeat_ok_sentinel(""));
+        assert!(!is_heartbeat_ok_sentinel("normal text"));
     }
 
     #[test]
