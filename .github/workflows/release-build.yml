@@ -90,3 +90,63 @@ jobs:
                       artifacts/zeroclaw.sha256
                   if-no-files-found: error
                   retention-days: 21
+
+    build-harmonyos:
+        name: Build HarmonyOS (aarch64-linux-ohos)
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 120
+        needs: build-and-test
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+
+            - name: Setup Rust nightly
+              uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: nightly
+                  components: rustfmt, clippy
+
+            - name: Install HarmonyOS NDK
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  OHOS_TOOLS_DIR="/opt/commandline-tools"
+                  if [[ -d "${OHOS_TOOLS_DIR}" ]]; then
+                      echo "HarmonyOS NDK already installed at ${OHOS_TOOLS_DIR}"
+                  else
+                      echo "Error: HarmonyOS NDK not found at ${OHOS_TOOLS_DIR}"
+                      echo "Please install HarmonyOS Command Line Tools on the CI runner."
+                      exit 1
+                  fi
+                  echo "OHOS_NDK_HOME=${OHOS_TOOLS_DIR}/sdk/default/openharmony/native" >> $GITHUB_ENV
+
+            - name: Build HarmonyOS binary
+              shell: bash
+              env:
+                  OHOS_NDK_HOME: /opt/commandline-tools/sdk/default/openharmony/native
+              run: |
+                  set -euo pipefail
+                  bash ./scripts/build-ohos.sh --release
+
+            - name: Prepare HarmonyOS artifact bundle
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  cp target/aarch64-linux-ohos/release/zeroclaw artifacts/zeroclaw
+                  sha256sum artifacts/zeroclaw > artifacts/zeroclaw.sha256
+
+            - name: Upload HarmonyOS artifact
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: zeroclaw-harmonyos-aarch64
+                  path: |
+                      artifacts/zeroclaw
+                      artifacts/zeroclaw.sha256
+                  if-no-files-found: error
+                  retention-days: 21
