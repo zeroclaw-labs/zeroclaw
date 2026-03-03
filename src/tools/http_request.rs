@@ -56,14 +56,6 @@ impl HttpRequestTool {
             Ok(secret_raw) => {
                 let secret = secret_raw.trim();
                 if secret.is_empty() {
-                    if let Some(cached) = self.cached_secret(env_var) {
-                        tracing::warn!(
-                            profile = requested_name,
-                            env_var,
-                            "http_request credential env var is empty; using cached secret"
-                        );
-                        return Ok(cached);
-                    }
                     anyhow::bail!(
                         "credential_profile '{requested_name}' uses environment variable {env_var}, but it is empty"
                     );
@@ -1029,6 +1021,46 @@ mod tests {
             .resolve_credential_profile("rotating")
             .expect("cached rotated value should be used");
         assert_eq!(headers_after_removal[0].1, "Bearer rotated-secret");
+    }
+
+    #[test]
+    fn resolve_credential_profile_empty_env_var_does_not_fallback_to_cached_secret() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_HTTP_REQUEST_EMPTY_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        std::env::set_var(&env_var, "cached-secret");
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "empty".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "Authorization".to_string(),
+                env_var: env_var.clone(),
+                value_prefix: "Bearer ".to_string(),
+            },
+        );
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+            profiles,
+        );
+
+        // Explicitly set to empty: this should be treated as misconfiguration
+        // and must not fall back to cache.
+        std::env::set_var(&env_var, "");
+        let err = tool
+            .resolve_credential_profile("empty")
+            .expect_err("empty env var should hard-fail")
+            .to_string();
+        assert!(err.contains("but it is empty"));
+
+        std::env::remove_var(&env_var);
     }
 
     #[test]
