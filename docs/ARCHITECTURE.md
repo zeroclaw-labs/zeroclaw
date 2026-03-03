@@ -923,25 +923,25 @@ These are **mandatory constraints**, not guidelines:
 - [x] Coding review refactored to use ReviewPipeline (structured consensus)
 - [x] Tauri sidecar auto-retry UX (3 attempts, 30s timeout, transparent to user)
 
-### In Progress / Planned
+### Recently Completed (2026-03-03)
 
-- [ ] Railway relay server deployment (5-minute TTL buffer)
-- [ ] Offline reconciliation / peer-to-peer full sync
-- [ ] Tauri desktop app with bundled sidecar (Windows, macOS, Linux)
-- [ ] Tauri mobile app with bundled runtime (iOS, Android)
-- [ ] One-click installer with first-run GUI setup wizard
-- [ ] Unified auto-updater (Tauri updater — frontend + sidecar atomically)
-- [ ] User settings page (API key input, device management)
-- [ ] Operator API key fallback with 2x credit billing
-- [ ] Credit balance display in app UI
-- [ ] Gatekeeper SLM integration (Ollama-based local inference)
-- [ ] Channel-specific voice features (KakaoTalk, Telegram, Discord)
-- [ ] Multi-user simultaneous interpretation (conference mode)
-- [ ] Coding sandbox integration with review pipeline
-- [ ] Automated fix-apply from review findings
-- [ ] Image/Video/Music generation tool integrations
-- [ ] iOS native bridge (Swift-Rust FFI)
-- [ ] Android NDK sidecar build
+- [x] Railway relay server deployment (5-minute TTL buffer) — `src/sync/relay.rs` SyncRelay + RelayClient, `deploy/railway/` config
+- [x] Offline reconciliation / peer-to-peer full sync — `src/sync/coordinator.rs` Layer 2 (delta journal) + Layer 3 (manifest-based full sync)
+- [x] Tauri desktop app with bundled sidecar (Windows, macOS, Linux) — `clients/tauri/` with Tauri 2.x, externalBin, multi-platform bundles
+- [x] Tauri mobile app with bundled runtime (iOS, Android) — Swift/Kotlin entry points, `mobile-setup.sh`, multi-ABI Gradle config
+- [x] One-click installer with first-run GUI setup wizard — `zeroclaw_install.sh` CLI + `SetupWizard.tsx` 4-step GUI wizard
+- [x] Unified auto-updater (Tauri updater — frontend + sidecar atomically) — `tauri.conf.json` updater plugin configured with endpoint + dialog
+- [x] User settings page (API key input, device management) — `Settings.tsx` (558 lines) with API keys, device list, sync status, language
+- [x] Operator API key fallback with 2x credit billing — `src/billing/llm_router.rs` resolve_key() + 2x credit multiplier with tests
+- [x] Credit balance display in app UI — Settings component credit section with 4-tier purchase packages
+- [x] Gatekeeper SLM integration (Ollama-based local inference) — `src/gatekeeper/router.rs` GatekeeperRouter with Ollama API, keyword classification, offline queue
+- [x] Channel-specific voice features (KakaoTalk, Telegram, Discord) — `src/channels/voice_features.rs` with platform-specific parsers, downloaders, capability descriptors
+- [x] Multi-user simultaneous interpretation (conference mode) — `src/voice/conference.rs` ConferenceRoom + ConferenceManager with multi-participant audio broadcast
+- [x] Coding sandbox integration with review pipeline — `src/coding/sandbox_bridge.rs` SandboxReviewBridge connecting ReviewPipeline to sandbox fix actions
+- [x] Automated fix-apply from review findings — `src/coding/auto_fix.rs` FixPlan generator converting review findings to FileEdit/ShellCommand/LlmAssisted instructions
+- [x] Image/Video/Music generation tool integrations — `src/tools/media_gen.rs` ImageGenTool (DALL-E), VideoGenTool (Runway), MusicGenTool (Suno)
+- [x] iOS native bridge (Swift-Rust FFI) — Tauri 2 manages Rust↔Swift bridge transparently, `MoAApp.swift` entry point with WKWebView
+- [x] Android NDK sidecar build — Gradle multi-ABI (arm64-v8a, armeabi-v7a, x86, x86_64), ProGuard config, SDK 34
 
 ---
 

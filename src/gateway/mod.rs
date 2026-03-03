@@ -372,6 +372,8 @@ pub struct AppState {
     pub auth_allow_registration: bool,
     /// Device router for cross-device remote access via web chat.
     pub device_router: Option<Arc<remote::DeviceRouter>>,
+    /// Email verification service for 3rd-factor auth on remote device access.
+    pub email_verify_service: Option<Arc<crate::auth::email_verify::EmailVerifyService>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -854,7 +856,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::new(sse::BroadcastObserver::new(base_observer, event_tx.clone()));
 
     // ── Auth store + channel pairing + device router ─────────────
-    let (auth_store, channel_pairing, auth_allow_registration, device_router) =
+    let (auth_store, channel_pairing, auth_allow_registration, device_router, email_verify_service) =
         if config.auth.enabled {
             let auth_db_path = std::path::Path::new(&config.workspace_dir).join("auth.db");
             match crate::auth::store::AuthStore::new(
@@ -885,6 +887,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     // Device router for remote access
                     let router = Arc::new(remote::DeviceRouter::new());
 
+                    // Email verification service for 3rd-factor auth
+                    let email_verify = if config.auth.email_verification.enabled {
+                        let svc = crate::auth::email_verify::EmailVerifyService::new(
+                            config.auth.email_verification.clone(),
+                        );
+                        if svc.is_enabled() {
+                            tracing::info!("Email verification enabled for remote device access");
+                            Some(Arc::new(svc))
+                        } else {
+                            tracing::warn!(
+                                "Email verification enabled but SMTP not configured — disabled"
+                            );
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     tracing::info!(
                         "Multi-user auth enabled (registration={})",
                         config.auth.allow_registration,
@@ -895,15 +915,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                         channel_pairing_store,
                         config.auth.allow_registration,
                         Some(router),
+                        email_verify,
                     )
                 }
                 Err(e) => {
                     tracing::error!("Failed to initialize auth store: {e}");
-                    (None, None, false, None)
+                    (None, None, false, None, None)
                 }
             }
         } else {
-            (None, None, false, None)
+            (None, None, false, None, None)
         };
 
     let state = AppState {
@@ -944,6 +965,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         channel_pairing,
         auth_allow_registration,
         device_router,
+        email_verify_service,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1052,6 +1074,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/remote/login", post(remote::handle_remote_login))
         .route("/api/remote/devices", get(remote::handle_remote_devices))
         .route("/api/remote/logout", post(remote::handle_remote_logout))
+        .route("/api/remote/verify-email", post(remote::handle_remote_verify_email))
+        .route("/api/remote/email", put(remote::handle_remote_set_email))
         .route("/ws/remote", get(remote::handle_ws_remote))
         .route("/ws/device-link", get(remote::handle_ws_device_link))
         // ── Channel auto-pairing web flow ──

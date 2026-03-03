@@ -53,6 +53,7 @@ pub mod mcp_client;
 pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
+pub mod media_gen;
 pub mod memory_forget;
 pub mod memory_observe;
 pub mod memory_recall;
@@ -118,6 +119,8 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+#[allow(unused_imports)]
+pub use media_gen::{ImageGenTool, MusicGenTool, VideoGenTool};
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;

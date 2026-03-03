@@ -297,11 +297,18 @@ pub struct RemoteLoginRequest {
 
 #[derive(Debug, Serialize)]
 pub struct RemoteLoginResponse {
-    pub session_token: String,
+    pub session_token: Option<String>,
     pub user_id: String,
     pub device_id: String,
     pub device_name: String,
     pub device_online: bool,
+    /// When true, the client must call POST /api/remote/verify-email
+    /// with the code sent to the user's registered email.
+    #[serde(default)]
+    pub requires_email_verification: bool,
+    /// Masked email address hint (e.g. "u***@example.com") for display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_hint: Option<String>,
 }
 
 pub async fn handle_remote_login(
@@ -419,7 +426,59 @@ pub async fn handle_remote_login(
         }
     }
 
-    // 4. Create session token
+    // 4. Check if email verification is required
+    if let Some(ref email_svc) = state.email_verify_service {
+        // Email verification is enabled — send code instead of granting session
+        let email = match user.email.as_deref() {
+            Some(e) if !e.trim().is_empty() => e.trim().to_string(),
+            _ => {
+                return (
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(serde_json::json!({
+                        "error": "이메일 주소가 등록되어 있지 않습니다. 설정에서 이메일을 등록해주세요. / No email address registered. Please set your email in Settings.",
+                        "code": "NO_EMAIL"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Send verification code
+        if let Err(e) = email_svc.send_verification_code(
+            &user.id,
+            &body.device_id,
+            &email,
+            &user.username,
+        ) {
+            tracing::error!("Failed to send email verification: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "인증코드 발송에 실패했습니다. 잠시 후 다시 시도해주세요. / Failed to send verification code. Please try again."
+                })),
+            )
+                .into_response();
+        }
+
+        // Clear rate limit (credentials were valid)
+        device_router.clear_login_attempts(&client_key);
+
+        let device_online = device_router.is_device_online(&body.device_id);
+        let email_hint = mask_email(&email);
+
+        return Json(RemoteLoginResponse {
+            session_token: None,
+            user_id: user.id,
+            device_id: body.device_id.clone(),
+            device_name: device.device_name.clone(),
+            device_online,
+            requires_email_verification: true,
+            email_hint: Some(email_hint),
+        })
+        .into_response();
+    }
+
+    // 4b. No email verification — create session token directly
     let session_token = match auth_store.create_session(
         &user.id,
         Some(&body.device_id),
@@ -445,11 +504,13 @@ pub async fn handle_remote_login(
     let device_online = device_router.is_device_online(&body.device_id);
 
     Json(RemoteLoginResponse {
-        session_token,
+        session_token: Some(session_token),
         user_id: user.id,
         device_id: body.device_id.clone(),
         device_name: device.device_name.clone(),
         device_online,
+        requires_email_verification: false,
+        email_hint: None,
     })
     .into_response()
 }
@@ -1014,6 +1075,245 @@ static REMOTE_RESPONSE_CHANNELS: std::sync::LazyLock<
     Mutex<HashMap<String, mpsc::Sender<RoutedMessage>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+
+// ── Email Verification Endpoint ───────────────────────────────
+
+/// POST /api/remote/verify-email
+///
+/// Verify the email code sent during remote login.
+///
+/// Request body:
+/// ```json
+/// {
+///   "user_id": "uuid",
+///   "code": "123456"
+/// }
+/// ```
+///
+/// Response (success):
+/// ```json
+/// {
+///   "session_token": "hex_token",
+///   "user_id": "uuid",
+///   "device_id": "device_abc",
+///   "device_name": "My Phone",
+///   "device_online": true
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct EmailVerifyRequest {
+    pub user_id: String,
+    pub code: String,
+}
+
+pub async fn handle_remote_verify_email(
+    State(state): State<AppState>,
+    Json(body): Json<EmailVerifyRequest>,
+) -> impl IntoResponse {
+    let email_svc = match state.email_verify_service.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Email verification is not enabled"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Authentication service is not enabled"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let device_router = match state.device_router.as_ref() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Remote device access is not enabled"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Verify the email code
+    let device_id = match email_svc.verify_code(&body.user_id, &body.code) {
+        Ok(did) => did,
+        Err(e) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Look up device info
+    let devices = match auth_store.list_devices(&body.user_id) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to list devices after email verify: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to retrieve device information"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let device_name = devices
+        .iter()
+        .find(|d| d.device_id == device_id)
+        .map(|d| d.device_name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // Create session token (email code verified = full 3-factor auth complete)
+    let session_token = match auth_store.create_session(
+        &body.user_id,
+        Some(&device_id),
+        Some(&device_name),
+    ) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::error!("Failed to create session after email verify: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to create session"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let device_online = device_router.is_device_online(&device_id);
+
+    Json(serde_json::json!({
+        "session_token": session_token,
+        "user_id": body.user_id,
+        "device_id": device_id,
+        "device_name": device_name,
+        "device_online": device_online,
+    }))
+    .into_response()
+}
+
+// ── Email Settings Endpoint ──────────────────────────────────
+
+/// PUT /api/remote/email
+///
+/// Set or update the user's email address for verification.
+/// Requires session token in Authorization header.
+///
+/// Request body:
+/// ```json
+/// {
+///   "email": "user@example.com"
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct SetEmailRequest {
+    pub email: String,
+}
+
+pub async fn handle_remote_set_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetEmailRequest>,
+) -> impl IntoResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Authentication service is not enabled"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate session token
+    let token = extract_bearer_token(&headers).unwrap_or("");
+    let session = match auth_store.validate_session(token) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Invalid or expired session token"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Basic email format validation
+    let email = body.email.trim();
+    if email.is_empty() || !email.contains('@') || !email.contains('.') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "유효한 이메일 주소를 입력해주세요. / Please enter a valid email address."
+            })),
+        )
+            .into_response();
+    }
+
+    // Set email
+    if let Err(e) = auth_store.set_user_email(&session.user_id, email) {
+        tracing::error!("Failed to set user email: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to update email address"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "email": mask_email(email),
+    }))
+    .into_response()
+}
+
+// ── Email Masking Helper ─────────────────────────────────────
+
+/// Mask an email address for display (e.g., "user@example.com" → "u***@example.com").
+fn mask_email(email: &str) -> String {
+    let parts: Vec<&str> = email.splitn(2, '@').collect();
+    if parts.len() != 2 {
+        return "***".to_string();
+    }
+    let local = parts[0];
+    let domain = parts[1];
+    if local.len() <= 1 {
+        format!("{}***@{}", local, domain)
+    } else {
+        let visible = &local[..1];
+        format!("{}***@{}", visible, domain)
+    }
+}
 
 // ── Query parameter parsing ───────────────────────────────────────
 

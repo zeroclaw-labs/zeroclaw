@@ -14796,6 +14796,78 @@ pub struct AuthConfig {
     /// Maximum registered users (0 = unlimited, default: 0).
     #[serde(default)]
     pub max_users: u64,
+    /// Email verification for remote device access (`[auth.email_verification]`).
+    #[serde(default)]
+    pub email_verification: EmailVerificationConfig,
+}
+
+/// Email-based verification code configuration for remote device access.
+///
+/// When enabled, after successful password + device pairing code authentication,
+/// a 6-digit verification code is sent to the user's registered email address.
+/// The user must enter this code within the TTL window to complete authentication.
+/// This provides a third authentication factor to protect against full credential compromise.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EmailVerificationConfig {
+    /// Enable email verification for remote device access (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// SMTP server host for sending verification emails.
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    /// SMTP server port (default: 587 for STARTTLS).
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// SMTP username for authentication.
+    #[serde(default)]
+    pub smtp_username: Option<String>,
+    /// SMTP password for authentication.
+    #[serde(default)]
+    pub smtp_password: Option<String>,
+    /// Sender email address ("From" field).
+    #[serde(default)]
+    pub from_email: Option<String>,
+    /// Sender display name (default: "MoA Security").
+    #[serde(default = "default_email_sender_name")]
+    pub from_name: String,
+    /// Verification code TTL in seconds (default: 300 = 5 minutes).
+    #[serde(default = "default_email_verify_ttl_secs")]
+    pub code_ttl_secs: u64,
+    /// Maximum verification attempts before lockout (default: 5).
+    #[serde(default = "default_email_verify_max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_email_sender_name() -> String {
+    "MoA Security".to_string()
+}
+
+fn default_email_verify_ttl_secs() -> u64 {
+    300
+}
+
+fn default_email_verify_max_attempts() -> u32 {
+    5
+}
+
+impl Default for EmailVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: None,
+            smtp_port: default_smtp_port(),
+            smtp_username: None,
+            smtp_password: None,
+            from_email: None,
+            from_name: default_email_sender_name(),
+            code_ttl_secs: default_email_verify_ttl_secs(),
+            max_attempts: default_email_verify_max_attempts(),
+        }
+    }
 }
 
 fn default_session_ttl_secs() -> u64 {
@@ -14814,6 +14886,7 @@ impl Default for AuthConfig {
             session_ttl_secs: default_session_ttl_secs(),
             max_devices_per_user: default_max_devices_per_user(),
             max_users: 0,
+            email_verification: EmailVerificationConfig::default(),
         }
     }
 }
