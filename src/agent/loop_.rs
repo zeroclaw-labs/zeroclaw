@@ -619,11 +619,18 @@ fn stop_reason_name(reason: &NormalizedStopReason) -> &'static str {
     }
 }
 
+fn is_legacy_cron_model_fallback(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "gpt-4o-mini" | "openai/gpt-4o-mini")
+}
+
 fn maybe_inject_cron_add_delivery(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
     reply_target: Option<&str>,
+    provider_name: &str,
+    active_model: &str,
 ) {
     if tool_name != "cron_add"
         || !AUTO_CRON_DELIVERY_CHANNELS
@@ -690,6 +697,44 @@ fn maybe_inject_cron_add_delivery(
         delivery_obj.insert(
             "to".to_string(),
             serde_json::Value::String(reply_target.to_string()),
+        );
+    }
+
+    let active_model = active_model.trim();
+    if active_model.is_empty() {
+        return;
+    }
+
+    let model_missing = args_obj
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if model_missing {
+        args_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(active_model.to_string()),
+        );
+        return;
+    }
+
+    let is_custom_provider = provider_name
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("custom:");
+    if !is_custom_provider {
+        return;
+    }
+
+    let should_replace_model = args_obj
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| {
+            is_legacy_cron_model_fallback(value) && !value.trim().eq_ignore_ascii_case(active_model)
+        });
+    if should_replace_model {
+        args_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(active_model.to_string()),
         );
     }
 }
@@ -1917,6 +1962,8 @@ pub async fn run_tool_call_loop(
                 &mut tool_args,
                 channel_name,
                 channel_reply_target.as_deref(),
+                provider_name,
+                active_model.as_str(),
             );
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
@@ -3347,11 +3394,19 @@ mod tests {
             "prompt": "remind me later"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "custom:https://llm.example.com/v1",
+            "gpt-oss:20b",
+        );
 
         assert_eq!(args["delivery"]["mode"], "announce");
         assert_eq!(args["delivery"]["channel"], "telegram");
         assert_eq!(args["delivery"]["to"], "-10012345");
+        assert_eq!(args["model"], "gpt-oss:20b");
     }
 
     #[test]
@@ -3366,7 +3421,14 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert_eq!(args["delivery"]["channel"], "discord");
         assert_eq!(args["delivery"]["to"], "C123");
@@ -3379,7 +3441,14 @@ mod tests {
             "command": "echo hello"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert!(args.get("delivery").is_none());
     }
@@ -3390,7 +3459,14 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut lark_args,
+            "lark",
+            Some("oc_xxx"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(lark_args["delivery"]["channel"], "lark");
         assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
 
@@ -3398,9 +3474,56 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut feishu_args,
+            "feishu",
+            Some("oc_yyy"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(feishu_args["delivery"]["channel"], "feishu");
         assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_replaces_legacy_model_on_custom_provider() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "model": "gpt-4o-mini"
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("C123"),
+            "custom:https://somecoolai.endpoint.lan/api/v1",
+            "gpt-oss:20b",
+        );
+
+        assert_eq!(args["model"], "gpt-oss:20b");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_keeps_explicit_model_for_non_custom_provider() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "model": "gpt-4o-mini"
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("C123"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
+
+        assert_eq!(args["model"], "gpt-4o-mini");
     }
 
     #[test]
