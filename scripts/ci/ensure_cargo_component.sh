@@ -5,6 +5,8 @@ requested_toolchain="${1:-1.92.0}"
 fallback_toolchain="${2:-stable}"
 strict_mode_raw="${3:-${ENSURE_CARGO_COMPONENT_STRICT:-false}}"
 strict_mode="$(printf '%s' "${strict_mode_raw}" | tr '[:upper:]' '[:lower:]')"
+required_components_raw="${4:-${ENSURE_RUST_COMPONENTS:-auto}}"
+job_name="$(printf '%s' "${GITHUB_JOB:-}" | tr '[:upper:]' '[:lower:]')"
 
 is_truthy() {
     local value="${1:-}"
@@ -36,11 +38,17 @@ probe_rustdoc() {
 
 ensure_required_tooling() {
     local toolchain="$1"
+    local required_components="${2:-}"
 
-    # Lint and doctest jobs require both rustfmt and rustdoc to be available.
-    rustup component add --toolchain "${toolchain}" rustfmt rust-docs || true
+    if [ -z "${required_components}" ]; then
+        return 0
+    fi
 
-    if ! probe_rustfmt "${toolchain}"; then
+    for component in ${required_components}; do
+        rustup component add --toolchain "${toolchain}" "${component}" || true
+    done
+
+    if [[ " ${required_components} " == *" rustfmt "* ]] && ! probe_rustfmt "${toolchain}"; then
         echo "::error::rustfmt is unavailable for toolchain ${toolchain}."
         rustup component add --toolchain "${toolchain}" rustfmt || true
         if ! probe_rustfmt "${toolchain}"; then
@@ -48,13 +56,22 @@ ensure_required_tooling() {
         fi
     fi
 
-    if ! probe_rustdoc "${toolchain}"; then
+    if [[ " ${required_components} " == *" rust-docs "* ]] && ! probe_rustdoc "${toolchain}"; then
         echo "::error::rustdoc is unavailable for toolchain ${toolchain}."
         rustup component add --toolchain "${toolchain}" rust-docs || true
         if ! probe_rustdoc "${toolchain}"; then
             return 1
         fi
     fi
+}
+
+default_required_components() {
+    local normalized_job_name="${1:-}"
+    case "${normalized_job_name}" in
+    *lint*) echo "rustfmt" ;;
+    *test*) echo "rust-docs" ;;
+    *) echo "" ;;
+    esac
 }
 
 export_toolchain_for_next_steps() {
@@ -129,7 +146,16 @@ if is_truthy "${strict_mode}" && [ "${selected_toolchain}" != "${requested_toolc
     exit 1
 fi
 
-if ! ensure_required_tooling "${selected_toolchain}"; then
+required_components="${required_components_raw}"
+if [ "${required_components}" = "auto" ]; then
+    required_components="$(default_required_components "${job_name}")"
+fi
+
+if [ -n "${required_components}" ]; then
+    echo "Ensuring Rust components for job '${job_name:-unknown}': ${required_components}"
+fi
+
+if ! ensure_required_tooling "${selected_toolchain}" "${required_components}"; then
     echo "Required Rust tooling unavailable for ${selected_toolchain}" >&2
     rustup toolchain list || true
     exit 1
