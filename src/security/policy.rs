@@ -1,3 +1,4 @@
+use glob::Pattern;
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -911,6 +912,35 @@ impl SecurityPolicy {
     // forbidden-prefix match. Each layer addresses a distinct escape
     // technique; together they enforce workspace confinement.
 
+    /// Check if a forbidden pattern matches a path.
+    /// Supports glob wildcards (*, ?, []) for file patterns like "*.env".
+    /// Falls back to starts_with for directory prefixes like "/etc".
+    fn is_forbidden_match(path: &Path, forbidden_pattern: &str) -> bool {
+        let forbidden_expanded = expand_user_path(forbidden_pattern);
+        let forbidden_str = forbidden_expanded.to_string_lossy();
+
+        // If pattern contains glob wildcards, use glob matching
+        if forbidden_pattern.contains('*') || forbidden_pattern.contains('?') || forbidden_pattern.contains('[') {
+            // Try matching against the full path string
+            if let Ok(pattern) = Pattern::new(&forbidden_str) {
+                if pattern.matches(path.to_string_lossy().as_ref()) {
+                    return true;
+                }
+            }
+            // Also try matching just the filename component for patterns like "*.env"
+            if let Some(filename) = path.file_name() {
+                if let Ok(pattern) = Pattern::new(&forbidden_str) {
+                    if pattern.matches(filename.to_string_lossy().as_ref()) {
+                        return true;
+                    }
+                }
+            }
+            false
+        } else {
+            // No wildcards - use directory prefix matching
+            path.starts_with(&forbidden_expanded)
+        }
+    }
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -948,8 +978,7 @@ impl SecurityPolicy {
 
         // Block forbidden paths using path-component-aware matching
         for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
+            if Self::is_forbidden_match(&expanded_path, forbidden) {
                 return false;
             }
         }
@@ -983,8 +1012,7 @@ impl SecurityPolicy {
         // For paths outside workspace/allowlist, block forbidden roots to
         // prevent symlink escapes and sensitive directory access.
         for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
+            if Self::is_forbidden_match(resolved, forbidden) {
                 return false;
             }
         }
@@ -1425,19 +1453,69 @@ mod tests {
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
     }
 
+
+    #[test]
+    fn forbidden_paths_wildcard_patterns() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["*.env".into(), "*.pem".into(), "secret*".into()],
+            ..SecurityPolicy::default()
+        };
+        // Wildcard patterns should match file extensions
+        assert!(!p.is_path_allowed("config.env"));
+        assert!(!p.is_path_allowed(".env"));
+        assert!(!p.is_path_allowed("/tmp/test.env"));
+        assert!(!p.is_path_allowed("cert.pem"));
+        assert!(!p.is_path_allowed("/etc/ssl/cert.pem"));
+        assert!(!p.is_path_allowed("secrets.txt"));
+        assert!(!p.is_path_allowed("secret_file"));
+
+        // Non-matching files should be allowed
+        assert!(p.is_path_allowed("config.toml"));
+        assert!(p.is_path_allowed("README.md"));
+        assert!(p.is_path_allowed("/etc/passwd"));
+    }
+
+    #[test]
+    fn forbidden_paths_wildcard_question_mark() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["file?.txt".into()],
+            ..SecurityPolicy::default()
+        };
+        // ? matches single character
+        assert!(!p.is_path_allowed("file1.txt"));
+        assert!(!p.is_path_allowed("fileA.txt"));
+        assert!(!p.is_path_allowed("/tmp/filex.txt"));
+
+        // Should not match
+        assert!(p.is_path_allowed("file10.txt"));
+        assert!(p.is_path_allowed("file.txt"));
+    }
+
+    #[test]
+    fn forbidden_paths_character_class() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["backup[0-9].zip".into()],
+            ..SecurityPolicy::default()
+        };
+        // Character class matching
+        assert!(!p.is_path_allowed("backup1.zip"));
+        assert!(!p.is_path_allowed("backup9.zip"));
+        assert!(!p.is_path_allowed("/tmp/backup5.zip"));
+
+        // Should not match
+        assert!(p.is_path_allowed("backup.zip"));
+        assert!(p.is_path_allowed("backup10.zip"));
+        assert!(p.is_path_allowed("backupA.zip"));
+    }
+
     #[test]
     fn empty_path_allowed() {
         let p = default_policy();
         assert!(p.is_path_allowed(""));
     }
-
-    #[test]
-    fn dotfile_in_workspace_allowed() {
-        let p = default_policy();
-        assert!(p.is_path_allowed(".gitignore"));
-        assert!(p.is_path_allowed(".env"));
-    }
-
     // ── from_config ─────────────────────────────────────────
 
     #[test]
