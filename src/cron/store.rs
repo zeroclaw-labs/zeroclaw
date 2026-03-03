@@ -650,13 +650,8 @@ mod tests {
 
         let now = Utc::now();
         let scheduled_at = now + ChronoDuration::minutes(1);
-        let job = add_shell_job(
-            &config,
-            None,
-            Schedule::At { at: scheduled_at },
-            "echo due",
-        )
-        .unwrap();
+        let job =
+            add_shell_job(&config, None, Schedule::At { at: scheduled_at }, "echo due").unwrap();
 
         let due_now = due_jobs(&config, now).unwrap();
         assert!(due_now.is_empty(), "new job should not be due immediately");
