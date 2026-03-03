@@ -17,6 +17,7 @@
 //! - `events` — WebSocket event schema for client-server communication
 //! - `simul_session` — session manager tying Live API + segmentation + events
 
+pub mod conference;
 pub mod events;
 pub mod gemini_live;
 pub mod openai_realtime;
@@ -63,3 +64,5 @@ pub use pipeline::{
 pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
 #[allow(unused_imports)]
 pub use simul_session::{SimulSession, SimulSessionConfig};
+#[allow(unused_imports)]
+pub use conference::{ConferenceConfig, ConferenceManager, ConferenceRoom, ConferenceRoomSummary};

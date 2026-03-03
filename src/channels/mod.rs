@@ -44,6 +44,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod voice_features;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
