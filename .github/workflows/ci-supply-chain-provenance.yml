@@ -32,7 +32,7 @@ env:
 jobs:
     provenance:
         name: Build + Provenance Bundle
-        runs-on: ubuntu-22.04
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 60
         steps:
             - name: Checkout

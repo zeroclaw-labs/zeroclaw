@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 set_env_var() {
     local key="$1"
     local value="$2"
@@ -46,11 +48,36 @@ if command -v clang >/dev/null 2>&1; then
     exit 0
 fi
 
-if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    echo "C compiler not found. Installing build-essential via apt..."
-    sudo apt-get update
-    sudo apt-get install -y build-essential
-    configure_linker "$(command -v cc)"
+resolve_cc_after_bootstrap() {
+    if command -v cc >/dev/null 2>&1; then
+        command -v cc
+        return 0
+    fi
+
+    local shim_dir="${RUNNER_TEMP:-/tmp}/cc-shim"
+    local shim_cc="${shim_dir}/cc"
+    if [ -x "${shim_cc}" ]; then
+        export PATH="${shim_dir}:${PATH}"
+        command -v cc
+        return 0
+    fi
+
+    return 1
+}
+
+# Prefer the resilient provisioning path (package manager + Zig fallback) used by CI Rust jobs.
+if [ -x "${script_dir}/ensure_cc.sh" ]; then
+    if bash "${script_dir}/ensure_cc.sh"; then
+        if cc_path="$(resolve_cc_after_bootstrap)"; then
+            configure_linker "${cc_path}"
+            exit 0
+        fi
+        echo "::warning::C toolchain bootstrap reported success but 'cc' is still unavailable in current step."
+    fi
+fi
+
+if [ "${ALLOW_MISSING_C_TOOLCHAIN:-}" = "1" ] || [ "${ALLOW_MISSING_C_TOOLCHAIN:-}" = "true" ]; then
+    echo "::warning::No usable C compiler found; continuing because ALLOW_MISSING_C_TOOLCHAIN is enabled."
     exit 0
 fi
 
