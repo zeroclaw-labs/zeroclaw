@@ -24,6 +24,9 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 /// Default media type for MCP JSON-RPC request bodies.
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
 
+/// Header name for MCP session ID (set by server, echoed by client).
+const HEADER_MCP_SESSION_ID: &str = "MCP-Session-Id";
+
 // ── Transport Trait ──────────────────────────────────────────────────────
 
 /// Abstract transport for MCP communication.
@@ -177,25 +180,8 @@ impl McpTransportConn for HttpTransport {
     async fn send_and_recv(&mut self, request: &JsonRpcRequest) -> Result<JsonRpcResponse> {
         let body = serde_json::to_string(request)?;
 
-        let has_accept = self
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("Accept"));
-        let has_content_type = self
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("Content-Type"));
-
-        let mut req = self.client.post(&self.url).body(body);
-        if !has_content_type {
-            req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
-        }
-        for (key, value) in &self.headers {
-            req = req.header(key, value);
-        }
-        if !has_accept {
-            req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
-        }
+        let req = self.client.post(&self.url).body(body);
+        let req = apply_mcp_headers(req, &self.headers, true);
 
         let resp = req
             .send()
@@ -204,6 +190,16 @@ impl McpTransportConn for HttpTransport {
 
         if !resp.status().is_success() {
             bail!("MCP server returned HTTP {}", resp.status());
+        }
+
+        if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
+            if let Ok(id_str) = session_id.to_str() {
+                if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
+                    tracing::debug!("MCP HTTP: captured session id <redacted>");
+                }
+                self.headers
+                    .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
+            }
         }
 
         if request.id.is_none() {
@@ -298,21 +294,11 @@ impl SseTransport {
             }
         }
 
-        let has_accept = self
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("Accept"));
-
-        let mut req = self
+        let req = self
             .client
             .get(&self.sse_url)
             .header("Cache-Control", "no-cache");
-        for (key, value) in &self.headers {
-            req = req.header(key, value);
-        }
-        if !has_accept {
-            req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
-        }
+        let req = apply_mcp_headers(req, &self.headers, false);
 
         let resp = req.send().await.context("SSE GET to MCP server failed")?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND
@@ -323,6 +309,18 @@ impl SseTransport {
         }
         if !resp.status().is_success() {
             return Err(anyhow!("MCP server returned HTTP {}", resp.status()));
+        }
+        if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
+            if let Ok(id_str) = session_id.to_str() {
+                if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
+                    tracing::debug!(
+                        "MCP SSE `{}`: captured session id <redacted>",
+                        self.server_name,
+                    );
+                }
+                self.headers
+                    .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
+            }
         }
         let is_event_stream = resp
             .headers()
@@ -459,6 +457,28 @@ struct SseSharedState {
     message_url: Option<String>,
     message_url_from_endpoint: bool,
     pending: std::collections::HashMap<u64, oneshot::Sender<JsonRpcResponse>>,
+}
+
+fn apply_mcp_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: &std::collections::HashMap<String, String>,
+    ensure_json_content_type: bool,
+) -> reqwest::RequestBuilder {
+    let has_accept = headers.keys().any(|k| k.eq_ignore_ascii_case("Accept"));
+    let has_content_type = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("Content-Type"));
+
+    if ensure_json_content_type && !has_content_type {
+        builder = builder.header("Content-Type", MCP_JSON_CONTENT_TYPE);
+    }
+    for (key, value) in headers {
+        builder = builder.header(key, value);
+    }
+    if !has_accept {
+        builder = builder.header("Accept", MCP_STREAMABLE_ACCEPT);
+    }
+    builder
 }
 
 fn derive_message_url(sse_url: &str, message_path: &str) -> Option<String> {
@@ -738,28 +758,12 @@ impl McpTransportConn for SseTransport {
             .chain(secondary_url.into_iter())
             .enumerate()
         {
-            let has_accept = self
-                .headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("Accept"));
-            let has_content_type = self
-                .headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("Content-Type"));
-            let mut req = self
+            let req = self
                 .client
                 .post(&url)
                 .timeout(Duration::from_secs(120))
                 .body(body.clone());
-            if !has_content_type {
-                req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
-            }
-            for (key, value) in &self.headers {
-                req = req.header(key, value);
-            }
-            if !has_accept {
-                req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
-            }
+            let req = apply_mcp_headers(req, &self.headers, true);
 
             let resp = req.send().await.context("SSE POST to MCP server failed")?;
             let status = resp.status();
@@ -774,6 +778,19 @@ impl McpTransportConn for SseTransport {
 
             if !status.is_success() {
                 break;
+            }
+
+            if let Some(session_id) = resp.headers().get(HEADER_MCP_SESSION_ID) {
+                if let Ok(id_str) = session_id.to_str() {
+                    if !self.headers.contains_key(HEADER_MCP_SESSION_ID) {
+                        tracing::debug!(
+                            "MCP SSE `{}`: captured session id <redacted>",
+                            self.server_name,
+                        );
+                    }
+                    self.headers
+                        .insert(HEADER_MCP_SESSION_ID.to_string(), id_str.to_string());
+                }
             }
 
             if request.id.is_none() {
@@ -987,5 +1004,10 @@ mod tests {
     #[test]
     fn test_parse_jsonrpc_response_text_rejects_empty_payload() {
         assert!(parse_jsonrpc_response_text(" \n\t ").is_err());
+    }
+
+    #[test]
+    fn header_mcp_session_id_matches_protocol_format() {
+        assert_eq!(HEADER_MCP_SESSION_ID, "MCP-Session-Id");
     }
 }
