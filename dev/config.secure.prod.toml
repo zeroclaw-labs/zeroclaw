@@ -1,0 +1,49 @@
+# Secure production baseline template for ZeroClaw.
+# Copy to ~/.zeroclaw/config.toml and merge provider/channel specifics as needed.
+
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[secrets]
+encrypt = true
+
+[gateway]
+host = "127.0.0.1"
+port = 42617
+require_pairing = true
+allow_public_bind = false
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+block_high_risk_commands = true
+require_approval_for_medium_risk = true
+allow_sensitive_file_reads = false
+allow_sensitive_file_writes = false
+
+[skills]
+open_skills_enabled = false
+allow_scripts = false
+prompt_injection_mode = "compact"
+trusted_skill_roots = ["/opt/zeroclaw/skills-trusted"]
+
+[security.url_access]
+block_private_ip = true
+allow_loopback = false
+enforce_domain_allowlist = true
+domain_allowlist = ["api.openai.com", "openrouter.ai"]
+domain_blocklist = []
+
+# Optional hardening controls:
+#
+#[security.otp]
+#enabled = true
+#method = "totp"
+#token_ttl_secs = 30
+#cache_valid_secs = 300
+#gated_actions = ["shell", "browser_open"]
+#
+#[security.estop]
+#enabled = true
+#require_otp_to_resume = true
