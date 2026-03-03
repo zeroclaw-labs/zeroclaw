@@ -462,6 +462,12 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
+Notes:
+
+- Private replies use `POST /v1.0/robot/oToMessages/batchSend` by default.
+- If DingTalk returns `code = "chatbotId.notAllow.sendOTO"` and a `sessionWebhook` is cached for the same chat, ZeroClaw automatically falls back to replying via that `sessionWebhook`.
+- Proactive outbound private messages without a prior inbound chat session still require OTO permission.
+
 ### 4.15 QQ
 
 ```toml

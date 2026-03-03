@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
+const DINGTALK_OTO_NOT_ALLOWED_CODE: &str = "chatbotId.notAllow.sendOTO";
 
 /// Cached access token with expiry time
 #[derive(Clone)]
@@ -247,6 +248,69 @@ impl DingTalkChannel {
         }
     }
 
+    fn parse_app_error(resp_text: &str) -> Option<(String, String)> {
+        let json = serde_json::from_str::<serde_json::Value>(resp_text).ok()?;
+        let code =
+            json.get("errcode")
+                .or_else(|| json.get("code"))
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.to_string()),
+                    _ => None,
+                })?;
+        let message = json
+            .get("errmsg")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("message").and_then(|v| v.as_str()))
+            .unwrap_or("unknown error")
+            .to_string();
+        Some((code, message))
+    }
+
+    fn should_fallback_to_session_webhook(recipient: &str, resp_text: &str) -> bool {
+        !Self::is_group_recipient(recipient)
+            && Self::parse_app_error(resp_text)
+                .map(|(code, _)| code == DINGTALK_OTO_NOT_ALLOWED_CODE)
+                .unwrap_or(false)
+    }
+
+    async fn send_via_session_webhook(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let webhook_url = {
+            let webhooks = self.session_webhooks.read().await;
+            webhooks.get(&message.recipient).cloned()
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No session webhook found for chat {}. \
+                 The user must send a message first to establish a session.",
+                message.recipient
+            )
+        })?;
+
+        let title = message.subject.as_deref().unwrap_or("ZeroClaw");
+        let body = serde_json::json!({
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": message.content,
+            }
+        });
+
+        let resp = self
+            .http_client()
+            .post(webhook_url)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("DingTalk webhook reply failed ({status}): {sanitized}");
+        }
+        Ok(())
+    }
+
     /// Register a connection with DingTalk's gateway to get a WebSocket endpoint.
     async fn register_connection(&self) -> anyhow::Result<GatewayResponse> {
         let body = serde_json::json!({
@@ -329,22 +393,38 @@ impl Channel for DingTalkChannel {
         let resp_text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            if Self::should_fallback_to_session_webhook(&message.recipient, &resp_text) {
+                tracing::warn!(
+                    recipient = %message.recipient,
+                    "DingTalk OTO send is not allowed, falling back to session webhook reply"
+                );
+                return self.send_via_session_webhook(message).await.map_err(|fallback_err| {
+                    anyhow::anyhow!(
+                        "DingTalk API send failed ({status}): {}; fallback via sessionWebhook also failed: {fallback_err}",
+                        crate::providers::sanitize_api_error(&resp_text)
+                    )
+                });
+            }
             let sanitized = crate::providers::sanitize_api_error(&resp_text);
             anyhow::bail!("DingTalk API send failed ({status}): {sanitized}");
         }
 
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
-            let app_code = json
-                .get("errcode")
-                .and_then(|v| v.as_i64())
-                .or_else(|| json.get("code").and_then(|v| v.as_i64()))
-                .unwrap_or(0);
-            if app_code != 0 {
-                let app_msg = json
-                    .get("errmsg")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| json.get("message").and_then(|v| v.as_str()))
-                    .unwrap_or("unknown error");
+        if let Some((app_code, app_msg)) = Self::parse_app_error(&resp_text) {
+            if app_code != "0" {
+                if Self::should_fallback_to_session_webhook(&message.recipient, &resp_text) {
+                    tracing::warn!(
+                        recipient = %message.recipient,
+                        "DingTalk OTO send was rejected, falling back to session webhook reply"
+                    );
+                    return self.send_via_session_webhook(message).await.map_err(|fallback_err| {
+                        anyhow::anyhow!(
+                            "DingTalk API send rejected (code={}): {}; fallback via sessionWebhook also failed: {}",
+                            app_code,
+                            app_msg,
+                            fallback_err
+                        )
+                    });
+                }
                 anyhow::bail!("DingTalk API send rejected (code={app_code}): {app_msg}");
             }
         }
@@ -588,6 +668,33 @@ client_secret = "secret"
         });
         let chat_id = DingTalkChannel::resolve_chat_id(&data, "staff-1");
         assert_eq!(chat_id, "cid-group");
+    }
+
+    #[test]
+    fn should_fallback_to_session_webhook_for_oto_permission_error() {
+        let resp =
+            r#"{"code":"chatbotId.notAllow.sendOTO","message":"robot is disabled or not enabled"}"#;
+        assert!(DingTalkChannel::should_fallback_to_session_webhook(
+            "112954", resp
+        ));
+    }
+
+    #[test]
+    fn should_not_fallback_to_session_webhook_for_group_recipient() {
+        let resp =
+            r#"{"code":"chatbotId.notAllow.sendOTO","message":"robot is disabled or not enabled"}"#;
+        assert!(!DingTalkChannel::should_fallback_to_session_webhook(
+            "cidabc123",
+            resp
+        ));
+    }
+
+    #[test]
+    fn should_not_fallback_to_session_webhook_for_other_error_code() {
+        let resp = r#"{"code":"chatbotId.permission.denied","message":"permission denied"}"#;
+        assert!(!DingTalkChannel::should_fallback_to_session_webhook(
+            "112954", resp
+        ));
     }
 
     #[test]
