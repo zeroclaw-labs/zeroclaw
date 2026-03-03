@@ -2427,6 +2427,38 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
+async fn register_mcp_tools_if_enabled(config: &Config, tools_registry: &mut Vec<Box<dyn Tool>>) {
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(count = config.mcp.servers.len(), "Initializing MCP client");
+        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let names = registry.tool_names();
+                let mut registered = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let server_env = registry.get_server_env(&name).await;
+                        let wrapper = tools::McpToolWrapper::new(
+                            name,
+                            def,
+                            std::sync::Arc::clone(&registry),
+                            &server_env,
+                        );
+                        tools_registry.push(Box::new(wrapper));
+                        registered += 1;
+                    }
+                }
+                tracing::info!(
+                    registered,
+                    servers = registry.server_count(),
+                    "MCP tools registered"
+                );
+            }
+            Err(e) => tracing::error!("MCP registry failed to initialize: {e:#}"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 /// Run the agent loop with the given configuration.
 ///
@@ -2509,6 +2541,8 @@ pub async fn run(
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
     }
+
+    register_mcp_tools_if_enabled(&config, &mut tools_registry).await;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -3133,6 +3167,7 @@ pub async fn process_message_with_session(
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+    register_mcp_tools_if_enabled(&config, &mut tools_registry).await;
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = crate::config::resolve_default_model_id(

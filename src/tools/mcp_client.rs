@@ -2,7 +2,7 @@
 //!
 //! Supports multiple transports: stdio (spawn local process), HTTP, and SSE.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -155,6 +155,8 @@ impl McpServer {
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let mut inner = self.inner.lock().await;
+        let arguments = Self::inject_env_args(&inner.config.env, arguments);
+
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let req = JsonRpcRequest::new(
             id,
@@ -193,6 +195,58 @@ impl McpServer {
             bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
         }
         Ok(resp.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Returns true if `key` looks like a credential parameter.
+    pub fn is_credential_like_key(key: &str) -> bool {
+        let k = key.to_ascii_lowercase();
+        k.contains("token")
+            || k.contains("secret")
+            || k.contains("password")
+            || k.contains("api_key")
+            || k.contains("apikey")
+            || k.contains("credential")
+            || k.contains("bearer")
+            || k == "client_id"
+            || k == "client_secret"
+    }
+
+    /// Inject credential-like `env` values into matching tool arguments (case-insensitive).
+    fn inject_env_args(
+        env: &HashMap<String, String>,
+        mut arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        if env.is_empty() {
+            return arguments;
+        }
+        if let serde_json::Value::Object(ref mut map) = arguments {
+            let env_lower: HashMap<String, (&str, &str)> = env
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), (k.as_str(), v.as_str())))
+                .collect();
+
+            for (param_key, param_val) in map.iter_mut() {
+                let key_lc = param_key.to_ascii_lowercase();
+                if !Self::is_credential_like_key(&key_lc) {
+                    continue;
+                }
+                if let Some((_orig_key, env_val)) = env_lower.get(&key_lc) {
+                    *param_val = serde_json::Value::String(env_val.to_string());
+                }
+            }
+
+            let existing_keys: HashSet<String> =
+                map.keys().map(|k| k.to_ascii_lowercase()).collect();
+            for (key_lc, (_orig_key, env_val)) in &env_lower {
+                if Self::is_credential_like_key(key_lc) && !existing_keys.contains(key_lc) {
+                    map.insert(
+                        key_lc.clone(),
+                        serde_json::Value::String(env_val.to_string()),
+                    );
+                }
+            }
+        }
+        arguments
     }
 }
 
@@ -251,6 +305,19 @@ impl McpRegistry {
             .iter()
             .find(|t| &t.name == original_name)
             .cloned()
+    }
+
+    pub async fn get_server_env(&self, prefixed_name: &str) -> HashMap<String, String> {
+        match self.tool_index.get(prefixed_name) {
+            Some((server_idx, _)) => self.servers[*server_idx]
+                .inner
+                .lock()
+                .await
+                .config
+                .env
+                .clone(),
+            None => HashMap::new(),
+        }
     }
 
     /// Execute a tool by prefixed name.
@@ -353,5 +420,60 @@ mod tests {
         };
         let result = create_transport(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn inject_env_args_overwrites_matching_keys() {
+        let mut env = HashMap::new();
+        env.insert("GITLAB_TOKEN".to_string(), "real-token-123".to_string());
+
+        let args = json!({
+            "gitlab_token": "placeholder",
+            "project_id": "my-project"
+        });
+
+        let result = McpServer::inject_env_args(&env, args);
+        assert_eq!(result["gitlab_token"], "real-token-123");
+        assert_eq!(result["project_id"], "my-project");
+    }
+
+    #[test]
+    fn inject_env_args_no_match_leaves_args_unchanged() {
+        let mut env = HashMap::new();
+        env.insert("OTHER_KEY".to_string(), "value".to_string());
+
+        let args = json!({
+            "gitlab_token": "original",
+            "project_id": "my-project"
+        });
+
+        let result = McpServer::inject_env_args(&env, args);
+        assert_eq!(result["gitlab_token"], "original");
+    }
+
+    #[test]
+    fn inject_env_args_skips_non_credential_keys() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/injected".to_string());
+        env.insert("API_KEY".to_string(), "real-key".to_string());
+
+        let args = json!({
+            "path": "/original",
+            "api_key": "placeholder"
+        });
+
+        let result = McpServer::inject_env_args(&env, args);
+        // PATH should NOT be injected (not credential-like)
+        assert_eq!(result["path"], "/original");
+        // API_KEY should be injected (credential-like)
+        assert_eq!(result["api_key"], "real-key");
+    }
+
+    #[test]
+    fn inject_env_args_empty_env_is_noop() {
+        let env = HashMap::new();
+        let args = json!({"key": "val"});
+        let result = McpServer::inject_env_args(&env, args.clone());
+        assert_eq!(result, args);
     }
 }
