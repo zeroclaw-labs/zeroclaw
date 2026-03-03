@@ -12,10 +12,44 @@ import (
   "net/url"
   "os"
   "strings"
+  "sync"
   "time"
 
   "github.com/gorilla/websocket"
 )
+
+// sseWriter synchronizes writes to an http.ResponseWriter so that the
+// keepalive goroutine and the main relay loop never interleave output.
+type sseWriter struct {
+  mu      sync.Mutex
+  w       http.ResponseWriter
+  flusher http.Flusher
+}
+
+func (s *sseWriter) WriteEvent(data []byte) {
+  s.mu.Lock()
+  defer s.mu.Unlock()
+  _, _ = s.w.Write([]byte("data: "))
+  _, _ = s.w.Write(data)
+  _, _ = s.w.Write([]byte("\n\n"))
+  s.flusher.Flush()
+}
+
+func (s *sseWriter) WriteRaw(line []byte, flush bool) {
+  s.mu.Lock()
+  defer s.mu.Unlock()
+  _, _ = s.w.Write(line)
+  if flush {
+    s.flusher.Flush()
+  }
+}
+
+func (s *sseWriter) WriteKeepalive() {
+  s.mu.Lock()
+  defer s.mu.Unlock()
+  _, _ = s.w.Write([]byte(": keepalive\n\n"))
+  s.flusher.Flush()
+}
 
 type rpcRequest struct {
   JSONRPC string          `json:"jsonrpc"`
@@ -251,6 +285,20 @@ func enrichAttachments(ctx context.Context, account string, raw json.RawMessage)
 		}
 	}
 
+	// Normalize receipt type: signal-cli uses isDelivery/isRead booleans
+	// but zeroclaw expects a "type" string field.
+	if rm, ok := envelope["receiptMessage"].(map[string]any); ok {
+		if _, hasType := rm["type"]; !hasType {
+			if isRead, _ := rm["isRead"].(bool); isRead {
+				rm["type"] = "READ"
+			} else if isDel, _ := rm["isDelivery"].(bool); isDel {
+				rm["type"] = "DELIVERY"
+			} else if isViewed, _ := rm["isViewed"].(bool); isViewed {
+				rm["type"] = "VIEWED"
+			}
+		}
+	}
+
 	enriched, err := json.Marshal(obj)
 	if err != nil {
 		return raw
@@ -279,34 +327,65 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
   w.Header().Set("Connection", "keep-alive")
   w.WriteHeader(http.StatusOK)
 
+  sw := &sseWriter{w: w, flusher: flusher}
+
   // Initial comment to ensure clients treat this as an open SSE stream.
-  _, _ = w.Write([]byte(": connected\n\n"))
-  flusher.Flush()
+  sw.WriteRaw([]byte(": connected\n\n"), true)
 
   log.Printf("events stream opened account=%s remote=%s", account, r.RemoteAddr)
+
+  // SSE is the primary transport. On clean disconnect (daemon restart,
+  // upstream reconnect) retry immediately with a brief backoff instead of
+  // cascading through websocket/polling which adds 40+ seconds of blackout.
+  consecutiveSSEFailures := 0
   for {
-    if err := streamEventsFromSSEEndpoint(r.Context(), account, w, flusher); err != nil {
-      log.Printf("events native sse mode failed account=%s err=%v; trying websocket", account, err)
-    } else if r.Context().Err() != nil {
+    if r.Context().Err() != nil {
       log.Printf("events stream closed account=%s", account)
       return
     }
 
-    if err := streamEventsOverWebsocket(r.Context(), account, w, flusher); err != nil {
-      log.Printf("events websocket mode failed account=%s err=%v; falling back to polling", account, err)
-      if err := streamEventsByPolling(r.Context(), account, w, flusher); err != nil {
-        log.Printf("events polling mode failed account=%s err=%v", account, err)
+    err := streamEventsFromSSEEndpoint(r.Context(), account, sw)
+    if r.Context().Err() != nil {
+      log.Printf("events stream closed account=%s", account)
+      return
+    }
+
+    if err == nil {
+      // Clean disconnect (EOF): daemon likely restarted. Retry SSE quickly.
+      consecutiveSSEFailures = 0
+      log.Printf("events sse stream ended cleanly account=%s; reconnecting in 1s", account)
+      time.Sleep(1 * time.Second)
+      continue
+    }
+
+    consecutiveSSEFailures++
+    log.Printf("events sse failed account=%s err=%v (consecutive=%d)", account, err, consecutiveSSEFailures)
+
+    // Only fall through to websocket/polling after repeated SSE failures.
+    if consecutiveSSEFailures < 3 {
+      time.Sleep(time.Duration(consecutiveSSEFailures) * time.Second)
+      continue
+    }
+
+    // SSE is persistently broken; try websocket then polling.
+    if wsErr := streamEventsOverWebsocket(r.Context(), account, sw); wsErr != nil {
+      log.Printf("events websocket failed account=%s err=%v; falling back to polling", account, wsErr)
+      if pollErr := streamEventsByPolling(r.Context(), account, sw); pollErr != nil {
+        log.Printf("events polling failed account=%s err=%v", account, pollErr)
       }
     }
     if r.Context().Err() != nil {
       log.Printf("events stream closed account=%s", account)
       return
     }
+
+    // Reset counter so we try SSE again at the top of the loop.
+    consecutiveSSEFailures = 0
     time.Sleep(2 * time.Second)
   }
 }
 
-func streamEventsFromSSEEndpoint(ctx context.Context, account string, w http.ResponseWriter, flusher http.Flusher) error {
+func streamEventsFromSSEEndpoint(ctx context.Context, account string, sw *sseWriter) error {
   sseURL := fmt.Sprintf("%s/api/v1/events?account=%s", bridgeURL, url.QueryEscape(account))
   req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
   if err != nil {
@@ -335,52 +414,45 @@ func streamEventsFromSSEEndpoint(ctx context.Context, account string, w http.Res
       case <-ctx.Done():
         return
       case <-keepaliveTicker.C:
-        _, _ = w.Write([]byte(": keepalive\n\n"))
-        flusher.Flush()
+        sw.WriteKeepalive()
       }
     }
   }()
 
-	scanner := bufio.NewScanner(resp.Body)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	var dataBuf strings.Builder
-	for scanner.Scan() {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		line := scanner.Text()
+  scanner := bufio.NewScanner(resp.Body)
+  buf := make([]byte, 0, 64*1024)
+  scanner.Buffer(buf, 1024*1024)
+  var dataBuf strings.Builder
+  for scanner.Scan() {
+    if ctx.Err() != nil {
+      return ctx.Err()
+    }
+    line := scanner.Text()
 
-		// Buffer data lines; enrich and flush on blank line (end of event).
-		if strings.HasPrefix(line, "data:") {
-			dataBuf.WriteString(strings.TrimPrefix(line, "data:"))
-			continue
-		}
-		if line == "" && dataBuf.Len() > 0 {
-			raw := json.RawMessage(strings.TrimSpace(dataBuf.String()))
-			dataBuf.Reset()
-			enriched := enrichAttachments(ctx, account, raw)
-			_, _ = w.Write([]byte("data: "))
-			_, _ = w.Write(enriched)
-			_, _ = w.Write([]byte("\n\n"))
-			flusher.Flush()
-			continue
-		}
+    // Buffer data lines; enrich and flush on blank line (end of event).
+    if after, ok := strings.CutPrefix(line, "data:"); ok {
+      dataBuf.WriteString(after)
+      continue
+    }
+    if line == "" && dataBuf.Len() > 0 {
+      raw := json.RawMessage(strings.TrimSpace(dataBuf.String()))
+      dataBuf.Reset()
+      enriched := enrichAttachments(ctx, account, raw)
+      sw.WriteEvent(enriched)
+      continue
+    }
 
-		// Pass through comments and other lines as-is.
-		_, _ = w.Write([]byte(line))
-		_, _ = w.Write([]byte("\n"))
-		if line == "" || strings.HasPrefix(line, ":") {
-			flusher.Flush()
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return nil
+    // Pass through comments and other lines as-is.
+    flush := line == "" || strings.HasPrefix(line, ":")
+    sw.WriteRaw(append([]byte(line), '\n'), flush)
+  }
+  if err := scanner.Err(); err != nil {
+    return err
+  }
+  return nil
 }
 
-func streamEventsOverWebsocket(ctx context.Context, account string, w http.ResponseWriter, flusher http.Flusher) error {
+func streamEventsOverWebsocket(ctx context.Context, account string, sw *sseWriter) error {
   wsBase := strings.Replace(strings.Replace(bridgeURL, "https://", "wss://", 1), "http://", "ws://", 1)
   wsURL := fmt.Sprintf("%s/v1/receive/%s", wsBase, url.PathEscape(account))
   log.Printf("events websocket connect account=%s url=%s", account, wsURL)
@@ -408,19 +480,16 @@ func streamEventsOverWebsocket(ctx context.Context, account string, w http.Respo
       continue
     }
 
-		enriched := enrichAttachments(ctx, account, json.RawMessage(msg))
-		payload, ok := toSSEPayload(enriched)
-		if !ok {
-			continue
-		}
-		_, _ = w.Write([]byte("data: "))
-		_, _ = w.Write(payload)
-		_, _ = w.Write([]byte("\n\n"))
-		flusher.Flush()
-	}
+    enriched := enrichAttachments(ctx, account, json.RawMessage(msg))
+    payload, ok := toSSEPayload(enriched)
+    if !ok {
+      continue
+    }
+    sw.WriteEvent(payload)
+  }
 }
 
-func streamEventsByPolling(ctx context.Context, account string, w http.ResponseWriter, flusher http.Flusher) error {
+func streamEventsByPolling(ctx context.Context, account string, sw *sseWriter) error {
   ticker := time.NewTicker(15 * time.Second)
   defer ticker.Stop()
 
@@ -432,8 +501,7 @@ func streamEventsByPolling(ctx context.Context, account string, w http.ResponseW
     case <-ctx.Done():
       return ctx.Err()
     case <-ticker.C:
-      _, _ = w.Write([]byte(": keepalive\n\n"))
-      flusher.Flush()
+      sw.WriteKeepalive()
     default:
     }
 
@@ -471,16 +539,13 @@ func streamEventsByPolling(ctx context.Context, account string, w http.ResponseW
       arr = []json.RawMessage{trimmed}
     }
 
-		for _, item := range arr {
-			enriched := enrichAttachments(ctx, account, item)
-			payload, ok := toSSEPayload(enriched)
+    for _, item := range arr {
+      enriched := enrichAttachments(ctx, account, item)
+      payload, ok := toSSEPayload(enriched)
       if !ok {
         continue
       }
-      _, _ = w.Write([]byte("data: "))
-      _, _ = w.Write(payload)
-      _, _ = w.Write([]byte("\n\n"))
-      flusher.Flush()
+      sw.WriteEvent(payload)
     }
   }
 }
@@ -550,7 +615,13 @@ func handleRPC(w http.ResponseWriter, r *http.Request) {
       writeRPC(w, http.StatusBadGateway, rpcResponse{JSONRPC: "2.0", Error: daemonResp.Error, ID: req.ID})
       return
     }
-    writeRPC(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", Result: map[string]bool{"ok": true}, ID: req.ID})
+    // Forward daemon result (includes sent-message timestamp for receipt correlation);
+    // fall back to {"ok": true} if the response couldn't be parsed.
+    result := daemonResp.Result
+    if result == nil {
+      result = map[string]bool{"ok": true}
+    }
+    writeRPC(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
 
   case "sendTyping":
     // signal-cli-rest-api has no dedicated typing endpoint; keep this as a successful no-op.
