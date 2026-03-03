@@ -179,6 +179,8 @@ jobs:
               with:
                   context: .
                   push: true
+                  build-args: |
+                      ZEROCLAW_CARGO_ALL_FEATURES=true
                   tags: ${{ steps.meta.outputs.tags }}
                   platforms: linux/amd64,linux/arm64
                   cache-from: type=gha
