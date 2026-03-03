@@ -155,6 +155,30 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Check whether a chat JID is allowed by the `allowed_groups` policy.
+///
+/// Tokens are evaluated as a union:
+/// - `"*"` — allow all chats (groups and DMs)
+/// - `"dm"` — allow direct messages
+/// - explicit JID — allow the matching group (prefix or full JID match)
+///
+/// An empty `allowed_groups` slice should be treated as "allow all" by the
+/// caller; this function assumes the list is non-empty.
+#[cfg(feature = "whatsapp-web")]
+fn is_chat_allowed(chat: &str, sender: &str, allowed_groups: &[String]) -> bool {
+    let chat_prefix = chat.split('@').next().unwrap_or("");
+    let is_dm = chat.ends_with("@s.whatsapp.net") || chat_prefix == sender;
+
+    let allow_all = allowed_groups.iter().any(|g| g == "*");
+    let allow_dm = allowed_groups.iter().any(|g| g == "dm");
+    let explicit_match = allowed_groups.iter().any(|g| {
+        let g_id = g.split('@').next().unwrap_or("");
+        g_id == chat_prefix || g == chat
+    });
+
+    allow_all || (is_dm && allow_dm) || explicit_match
+}
+
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
@@ -556,33 +580,14 @@ impl Channel for WhatsAppWebChannel {
                             };
 
                             if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
-                                // Group filtering: check if chat is allowed
-                                // DMs use @s.whatsapp.net or sender@lid; groups use @g.us or groupid@lid
-                                let chat_prefix = chat.split('@').next().unwrap_or("");
-                                let is_dm = chat.ends_with("@s.whatsapp.net")
-                                    || chat_prefix == &sender;
-                                if !allowed_groups.is_empty() {
-                                    let group_allowed = if allowed_groups.iter().any(|g| g == "*") {
-                                        // Wildcard: allow all groups (and DMs)
-                                        true
-                                    } else if allowed_groups.iter().any(|g| g == "dm") {
-                                        // "dm" mode: only allow DMs (non-group chats)
-                                        is_dm
-                                    } else {
-                                        // Explicit list: allow listed group JIDs + all DMs
-                                        // Match by numeric prefix to handle both @g.us and @lid suffixes
-                                        is_dm || allowed_groups.iter().any(|g| {
-                                            let g_id = g.split('@').next().unwrap_or("");
-                                            g_id == chat_prefix || g == &chat
-                                        })
-                                    };
-                                    if !group_allowed {
-                                        tracing::warn!(
-                                            "WhatsApp Web: chat {} not in allowed_groups, ignoring message from {}",
-                                            chat, normalized
-                                        );
-                                        return;
-                                    }
+                                if !allowed_groups.is_empty()
+                                    && !is_chat_allowed(&chat, &sender, &allowed_groups)
+                                {
+                                    tracing::debug!(
+                                        "WhatsApp Web: chat {} not in allowed_groups, ignoring message from {}",
+                                        chat, normalized
+                                    );
+                                    return;
                                 }
 
                                 let trimmed = text.trim();
@@ -853,7 +858,8 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()], vec![]);
+        let ch =
+            WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()], vec![]);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -952,5 +958,90 @@ mod tests {
         let (text, attachments) = parse_wa_attachment_markers(msg);
         assert_eq!(text, "Check [UNKNOWN:/foo] out");
         assert!(attachments.is_empty());
+    }
+
+    // ── allowed_groups policy matrix ───────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_wildcard_allows_all() {
+        let groups = vec!["*".into()];
+        assert!(is_chat_allowed("120363@g.us", "sender1", &groups));
+        assert!(is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_dm_only() {
+        let groups = vec!["dm".into()];
+        assert!(is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+        assert!(!is_chat_allowed("120363@g.us", "sender1", &groups));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_explicit_jid() {
+        let groups = vec!["120363407513744860@g.us".into()];
+        assert!(is_chat_allowed(
+            "120363407513744860@g.us",
+            "sender1",
+            &groups
+        ));
+        assert!(!is_chat_allowed("999999@g.us", "sender1", &groups));
+        // Explicit JID list also allows DMs (union with implicit DM pass-through
+        // is NOT enabled — only listed entries match)
+        assert!(!is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_dm_plus_explicit_jid() {
+        // This is the case that was broken before the fix: "dm" must not
+        // short-circuit and reject the explicit group JID.
+        let groups = vec!["120363407513744860@g.us".into(), "dm".into()];
+        assert!(is_chat_allowed(
+            "120363407513744860@g.us",
+            "sender1",
+            &groups
+        ));
+        assert!(is_chat_allowed(
+            "sender1@s.whatsapp.net",
+            "sender1",
+            &groups
+        ));
+        assert!(!is_chat_allowed("999999@g.us", "sender1", &groups));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_prefix_match_across_jid_suffixes() {
+        // Same numeric prefix with @g.us config should match @lid at runtime
+        let groups = vec!["120363407513744860@g.us".into()];
+        assert!(is_chat_allowed(
+            "120363407513744860@lid",
+            "sender1",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_allowed_dm_detection_lid_format() {
+        // When sender prefix matches chat prefix, it's a DM even with @lid suffix
+        let groups = vec!["dm".into()];
+        assert!(is_chat_allowed("sender1@lid", "sender1", &groups));
+        assert!(!is_chat_allowed("othergroup@lid", "sender1", &groups));
     }
 }

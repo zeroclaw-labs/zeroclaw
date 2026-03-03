@@ -3789,8 +3789,11 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
-    /// Allowed group JIDs (e.g. "120363407513744860@g.us") or "*" for all groups.
-    /// If empty, all groups are allowed. Use ["dm"] to restrict to direct messages only.
+    /// Allowed group JIDs (e.g. "120363407513744860@g.us"), or special tokens.
+    /// Tokens are additive (union): `"*"` = all chats, `"dm"` = direct messages,
+    /// explicit JIDs = matching groups. Combine freely: `["dm", "123@g.us"]`.
+    /// Default (empty) = allow all chats (backward-compatible).
+    /// Rollback: remove key or set to `[]` to restore allow-all behavior.
     #[serde(default)]
     pub allowed_groups: Vec<String>,
 }
@@ -7970,6 +7973,7 @@ channel_id = "C123"
         let json = r#"{"access_token":"tok","phone_number_id":"123","verify_token":"ver"}"#;
         let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_numbers.is_empty());
+        assert!(parsed.allowed_groups.is_empty());
     }
 
     #[test]
