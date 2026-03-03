@@ -95,7 +95,7 @@ struct ApiChatRequest<'a> {
 struct ApiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<ApiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,6 +129,28 @@ struct NativeToolCall {
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+}
+
+/// Multi-part content for vision messages (OpenAI format).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum ApiContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlDetail },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImageUrlDetail {
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +267,34 @@ impl CopilotProvider {
         })
     }
 
+    /// Convert message content to API format, with multi-part support for
+    /// user messages containing `[IMAGE:...]` markers.
+    fn to_api_content(role: &str, content: &str) -> Option<ApiContent> {
+        if role != "user" {
+            return Some(ApiContent::Text(content.to_string()));
+        }
+
+        let (cleaned_text, image_refs) = crate::multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return Some(ApiContent::Text(content.to_string()));
+        }
+
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed = cleaned_text.trim();
+        if !trimmed.is_empty() {
+            parts.push(ContentPart::Text {
+                text: trimmed.to_string(),
+            });
+        }
+        for image_ref in image_refs {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrlDetail { url: image_ref },
+            });
+        }
+
+        Some(ApiContent::Parts(parts))
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> Vec<ApiMessage> {
         messages
             .iter()
@@ -270,7 +320,7 @@ impl CopilotProvider {
                                 let content = value
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(|s| ApiContent::Text(s.to_string()));
 
                                 return ApiMessage {
                                     role: "assistant".to_string(),
@@ -292,7 +342,7 @@ impl CopilotProvider {
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
+                            .map(|s| ApiContent::Text(s.to_string()));
 
                         return ApiMessage {
                             role: "tool".to_string(),
@@ -305,7 +355,7 @@ impl CopilotProvider {
 
                 ApiMessage {
                     role: message.role.clone(),
-                    content: Some(message.content.clone()),
+                    content: Self::to_api_content(&message.role, &message.content),
                     tool_call_id: None,
                     tool_calls: None,
                 }
@@ -610,14 +660,14 @@ impl Provider for CopilotProvider {
         if let Some(system) = system_prompt {
             messages.push(ApiMessage {
                 role: "system".to_string(),
-                content: Some(system.to_string()),
+                content: Some(ApiContent::Text(system.to_string())),
                 tool_call_id: None,
                 tool_calls: None,
             });
         }
         messages.push(ApiMessage {
             role: "user".to_string(),
-            content: Some(message.to_string()),
+            content: Some(ApiContent::Text(message.to_string())),
             tool_call_id: None,
             tool_calls: None,
         });
