@@ -160,20 +160,21 @@ impl BlueBubblesChannel {
         password: String,
         allowed_senders: Vec<String>,
         ignore_senders: Vec<String>,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let client = reqwest::ClientBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build BlueBubbles HTTP client: {e}"))?;
+        Ok(Self {
             server_url: server_url.trim_end_matches('/').to_string(),
             password,
             allowed_senders,
             ignore_senders,
-            client: reqwest::ClientBuilder::new()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("valid reqwest client config"),
+            client,
             from_me_cache: Mutex::new(FromMeCache::new()),
             typing_handles: Mutex::new(HashMap::new()),
             transcription: None,
-        }
+        })
     }
 
     /// Configure voice transcription via Groq Whisper.
@@ -539,7 +540,10 @@ impl BlueBubblesChannel {
                 std::env::temp_dir().join(format!("zc_bb_audio_{}.{ext}", uuid::Uuid::new_v4()));
             tokio::fs::write(&tmp_path, &bytes).await?;
             let result =
-                super::transcription::transcribe_audio_local(tmp_path.to_str().unwrap_or("")).await;
+                super::transcription::transcribe_audio_local(tmp_path.to_str().ok_or_else(
+                    || anyhow::anyhow!("Temp audio path contains non-UTF-8 characters"),
+                )?)
+                .await;
             // Clean up temp file regardless of result.
             tokio::fs::remove_file(&tmp_path).await.ok();
             let transcript = result?;
@@ -1357,6 +1361,7 @@ mod tests {
             vec!["+1_234_567_890".into()],
             vec![],
         )
+        .expect("test HTTP client build")
     }
 
     fn make_open_channel() -> BlueBubblesChannel {
@@ -1366,6 +1371,7 @@ mod tests {
             vec!["*".into()],
             vec![],
         )
+        .expect("test HTTP client build")
     }
 
     #[test]
@@ -1392,7 +1398,8 @@ mod tests {
     fn bluebubbles_sender_allowed_empty_list_allows_all() {
         // Empty allowlist = no restriction (matches OpenClaw behaviour)
         let ch =
-            BlueBubblesChannel::new("http://localhost:1234".into(), "pw".into(), vec![], vec![]);
+            BlueBubblesChannel::new("http://localhost:1234".into(), "pw".into(), vec![], vec![])
+                .expect("test HTTP client build");
         assert!(ch.is_sender_allowed("+1_234_567_890"));
         assert!(ch.is_sender_allowed("anyone@example.com"));
     }
@@ -1404,7 +1411,8 @@ mod tests {
             "pw".into(),
             vec!["*".into()],
             vec![],
-        );
+        )
+        .expect("test HTTP client build");
         assert_eq!(
             ch.api_url("/api/v1/server/info"),
             "http://localhost:1234/api/v1/server/info"
@@ -1676,7 +1684,8 @@ mod tests {
             "pw".into(),
             vec!["user@example.com".into()],
             vec![],
-        );
+        )
+        .expect("test HTTP client build");
         let payload = serde_json::json!({
             "type": "new-message",
             "data": {
@@ -1960,7 +1969,8 @@ mod tests {
             "pw".into(),
             vec!["*".into()],
             vec!["+1_999_000_0000".into()],
-        );
+        )
+        .expect("test HTTP client build");
         assert!(ch.is_sender_ignored("+1_999_000_0000"));
         assert!(!ch.is_sender_ignored("+1_234_567_890"));
     }
@@ -1973,7 +1983,8 @@ mod tests {
             "pw".into(),
             vec!["+1_999_000_0000".into()],
             vec!["+1_999_000_0000".into()],
-        );
+        )
+        .expect("test HTTP client build");
         assert!(ch.is_sender_ignored("+1_999_000_0000"));
     }
 

@@ -655,6 +655,10 @@ pub async fn get_google_token(
 
     if needs_refresh && token.refresh_token.is_some() {
         refresh_google_token(oauth_dir, client_id, client_secret).await
+    } else if needs_refresh {
+        anyhow::bail!(
+            "Google OAuth token expired and no refresh token available. Re-authenticate at /auth/google"
+        )
     } else {
         Ok(token.access_token)
     }

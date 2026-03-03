@@ -86,8 +86,10 @@ async fn transcribe_with_whisper_cpp(
         if !conv.status.success() {
             // Clean up any partial output file before propagating the error.
             let _ = tokio::fs::remove_file(&tmp).await;
-            let stderr = String::from_utf8_lossy(&conv.stderr);
-            anyhow::bail!("ffmpeg failed converting CAF: {stderr}");
+            anyhow::bail!(
+                "ffmpeg failed converting CAF (exit: {})",
+                conv.status.code().unwrap_or(-1)
+            );
         }
         (tmp.clone(), Some(tmp))
     };
@@ -100,6 +102,12 @@ async fn transcribe_with_whisper_cpp(
         return Err(anyhow::anyhow!(
             "Failed to create whisper-cli output dir: {e}"
         ));
+    }
+    // Restrict to owner-only to protect temp audio content from other processes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).await;
     }
     let stem = input_path
         .file_stem()

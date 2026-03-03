@@ -552,18 +552,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .map(Arc::from);
 
     // BlueBubbles channel (if configured)
-    let bluebubbles_channel: Option<Arc<BlueBubblesChannel>> =
-        config.channels_config.bluebubbles.as_ref().map(|bb| {
-            Arc::new(
-                BlueBubblesChannel::new(
-                    bb.server_url.clone(),
-                    bb.password.clone(),
-                    bb.allowed_senders.clone(),
-                    bb.ignore_senders.clone(),
-                )
-                .with_transcription(config.transcription.clone()),
+    let bluebubbles_channel: Option<Arc<BlueBubblesChannel>> = config
+        .channels_config
+        .bluebubbles
+        .as_ref()
+        .map(|bb| {
+            BlueBubblesChannel::new(
+                bb.server_url.clone(),
+                bb.password.clone(),
+                bb.allowed_senders.clone(),
+                bb.ignore_senders.clone(),
             )
-        });
+            .map(|ch| Arc::new(ch.with_transcription(config.transcription.clone())))
+        })
+        .transpose()
+        .map_err(|e| {
+            tracing::error!("Failed to initialize BlueBubbles channel: {e}");
+            e
+        })
+        .ok()
+        .flatten();
     let bluebubbles_webhook_secret: Option<Arc<str>> = config
         .channels_config
         .bluebubbles
