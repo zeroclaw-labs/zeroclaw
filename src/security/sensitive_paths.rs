@@ -134,15 +134,23 @@ mod tests {
 
     #[test]
     fn detects_zeroclaw_config_paths() {
-        assert!(is_zeroclaw_config_path(Path::new("/home/user/.zeroclaw/config.toml")));
+        assert!(is_zeroclaw_config_path(Path::new(
+            "/home/user/.zeroclaw/config.toml"
+        )));
         assert!(is_zeroclaw_config_path(Path::new(".zeroclaw/config.toml")));
-        assert!(is_zeroclaw_config_path(Path::new("/home/user/.zeroclaw/agents.db")));
+        assert!(is_zeroclaw_config_path(Path::new(
+            "/home/user/.zeroclaw/agents.db"
+        )));
     }
 
     #[test]
     fn ignores_non_config_paths() {
         assert!(!is_zeroclaw_config_path(Path::new("src/main.rs")));
-        assert!(!is_zeroclaw_config_path(Path::new("/home/user/project/file.txt")));
-        assert!(!is_zeroclaw_config_path(Path::new("notes/zeroclaw-ideas.md")));
+        assert!(!is_zeroclaw_config_path(Path::new(
+            "/home/user/project/file.txt"
+        )));
+        assert!(!is_zeroclaw_config_path(Path::new(
+            "notes/zeroclaw-ideas.md"
+        )));
     }
 }

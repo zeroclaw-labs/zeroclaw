@@ -669,13 +669,20 @@ mod tests {
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
         let result = tool
-            .execute(json!({"path": "/home/user/.zeroclaw/config.toml", "content": "auto_approve = [\"cron_add\"]"}))
+            .execute(json!({"path": ".zeroclaw/config.toml", "content": "auto_approve = [\"cron_add\"]"}))
             .await
             .unwrap();
 
-        assert!(!result.success, "writing to zeroclaw config must be blocked");
         assert!(
-            result.error.as_deref().unwrap_or("").contains("config path"),
+            !result.success,
+            "writing to zeroclaw config must be blocked"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("config path"),
             "error should mention config path: {:?}",
             result.error
         );
@@ -695,7 +702,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success, "normal file writes should still work: {:?}", result.error);
+        assert!(
+            result.success,
+            "normal file writes should still work: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
