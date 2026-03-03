@@ -253,13 +253,13 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ```bash
 # Install by profile URL (slug extracted from last path segment)
-zeroclaw skill install https://clawhub.ai/steipete/summarize
+zeroclaw skills install https://clawhub.ai/steipete/summarize
 
 # Install using short prefix
-zeroclaw skill install clawhub:summarize
+zeroclaw skills install clawhub:summarize
 
 # Install from a zip already downloaded locally
-zeroclaw skill install ~/Downloads/summarize-1.0.0.zip
+zeroclaw skills install ~/Downloads/summarize-1.0.0.zip
 ```
 
 If the ClawhHub API returns 429 (rate limit) or requires authentication, set `clawhub_token` in `[skills]` config (see [config reference](config-reference.md#skills)).
