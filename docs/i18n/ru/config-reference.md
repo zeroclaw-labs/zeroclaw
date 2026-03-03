@@ -16,3 +16,4 @@
 
 - Названия config keys не переводятся.
 - Точное runtime-поведение определяется английским оригиналом.
+- Добавлен ключ `observability.runtime_trace_record_http` для записи HTTP-деталей вызовов LLM (`llm_http_request` / `llm_http_response`). Подробности в английском оригинале.

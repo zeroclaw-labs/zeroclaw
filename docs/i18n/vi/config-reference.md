@@ -44,11 +44,13 @@ Lưu ý:
 | `backend` | `none` | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry` hoặc `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | Endpoint OTLP HTTP khi backend là `otel` |
 | `otel_service_name` | `zeroclaw` | Tên dịch vụ gửi đến OTLP collector |
+| `runtime_trace_record_http` | `false` | Ghi chi tiết HTTP request/response của LLM vào runtime trace (`llm_http_request` / `llm_http_response`) |
 
 Lưu ý:
 
 - `backend = "otel"` dùng OTLP HTTP export với blocking exporter client để span và metric có thể được gửi an toàn từ context ngoài Tokio.
 - Bí danh `opentelemetry` và `otlp` trỏ đến cùng backend OTel.
+- `runtime_trace_record_http` chỉ có hiệu lực khi `runtime_trace_mode` là `rolling` hoặc `full`.
 
 Ví dụ:
 
@@ -57,6 +59,7 @@ Ví dụ:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+runtime_trace_record_http = true
 ```
 
 ## Ghi đè provider qua biến môi trường
