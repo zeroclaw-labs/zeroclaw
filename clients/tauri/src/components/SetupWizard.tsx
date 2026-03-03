@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import { type Locale, t } from "../lib/i18n";
+import { type Locale } from "../lib/i18n";
 import { setStoredLocale } from "../lib/i18n";
 import { apiClient } from "../lib/api";
 import { isTauri, isGatewayRunning, writeZeroClawConfig } from "../lib/tauri-bridge";
