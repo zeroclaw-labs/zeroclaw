@@ -925,6 +925,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
         "llama.cpp" => "llamacpp",
+        "lm-studio" => "lmstudio",
         _ => provider_name,
     }
 }
@@ -935,6 +936,7 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
         "openrouter"
             | "ollama"
             | "llamacpp"
+            | "lmstudio"
             | "sglang"
             | "vllm"
             | "osaurus"
@@ -983,7 +985,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "sglang" | "vllm" | "osaurus" | "copilot" => "default".into(),
+        "lmstudio" | "sglang" | "vllm" | "osaurus" | "copilot" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -1390,6 +1392,28 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GLM-5 (high reasoning)".to_string(),
             ),
         ],
+        "lmstudio" => vec![
+            (
+                "default".to_string(),
+                "Use currently loaded model (recommended)".to_string(),
+            ),
+            (
+                "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
+                "Llama 3.1 8B Instruct (balanced, popular)".to_string(),
+            ),
+            (
+                "lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF".to_string(),
+                "Qwen2.5 Coder 7B (coding-focused)".to_string(),
+            ),
+            (
+                "lmstudio-community/gemma-3-4b-it-GGUF".to_string(),
+                "Gemma 3 4B (efficient, Google)".to_string(),
+            ),
+            (
+                "lmstudio-community/Phi-4-mini-instruct-GGUF".to_string(),
+                "Phi-4 Mini (fast, Microsoft)".to_string(),
+            ),
+        ],
         "ollama" => vec![
             (
                 "llama3.2".to_string(),
@@ -1504,6 +1528,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "lmstudio"
             | "sglang"
             | "vllm"
             | "osaurus"
@@ -1554,6 +1579,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "lmstudio" => Some("http://localhost:1234/v1/models"),
             "sglang" => Some("http://localhost:30000/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
             "osaurus" => Some("http://localhost:1337/v1/models"),
@@ -1800,10 +1826,25 @@ fn resolve_live_models_endpoint(
         return Some(format!("{normalized}/models"));
     }
 
-    if matches!(
-        canonical_provider_name(provider_name),
-        "llamacpp" | "sglang" | "vllm" | "osaurus"
-    ) {
+    let canonical = canonical_provider_name(provider_name);
+
+    if canonical == "lmstudio" {
+        if let Some(url) = provider_api_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            let normalized = url.trim_end_matches('/');
+            if normalized.ends_with("/models") {
+                return Some(normalized.to_string());
+            }
+            if normalized.ends_with("/v1") {
+                return Some(format!("{normalized}/models"));
+            }
+            return Some(format!("{normalized}/v1/models"));
+        }
+    }
+
+    if matches!(canonical, "llamacpp" | "sglang" | "vllm" | "osaurus") {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -1816,7 +1857,7 @@ fn resolve_live_models_endpoint(
         }
     }
 
-    if canonical_provider_name(provider_name) == "openai-codex" {
+    if canonical == "openai-codex" {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -2798,6 +2839,40 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if provider_name == "lmstudio" {
+        let raw_url: String = Input::new()
+            .with_prompt("  LM Studio server endpoint URL")
+            .default("http://localhost:1234".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("LM Studio endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using LM Studio server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("Authentication is disabled by default in LM Studio.");
+        print_bullet(
+            "To enable it: Developers Page \u{2192} Server Settings \u{2192} Require authentication.",
+        );
+
+        let key: String = Input::new()
+            .with_prompt("  API token for LM Studio (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API token provided. Set {} later if you enable authentication.",
+                style("LMSTUDIO_API_KEY").yellow()
+            ));
+        }
+
+        key
     } else if canonical_provider_name(provider_name) == "copilot" {
         print_bullet("GitHub Copilot uses GitHub OAuth device flow.");
         print_bullet("Press Enter to keep setup keyless and authenticate on first run.");
@@ -3222,6 +3297,10 @@ fn local_provider_choices() -> Vec<(&'static str, &'static str)> {
     vec![
         ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
         (
+            "lmstudio",
+            "LM Studio — local model runner with context & reasoning controls",
+        ),
+        (
             "llamacpp",
             "llama.cpp server — local OpenAI-compatible endpoint",
         ),
@@ -3248,6 +3327,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai-codex" | "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
+        "lmstudio" => "LMSTUDIO_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "sglang" => "SGLANG_API_KEY",
         "vllm" => "VLLM_API_KEY",
@@ -3315,7 +3395,7 @@ fn provider_has_env_api_key(provider_name: &str) -> bool {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
+        "ollama" | "lmstudio" | "llamacpp" | "sglang" | "vllm" | "osaurus"
     )
 }
 
@@ -8312,6 +8392,34 @@ mod tests {
         );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_prefers_lmstudio_custom_url() {
+        assert_eq!(
+            resolve_live_models_endpoint("lmstudio", Some("http://192.168.1.5:1234")),
+            Some("http://192.168.1.5:1234/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("lm-studio", Some("http://192.168.1.5:1234/")),
+            Some("http://192.168.1.5:1234/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("lmstudio", Some("http://192.168.1.5:1234/v1/models")),
+            Some("http://192.168.1.5:1234/v1/models".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_lmstudio_uses_default() {
+        assert_eq!(
+            resolve_live_models_endpoint("lmstudio", None),
+            Some("http://localhost:1234/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("lm-studio", None),
+            Some("http://localhost:1234/v1/models".to_string())
+        );
     }
 
     #[test]

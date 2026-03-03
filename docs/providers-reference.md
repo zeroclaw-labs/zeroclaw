@@ -59,7 +59,7 @@ credential is not reused for fallback providers.
 | `cohere` | — | No | `COHERE_API_KEY` |
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `cursor` | — | Yes | (none; Cursor manages its own credentials) |
-| `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
+| `lmstudio` | `lm-studio` | Yes | `LMSTUDIO_API_KEY` (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
@@ -209,6 +209,37 @@ zeroclaw agent --provider siliconflow --model Pro/zai-org/GLM-4.7 -m "ping"
 - Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
 - Authentication: `HUNYUAN_API_KEY` (obtain from [Tencent Cloud console](https://console.cloud.tencent.com/hunyuan))
 - Recommended models: `hunyuan-t1-latest` (deep reasoning), `hunyuan-turbo-latest` (fast), `hunyuan-pro` (high quality)
+
+### LM Studio Notes
+
+- Provider ID: `lmstudio` (alias: `lm-studio`)
+- Default endpoint: `http://localhost:1234`
+- Authentication is **disabled by default** in LM Studio. Enable via Developers Page → Server Settings → Require authentication. When enabled, set `LMSTUDIO_API_KEY` or configure `api_key` in `config.toml`.
+- Inference uses the native `POST /api/v1/chat` endpoint for single-turn chat and `POST /v1/chat/completions` for multi-turn history and tool calling.
+- Model discovery: `zeroclaw models refresh --provider lmstudio`
+
+**LM Studio-specific parameters** (set via `api_url` override or provider constructor):
+
+| Parameter | Config key | Description |
+|---|---|---|
+| `api_url` | `api_url` | Override the LM Studio base URL (default: `http://localhost:1234`) |
+| `api_key` | `api_key` / `LMSTUDIO_API_KEY` | Bearer token for LM Studio authentication (optional; auth is off by default) |
+| `context_length` | — | Override the loaded model's context window size per request |
+| `reasoning` | — | Reasoning budget: `off` / `low` / `medium` / `high` / `on` (requires a reasoning-capable model) |
+
+Example config:
+
+```toml
+default_provider = "lmstudio"
+api_url = "http://192.168.1.5:1234"   # custom host
+```
+
+Notes:
+
+- Load a model in LM Studio before sending requests; the provider will error if no model is loaded.
+- The `context_length` override is most useful for long-context tasks (e.g., passing large codebases to the model).
+- The `reasoning` parameter errors if the loaded model does not support reasoning/thinking mode.
+- Vision is supported on the native `/api/v1/chat` path via data URI image markers.
 
 ### llama.cpp Server Notes
 
