@@ -5636,7 +5636,7 @@ impl FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecurityConfig {
     /// Sandbox configuration
     #[serde(default)]
@@ -5674,9 +5674,31 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub outbound_leak_guard: OutboundLeakGuardConfig,
 
+    /// Enable per-turn canary tokens to detect system-context exfiltration.
+    #[serde(default = "default_true")]
+    pub canary_tokens: bool,
+
     /// Shared URL access policy for network-enabled tools.
     #[serde(default)]
     pub url_access: UrlAccessConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+            otp: OtpConfig::default(),
+            roles: Vec::default(),
+            estop: EstopConfig::default(),
+            syscall_anomaly: SyscallAnomalyConfig::default(),
+            perplexity_filter: PerplexityFilterConfig::default(),
+            outbound_leak_guard: OutboundLeakGuardConfig::default(),
+            canary_tokens: true,
+            url_access: UrlAccessConfig::default(),
+        }
+    }
 }
 
 /// Outbound leak handling mode for channel responses.
@@ -14129,6 +14151,7 @@ default_temperature = 0.7
             OutboundLeakGuardAction::Redact
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.7);
+        assert!(parsed.security.canary_tokens);
     }
 
     #[test]
@@ -14138,6 +14161,9 @@ default_temperature = 0.7
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
+
+[security]
+canary_tokens = false
 
 [security.otp]
 enabled = true
@@ -14220,6 +14246,7 @@ sensitivity = 0.9
             OutboundLeakGuardAction::Block
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.9);
+        assert!(!parsed.security.canary_tokens);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         assert_eq!(

@@ -10,7 +10,7 @@ use crate::providers::{
     ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{CanaryGuard, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -71,6 +71,10 @@ const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Previous response was truncated by
 /// Notice appended when continuation budget is exhausted before completion.
 const MAX_TOKENS_CONTINUATION_NOTICE: &str =
     "\n\n[Response may be truncated due to continuation limits. Reply \"continue\" to resume.]";
+
+/// Returned when canary token exfiltration is detected in model output.
+const CANARY_EXFILTRATION_BLOCK_MESSAGE: &str =
+    "I blocked that response because it attempted to reveal protected internal context.";
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -278,6 +282,10 @@ pub(crate) const DRAFT_PROGRESS_SECTION_END: &str = "\n<!-- progress-end -->\n";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_CANARY_TOKENS_ENABLED: bool;
 }
 
 const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
@@ -895,25 +903,29 @@ pub(crate) async fn agent_turn(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
-    run_tool_call_loop(
-        provider,
-        history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        None,
-        "channel",
-        multimodal_config,
-        max_tool_iterations,
-        None,
-        None,
-        None,
-        &[],
-    )
-    .await
+    TOOL_LOOP_CANARY_TOKENS_ENABLED
+        .scope(
+            false,
+            run_tool_call_loop(
+                provider,
+                history,
+                tools_registry,
+                observer,
+                provider_name,
+                model,
+                temperature,
+                silent,
+                None,
+                "channel",
+                multimodal_config,
+                max_tool_iterations,
+                None,
+                None,
+                None,
+                &[],
+            ),
+        )
+        .await
 }
 
 /// Run the tool loop with channel reply_target context, used by channel runtimes
@@ -942,25 +954,28 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
     TOOL_LOOP_PROGRESS_MODE
         .scope(
             progress_mode,
-            TOOL_LOOP_REPLY_TARGET.scope(
-                reply_target.map(str::to_string),
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+            TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                false,
+                TOOL_LOOP_REPLY_TARGET.scope(
+                    reply_target.map(str::to_string),
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -989,6 +1004,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     excluded_tools: &[String],
     progress_mode: ProgressMode,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
+    canary_tokens_enabled: bool,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
@@ -999,27 +1015,30 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
             progress_mode,
             SAFETY_HEARTBEAT_CONFIG.scope(
                 safety_heartbeat,
-                TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
-                    non_cli_approval_context,
-                    TOOL_LOOP_REPLY_TARGET.scope(
-                        reply_target,
-                        run_tool_call_loop(
-                            provider,
-                            history,
-                            tools_registry,
-                            observer,
-                            provider_name,
-                            model,
-                            temperature,
-                            silent,
-                            approval,
-                            channel_name,
-                            multimodal_config,
-                            max_tool_iterations,
-                            cancellation_token,
-                            on_delta,
-                            hooks,
-                            excluded_tools,
+                TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                    canary_tokens_enabled,
+                    TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                        non_cli_approval_context,
+                        TOOL_LOOP_REPLY_TARGET.scope(
+                            reply_target,
+                            run_tool_call_loop(
+                                provider,
+                                history,
+                                tools_registry,
+                                observer,
+                                provider_name,
+                                model,
+                                temperature,
+                                silent,
+                                approval,
+                                channel_name,
+                                multimodal_config,
+                                max_tool_iterations,
+                                cancellation_token,
+                                on_delta,
+                                hooks,
+                                excluded_tools,
+                            ),
                         ),
                     ),
                 ),
@@ -1109,6 +1128,23 @@ pub async fn run_tool_call_loop(
         .flatten();
     let mut progress_tracker = ProgressTracker::default();
     let mut active_model = model.to_string();
+    let canary_guard = CanaryGuard::new(
+        TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false),
+    );
+    let mut turn_canary_token: Option<String> = None;
+    if let Some(system_message) = history.first_mut() {
+        if system_message.role == "system" {
+            let (updated_prompt, token) = canary_guard.inject_turn_token(&system_message.content);
+            system_message.content = updated_prompt;
+            turn_canary_token = token;
+        }
+    }
+    let redact_trace_text = |text: &str| -> String {
+        let scrubbed = scrub_credentials(text);
+        canary_guard.redact_token_from_text(&scrubbed, turn_canary_token.as_deref())
+    };
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -1632,7 +1668,7 @@ pub async fn run_tool_call_loop(
                             "iteration": iteration + 1,
                             "invalid_native_tool_json_count": invalid_native_tool_json_count,
                             "response_excerpt": truncate_with_ellipsis(
-                                &scrub_credentials(&response_text),
+                                &redact_trace_text(&response_text),
                                 600
                             ),
                         }),
@@ -1652,7 +1688,7 @@ pub async fn run_tool_call_loop(
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                         "input_tokens": resp_input_tokens,
                         "output_tokens": resp_output_tokens,
-                        "raw_response": scrub_credentials(&response_text),
+                        "raw_response": redact_trace_text(&response_text),
                         "native_tool_calls": native_calls.len(),
                         "parsed_tool_calls": calls.len(),
                         "continuation_attempts": continuation_attempts,
@@ -1725,6 +1761,33 @@ pub async fn run_tool_call_loop(
             parsed_text
         };
 
+        let canary_exfiltration_detected = canary_guard
+            .response_contains_canary(&response_text, turn_canary_token.as_deref())
+            || canary_guard.response_contains_canary(&display_text, turn_canary_token.as_deref());
+        if canary_exfiltration_detected {
+            runtime_trace::record_event(
+                "security_canary_exfiltration_blocked",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(false),
+                Some("llm output contained turn canary token"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
+                }),
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string()).await;
+            }
+            history.push(ChatMessage::assistant(
+                CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string(),
+            ));
+            return Ok(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string());
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if should_emit_verbose_progress(progress_mode) {
             if let Some(ref tx) = on_delta {
@@ -1767,7 +1830,7 @@ pub async fn run_tool_call_loop(
                     serde_json::json!({
                         "iteration": iteration + 1,
                         "reason": retry_reason,
-                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                        "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
                     }),
                 );
 
@@ -1795,7 +1858,7 @@ pub async fn run_tool_call_loop(
                     Some("llm response still implied follow-up action but emitted no tool call after retry"),
                     serde_json::json!({
                         "iteration": iteration + 1,
-                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                        "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
                     }),
                 );
                 anyhow::bail!(
@@ -1813,7 +1876,7 @@ pub async fn run_tool_call_loop(
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "text": scrub_credentials(&display_text),
+                    "text": redact_trace_text(&display_text),
                 }),
             );
             // No tool calls — this is the final response.
@@ -2787,23 +2850,26 @@ pub async fn run(
                 hb_cfg,
                 LOOP_DETECTION_CONFIG.scope(
                     ld_cfg,
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        provider_name,
-                        &model_name,
-                        temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        effective_hooks,
-                        &[],
+                    TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                        config.security.canary_tokens,
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            provider_name,
+                            &model_name,
+                            temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            effective_hooks,
+                            &[],
+                        ),
                     ),
                 ),
             ),
@@ -2972,23 +3038,26 @@ pub async fn run(
                     hb_cfg,
                     LOOP_DETECTION_CONFIG.scope(
                         ld_cfg,
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            provider_name,
-                            &model_name,
-                            temperature,
-                            false,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            None,
-                            None,
-                            effective_hooks,
-                            &[],
+                        TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                            config.security.canary_tokens,
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                provider_name,
+                                &model_name,
+                                temperature,
+                                false,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                None,
+                                None,
+                                effective_hooks,
+                                &[],
+                            ),
                         ),
                     ),
                 ),
@@ -3576,6 +3645,54 @@ mod tests {
         }
     }
 
+    struct EchoCanaryProvider;
+
+    #[async_trait]
+    impl Provider for EchoCanaryProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in canary provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let canary = request
+                .messages
+                .iter()
+                .find(|msg| msg.role == "system")
+                .and_then(|msg| {
+                    msg.content.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix("Internal security canary token: ")
+                            .map(str::trim)
+                    })
+                })
+                .unwrap_or("NO_CANARY");
+            Ok(ChatResponse {
+                text: Some(format!("Leaking token for test: {canary}")),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+            })
+        }
+    }
+
     struct CountingTool {
         name: String,
         invocations: Arc<AtomicUsize>,
@@ -3818,6 +3935,87 @@ mod tests {
         .expect("anthropic route should not fail on a false-negative vision capability probe");
 
         assert_eq!(result, "vision-ok");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_when_canary_token_is_echoed() {
+        let provider = EchoCanaryProvider;
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .scope(
+                true,
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &tools_registry,
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "cli",
+                    &crate::config::MultimodalConfig::default(),
+                    3,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+            )
+            .await
+            .expect("canary leak should return a guarded message");
+
+        assert_eq!(result, CANARY_EXFILTRATION_BLOCK_MESSAGE);
+        assert_eq!(
+            history.last().map(|msg| msg.content.as_str()),
+            Some(result.as_str())
+        );
+        assert!(history[0].content.contains("ZC_CANARY_START"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_echo_provider_when_canary_guard_disabled() {
+        let provider = EchoCanaryProvider;
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .scope(
+                false,
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &tools_registry,
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "cli",
+                    &crate::config::MultimodalConfig::default(),
+                    3,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+            )
+            .await
+            .expect("without canary guard, response should pass through");
+
+        assert!(result.contains("NO_CANARY"));
     }
 
     #[tokio::test]
@@ -4233,6 +4431,7 @@ mod tests {
             &[],
             ProgressMode::Verbose,
             None,
+            false,
         )
         .await
         .expect("tool loop should continue after non-cli approval");

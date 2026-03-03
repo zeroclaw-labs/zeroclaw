@@ -272,6 +272,7 @@ struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
     perplexity_filter: crate::config::PerplexityFilterConfig,
     outbound_leak_guard: crate::config::OutboundLeakGuardConfig,
+    canary_tokens: bool,
     last_applied_stamp: Option<ConfigFileStamp>,
 }
 
@@ -286,6 +287,7 @@ struct RuntimeAutonomyPolicy {
         HashMap<String, NonCliNaturalLanguageApprovalMode>,
     perplexity_filter: crate::config::PerplexityFilterConfig,
     outbound_leak_guard: crate::config::OutboundLeakGuardConfig,
+    canary_tokens: bool,
 }
 
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
@@ -1117,6 +1119,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
             .clone(),
         perplexity_filter: config.security.perplexity_filter.clone(),
         outbound_leak_guard: config.security.outbound_leak_guard.clone(),
+        canary_tokens: config.security.canary_tokens,
     }
 }
 
@@ -1187,6 +1190,19 @@ fn runtime_outbound_leak_guard_snapshot(
     }
     crate::config::OutboundLeakGuardConfig::default()
 }
+
+fn runtime_canary_tokens_snapshot(ctx: &ChannelRuntimeContext) -> bool {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.canary_tokens;
+        }
+    }
+    false
+}
+
 fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
     ctx.non_cli_excluded_tools
         .lock()
@@ -1713,6 +1729,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
                 defaults: next_defaults.clone(),
                 perplexity_filter: next_autonomy_policy.perplexity_filter.clone(),
                 outbound_leak_guard: next_autonomy_policy.outbound_leak_guard.clone(),
+                canary_tokens: next_autonomy_policy.canary_tokens,
                 last_applied_stamp: Some(stamp),
             },
         );
@@ -1747,6 +1764,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         outbound_leak_guard_enabled = next_autonomy_policy.outbound_leak_guard.enabled,
         outbound_leak_guard_action = ?next_autonomy_policy.outbound_leak_guard.action,
         outbound_leak_guard_sensitivity = next_autonomy_policy.outbound_leak_guard.sensitivity,
+        canary_tokens = next_autonomy_policy.canary_tokens,
         "Applied updated channel runtime config from disk"
     );
 
@@ -3818,6 +3836,7 @@ or tune thresholds in config.",
                     &excluded_tools_snapshot,
                     progress_mode,
                     ctx.safety_heartbeat.clone(),
+                    runtime_canary_tokens_snapshot(ctx.as_ref()),
                 ),
             ),
         ) => LlmExecutionResult::Completed(result),
@@ -5404,6 +5423,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 defaults: runtime_defaults_from_config(&config),
                 perplexity_filter: config.security.perplexity_filter.clone(),
                 outbound_leak_guard: config.security.outbound_leak_guard.clone(),
+                canary_tokens: config.security.canary_tokens,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -9571,6 +9591,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
+                    canary_tokens: true,
                     last_applied_stamp: None,
                 },
             );

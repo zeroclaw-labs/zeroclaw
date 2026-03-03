@@ -530,6 +530,7 @@ Lưu ý:
 - Allowlist kênh mặc định từ chối tất cả (`[]` nghĩa là từ chối tất cả)
 - Gateway mặc định yêu cầu ghép nối
 - Mặc định chặn public bind
+- `security.canary_tokens = true` bật canary token theo từng lượt để phát hiện rò rỉ ngữ cảnh hệ thống
 
 ## Lệnh kiểm tra
 

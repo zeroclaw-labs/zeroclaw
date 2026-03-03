@@ -377,6 +377,18 @@ Environment overrides:
 - `ZEROCLAW_URL_ACCESS_DOMAIN_BLOCKLIST` / `URL_ACCESS_DOMAIN_BLOCKLIST` (comma-separated)
 - `ZEROCLAW_URL_ACCESS_APPROVED_DOMAINS` / `URL_ACCESS_APPROVED_DOMAINS` (comma-separated)
 
+## `[security]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `canary_tokens` | `true` | Inject per-turn canary token into system prompt and block responses that echo it |
+
+Notes:
+
+- Canary tokens are generated per turn and are redacted from runtime traces.
+- This guard is additive to `security.outbound_leak_guard`: canary catches prompt-context leakage, while outbound leak guard catches credential-like material.
+- Set `canary_tokens = false` to disable this layer.
+
 ## `[security.syscall_anomaly]`
 
 | Key | Default | Purpose |
