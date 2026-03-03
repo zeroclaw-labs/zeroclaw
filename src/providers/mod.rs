@@ -1122,7 +1122,6 @@ fn resolve_custom_provider_auth_style(options: &ProviderRuntimeOptions) -> AuthS
         Ok(_) => AuthStyle::Custom(header.to_string()),
         Err(error) => {
             tracing::warn!(
-                header = %header,
                 "Ignoring invalid custom provider auth header and falling back to Bearer: {error}"
             );
             AuthStyle::Bearer

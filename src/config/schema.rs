@@ -7738,8 +7738,21 @@ impl Config {
         }
     }
 
+    fn normalize_url_for_profile_match(raw: &str) -> (String, Option<String>) {
+        let trimmed = raw.trim();
+        let (path, query) = match trimmed.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (trimmed, None),
+        };
+
+        (
+            path.trim_end_matches('/').to_string(),
+            query.map(|value| value.to_string()),
+        )
+    }
+
     fn urls_match_ignoring_trailing_slash(lhs: &str, rhs: &str) -> bool {
-        lhs.trim().trim_end_matches('/') == rhs.trim().trim_end_matches('/')
+        Self::normalize_url_for_profile_match(lhs) == Self::normalize_url_for_profile_match(rhs)
     }
 
     /// Resolve provider reasoning level with backward-compatible runtime alias.
@@ -8572,22 +8585,26 @@ impl Config {
             }
         }
 
+        let mut custom_auth_headers_by_base_url: Vec<(String, String, String)> = Vec::new();
         for (profile_key, profile) in &self.model_providers {
             let profile_name = profile_key.trim();
             if profile_name.is_empty() {
                 anyhow::bail!("model_providers contains an empty profile name");
             }
 
+            let normalized_base_url = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+
             let has_name = profile
                 .name
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
-            let has_base_url = profile
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
+            let has_base_url = normalized_base_url.is_some();
 
             if !has_name && !has_base_url {
                 anyhow::bail!(
@@ -8595,16 +8612,12 @@ impl Config {
                 );
             }
 
-            if let Some(base_url) = profile.base_url.as_deref().map(str::trim) {
-                if !base_url.is_empty() {
-                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                        format!("model_providers.{profile_name}.base_url is not a valid URL")
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") {
-                        anyhow::bail!(
-                            "model_providers.{profile_name}.base_url must use http/https"
-                        );
-                    }
+            if let Some(base_url) = normalized_base_url.as_deref() {
+                let parsed = reqwest::Url::parse(base_url).with_context(|| {
+                    format!("model_providers.{profile_name}.base_url is not a valid URL")
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("model_providers.{profile_name}.base_url must use http/https");
                 }
             }
 
@@ -8625,6 +8638,30 @@ impl Config {
                             )
                         },
                     )?;
+
+                    if let Some(base_url) = normalized_base_url.as_deref() {
+                        custom_auth_headers_by_base_url.push((
+                            profile_name.to_string(),
+                            base_url.to_string(),
+                            auth_header.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for left_index in 0..custom_auth_headers_by_base_url.len() {
+            let (left_profile, left_url, left_header) =
+                &custom_auth_headers_by_base_url[left_index];
+            for right_index in (left_index + 1)..custom_auth_headers_by_base_url.len() {
+                let (right_profile, right_url, right_header) =
+                    &custom_auth_headers_by_base_url[right_index];
+                if Self::urls_match_ignoring_trailing_slash(left_url, right_url)
+                    && !left_header.eq_ignore_ascii_case(right_header)
+                {
+                    anyhow::bail!(
+                        "model_providers.{left_profile} and model_providers.{right_profile} define conflicting auth_header values for equivalent base_url {left_url}"
+                    );
                 }
             }
         }
@@ -12708,6 +12745,38 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn model_provider_profile_custom_auth_header_matches_slash_before_query() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                    .to_string(),
+            ),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions/?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.effective_custom_provider_auth_header().as_deref(),
+            Some("api-key")
+        );
+    }
+
+    #[test]
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12820,6 +12889,53 @@ provider_api = "not-a-real-mode"
 
         let error = config.validate().expect_err("expected validation failure");
         assert!(error.to_string().contains("auth_header is invalid"));
+    }
+
+    #[test]
+    async fn validate_rejects_conflicting_model_provider_auth_headers_for_same_base_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                    .to_string(),
+            ),
+            model_providers: HashMap::from([
+                (
+                    "azure_a".to_string(),
+                    ModelProviderConfig {
+                        name: Some("openai".to_string()),
+                        base_url: Some(
+                            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                                .to_string(),
+                        ),
+                        auth_header: Some("api-key".to_string()),
+                        wire_api: None,
+                        default_model: None,
+                        api_key: None,
+                        requires_openai_auth: false,
+                    },
+                ),
+                (
+                    "azure_b".to_string(),
+                    ModelProviderConfig {
+                        name: Some("openai".to_string()),
+                        base_url: Some(
+                            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions/?api-version=2024-02-01"
+                                .to_string(),
+                        ),
+                        auth_header: Some("x-api-key".to_string()),
+                        wire_api: None,
+                        default_model: None,
+                        api_key: None,
+                        requires_openai_auth: false,
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("conflicting auth_header values"));
     }
 
     #[test]
