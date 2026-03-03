@@ -547,7 +547,7 @@ Notes:
 | `open_skills_dir`       | unset   | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled)                     |
 | `trusted_skill_roots`   | `[]`    | Allowlist of directory roots for symlink targets in `workspace/skills/*`                                 |
 | `prompt_injection_mode` | `full`  | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
-| `clawhub_token`         | unset   | Optional Bearer token for authenticated ClawhHub skill downloads                                         |
+| `clawhub_token`         | unset   | Optional Bearer token for authenticated ClawHub skill downloads                                          |
 
 Notes:
 
@@ -560,9 +560,9 @@ Notes:
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 - Symlinked workspace skills are blocked by default. Set `trusted_skill_roots` to allow local shared-skill directories after explicit trust review.
 - `zeroclaw skills install` and `zeroclaw skills audit` apply a static security audit. Skills that contain script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
-- `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawhHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
+- `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
 
-**ClawhHub token example:**
+**ClawHub token example:**
 
 ```toml
 [skills]
