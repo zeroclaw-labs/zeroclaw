@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
@@ -33,6 +34,7 @@ pub struct MatrixChannel {
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
     http_client: Client,
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -41,6 +43,7 @@ impl std::fmt::Debug for MatrixChannel {
             .field("homeserver", &self.homeserver)
             .field("room_id", &self.room_id)
             .field("allowed_users", &self.allowed_users)
+            .field("transcription_enabled", &self.transcription.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -172,7 +175,16 @@ impl MatrixChannel {
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
             http_client: Client::new(),
+            transcription: None,
         }
+    }
+
+    /// Configure voice transcription.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
     }
 
     pub fn with_mention_only(mut self, mention_only: bool) -> Self {
@@ -224,7 +236,7 @@ impl MatrixChannel {
     }
 
     fn is_supported_message_type(msgtype: &str) -> bool {
-        matches!(msgtype, "m.text" | "m.notice")
+        matches!(msgtype, "m.text" | "m.notice" | "m.audio")
     }
 
     fn has_non_empty_body(body: &str) -> bool {
@@ -745,6 +757,7 @@ impl Channel for MatrixChannel {
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let bot_dedupe_for_handler = Arc::clone(&recent_bot_event_cache);
         let mention_only_for_handler = self.mention_only;
+        let transcription_for_handler = self.transcription.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -753,6 +766,7 @@ impl Channel for MatrixChannel {
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
             let bot_dedupe = Arc::clone(&bot_dedupe_for_handler);
+            let transcription = transcription_for_handler.clone();
 
             async move {
                 if room.room_id().as_str() != target_room.as_str() {
@@ -776,6 +790,45 @@ impl Channel for MatrixChannel {
                 let body = match &event.content.msgtype {
                     MessageType::Text(content) => content.body.clone(),
                     MessageType::Notice(content) => content.body.clone(),
+                    MessageType::Audio(content) => {
+                        // Check if transcription is enabled
+                        if let Some(ref tc) = transcription {
+                            if tc.enabled {
+                                // 2. Media Acquisition
+                                // We use the room's client to fetch the actual media bytes.
+                                // This handles decryption automatically if the room is E2EE.
+                                let media_request = MediaRequestParameters {
+                                    source: content.source.clone(),
+                                    format: MediaFormat::File,
+                                };
+                                match room.client().media().get_media_content(&media_request, true).await {
+                                    Ok(audio_data) => {
+                                        // 3. Transcription via local service
+                                        match crate::channels::transcription::transcribe_audio(
+                                            audio_data,
+                                            &content.body,
+                                            tc,
+                                        ).await {
+                                            Ok(text) => text,
+                                            Err(e) => {
+                                                tracing::warn!("Matrix voice transcription failed: {e}");
+                                                format!("[Audio transcription failed: {}]", content.body)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let safe_error = MatrixChannel::sanitize_error_for_log(&e);
+                                        tracing::warn!("Failed to download Matrix audio: {safe_error}");
+                                        format!("[Audio download failed: {}]", content.body)
+                                    }
+                                }
+                            } else {
+                                return;
+                            }
+                        } else {
+                            return;
+                        }
+                    }
                     _ => return,
                 };
 
@@ -783,18 +836,18 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                let mut is_direct_room = false;
-                let mut is_mentioned = false;
-                let mut is_reply_to_bot = false;
-
                 if mention_only_for_handler {
-                    is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
+                    let is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
                         let safe_error = MatrixChannel::sanitize_error_for_log(&error);
                         tracing::warn!(
                             "Matrix is_direct() failed while evaluating mention_only gate: {safe_error}"
                         );
                         false
                     });
+
+                    let mut is_mentioned = false;
+                    let mut is_reply_to_bot = false;
+
                     if !is_direct_room {
                         is_mentioned =
                             MatrixChannel::event_mentions_user(&event, &body, my_user_id.as_str());

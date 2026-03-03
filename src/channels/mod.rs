@@ -5027,7 +5027,8 @@ fn collect_configured_channels(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 )
-                .with_mention_only(mx.mention_only),
+                .with_mention_only(mx.mention_only)
+                .with_transcription(config.transcription.clone()),
             ),
         });
     }
