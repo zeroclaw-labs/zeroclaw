@@ -581,7 +581,7 @@ async fn run_job_command_with_timeout(
 
     let mut command = Command::new("/bin/sh");
     command
-        .arg("-lc")
+        .arg("-c")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
         .stdin(Stdio::null())
