@@ -851,6 +851,13 @@ fn parse_source_agent(raw_agent: &Value) -> Option<DelegateAgentConfig> {
         model,
         system_prompt: find_string(obj, &["system_prompt", "systemPrompt"]),
         api_key: find_string(obj, &["api_key", "apiKey"]),
+        enabled: find_bool(obj, &["enabled"]).unwrap_or(true),
+        capabilities: obj
+            .get("capabilities")
+            .or_else(|| obj.get("skills"))
+            .map(parse_tool_list)
+            .unwrap_or_default(),
+        priority: find_i32(obj, &["priority"]).unwrap_or(0),
         temperature: find_f64(obj, &["temperature"]),
         max_depth: find_u32(obj, &["max_depth", "maxDepth"]).unwrap_or(3),
         agentic: obj.get("agentic").and_then(Value::as_bool).unwrap_or(false),
@@ -971,6 +978,19 @@ fn find_usize(obj: &JsonMap<String, Value>, keys: &[&str]) -> Option<usize> {
         obj.get(*key)
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
+    })
+}
+
+fn find_bool(obj: &JsonMap<String, Value>, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(Value::as_bool))
+}
+
+fn find_i32(obj: &JsonMap<String, Value>, keys: &[&str]) -> Option<i32> {
+    keys.iter().find_map(|key| {
+        obj.get(*key)
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
     })
 }
 
@@ -1468,6 +1488,9 @@ mod tests {
                 model: "existing-model".to_string(),
                 system_prompt: Some("existing prompt".to_string()),
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,

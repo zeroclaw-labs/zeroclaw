@@ -8,6 +8,9 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
+            - "scripts/ci/ensure_cc.sh"
             - "scripts/ci/reproducible_build_check.sh"
             - "scripts/ci/self_heal_rust_toolchain.sh"
             - ".github/workflows/ci-reproducible-build.yml"
@@ -18,6 +21,9 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
+            - "scripts/ci/ensure_cc.sh"
             - "scripts/ci/reproducible_build_check.sh"
             - "scripts/ci/self_heal_rust_toolchain.sh"
             - ".github/workflows/ci-reproducible-build.yml"
@@ -52,8 +58,12 @@ env:
 jobs:
     reproducibility:
         name: Reproducible Build Probe
-        runs-on: ubuntu-22.04
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 75
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -62,10 +72,22 @@ jobs:
               shell: bash
               run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
 
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              env:
+                  ENSURE_CARGO_COMPONENT_STRICT: "true"
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
 
             - name: Run reproducible build check
               shell: bash

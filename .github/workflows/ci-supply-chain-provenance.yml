@@ -8,6 +8,7 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_cc.sh"
             - "scripts/ci/generate_provenance.py"
             - ".github/workflows/ci-supply-chain-provenance.yml"
     workflow_dispatch:
@@ -31,7 +32,7 @@ env:
 jobs:
     provenance:
         name: Build + Provenance Bundle
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 60
         steps:
             - name: Checkout
@@ -41,6 +42,20 @@ jobs:
               uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+
+            - name: Runner preflight (compiler + disk)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  ./scripts/ci/ensure_cc.sh
+                  echo "Runner: ${RUNNER_NAME:-unknown} (${RUNNER_OS:-unknown}/${RUNNER_ARCH:-unknown})"
+                  free_kb="$(df -Pk . | awk 'NR==2 {print $4}')"
+                  min_kb=$((10 * 1024 * 1024))
+                  if [ "${free_kb}" -lt "${min_kb}" ]; then
+                    echo "::error::Insufficient disk space on runner (<10 GiB free)."
+                    df -h .
+                    exit 1
+                  fi
 
             - name: Build release-fast artifact
               shell: bash

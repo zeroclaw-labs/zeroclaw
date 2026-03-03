@@ -3833,6 +3833,84 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         planned_ids = [item["id"] for item in report["planned_actions"]]
         self.assertEqual(planned_ids, [101, 102])
 
+    def test_queue_hygiene_priority_branch_prefix_preempts_non_release_runs(self) -> None:
+        runs_json = self.tmp / "runs-priority-release.json"
+        output_json = self.tmp / "queue-hygiene-priority-release.json"
+        runs_json.write_text(
+            json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 501,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "release/v0.2.0",
+                            "head_sha": "sha-501",
+                            "created_at": "2026-02-27T20:00:00Z",
+                        },
+                        {
+                            "id": 502,
+                            "name": "CI Run",
+                            "event": "push",
+                            "head_branch": "feature-fast-path",
+                            "head_sha": "sha-502",
+                            "created_at": "2026-02-27T20:01:00Z",
+                        },
+                        {
+                            "id": 503,
+                            "name": "Sec CodeQL",
+                            "event": "pull_request",
+                            "head_branch": "feature-a",
+                            "head_sha": "sha-503",
+                            "created_at": "2026-02-27T20:02:00Z",
+                            "pull_requests": [{"number": 2001}],
+                        },
+                        {
+                            "id": 504,
+                            "name": "Sec CodeQL",
+                            "event": "pull_request",
+                            "head_branch": "release/v0.2.0",
+                            "head_sha": "sha-504",
+                            "created_at": "2026-02-27T20:03:00Z",
+                            "pull_requests": [{"number": 2002}],
+                        },
+                        {
+                            "id": 505,
+                            "name": "Security Audit",
+                            "event": "push",
+                            "head_branch": "feature-only",
+                            "head_sha": "sha-505",
+                            "created_at": "2026-02-27T20:04:00Z",
+                        },
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("queue_hygiene.py"),
+                "--runs-json",
+                str(runs_json),
+                "--priority-branch-prefix",
+                "release/",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        report = json.loads(output_json.read_text(encoding="utf-8"))
+        planned_ids = [item["id"] for item in report["planned_actions"]]
+        self.assertEqual(planned_ids, [502, 503])
+        reasons_by_id = {item["id"]: item["reasons"] for item in report["planned_actions"]}
+        self.assertIn("priority-preempted-by-release", reasons_by_id[502])
+        self.assertIn("priority-preempted-by-release", reasons_by_id[503])
+        self.assertEqual(report["policies"]["priority_branch_prefixes"], ["release/"])
+
     def test_queue_hygiene_non_pr_branch_mode_dedupes_push_runs(self) -> None:
         runs_json = self.tmp / "runs-non-pr-branch.json"
         output_json = self.tmp / "queue-hygiene-non-pr-branch.json"

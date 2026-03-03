@@ -82,6 +82,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of runs to cancel/apply in one execution.",
     )
     parser.add_argument(
+        "--priority-branch-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Branch prefix to prioritize (repeatable). "
+            "When present in queue, non-matching runs of the same workflow become cancel candidates."
+        ),
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
         help="Apply cancel operations. Default is dry-run.",
@@ -174,6 +183,12 @@ def parse_timestamp(value: str | None) -> datetime:
         return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
+def branch_has_prefix(branch: str, prefixes: set[str]) -> bool:
+    if not branch:
+        return False
+    return any(branch.startswith(prefix) for prefix in prefixes)
+
+
 def run_identity_key(run: dict[str, Any], *, non_pr_key: str) -> tuple[str, str, str, str]:
     name = str(run.get("name", ""))
     event = str(run.get("event", ""))
@@ -202,6 +217,7 @@ def collect_candidates(
     *,
     include_non_pr: bool,
     non_pr_key: str,
+    priority_branch_prefixes: set[str],
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     reasons_by_id: dict[int, set[str]] = defaultdict(set)
     runs_by_id: dict[int, dict[str, Any]] = {}
@@ -217,6 +233,31 @@ def collect_candidates(
         runs_by_id[run_id] = run
         if str(run.get("name", "")) in obsolete_workflows:
             reasons_by_id[run_id].add("obsolete-workflow")
+
+    if priority_branch_prefixes:
+        prioritized_workflows: set[str] = set()
+        for run in runs:
+            branch = str(run.get("head_branch", ""))
+            if branch_has_prefix(branch, priority_branch_prefixes):
+                workflow = str(run.get("name", ""))
+                if workflow:
+                    prioritized_workflows.add(workflow)
+
+        for run in runs:
+            run_id_raw = run.get("id")
+            if run_id_raw is None:
+                continue
+            try:
+                run_id = int(run_id_raw)
+            except (TypeError, ValueError):
+                continue
+            workflow = str(run.get("name", ""))
+            if workflow not in prioritized_workflows:
+                continue
+            branch = str(run.get("head_branch", ""))
+            if branch_has_prefix(branch, priority_branch_prefixes):
+                continue
+            reasons_by_id[run_id].add("priority-preempted-by-release")
 
     by_workflow: dict[str, dict[tuple[str, str, str, str], list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
@@ -312,9 +353,10 @@ def main() -> int:
 
     obsolete_workflows = normalize_values(args.obsolete_workflow)
     dedupe_workflows = normalize_values(args.dedupe_workflow)
-    if not obsolete_workflows and not dedupe_workflows:
+    priority_prefixes = normalize_values(args.priority_branch_prefix)
+    if not obsolete_workflows and not dedupe_workflows and not priority_prefixes:
         print(
-            "queue_hygiene: no policy configured. Provide --obsolete-workflow and/or --dedupe-workflow.",
+            "queue_hygiene: no policy configured. Provide --obsolete-workflow, --dedupe-workflow, and/or --priority-branch-prefix.",
             file=sys.stderr,
         )
         return 2
@@ -345,6 +387,7 @@ def main() -> int:
         dedupe_workflows,
         include_non_pr=args.dedupe_include_non_pr,
         non_pr_key=args.non_pr_key,
+        priority_branch_prefixes=priority_prefixes,
     )
 
     capped = selected[: max(0, args.max_cancel)]
@@ -360,6 +403,7 @@ def main() -> int:
             "dedupe_workflows": sorted(dedupe_workflows),
             "dedupe_include_non_pr": args.dedupe_include_non_pr,
             "non_pr_key": args.non_pr_key,
+            "priority_branch_prefixes": sorted(priority_prefixes),
             "max_cancel": args.max_cancel,
         },
         "counts": {

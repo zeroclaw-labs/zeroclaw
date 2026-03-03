@@ -141,6 +141,105 @@ Notes:
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 - **Loop detection** intervenes before `max_tool_iterations` is exhausted. On first detection the agent receives a self-correction prompt; if the loop persists the agent is stopped early. Detection is result-aware: repeated calls with *different* outputs (genuine progress) do not trigger. Set any threshold to `0` to disable that detector.
 
+## `[agent.teams]`
+
+Controls synchronous team delegation behavior (`delegate` tool).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable/disable agent-team delegation runtime |
+| `auto_activate` | `true` | Allow automatic team-agent selection when `delegate.agent` is omitted or `"auto"` |
+| `max_agents` | `32` | Max active delegate profiles considered for team selection |
+| `strategy` | `adaptive` | Load-balancing strategy: `semantic`, `adaptive`, `least_loaded` |
+| `load_window_secs` | `120` | Sliding window used for recent load/failure scoring |
+| `inflight_penalty` | `8` | Score penalty per in-flight task |
+| `recent_selection_penalty` | `2` | Score penalty per recent assignment within the load window |
+| `recent_failure_penalty` | `12` | Score penalty per recent failure within the load window |
+
+Notes:
+
+- `semantic` preserves lexical/metadata matching priority.
+- `adaptive` blends semantic signals with runtime load and recent outcomes (default).
+- `least_loaded` prioritizes healthy least-loaded agents before semantic tie-breakers.
+- `max_agents` has no hard-coded upper cap in tooling; use any positive integer that fits the platform.
+- `max_agents` and `load_window_secs` must be greater than `0`.
+
+Example:
+
+```toml
+[agent.teams]
+enabled = true
+auto_activate = true
+max_agents = 48
+strategy = "adaptive"
+load_window_secs = 180
+inflight_penalty = 10
+recent_selection_penalty = 3
+recent_failure_penalty = 14
+```
+
+## `[agent.subagents]`
+
+Controls asynchronous/background delegation (`subagent_spawn`, `subagent_list`, `subagent_manage`).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable/disable background sub-agent runtime |
+| `auto_activate` | `true` | Allow automatic sub-agent selection when `subagent_spawn.agent` is omitted or `"auto"` |
+| `max_concurrent` | `10` | Max number of concurrently running background sub-agents |
+| `strategy` | `adaptive` | Load-balancing strategy: `semantic`, `adaptive`, `least_loaded` |
+| `load_window_secs` | `180` | Sliding window used for recent load/failure scoring |
+| `inflight_penalty` | `10` | Score penalty per in-flight task |
+| `recent_selection_penalty` | `3` | Score penalty per recent assignment within the load window |
+| `recent_failure_penalty` | `16` | Score penalty per recent failure within the load window |
+| `queue_wait_ms` | `15000` | Wait duration for free concurrency slot before failing (`0` = fail-fast) |
+| `queue_poll_ms` | `200` | Poll interval while waiting for a slot |
+
+Notes:
+
+- `max_concurrent` has no hard-coded upper cap in tooling; use any positive integer that fits the platform.
+- `max_concurrent`, `load_window_secs`, and `queue_poll_ms` must be greater than `0`.
+- `queue_wait_ms = 0` is valid and forces immediate failure when at capacity.
+
+Example:
+
+```toml
+[agent.subagents]
+enabled = true
+auto_activate = true
+max_concurrent = 24
+strategy = "least_loaded"
+load_window_secs = 240
+inflight_penalty = 12
+recent_selection_penalty = 4
+recent_failure_penalty = 18
+queue_wait_ms = 30000
+queue_poll_ms = 250
+```
+
+## Runtime Orchestration Updates (Natural Language + Tool)
+
+You can update the orchestration controls in interactive chat with natural language requests (for example: "disable subagents", "set subagents max concurrent to 20", "switch team strategy to least-loaded").
+
+The runtime persists these updates via `model_routing_config` (`action = "set_orchestration"`), and delegation tools hot-apply them without requiring a process restart.
+
+Example tool payload:
+
+```json
+{
+  "action": "set_orchestration",
+  "teams_enabled": true,
+  "teams_strategy": "adaptive",
+  "max_team_agents": 64,
+  "subagents_enabled": true,
+  "subagents_auto_activate": true,
+  "max_concurrent_subagents": 32,
+  "subagents_strategy": "least_loaded",
+  "subagents_queue_wait_ms": 15000,
+  "subagents_queue_poll_ms": 200
+}
+```
+
 ## `[security.otp]`
 
 | Key | Default | Purpose |
@@ -622,6 +721,11 @@ Notes:
 - Remote URL only when `allow_remote_fetch = true`
 - Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
 - When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+- In `proxy.scope = "services"` mode, remote image fetch uses service-key routing. For best compatibility include relevant selectors/keys such as:
+  - `channel.qq` (QQ media hosts like `multimedia.nt.qq.com.cn`)
+  - `tool.multimodal` (dedicated multimodal fetch path)
+  - `tool.http_request` (compatibility fallback path)
+  - `provider.*` or the active provider key (for example `provider.openai`)
 
 ## `[browser]`
 

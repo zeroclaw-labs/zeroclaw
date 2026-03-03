@@ -27,7 +27,7 @@ env:
 jobs:
     nightly-lanes:
         name: Nightly Lane (${{ matrix.name }})
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 70
         strategy:
             fail-fast: false
@@ -137,7 +137,7 @@ jobs:
         name: Nightly Summary & Routing
         needs: [nightly-lanes]
         if: always()
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -36,6 +36,8 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +147,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,7 +286,12 @@ impl OpenAiProvider {
             .collect()
     }
 
-    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(choice: NativeChoice) -> ProviderChatResponse {
+        let raw_stop_reason = choice.finish_reason;
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
+        let message = choice.message;
         let text = message.effective_content();
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
@@ -302,6 +311,8 @@ impl OpenAiProvider {
             usage: None,
             reasoning_content,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 
@@ -407,13 +418,12 @@ impl Provider for OpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        let mut result = Self::parse_native_response(message);
+        let mut result = Self::parse_native_response(choice);
         result.usage = usage;
         result.quota_metadata = quota_metadata;
         Ok(result)
@@ -476,13 +486,12 @@ impl Provider for OpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        let mut result = Self::parse_native_response(message);
+        let mut result = Self::parse_native_response(choice);
         result.usage = usage;
         result.quota_metadata = quota_metadata;
         Ok(result)
@@ -773,21 +782,25 @@ mod tests {
             "content":"answer",
             "reasoning_content":"thinking step",
             "tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]
-        }}]}"#;
+        },"finish_reason":"length"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let message = resp.choices.into_iter().next().unwrap().message;
-        let parsed = OpenAiProvider::parse_native_response(message);
+        let choice = resp.choices.into_iter().next().unwrap();
+        let parsed = OpenAiProvider::parse_native_response(choice);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::MaxTokens));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("length"));
     }
 
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
-        let json = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let json = r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let message = resp.choices.into_iter().next().unwrap().message;
-        let parsed = OpenAiProvider::parse_native_response(message);
+        let choice = resp.choices.into_iter().next().unwrap();
+        let parsed = OpenAiProvider::parse_native_response(choice);
         assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::EndTurn));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("stop"));
     }
 
     #[test]

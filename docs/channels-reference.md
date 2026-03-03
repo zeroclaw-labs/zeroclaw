@@ -148,6 +148,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | QQ | bot gateway | No |
 | Napcat | websocket receive + HTTP send (OneBot) | No (typically local/LAN) |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
+| WATI | webhook (`/wati`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
 | ACP | stdio (JSON-RPC 2.0) | No |
 | Nostr | relay websocket (NIP-04 / NIP-17) | No |
@@ -166,7 +167,7 @@ Field names differ by channel:
 
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Napcat/Nextcloud Talk/ACP)
 - `allowed_from` (Signal)
-- `allowed_numbers` (WhatsApp)
+- `allowed_numbers` (WhatsApp/WATI)
 - `allowed_senders` (Email/Linq)
 - `allowed_contacts` (iMessage)
 - `allowed_pubkeys` (Nostr)
@@ -544,7 +545,29 @@ Notes:
 allowed_contacts = ["*"]
 ```
 
-### 4.18 ACP
+### 4.20 WATI
+
+```toml
+[channels_config.wati]
+api_token = "wati-api-token"
+api_url = "https://live-mt-server.wati.io"  # optional
+webhook_secret = "required-shared-secret"
+tenant_id = "tenant-id"                      # optional
+allowed_numbers = ["*"]                      # optional, "*" = allow all
+```
+
+Notes:
+
+- Inbound webhook endpoint: `POST /wati`.
+- WATI webhook auth is fail-closed:
+  - `500` when `webhook_secret` is not configured.
+  - `401` when signature/bearer auth is missing or invalid.
+- Accepted auth methods:
+  - `X-Hub-Signature-256`, `X-Wati-Signature`, or `X-Webhook-Signature` HMAC-SHA256 (`sha256=<hex>` or raw hex)
+  - `Authorization: Bearer <webhook_secret>` fallback
+- `ZEROCLAW_WATI_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+
+### 4.21 ACP
 
 ACP (Agent Client Protocol) enables ZeroClaw to act as a client for OpenCode ACP server,
 allowing remote control of OpenCode behavior through JSON-RPC 2.0 communication over stdio.

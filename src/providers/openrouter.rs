@@ -1,7 +1,7 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -55,6 +55,8 @@ struct ApiChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +139,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,7 +288,12 @@ impl OpenRouterProvider {
         MessageContent::Parts(parts)
     }
 
-    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(choice: NativeChoice) -> ProviderChatResponse {
+        let raw_stop_reason = choice.finish_reason;
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
+        let message = choice.message;
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
             .tool_calls
@@ -303,6 +312,8 @@ impl OpenRouterProvider {
             usage: None,
             reasoning_content,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 
@@ -487,13 +498,12 @@ impl Provider for OpenRouterProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        let mut result = Self::parse_native_response(message);
+        let mut result = Self::parse_native_response(choice);
         result.usage = usage;
         Ok(result)
     }
@@ -582,13 +592,12 @@ impl Provider for OpenRouterProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        let mut result = Self::parse_native_response(message);
+        let mut result = Self::parse_native_response(choice);
         result.usage = usage;
         Ok(result)
     }
@@ -828,25 +837,30 @@ mod tests {
 
     #[test]
     fn parse_native_response_converts_to_chat_response() {
-        let message = NativeResponseMessage {
-            content: Some("Here you go.".into()),
-            reasoning_content: None,
-            tool_calls: Some(vec![NativeToolCall {
-                id: Some("call_789".into()),
-                kind: Some("function".into()),
-                function: NativeFunctionCall {
-                    name: "file_read".into(),
-                    arguments: r#"{"path":"test.txt"}"#.into(),
-                },
-            }]),
+        let choice = NativeChoice {
+            message: NativeResponseMessage {
+                content: Some("Here you go.".into()),
+                reasoning_content: None,
+                tool_calls: Some(vec![NativeToolCall {
+                    id: Some("call_789".into()),
+                    kind: Some("function".into()),
+                    function: NativeFunctionCall {
+                        name: "file_read".into(),
+                        arguments: r#"{"path":"test.txt"}"#.into(),
+                    },
+                }]),
+            },
+            finish_reason: Some("stop".into()),
         };
 
-        let response = OpenRouterProvider::parse_native_response(message);
+        let response = OpenRouterProvider::parse_native_response(choice);
 
         assert_eq!(response.text.as_deref(), Some("Here you go."));
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].id, "call_789");
         assert_eq!(response.tool_calls[0].name, "file_read");
+        assert_eq!(response.stop_reason, Some(NormalizedStopReason::EndTurn));
+        assert_eq!(response.raw_stop_reason.as_deref(), Some("stop"));
     }
 
     #[test]
@@ -942,32 +956,42 @@ mod tests {
 
     #[test]
     fn parse_native_response_captures_reasoning_content() {
-        let message = NativeResponseMessage {
-            content: Some("answer".into()),
-            reasoning_content: Some("thinking step".into()),
-            tool_calls: Some(vec![NativeToolCall {
-                id: Some("call_1".into()),
-                kind: Some("function".into()),
-                function: NativeFunctionCall {
-                    name: "shell".into(),
-                    arguments: "{}".into(),
-                },
-            }]),
+        let choice = NativeChoice {
+            message: NativeResponseMessage {
+                content: Some("answer".into()),
+                reasoning_content: Some("thinking step".into()),
+                tool_calls: Some(vec![NativeToolCall {
+                    id: Some("call_1".into()),
+                    kind: Some("function".into()),
+                    function: NativeFunctionCall {
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            },
+            finish_reason: Some("length".into()),
         };
-        let parsed = OpenRouterProvider::parse_native_response(message);
+        let parsed = OpenRouterProvider::parse_native_response(choice);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::MaxTokens));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("length"));
     }
 
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
-        let message = NativeResponseMessage {
-            content: Some("hello".into()),
-            reasoning_content: None,
-            tool_calls: None,
+        let choice = NativeChoice {
+            message: NativeResponseMessage {
+                content: Some("hello".into()),
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            finish_reason: Some("stop".into()),
         };
-        let parsed = OpenRouterProvider::parse_native_response(message);
+        let parsed = OpenRouterProvider::parse_native_response(choice);
         assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::EndTurn));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("stop"));
     }
 
     #[test]

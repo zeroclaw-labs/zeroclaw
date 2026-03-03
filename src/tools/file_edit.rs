@@ -294,7 +294,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_user_supplied_path(path);
 
         // ── 5. Canonicalize parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
@@ -474,6 +474,18 @@ mod tests {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
             allow_sensitive_file_writes,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_allows_outside_workspace(
+        workspace: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
             ..SecurityPolicy::default()
         })
     }
@@ -1052,6 +1064,44 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_edit_expands_tilde_path_consistently_with_policy() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME should be available for tilde expansion tests");
+        let target_rel = format!("zeroclaw_tilde_edit_{}.txt", uuid::Uuid::new_v4());
+        let target_path = home.join(&target_rel);
+        let _ = tokio::fs::remove_file(&target_path).await;
+        tokio::fs::write(&target_path, "alpha beta gamma")
+            .await
+            .unwrap();
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_edit_tilde_workspace");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let tool = FileEditTool::new(test_security_allows_outside_workspace(workspace.clone()));
+        let result = tool
+            .execute(json!({
+                "path": format!("~/{}", target_rel),
+                "old_string": "beta",
+                "new_string": "delta"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "tilde path edit should succeed when policy allows outside workspace: {:?}",
+            result.error
+        );
+
+        let content = tokio::fs::read_to_string(&target_path).await.unwrap();
+        assert_eq!(content, "alpha delta gamma");
+
+        let _ = tokio::fs::remove_file(&target_path).await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
     #[cfg(unix)]
