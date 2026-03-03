@@ -9989,15 +9989,15 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let config_path = cfg.config_path.clone();
         let result = start_channels(cfg).await;
-        assert!(
-            result.is_ok(),
-            "start_channels should support routed providers without global credentials: {result:?}"
-        );
-
         let mut store = runtime_config_store()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         store.remove(&config_path);
+
+        assert!(
+            result.is_ok(),
+            "start_channels should support routed providers without global credentials: {result:?}"
+        );
     }
 
     #[tokio::test]
