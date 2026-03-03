@@ -164,10 +164,7 @@ impl Tool for BlueBubblesMessageTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!(
-                                "BB reply request failed: {}",
-                                e.without_url()
-                            )),
+                            error: Some(format!("BB reply request failed: {}", e.without_url())),
                         })
                     }
                 };
@@ -259,10 +256,7 @@ impl Tool for BlueBubblesMessageTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!(
-                                "BB unsend request failed: {}",
-                                e.without_url()
-                            )),
+                            error: Some(format!("BB unsend request failed: {}", e.without_url())),
                         })
                     }
                 };
