@@ -279,6 +279,7 @@ struct RuntimeConfigState {
 struct RuntimeAutonomyPolicy {
     auto_approve: Vec<String>,
     always_ask: Vec<String>,
+    command_context_rules: Vec<crate::config::CommandContextRuleConfig>,
     non_cli_excluded_tools: Vec<String>,
     non_cli_approval_approvers: Vec<String>,
     non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
@@ -1106,6 +1107,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
     RuntimeAutonomyPolicy {
         auto_approve: config.autonomy.auto_approve.clone(),
         always_ask: config.autonomy.always_ask.clone(),
+        command_context_rules: config.autonomy.command_context_rules.clone(),
         non_cli_excluded_tools: config.autonomy.non_cli_excluded_tools.clone(),
         non_cli_approval_approvers: config.autonomy.non_cli_approval_approvers.clone(),
         non_cli_natural_language_approval_mode: config
@@ -1721,6 +1723,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     ctx.approval_manager.replace_runtime_non_cli_policy(
         &next_autonomy_policy.auto_approve,
         &next_autonomy_policy.always_ask,
+        &next_autonomy_policy.command_context_rules,
         &next_autonomy_policy.non_cli_approval_approvers,
         next_autonomy_policy.non_cli_natural_language_approval_mode,
         &next_autonomy_policy.non_cli_natural_language_approval_mode_by_channel,

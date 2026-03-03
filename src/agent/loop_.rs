@@ -1953,7 +1953,11 @@ pub async fn run_tool_call_loop(
             if let Some(mgr) = approval {
                 let non_cli_session_granted =
                     channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
-                if bypass_non_cli_approval_for_turn || non_cli_session_granted {
+                let requires_interactive_approval =
+                    mgr.needs_approval_for_call(&tool_name, &tool_args);
+                if (bypass_non_cli_approval_for_turn || non_cli_session_granted)
+                    && !requires_interactive_approval
+                {
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
@@ -1975,7 +1979,7 @@ pub async fn run_tool_call_loop(
                             }),
                         );
                     }
-                } else if mgr.needs_approval(&tool_name) {
+                } else if requires_interactive_approval {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
@@ -2043,6 +2047,24 @@ pub async fn run_tool_call_loop(
                             },
                         ));
                         continue;
+                    }
+
+                    if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                        match &mut tool_args {
+                            serde_json::Value::Object(map) => {
+                                map.insert("approved".to_string(), serde_json::Value::Bool(true));
+                            }
+                            serde_json::Value::String(command) => {
+                                let normalized_command = command.trim().to_string();
+                                if !normalized_command.is_empty() {
+                                    tool_args = serde_json::json!({
+                                        "command": normalized_command,
+                                        "approved": true
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -3317,7 +3339,7 @@ mod tests {
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -3633,6 +3655,16 @@ mod tests {
         max_active: Arc<AtomicUsize>,
     }
 
+    struct ApprovalFlagTool {
+        approved_seen: Arc<AtomicBool>,
+    }
+
+    impl ApprovalFlagTool {
+        fn new(approved_seen: Arc<AtomicBool>) -> Self {
+            Self { approved_seen }
+        }
+    }
+
     impl DelayTool {
         fn new(
             name: &str,
@@ -3744,6 +3776,44 @@ mod tests {
                 success: true,
                 output: format!("ok:{value}"),
                 error: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ApprovalFlagTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Captures the approved flag for approval-flow tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "approved": { "type": "boolean" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let approved = args
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.approved_seen.store(approved, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: approved,
+                output: format!("approved={approved}"),
+                error: (!approved).then(|| "missing approved=true".to_string()),
             })
         }
     }
@@ -3955,6 +4025,76 @@ mod tests {
         ];
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_false_when_command_rule_requires_approval() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "rm -f ./tmp.txt"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                tool_call_id: None,
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string(), "file_read".to_string()],
+            always_ask: vec![],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".to_string(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(!should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_true_when_command_rule_does_not_match() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "ls -la"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                tool_call_id: None,
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string(), "file_read".to_string()],
+            always_ask: vec![],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".to_string(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
             ..crate::config::AutonomyConfig::default()
         };
         let approval_mgr = ApprovalManager::from_config(&approval_cfg);
@@ -4243,6 +4383,84 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_approved_flag_after_non_cli_approval() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"rm -f ./tmp.txt"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let approved_seen = Arc::new(AtomicBool::new(false));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(ApprovalFlagTool::new(Arc::clone(&approved_seen)))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let approval_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            approval_mgr_for_task
+                .confirm_non_cli_pending_request(
+                    &prompt.request_id,
+                    "alice",
+                    "telegram",
+                    "chat-approved-flag",
+                )
+                .expect("pending approval should confirm");
+            approval_mgr_for_task
+                .record_non_cli_pending_resolution(&prompt.request_id, ApprovalResponse::Yes);
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approved-flag".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            ProgressMode::Verbose,
+            None,
+        )
+        .await
+        .expect("tool loop should continue after non-cli approval");
+
+        approval_task.await.expect("approval task should complete");
+        assert_eq!(result, "done");
+        assert!(
+            approved_seen.load(Ordering::SeqCst),
+            "approved=true should be injected after prompt approval"
         );
     }
 
