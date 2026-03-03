@@ -5,7 +5,6 @@
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -311,6 +310,7 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     // This avoids cross-filesystem rename failures (EXDEV) from temp dirs.
     #[cfg(unix)]
     {
+        use std::io::ErrorKind;
         use std::os::unix::fs::PermissionsExt;
 
         let parent = current_exe

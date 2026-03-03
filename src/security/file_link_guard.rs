@@ -15,9 +15,11 @@ fn link_count(metadata: &Metadata) -> u64 {
 }
 
 #[cfg(windows)]
-fn link_count(metadata: &Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    u64::from(metadata.number_of_links())
+fn link_count(_metadata: &Metadata) -> u64 {
+    // number_of_links() is unstable on Windows (rust-lang#63010).
+    // Conservatively return 1 so the guard never triggers false positives.
+    // A future improvement can call GetFileInformationByHandle via windows-sys.
+    1
 }
 
 #[cfg(not(any(unix, windows)))]
