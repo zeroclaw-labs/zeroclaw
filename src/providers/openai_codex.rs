@@ -1676,12 +1676,19 @@ data: [DONE]
     }
 
     #[test]
-    fn websocket_explicit_stream_failure_remains_stream_error() {
-        let err = websocket_stream_classification_error(anyhow::anyhow!(
-            "socket frame decode failed"
-        ));
+    fn websocket_binary_decode_failure_remains_stream_error() {
+        let err = String::from_utf8(vec![0xFF])
+            .map(|_| ())
+            .map_err(|error| {
+                websocket_stream_classification_error(anyhow::anyhow!(
+                    "invalid UTF-8 websocket frame from OpenAI Codex: {error}"
+                ))
+            })
+            .expect_err("invalid websocket binary payload should be stream-classified");
         assert!(matches!(err, WebsocketRequestError::Stream(_)));
-        assert!(err.to_string().contains("socket frame decode failed"));
+        assert!(err
+            .to_string()
+            .contains("invalid UTF-8 websocket frame from OpenAI Codex"));
     }
 
     #[test]
