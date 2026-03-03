@@ -95,7 +95,16 @@
 - **FR-006**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
 - **FR-007**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
 
-### Key Entities *(include if feature involves data)*
+### Additional Required Requirements
+
+- For all security/runtime/tools/gateway/observability edits, include explicit
+  failure-mode, rollback, and contract reference updates.
+- If a requirement changes config or command contracts, list the impacted docs in:
+  `docs/commands-reference.md`, `docs/providers-reference.md`,
+  `docs/channels-reference.md`, `docs/config-reference.md`,
+  `docs/operations-runbook.md`.
+
+## Key Entities *(include if feature involves data)*
 
 - **[Entity 1]**: [What it represents, key attributes without implementation]
 - **[Entity 2]**: [What it represents, relationships to other entities]
@@ -103,8 +112,8 @@
 ## Success Criteria *(mandatory)*
 
 <!--
-  ACTION REQUIRED: Define measurable success criteria.
-  These must be technology-agnostic and measurable.
+  ACTION REQUIRED: The content in this section represents placeholders.
+  Fill them out with the right measurable requirements.
 -->
 
 ### Measurable Outcomes

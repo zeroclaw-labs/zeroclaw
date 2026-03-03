@@ -1,7 +1,9 @@
 # PRD: ZeroClaw Runtime Specification Recovery and Controlled Evolution
 
+This initiative applies to the ZeroClaw runtime framework as described in the repository [README](README.md) and [docs hub](docs/README.md).
+
 ## 1) Problem
-ZeroClaw has grown into a modular but tightly coupled runtime with many high-risk boundary surfaces. There is no single spec-backed, auditable map of current behavioral contracts across providers, channels, tools, memory, security, runtime adapters, and observability. This causes hidden contract drift and increases risk during future changes.
+ZeroClaw has grown into a modular but tightly coupled runtime with many high-risk boundary surfaces. There is no single spec-backed, auditable map of current behavioral contracts across gateway, providers, channels, tools, memory, security, runtime adapters, and observability. This causes hidden contract drift and increases risk during future changes.
 
 ## 2) Goals
 - Capture current behavior comprehensively in Spec Kit format without changing execution.
@@ -11,7 +13,7 @@ ZeroClaw has grown into a modular but tightly coupled runtime with many high-ris
 - Produce a spec coverage map for architectural confidence and maintenance.
 
 ### Dependencies and stakeholders
-Spec Kit format and repo structure; owners per spec as in spec-tracking-review.
+Spec Kit format and repo structure; owners per spec as in spec-tracking-review. Product and docs context as in README and docs/README.md.
 
 ## 3) Success Metrics
 - 100% of listed core seams has at least one spec.
