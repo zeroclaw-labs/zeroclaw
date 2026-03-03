@@ -92,6 +92,8 @@ mod service;
 mod skillforge;
 mod skills;
 mod tools;
+#[cfg(feature = "tui-ratatui")]
+mod tui;
 mod tunnel;
 mod update;
 mod util;
@@ -249,6 +251,26 @@ Examples:
         /// Memory backend (sqlite, markdown, none)
         #[arg(long)]
         memory_backend: Option<String>,
+    },
+
+    /// Start terminal UI mode (rich split-pane chat interface)
+    #[command(long_about = "\
+Start terminal UI mode.
+
+Launches a full-screen terminal interface with chat history, tool progress, \
+and multiline input.
+
+Examples:
+  zeroclaw tui
+  zeroclaw tui --provider anthropic --model claude-sonnet-4-20250514")]
+    Tui {
+        /// Provider to use (openrouter, anthropic, openai, openai-codex)
+        #[arg(short, long)]
+        provider: Option<String>,
+
+        /// Model to use
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -984,6 +1006,26 @@ async fn main() -> Result<()> {
             ))
             .await
             .map(|_| ())
+        }
+
+        Commands::Tui { provider, model } => {
+            if let Some(provider) = provider {
+                config.default_provider = Some(provider);
+            }
+            if let Some(model) = model {
+                config.default_model = Some(model);
+            }
+
+            #[cfg(feature = "tui-ratatui")]
+            {
+                tui::run(&config).await
+            }
+
+            #[cfg(not(feature = "tui-ratatui"))]
+            {
+                let _ = config;
+                bail!("TUI feature not enabled. Rebuild with: --features tui-ratatui");
+            }
         }
 
         Commands::Gateway {
@@ -2681,6 +2723,27 @@ mod tests {
                 assert!(instructions);
             }
             other => panic!("expected update command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_cli_parses_provider_and_model_flags() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "tui",
+            "--provider",
+            "openrouter",
+            "--model",
+            "anthropic/claude-sonnet-4.6",
+        ])
+        .expect("tui command with provider/model should parse");
+
+        match cli.command {
+            Commands::Tui { provider, model } => {
+                assert_eq!(provider.as_deref(), Some("openrouter"));
+                assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
+            }
+            other => panic!("expected tui command, got {other:?}"),
         }
     }
 }

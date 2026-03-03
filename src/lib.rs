@@ -75,6 +75,8 @@ pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
 pub mod tools;
+#[cfg(feature = "tui-ratatui")]
+pub mod tui;
 pub(crate) mod tunnel;
 pub mod update;
 pub(crate) mod util;

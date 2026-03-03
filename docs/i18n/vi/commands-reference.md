@@ -2,7 +2,7 @@
 
 Dựa trên CLI hiện tại (`zeroclaw --help`).
 
-Xác minh lần cuối: **2026-02-28**.
+Xác minh lần cuối: **2026-03-03**.
 
 ## Lệnh cấp cao nhất
 
@@ -10,6 +10,7 @@ Xác minh lần cuối: **2026-02-28**.
 |---|---|
 | `onboard` | Khởi tạo workspace/config nhanh hoặc tương tác |
 | `agent` | Chạy chat tương tác hoặc chế độ gửi tin nhắn đơn |
+| `tui` | Chạy giao diện terminal toàn màn hình (cần feature `tui-ratatui`) |
 | `gateway` | Khởi động gateway webhook và HTTP WhatsApp |
 | `daemon` | Khởi động runtime có giám sát (gateway + channels + heartbeat/scheduler tùy chọn) |
 | `service` | Quản lý vòng đời dịch vụ cấp hệ điều hành |
@@ -45,6 +46,22 @@ Xác minh lần cuối: **2026-02-28**.
 - `zeroclaw agent -m "Hello"`
 - `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
 - `zeroclaw agent --peripheral <board:path>`
+
+### `tui`
+
+- `zeroclaw tui`
+- `zeroclaw tui --provider <ID> --model <MODEL>`
+
+Ghi chú:
+
+- `tui` yêu cầu build với `--features tui-ratatui`.
+- Khi thiếu feature, lệnh sẽ trả thông báo rebuild thân thiện.
+- Phím tắt chính:
+  - `Enter` gửi tin nhắn (chế độ nhập)
+  - `Shift+Enter` xuống dòng
+  - `Ctrl+C` hủy request đang chạy
+  - nhấn `Ctrl+C` hai lần trong 300ms để thoát cưỡng bức
+  - `q` hoặc `Ctrl+D` để thoát
 
 ### `gateway` / `daemon`
 

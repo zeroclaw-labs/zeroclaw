@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 28, 2026**.
+Last verified: **March 3, 2026**.
 
 ## Top-Level Commands
 
@@ -10,6 +10,7 @@ Last verified: **February 28, 2026**.
 |---|---|
 | `onboard` | Initialize workspace/config quickly or interactively |
 | `agent` | Run interactive chat or single-message mode |
+| `tui` | Run full-screen terminal UI mode (requires `tui-ratatui` feature) |
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
 | `service` | Manage user-level OS service lifecycle |
@@ -69,6 +70,22 @@ Tip:
   - switch web search provider/fallbacks (`web_search_config`)
   - inspect or update domain access policy (`web_access_config`)
   - preview/apply OpenClaw merge migration (`openclaw_migration`)
+
+### `tui`
+
+- `zeroclaw tui`
+- `zeroclaw tui --provider <ID> --model <MODEL>`
+
+Notes:
+
+- Build-time feature gate: `tui` requires compiling with `--features tui-ratatui`.
+- Without this feature, `zeroclaw tui` returns a friendly rebuild hint.
+- Keyboard behavior:
+  - `Enter` sends message (editing mode)
+  - `Shift+Enter` inserts newline
+  - `Ctrl+C` cancels current in-flight request
+  - double `Ctrl+C` within 300ms forces quit
+  - `q` or `Ctrl+D` exits TUI
 
 ### `gateway` / `daemon`
 

@@ -138,6 +138,10 @@ tempfile = "3.14"
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Optional terminal UI backend
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", optional = true, default-features = false, features = ["event-stream"] }
+strip-ansi-escapes = { version = "0.2", optional = true }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
 regex = "1.10"
 hostname = "0.4.2"
@@ -247,6 +251,7 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []
 web-fetch-html2md = ["dep:html2md"]
+tui-ratatui = ["dep:ratatui", "dep:crossterm", "dep:strip-ansi-escapes"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
