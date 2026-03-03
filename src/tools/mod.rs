@@ -639,13 +639,16 @@ pub fn all_tools_with_runtime(
         // Keep raw password for auth; trim only to check for empty.
         let password = bb.password.clone();
         if !server_url.is_empty() && !password.trim().is_empty() {
-            match BlueBubblesGroupTool::new(security.clone(), server_url.clone(), password.clone()) {
+            match BlueBubblesGroupTool::new(security.clone(), server_url.clone(), password.clone())
+            {
                 Ok(tool) => tool_arcs.push(Arc::new(tool)),
                 Err(e) => tracing::error!("Failed to initialize BlueBubblesGroupTool: {e}"),
             }
             match BlueBubblesSendAttachmentTool::new(security.clone(), server_url, password) {
                 Ok(tool) => tool_arcs.push(Arc::new(tool)),
-                Err(e) => tracing::error!("Failed to initialize BlueBubblesSendAttachmentTool: {e}"),
+                Err(e) => {
+                    tracing::error!("Failed to initialize BlueBubblesSendAttachmentTool: {e}")
+                }
             }
         }
     }
