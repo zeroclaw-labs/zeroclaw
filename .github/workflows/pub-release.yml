@@ -121,7 +121,7 @@ jobs:
                     --release-ref "${{ steps.vars.outputs.release_ref }}" \
                     --release-tag "${{ steps.vars.outputs.release_tag }}" \
                     --publish-release "${{ steps.vars.outputs.publish_release }}" \
-                    --authorized-actors "${{ vars.RELEASE_AUTHORIZED_ACTORS || 'willsarg,theonlyhennygod,chumyin' }}" \
+                    --authorized-actors "${{ vars.RELEASE_AUTHORIZED_ACTORS }}" \
                     --authorized-tagger-emails "${{ vars.RELEASE_AUTHORIZED_TAGGER_EMAILS || '' }}" \
                     --require-annotated-tag true \
                     --output-json artifacts/release-trigger-guard.json \
@@ -449,6 +449,7 @@ jobs:
         needs: [prepare, verify-artifacts]
         runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 45
+        environment: release
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:

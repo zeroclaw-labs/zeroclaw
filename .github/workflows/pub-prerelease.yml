@@ -81,6 +81,32 @@ jobs:
                     echo "draft=${draft}"
                   } >> "$GITHUB_OUTPUT"
 
+            - name: Enforce release actor allowlist
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  allowed_csv="${{ vars.RELEASE_AUTHORIZED_ACTORS || '' }}"
+                  if [[ -z "$allowed_csv" ]]; then
+                    echo "::error::RELEASE_AUTHORIZED_ACTORS is not configured."
+                    exit 1
+                  fi
+
+                  actor="${GITHUB_ACTOR}"
+                  authorized="false"
+                  IFS=',' read -r -a allowed <<< "$allowed_csv"
+                  for candidate in "${allowed[@]}"; do
+                    normalized="$(echo "$candidate" | xargs)"
+                    if [[ -n "$normalized" && "$actor" == "$normalized" ]]; then
+                      authorized="true"
+                      break
+                    fi
+                  done
+
+                  if [[ "$authorized" != "true" ]]; then
+                    echo "::error::Actor ${actor} is not allowed to publish prereleases. Allowed actors: ${allowed_csv}"
+                    exit 1
+                  fi
+
             - name: Validate prerelease stage gate
               shell: bash
               run: |
@@ -241,6 +267,7 @@ jobs:
         if: needs.prerelease-guard.outputs.ready_to_publish == 'true'
         runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 15
+        environment: release
         steps:
             - name: Download prerelease artifacts
               uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0

@@ -2,7 +2,7 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **February 25, 2026**.
+Last verified: **March 1, 2026**.
 
 ## Release Goals
 
@@ -44,6 +44,19 @@ Publish-mode guardrails:
 - Trigger provenance is recorded in `release-trigger-guard.json` and `audit-event-release-trigger-guard.json`.
 - Multi-arch artifact contract is enforced by `.github/release/release-artifact-contract.json` through `release_artifact_guard.py`.
 - Release notes include a generated supply-chain evidence preface (`release-notes-supply-chain.md`) plus GitHub-generated commit-window notes.
+
+## Release Authority
+
+- Canonical release-operator team: `zeroclaw-labs/ReleaseOperators` (`@zeroclaw-labs/releaseoperators`).
+- Current intended members: `gh-xj`, `chumyin`, `theonlyhennygod`.
+- Workflow actor gate source of truth: repository variable `RELEASE_AUTHORIZED_ACTORS`.
+- Manual publish jobs (`Pub Release`, `Pub Pre-release`, `Pub Docker Img`) must pass the `release` environment approval gate.
+- Release tag mutation is restricted by repository tag ruleset `Release Tags - Restricted Operators` (rule id `13369578`) for:
+  - `refs/tags/v*`
+  - `refs/tags/v*-alpha.*`
+  - `refs/tags/v*-beta.*`
+  - `refs/tags/v*-rc.*`
+- Non-release marker tags (for example `canary-*`, `rollback-*`) are intentionally outside this tag ruleset scope.
 
 ## Maintainer Procedure
 
