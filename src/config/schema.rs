@@ -169,19 +169,29 @@ const DEFAULT_MODEL_NAME: &str = "anthropic/claude-sonnet-4.6";
 pub enum ProviderApiMode {
     /// Default behavior: `/chat/completions` first, optional `/responses`
     /// fallback when supported.
-    OpenAiChatCompletions,
+    ///
+    /// TOML value: `"openai-chat-completions"`
+    ///
+    /// The alias `"open-ai-chat-completions"` is accepted for backwards compatibility.
+    #[serde(alias = "open-ai-chat-completions")]
+    OpenaiChatCompletions,
     /// Responses-first behavior: call `/responses` directly.
-    OpenAiResponses,
+    ///
+    /// TOML value: `"openai-responses"`
+    ///
+    /// The alias `"open-ai-responses"` is accepted for backwards compatibility.
+    #[serde(alias = "open-ai-responses")]
+    OpenaiResponses,
 }
 
 impl ProviderApiMode {
     pub fn as_compatible_mode(self) -> crate::providers::compatible::CompatibleApiMode {
         match self {
-            Self::OpenAiChatCompletions => {
-                crate::providers::compatible::CompatibleApiMode::OpenAiChatCompletions
+            Self::OpenaiChatCompletions => {
+                crate::providers::compatible::CompatibleApiMode::OpenaiChatCompletions
             }
-            Self::OpenAiResponses => {
-                crate::providers::compatible::CompatibleApiMode::OpenAiResponses
+            Self::OpenaiResponses => {
+                crate::providers::compatible::CompatibleApiMode::OpenaiResponses
             }
         }
     }
@@ -12150,7 +12160,7 @@ requires_openai_auth = true
     async fn provider_api_requires_custom_default_provider() {
         let mut config = Config::default();
         config.default_provider = Some("openai".to_string());
-        config.provider_api = Some(ProviderApiMode::OpenAiResponses);
+        config.provider_api = Some(ProviderApiMode::OpenaiResponses);
 
         let err = config
             .validate()

@@ -70,9 +70,9 @@ pub enum AuthStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibleApiMode {
     /// Default mode: call chat-completions first and optionally fallback.
-    OpenAiChatCompletions,
+    OpenaiChatCompletions,
     /// Responses-first mode: call `/responses` directly.
-    OpenAiResponses,
+    OpenaiResponses,
 }
 
 impl OpenAiCompatibleProvider {
@@ -91,7 +91,7 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
+            CompatibleApiMode::OpenaiChatCompletions,
             None,
         )
     }
@@ -112,7 +112,7 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
+            CompatibleApiMode::OpenaiChatCompletions,
             None,
         )
     }
@@ -134,7 +134,7 @@ impl OpenAiCompatibleProvider {
             false,
             None,
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
+            CompatibleApiMode::OpenaiChatCompletions,
             None,
         )
     }
@@ -159,7 +159,7 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
+            CompatibleApiMode::OpenaiChatCompletions,
             None,
         )
     }
@@ -181,7 +181,7 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
+            CompatibleApiMode::OpenaiChatCompletions,
             None,
         )
     }
@@ -203,7 +203,7 @@ impl OpenAiCompatibleProvider {
             false,
             None,
             true,
-            CompatibleApiMode::OpenAiChatCompletions,
+            CompatibleApiMode::OpenaiChatCompletions,
             None,
         )
     }
@@ -1150,12 +1150,12 @@ fn parse_responses_response_body(
 
 impl OpenAiCompatibleProvider {
     fn should_use_responses_mode(&self) -> bool {
-        self.api_mode == CompatibleApiMode::OpenAiResponses
+        self.api_mode == CompatibleApiMode::OpenaiResponses
     }
 
     fn chat_completions_fallback_provider(&self) -> Self {
         let mut provider = self.clone();
-        provider.api_mode = CompatibleApiMode::OpenAiChatCompletions;
+        provider.api_mode = CompatibleApiMode::OpenaiChatCompletions;
         provider.supports_responses_fallback = false;
         provider
     }
@@ -2727,7 +2727,7 @@ mod tests {
             Some("key"),
             AuthStyle::Bearer,
             true,
-            CompatibleApiMode::OpenAiResponses,
+            CompatibleApiMode::OpenaiResponses,
             Some(2048),
         );
 
@@ -3011,7 +3011,7 @@ mod tests {
             Some("test-key"),
             AuthStyle::Bearer,
             false,
-            CompatibleApiMode::OpenAiResponses,
+            CompatibleApiMode::OpenaiResponses,
             None,
         );
         let text = provider
@@ -3088,7 +3088,7 @@ mod tests {
             Some("test-key"),
             AuthStyle::Bearer,
             false,
-            CompatibleApiMode::OpenAiResponses,
+            CompatibleApiMode::OpenaiResponses,
             None,
         );
         let err = provider
@@ -3175,7 +3175,7 @@ mod tests {
             Some("test-key"),
             AuthStyle::Bearer,
             false,
-            CompatibleApiMode::OpenAiResponses,
+            CompatibleApiMode::OpenaiResponses,
             None,
         );
         let messages = vec![ChatMessage::user("run a command")];
