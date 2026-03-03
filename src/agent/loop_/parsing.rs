@@ -10,6 +10,12 @@ pub(super) struct ParsedToolCall {
     pub(super) tool_call_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct StructuredToolCallParseResult {
+    pub(super) calls: Vec<ParsedToolCall>,
+    pub(super) invalid_json_arguments: usize,
+}
+
 pub(super) fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
@@ -886,6 +892,7 @@ pub(super) fn map_tool_name_alias(tool_name: &str) -> &str {
         // Memory variations
         "memoryrecall" | "memory_recall" | "recall" | "memrecall" => "memory_recall",
         "memorystore" | "memory_store" | "store" | "memstore" => "memory_store",
+        "memoryobserve" | "memory_observe" | "observe" | "memobserve" => "memory_observe",
         "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
         // HTTP variations
         "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
@@ -1026,6 +1033,7 @@ pub(super) fn default_param_for_tool(tool: &str) -> &'static str {
         "memory_recall" | "memoryrecall" | "recall" | "memrecall" | "memory_forget"
         | "memoryforget" | "forget" | "memforget" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
+        "memory_observe" | "memoryobserve" | "observe" | "memobserve" => "observation",
         // HTTP and browser tools default to "url"
         "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser"
         | "web_search" => "url",
@@ -1674,18 +1682,41 @@ pub(super) fn detect_tool_call_parse_issue(
     }
 }
 
-pub(super) fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
-    tool_calls
-        .iter()
-        .map(|call| {
-            let name = call.name.clone();
-            let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-            ParsedToolCall {
-                name: name.clone(),
-                arguments: normalize_tool_arguments(&name, parsed, Some(call.arguments.as_str())),
-                tool_call_id: Some(call.id.clone()),
-            }
-        })
-        .collect()
+pub(super) fn parse_structured_tool_calls(
+    tool_calls: &[ToolCall],
+) -> StructuredToolCallParseResult {
+    let mut result = StructuredToolCallParseResult::default();
+
+    for call in tool_calls {
+        let name = call.name.clone();
+        let raw_arguments = call.arguments.trim();
+
+        // Fail closed for truncated/invalid JSON payloads that look like native
+        // structured tool-call arguments. This prevents executing partial args.
+        if (raw_arguments.starts_with('{') || raw_arguments.starts_with('['))
+            && serde_json::from_str::<serde_json::Value>(raw_arguments).is_err()
+        {
+            result.invalid_json_arguments += 1;
+            tracing::warn!(
+                tool_name = %name,
+                tool_call_id = %call.id,
+                "Skipping native tool call with invalid JSON arguments"
+            );
+            continue;
+        }
+
+        let raw_value = serde_json::Value::String(call.arguments.clone());
+        let arguments = normalize_tool_arguments(
+            &name,
+            parse_arguments_value(Some(&raw_value)),
+            raw_string_argument_hint(Some(&raw_value)),
+        );
+        result.calls.push(ParsedToolCall {
+            name,
+            arguments,
+            tool_call_id: Some(call.id.clone()),
+        });
+    }
+
+    result
 }

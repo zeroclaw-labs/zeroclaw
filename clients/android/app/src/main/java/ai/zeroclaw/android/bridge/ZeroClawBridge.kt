@@ -2,17 +2,17 @@ package ai.zeroclaw.android.bridge
 
 /**
  * JNI bridge to ZeroClaw Rust library.
- * 
+ *
  * This class will be replaced by UniFFI-generated bindings.
  * For now, it provides stub implementations.
- * 
+ *
  * Native library: libzeroclaw.so
  * Build command: cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release
  */
 object ZeroClawBridge {
-    
+
     private var initialized = false
-    
+
     /**
      * Initialize the ZeroClaw runtime.
      * Must be called before any other methods.
@@ -25,7 +25,7 @@ object ZeroClawBridge {
             initialized = true
         }
     }
-    
+
     /**
      * Start the ZeroClaw gateway.
      * @param configPath Path to zeroclaw.toml config file
@@ -36,7 +36,7 @@ object ZeroClawBridge {
             // TODO: nativeStart(configPath)
         }
     }
-    
+
     /**
      * Stop the ZeroClaw gateway.
      */
@@ -45,7 +45,7 @@ object ZeroClawBridge {
             // TODO: nativeStop()
         }
     }
-    
+
     /**
      * Send a message to the agent.
      */
@@ -55,7 +55,7 @@ object ZeroClawBridge {
             // TODO: nativeSendMessage(message)
         }
     }
-    
+
     /**
      * Poll for the next message from the agent.
      * Returns null if no message available.
@@ -65,7 +65,7 @@ object ZeroClawBridge {
         // TODO: return nativePollMessage()
         return null
     }
-    
+
     /**
      * Get current agent status.
      */
@@ -74,12 +74,12 @@ object ZeroClawBridge {
         // TODO: return nativeGetStatus()
         return AgentStatus.Stopped
     }
-    
+
     /**
      * Check if the native library is loaded.
      */
     fun isLoaded(): Boolean = initialized
-    
+
     // Native method declarations (to be implemented)
     // private external fun nativeInit(dataDir: String)
     // private external fun nativeStart(configPath: String)

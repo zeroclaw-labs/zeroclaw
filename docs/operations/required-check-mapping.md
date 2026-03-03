@@ -18,14 +18,6 @@ Feature matrix lane check names (informational, non-required):
 - `Matrix Lane (browser-native)`
 - `Matrix Lane (nightly-all-features)`
 
-## Promotion to `main`
-
-| Required check name | Source workflow | Scope |
-| --- | --- | --- |
-| `Main Promotion Gate` | `.github/workflows/main-promotion-gate.yml` | branch + actor policy |
-| `CI Required Gate` | `.github/workflows/ci-run.yml` | baseline quality gate |
-| `Security Audit` | `.github/workflows/sec-audit.yml` | security baseline |
-
 ## Release / Pre-release
 
 | Required check name | Source workflow | Scope |
@@ -47,5 +39,5 @@ Feature matrix lane check names (informational, non-required):
 
 - Use pinned `uses:` references for all workflow actions.
 - Keep check names stable; renaming check jobs can break branch protection rules.
-- GitHub scheduled/manual discovery for workflows is default-branch driven. If a release/nightly workflow only exists on `dev`, promotion to `main` is required before default-branch schedule visibility is expected.
+- GitHub scheduled/manual discovery for workflows is default-branch driven. If a release/nightly workflow only exists on a non-default branch, merge it into the default branch before expecting schedule visibility.
 - Update this mapping whenever merge-critical workflows/jobs are added or renamed.

@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::skills::skills_dir;
+    use crate::config::Config;
+    use crate::skills::{handle_command, load_skills_with_config, skills_dir};
+    use crate::SkillCommands;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -83,7 +85,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skills_symlink_permissions_and_safety() {
+    async fn test_workspace_symlink_loading_requires_trusted_roots() {
         let tmp = TempDir::new().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
@@ -93,7 +95,6 @@ mod tests {
 
         #[cfg(unix)]
         {
-            // Test case: Symlink outside workspace should be allowed (user responsibility)
             let outside_dir = tmp.path().join("outside_skill");
             tokio::fs::create_dir_all(&outside_dir).await.unwrap();
             tokio::fs::write(outside_dir.join("SKILL.md"), "# Outside Skill\nContent")
@@ -102,15 +103,74 @@ mod tests {
 
             let dest_link = skills_path.join("outside_skill");
             let result = std::os::unix::fs::symlink(&outside_dir, &dest_link);
+            assert!(result.is_ok(), "symlink creation should succeed on unix");
+
+            let mut config = Config::default();
+            config.workspace_dir = workspace_dir.clone();
+            config.config_path = workspace_dir.join("config.toml");
+
+            let blocked = load_skills_with_config(&workspace_dir, &config);
             assert!(
-                result.is_ok(),
-                "Should allow symlinking to directories outside workspace"
+                blocked.is_empty(),
+                "symlinked skill should be rejected when trusted_skill_roots is empty"
             );
 
-            // Should still be readable
-            let content = tokio::fs::read_to_string(dest_link.join("SKILL.md")).await;
-            assert!(content.is_ok());
-            assert!(content.unwrap().contains("Outside Skill"));
+            config.skills.trusted_skill_roots = vec![tmp.path().display().to_string()];
+            let allowed = load_skills_with_config(&workspace_dir, &config);
+            assert_eq!(
+                allowed.len(),
+                1,
+                "symlinked skill should load when target is inside trusted roots"
+            );
+            assert_eq!(allowed[0].name, "outside_skill");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_skills_audit_respects_trusted_symlink_roots() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
+
+        let skills_path = skills_dir(&workspace_dir);
+        tokio::fs::create_dir_all(&skills_path).await.unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside_dir = tmp.path().join("outside_skill");
+            tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+            tokio::fs::write(outside_dir.join("SKILL.md"), "# Outside Skill\nContent")
+                .await
+                .unwrap();
+            let link_path = skills_path.join("outside_skill");
+            std::os::unix::fs::symlink(&outside_dir, &link_path).unwrap();
+
+            let mut config = Config::default();
+            config.workspace_dir = workspace_dir.clone();
+            config.config_path = workspace_dir.join("config.toml");
+
+            let blocked = handle_command(
+                SkillCommands::Audit {
+                    source: "outside_skill".to_string(),
+                },
+                &config,
+            );
+            assert!(
+                blocked.is_err(),
+                "audit should reject symlink target when trusted roots are not configured"
+            );
+
+            config.skills.trusted_skill_roots = vec![tmp.path().display().to_string()];
+            let allowed = handle_command(
+                SkillCommands::Audit {
+                    source: "outside_skill".to_string(),
+                },
+                &config,
+            );
+            assert!(
+                allowed.is_ok(),
+                "audit should pass when symlink target is inside a trusted root"
+            );
         }
     }
 }

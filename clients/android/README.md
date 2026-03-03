@@ -5,7 +5,7 @@ Native Android client for ZeroClaw - run your autonomous AI assistant on Android
 ## Features
 
 - 🚀 **Native Performance** - Kotlin/Jetpack Compose, not a webview
-- 🔋 **Battery Efficient** - WorkManager, Doze-aware, minimal wake locks  
+- 🔋 **Battery Efficient** - WorkManager, Doze-aware, minimal wake locks
 - 🔐 **Security First** - Android Keystore for secrets, sandboxed execution
 - 🦀 **ZeroClaw Core** - Full Rust binary via UniFFI/JNI
 - 🎨 **Material You** - Dynamic theming, modern Android UX
@@ -80,12 +80,24 @@ cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release
 - [x] Chat UI scaffold
 - [x] Theme system (Material 3)
 
-🚧 **Phase 3: Integration** (Next)
-- [ ] Cargo NDK build integration
-- [ ] Native library loading
-- [ ] WorkManager for cron
-- [ ] DataStore persistence
-- [ ] Quick Settings tile
+✅ **Phase 3: Integration** (Complete)
+- [x] WorkManager for cron/heartbeat
+- [x] DataStore + encrypted preferences
+- [x] Quick Settings tile
+- [x] Share intent handling
+- [x] Battery optimization helpers
+- [x] CI workflow for Android builds
+
+✅ **Phase 4: Polish** (Complete)
+- [x] Home screen widget
+- [x] Accessibility utilities (TalkBack support)
+- [x] One-liner install scripts (Termux, ADB)
+- [x] Web installer page
+
+🚀 **Ready for Production**
+- [ ] Cargo NDK CI integration
+- [ ] F-Droid submission
+- [ ] Google Play submission
 
 ## Contributing
 

@@ -334,6 +334,19 @@ fn factory_resolves_doubao_provider() {
 }
 
 #[test]
+fn factory_resolves_volcengine_provider() {
+    assert_provider_ok("volcengine", Some("test-key"), None);
+    assert_provider_ok("ark", Some("test-key"), None);
+}
+
+#[test]
+fn factory_resolves_siliconflow_provider() {
+    assert_provider_ok("siliconflow", Some("test-key"), None);
+    assert_provider_ok("silicon-cloud", Some("test-key"), None);
+    assert_provider_ok("siliconcloud", Some("test-key"), None);
+}
+
+#[test]
 fn factory_resolves_qianfan_provider() {
     assert_provider_ok("qianfan", Some("test-key"), None);
 }

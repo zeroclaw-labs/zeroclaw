@@ -1,8 +1,10 @@
 //! WASM plugin tool — executes a `.wasm` binary as a ZeroClaw tool.
 //!
 //! # Feature gate
-//! Only compiled when `--features wasm-tools` is active.
-//! Without the feature, [`WasmTool`] stubs return a clear error.
+//! Compiled when `--features wasm-tools` is active on supported targets
+//! (Linux, macOS, Windows).
+//! Unsupported targets (including Android/Termux) always use the stub implementation.
+//! Without runtime support, [`WasmTool`] stubs return a clear error.
 //!
 //! # Protocol (WASI stdio)
 //!
@@ -32,7 +34,7 @@
 //! - Output capped at 1 MiB (enforced by [`MemoryOutputPipe`] capacity).
 
 use super::traits::{Tool, ToolResult};
-use anyhow::{bail, Context};
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::Path;
@@ -45,15 +47,18 @@ const WASM_TIMEOUT_SECS: u64 = 30;
 
 // ─── Feature-gated implementation ─────────────────────────────────────────────
 
-#[cfg(feature = "wasm-tools")]
+#[cfg(all(
+    feature = "wasm-tools",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 mod inner {
     use super::{
-        async_trait, bail, Context, Path, Tool, ToolResult, Value, MAX_OUTPUT_BYTES,
-        WASM_TIMEOUT_SECS,
+        async_trait, Context, Path, Tool, ToolResult, Value, MAX_OUTPUT_BYTES, WASM_TIMEOUT_SECS,
     };
+    use anyhow::bail;
     use wasmtime::{Config as WtConfig, Engine, Linker, Module, Store};
     use wasmtime_wasi::{
-        pipe::{MemoryInputPipe, MemoryOutputPipe},
+        p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
         preview1::{self, WasiP1Ctx},
         WasiCtxBuilder,
     };
@@ -221,9 +226,30 @@ mod inner {
 
 // ─── Feature-absent stub ──────────────────────────────────────────────────────
 
-#[cfg(not(feature = "wasm-tools"))]
+#[cfg(any(
+    not(feature = "wasm-tools"),
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
 mod inner {
     use super::*;
+
+    pub(super) fn unavailable_message(
+        feature_enabled: bool,
+        target_is_android: bool,
+    ) -> &'static str {
+        if feature_enabled {
+            if target_is_android {
+                "WASM tools are currently unavailable on Android/Termux builds. \
+                 Build on Linux/macOS/Windows to enable wasm-tools."
+            } else {
+                "WASM tools are currently unavailable on this target. \
+                 Build on Linux/macOS/Windows to enable wasm-tools."
+            }
+        } else {
+            "WASM tools are not enabled in this build. \
+             Recompile with '--features wasm-tools'."
+        }
+    }
 
     /// Stub: returned when the `wasm-tools` feature is not compiled in.
     /// Construction succeeds so callers can enumerate plugins; execution returns a clear error.
@@ -261,14 +287,13 @@ mod inner {
         }
 
         async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
+            let message =
+                unavailable_message(cfg!(feature = "wasm-tools"), cfg!(target_os = "android"));
+
             Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(
-                    "WASM tools are not enabled in this build. \
-                     Recompile with '--features wasm-tools'."
-                        .into(),
-                ),
+                error: Some(message.into()),
             })
         }
     }
@@ -495,7 +520,26 @@ mod tests {
         assert!(tools.is_empty());
     }
 
-    #[cfg(not(feature = "wasm-tools"))]
+    #[cfg(any(
+        not(feature = "wasm-tools"),
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
+    #[test]
+    fn stub_unavailable_message_matrix_is_stable() {
+        let feature_off = inner::unavailable_message(false, false);
+        assert!(feature_off.contains("Recompile with '--features wasm-tools'"));
+
+        let android = inner::unavailable_message(true, true);
+        assert!(android.contains("Android/Termux"));
+
+        let unsupported_target = inner::unavailable_message(true, false);
+        assert!(unsupported_target.contains("currently unavailable on this target"));
+    }
+
+    #[cfg(any(
+        not(feature = "wasm-tools"),
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
     #[tokio::test]
     async fn stub_reports_feature_disabled() {
         let t = WasmTool::load(
@@ -507,7 +551,9 @@ mod tests {
         .unwrap();
         let r = t.execute(serde_json::json!({})).await.unwrap();
         assert!(!r.success);
-        assert!(r.error.unwrap().contains("wasm-tools"));
+        let expected =
+            inner::unavailable_message(cfg!(feature = "wasm-tools"), cfg!(target_os = "android"));
+        assert_eq!(r.error.as_deref(), Some(expected));
     }
 
     // ── WasmManifest error paths ──────────────────────────────────────────────
@@ -630,7 +676,10 @@ mod tests {
 
     // ── Feature-gated: invalid WASM binary fails at compile time ─────────────
 
-    #[cfg(feature = "wasm-tools")]
+    #[cfg(all(
+        feature = "wasm-tools",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     #[test]
     #[ignore = "slow: initializes wasmtime Cranelift compiler; run with --include-ignored"]
     fn wasm_tool_load_rejects_invalid_binary() {
@@ -651,7 +700,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "wasm-tools")]
+    #[cfg(all(
+        feature = "wasm-tools",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     #[test]
     #[ignore = "slow: initializes wasmtime Cranelift compiler; run with --include-ignored"]
     fn wasm_tool_load_rejects_missing_file() {

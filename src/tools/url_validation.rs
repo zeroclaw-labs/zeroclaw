@@ -47,9 +47,43 @@ pub fn validate_url(raw_url: &str, policy: &DomainPolicy<'_>) -> Result<String> 
         anyhow::bail!("Host '{host}' is not in {}", policy.allowed_field_name);
     }
 
+    enforce_global_domain_access_policy(&host, policy.url_access)?;
     enforce_private_host_policy(&host, policy.url_access)?;
 
     Ok(url.to_string())
+}
+
+fn enforce_global_domain_access_policy(
+    host: &str,
+    url_access: Option<&UrlAccessConfig>,
+) -> Result<()> {
+    let config = url_access.cloned().unwrap_or_default();
+
+    if host_matches_allowlist(host, &config.domain_blocklist) {
+        anyhow::bail!("Host '{host}' is blocked by security.url_access.domain_blocklist");
+    }
+
+    if config.enforce_domain_allowlist {
+        if config.domain_allowlist.is_empty() {
+            anyhow::bail!(
+                "security.url_access.enforce_domain_allowlist=true but security.url_access.domain_allowlist is empty"
+            );
+        }
+        if !host_matches_allowlist(host, &config.domain_allowlist) {
+            anyhow::bail!("Host '{host}' is not in security.url_access.domain_allowlist");
+        }
+    }
+
+    if config.require_first_visit_approval
+        && !host_matches_allowlist(host, &config.domain_allowlist)
+        && !host_matches_allowlist(host, &config.approved_domains)
+    {
+        anyhow::bail!(
+            "First-time domain approval required for '{host}'. Ask a human to confirm and then add it to security.url_access.approved_domains (for example via web_access_config)."
+        );
+    }
+
+    Ok(())
 }
 
 fn enforce_private_host_policy(host: &str, url_access: Option<&UrlAccessConfig>) -> Result<()> {
@@ -564,5 +598,77 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_url_rejects_domain_blocklist_match() {
+        let allowed = vec!["*".to_string()];
+        let blocked: Vec<String> = Vec::new();
+        let url_access = UrlAccessConfig {
+            domain_blocklist: vec!["example.com".to_string()],
+            ..UrlAccessConfig::default()
+        };
+        let policy = DomainPolicy {
+            url_access: Some(&url_access),
+            ..policy(&allowed, &blocked)
+        };
+        let err = validate_url("https://docs.example.com", &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("domain_blocklist"));
+    }
+
+    #[test]
+    fn validate_url_enforce_global_allowlist_rejects_miss() {
+        let allowed = vec!["*".to_string()];
+        let blocked: Vec<String> = Vec::new();
+        let url_access = UrlAccessConfig {
+            enforce_domain_allowlist: true,
+            domain_allowlist: vec!["rust-lang.org".to_string()],
+            ..UrlAccessConfig::default()
+        };
+        let policy = DomainPolicy {
+            url_access: Some(&url_access),
+            ..policy(&allowed, &blocked)
+        };
+        let err = validate_url("https://docs.rs", &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("security.url_access.domain_allowlist"));
+    }
+
+    #[test]
+    fn validate_url_requires_first_visit_approval_for_unseen_domain() {
+        let allowed = vec!["*".to_string()];
+        let blocked: Vec<String> = Vec::new();
+        let url_access = UrlAccessConfig {
+            require_first_visit_approval: true,
+            ..UrlAccessConfig::default()
+        };
+        let policy = DomainPolicy {
+            url_access: Some(&url_access),
+            ..policy(&allowed, &blocked)
+        };
+        let err = validate_url("https://docs.rs", &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("First-time domain approval required"));
+    }
+
+    #[test]
+    fn validate_url_allows_first_visit_when_domain_is_preapproved() {
+        let allowed = vec!["*".to_string()];
+        let blocked: Vec<String> = Vec::new();
+        let url_access = UrlAccessConfig {
+            require_first_visit_approval: true,
+            approved_domains: vec!["docs.rs".to_string()],
+            ..UrlAccessConfig::default()
+        };
+        let policy = DomainPolicy {
+            url_access: Some(&url_access),
+            ..policy(&allowed, &blocked)
+        };
+        let got = validate_url("https://docs.rs", &policy).unwrap();
+        assert_eq!(got, "https://docs.rs");
     }
 }

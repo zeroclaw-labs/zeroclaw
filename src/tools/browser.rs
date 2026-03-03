@@ -6,6 +6,8 @@
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{validate_url as validate_network_url, DomainPolicy, UrlSchemePolicy};
+use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -63,8 +65,13 @@ impl Default for ComputerUseConfig {
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    url_access: UrlAccessConfig,
     session_name: Option<String>,
     backend: String,
+    auto_backend_priority: Vec<String>,
+    agent_browser_command: String,
+    agent_browser_extra_args: Vec<String>,
+    agent_browser_timeout_ms: u64,
     native_headless: bool,
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
@@ -204,11 +211,16 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
     ) -> Self {
-        Self::new_with_backend(
+        Self::new_with_backend_and_url_access(
             security,
             allowed_domains,
+            UrlAccessConfig::default(),
             session_name,
             "agent_browser".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -222,6 +234,43 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
         backend: String,
+        auto_backend_priority: Vec<String>,
+        agent_browser_command: String,
+        agent_browser_extra_args: Vec<String>,
+        agent_browser_timeout_ms: u64,
+        native_headless: bool,
+        native_webdriver_url: String,
+        native_chrome_path: Option<String>,
+        computer_use: ComputerUseConfig,
+    ) -> Self {
+        Self::new_with_backend_and_url_access(
+            security,
+            allowed_domains,
+            UrlAccessConfig::default(),
+            session_name,
+            backend,
+            auto_backend_priority,
+            agent_browser_command,
+            agent_browser_extra_args,
+            agent_browser_timeout_ms,
+            native_headless,
+            native_webdriver_url,
+            native_chrome_path,
+            computer_use,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_backend_and_url_access(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        url_access: UrlAccessConfig,
+        session_name: Option<String>,
+        backend: String,
+        auto_backend_priority: Vec<String>,
+        agent_browser_command: String,
+        agent_browser_extra_args: Vec<String>,
+        agent_browser_timeout_ms: u64,
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
@@ -230,8 +279,13 @@ impl BrowserTool {
         Self {
             security,
             allowed_domains: normalize_domains(allowed_domains),
+            url_access,
             session_name,
             backend,
+            auto_backend_priority,
+            agent_browser_command,
+            agent_browser_extra_args,
+            agent_browser_timeout_ms,
             native_headless,
             native_webdriver_url,
             native_chrome_path,
@@ -241,9 +295,9 @@ impl BrowserTool {
         }
     }
 
-    /// Check if agent-browser CLI is available
-    pub async fn is_agent_browser_available() -> bool {
-        Command::new("agent-browser")
+    /// Check if agent-browser CLI is available.
+    async fn is_agent_browser_available_with_command(command: &str) -> bool {
+        Command::new(command)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -251,6 +305,11 @@ impl BrowserTool {
             .await
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// Backward-compatible helper using default executable name.
+    pub async fn is_agent_browser_available() -> bool {
+        Self::is_agent_browser_available_with_command("agent-browser").await
     }
 
     /// Backward-compatible alias.
@@ -327,17 +386,54 @@ impl BrowserTool {
         Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
     }
 
+    fn auto_backend_priority(&self) -> anyhow::Result<Vec<BrowserBackendKind>> {
+        if self.auto_backend_priority.is_empty() {
+            return Ok(vec![
+                BrowserBackendKind::AgentBrowser,
+                BrowserBackendKind::RustNative,
+                BrowserBackendKind::ComputerUse,
+            ]);
+        }
+
+        let mut ordered: Vec<BrowserBackendKind> = Vec::new();
+        for raw in &self.auto_backend_priority {
+            let parsed = BrowserBackendKind::parse(raw)?;
+            if parsed == BrowserBackendKind::Auto {
+                anyhow::bail!("browser.auto_backend_priority cannot contain 'auto'");
+            }
+            if !ordered.contains(&parsed) {
+                ordered.push(parsed);
+            }
+        }
+
+        if ordered.is_empty() {
+            anyhow::bail!(
+                "browser.auto_backend_priority resolved to empty list; configure at least one backend"
+            );
+        }
+
+        Ok(ordered)
+    }
+
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
         let configured = self.configured_backend()?;
+        let agent_browser_command = self.agent_browser_command.trim();
+        if agent_browser_command.is_empty() {
+            anyhow::bail!("browser.agent_browser_command cannot be empty");
+        }
+        if self.agent_browser_timeout_ms == 0 {
+            anyhow::bail!("browser.agent_browser_timeout_ms must be > 0");
+        }
 
         match configured {
             BrowserBackendKind::AgentBrowser => {
-                if Self::is_agent_browser_available().await {
+                if Self::is_agent_browser_available_with_command(agent_browser_command).await {
                     Ok(ResolvedBackend::AgentBrowser)
                 } else {
                     anyhow::bail!(
-                        "browser.backend='{}' but agent-browser CLI is unavailable. Install with: npm install -g agent-browser",
-                        configured.as_str()
+                        "browser.backend='{}' but agent-browser CLI ('{}') is unavailable. Install agent-browser or set browser.agent_browser_command",
+                        configured.as_str(),
+                        agent_browser_command
                     )
                 }
             }
@@ -363,84 +459,96 @@ impl BrowserTool {
                 Ok(ResolvedBackend::ComputerUse)
             }
             BrowserBackendKind::Auto => {
-                if Self::rust_native_compiled() && self.rust_native_available() {
-                    return Ok(ResolvedBackend::RustNative);
-                }
-                if Self::is_agent_browser_available().await {
-                    return Ok(ResolvedBackend::AgentBrowser);
-                }
-
-                let computer_use_err = match self.computer_use_available() {
-                    Ok(true) => return Ok(ResolvedBackend::ComputerUse),
-                    Ok(false) => None,
-                    Err(err) => Some(err.to_string()),
-                };
-
-                if Self::rust_native_compiled() {
-                    if let Some(err) = computer_use_err {
-                        anyhow::bail!(
-                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
-                        );
+                let priority = self.auto_backend_priority()?;
+                let mut reasons: Vec<String> = Vec::new();
+                for candidate in priority.iter().copied() {
+                    match candidate {
+                        BrowserBackendKind::AgentBrowser => {
+                            if Self::is_agent_browser_available_with_command(agent_browser_command)
+                                .await
+                            {
+                                return Ok(ResolvedBackend::AgentBrowser);
+                            }
+                            reasons.push(format!(
+                                "agent_browser unavailable at '{}'",
+                                agent_browser_command
+                            ));
+                        }
+                        BrowserBackendKind::RustNative => {
+                            if !Self::rust_native_compiled() {
+                                reasons.push(
+                                    "rust_native backend not compiled (enable feature browser-native)"
+                                        .into(),
+                                );
+                            } else if self.rust_native_available() {
+                                return Ok(ResolvedBackend::RustNative);
+                            } else {
+                                reasons.push(
+                                    "rust_native unavailable (WebDriver endpoint not reachable)"
+                                        .into(),
+                                );
+                            }
+                        }
+                        BrowserBackendKind::ComputerUse => match self.computer_use_available() {
+                            Ok(true) => return Ok(ResolvedBackend::ComputerUse),
+                            Ok(false) => reasons.push(
+                                "computer_use unavailable (sidecar endpoint unreachable)".into(),
+                            ),
+                            Err(err) => reasons.push(format!("computer_use invalid: {err}")),
+                        },
+                        BrowserBackendKind::Auto => {
+                            reasons.push("invalid auto backend priority entry: auto".into())
+                        }
                     }
-                    anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
-                    )
                 }
 
-                if let Some(err) = computer_use_err {
-                    anyhow::bail!(
-                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
-                    );
-                }
-
+                let priority_display = priority
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 anyhow::bail!(
-                    "browser.backend='auto' needs agent-browser CLI, browser-native, or computer-use sidecar"
-                )
+                    "browser.backend='auto' found no usable backend. Checked [{}]: {}",
+                    priority_display,
+                    reasons.join("; ")
+                );
             }
         }
     }
 
     /// Validate URL against allowlist
     fn validate_url(&self, url: &str) -> anyhow::Result<()> {
-        let url = url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        // Block file:// URLs — browser file access bypasses all SSRF and
-        // domain-allowlist controls and can exfiltrate arbitrary local files.
-        if url.starts_with("file://") {
-            anyhow::bail!("file:// URLs are not allowed in browser automation");
-        }
-
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool enabled but no allowed_domains configured. \
-                Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' not in browser.allowed_domains");
-        }
-
+        let _ = validate_network_url(
+            url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &[],
+                allowed_field_name: "browser.allowed_domains",
+                blocked_field_name: None,
+                empty_allowed_message: "Browser tool enabled but no allowed_domains configured. Add [browser].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpsOnly,
+                ipv6_error_context: "browser",
+                url_access: Some(&self.url_access),
+            },
+        )?;
         Ok(())
     }
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let mut cmd = Command::new("agent-browser");
+        let command = self.agent_browser_command.trim();
+        if command.is_empty() {
+            anyhow::bail!("browser.agent_browser_command cannot be empty");
+        }
+
+        let mut cmd = Command::new(command);
+
+        for extra in &self.agent_browser_extra_args {
+            let trimmed = extra.trim();
+            if !trimmed.is_empty() {
+                cmd.arg(trimmed);
+            }
+        }
 
         // Add session if configured
         if let Some(ref session) = self.session_name {
@@ -450,13 +558,19 @@ impl BrowserTool {
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
 
-        debug!("Running: agent-browser {} --json", args.join(" "));
+        debug!("Running: {} {} --json", command, args.join(" "));
 
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
+        let output = tokio::time::timeout(
+            Duration::from_millis(self.agent_browser_timeout_ms),
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "agent-browser command timed out after {} ms",
+                self.agent_browser_timeout_ms
+            )
+        })??;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1983,7 +2097,7 @@ return true;"#,
             .unwrap_or_else(|| "null".to_string());
 
         format!(
-            r#"(() => {{
+            r#"return (() => {{
   const interactiveOnly = {interactive_only};
   const compact = {compact};
   const maxDepth = {depth_literal};
@@ -2589,6 +2703,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "auto".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2605,6 +2723,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2617,6 +2739,86 @@ mod tests {
     }
 
     #[test]
+    fn auto_backend_priority_defaults_when_unset() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "auto".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        assert_eq!(
+            tool.auto_backend_priority().unwrap(),
+            vec![
+                BrowserBackendKind::AgentBrowser,
+                BrowserBackendKind::RustNative,
+                BrowserBackendKind::ComputerUse
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_backend_priority_accepts_custom_order_and_dedupes() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "auto".into(),
+            vec![
+                "computer_use".into(),
+                "agent_browser".into(),
+                "computer_use".into(),
+            ],
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        assert_eq!(
+            tool.auto_backend_priority().unwrap(),
+            vec![
+                BrowserBackendKind::ComputerUse,
+                BrowserBackendKind::AgentBrowser
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_backend_priority_rejects_invalid_entries() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "auto".into(),
+            vec!["auto".into(), "unknown".into()],
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+
+        assert!(tool.auto_backend_priority().is_err());
+    }
+
+    #[test]
     fn computer_use_endpoint_rejects_public_http_by_default() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new_with_backend(
@@ -2624,6 +2826,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2644,6 +2850,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2665,6 +2875,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2705,6 +2919,10 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            Vec::new(),
+            "agent-browser".into(),
+            Vec::new(),
+            30_000,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2754,6 +2972,7 @@ mod tests {
         assert!(tool.validate_url("https://127.0.0.1").is_err());
 
         // Invalid - not https
+        assert!(tool.validate_url("http://example.com").is_err());
         assert!(tool.validate_url("ftp://example.com").is_err());
 
         // file:// URLs blocked (local file exfiltration risk)

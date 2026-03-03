@@ -1,7 +1,10 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::file_link_guard::has_multiple_hard_links;
+use crate::security::sensitive_paths::is_sensitive_file_path;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Write file contents with path sandboxing
@@ -15,6 +18,21 @@ impl FileWriteTool {
     }
 }
 
+fn sensitive_file_write_block_message(path: &str) -> String {
+    format!(
+        "Writing sensitive file '{path}' is blocked by policy. \
+Set [autonomy].allow_sensitive_file_writes = true only when strictly necessary."
+    )
+}
+
+fn hard_link_write_block_message(path: &Path) -> String {
+    format!(
+        "Writing multiply-linked file '{}' is blocked by policy \
+(potential hard-link escape).",
+        path.display()
+    )
+}
+
 #[async_trait]
 impl Tool for FileWriteTool {
     fn name(&self) -> &str {
@@ -22,7 +40,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write contents to a file in the workspace"
+        "Write contents to a file in the workspace. Sensitive files (for example .env and key material) are blocked by default."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,7 +96,15 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        if !self.security.allow_sensitive_file_writes && is_sensitive_file_path(Path::new(path)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(sensitive_file_write_block_message(path)),
+            });
+        }
+
+        let full_path = self.security.resolve_user_supplied_path(path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
@@ -124,6 +150,16 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
+        if !self.security.allow_sensitive_file_writes && is_sensitive_file_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(sensitive_file_write_block_message(
+                    &resolved_target.display().to_string(),
+                )),
+            });
+        }
+
         // If the target already exists and is a symlink, refuse to follow it
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
             if meta.file_type().is_symlink() {
@@ -134,6 +170,14 @@ impl Tool for FileWriteTool {
                         "Refusing to write through symlink: {}",
                         resolved_target.display()
                     )),
+                });
+            }
+
+            if has_multiple_hard_links(&meta) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(hard_link_write_block_message(&resolved_target)),
                 });
             }
         }
@@ -183,6 +227,30 @@ mod tests {
             autonomy,
             workspace_dir: workspace,
             max_actions_per_hour,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_allow_sensitive_writes(
+        workspace: std::path::PathBuf,
+        allow_sensitive_file_writes: bool,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            allow_sensitive_file_writes,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_allows_outside_workspace(
+        workspace: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
             ..SecurityPolicy::default()
         })
     }
@@ -300,6 +368,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_write_expands_tilde_path_consistently_with_policy() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME should be available for tilde expansion tests");
+        let target_rel = format!("zeroclaw_tilde_write_{}.txt", uuid::Uuid::new_v4());
+        let target_path = home.join(&target_rel);
+        let _ = tokio::fs::remove_file(&target_path).await;
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_write_tilde_workspace");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security_allows_outside_workspace(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": format!("~/{}", target_rel), "content": "tilde-write"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "tilde path write should succeed when policy allows outside workspace: {:?}",
+            result.error
+        );
+
+        let content = tokio::fs::read_to_string(&target_path).await.unwrap();
+        assert_eq!(content, "tilde-write");
+
+        let _ = tokio::fs::remove_file(&target_path).await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+    }
+
+    #[tokio::test]
     async fn file_write_missing_path_param() {
         let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
         let result = tool.execute(json!({"content": "data"})).await;
@@ -326,6 +425,52 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("0 bytes"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_sensitive_file_by_default() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_sensitive_blocked");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": ".env", "content": "API_KEY=123"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("sensitive file"));
+        assert!(!dir.join(".env").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_sensitive_file_when_configured() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_sensitive_allowed");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security_allow_sensitive_writes(dir.clone(), true));
+        let result = tool
+            .execute(json!({"path": ".env", "content": "API_KEY=123"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "sensitive write should succeed when enabled: {:?}",
+            result.error
+        );
+        let content = tokio::fs::read_to_string(dir.join(".env")).await.unwrap();
+        assert_eq!(content, "API_KEY=123");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -442,6 +587,43 @@ mod tests {
         );
 
         // Verify original file was not modified
+        let content = tokio::fs::read_to_string(outside.join("target.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "original", "original file must not be modified");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_blocks_hardlink_target_file() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_hardlink_target");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        tokio::fs::write(outside.join("target.txt"), "original")
+            .await
+            .unwrap();
+        std::fs::hard_link(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
+
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": "linked.txt", "content": "overwritten"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "writing through hard link must be blocked");
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("hard-link escape"));
+
         let content = tokio::fs::read_to_string(outside.join("target.txt"))
             .await
             .unwrap();

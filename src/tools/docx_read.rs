@@ -143,7 +143,7 @@ impl Tool for DocxReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_user_supplied_path(path);
 
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
@@ -202,24 +202,23 @@ impl Tool for DocxReadTool {
             }
         };
 
-        let text =
-            match tokio::task::spawn_blocking(move || extract_docx_text(&bytes)).await {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("DOCX extraction failed: {e}")),
-                    });
-                }
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("DOCX extraction task panicked: {e}")),
-                    });
-                }
-            };
+        let text = match tokio::task::spawn_blocking(move || extract_docx_text(&bytes)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("DOCX extraction failed: {e}")),
+                });
+            }
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("DOCX extraction task panicked: {e}")),
+                });
+            }
+        };
 
         if text.trim().is_empty() {
             return Ok(ToolResult {
@@ -288,8 +287,8 @@ mod tests {
         let buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(buf);
 
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
 
         zip.start_file("word/document.xml", options).unwrap();
         zip.write_all(document_xml.as_bytes()).unwrap();
@@ -456,8 +455,8 @@ mod tests {
         use std::io::Write;
         let buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(buf);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         zip.start_file("word/document.xml", options).unwrap();
         zip.write_all(xml.as_bytes()).unwrap();
         let buf = zip.finish().unwrap();

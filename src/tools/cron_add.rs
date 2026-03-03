@@ -11,6 +11,8 @@ pub struct CronAddTool {
     security: Arc<SecurityPolicy>,
 }
 
+const MIN_AGENT_EVERY_MS: u64 = 5 * 60 * 1000;
+
 impl CronAddTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
@@ -56,7 +58,9 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Lark, Feishu, Email), set \
+         Use schedule.kind='at' for one-time reminders/delayed sends (recommended). \
+         Agent jobs with schedule.kind='cron' or schedule.kind='every' are recurring and require explicit recurring confirmation. \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Napcat, Lark, Feishu, Email), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -68,19 +72,24 @@ impl Tool for CronAddTool {
                 "name": { "type": "string" },
                 "schedule": {
                     "type": "object",
-                    "description": "Schedule object: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}"
+                    "description": "Schedule object: {kind:'cron',expr,tz?} recurring | {kind:'at',at} one-time | {kind:'every',every_ms} recurring interval"
                 },
                 "job_type": { "type": "string", "enum": ["shell", "agent"] },
                 "command": { "type": "string" },
                 "prompt": { "type": "string" },
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 "model": { "type": "string" },
+                "recurring_confirmed": {
+                    "type": "boolean",
+                    "description": "Required for agent recurring schedules (schedule.kind='cron' or 'every'). Set true only when recurring behavior is intentional.",
+                    "default": false
+                },
                 "delivery": {
                     "type": "object",
                     "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "lark", "feishu", "email"], "description": "Channel type to deliver to" },
+                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "napcat", "lark", "feishu", "email"], "description": "Channel type to deliver to" },
                         "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }
@@ -216,6 +225,49 @@ impl Tool for CronAddTool {
                     .get("model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                let recurring_confirmed = args
+                    .get("recurring_confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+
+                match &schedule {
+                    Schedule::Every { every_ms } => {
+                        if !recurring_confirmed {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(
+                                    "Agent jobs with recurring schedules require recurring_confirmed=true. \
+For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        if *every_ms < MIN_AGENT_EVERY_MS {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "Agent schedule.kind='every' must be >= {MIN_AGENT_EVERY_MS} ms (5 minutes)"
+                                )),
+                            });
+                        }
+                    }
+                    Schedule::Cron { .. } => {
+                        if !recurring_confirmed {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(
+                                    "Agent jobs with recurring schedules require recurring_confirmed=true. \
+For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
+                    Schedule::At { .. } => {}
+                }
 
                 let delivery = match args.get("delivery") {
                     Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
@@ -481,5 +533,92 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn agent_every_requires_recurring_confirmation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "every", "every_ms": 300000 },
+                "job_type": "agent",
+                "prompt": "Send me a recurring status update"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("recurring_confirmed=true"));
+    }
+
+    #[tokio::test]
+    async fn agent_cron_requires_recurring_confirmation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "agent",
+                "prompt": "Send recurring reminders"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("recurring_confirmed=true"));
+    }
+
+    #[tokio::test]
+    async fn agent_every_rejects_high_frequency_intervals() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "every", "every_ms": 60000 },
+                "job_type": "agent",
+                "prompt": "Send me updates frequently",
+                "recurring_confirmed": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("must be >= 300000 ms"));
+    }
+
+    #[tokio::test]
+    async fn agent_every_with_explicit_confirmation_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "every", "every_ms": 300000 },
+                "job_type": "agent",
+                "prompt": "Share a heartbeat summary",
+                "recurring_confirmed": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("next_run"));
     }
 }

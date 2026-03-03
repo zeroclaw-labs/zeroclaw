@@ -6,6 +6,7 @@ import type {
   IntegrationSettingsPayload,
   DiagResult,
   MemoryEntry,
+  PairedDevice,
   CostSummary,
   CliTool,
   HealthSnapshot,
@@ -243,6 +244,22 @@ export function storeMemory(
 
 export function deleteMemory(key: string): Promise<void> {
   return apiFetch<void>(`/api/memory/${encodeURIComponent(key)}`, {
+    method: 'DELETE',
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Paired Devices
+// ---------------------------------------------------------------------------
+
+export function getPairedDevices(): Promise<PairedDevice[]> {
+  return apiFetch<PairedDevice[] | { devices: PairedDevice[] }>('/api/pairing/devices').then(
+    (data) => unwrapField(data, 'devices'),
+  );
+}
+
+export function revokePairedDevice(id: string): Promise<void> {
+  return apiFetch<void>(`/api/pairing/devices/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
 }

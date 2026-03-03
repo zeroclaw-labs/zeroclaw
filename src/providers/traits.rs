@@ -11,31 +11,40 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+pub const ROLE_SYSTEM: &str = "system";
+pub const ROLE_USER: &str = "user";
+pub const ROLE_ASSISTANT: &str = "assistant";
+pub const ROLE_TOOL: &str = "tool";
+
+pub fn is_user_or_assistant_role(role: &str) -> bool {
+    role == ROLE_USER || role == ROLE_ASSISTANT
+}
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: ROLE_SYSTEM.into(),
             content: content.into(),
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: "user".into(),
+            role: ROLE_USER.into(),
             content: content.into(),
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: ROLE_ASSISTANT.into(),
             content: content.into(),
         }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
-            role: "tool".into(),
+            role: ROLE_TOOL.into(),
             content: content.into(),
         }
     }
@@ -56,6 +65,69 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
 }
 
+/// Provider-agnostic stop reasons used by the agent loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum NormalizedStopReason {
+    EndTurn,
+    ToolCall,
+    MaxTokens,
+    ContextWindowExceeded,
+    SafetyBlocked,
+    Cancelled,
+    Unknown(String),
+}
+
+impl NormalizedStopReason {
+    pub fn from_openai_finish_reason(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "stop" => Self::EndTurn,
+            "tool_calls" | "function_call" => Self::ToolCall,
+            "length" | "max_tokens" => Self::MaxTokens,
+            "content_filter" => Self::SafetyBlocked,
+            "cancelled" | "canceled" => Self::Cancelled,
+            _ => Self::Unknown(raw.trim().to_string()),
+        }
+    }
+
+    pub fn from_anthropic_stop_reason(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "end_turn" | "stop_sequence" => Self::EndTurn,
+            "tool_use" => Self::ToolCall,
+            "max_tokens" => Self::MaxTokens,
+            "model_context_window_exceeded" => Self::ContextWindowExceeded,
+            "safety" => Self::SafetyBlocked,
+            "cancelled" | "canceled" => Self::Cancelled,
+            _ => Self::Unknown(raw.trim().to_string()),
+        }
+    }
+
+    pub fn from_bedrock_stop_reason(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolCall,
+            "max_tokens" => Self::MaxTokens,
+            "guardrail_intervened" => Self::SafetyBlocked,
+            "cancelled" | "canceled" => Self::Cancelled,
+            _ => Self::Unknown(raw.trim().to_string()),
+        }
+    }
+
+    pub fn from_gemini_finish_reason(raw: &str) -> Self {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "STOP" => Self::EndTurn,
+            "MAX_TOKENS" => Self::MaxTokens,
+            "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "TOO_MANY_TOOL_CALLS" => {
+                Self::ToolCall
+            }
+            "SAFETY" | "RECITATION" => Self::SafetyBlocked,
+            // Observed in some integrations even though not always listed in docs.
+            "CANCELLED" => Self::Cancelled,
+            _ => Self::Unknown(raw.trim().to_string()),
+        }
+    }
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -70,6 +142,13 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+    /// Quota metadata extracted from response headers (if available).
+    /// Populated by providers that support quota tracking.
+    pub quota_metadata: Option<super::quota_types::QuotaMetadata>,
+    /// Normalized provider stop reason (if surfaced by the upstream API).
+    pub stop_reason: Option<NormalizedStopReason>,
+    /// Raw provider-native stop reason string for diagnostics.
+    pub raw_stop_reason: Option<String>,
 }
 
 impl ChatResponse {
@@ -363,6 +442,9 @@ pub trait Provider: Send + Sync {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
         }
@@ -375,6 +457,9 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -410,6 +495,9 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -539,6 +627,9 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -552,6 +643,9 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -574,6 +668,9 @@ mod tests {
                 output_tokens: Some(50),
             }),
             reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));
@@ -641,6 +738,42 @@ mod tests {
     fn supports_vision_reflects_capabilities_default_mapping() {
         let provider = CapabilityMockProvider;
         assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn normalized_stop_reason_mappings_cover_core_provider_values() {
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("length"),
+            NormalizedStopReason::MaxTokens
+        );
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("tool_calls"),
+            NormalizedStopReason::ToolCall
+        );
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("model_context_window_exceeded"),
+            NormalizedStopReason::ContextWindowExceeded
+        );
+        assert_eq!(
+            NormalizedStopReason::from_bedrock_stop_reason("guardrail_intervened"),
+            NormalizedStopReason::SafetyBlocked
+        );
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("MAX_TOKENS"),
+            NormalizedStopReason::MaxTokens
+        );
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("MALFORMED_FUNCTION_CALL"),
+            NormalizedStopReason::ToolCall
+        );
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("UNEXPECTED_TOOL_CALL"),
+            NormalizedStopReason::ToolCall
+        );
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("TOO_MANY_TOOL_CALLS"),
+            NormalizedStopReason::ToolCall
+        );
     }
 
     #[test]

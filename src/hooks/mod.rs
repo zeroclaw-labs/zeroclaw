@@ -8,3 +8,9 @@ pub use runner::HookRunner;
 // external integrations and future plugin authors.
 #[allow(unused_imports)]
 pub use traits::{HookHandler, HookResult};
+
+pub fn create_runner_from_config(
+    config: &crate::config::HooksConfig,
+) -> Option<std::sync::Arc<HookRunner>> {
+    HookRunner::from_config(config).map(std::sync::Arc::new)
+}

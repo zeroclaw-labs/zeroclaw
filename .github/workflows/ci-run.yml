@@ -9,7 +9,7 @@ on:
         branches: [dev, main]
 
 concurrency:
-    group: ci-${{ github.event.pull_request.number || github.sha }}
+    group: ci-run-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
     cancel-in-progress: true
 
 permissions:
@@ -24,12 +24,13 @@ env:
 jobs:
     changes:
         name: Detect Change Scope
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         outputs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
             workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
+            ci_cd_changed: ${{ steps.scope.outputs.ci_cd_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
             base_sha: ${{ steps.scope.outputs.base_sha }}
         steps:
@@ -49,19 +50,35 @@ jobs:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 25
+        runs-on: ubuntu-22.04
+        timeout-minutes: 75
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
+                  cache-bin: false
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
             - name: Run strict lint delta gate
@@ -69,20 +86,82 @@ jobs:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
 
-    test:
-        name: Test
+    workspace-check:
+        name: Workspace Check
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 35
+        runs-on: ubuntu-22.04
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
+                  prefix-key: ci-run-workspace-check
+                  cache-bin: false
+            - name: Check workspace
+              run: cargo check --workspace --locked
+
+    package-check:
+        name: Package Check (${{ matrix.package }})
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-22.04
+        timeout-minutes: 25
+        strategy:
+            fail-fast: false
+            matrix:
+                package: [zeroclaw-types, zeroclaw-core]
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-package-check
+                  cache-bin: false
+            - name: Check package
+              run: cargo check -p ${{ matrix.package }} --locked
+
+    test:
+        name: Test
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-22.04
+        timeout-minutes: 120
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
                   prefix-key: ci-run-check
+                  cache-bin: false
             - name: Run tests with flake detection
               shell: bash
               env:
@@ -117,9 +196,11 @@ jobs:
                   if [ -f artifacts/flake-probe.json ]; then
                     status=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['status'])")
                     flake=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['flake_suspected'])")
-                    echo "### Test Flake Probe" >> "$GITHUB_STEP_SUMMARY"
-                    echo "- Status: \`${status}\`" >> "$GITHUB_STEP_SUMMARY"
-                    echo "- Flake suspected: \`${flake}\`" >> "$GITHUB_STEP_SUMMARY"
+                    {
+                      echo "### Test Flake Probe"
+                      echo "- Status: \`${status}\`"
+                      echo "- Flake suspected: \`${flake}\`"
+                    } >> "$GITHUB_STEP_SUMMARY"
                   fi
             - name: Upload flake probe artifact
               if: always()
@@ -134,28 +215,51 @@ jobs:
         name: Build (Smoke)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 20
+        runs-on: ubuntu-22.04
+        timeout-minutes: 90
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
 
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-build
                   cache-targets: true
+                  cache-bin: false
             - name: Build binary (smoke check)
-              run: cargo build --profile release-fast --locked --verbose
+              env:
+                  CARGO_BUILD_JOBS: 2
+                  CI_SMOKE_BUILD_ATTEMPTS: 3
+              run: bash scripts/ci/smoke_build_retry.sh
             - name: Check binary size
+              env:
+                  BINARY_SIZE_HARD_LIMIT_MB: 28
+                  BINARY_SIZE_ADVISORY_MB: 20
+                  BINARY_SIZE_TARGET_MB: 5
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
     docs-only:
         name: Docs-Only Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         steps:
             - name: Skip heavy jobs for docs-only change
               run: echo "Docs-only change detected. Rust lint/test/build skipped."
@@ -164,7 +268,7 @@ jobs:
         name: Non-Rust Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         steps:
             - name: Skip Rust jobs for non-Rust change scope
               run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
@@ -173,12 +277,16 @@ jobs:
         name: Docs Quality
         needs: [changes]
         if: needs.changes.outputs.docs_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+            - name: Setup Node.js for markdown lint
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version: "22"
 
             - name: Markdown lint (changed lines only)
               env:
@@ -209,7 +317,7 @@ jobs:
 
             - name: Link check (offline, added links only)
               if: steps.collect_links.outputs.count != '0'
-              uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
+              uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
               with:
                   fail: true
                   args: >-
@@ -228,7 +336,7 @@ jobs:
         name: Lint Feedback
         if: github.event_name == 'pull_request'
         needs: [changes, lint, docs-quality]
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         permissions:
             contents: read
             pull-requests: write
@@ -250,55 +358,11 @@ jobs:
                       const script = require('./.github/workflows/scripts/lint_feedback.js');
                       await script({github, context, core});
 
-    workflow-owner-approval:
-        name: Workflow Owner Approval
-        needs: [changes]
-        if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Require owner approval for workflow file changes
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
-                    await script({ github, context, core });
-
-    human-review-approval:
-        name: Human Review Approval
-        needs: [changes]
-        if: github.event_name == 'pull_request'
-        runs-on: [self-hosted, aws-india]
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  ref: ${{ github.event.pull_request.base.sha }}
-
-            - name: Require at least one human approving review
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  HUMAN_REVIEW_BOT_LOGINS: ${{ vars.HUMAN_REVIEW_BOT_LOGINS }}
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_human_review_guard.js');
-                    await script({ github, context, core });
-
     license-file-owner-guard:
         name: License File Owner Guard
         needs: [changes]
         if: github.event_name == 'pull_request'
-        runs-on: [self-hosted, aws-india]
+        runs-on: ubuntu-22.04
         permissions:
             contents: read
             pull-requests: read
@@ -315,8 +379,8 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, human-review-approval, license-file-owner-guard]
-        runs-on: [self-hosted, aws-india]
+        needs: [changes, lint, workspace-check, package-check, test, build, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
+        runs-on: ubuntu-22.04
         steps:
             - name: Enforce required status
               shell: bash
@@ -326,23 +390,12 @@ jobs:
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
-                  workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
-                  workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
-                  human_review_result="${{ needs.human-review-approval.result }}"
                   license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
                   # --- Helper: enforce PR governance gates ---
                   check_pr_governance() {
                     if [ "$event_name" != "pull_request" ]; then return 0; fi
-                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
-                    if [ "$human_review_result" != "success" ]; then
-                      echo "Human review approval guard did not pass."
-                      exit 1
-                    fi
                     if [ "$license_owner_result" != "success" ]; then
                       echo "License file owner guard did not pass."
                       exit 1
@@ -374,21 +427,23 @@ jobs:
 
                   # --- Rust change path ---
                   lint_result="${{ needs.lint.result }}"
+                  workspace_check_result="${{ needs.workspace-check.result }}"
+                  package_check_result="${{ needs.package-check.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
 
                   echo "lint=${lint_result}"
+                  echo "workspace-check=${workspace_check_result}"
+                  echo "package-check=${package_check_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
-                  echo "workflow_owner_approval=${workflow_owner_result}"
-                  echo "human_review_approval=${human_review_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
                   check_pr_governance
 
-                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                    echo "Required CI jobs did not pass: lint=${lint_result} test=${test_result} build=${build_result}"
+                  if [ "$lint_result" != "success" ] || [ "$workspace_check_result" != "success" ] || [ "$package_check_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required CI jobs did not pass: lint=${lint_result} workspace-check=${workspace_check_result} package-check=${package_check_result} test=${test_result} build=${build_result}"
                     exit 1
                   fi
 

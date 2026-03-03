@@ -26,7 +26,7 @@ Policy: `.github/release/prerelease-stage-gates.json`
 | `alpha` | - | `CI Required Gate`, `Security Audit` |
 | `beta` | `alpha` | `CI Required Gate`, `Security Audit`, `Feature Matrix Summary` |
 | `rc` | `beta` | `CI Required Gate`, `Security Audit`, `Feature Matrix Summary`, `Nightly Summary & Routing` |
-| `stable` | `rc` | `Main Promotion Gate`, `CI Required Gate`, `Security Audit`, `Feature Matrix Summary`, `Verify Artifact Set`, `Nightly Summary & Routing` |
+| `stable` | `rc` | `CI Required Gate`, `Security Audit`, `Feature Matrix Summary`, `Verify Artifact Set`, `Nightly Summary & Routing` |
 
 The guard validates that the policy file defines this matrix shape completely. Missing or malformed matrix configuration fails validation.
 

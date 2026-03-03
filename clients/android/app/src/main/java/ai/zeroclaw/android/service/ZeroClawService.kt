@@ -15,7 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Foreground service that keeps ZeroClaw running in the background.
- * 
+ *
  * This service:
  * - Runs the ZeroClaw Rust binary via JNI
  * - Maintains a persistent notification
@@ -23,27 +23,27 @@ import kotlinx.coroutines.flow.StateFlow
  * - Survives app backgrounding (within Android limits)
  */
 class ZeroClawService : Service() {
-    
+
     private val binder = LocalBinder()
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    
+
     private val _status = MutableStateFlow(Status.Stopped)
     val status: StateFlow<Status> = _status
-    
+
     private val _lastMessage = MutableStateFlow<String?>(null)
     val lastMessage: StateFlow<String?> = _lastMessage
-    
+
     inner class LocalBinder : Binder() {
         fun getService(): ZeroClawService = this@ZeroClawService
     }
-    
+
     override fun onBind(intent: Intent): IBinder = binder
-    
+
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, createNotification())
     }
-    
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> startAgent()
@@ -52,24 +52,24 @@ class ZeroClawService : Service() {
         }
         return START_STICKY
     }
-    
+
     override fun onDestroy() {
         scope.cancel()
         super.onDestroy()
     }
-    
+
     private fun startAgent() {
         if (_status.value == Status.Running) return
-        
+
         _status.value = Status.Starting
-        
+
         scope.launch {
             try {
                 // TODO: Initialize and start ZeroClaw native library
                 // ZeroClawBridge.start(configPath)
-                
+
                 _status.value = Status.Running
-                
+
                 // TODO: Start message loop
                 // while (isActive) {
                 //     val message = ZeroClawBridge.pollMessage()
@@ -80,20 +80,20 @@ class ZeroClawService : Service() {
             }
         }
     }
-    
+
     private fun stopAgent() {
         scope.launch {
             // TODO: ZeroClawBridge.stop()
             _status.value = Status.Stopped
         }
     }
-    
+
     private fun sendMessage(message: String) {
         scope.launch {
             // TODO: ZeroClawBridge.sendMessage(message)
         }
     }
-    
+
     private fun createNotification(): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this,
@@ -101,7 +101,7 @@ class ZeroClawService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
-        
+
         return NotificationCompat.Builder(this, ZeroClawApp.CHANNEL_ID)
             .setContentTitle("ZeroClaw is running")
             .setContentText("Your AI assistant is active")
@@ -111,7 +111,7 @@ class ZeroClawService : Service() {
             .setSilent(true)
             .build()
     }
-    
+
     companion object {
         private const val NOTIFICATION_ID = 1001
         const val ACTION_START = "ai.zeroclaw.action.START"
@@ -119,7 +119,7 @@ class ZeroClawService : Service() {
         const val ACTION_SEND = "ai.zeroclaw.action.SEND"
         const val EXTRA_MESSAGE = "message"
     }
-    
+
     sealed class Status {
         object Stopped : Status()
         object Starting : Status()

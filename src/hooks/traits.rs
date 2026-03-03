@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::channels::traits::ChannelMessage;
+use crate::plugins::traits::PluginCapability;
 use crate::providers::traits::{ChatMessage, ChatResponse};
 use crate::tools::traits::ToolResult;
 
@@ -26,6 +27,11 @@ pub trait HookHandler: Send + Sync {
     fn name(&self) -> &str;
     fn priority(&self) -> i32 {
         0
+    }
+    /// Capabilities granted to this hook handler.
+    /// Handlers without `ModifyToolResults` cannot modify tool results.
+    fn capabilities(&self) -> &[PluginCapability] {
+        &[]
     }
 
     // --- Void hooks (parallel, fire-and-forget) ---
@@ -62,6 +68,22 @@ pub trait HookHandler: Send + Sync {
 
     async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
         HookResult::Continue((name, args))
+    }
+
+    async fn before_compaction(&self, messages: Vec<ChatMessage>) -> HookResult<Vec<ChatMessage>> {
+        HookResult::Continue(messages)
+    }
+
+    async fn after_compaction(&self, summary: String) -> HookResult<String> {
+        HookResult::Continue(summary)
+    }
+
+    async fn tool_result_persist(
+        &self,
+        _tool: String,
+        result: ToolResult,
+    ) -> HookResult<ToolResult> {
+        HookResult::Continue(result)
     }
 
     async fn on_message_received(&self, message: ChannelMessage) -> HookResult<ChannelMessage> {

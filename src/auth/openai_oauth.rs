@@ -7,6 +7,7 @@ use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -296,7 +297,26 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     if let Some(expected_state) = expected_state {
         if let Some(got) = params.get("state") {
             if got != expected_state {
-                anyhow::bail!("OAuth state mismatch");
+                let mut err_msg = format!(
+                    "OAuth state mismatch (expected length={}, got length={})",
+                    expected_state.len(),
+                    got.len()
+                );
+
+                // Add helpful hint if truncation detected
+                if let Some(hint) =
+                    crate::auth::oauth_common::detect_url_truncation(input, expected_state.len())
+                {
+                    let _ = write!(
+                        &mut err_msg,
+                        "\n\n💡 Tip: {}\n   \
+                        Try copying ONLY the authorization code instead of the full URL.\n   \
+                        The code looks like: eyJh...",
+                        hint
+                    );
+                }
+
+                anyhow::bail!(err_msg);
             }
         } else if is_callback_payload {
             anyhow::bail!("Missing OAuth state in callback");

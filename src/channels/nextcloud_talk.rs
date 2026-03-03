@@ -1,7 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use uuid::Uuid;
 
 /// Nextcloud Talk channel in webhook mode.
@@ -247,6 +245,8 @@ pub fn verify_nextcloud_talk_signature(
     body: &str,
     signature: &str,
 ) -> bool {
+    use ring::hmac;
+
     let random = random.trim();
     if random.is_empty() {
         tracing::warn!("Nextcloud Talk: missing X-Nextcloud-Talk-Random header");
@@ -265,17 +265,15 @@ pub fn verify_nextcloud_talk_signature(
     };
 
     let payload = format!("{random}{body}");
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(payload.as_bytes());
-
-    mac.verify_slice(&provided).is_ok()
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    hmac::verify(&key, payload.as_bytes(), &provided).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     fn make_channel() -> NextcloudTalkChannel {
         NextcloudTalkChannel::new(

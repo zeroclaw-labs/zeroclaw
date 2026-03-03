@@ -306,6 +306,50 @@ Linux logs:
 journalctl --user -u zeroclaw.service -f
 ```
 
+## macOS Catalina (10.15) Compatibility
+
+### Build or run fails on macOS Catalina
+
+Symptoms:
+
+- `cargo build` fails with linker errors referencing a minimum deployment target higher than 10.15
+- Binary exits immediately or crashes with `Illegal instruction: 4` on launch
+- Error message references `macOS 11.0` or `Big Sur` as a requirement
+
+Why this happens:
+
+- `wasmtime` (the WASM plugin engine used by the `wasm-tools` feature) uses Cranelift JIT
+  compilation, which has macOS version dependencies that may exceed Catalina (10.15).
+- If your Rust toolchain was installed or updated on a newer macOS host, the default
+  `MACOSX_DEPLOYMENT_TARGET` may be set higher than 10.15, producing binaries that refuse
+  to start on Catalina.
+
+Fix — build without the WASM plugin engine (recommended on Catalina):
+
+```bash
+cargo build --release --locked
+```
+
+The default feature set no longer includes `wasm-tools`, so the above command produces a
+Catalina-compatible binary without Cranelift/JIT dependencies.
+
+If you need WASM plugin support and are on a newer macOS (11.0+), opt in explicitly:
+
+```bash
+cargo build --release --locked --features wasm-tools
+```
+
+Fix — explicit deployment target (belt-and-suspenders):
+
+If you still see deployment-target linker errors, set the target explicitly before building:
+
+```bash
+MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --release --locked
+```
+
+The `.cargo/config.toml` in this repository already pins `x86_64-apple-darwin` builds to
+`-mmacosx-version-min=10.15`, so the environment variable is usually not required.
+
 ## Legacy Installer Compatibility
 
 Both still work:

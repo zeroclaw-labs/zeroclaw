@@ -1,4 +1,6 @@
+use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::AckReactionConfig;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -10,6 +12,10 @@ use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
+/// Discord approval button custom_id prefixes.
+const DISCORD_APPROVAL_APPROVE_PREFIX: &str = "zcapr:yes:";
+const DISCORD_APPROVAL_DENY_PREFIX: &str = "zcapr:no:";
+
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
     bot_token: String,
@@ -18,6 +24,7 @@ pub struct DiscordChannel {
     listen_to_bots: bool,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
+    ack_reaction: Option<AckReactionConfig>,
     workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
@@ -37,6 +44,7 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             group_reply_allowed_sender_ids: Vec::new(),
+            ack_reaction: None,
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
@@ -45,6 +53,12 @@ impl DiscordChannel {
     /// Configure sender IDs that bypass mention gating in guild channels.
     pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
         self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+        self
+    }
+
+    /// Configure ACK reaction policy.
+    pub fn with_ack_reaction(mut self, ack_reaction: Option<AckReactionConfig>) -> Self {
+        self.ack_reaction = ack_reaction;
         self
     }
 
@@ -132,9 +146,11 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// `text/*` MIME types are fetched and inlined, while `image/*` MIME types are
-/// forwarded as `[IMAGE:<url>]` markers. Other types are skipped. Fetch errors
-/// are logged as warnings.
+/// `image/*` attachments are forwarded as `[IMAGE:<url>]` markers. For
+/// `application/octet-stream` or missing MIME types, image-like filename/url
+/// extensions are also treated as images.
+/// `text/*` MIME types are fetched and inlined. Other types are skipped.
+/// Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -153,7 +169,9 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-        if ct.starts_with("text/") {
+        if is_image_attachment(ct, name, url) {
+            parts.push(format!("[IMAGE:{url}]"));
+        } else if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
@@ -167,8 +185,6 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
-        } else if ct.starts_with("image/") {
-            parts.push(format!("[IMAGE:{url}]"));
         } else {
             tracing::debug!(
                 name,
@@ -178,6 +194,54 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
+}
+
+fn is_image_attachment(content_type: &str, filename: &str, url: &str) -> bool {
+    let normalized_content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if !normalized_content_type.is_empty() {
+        if normalized_content_type.starts_with("image/") {
+            return true;
+        }
+        // Trust explicit non-image MIME to avoid false positives from filename extensions.
+        if normalized_content_type != "application/octet-stream" {
+            return false;
+        }
+    }
+
+    has_image_extension(filename) || has_image_extension(url)
+}
+
+fn has_image_extension(value: &str) -> bool {
+    let base = value.split('?').next().unwrap_or(value);
+    let base = base.split('#').next().unwrap_or(base);
+    let ext = Path::new(base)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    matches!(
+        ext.as_deref(),
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "tif"
+                | "tiff"
+                | "svg"
+                | "avif"
+                | "heic"
+                | "heif"
+        )
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +580,108 @@ fn normalize_incoming_content(
     Some(normalized)
 }
 
+fn parse_approval_request_id(custom_id: &str, prefix: &str) -> Option<String> {
+    let raw = custom_id.strip_prefix(prefix)?.trim();
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Parse a Discord `INTERACTION_CREATE` message-component event into a
+/// slash-command-equivalent ChannelMessage.
+fn try_parse_approval_interaction(
+    d: &serde_json::Value,
+) -> Option<(ChannelMessage, String, String)> {
+    // type=3 => MessageComponent interaction
+    let interaction_type = d.get("type").and_then(serde_json::Value::as_u64)?;
+    if interaction_type != 3 {
+        return None;
+    }
+
+    let interaction_id = d.get("id").and_then(serde_json::Value::as_str)?.to_string();
+    let interaction_token = d
+        .get("token")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+
+    let custom_id = d
+        .get("data")
+        .and_then(|data| data.get("custom_id"))
+        .and_then(serde_json::Value::as_str)?;
+
+    let content = if let Some(request_id) =
+        parse_approval_request_id(custom_id, DISCORD_APPROVAL_APPROVE_PREFIX)
+    {
+        format!("/approve-allow {request_id}")
+    } else if let Some(request_id) =
+        parse_approval_request_id(custom_id, DISCORD_APPROVAL_DENY_PREFIX)
+    {
+        format!("/approve-deny {request_id}")
+    } else {
+        return None;
+    };
+
+    // Guild interactions expose user in member.user; DMs expose top-level user.
+    let user = d
+        .get("member")
+        .and_then(|member| member.get("user"))
+        .or_else(|| d.get("user"))?;
+    let user_id = user
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let channel_id = d
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let message = ChannelMessage {
+        id: format!("discord_interaction_{interaction_id}"),
+        sender: user_id.to_string(),
+        reply_target: if channel_id.is_empty() {
+            user_id.to_string()
+        } else {
+            channel_id.to_string()
+        },
+        content,
+        channel: "discord".to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        thread_ts: None,
+    };
+
+    Some((message, interaction_id, interaction_token))
+}
+
+/// ACK an interaction by editing the original message and removing its buttons.
+fn acknowledge_interaction_nonblocking(
+    client: reqwest::Client,
+    interaction_id: String,
+    interaction_token: String,
+    approved: bool,
+) {
+    let decision_text = if approved { "Approved" } else { "Denied" };
+    let emoji = if approved { "\u{2705}" } else { "\u{274c}" };
+
+    tokio::spawn(async move {
+        let url = format!(
+            "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+        );
+        let body = json!({
+            "type": 7,
+            "data": {
+                "content": format!("{emoji} {decision_text}."),
+                "components": []
+            }
+        });
+        let _ = client.post(&url).json(&body).send().await;
+    });
+}
+
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -754,8 +920,45 @@ impl Channel for DiscordChannel {
                         _ => {}
                     }
 
-                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    // Handle button interaction callbacks for tool approvals.
+                    if event_type == "INTERACTION_CREATE" {
+                        if let Some(d) = event.get("d") {
+                            if let Some((channel_msg, interaction_id, interaction_token)) =
+                                try_parse_approval_interaction(d)
+                            {
+                                if !self.is_user_allowed(&channel_msg.sender) {
+                                    tracing::warn!(
+                                        "Discord: ignoring approval interaction from unauthorized user: {}",
+                                        channel_msg.sender
+                                    );
+                                    // Always ACK to avoid "interaction failed" in Discord client.
+                                    acknowledge_interaction_nonblocking(
+                                        self.http_client(),
+                                        interaction_id,
+                                        interaction_token,
+                                        false,
+                                    );
+                                    continue;
+                                }
+
+                                let approved = channel_msg.content.starts_with("/approve-allow ");
+                                acknowledge_interaction_nonblocking(
+                                    self.http_client(),
+                                    interaction_id,
+                                    interaction_token,
+                                    approved,
+                                );
+
+                                if tx.send(channel_msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -835,21 +1038,37 @@ impl Channel for DiscordChannel {
                         );
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
-                        let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
-                            if let Err(err) = reaction_channel
-                                .add_reaction(
-                                    &reaction_channel_id,
-                                    &reaction_message_id,
-                                    &reaction_emoji,
-                                )
-                                .await
-                            {
-                                tracing::debug!(
-                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
-                                );
-                            }
-                        });
+                        let reaction_ctx = AckReactionContext {
+                            text: &final_content,
+                            sender_id: Some(author_id),
+                            chat_id: Some(&channel_id),
+                            chat_type: if is_group_message {
+                                AckReactionContextChatType::Group
+                            } else {
+                                AckReactionContextChatType::Direct
+                            },
+                            locale_hint: None,
+                        };
+                        if let Some(reaction_emoji) = select_ack_reaction(
+                            self.ack_reaction.as_ref(),
+                            DISCORD_ACK_REACTIONS,
+                            &reaction_ctx,
+                        ) {
+                            tokio::spawn(async move {
+                                if let Err(err) = reaction_channel
+                                    .add_reaction(
+                                        &reaction_channel_id,
+                                        &reaction_message_id,
+                                        &reaction_emoji,
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                    );
+                                }
+                            });
+                        }
                     }
 
                     let channel_msg = ChannelMessage {
@@ -878,6 +1097,66 @@ impl Channel for DiscordChannel {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        _thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.chars().count() > 260 {
+            crate::util::truncate_with_ellipsis(&raw_args, 260)
+        } else {
+            raw_args
+        };
+
+        let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+        let body = json!({
+            "content": format!(
+                "**Approval required** for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`"
+            ),
+            "components": [{
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 3,
+                        "label": "Approve",
+                        "custom_id": format!("{DISCORD_APPROVAL_APPROVE_PREFIX}{request_id}")
+                    },
+                    {
+                        "type": 2,
+                        "style": 4,
+                        "label": "Deny",
+                        "custom_id": format!("{DISCORD_APPROVAL_DENY_PREFIX}{request_id}")
+                    }
+                ]
+            }]
+        });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Discord approval prompt failed ({status}): {sanitized}");
         }
 
         Ok(())
@@ -1561,8 +1840,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_attachments_emits_single_image_marker() {
+    async fn process_attachments_emits_image_marker_for_image_content_type() {
         let client = reqwest::Client::new();
         let attachments = vec![serde_json::json!({
             "url": "https://cdn.discordapp.com/attachments/123/456/photo.png",
@@ -1598,6 +1876,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_attachments_emits_image_marker_from_filename_without_content_type() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024",
+            "filename": "photo.jpeg"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024]"
+        );
+    }
+
+    #[test]
+    fn is_image_attachment_prefers_non_image_content_type_over_extension() {
+        assert!(!is_image_attachment(
+            "text/plain",
+            "photo.png",
+            "https://cdn.discordapp.com/attachments/123/456/photo.png"
+        ));
+    }
+
+    #[test]
+    fn is_image_attachment_allows_octet_stream_extension_fallback() {
+        assert!(is_image_attachment(
+            "application/octet-stream",
+            "photo.png",
+            "https://cdn.discordapp.com/attachments/123/456/photo.png"
+        ));
+    }
     #[test]
     fn parse_attachment_markers_extracts_supported_markers() {
         let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
@@ -1693,5 +2002,87 @@ mod tests {
 
         let escaped = channel.resolve_local_attachment_path(outside.to_string_lossy().as_ref());
         assert!(escaped.is_err(), "path outside workspace must be rejected");
+    }
+
+    #[test]
+    fn discord_parse_approval_interaction_approve() {
+        let event = json!({
+            "type": 3,
+            "id": "111222333",
+            "token": "fake_token",
+            "data": { "custom_id": "zcapr:yes:req-42" },
+            "member": { "user": { "id": "user_1" } },
+            "channel_id": "chan_99"
+        });
+
+        let (msg, interaction_id, interaction_token) =
+            try_parse_approval_interaction(&event).expect("approval interaction should parse");
+        assert_eq!(msg.content, "/approve-allow req-42");
+        assert_eq!(msg.sender, "user_1");
+        assert_eq!(msg.reply_target, "chan_99");
+        assert_eq!(msg.channel, "discord");
+        assert!(msg.id.contains("111222333"));
+        assert_eq!(interaction_id, "111222333");
+        assert_eq!(interaction_token, "fake_token");
+    }
+
+    #[test]
+    fn discord_parse_approval_interaction_deny() {
+        let event = json!({
+            "type": 3,
+            "id": "444555666",
+            "token": "tok",
+            "data": { "custom_id": "zcapr:no:req-99" },
+            "user": { "id": "dm_user" },
+            "channel_id": ""
+        });
+
+        let (msg, _, _) =
+            try_parse_approval_interaction(&event).expect("deny interaction should parse");
+        assert_eq!(msg.content, "/approve-deny req-99");
+        assert_eq!(msg.sender, "dm_user");
+        assert_eq!(msg.reply_target, "dm_user");
+    }
+
+    #[test]
+    fn discord_parse_approval_interaction_ignores_non_approval() {
+        let event = json!({
+            "type": 3,
+            "id": "777",
+            "token": "tok",
+            "data": { "custom_id": "some_other_button" },
+            "member": { "user": { "id": "user_1" } },
+            "channel_id": "chan_1"
+        });
+
+        assert!(try_parse_approval_interaction(&event).is_none());
+    }
+
+    #[test]
+    fn discord_parse_approval_interaction_ignores_non_component() {
+        let event = json!({
+            "type": 2,
+            "id": "888",
+            "token": "tok",
+            "data": { "custom_id": "zcapr:yes:req-1" },
+            "member": { "user": { "id": "user_1" } },
+            "channel_id": "chan_1"
+        });
+
+        assert!(try_parse_approval_interaction(&event).is_none());
+    }
+
+    #[test]
+    fn discord_parse_approval_interaction_rejects_whitespace_request_id() {
+        let event = json!({
+            "type": 3,
+            "id": "999",
+            "token": "tok",
+            "data": { "custom_id": "zcapr:yes:req 1" },
+            "member": { "user": { "id": "user_1" } },
+            "channel_id": "chan_1"
+        });
+
+        assert!(try_parse_approval_interaction(&event).is_none());
     }
 }

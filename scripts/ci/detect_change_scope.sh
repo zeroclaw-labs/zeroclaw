@@ -24,29 +24,43 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
     echo "docs_changed=false"
     echo "rust_changed=true"
     echo "workflow_changed=false"
+    echo "ci_cd_changed=false"
     echo "base_sha="
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
   exit 0
 fi
 
-# Use merge-base to avoid false positives when the base branch has advanced
-# and the PR branch is temporarily behind. This limits scope to changes
-# introduced by the head branch itself.
 DIFF_BASE="$BASE"
-if MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
-  if [ -n "$MERGE_BASE" ]; then
-    DIFF_BASE="$MERGE_BASE"
+DIFF_HEAD="HEAD"
+
+# For pull_request events, checkout usually points to refs/pull/*/merge.
+# In that case HEAD is a synthetic merge commit:
+# - HEAD^1 => latest base branch tip
+# - HEAD   => merged result used for CI
+# Diffing HEAD^1..HEAD isolates only PR-introduced changes, even when the
+# BASE_SHA from the event payload is stale.
+if [ "$EVENT_NAME" = "pull_request" ] && git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+  DIFF_BASE="$(git rev-parse HEAD^1)"
+  DIFF_HEAD="HEAD"
+else
+  # Fallback: use merge-base to avoid false positives when the base branch has
+  # advanced and the PR branch is temporarily behind.
+  if MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
+    if [ -n "$MERGE_BASE" ]; then
+      DIFF_BASE="$MERGE_BASE"
+    fi
   fi
 fi
 
-CHANGED="$(git diff --name-only "$DIFF_BASE" HEAD || true)"
+CHANGED="$(git diff --name-only "$DIFF_BASE" "$DIFF_HEAD" || true)"
 if [ -z "$CHANGED" ]; then
   {
     echo "docs_only=false"
     echo "docs_changed=false"
     echo "rust_changed=false"
     echo "workflow_changed=false"
+    echo "ci_cd_changed=false"
     echo "base_sha=$DIFF_BASE"
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
@@ -57,12 +71,27 @@ docs_only=true
 docs_changed=false
 rust_changed=false
 workflow_changed=false
+ci_cd_changed=false
 docs_files=()
 while IFS= read -r file; do
   [ -z "$file" ] && continue
 
   if [[ "$file" == .github/workflows/* ]]; then
     workflow_changed=true
+  fi
+
+  if [[ "$file" == .github/workflows/* ]] \
+    || [[ "$file" == .github/codeql/* ]] \
+    || [[ "$file" == .github/connectivity/* ]] \
+    || [[ "$file" == .github/release/* ]] \
+    || [[ "$file" == .github/security/* ]] \
+    || [[ "$file" == .github/actionlint.yaml ]] \
+    || [[ "$file" == .github/dependabot.yml ]] \
+    || [[ "$file" == scripts/ci/* ]] \
+    || [[ "$file" == docs/ci-map.md ]] \
+    || [[ "$file" == docs/actions-source-policy.md ]] \
+    || [[ "$file" == docs/operations/self-hosted-runner-remediation.md ]]; then
+    ci_cd_changed=true
   fi
 
   if [[ "$file" == docs/* ]] \
@@ -98,8 +127,11 @@ done <<< "$CHANGED"
   echo "docs_changed=$docs_changed"
   echo "rust_changed=$rust_changed"
   echo "workflow_changed=$workflow_changed"
+  echo "ci_cd_changed=$ci_cd_changed"
   echo "base_sha=$DIFF_BASE"
   echo "docs_files<<EOF"
-  printf '%s\n' "${docs_files[@]}"
+  if [ "${#docs_files[@]}" -gt 0 ]; then
+    printf '%s\n' "${docs_files[@]}"
+  fi
   echo "EOF"
 } >> "$GITHUB_OUTPUT"

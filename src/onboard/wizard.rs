@@ -1,13 +1,14 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, QQEnvironment, QQReceiveMode, SignalConfig,
-    StreamMode, WhatsAppConfig,
+    NextcloudTalkConfig, NostrConfig, ProgressMode, QQConfig, QQEnvironment, QQReceiveMode,
+    SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
-    TelegramConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    HeartbeatConfig, HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig,
+    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig,
+    SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebFetchConfig, WebSearchConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::identity::{
@@ -17,10 +18,14 @@ use crate::memory::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind,
 };
+use crate::migration::{
+    load_config_without_env, migrate_openclaw, resolve_openclaw_config, resolve_openclaw_workspace,
+    OpenClawMigrationOptions,
+};
 use crate::providers::{
-    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    canonical_china_provider_name, is_doubao_alias, is_glm_alias, is_glm_cn_alias,
+    is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias,
+    is_siliconflow_alias, is_stepfun_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -42,6 +47,13 @@ pub struct ProjectContext {
     pub timezone: String,
     pub agent_name: String,
     pub communication_style: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenClawOnboardMigrationOptions {
+    pub enabled: bool,
+    pub source_workspace: Option<PathBuf>,
+    pub source_config: Option<PathBuf>,
 }
 
 // ── Banner ───────────────────────────────────────────────────────
@@ -80,6 +92,17 @@ enum InteractiveOnboardingMode {
 }
 
 pub async fn run_wizard(force: bool) -> Result<Config> {
+    Box::pin(run_wizard_with_migration(
+        force,
+        OpenClawOnboardMigrationOptions::default(),
+    ))
+    .await
+}
+
+pub async fn run_wizard_with_migration(
+    force: bool,
+    migration_options: OpenClawOnboardMigrationOptions,
+) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -99,7 +122,23 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
         InteractiveOnboardingMode::UpdateProviderOnly => {
-            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+            let raw = fs::read_to_string(&config_path).await.with_context(|| {
+                format!(
+                    "Failed to read existing config at {}",
+                    config_path.display()
+                )
+            })?;
+            let mut existing_config: Config = toml::from_str(&raw).with_context(|| {
+                format!(
+                    "Failed to parse existing config at {}",
+                    config_path.display()
+                )
+            })?;
+            existing_config.workspace_dir = workspace_dir.to_path_buf();
+            existing_config.config_path = config_path.to_path_buf();
+            maybe_run_openclaw_migration(&mut existing_config, &migration_options, true).await?;
+            let config = run_provider_update_wizard(&workspace_dir, &config_path).await?;
+            return Ok(config);
         }
     }
 
@@ -141,7 +180,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: if api_key.is_empty() {
@@ -186,6 +225,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         proxy: crate::config::ProxyConfig::default(),
         identity: identity_config,
         cost: crate::config::CostConfig::default(),
+        economic: crate::config::EconomicConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
@@ -213,6 +253,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
+
+    maybe_run_openclaw_migration(&mut config, &migration_options, true).await?;
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -379,7 +421,7 @@ fn apply_provider_update(
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
+/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid|cortex-mem`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
@@ -416,6 +458,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        sqlite_journal_mode: "wal".to_string(),
         qdrant: crate::config::QdrantConfig::default(),
     }
 }
@@ -429,11 +472,36 @@ pub async fn run_quick_setup(
     force: bool,
     no_totp: bool,
 ) -> Result<Config> {
+    Box::pin(run_quick_setup_with_migration(
+        credential_override,
+        provider,
+        model_override,
+        memory_backend,
+        force,
+        no_totp,
+        OpenClawOnboardMigrationOptions::default(),
+    ))
+    .await
+}
+
+pub async fn run_quick_setup_with_migration(
+    credential_override: Option<&str>,
+    provider: Option<&str>,
+    model_override: Option<&str>,
+    memory_backend: Option<&str>,
+    force: bool,
+    no_totp: bool,
+    migration_options: OpenClawOnboardMigrationOptions,
+) -> Result<Config> {
+    let migration_requested = migration_options.enabled
+        || migration_options.source_workspace.is_some()
+        || migration_options.source_config.is_some();
+
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(
+    let mut config = run_quick_setup_with_home(
         credential_override,
         provider,
         model_override,
@@ -442,7 +510,130 @@ pub async fn run_quick_setup(
         no_totp,
         &home,
     )
-    .await
+    .await?;
+
+    maybe_run_openclaw_migration(&mut config, &migration_options, false).await?;
+
+    if migration_requested {
+        println!();
+        println!(
+            "  {} Post-migration summary (updated configuration):",
+            style("↻").cyan().bold()
+        );
+        print_summary(&config);
+    }
+    Ok(config)
+}
+
+async fn maybe_run_openclaw_migration(
+    config: &mut Config,
+    options: &OpenClawOnboardMigrationOptions,
+    allow_interactive_prompt: bool,
+) -> Result<()> {
+    let resolved_workspace = resolve_openclaw_workspace(options.source_workspace.clone())?;
+    let resolved_config = resolve_openclaw_config(options.source_config.clone())?;
+
+    let auto_detected = resolved_workspace.exists() || resolved_config.exists();
+    let should_run = if options.enabled {
+        true
+    } else if allow_interactive_prompt && auto_detected {
+        println!();
+        println!(
+            "  {} OpenClaw data detected. Optional merge migration is available.",
+            style("↻").cyan().bold()
+        );
+        Confirm::new()
+            .with_prompt(
+                "  Merge OpenClaw data into this ZeroClaw workspace now? (preserve existing data)",
+            )
+            .default(true)
+            .interact()?
+    } else {
+        false
+    };
+
+    if !should_run {
+        return Ok(());
+    }
+
+    println!(
+        "  {} Running OpenClaw merge migration...",
+        style("↻").cyan().bold()
+    );
+
+    let report = migrate_openclaw(
+        config,
+        OpenClawMigrationOptions {
+            source_workspace: if options.source_workspace.is_some() || resolved_workspace.exists() {
+                Some(resolved_workspace.clone())
+            } else {
+                None
+            },
+            source_config: if options.source_config.is_some() || resolved_config.exists() {
+                Some(resolved_config.clone())
+            } else {
+                None
+            },
+            include_memory: true,
+            include_config: true,
+            dry_run: false,
+        },
+    )
+    .await?;
+
+    *config = load_config_without_env(config)?;
+
+    let report_json = serde_json::to_value(&report).unwrap_or(Value::Null);
+    let metric = |pointer: &str| -> u64 {
+        report_json
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+
+    let changed_units = metric("/memory/imported")
+        + metric("/memory/renamed_conflicts")
+        + metric("/config/defaults_added")
+        + metric("/config/channels_added")
+        + metric("/config/channels_merged")
+        + metric("/config/agents_added")
+        + metric("/config/agents_merged")
+        + metric("/config/agent_tools_added");
+
+    if changed_units > 0 {
+        println!(
+            "  {} OpenClaw migration merged successfully",
+            style("✓").green().bold()
+        );
+    } else {
+        println!(
+            "  {} OpenClaw migration completed with no data changes",
+            style("✓").green().bold()
+        );
+    }
+
+    if let Some(backups) = report_json.get("backups").and_then(Value::as_array) {
+        if !backups.is_empty() {
+            println!("  {} Backups:", style("🛟").cyan().bold());
+            for backup in backups {
+                if let Some(path) = backup.as_str() {
+                    println!("    - {path}");
+                }
+            }
+        }
+    }
+
+    if let Some(notes) = report_json.get("notes").and_then(Value::as_array) {
+        if !notes.is_empty() {
+            println!("  {} Notes:", style("ℹ").cyan().bold());
+            for note in notes {
+                if let Some(text) = note.as_str() {
+                    println!("    - {text}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
@@ -550,6 +741,7 @@ async fn run_quick_setup_with_home(
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
+        economic: crate::config::EconomicConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
@@ -690,6 +882,13 @@ async fn run_quick_setup_with_home(
         } else {
             let env_var = provider_env_var(&provider_name);
             println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
+            let fallback_env_vars = provider_env_var_fallbacks(&provider_name);
+            if !fallback_env_vars.is_empty() {
+                println!(
+                    "       Alternate accepted env var(s): {}",
+                    fallback_env_vars.join(", ")
+                );
+            }
             println!("    2. Or edit:           ~/.zeroclaw/config.toml");
             println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
             println!("    4. Gateway:           zeroclaw gateway");
@@ -710,6 +909,9 @@ fn canonical_provider_name(provider_name: &str) -> &str {
     }
 
     if let Some(canonical) = canonical_china_provider_name(provider_name) {
+        if canonical == "doubao" {
+            return "volcengine";
+        }
         return canonical;
     }
 
@@ -771,14 +973,17 @@ fn default_model_for_provider(provider: &str) -> String {
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
+        "stepfun" => "step-3.5-flash".into(),
         "hunyuan" => "hunyuan-t1-latest".into(),
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
+        "volcengine" => "doubao-1-5-pro-32k-250115".into(),
+        "siliconflow" => "Pro/zai-org/GLM-4.7".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "sglang" | "vllm" | "osaurus" => "default".into(),
+        "sglang" | "vllm" | "osaurus" | "copilot" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -869,6 +1074,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "openai-codex" => vec![
+            (
+                "gpt-5.3-codex".to_string(),
+                "GPT-5.3 Codex (latest codex generation)".to_string(),
+            ),
             (
                 "gpt-5-codex".to_string(),
                 "GPT-5 Codex (recommended)".to_string(),
@@ -1049,6 +1258,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Kimi K2 0905 Preview (strong coding)".to_string(),
             ),
         ],
+        "stepfun" => vec![
+            (
+                "step-3.5-flash".to_string(),
+                "Step 3.5 Flash (recommended default)".to_string(),
+            ),
+            (
+                "step-3".to_string(),
+                "Step 3 (flagship reasoning)".to_string(),
+            ),
+            (
+                "step-2-mini".to_string(),
+                "Step 2 Mini (balanced and fast)".to_string(),
+            ),
+            (
+                "step-1o-turbo-vision".to_string(),
+                "Step 1o Turbo Vision (multimodal)".to_string(),
+            ),
+        ],
         "glm" | "zai" => vec![
             ("glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
             (
@@ -1087,6 +1314,31 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "qwen-turbo".to_string(),
                 "Qwen Turbo (fast and cost-efficient)".to_string(),
             ),
+        ],
+        "volcengine" => vec![
+            (
+                "doubao-1-5-pro-32k-250115".to_string(),
+                "Doubao 1.5 Pro 32K (official sample model)".to_string(),
+            ),
+            (
+                "doubao-seed-1-6-250615".to_string(),
+                "Doubao Seed 1.6 (reasoning flagship)".to_string(),
+            ),
+            (
+                "deepseek-v3.2".to_string(),
+                "DeepSeek V3.2 (available in ARK catalog)".to_string(),
+            ),
+        ],
+        "siliconflow" => vec![
+            (
+                "Pro/zai-org/GLM-4.7".to_string(),
+                "GLM-4.7 Pro (official API example)".to_string(),
+            ),
+            (
+                "Pro/deepseek-ai/DeepSeek-V3.2".to_string(),
+                "DeepSeek V3.2 Pro".to_string(),
+            ),
+            ("Qwen/Qwen3-32B".to_string(), "Qwen3 32B".to_string()),
         ],
         "qwen-code" => vec![
             (
@@ -1225,6 +1477,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
             ),
         ],
+        "copilot" => vec![(
+            "default".to_string(),
+            "Copilot default model (recommended)".to_string(),
+        )],
         _ => vec![("default".to_string(), "Default model".to_string())],
     }
 }
@@ -1257,9 +1513,12 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "novita"
             | "cohere"
             | "moonshot"
+            | "stepfun"
             | "glm"
             | "zai"
             | "qwen"
+            | "volcengine"
+            | "siliconflow"
             | "nvidia"
     )
 }
@@ -1272,6 +1531,9 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
         "moonshot-cn" | "kimi-cn" => Some("https://api.moonshot.cn/v1/models"),
         "glm-cn" | "bigmodel" => Some("https://open.bigmodel.cn/api/paas/v4/models"),
         "zai-cn" | "z.ai-cn" => Some("https://open.bigmodel.cn/api/coding/paas/v4/models"),
+        "volcengine" | "ark" | "doubao" | "doubao-cn" => {
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        }
         _ => match canonical_provider_name(provider_name) {
             "openai-codex" | "openai" => Some("https://api.openai.com/v1/models"),
             "venice" => Some("https://api.venice.ai/api/v1/models"),
@@ -1284,9 +1546,11 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "novita" => Some("https://api.novita.ai/openai/v1/models"),
             "cohere" => Some("https://api.cohere.com/compatibility/v1/models"),
             "moonshot" => Some("https://api.moonshot.ai/v1/models"),
+            "stepfun" => Some("https://api.stepfun.com/v1/models"),
             "glm" => Some("https://api.z.ai/api/paas/v4/models"),
             "zai" => Some("https://api.z.ai/api/coding/paas/v4/models"),
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
+            "siliconflow" => Some("https://api.siliconflow.cn/v1/models"),
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
@@ -1580,20 +1844,7 @@ fn fetch_live_models_for_provider(
         if provider_name == "ollama" && !ollama_remote {
             None
         } else {
-            std::env::var(provider_env_var(provider_name))
-                .ok()
-                .or_else(|| {
-                    // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
-                    if provider_name == "anthropic" {
-                        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                    } else if provider_name == "minimax" {
-                        std::env::var("MINIMAX_OAUTH_TOKEN").ok()
-                    } else {
-                        None
-                    }
-                })
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
+            resolve_provider_api_key_from_env(provider_name)
         }
     } else {
         Some(api_key.trim().to_string())
@@ -2213,7 +2464,7 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
-        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
+        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini, GitHub Copilot)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
@@ -2239,6 +2490,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             (
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
+            ),
+            (
+                "copilot",
+                "GitHub Copilot — OAuth device flow (Copilot subscription)",
             ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
@@ -2279,6 +2534,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "moonshot-intl",
                 "Moonshot — Kimi API (international endpoint)",
             ),
+            ("stepfun", "StepFun — Step AI OpenAI-compatible endpoint"),
             ("glm", "GLM — ChatGLM / Zhipu (international endpoint)"),
             ("glm-cn", "GLM — ChatGLM / Zhipu (China endpoint)"),
             (
@@ -2295,6 +2551,11 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("qwen-us", "Qwen — DashScope US endpoint"),
             ("hunyuan", "Hunyuan — Tencent large models (T1, Turbo, Pro)"),
             ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
+            ("volcengine", "Volcengine ARK — Doubao model family"),
+            (
+                "siliconflow",
+                "SiliconFlow — OpenAI-compatible hosted models",
+            ),
             ("zai", "Z.AI — global coding endpoint"),
             ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
             ("synthetic", "Synthetic — Synthetic AI models"),
@@ -2537,6 +2798,24 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        print_bullet("GitHub Copilot uses GitHub OAuth device flow.");
+        print_bullet("Press Enter to keep setup keyless and authenticate on first run.");
+        print_bullet("Optional: paste a GitHub token now to skip the first-run device prompt.");
+        println!();
+
+        let key: String = Input::new()
+            .with_prompt("  Paste your GitHub token (optional; Enter = device flow)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(
+                "No token provided. ZeroClaw will open the GitHub device login flow on first use.",
+            );
+        }
+
+        key
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -2671,6 +2950,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
         } else if is_qianfan_alias(provider_name) {
             "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78"
+        } else if is_doubao_alias(provider_name) {
+            "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey"
+        } else if is_siliconflow_alias(provider_name) {
+            "https://cloud.siliconflow.cn/account/ak"
+        } else if is_stepfun_alias(provider_name) {
+            "https://platform.stepfun.com/interface-key"
         } else {
             match provider_name {
                 "openrouter" => "https://openrouter.ai/keys",
@@ -2733,10 +3018,19 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
             if key.is_empty() {
                 let env_var = provider_env_var(provider_name);
-                print_bullet(&format!(
-                    "Skipped. Set {} or edit config.toml later.",
-                    style(env_var).yellow()
-                ));
+                let fallback_env_vars = provider_env_var_fallbacks(provider_name);
+                if fallback_env_vars.is_empty() {
+                    print_bullet(&format!(
+                        "Skipped. Set {} or edit config.toml later.",
+                        style(env_var).yellow()
+                    ));
+                } else {
+                    print_bullet(&format!(
+                        "Skipped. Set {} (fallback: {}) or edit config.toml later.",
+                        style(env_var).yellow(),
+                        style(fallback_env_vars.join(", ")).yellow()
+                    ));
+                }
             }
 
             key
@@ -2756,13 +3050,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             allows_unauthenticated_model_fetch(provider_name) && !ollama_remote;
         let has_api_key = !api_key.trim().is_empty()
             || ((canonical_provider != "ollama" || ollama_remote)
-                && std::env::var(provider_env_var(provider_name))
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()))
-            || (provider_name == "minimax"
-                && std::env::var("MINIMAX_OAUTH_TOKEN")
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()));
+                && provider_has_env_api_key(provider_name));
 
         if canonical_provider == "ollama" && ollama_remote && !has_api_key {
             print_bullet(&format!(
@@ -2976,9 +3264,12 @@ fn provider_env_var(name: &str) -> &'static str {
         "cohere" => "COHERE_API_KEY",
         "kimi-code" => "KIMI_CODE_API_KEY",
         "moonshot" => "MOONSHOT_API_KEY",
+        "stepfun" => "STEP_API_KEY",
         "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "qwen" => "DASHSCOPE_API_KEY",
+        "volcengine" => "ARK_API_KEY",
+        "siliconflow" => "SILICONFLOW_API_KEY",
         "hunyuan" => "HUNYUAN_API_KEY",
         "qianfan" => "QIANFAN_API_KEY",
         "zai" => "ZAI_API_KEY",
@@ -2992,6 +3283,33 @@ fn provider_env_var(name: &str) -> &'static str {
         "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
     }
+}
+
+fn provider_env_var_fallbacks(name: &str) -> &'static [&'static str] {
+    match canonical_provider_name(name) {
+        "anthropic" => &["ANTHROPIC_OAUTH_TOKEN"],
+        "gemini" => &["GOOGLE_API_KEY"],
+        "minimax" => &["MINIMAX_OAUTH_TOKEN"],
+        "volcengine" => &["DOUBAO_API_KEY"],
+        "stepfun" => &["STEPFUN_API_KEY"],
+        "kimi-code" => &["MOONSHOT_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn resolve_provider_api_key_from_env(provider_name: &str) -> Option<String> {
+    std::iter::once(provider_env_var(provider_name))
+        .chain(provider_env_var_fallbacks(provider_name).iter().copied())
+        .find_map(|env_var| {
+            std::env::var(env_var)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn provider_has_env_api_key(provider_name: &str) -> bool {
+    resolve_provider_api_key_from_env(provider_name).is_some()
 }
 
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
@@ -3008,7 +3326,63 @@ fn provider_supports_device_flow(provider_name: &str) -> bool {
     )
 }
 
+fn http_request_productivity_allowed_domains() -> Vec<String> {
+    vec![
+        "api.github.com".to_string(),
+        "github.com".to_string(),
+        "api.linear.app".to_string(),
+        "linear.app".to_string(),
+        "calendar.googleapis.com".to_string(),
+        "tasks.googleapis.com".to_string(),
+        "www.googleapis.com".to_string(),
+        "oauth2.googleapis.com".to_string(),
+        "api.notion.com".to_string(),
+        "api.trello.com".to_string(),
+        "api.atlassian.com".to_string(),
+    ]
+}
+
+fn parse_allowed_domains_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
+    if tool_name == "http_request" {
+        let options = vec![
+            "Productivity starter allowlist (GitHub, Linear, Google, Notion, Trello, Atlassian)",
+            "Allow all public domains (*)",
+            "Custom domain list (comma-separated)",
+        ];
+        let choice = Select::new()
+            .with_prompt("  HTTP domain policy")
+            .items(&options)
+            .default(0)
+            .interact()?;
+
+        return match choice {
+            0 => Ok(http_request_productivity_allowed_domains()),
+            1 => Ok(vec!["*".to_string()]),
+            _ => {
+                let raw: String = Input::new()
+                    .with_prompt("  http_request.allowed_domains (comma-separated, '*' allows all)")
+                    .allow_empty(true)
+                    .default("api.github.com,api.linear.app,calendar.googleapis.com".to_string())
+                    .interact_text()?;
+                let domains = parse_allowed_domains_csv(&raw);
+                if domains.is_empty() {
+                    anyhow::bail!(
+                        "Custom domain list cannot be empty. Use 'Allow all public domains (*)' if that is intended."
+                    )
+                }
+                Ok(domains)
+            }
+        };
+    }
+
     let prompt = format!(
         "  {}.allowed_domains (comma-separated, '*' allows all)",
         tool_name
@@ -3019,18 +3393,156 @@ fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
         .default("*".to_string())
         .interact_text()?;
 
-    let domains: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let domains = parse_allowed_domains_csv(&raw);
 
     if domains.is_empty() {
         Ok(vec!["*".to_string()])
     } else {
         Ok(domains)
     }
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn normalize_http_request_profile_name(name: &str) -> String {
+    let normalized = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized.trim_matches('-').to_string()
+}
+
+fn default_env_var_for_profile(profile_name: &str) -> String {
+    match profile_name {
+        "github" => "GITHUB_TOKEN".to_string(),
+        "linear" => "LINEAR_API_KEY".to_string(),
+        "google" => "GOOGLE_API_KEY".to_string(),
+        _ => format!(
+            "{}_TOKEN",
+            profile_name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        ),
+    }
+}
+
+fn setup_http_request_credential_profiles(
+    http_request_config: &mut HttpRequestConfig,
+) -> Result<()> {
+    println!();
+    print_bullet("Optional: configure env-backed credential profiles for http_request.");
+    print_bullet(
+        "This avoids passing raw tokens in tool arguments (use credential_profile instead).",
+    );
+
+    let configure_profiles = Confirm::new()
+        .with_prompt("  Configure HTTP credential profiles now?")
+        .default(false)
+        .interact()?;
+    if !configure_profiles {
+        return Ok(());
+    }
+
+    loop {
+        let default_name = if http_request_config.credential_profiles.is_empty() {
+            "github".to_string()
+        } else {
+            format!(
+                "profile-{}",
+                http_request_config.credential_profiles.len() + 1
+            )
+        };
+        let raw_name: String = Input::new()
+            .with_prompt("  Profile name (e.g., github, linear)")
+            .default(default_name)
+            .interact_text()?;
+        let profile_name = normalize_http_request_profile_name(&raw_name);
+        if profile_name.is_empty() {
+            anyhow::bail!("Credential profile name must contain letters, numbers, '_' or '-'");
+        }
+        if http_request_config
+            .credential_profiles
+            .contains_key(&profile_name)
+        {
+            anyhow::bail!(
+                "Credential profile '{}' normalizes to '{}' which already exists. Choose a different profile name.",
+                raw_name,
+                profile_name
+            );
+        }
+
+        let env_var_default = default_env_var_for_profile(&profile_name);
+        let env_var_raw: String = Input::new()
+            .with_prompt("  Environment variable containing token/secret")
+            .default(env_var_default)
+            .interact_text()?;
+        let env_var = env_var_raw.trim().to_string();
+        if !is_valid_env_var_name(&env_var) {
+            anyhow::bail!(
+                "Invalid environment variable name: {env_var}. Expected [A-Za-z_][A-Za-z0-9_]*"
+            );
+        }
+
+        let header_name: String = Input::new()
+            .with_prompt("  Header name")
+            .default("Authorization".to_string())
+            .interact_text()?;
+        let header_name = header_name.trim().to_string();
+        if header_name.is_empty() {
+            anyhow::bail!("Header name must not be empty");
+        }
+
+        let value_prefix: String = Input::new()
+            .with_prompt("  Header value prefix (e.g., 'Bearer ', empty for raw token)")
+            .allow_empty(true)
+            .default("Bearer ".to_string())
+            .interact_text()?;
+
+        http_request_config.credential_profiles.insert(
+            profile_name.clone(),
+            HttpRequestCredentialProfile {
+                header_name,
+                env_var,
+                value_prefix,
+            },
+        );
+
+        println!(
+            "  {} Added credential profile: {}",
+            style("✓").green().bold(),
+            style(profile_name).green()
+        );
+
+        let add_another = Confirm::new()
+            .with_prompt("  Add another credential profile?")
+            .default(false)
+            .interact()?;
+        if !add_another {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 // ── Step 6: Web & Internet Tools ────────────────────────────────
@@ -3186,11 +3698,28 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
     if enable_http_request {
         http_request_config.enabled = true;
         http_request_config.allowed_domains = prompt_allowed_domains_for_tool("http_request")?;
+        setup_http_request_credential_profiles(&mut http_request_config)?;
         println!(
             "  {} http_request.allowed_domains = [{}]",
             style("✓").green().bold(),
             style(http_request_config.allowed_domains.join(", ")).green()
         );
+        if !http_request_config.credential_profiles.is_empty() {
+            let mut names: Vec<String> = http_request_config
+                .credential_profiles
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            println!(
+                "  {} http_request.credential_profiles = [{}]",
+                style("✓").green().bold(),
+                style(names.join(", ")).green()
+            );
+            print_bullet(
+                "Use tool arg `credential_profile` (for example `github`) instead of raw Authorization headers.",
+            );
+        }
     } else {
         println!(
             "  {} http_request: {}",
@@ -3615,7 +4144,66 @@ fn setup_memory() -> Result<MemoryConfig> {
 
     let mut config = memory_config_defaults_for_backend(backend);
     config.auto_save = auto_save;
+
+    if classify_memory_backend(backend) == MemoryBackendKind::SqliteQdrantHybrid {
+        configure_hybrid_qdrant_memory(&mut config)?;
+    }
+
     Ok(config)
+}
+
+fn configure_hybrid_qdrant_memory(config: &mut MemoryConfig) -> Result<()> {
+    print_bullet("Hybrid memory keeps local SQLite metadata and uses Qdrant for semantic ranking.");
+    print_bullet("SQLite storage path stays at the default workspace database.");
+
+    let qdrant_url_default = config
+        .qdrant
+        .url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:6333".to_string());
+    let qdrant_url: String = Input::new()
+        .with_prompt("  Qdrant URL")
+        .default(qdrant_url_default)
+        .interact_text()?;
+    let qdrant_url = qdrant_url.trim();
+    if qdrant_url.is_empty() {
+        bail!("Qdrant URL is required for sqlite_qdrant_hybrid backend");
+    }
+    config.qdrant.url = Some(qdrant_url.to_string());
+
+    let qdrant_collection: String = Input::new()
+        .with_prompt("  Qdrant collection")
+        .default(config.qdrant.collection.clone())
+        .interact_text()?;
+    let qdrant_collection = qdrant_collection.trim();
+    if !qdrant_collection.is_empty() {
+        config.qdrant.collection = qdrant_collection.to_string();
+    }
+
+    let qdrant_api_key: String = Input::new()
+        .with_prompt("  Qdrant API key (optional, Enter to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+    let qdrant_api_key = qdrant_api_key.trim();
+    config.qdrant.api_key = if qdrant_api_key.is_empty() {
+        None
+    } else {
+        Some(qdrant_api_key.to_string())
+    };
+
+    println!(
+        "  {} Qdrant: {} (collection: {}, api key: {})",
+        style("✓").green().bold(),
+        style(config.qdrant.url.as_deref().unwrap_or_default()).green(),
+        style(&config.qdrant.collection).green(),
+        if config.qdrant.api_key.is_some() {
+            style("set").green().to_string()
+        } else {
+            style("not set").dim().to_string()
+        }
+    );
+
+    Ok(())
 }
 
 fn setup_identity_backend() -> Result<IdentityConfig> {
@@ -3960,8 +4548,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    progress_mode: ProgressMode::default(),
                     group_reply: None,
                     base_url: None,
+                    ack_enabled: true,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -4188,6 +4778,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     } else {
                         Some(channel)
                     },
+                    channel_ids: vec![],
                     allowed_users,
                     group_reply: None,
                 });
@@ -5888,6 +6479,8 @@ async fn scaffold_workspace(
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
+    // Ensure skills README + transparent preloaded defaults + policy metadata are initialized.
+    crate::skills::init_skills_dir(workspace_dir)?;
 
     let mut created = 0;
     let mut skipped = 0;
@@ -6096,8 +6689,19 @@ fn print_summary(config: &Config) {
     let mut step = 1u8;
 
     let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let canonical_provider = canonical_provider_name(provider);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if provider == "openai-codex" {
+        if canonical_provider == "copilot" {
+            println!(
+                "    {} Authenticate GitHub Copilot:",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!("       {}", style("zeroclaw agent -m \"Hello!\"").yellow());
+            println!(
+                "       {}",
+                style("(device/OAuth prompt appears automatically on first run)").dim()
+            );
+        } else if canonical_provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
                 style(format!("{step}.")).cyan().bold()
@@ -6106,7 +6710,7 @@ fn print_summary(config: &Config) {
                 "       {}",
                 style("zeroclaw auth login --provider openai-codex --device-code").yellow()
             );
-        } else if provider == "anthropic" {
+        } else if canonical_provider == "anthropic" {
             println!(
                 "    {} Configure Anthropic auth:",
                 style(format!("{step}.")).cyan().bold()
@@ -7254,6 +7858,7 @@ mod tests {
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("copilot"), "default");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
             default_model_for_provider("bedrock"),
@@ -7265,8 +7870,17 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
+        assert_eq!(default_model_for_provider("stepfun"), "step-3.5-flash");
         assert_eq!(default_model_for_provider("hunyuan"), "hunyuan-t1-latest");
         assert_eq!(default_model_for_provider("tencent"), "hunyuan-t1-latest");
+        assert_eq!(
+            default_model_for_provider("siliconflow"),
+            "Pro/zai-org/GLM-4.7"
+        );
+        assert_eq!(
+            default_model_for_provider("volcengine"),
+            "doubao-1-5-pro-32k-250115"
+        );
         assert_eq!(
             default_model_for_provider("nvidia"),
             "meta/llama-3.3-70b-instruct"
@@ -7298,6 +7912,9 @@ mod tests {
         assert_eq!(canonical_provider_name("openai_codex"), "openai-codex");
         assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
         assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
+        assert_eq!(canonical_provider_name("step"), "stepfun");
+        assert_eq!(canonical_provider_name("step-ai"), "stepfun");
+        assert_eq!(canonical_provider_name("step_ai"), "stepfun");
         assert_eq!(canonical_provider_name("kimi_coding"), "kimi-code");
         assert_eq!(canonical_provider_name("kimi_for_coding"), "kimi-code");
         assert_eq!(canonical_provider_name("glm-cn"), "glm");
@@ -7305,6 +7922,10 @@ mod tests {
         assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
         assert_eq!(canonical_provider_name("zai-cn"), "zai");
         assert_eq!(canonical_provider_name("z.ai-global"), "zai");
+        assert_eq!(canonical_provider_name("doubao"), "volcengine");
+        assert_eq!(canonical_provider_name("ark"), "volcengine");
+        assert_eq!(canonical_provider_name("silicon-cloud"), "siliconflow");
+        assert_eq!(canonical_provider_name("siliconcloud"), "siliconflow");
         assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
@@ -7343,8 +7964,21 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
+        assert!(ids.contains(&"gpt-5.3-codex".to_string()));
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_have_default_entry() {
+        let models = curated_models_for_provider("copilot");
+        assert_eq!(
+            models,
+            vec![(
+                "default".to_string(),
+                "Copilot default model (recommended)".to_string(),
+            )]
+        );
     }
 
     #[test]
@@ -7381,6 +8015,19 @@ mod tests {
         assert!(ids.contains(&"kimi-k2-thinking".to_string()));
         assert!(!ids.contains(&"kimi-latest".to_string()));
         assert!(!ids.contains(&"kimi-thinking-preview".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_stepfun_include_expected_defaults() {
+        let ids: Vec<String> = curated_models_for_provider("stepfun")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"step-3.5-flash".to_string()));
+        assert!(ids.contains(&"step-3".to_string()));
+        assert!(ids.contains(&"step-2-mini".to_string()));
+        assert!(ids.contains(&"step-1o-turbo-vision".to_string()));
     }
 
     #[test]
@@ -7436,6 +8083,23 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_volcengine_and_siliconflow_include_expected_defaults() {
+        let volcengine_ids: Vec<String> = curated_models_for_provider("volcengine")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(volcengine_ids.contains(&"doubao-1-5-pro-32k-250115".to_string()));
+        assert!(volcengine_ids.contains(&"doubao-seed-1-6-250615".to_string()));
+
+        let siliconflow_ids: Vec<String> = curated_models_for_provider("siliconflow")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(siliconflow_ids.contains(&"Pro/zai-org/GLM-4.7".to_string()));
+        assert!(siliconflow_ids.contains(&"Pro/deepseek-ai/DeepSeek-V3.2".to_string()));
+    }
+
+    #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
@@ -7453,9 +8117,17 @@ mod tests {
         assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
+        assert!(supports_live_model_fetch("stepfun"));
+        assert!(supports_live_model_fetch("step"));
+        assert!(supports_live_model_fetch("step-ai"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
         assert!(supports_live_model_fetch("qwen-coding-plan"));
+        assert!(supports_live_model_fetch("siliconflow"));
+        assert!(supports_live_model_fetch("silicon-cloud"));
+        assert!(supports_live_model_fetch("volcengine"));
+        assert!(supports_live_model_fetch("doubao"));
+        assert!(supports_live_model_fetch("ark"));
         assert!(!supports_live_model_fetch("minimax-cn"));
         assert!(!supports_live_model_fetch("unknown-provider"));
     }
@@ -7514,6 +8186,30 @@ mod tests {
             curated_models_for_provider("bedrock"),
             curated_models_for_provider("aws-bedrock")
         );
+        assert_eq!(
+            curated_models_for_provider("volcengine"),
+            curated_models_for_provider("doubao")
+        );
+        assert_eq!(
+            curated_models_for_provider("volcengine"),
+            curated_models_for_provider("ark")
+        );
+        assert_eq!(
+            curated_models_for_provider("stepfun"),
+            curated_models_for_provider("step")
+        );
+        assert_eq!(
+            curated_models_for_provider("stepfun"),
+            curated_models_for_provider("step-ai")
+        );
+        assert_eq!(
+            curated_models_for_provider("siliconflow"),
+            curated_models_for_provider("silicon-cloud")
+        );
+        assert_eq!(
+            curated_models_for_provider("siliconflow"),
+            curated_models_for_provider("siliconcloud")
+        );
     }
 
     #[test]
@@ -7546,6 +8242,18 @@ mod tests {
             models_endpoint_for_provider("qwen-coding-plan"),
             Some("https://coding.dashscope.aliyuncs.com/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("volcengine"),
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("doubao"),
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("ark"),
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        );
     }
 
     #[test]
@@ -7565,6 +8273,26 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("moonshot"),
             Some("https://api.moonshot.ai/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("stepfun"),
+            Some("https://api.stepfun.com/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("step"),
+            Some("https://api.stepfun.com/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("step-ai"),
+            Some("https://api.stepfun.com/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("siliconflow"),
+            Some("https://api.siliconflow.cn/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("silicon-cloud"),
+            Some("https://api.siliconflow.cn/v1/models")
         );
         assert_eq!(
             models_endpoint_for_provider("llamacpp"),
@@ -7863,13 +8591,68 @@ mod tests {
         assert_eq!(provider_env_var("minimax-oauth"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
+        assert_eq!(provider_env_var("stepfun"), "STEP_API_KEY");
+        assert_eq!(provider_env_var("step"), "STEP_API_KEY");
+        assert_eq!(provider_env_var("step-ai"), "STEP_API_KEY");
         assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
+        assert_eq!(provider_env_var("doubao"), "ARK_API_KEY");
+        assert_eq!(provider_env_var("volcengine"), "ARK_API_KEY");
+        assert_eq!(provider_env_var("ark"), "ARK_API_KEY");
+        assert_eq!(provider_env_var("siliconflow"), "SILICONFLOW_API_KEY");
+        assert_eq!(provider_env_var("silicon-cloud"), "SILICONFLOW_API_KEY");
+        assert_eq!(provider_env_var("siliconcloud"), "SILICONFLOW_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
         assert_eq!(provider_env_var("hunyuan"), "HUNYUAN_API_KEY");
         assert_eq!(provider_env_var("tencent"), "HUNYUAN_API_KEY"); // alias
+    }
+
+    #[test]
+    fn provider_env_var_fallbacks_cover_expected_aliases() {
+        assert_eq!(provider_env_var_fallbacks("stepfun"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step-ai"), &["STEPFUN_API_KEY"]);
+        assert_eq!(provider_env_var_fallbacks("step_ai"), &["STEPFUN_API_KEY"]);
+        assert_eq!(
+            provider_env_var_fallbacks("anthropic"),
+            &["ANTHROPIC_OAUTH_TOKEN"]
+        );
+        assert_eq!(provider_env_var_fallbacks("gemini"), &["GOOGLE_API_KEY"]);
+        assert_eq!(
+            provider_env_var_fallbacks("minimax"),
+            &["MINIMAX_OAUTH_TOKEN"]
+        );
+        assert_eq!(
+            provider_env_var_fallbacks("volcengine"),
+            &["DOUBAO_API_KEY"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_from_env_prefers_primary_over_fallback() {
+        let _env_guard = env_lock().lock().await;
+        let _primary = EnvVarGuard::set("STEP_API_KEY", "primary-step-key");
+        let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
+
+        assert_eq!(
+            resolve_provider_api_key_from_env("stepfun").as_deref(),
+            Some("primary-step-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_from_env_uses_stepfun_fallback_key() {
+        let _env_guard = env_lock().lock().await;
+        let _unset_primary = EnvVarGuard::unset("STEP_API_KEY");
+        let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
+
+        assert_eq!(
+            resolve_provider_api_key_from_env("step-ai").as_deref(),
+            Some("fallback-step-key")
+        );
+        assert!(provider_has_env_api_key("step_ai"));
     }
 
     #[test]
@@ -7893,6 +8676,36 @@ mod tests {
     }
 
     #[test]
+    fn http_request_productivity_allowed_domains_include_common_integrations() {
+        let domains = http_request_productivity_allowed_domains();
+        assert!(domains.iter().any(|d| d == "api.github.com"));
+        assert!(domains.iter().any(|d| d == "api.linear.app"));
+        assert!(domains.iter().any(|d| d == "calendar.googleapis.com"));
+    }
+
+    #[test]
+    fn normalize_http_request_profile_name_sanitizes_input() {
+        assert_eq!(
+            normalize_http_request_profile_name(" GitHub Main "),
+            "github-main"
+        );
+        assert_eq!(
+            normalize_http_request_profile_name("LINEAR_API"),
+            "linear_api"
+        );
+        assert_eq!(normalize_http_request_profile_name("!!!"), "");
+    }
+
+    #[test]
+    fn is_valid_env_var_name_accepts_and_rejects_expected_patterns() {
+        assert!(is_valid_env_var_name("GITHUB_TOKEN"));
+        assert!(is_valid_env_var_name("_PRIVATE_KEY"));
+        assert!(!is_valid_env_var_name("1BAD"));
+        assert!(!is_valid_env_var_name("BAD-NAME"));
+        assert!(!is_valid_env_var_name("BAD NAME"));
+    }
+
+    #[test]
     fn local_provider_choices_include_sglang() {
         let choices = local_provider_choices();
         assert!(choices.iter().any(|(provider, _)| *provider == "sglang"));
@@ -7906,9 +8719,11 @@ mod tests {
     #[test]
     fn backend_key_from_choice_maps_supported_backends() {
         assert_eq!(backend_key_from_choice(0), "sqlite");
-        assert_eq!(backend_key_from_choice(1), "lucid");
-        assert_eq!(backend_key_from_choice(2), "markdown");
-        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(1), "sqlite_qdrant_hybrid");
+        assert_eq!(backend_key_from_choice(2), "lucid");
+        assert_eq!(backend_key_from_choice(3), "cortex-mem");
+        assert_eq!(backend_key_from_choice(4), "markdown");
+        assert_eq!(backend_key_from_choice(5), "none");
         assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
@@ -7919,6 +8734,12 @@ mod tests {
         assert!(lucid.uses_sqlite_hygiene);
         assert!(lucid.sqlite_based);
         assert!(lucid.optional_dependency);
+
+        let cortex_mem = memory_backend_profile("cortex-mem");
+        assert!(cortex_mem.auto_save_default);
+        assert!(cortex_mem.uses_sqlite_hygiene);
+        assert!(cortex_mem.sqlite_based);
+        assert!(cortex_mem.optional_dependency);
 
         let markdown = memory_backend_profile("markdown");
         assert!(markdown.auto_save_default);
@@ -7945,6 +8766,18 @@ mod tests {
     }
 
     #[test]
+    fn memory_config_defaults_for_hybrid_enable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("sqlite_qdrant_hybrid");
+        assert_eq!(config.backend, "sqlite_qdrant_hybrid");
+        assert!(config.auto_save);
+        assert!(config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 7);
+        assert_eq!(config.purge_after_days, 30);
+        assert_eq!(config.embedding_cache_size, 10000);
+        assert_eq!(config.qdrant.collection, "zeroclaw_memories");
+    }
+
+    #[test]
     fn memory_config_defaults_for_none_disable_sqlite_hygiene() {
         let config = memory_config_defaults_for_backend("none");
         assert_eq!(config.backend, "none");
@@ -7956,13 +8789,14 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+    fn channel_menu_choices_include_signal_nextcloud_and_dingtalk() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::DingTalk));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
+    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_dingtalk() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -8003,6 +8837,14 @@ mod tests {
             base_url: "https://cloud.example.com".into(),
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.nextcloud_talk = None;
+        channels.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client-id".into(),
+            client_secret: "client-secret".into(),
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));
