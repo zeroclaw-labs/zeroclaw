@@ -560,7 +560,7 @@ pub fn all_tools_with_runtime(
             custom_provider_api_mode: root_config
                 .provider_api
                 .map(|mode| mode.as_compatible_mode()),
-            max_tokens_override: None,
+            max_tokens_override: root_config.max_tokens,
             model_support_vision: root_config.model_support_vision,
         };
         let runtime_config_path = Some(root_config.config_path.clone());

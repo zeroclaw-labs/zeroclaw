@@ -1734,6 +1734,9 @@ pub fn create_routed_provider_with_options(
         {
             route_options.provider_transport = Some(transport.to_string());
         }
+        if let Some(max_tokens) = route.max_tokens {
+            route_options.max_tokens_override = Some(max_tokens);
+        }
 
         match create_resilient_provider_with_options(
             &route.provider,
