@@ -484,9 +484,11 @@ pub(crate) async fn deliver_announcement(
                         );
                     }
                 } else {
-                    anyhow::bail!("feishu channel not configured: \
+                    anyhow::bail!(
+                        "feishu channel not configured: \
                                    neither [channels_config.feishu] nor [channels_config.lark] \
-                                   with use_feishu=true is configured");
+                                   with use_feishu=true is configured"
+                    );
                 }
             }
             #[cfg(not(feature = "channel-lark"))]
