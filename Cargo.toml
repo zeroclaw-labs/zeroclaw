@@ -272,9 +272,6 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-[profile.dev]
-debug = 0
-
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
