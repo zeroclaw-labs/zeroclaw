@@ -463,6 +463,12 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
+Notes:
+
+- Inbound `picture` and `richText` image segments are converted into multimodal markers (`[IMAGE:<absolute-path>]`).
+- Images are downloaded via DingTalk `messageFiles/download` and persisted under `<workspace>/dingtalk_files/inbound/`.
+- When image download fails, ZeroClaw falls back to text content (if any) or a visible warning (`[DingTalk 图片已收到但下载失败]`) instead of silently dropping the callback.
+
 ### 4.15 QQ
 
 ```toml
