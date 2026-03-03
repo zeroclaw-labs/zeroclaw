@@ -5,6 +5,7 @@ use super::url_validation::{
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,19 +15,33 @@ use std::time::Duration;
 /// - `fast_html2md`: fetch with reqwest, convert HTML to markdown
 /// - `nanohtml2text`: fetch with reqwest, convert HTML to plaintext
 /// - `firecrawl`: fetch using Firecrawl cloud/self-hosted API
+/// - `tavily`: fetch using Tavily Extract API
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
-    api_key: Option<String>,
+    api_keys: Vec<String>,
     api_url: Option<String>,
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
     user_agent: String,
+    key_index: Arc<AtomicUsize>,
 }
 
 impl WebFetchTool {
+    /// Create a new WebFetchTool instance.
+    ///
+    /// # Arguments
+    /// * `security` - Security policy for URL validation
+    /// * `provider` - Provider name (fast_html2md, nanohtml2text, firecrawl, tavily)
+    /// * `api_key` - API key (supports comma-separated multiple keys for round-robin)
+    /// * `api_url` - Optional API URL override
+    /// * `allowed_domains` - List of allowed domains (empty = deny all)
+    /// * `blocked_domains` - List of blocked domains
+    /// * `max_response_size` - Maximum response size in bytes
+    /// * `timeout_secs` - Request timeout in seconds
+    /// * `user_agent` - HTTP user agent string
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -40,6 +55,18 @@ impl WebFetchTool {
         user_agent: String,
     ) -> Self {
         let provider = provider.trim().to_lowercase();
+
+        // Parse comma-separated API keys for round-robin support
+        let api_keys = api_key
+            .as_ref()
+            .map(|keys| {
+                keys.split(',')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             security,
             provider: if provider.is_empty() {
@@ -47,16 +74,34 @@ impl WebFetchTool {
             } else {
                 provider
             },
-            api_key,
+            api_keys,
             api_url,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             blocked_domains: normalize_allowed_domains(blocked_domains),
             max_response_size,
             timeout_secs,
             user_agent,
+            key_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// Get the next API key using round-robin strategy.
+    /// Returns None if no keys are configured.
+    fn get_next_api_key(&self) -> Option<String> {
+        if self.api_keys.is_empty() {
+            return None;
+        }
+        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+        Some(self.api_keys[idx].clone())
+    }
+
+    /// Validate URL against security policy (allowed/blocked domains, schemes).
+    ///
+    /// # Arguments
+    /// * `raw_url` - The URL to validate
+    ///
+    /// # Returns
+    /// The validated URL string
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
         validate_url(
             raw_url,
@@ -122,7 +167,7 @@ impl WebFetchTool {
                 }
             }
             _ => anyhow::bail!(
-                "Unknown web_fetch provider: '{}'. Set tools.web_fetch.provider to 'fast_html2md', 'nanohtml2text', or 'firecrawl' in config.toml",
+                "Unknown web_fetch provider: '{}'. Set [web_fetch].provider to 'fast_html2md', 'nanohtml2text', 'firecrawl', or 'tavily' in config.toml",
                 self.provider
             ),
         }
@@ -196,14 +241,11 @@ impl WebFetchTool {
 
     #[cfg(feature = "firecrawl")]
     async fn fetch_with_firecrawl(&self, url: &str) -> anyhow::Result<String> {
-        let auth_token = match self.api_key.as_ref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim(),
-            _ => {
-                anyhow::bail!(
-                    "web_fetch provider 'firecrawl' requires [web_fetch].api_key in config.toml"
-                );
-            }
-        };
+        let auth_token = self.get_next_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_fetch provider 'firecrawl' requires [web_fetch].api_key in config.toml"
+            )
+        })?;
 
         let api_url = self
             .api_url
@@ -276,6 +318,82 @@ impl WebFetchTool {
     async fn fetch_with_firecrawl(&self, _url: &str) -> anyhow::Result<String> {
         anyhow::bail!("web_fetch provider 'firecrawl' requires Cargo feature 'firecrawl'")
     }
+
+    /// Fetch web page content using Tavily Extract API.
+    ///
+    /// # Arguments
+    /// * `url` - The URL to fetch
+    ///
+    /// # Returns
+    /// The extracted content as markdown/text
+    async fn fetch_with_tavily(&self, url: &str) -> anyhow::Result<String> {
+        let api_key = self.get_next_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_fetch provider 'tavily' requires [web_fetch].api_key in config.toml"
+            )
+        })?;
+
+        let api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.tavily.com");
+
+        let endpoint = format!("{}/extract", api_url.trim_end_matches('/'));
+
+        let response = self
+            .build_http_client()?
+            .post(endpoint)
+            .json(&json!({
+                "api_key": api_key,
+                "urls": [url]
+            }))
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "Tavily extract failed with status {}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid Tavily response JSON: {e}"))?;
+
+        // Check for API error in response
+        if let Some(error) = parsed.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("Tavily API error: {}", error);
+        }
+
+        let results = parsed
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Tavily response missing results array"))?;
+
+        if results.is_empty() {
+            anyhow::bail!("Tavily returned no results for URL: {}", url);
+        }
+
+        // Get the first result (we only requested one URL)
+        let result = &results[0];
+        let output = result
+            .get("raw_content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| result.get("content").and_then(serde_json::Value::as_str))
+            .unwrap_or("");
+
+        if output.trim().is_empty() {
+            anyhow::bail!("Tavily returned empty content for URL: {}", url);
+        }
+
+        Ok(output.to_string())
+    }
 }
 
 #[async_trait]
@@ -285,7 +403,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a web page and return markdown/text content for LLM consumption. Providers: fast_html2md, nanohtml2text, firecrawl. Security: allowlist-only domains, blocked_domains, and no local/private hosts."
+        "Fetch a web page and return markdown/text content for LLM consumption. Providers: fast_html2md, nanohtml2text, firecrawl, tavily. Security: allowlist-only domains, blocked_domains, and no local/private hosts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -337,8 +455,9 @@ impl Tool for WebFetchTool {
         let result = match self.provider.as_str() {
             "fast_html2md" | "nanohtml2text" => self.fetch_with_http_provider(&url).await,
             "firecrawl" => self.fetch_with_firecrawl(&url).await,
+            "tavily" => self.fetch_with_tavily(&url).await,
             _ => Err(anyhow::anyhow!(
-                "Unknown web_fetch provider: '{}'. Set tools.web_fetch.provider to 'fast_html2md', 'nanohtml2text', or 'firecrawl' in config.toml",
+                "Unknown web_fetch provider: '{}'. Set [web_fetch].provider to 'fast_html2md', 'nanohtml2text', 'firecrawl', or 'tavily' in config.toml",
                 self.provider
             )),
         };
@@ -695,5 +814,61 @@ mod tests {
         } else {
             assert!(error.contains("requires Cargo feature 'firecrawl'"));
         }
+    }
+
+    #[tokio::test]
+    async fn tavily_provider_requires_api_key() {
+        let tool = test_tool_with_provider(vec!["*"], vec![], "tavily", None, None);
+        let result = tool
+            .execute(json!({"url": "https://example.com"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("requires [web_fetch].api_key"));
+    }
+
+    #[test]
+    fn test_multiple_api_keys_parsing() {
+        let tool =
+            test_tool_with_provider(vec!["*"], vec![], "tavily", Some("key1,key2,key3"), None);
+        assert_eq!(tool.api_keys.len(), 3);
+        assert_eq!(tool.api_keys[0], "key1");
+        assert_eq!(tool.api_keys[1], "key2");
+        assert_eq!(tool.api_keys[2], "key3");
+    }
+
+    #[test]
+    fn test_multiple_api_keys_with_spaces() {
+        let tool =
+            test_tool_with_provider(vec!["*"], vec![], "tavily", Some("key1, key2 , key3"), None);
+        assert_eq!(tool.api_keys.len(), 3);
+        assert_eq!(tool.api_keys[0], "key1");
+        assert_eq!(tool.api_keys[1], "key2");
+        assert_eq!(tool.api_keys[2], "key3");
+    }
+
+    #[test]
+    fn test_round_robin_api_key_selection() {
+        let tool =
+            test_tool_with_provider(vec!["*"], vec![], "tavily", Some("key1,key2,key3"), None);
+
+        assert_eq!(tool.get_next_api_key().unwrap(), "key1");
+        assert_eq!(tool.get_next_api_key().unwrap(), "key2");
+        assert_eq!(tool.get_next_api_key().unwrap(), "key3");
+        assert_eq!(tool.get_next_api_key().unwrap(), "key1"); // wraps around
+    }
+
+    #[test]
+    fn test_empty_api_key_returns_none() {
+        let tool = test_tool_with_provider(vec!["*"], vec![], "tavily", None, None);
+        assert!(tool.get_next_api_key().is_none());
+    }
+
+    #[test]
+    fn test_single_api_key_works() {
+        let tool = test_tool_with_provider(vec!["*"], vec![], "tavily", Some("single-key"), None);
+        assert_eq!(tool.api_keys.len(), 1);
+        assert_eq!(tool.get_next_api_key().unwrap(), "single-key");
     }
 }

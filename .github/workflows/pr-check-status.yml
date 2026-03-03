@@ -18,7 +18,7 @@ env:
 
 jobs:
   nudge-stale-prs:
-    runs-on: [self-hosted, aws-india]
+    runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
     permissions:
       contents: read
       pull-requests: write

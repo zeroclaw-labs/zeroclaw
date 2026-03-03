@@ -3,29 +3,41 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
 #[cfg_attr(
     feature = "firecrawl",
-    doc = "Supports providers: DuckDuckGo (free), Bing (free), Brave, Firecrawl."
+    doc = "Supports providers: DuckDuckGo (free), Bing (free), Brave, Firecrawl, Tavily."
 )]
 #[cfg_attr(
     not(feature = "firecrawl"),
-    doc = "Supports providers: DuckDuckGo (free), Bing (free), Brave."
+    doc = "Supports providers: DuckDuckGo (free), Bing (free), Brave, Tavily."
 )]
 pub struct WebSearchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
-    api_key: Option<String>,
+    api_keys: Vec<String>,
     api_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     user_agent: String,
+    key_index: Arc<AtomicUsize>,
 }
 
 impl WebSearchTool {
+    /// Create a new WebSearchTool instance.
+    ///
+    /// # Arguments
+    /// * `security` - Security policy
+    /// * `provider` - Search provider (duckduckgo, bing, brave, firecrawl, tavily)
+    /// * `api_key` - API key (supports comma-separated multiple keys for round-robin)
+    /// * `api_url` - Optional API URL override
+    /// * `max_results` - Maximum number of results to return (1-10)
+    /// * `timeout_secs` - Request timeout in seconds
+    /// * `user_agent` - HTTP user agent string
     pub fn new(
         security: Arc<SecurityPolicy>,
         provider: String,
@@ -35,17 +47,46 @@ impl WebSearchTool {
         timeout_secs: u64,
         user_agent: String,
     ) -> Self {
+        // Parse comma-separated API keys for round-robin support
+        let api_keys = api_key
+            .as_ref()
+            .map(|keys| {
+                keys.split(',')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             security,
             provider: provider.trim().to_lowercase(),
-            api_key,
+            api_keys,
             api_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             user_agent,
+            key_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// Get the next API key using round-robin strategy.
+    /// Returns None if no keys are configured.
+    fn get_next_api_key(&self) -> Option<String> {
+        if self.api_keys.is_empty() {
+            return None;
+        }
+        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+        Some(self.api_keys[idx].clone())
+    }
+
+    /// Perform web search using DuckDuckGo HTML interface (free, no API key required).
+    ///
+    /// # Arguments
+    /// * `query` - The search query string
+    ///
+    /// # Returns
+    /// Formatted search results with title, URL, and snippet
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
@@ -68,6 +109,14 @@ impl WebSearchTool {
         self.parse_duckduckgo_results(&html, query)
     }
 
+    /// Parse HTML response from DuckDuckGo search into formatted results.
+    ///
+    /// # Arguments
+    /// * `html` - The HTML response from DuckDuckGo
+    /// * `query` - The original search query (for context)
+    ///
+    /// # Returns
+    /// Formatted search results as a string
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
         // Extract result links: <a class="result__a" href="...">Title</a>
         let link_regex = Regex::new(
@@ -117,10 +166,9 @@ impl WebSearchTool {
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
-        let auth_token = match self.api_key.as_ref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim(),
-            _ => anyhow::bail!("Brave API key not configured"),
-        };
+        let auth_token = self
+            .get_next_api_key()
+            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
 
         let encoded_query = urlencoding::encode(query);
         let search_url = format!(
@@ -257,14 +305,11 @@ impl WebSearchTool {
 
     #[cfg(feature = "firecrawl")]
     async fn search_firecrawl(&self, query: &str) -> anyhow::Result<String> {
-        let auth_token = match self.api_key.as_ref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim(),
-            _ => {
-                anyhow::bail!(
-                    "web_search provider 'firecrawl' requires [web_search].api_key in config.toml"
-                );
-            }
-        };
+        let auth_token = self.get_next_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_search provider 'firecrawl' requires [web_search].api_key in config.toml"
+            )
+        })?;
 
         let api_url = self
             .api_url
@@ -357,8 +402,111 @@ impl WebSearchTool {
     async fn search_firecrawl(&self, _query: &str) -> anyhow::Result<String> {
         anyhow::bail!("web_search provider 'firecrawl' requires Cargo feature 'firecrawl'")
     }
+
+    /// Perform web search using Tavily Search API.
+    ///
+    /// # Arguments
+    /// * `query` - The search query string
+    ///
+    /// # Returns
+    /// Formatted search results with title, URL, and content snippets
+    async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
+        let api_key = self.get_next_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "web_search provider 'tavily' requires [web_search].api_key in config.toml"
+            )
+        })?;
+
+        let api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.tavily.com");
+
+        let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent(self.user_agent.as_str())
+            .build()?;
+
+        let response = client
+            .post(&endpoint)
+            .json(&json!({
+                "api_key": api_key,
+                "query": query,
+                "max_results": self.max_results,
+                "search_depth": "basic",
+                "include_answer": false,
+                "include_raw_content": false,
+                "include_images": false,
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Tavily search failed: {e}"))?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "Tavily search failed with status {}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Invalid Tavily response JSON: {e}"))?;
+
+        // Check for API error in response
+        if let Some(error) = parsed.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("Tavily API error: {}", error);
+        }
+
+        let results = parsed
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Tavily response missing results array"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Tavily)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("No title");
+            let url = result
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let content = result
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !content.trim().is_empty() {
+                lines.push(format!("   {}", content.trim()));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
 }
 
+/// Decode DuckDuckGo redirect URL to extract the actual destination URL.
+///
+/// # Arguments
+/// * `raw_url` - The redirect URL from DuckDuckGo
+///
+/// # Returns
+/// The decoded destination URL, or the original URL if decoding fails
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
     if let Some(index) = raw_url.find("uddg=") {
         let encoded = &raw_url[index + 5..];
@@ -371,6 +519,13 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
     raw_url.to_string()
 }
 
+/// Remove HTML tags from content, leaving only plain text.
+///
+/// # Arguments
+/// * `content` - The HTML content to strip
+///
+/// # Returns
+/// Plain text without HTML tags
 fn strip_tags(content: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap();
     re.replace_all(content, "").to_string()
@@ -432,14 +587,15 @@ impl Tool for WebSearchTool {
             "bing" => self.search_bing(query).await?,
             "brave" => self.search_brave(query).await?,
             "firecrawl" => self.search_firecrawl(query).await?,
+            "tavily" => self.search_tavily(query).await?,
             _ => {
                 let supported = if cfg!(feature = "firecrawl") {
-                    "'duckduckgo', 'bing', 'brave', or 'firecrawl'"
+                    "'duckduckgo', 'bing', 'brave', 'firecrawl', or 'tavily'"
                 } else {
-                    "'duckduckgo', 'bing', or 'brave'"
+                    "'duckduckgo', 'bing', 'brave', or 'tavily'"
                 };
                 anyhow::bail!(
-                    "Unknown search provider: '{}'. Set tools.web_search.provider to {} in config.toml",
+                    "Unknown search provider: '{}'. Set [web_search].provider to {} in config.toml",
                     self.provider,
                     supported
                 )
@@ -458,6 +614,7 @@ impl Tool for WebSearchTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use std::fmt::Write as _;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -671,9 +828,10 @@ mod tests {
         );
         let mut html = String::new();
         for i in 1..=6 {
-            html.push_str(&format!(
+            let _ = write!(
+                &mut html,
                 r#"<li class="b_algo"><h2><a href="https://example.com/{i}">Title {i}</a></h2><div class="b_caption"><p>Snippet {i}</p></div></li>"#
-            ));
+            );
         }
 
         let result = tool.parse_bing_results(&html, "test").unwrap();
@@ -790,9 +948,9 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
         if cfg!(feature = "firecrawl") {
-            assert!(error.contains("'duckduckgo', 'bing', 'brave', or 'firecrawl'"));
+            assert!(error.contains("'duckduckgo', 'bing', 'brave', 'firecrawl', or 'tavily'"));
         } else {
-            assert!(error.contains("'duckduckgo', 'bing', or 'brave'"));
+            assert!(error.contains("'duckduckgo', 'bing', 'brave', or 'tavily'"));
         }
     }
 
@@ -814,5 +972,102 @@ mod tests {
         let result = tool.execute(json!({"query": "rust"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tavily_without_api_key() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn test_multiple_api_keys_parsing() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("key1,key2,key3".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert_eq!(tool.api_keys.len(), 3);
+        assert_eq!(tool.api_keys[0], "key1");
+        assert_eq!(tool.api_keys[1], "key2");
+        assert_eq!(tool.api_keys[2], "key3");
+    }
+
+    #[test]
+    fn test_multiple_api_keys_with_spaces() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("key1, key2 , key3".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert_eq!(tool.api_keys.len(), 3);
+        assert_eq!(tool.api_keys[0], "key1");
+        assert_eq!(tool.api_keys[1], "key2");
+        assert_eq!(tool.api_keys[2], "key3");
+    }
+
+    #[test]
+    fn test_round_robin_api_key_selection() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("key1,key2,key3".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+
+        assert_eq!(tool.get_next_api_key().unwrap(), "key1");
+        assert_eq!(tool.get_next_api_key().unwrap(), "key2");
+        assert_eq!(tool.get_next_api_key().unwrap(), "key3");
+        assert_eq!(tool.get_next_api_key().unwrap(), "key1"); // wraps around
+    }
+
+    #[test]
+    fn test_empty_api_key_returns_none() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert!(tool.get_next_api_key().is_none());
+    }
+
+    #[test]
+    fn test_single_api_key_works() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "tavily".to_string(),
+            Some("single-key".to_string()),
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert_eq!(tool.api_keys.len(), 1);
+        assert_eq!(tool.get_next_api_key().unwrap(), "single-key");
     }
 }

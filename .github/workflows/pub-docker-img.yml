@@ -33,7 +33,7 @@ jobs:
     pr-smoke:
         name: PR Docker Smoke
         if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 25
         permissions:
             contents: read
@@ -73,7 +73,7 @@ jobs:
     publish:
         name: Build and Push Docker Image
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'zeroclaw-labs/zeroclaw'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 45
         permissions:
             contents: read

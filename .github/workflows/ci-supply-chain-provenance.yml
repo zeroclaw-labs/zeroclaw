@@ -31,7 +31,7 @@ env:
 jobs:
     provenance:
         name: Build + Provenance Bundle
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 35
         steps:
             - name: Checkout

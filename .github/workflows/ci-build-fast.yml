@@ -25,7 +25,7 @@ env:
 jobs:
     changes:
         name: Detect Change Scope
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         outputs:
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
             docs_only: ${{ steps.scope.outputs.docs_only }}
@@ -45,7 +45,7 @@ jobs:
         name: Build (Fast)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 25
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
