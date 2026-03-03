@@ -723,7 +723,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&config_dir).await.unwrap();
-        tokio::fs::write(config_dir.join("config.toml"), "original").await.unwrap();
+        tokio::fs::write(config_dir.join("config.toml"), "original")
+            .await
+            .unwrap();
 
         // Symlink from workspace into .zeroclaw
         symlink(&config_dir, workspace.join(".zeroclaw")).unwrap();
@@ -734,10 +736,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success, "symlink to zeroclaw config must be blocked");
+        assert!(
+            !result.success,
+            "symlink to zeroclaw config must be blocked"
+        );
 
-        let content = tokio::fs::read_to_string(config_dir.join("config.toml")).await.unwrap();
-        assert_eq!(content, "original", "config must not be modified");
+        let content = tokio::fs::read_to_string(config_dir.join("config.toml"))
+            .await
+            .unwrap();
+        assert_eq!(
+            content, "original",
+            "config must not be modified"
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
