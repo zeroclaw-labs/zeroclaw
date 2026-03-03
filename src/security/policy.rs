@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+
+
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -915,6 +917,10 @@ impl SecurityPolicy {
     /// Check if a forbidden pattern matches a path.
     /// Supports glob wildcards (*, ?, []) for file patterns like "*.env".
     /// Falls back to starts_with for directory prefixes like "/etc".
+    ///
+    /// If pattern parsing fails, returns false (no match) since malformed patterns
+    /// should not accidentally block files. Patterns are validated at config load time
+    /// by from_config(), so runtime failures indicate an unexpected condition.
     fn is_forbidden_match(path: &Path, forbidden_pattern: &str) -> bool {
         let forbidden_expanded = expand_user_path(forbidden_pattern);
         let forbidden_str = forbidden_expanded.to_string_lossy();
@@ -922,16 +928,28 @@ impl SecurityPolicy {
         // If pattern contains glob wildcards, use glob matching
         if forbidden_pattern.contains('*') || forbidden_pattern.contains('?') || forbidden_pattern.contains('[') {
             // Try matching against the full path string
-            if let Ok(pattern) = Pattern::new(&forbidden_str) {
-                if pattern.matches(path.to_string_lossy().as_ref()) {
-                    return true;
+            match Pattern::new(&forbidden_str) {
+                Ok(pattern) => {
+                    if pattern.matches(path.to_string_lossy().as_ref()) {
+                        return true;
+                    }
+                }
+                Err(_) => {
+                    // Malformed pattern doesn't match anything
+                    // (patterns are validated at config load time)
                 }
             }
             // Also try matching just the filename component for patterns like "*.env"
             if let Some(filename) = path.file_name() {
-                if let Ok(pattern) = Pattern::new(&forbidden_str) {
-                    if pattern.matches(filename.to_string_lossy().as_ref()) {
-                        return true;
+                match Pattern::new(&forbidden_str) {
+                    Ok(pattern) => {
+                        if pattern.matches(filename.to_string_lossy().as_ref()) {
+                            return true;
+                        }
+                    }
+                    Err(_) => {
+                        // Malformed pattern doesn't match anything
+                        // (patterns are validated at config load time)
                     }
                 }
             }
@@ -941,6 +959,7 @@ impl SecurityPolicy {
             path.starts_with(&forbidden_expanded)
         }
     }
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -1090,10 +1109,32 @@ impl SecurityPolicy {
     }
 
     /// Build from config sections
+    ///
+    /// Validates forbidden_paths for malformed glob patterns and returns an error
+    /// if any pattern cannot be parsed.
+    /// Build from config sections
+    ///
+    /// Panics if forbidden_paths contains malformed glob patterns.
+    /// This is a configuration error that should be caught at startup.
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        // Pre-validate forbidden_paths for malformed glob patterns
+        for forbidden in &autonomy_config.forbidden_paths {
+            // Only validate patterns that contain glob wildcards
+            if forbidden.contains('*') || forbidden.contains('?') || forbidden.contains('[') {
+                let expanded = expand_user_path(forbidden);
+                let pattern_str = expanded.to_string_lossy();
+                if let Err(e) = Pattern::new(&pattern_str) {
+                    panic!(
+                        "Invalid glob pattern in forbidden_paths '{}': {}",
+                        forbidden, e
+                    );
+                }
+            }
+        }
+
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
@@ -1120,6 +1161,7 @@ impl SecurityPolicy {
             tracker: ActionTracker::new(),
         }
     }
+
 }
 
 #[cfg(test)]
@@ -1509,6 +1551,41 @@ mod tests {
         assert!(p.is_path_allowed("backup.zip"));
         assert!(p.is_path_allowed("backup10.zip"));
         assert!(p.is_path_allowed("backupA.zip"));
+        // Should not match
+        assert!(p.is_path_allowed("backup.zip"));
+        assert!(p.is_path_allowed("backup10.zip"));
+        assert!(p.is_path_allowed("backupA.zip"));
+    }
+
+    #[test]
+    fn forbidden_paths_malformed_patterns() {
+        // Malformed glob patterns should NOT match any files
+        // (fail-closed: malformed patterns are treated as non-matching for safety)
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["[*.txt".into(), "file[.txt".into(), "[]".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Files should be allowed since malformed patterns don't match
+        assert!(p.is_path_allowed("file1.txt"));
+        assert!(p.is_path_allowed("config.env"));
+        assert!(p.is_path_allowed("backup1.zip"));
+        assert!(p.is_path_allowed("secret_file"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid glob pattern")]
+    fn from_config_rejects_malformed_glob_patterns() {
+        // Test that from_config panics on malformed glob patterns at startup
+        let autonomy_config = crate::config::AutonomyConfig {
+            forbidden_paths: vec!["[*.txt".into()], // unclosed bracket
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test");
+
+        // This should panic with "Invalid glob pattern"
+        let _policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
     }
 
     #[test]
