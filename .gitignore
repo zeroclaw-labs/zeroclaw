@@ -39,7 +39,6 @@ otp-secret
 credentials.json
 /config.toml
 .worktrees/
-.vscode
 
 # Nix
 result
