@@ -28,13 +28,15 @@ use crate::providers::{
     is_siliconflow_alias, is_stepfun_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
-use console::style;
+use console::{style, Style};
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::fs;
 
@@ -78,9 +80,62 @@ const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+const STEP_PROGRESS_BAR_WIDTH: usize = 24;
+const STEP_DIVIDER_WIDTH: usize = 62;
+const FULL_ONBOARDING_STEPS: [&str; 11] = [
+    "Workspace Setup",
+    "AI Provider & API Key",
+    "Channels",
+    "Tunnel",
+    "Tool Mode & Security",
+    "Web & Internet Tools",
+    "Hardware",
+    "Memory",
+    "Identity Backend",
+    "Project Context",
+    "Workspace Files",
+];
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
+}
+
+fn wizard_theme() -> &'static ColorfulTheme {
+    static THEME: OnceLock<ColorfulTheme> = OnceLock::new();
+    THEME.get_or_init(|| ColorfulTheme {
+        defaults_style: Style::new().for_stderr().cyan(),
+        prompt_style: Style::new().for_stderr().bold().white(),
+        prompt_prefix: style(">".to_string()).for_stderr().cyan().bold(),
+        prompt_suffix: style("::".to_string()).for_stderr().black().bright(),
+        success_prefix: style("✓".to_string()).for_stderr().green().bold(),
+        success_suffix: style("::".to_string()).for_stderr().black().bright(),
+        error_prefix: style("!".to_string()).for_stderr().red().bold(),
+        error_style: Style::new().for_stderr().red().bold(),
+        hint_style: Style::new().for_stderr().black().bright(),
+        values_style: Style::new().for_stderr().green().bold(),
+        active_item_style: Style::new().for_stderr().cyan().bold(),
+        inactive_item_style: Style::new().for_stderr(),
+        active_item_prefix: style("›".to_string()).for_stderr().cyan().bold(),
+        inactive_item_prefix: style(" ".to_string()).for_stderr(),
+        checked_item_prefix: style("✓".to_string()).for_stderr().green().bold(),
+        unchecked_item_prefix: style("○".to_string()).for_stderr().black().bright(),
+        picked_item_prefix: style("✓".to_string()).for_stderr().green().bold(),
+        unpicked_item_prefix: style(" ".to_string()).for_stderr(),
+        fuzzy_cursor_style: Style::new().for_stderr().black().on_white(),
+        fuzzy_match_highlight_style: Style::new().for_stderr().cyan().bold(),
+    })
+}
+
+fn print_onboarding_overview() {
+    println!("  {}", style("Wizard flow").white().bold());
+    for (idx, step) in FULL_ONBOARDING_STEPS.iter().enumerate() {
+        println!(
+            "    {} {}",
+            style(format!("{:>2}.", idx + 1)).cyan().bold(),
+            style(*step).dim()
+        );
+    }
+    println!();
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
@@ -116,6 +171,7 @@ pub async fn run_wizard_with_migration(
         style("This wizard will configure your agent in under 60 seconds.").dim()
     );
     println!();
+    print_onboarding_overview();
 
     print_step(1, 11, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
@@ -263,7 +319,7 @@ pub async fn run_wizard_with_migration(
     let has_channels = has_launchable_channels(&config.channels_config);
 
     if has_channels && config.api_key.is_some() {
-        let launch: bool = Confirm::new()
+        let launch: bool = Confirm::with_theme(wizard_theme())
             .with_prompt(format!(
                 "  {} Launch channels now? (connected channels → AI → reply)",
                 style("🚀").cyan()
@@ -315,7 +371,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     let has_channels = has_launchable_channels(&config.channels_config);
 
     if has_channels && config.api_key.is_some() {
-        let launch: bool = Confirm::new()
+        let launch: bool = Confirm::with_theme(wizard_theme())
             .with_prompt(format!(
                 "  {} Launch channels now? (connected channels → AI → reply)",
                 style("🚀").cyan()
@@ -378,7 +434,7 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
 
     let has_channels = has_launchable_channels(&config.channels_config);
     if has_channels && config.api_key.is_some() {
-        let launch: bool = Confirm::new()
+        let launch: bool = Confirm::with_theme(wizard_theme())
             .with_prompt(format!(
                 "  {} Launch channels now? (connected channels → AI → reply)",
                 style("🚀").cyan()
@@ -542,7 +598,7 @@ async fn maybe_run_openclaw_migration(
             "  {} OpenClaw data detected. Optional merge migration is available.",
             style("↻").cyan().bold()
         );
-        Confirm::new()
+        Confirm::with_theme(wizard_theme())
             .with_prompt(
                 "  Merge OpenClaw data into this ZeroClaw workspace now? (preserve existing data)",
             )
@@ -2308,17 +2364,28 @@ pub async fn run_models_refresh_all(config: &Config, force: bool) -> Result<()> 
 // ── Step helpers ─────────────────────────────────────────────────
 
 fn print_step(current: u8, total: u8, title: &str) {
+    let total = total.max(1);
+    let completed = current
+        .saturating_sub(1)
+        .min(total)
+        .saturating_mul(STEP_PROGRESS_BAR_WIDTH as u8)
+        / total;
+    let completed = usize::from(completed);
+    let remaining = STEP_PROGRESS_BAR_WIDTH.saturating_sub(completed);
+    let progress = format!("[{}{}]", "=".repeat(completed), ".".repeat(remaining));
+
     println!();
     println!(
-        "  {} {}",
+        "  {} {} {}",
         style(format!("[{current}/{total}]")).cyan().bold(),
+        style(progress).cyan(),
         style(title).white().bold()
     );
-    println!("  {}", style("─".repeat(50)).dim());
+    println!("  {}", style("─".repeat(STEP_DIVIDER_WIDTH)).dim());
 }
 
 fn print_bullet(text: &str) {
-    println!("  {} {}", style("›").cyan(), text);
+    println!("  {} {}", style("•").cyan().bold(), text);
 }
 
 fn resolve_interactive_onboarding_mode(
@@ -2354,7 +2421,7 @@ fn resolve_interactive_onboarding_mode(
         "Cancel",
     ];
 
-    let mode = Select::new()
+    let mode = Select::with_theme(wizard_theme())
         .with_prompt(format!(
             "  Existing config found at {}. Select setup mode",
             config_path.display()
@@ -2394,7 +2461,7 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         );
     }
 
-    let confirmed = Confirm::new()
+    let confirmed = Confirm::with_theme(wizard_theme())
         .with_prompt(format!(
             "  Existing config found at {}. Re-running onboarding will overwrite config.toml and may create missing workspace files (including BOOTSTRAP.md). Continue?",
             config_path.display()
@@ -2434,7 +2501,7 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         style(default_workspace_dir.display()).green()
     ));
 
-    let use_default = Confirm::new()
+    let use_default = Confirm::with_theme(wizard_theme())
         .with_prompt("  Use default workspace location?")
         .default(true)
         .interact()?;
@@ -2442,7 +2509,7 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let (config_dir, workspace_dir) = if use_default {
         (default_config_dir, default_workspace_dir)
     } else {
-        let custom: String = Input::new()
+        let custom: String = Input::with_theme(wizard_theme())
             .with_prompt("  Enter workspace path")
             .interact_text()?;
         let expanded = shellexpand::tilde(&custom).to_string();
@@ -2478,7 +2545,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
 
-    let tier_idx = Select::new()
+    let tier_idx = Select::with_theme(wizard_theme())
         .with_prompt("  Select provider category")
         .items(&tiers)
         .default(0)
@@ -2584,7 +2651,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         print_bullet("Examples: LiteLLM, LocalAI, vLLM, text-generation-webui, LM Studio, etc.");
         println!();
 
-        let base_url: String = Input::new()
+        let base_url: String = Input::with_theme(wizard_theme())
             .with_prompt("  API base URL (e.g. http://localhost:1234 or https://my-api.com)")
             .interact_text()?;
 
@@ -2593,12 +2660,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             anyhow::bail!("Custom provider requires a base URL.");
         }
 
-        let api_key: String = Input::new()
+        let api_key: String = Input::with_theme(wizard_theme())
             .with_prompt("  API key (or Enter to skip if not needed)")
             .allow_empty(true)
             .interact_text()?;
 
-        let model: String = Input::new()
+        let model: String = Input::with_theme(wizard_theme())
             .with_prompt("  Model name (e.g. llama3, gpt-4o, mistral)")
             .default("default".into())
             .interact_text()?;
@@ -2617,7 +2684,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
     let provider_labels: Vec<&str> = providers.iter().map(|(_, label)| *label).collect();
 
-    let provider_idx = Select::new()
+    let provider_idx = Select::with_theme(wizard_theme())
         .with_prompt("  Select your AI provider")
         .items(&provider_labels)
         .default(0)
@@ -2628,13 +2695,13 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     // ── API key / endpoint ──
     let mut provider_api_url: Option<String> = None;
     let api_key = if provider_name == "ollama" {
-        let use_remote_ollama = Confirm::new()
+        let use_remote_ollama = Confirm::with_theme(wizard_theme())
             .with_prompt("  Use a remote Ollama endpoint (for example Ollama Cloud)?")
             .default(false)
             .interact()?;
 
         if use_remote_ollama {
-            let raw_url: String = Input::new()
+            let raw_url: String = Input::with_theme(wizard_theme())
                 .with_prompt("  Remote Ollama endpoint URL")
                 .default("https://ollama.com".into())
                 .interact_text()?;
@@ -2663,7 +2730,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 style(":cloud").yellow()
             ));
 
-            let key: String = Input::new()
+            let key: String = Input::with_theme(wizard_theme())
                 .with_prompt("  API key for remote Ollama endpoint (or Enter to skip)")
                 .allow_empty(true)
                 .interact_text()?;
@@ -2681,7 +2748,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             String::new()
         }
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
-        let raw_url: String = Input::new()
+        let raw_url: String = Input::with_theme(wizard_theme())
             .with_prompt("  llama.cpp server endpoint URL")
             .default("http://localhost:8080/v1".into())
             .interact_text()?;
@@ -2698,7 +2765,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         ));
         print_bullet("No API key needed unless your llama.cpp server is started with --api-key.");
 
-        let key: String = Input::new()
+        let key: String = Input::with_theme(wizard_theme())
             .with_prompt("  API key for llama.cpp server (or Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
@@ -2712,7 +2779,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         key
     } else if provider_name == "sglang" {
-        let raw_url: String = Input::new()
+        let raw_url: String = Input::with_theme(wizard_theme())
             .with_prompt("  SGLang server endpoint URL")
             .default("http://localhost:30000/v1".into())
             .interact_text()?;
@@ -2729,7 +2796,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         ));
         print_bullet("No API key needed unless your SGLang server requires authentication.");
 
-        let key: String = Input::new()
+        let key: String = Input::with_theme(wizard_theme())
             .with_prompt("  API key for SGLang server (or Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
@@ -2743,7 +2810,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         key
     } else if provider_name == "vllm" {
-        let raw_url: String = Input::new()
+        let raw_url: String = Input::with_theme(wizard_theme())
             .with_prompt("  vLLM server endpoint URL")
             .default("http://localhost:8000/v1".into())
             .interact_text()?;
@@ -2760,7 +2827,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         ));
         print_bullet("No API key needed unless your vLLM server requires authentication.");
 
-        let key: String = Input::new()
+        let key: String = Input::with_theme(wizard_theme())
             .with_prompt("  API key for vLLM server (or Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
@@ -2774,7 +2841,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         key
     } else if provider_name == "osaurus" {
-        let raw_url: String = Input::new()
+        let raw_url: String = Input::with_theme(wizard_theme())
             .with_prompt("  Osaurus server endpoint URL")
             .default("http://localhost:1337/v1".into())
             .interact_text()?;
@@ -2791,7 +2858,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         ));
         print_bullet("No API key needed unless your Osaurus server requires authentication.");
 
-        let key: String = Input::new()
+        let key: String = Input::with_theme(wizard_theme())
             .with_prompt("  API key for Osaurus server (or Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
@@ -2810,7 +2877,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         print_bullet("Optional: paste a GitHub token now to skip the first-run device prompt.");
         println!();
 
-        let key: String = Input::new()
+        let key: String = Input::with_theme(wizard_theme())
             .with_prompt("  Paste your GitHub token (optional; Enter = device flow)")
             .allow_empty(true)
             .interact_text()?;
@@ -2832,7 +2899,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet("ZeroClaw will reuse your existing Gemini CLI authentication.");
             println!();
 
-            let use_cli: bool = dialoguer::Confirm::new()
+            let use_cli: bool = dialoguer::Confirm::with_theme(wizard_theme())
                 .with_prompt("  Use existing Gemini CLI authentication?")
                 .default(true)
                 .interact()?;
@@ -2845,7 +2912,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 String::new() // Empty key = will use CLI tokens
             } else {
                 print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
-                Input::new()
+                Input::with_theme(wizard_theme())
                     .with_prompt("  Paste your Gemini API key")
                     .allow_empty(true)
                     .interact_text()?
@@ -2861,7 +2928,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet("Or run `gemini` CLI to authenticate (tokens will be reused).");
             println!();
 
-            Input::new()
+            Input::with_theme(wizard_theme())
                 .with_prompt("  Paste your Gemini API key (or press Enter to skip)")
                 .allow_empty(true)
                 .interact_text()?
@@ -2889,7 +2956,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
             println!();
 
-            let key: String = Input::new()
+            let key: String = Input::with_theme(wizard_theme())
                 .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
                 .allow_empty(true)
                 .interact_text()?;
@@ -2921,7 +2988,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet("You can also set QWEN_OAUTH_TOKEN directly.");
             println!();
 
-            let key: String = Input::new()
+            let key: String = Input::with_theme(wizard_theme())
                 .with_prompt(
                     "  Paste your Qwen OAuth token (or press Enter to auto-detect cached OAuth)",
                 )
@@ -3017,7 +3084,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet("You can also set it later via env var or config file.");
             println!();
 
-            let key: String = Input::new()
+            let key: String = Input::with_theme(wizard_theme())
                 .with_prompt("  Paste your API key (or press Enter to skip)")
                 .allow_empty(true)
                 .interact_text()?;
@@ -3086,7 +3153,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 ));
             }
 
-            let should_fetch_now = Confirm::new()
+            let should_fetch_now = Confirm::with_theme(wizard_theme())
                 .with_prompt(if live_options.is_some() {
                     "  Refresh models from provider now?"
                 } else {
@@ -3170,7 +3237,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             format!("Curated starter list ({})", model_options.len()),
         ];
 
-        let source_idx = Select::new()
+        let source_idx = Select::with_theme(wizard_theme())
             .with_prompt("  Model source")
             .items(&source_options)
             .default(0)
@@ -3198,7 +3265,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         .map(|(model_id, label)| format!("{label} — {}", style(model_id).dim()))
         .collect();
 
-    let model_idx = Select::new()
+    let model_idx = Select::with_theme(wizard_theme())
         .with_prompt("  Select your default model")
         .items(&model_labels)
         .default(0)
@@ -3206,7 +3273,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
     let selected_model = model_options[model_idx].0.clone();
     let model = if selected_model == CUSTOM_MODEL_SENTINEL {
-        Input::new()
+        Input::with_theme(wizard_theme())
             .with_prompt("  Enter custom model ID")
             .default(default_model_for_provider(provider_name))
             .interact_text()?
@@ -3363,7 +3430,7 @@ fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
             "Allow all public domains (*)",
             "Custom domain list (comma-separated)",
         ];
-        let choice = Select::new()
+        let choice = Select::with_theme(wizard_theme())
             .with_prompt("  HTTP domain policy")
             .items(&options)
             .default(0)
@@ -3373,7 +3440,7 @@ fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
             0 => Ok(http_request_productivity_allowed_domains()),
             1 => Ok(vec!["*".to_string()]),
             _ => {
-                let raw: String = Input::new()
+                let raw: String = Input::with_theme(wizard_theme())
                     .with_prompt("  http_request.allowed_domains (comma-separated, '*' allows all)")
                     .allow_empty(true)
                     .default("api.github.com,api.linear.app,calendar.googleapis.com".to_string())
@@ -3393,7 +3460,7 @@ fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
         "  {}.allowed_domains (comma-separated, '*' allows all)",
         tool_name
     );
-    let raw: String = Input::new()
+    let raw: String = Input::with_theme(wizard_theme())
         .with_prompt(prompt)
         .allow_empty(true)
         .default("*".to_string())
@@ -3461,7 +3528,7 @@ fn setup_http_request_credential_profiles(
         "This avoids passing raw tokens in tool arguments (use credential_profile instead).",
     );
 
-    let configure_profiles = Confirm::new()
+    let configure_profiles = Confirm::with_theme(wizard_theme())
         .with_prompt("  Configure HTTP credential profiles now?")
         .default(false)
         .interact()?;
@@ -3478,7 +3545,7 @@ fn setup_http_request_credential_profiles(
                 http_request_config.credential_profiles.len() + 1
             )
         };
-        let raw_name: String = Input::new()
+        let raw_name: String = Input::with_theme(wizard_theme())
             .with_prompt("  Profile name (e.g., github, linear)")
             .default(default_name)
             .interact_text()?;
@@ -3498,7 +3565,7 @@ fn setup_http_request_credential_profiles(
         }
 
         let env_var_default = default_env_var_for_profile(&profile_name);
-        let env_var_raw: String = Input::new()
+        let env_var_raw: String = Input::with_theme(wizard_theme())
             .with_prompt("  Environment variable containing token/secret")
             .default(env_var_default)
             .interact_text()?;
@@ -3509,7 +3576,7 @@ fn setup_http_request_credential_profiles(
             );
         }
 
-        let header_name: String = Input::new()
+        let header_name: String = Input::with_theme(wizard_theme())
             .with_prompt("  Header name")
             .default("Authorization".to_string())
             .interact_text()?;
@@ -3518,7 +3585,7 @@ fn setup_http_request_credential_profiles(
             anyhow::bail!("Header name must not be empty");
         }
 
-        let value_prefix: String = Input::new()
+        let value_prefix: String = Input::with_theme(wizard_theme())
             .with_prompt("  Header value prefix (e.g., 'Bearer ', empty for raw token)")
             .allow_empty(true)
             .default("Bearer ".to_string())
@@ -3539,7 +3606,7 @@ fn setup_http_request_credential_profiles(
             style(profile_name).green()
         );
 
-        let add_another = Confirm::new()
+        let add_another = Confirm::with_theme(wizard_theme())
             .with_prompt("  Add another credential profile?")
             .default(false)
             .interact()?;
@@ -3560,7 +3627,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
 
     // ── Web Search ──────────────────────────────────────────────
     let mut web_search_config = WebSearchConfig::default();
-    let enable_web_search = Confirm::new()
+    let enable_web_search = Confirm::with_theme(wizard_theme())
         .with_prompt("  Enable web_search_tool?")
         .default(false)
         .interact()?;
@@ -3574,7 +3641,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
             #[cfg(feature = "firecrawl")]
             "Firecrawl (requires API key + firecrawl feature)",
         ];
-        let provider_choice = Select::new()
+        let provider_choice = Select::with_theme(wizard_theme())
             .with_prompt("  web_search provider")
             .items(&provider_options)
             .default(0)
@@ -3583,7 +3650,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         match provider_choice {
             1 => {
                 web_search_config.provider = "brave".to_string();
-                let key: String = Input::new()
+                let key: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Brave Search API key")
                     .interact_text()?;
                 if !key.trim().is_empty() {
@@ -3593,13 +3660,13 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
             #[cfg(feature = "firecrawl")]
             2 => {
                 web_search_config.provider = "firecrawl".to_string();
-                let key: String = Input::new()
+                let key: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Firecrawl API key")
                     .interact_text()?;
                 if !key.trim().is_empty() {
                     web_search_config.api_key = Some(key.trim().to_string());
                 }
-                let url: String = Input::new()
+                let url: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Firecrawl API URL (leave blank for cloud https://api.firecrawl.dev)",
                     )
@@ -3631,7 +3698,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
 
     // ── Web Fetch ───────────────────────────────────────────────
     let mut web_fetch_config = WebFetchConfig::default();
-    let enable_web_fetch = Confirm::new()
+    let enable_web_fetch = Confirm::with_theme(wizard_theme())
         .with_prompt("  Enable web_fetch tool (fetch and read web pages)?")
         .default(false)
         .interact()?;
@@ -3645,7 +3712,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
             #[cfg(feature = "firecrawl")]
             "firecrawl (cloud conversion, requires API key)",
         ];
-        let provider_choice = Select::new()
+        let provider_choice = Select::with_theme(wizard_theme())
             .with_prompt("  web_fetch provider")
             .items(&provider_options)
             .default(0)
@@ -3658,13 +3725,13 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
             #[cfg(feature = "firecrawl")]
             2 => {
                 web_fetch_config.provider = "firecrawl".to_string();
-                let key: String = Input::new()
+                let key: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Firecrawl API key")
                     .interact_text()?;
                 if !key.trim().is_empty() {
                     web_fetch_config.api_key = Some(key.trim().to_string());
                 }
-                let url: String = Input::new()
+                let url: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Firecrawl API URL (leave blank for cloud https://api.firecrawl.dev)",
                     )
@@ -3696,7 +3763,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
 
     // ── HTTP Request ────────────────────────────────────────────
     let mut http_request_config = HttpRequestConfig::default();
-    let enable_http_request = Confirm::new()
+    let enable_http_request = Confirm::with_theme(wizard_theme())
         .with_prompt("  Enable http_request tool for direct API calls?")
         .default(false)
         .interact()?;
@@ -3749,7 +3816,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         "Composio (managed OAuth) — 1000+ apps via OAuth, no raw keys shared",
     ];
 
-    let choice = Select::new()
+    let choice = Select::with_theme(wizard_theme())
         .with_prompt("  Select tool mode")
         .items(&options)
         .default(0)
@@ -3766,7 +3833,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         print_bullet("ZeroClaw uses Composio as a tool — your core agent stays local.");
         println!();
 
-        let api_key: String = Input::new()
+        let api_key: String = Input::with_theme(wizard_theme())
             .with_prompt("  Composio API key (or Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
@@ -3803,7 +3870,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     print_bullet("ZeroClaw can encrypt API keys stored in config.toml.");
     print_bullet("A local key file protects against plaintext exposure and accidental leaks.");
 
-    let encrypt = Confirm::new()
+    let encrypt = Confirm::with_theme(wizard_theme())
         .with_prompt("  Enable encrypted secret storage?")
         .default(true)
         .interact()?;
@@ -3886,7 +3953,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
 
     let recommended = hardware::recommended_wizard_default(&devices);
 
-    let choice = Select::new()
+    let choice = Select::with_theme(wizard_theme())
         .with_prompt("  How should ZeroClaw interact with the physical world?")
         .items(&options)
         .default(recommended)
@@ -3913,7 +3980,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
                 })
                 .collect();
 
-            let port_idx = Select::new()
+            let port_idx = Select::with_theme(wizard_theme())
                 .with_prompt("  Multiple serial devices found — select one")
                 .items(&port_labels)
                 .default(0)
@@ -3922,7 +3989,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             hw_config.serial_port = serial_devices[port_idx].device_path.clone();
         } else if serial_devices.is_empty() {
             // User chose serial but no device discovered — ask for manual path
-            let manual_port: String = Input::new()
+            let manual_port: String = Input::with_theme(wizard_theme())
                 .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
                 .default("/dev/ttyUSB0".into())
                 .interact_text()?;
@@ -3937,7 +4004,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             "230400",
             "Custom",
         ];
-        let baud_idx = Select::new()
+        let baud_idx = Select::with_theme(wizard_theme())
             .with_prompt("  Serial baud rate")
             .items(&baud_options)
             .default(0)
@@ -3948,7 +4015,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             2 => 57600,
             3 => 230_400,
             4 => {
-                let custom: String = Input::new()
+                let custom: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Custom baud rate")
                     .default("115200".into())
                     .interact_text()?;
@@ -3962,7 +4029,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
     if hw_config.transport_mode() == hardware::HardwareTransport::Probe
         && hw_config.probe_target.is_none()
     {
-        let target: String = Input::new()
+        let target: String = Input::with_theme(wizard_theme())
             .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
             .default("STM32F411CEUx".into())
             .interact_text()?;
@@ -3971,7 +4038,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
 
     // ── Datasheet RAG ──
     if hw_config.enabled {
-        let datasheets = Confirm::new()
+        let datasheets = Confirm::with_theme(wizard_theme())
             .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
             .default(true)
             .interact()?;
@@ -4022,7 +4089,7 @@ fn setup_project_context() -> Result<ProjectContext> {
     print_bullet("Press Enter to accept defaults.");
     println!();
 
-    let user_name: String = Input::new()
+    let user_name: String = Input::with_theme(wizard_theme())
         .with_prompt("  Your name")
         .default("User".into())
         .interact_text()?;
@@ -4040,14 +4107,14 @@ fn setup_project_context() -> Result<ProjectContext> {
         "Other (type manually)",
     ];
 
-    let tz_idx = Select::new()
+    let tz_idx = Select::with_theme(wizard_theme())
         .with_prompt("  Your timezone")
         .items(&tz_options)
         .default(0)
         .interact()?;
 
     let timezone = if tz_idx == tz_options.len() - 1 {
-        Input::new()
+        Input::with_theme(wizard_theme())
             .with_prompt("  Enter timezone (e.g. America/New_York)")
             .default("UTC".into())
             .interact_text()?
@@ -4061,7 +4128,7 @@ fn setup_project_context() -> Result<ProjectContext> {
             .to_string()
     };
 
-    let agent_name: String = Input::new()
+    let agent_name: String = Input::with_theme(wizard_theme())
         .with_prompt("  Agent name")
         .default("ZeroClaw".into())
         .interact_text()?;
@@ -4076,7 +4143,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         "Custom — write your own style guide",
     ];
 
-    let style_idx = Select::new()
+    let style_idx = Select::with_theme(wizard_theme())
         .with_prompt("  Communication style")
         .items(&style_options)
         .default(1)
@@ -4089,7 +4156,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         3 => "Be expressive and playful when appropriate. Use relevant emojis naturally (0-2 max), and keep serious topics emoji-light.".to_string(),
         4 => "Be technical and detailed. Thorough explanations, code-first.".to_string(),
         5 => "Adapt to the situation. Default to warm and clear communication; be concise when needed, thorough when it matters.".to_string(),
-        _ => Input::new()
+        _ => Input::with_theme(wizard_theme())
             .with_prompt("  Custom communication style")
             .default(
                 "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".into(),
@@ -4126,7 +4193,7 @@ fn setup_memory() -> Result<MemoryConfig> {
         .map(|backend| backend.label)
         .collect();
 
-    let choice = Select::new()
+    let choice = Select::with_theme(wizard_theme())
         .with_prompt("  Select memory backend")
         .items(&options)
         .default(0)
@@ -4136,7 +4203,7 @@ fn setup_memory() -> Result<MemoryConfig> {
     let profile = memory_backend_profile(backend);
 
     let auto_save = profile.auto_save_default
-        && Confirm::new()
+        && Confirm::with_theme(wizard_theme())
             .with_prompt("  Auto-save conversations to memory?")
             .default(true)
             .interact()?;
@@ -4167,7 +4234,7 @@ fn configure_hybrid_qdrant_memory(config: &mut MemoryConfig) -> Result<()> {
         .url
         .clone()
         .unwrap_or_else(|| "http://localhost:6333".to_string());
-    let qdrant_url: String = Input::new()
+    let qdrant_url: String = Input::with_theme(wizard_theme())
         .with_prompt("  Qdrant URL")
         .default(qdrant_url_default)
         .interact_text()?;
@@ -4177,7 +4244,7 @@ fn configure_hybrid_qdrant_memory(config: &mut MemoryConfig) -> Result<()> {
     }
     config.qdrant.url = Some(qdrant_url.to_string());
 
-    let qdrant_collection: String = Input::new()
+    let qdrant_collection: String = Input::with_theme(wizard_theme())
         .with_prompt("  Qdrant collection")
         .default(config.qdrant.collection.clone())
         .interact_text()?;
@@ -4186,7 +4253,7 @@ fn configure_hybrid_qdrant_memory(config: &mut MemoryConfig) -> Result<()> {
         config.qdrant.collection = qdrant_collection.to_string();
     }
 
-    let qdrant_api_key: String = Input::new()
+    let qdrant_api_key: String = Input::with_theme(wizard_theme())
         .with_prompt("  Qdrant API key (optional, Enter to skip)")
         .allow_empty(true)
         .interact_text()?;
@@ -4223,7 +4290,7 @@ fn setup_identity_backend() -> Result<IdentityConfig> {
         .map(|profile| format!("{} — {}", profile.label, profile.description))
         .collect();
 
-    let selected = Select::new()
+    let selected = Select::with_theme(wizard_theme())
         .with_prompt("  Select identity backend")
         .items(&options)
         .default(0)
@@ -4446,7 +4513,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
             })
             .collect();
 
-        let selection = Select::new()
+        let selection = Select::with_theme(wizard_theme())
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
             .default(options.len() - 1)
@@ -4471,7 +4538,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Copy the bot token and paste it below");
                 println!();
 
-                let token: String = Input::new()
+                let token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Bot token (from @BotFather)")
                     .interact_text()?;
 
@@ -4523,7 +4590,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
                 print_bullet("Use '*' only for temporary open testing.");
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Allowed Telegram identities (comma-separated: username without '@' and/or numeric user ID, '*' for all)",
                     )
@@ -4574,7 +4641,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("4. Invite bot to your server with messages permission");
                 println!();
 
-                let token: String = Input::new().with_prompt("  Bot token").interact_text()?;
+                let token: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  Bot token")
+                    .interact_text()?;
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -4616,7 +4685,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let guild: String = Input::new()
+                let guild: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Server (guild) ID (optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -4627,7 +4696,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
                 print_bullet("Use '*' only for temporary open testing.");
 
-                let allowed_users_str: String = Input::new()
+                let allowed_users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Allowed Discord user IDs (comma-separated, recommended: your own ID, '*' for all)",
                     )
@@ -4673,7 +4742,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Install to workspace and copy the Bot Token");
                 println!();
 
-                let token: String = Input::new()
+                let token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Bot token (xoxb-...)")
                     .interact_text()?;
 
@@ -4730,12 +4799,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let app_token: String = Input::new()
+                let app_token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  App token (xapp-..., optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
 
-                let channel: String = Input::new()
+                let channel: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Default channel ID (optional, Enter to skip for all accessible channels; '*' also means all)",
                     )
@@ -4748,7 +4817,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
                 print_bullet("Use '*' only for temporary open testing.");
 
-                let allowed_users_str: String = Input::new()
+                let allowed_users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Allowed Slack user IDs (comma-separated, recommended: your own member ID, '*' for all)",
                     )
@@ -4812,7 +4881,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
                 println!();
 
-                let contacts_str: String = Input::new()
+                let contacts_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
                     .default("*".into())
                     .interact_text()?;
@@ -4845,7 +4914,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("Get a token via Element → Settings → Help & About → Access Token.");
                 println!();
 
-                let homeserver: String = Input::new()
+                let homeserver: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Homeserver URL (e.g. https://matrix.org)")
                     .interact_text()?;
 
@@ -4854,8 +4923,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
+                let access_token: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  Access token")
+                    .interact_text()?;
 
                 if access_token.trim().is_empty() {
                     println!("  {} Skipped — token required", style("→").dim());
@@ -4921,11 +4991,11 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 };
 
-                let room_id: String = Input::new()
+                let room_id: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Room ID (e.g. !abc123:matrix.org)")
                     .interact_text()?;
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed users (comma-separated @user:server, or * for all)")
                     .default("*".into())
                     .interact_text()?;
@@ -4959,7 +5029,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Optionally scope to DMs only or to a specific group.");
                 println!();
 
-                let http_url: String = Input::new()
+                let http_url: String = Input::with_theme(wizard_theme())
                     .with_prompt("  signal-cli HTTP URL")
                     .default("http://127.0.0.1:8686".into())
                     .interact_text()?;
@@ -4969,7 +5039,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let account: String = Input::new()
+                let account: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Account number (E.164, e.g. +1234567890)")
                     .interact_text()?;
 
@@ -4983,7 +5053,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "DM only",
                     "Specific group ID",
                 ];
-                let scope_choice = Select::new()
+                let scope_choice = Select::with_theme(wizard_theme())
                     .with_prompt("  Message scope")
                     .items(scope_options)
                     .default(0)
@@ -4992,8 +5062,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let group_id = match scope_choice {
                     1 => Some("dm".to_string()),
                     2 => {
-                        let group_input: String =
-                            Input::new().with_prompt("  Group ID").interact_text()?;
+                        let group_input: String = Input::with_theme(wizard_theme())
+                            .with_prompt("  Group ID")
+                            .interact_text()?;
                         let group_input = group_input.trim().to_string();
                         if group_input.is_empty() {
                             println!("  {} Skipped — group ID required", style("→").dim());
@@ -5004,7 +5075,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     _ => None,
                 };
 
-                let allowed_from_raw: String = Input::new()
+                let allowed_from_raw: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
                     )
@@ -5021,12 +5092,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .collect()
                 };
 
-                let ignore_attachments = Confirm::new()
+                let ignore_attachments = Confirm::with_theme(wizard_theme())
                     .with_prompt("  Ignore attachment-only messages?")
                     .default(false)
                     .interact()?;
 
-                let ignore_stories = Confirm::new()
+                let ignore_stories = Confirm::with_theme(wizard_theme())
                     .with_prompt("  Ignore incoming stories?")
                     .default(true)
                     .interact()?;
@@ -5051,7 +5122,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "WhatsApp Web (QR / pair-code, no Meta Business API)",
                     "WhatsApp Business Cloud API (webhook)",
                 ];
-                let mode_idx = Select::new()
+                let mode_idx = Select::with_theme(wizard_theme())
                     .with_prompt("  Choose WhatsApp mode")
                     .items(&mode_options)
                     .default(0)
@@ -5066,7 +5137,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     print_bullet("3. Keep session_path persistent so relogin is not required");
                     println!();
 
-                    let session_path: String = Input::new()
+                    let session_path: String = Input::with_theme(wizard_theme())
                         .with_prompt("  Session database path")
                         .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
                         .interact_text()?;
@@ -5076,7 +5147,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         continue;
                     }
 
-                    let pair_phone: String = Input::new()
+                    let pair_phone: String = Input::with_theme(wizard_theme())
                         .with_prompt(
                             "  Pair phone (optional, digits only; leave empty to use QR flow)",
                         )
@@ -5086,7 +5157,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     let pair_code: String = if pair_phone.trim().is_empty() {
                         String::new()
                     } else {
-                        Input::new()
+                        Input::with_theme(wizard_theme())
                             .with_prompt(
                                 "  Custom pair code (optional, leave empty for auto-generated)",
                             )
@@ -5094,7 +5165,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .interact_text()?
                     };
 
-                    let users_str: String = Input::new()
+                    let users_str: String = Input::with_theme(wizard_theme())
                         .with_prompt(
                             "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
                         )
@@ -5138,7 +5209,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("4. Configure webhook URL to: https://your-domain/whatsapp");
                 println!();
 
-                let access_token: String = Input::new()
+                let access_token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Access token (from Meta Developers)")
                     .interact_text()?;
 
@@ -5147,7 +5218,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let phone_number_id: String = Input::new()
+                let phone_number_id: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Phone number ID (from WhatsApp app settings)")
                     .interact_text()?;
 
@@ -5156,7 +5227,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let verify_token: String = Input::new()
+                let verify_token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Webhook verify token (create your own)")
                     .default("zeroclaw-whatsapp-verify".into())
                     .interact_text()?;
@@ -5197,7 +5268,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
                     )
@@ -5234,7 +5305,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Configure webhook URL to: https://your-domain/linq");
                 println!();
 
-                let api_token: String = Input::new()
+                let api_token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  API token (Linq Partner API token)")
                     .interact_text()?;
 
@@ -5243,7 +5314,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let from_phone: String = Input::new()
+                let from_phone: String = Input::with_theme(wizard_theme())
                     .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
                     .interact_text()?;
 
@@ -5284,7 +5355,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt(
                         "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
                     )
@@ -5297,7 +5368,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
-                let signing_secret: String = Input::new()
+                let signing_secret: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5325,7 +5396,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("Supports SASL PLAIN and NickServ authentication");
                 println!();
 
-                let server: String = Input::new()
+                let server: String = Input::with_theme(wizard_theme())
                     .with_prompt("  IRC server (hostname)")
                     .interact_text()?;
 
@@ -5334,7 +5405,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let port_str: String = Input::new()
+                let port_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Port")
                     .default("6697".into())
                     .interact_text()?;
@@ -5347,15 +5418,16 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 };
 
-                let nickname: String =
-                    Input::new().with_prompt("  Bot nickname").interact_text()?;
+                let nickname: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  Bot nickname")
+                    .interact_text()?;
 
                 if nickname.trim().is_empty() {
                     println!("  {} Skipped — nickname required", style("→").dim());
                     continue;
                 }
 
-                let channels_str: String = Input::new()
+                let channels_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Channels to join (comma-separated: #channel1,#channel2)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5375,7 +5447,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
                 print_bullet("Use '*' to allow anyone (not recommended for production).");
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed nicknames (comma-separated, or * for all)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5399,22 +5471,22 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!();
                 print_bullet("Optional authentication (press Enter to skip each):");
 
-                let server_password: String = Input::new()
+                let server_password: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
                     .allow_empty(true)
                     .interact_text()?;
 
-                let nickserv_password: String = Input::new()
+                let nickserv_password: String = Input::with_theme(wizard_theme())
                     .with_prompt("  NickServ password (leave empty if none)")
                     .allow_empty(true)
                     .interact_text()?;
 
-                let sasl_password: String = Input::new()
+                let sasl_password: String = Input::with_theme(wizard_theme())
                     .with_prompt("  SASL PLAIN password (leave empty if none)")
                     .allow_empty(true)
                     .interact_text()?;
 
-                let verify_tls: bool = Confirm::new()
+                let verify_tls: bool = Confirm::with_theme(wizard_theme())
                     .with_prompt("  Verify TLS certificate?")
                     .default(true)
                     .interact()?;
@@ -5461,12 +5533,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style("— HTTP endpoint for custom integrations").dim()
                 );
 
-                let port: String = Input::new()
+                let port: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Port")
                     .default("8080".into())
                     .interact_text()?;
 
-                let secret: String = Input::new()
+                let secret: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Secret (optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5500,7 +5572,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
                 println!();
 
-                let base_url: String = Input::new()
+                let base_url: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Nextcloud base URL (e.g. https://cloud.example.com)")
                     .interact_text()?;
 
@@ -5510,7 +5582,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let app_token: String = Input::new()
+                let app_token: String = Input::with_theme(wizard_theme())
                     .with_prompt("  App token (Talk bot token)")
                     .interact_text()?;
 
@@ -5519,12 +5591,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let webhook_secret: String = Input::new()
+                let webhook_secret: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Webhook secret (optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
 
-                let allowed_users_raw: String = Input::new()
+                let allowed_users_raw: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed Nextcloud actor IDs (comma-separated, or * for all)")
                     .default("*".into())
                     .interact_text()?;
@@ -5565,7 +5637,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Copy the Client ID (AppKey) and Client Secret (AppSecret)");
                 println!();
 
-                let client_id: String = Input::new()
+                let client_id: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Client ID (AppKey)")
                     .interact_text()?;
 
@@ -5574,7 +5646,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let client_secret: String = Input::new()
+                let client_secret: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Client Secret (AppSecret)")
                     .interact_text()?;
 
@@ -5605,7 +5677,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed staff IDs (comma-separated, '*' for all)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5635,15 +5707,18 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Copy the App ID and App Secret");
                 println!();
 
-                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+                let app_id: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  App ID")
+                    .interact_text()?;
 
                 if app_id.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     continue;
                 }
 
-                let app_secret: String =
-                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  App Secret")
+                    .interact_text()?;
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
@@ -5681,7 +5756,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed user IDs (comma-separated, '*' for all)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5692,7 +5767,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .filter(|s| !s.is_empty())
                     .collect();
 
-                let receive_mode_choice = Select::new()
+                let receive_mode_choice = Select::with_theme(wizard_theme())
                     .with_prompt("  Receive mode")
                     .items(["Webhook (recommended)", "WebSocket (legacy fallback)"])
                     .default(0)
@@ -5703,7 +5778,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     QQReceiveMode::Websocket
                 };
 
-                let environment_choice = Select::new()
+                let environment_choice = Select::with_theme(wizard_theme())
                     .with_prompt("  API environment")
                     .items(["Production", "Sandbox (for unpublished bot testing)"])
                     .default(0)
@@ -5737,7 +5812,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Copy the App ID and App Secret");
                 println!();
 
-                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+                let app_id: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  App ID")
+                    .interact_text()?;
                 let app_id = app_id.trim().to_string();
 
                 if app_id.trim().is_empty() {
@@ -5745,8 +5822,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let app_secret: String =
-                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret: String = Input::with_theme(wizard_theme())
+                    .with_prompt("  App Secret")
+                    .interact_text()?;
                 let app_secret = app_secret.trim().to_string();
 
                 if app_secret.is_empty() {
@@ -5754,7 +5832,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let use_feishu = Select::new()
+                let use_feishu = Select::with_theme(wizard_theme())
                     .with_prompt("  Region")
                     .items(["Feishu (CN)", "Lark (International)"])
                     .default(0)
@@ -5834,7 +5912,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let receive_mode_choice = Select::new()
+                let receive_mode_choice = Select::with_theme(wizard_theme())
                     .with_prompt("  Receive Mode")
                     .items([
                         "WebSocket (recommended, no public IP needed)",
@@ -5850,7 +5928,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 };
 
                 let verification_token = if receive_mode == LarkReceiveMode::Webhook {
-                    let token: String = Input::new()
+                    let token: String = Input::with_theme(wizard_theme())
                         .with_prompt("  Verification Token (optional, for Webhook mode)")
                         .allow_empty(true)
                         .interact_text()?;
@@ -5871,7 +5949,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 let port = if receive_mode == LarkReceiveMode::Webhook {
-                    let p: String = Input::new()
+                    let p: String = Input::with_theme(wizard_theme())
                         .with_prompt("  Webhook Port")
                         .default("8080".into())
                         .interact_text()?;
@@ -5880,7 +5958,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     None
                 };
 
-                let users_str: String = Input::new()
+                let users_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed user Open IDs (comma-separated, '*' for all)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -5925,7 +6003,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("You need a Nostr private key (hex or nsec) and at least one relay.");
                 println!();
 
-                let private_key: String = Input::new()
+                let private_key: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Private key (hex or nsec1...)")
                     .interact_text()?;
 
@@ -5953,7 +6031,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 let default_relays = default_nostr_relays().join(",");
-                let relays_str: String = Input::new()
+                let relays_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Relay URLs (comma-separated, Enter for defaults)")
                     .default(default_relays)
                     .interact_text()?;
@@ -5967,7 +6045,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("Allowlist pubkeys that can message the bot (hex or npub).");
                 print_bullet("Use '*' to allow anyone (not recommended for production).");
 
-                let pubkeys_str: String = Input::new()
+                let pubkeys_str: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Allowed pubkeys (comma-separated, or * for all)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -6044,7 +6122,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         "Custom — bring your own (bore, frp, ssh, etc.)",
     ];
 
-    let choice = Select::new()
+    let choice = Select::with_theme(wizard_theme())
         .with_prompt("  Select tunnel provider")
         .items(&options)
         .default(0)
@@ -6054,7 +6132,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         1 => {
             println!();
             print_bullet("Get your tunnel token from the Cloudflare Zero Trust dashboard.");
-            let tunnel_value: String = Input::new()
+            let tunnel_value: String = Input::with_theme(wizard_theme())
                 .with_prompt("  Cloudflare tunnel token")
                 .interact_text()?;
             if tunnel_value.trim().is_empty() {
@@ -6078,7 +6156,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         2 => {
             println!();
             print_bullet("Tailscale must be installed and authenticated (tailscale up).");
-            let funnel = Confirm::new()
+            let funnel = Confirm::with_theme(wizard_theme())
                 .with_prompt("  Use Funnel (public internet)? No = tailnet only")
                 .default(false)
                 .interact()?;
@@ -6106,14 +6184,14 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
             print_bullet(
                 "Get your auth token at https://dashboard.ngrok.com/get-started/your-authtoken",
             );
-            let auth_token: String = Input::new()
+            let auth_token: String = Input::with_theme(wizard_theme())
                 .with_prompt("  ngrok auth token")
                 .interact_text()?;
             if auth_token.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
-                let domain: String = Input::new()
+                let domain: String = Input::with_theme(wizard_theme())
                     .with_prompt("  Custom domain (optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
@@ -6141,7 +6219,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
             print_bullet("Enter the command to start your tunnel.");
             print_bullet("Use {port} and {host} as placeholders.");
             print_bullet("Example: bore local {port} --to bore.pub");
-            let cmd: String = Input::new()
+            let cmd: String = Input::with_theme(wizard_theme())
                 .with_prompt("  Start command")
                 .interact_text()?;
             if cmd.trim().is_empty() {

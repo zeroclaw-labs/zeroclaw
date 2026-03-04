@@ -403,6 +403,17 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional custom authentication header for `custom:` providers
+    /// (for example `api-key` for Azure OpenAI).
+    ///
+    /// Contract:
+    /// - Default/omitted (`None`): uses the standard `Authorization: Bearer <token>` header.
+    /// - Compatibility: this key is additive and optional; older runtimes that do not support it
+    ///   ignore the field while continuing to use Bearer auth behavior.
+    /// - Rollback/migration: remove `auth_header` to return to Bearer-only auth if operators
+    ///   need to downgrade or revert custom-header behavior.
+    #[serde(default)]
+    pub auth_header: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
@@ -4009,6 +4020,16 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
+    /// Optional per-fallback provider API keys keyed by fallback entry name.
+    /// This allows distinct credentials for multiple `custom:<url>` endpoints.
+    ///
+    /// Contract:
+    /// - Default/omitted (`{}` via `#[serde(default)]`): no per-entry override is used.
+    /// - Compatibility: additive and non-breaking for existing configs that omit this field.
+    /// - Rollback/migration: remove this map (or specific entries) to revert to provider/env-based
+    ///   credential resolution.
+    #[serde(default)]
+    pub fallback_api_keys: std::collections::HashMap<String, String>,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
@@ -4064,6 +4085,7 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
@@ -6875,6 +6897,21 @@ fn decrypt_vec_secrets(
     Ok(())
 }
 
+fn decrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .decrypt(value)
+                .with_context(|| format!("Failed to decrypt {field_name}.{key}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -6915,6 +6952,21 @@ fn encrypt_vec_secrets(
             *value = store
                 .encrypt(value)
                 .with_context(|| format!("Failed to encrypt {field_name}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if !crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .encrypt(value)
+                .with_context(|| format!("Failed to encrypt {field_name}.{key}"))?;
         }
     }
     Ok(())
@@ -7645,6 +7697,11 @@ impl Config {
                 &mut config.reliability.api_keys,
                 "config.reliability.api_keys",
             )?;
+            decrypt_map_secrets(
+                &store,
+                &mut config.reliability.fallback_api_keys,
+                "config.reliability.fallback_api_keys",
+            )?;
             decrypt_vec_secrets(
                 &store,
                 &mut config.gateway.paired_tokens,
@@ -7734,6 +7791,23 @@ impl Config {
         }
     }
 
+    fn normalize_url_for_profile_match(raw: &str) -> (String, Option<String>) {
+        let trimmed = raw.trim();
+        let (path, query) = match trimmed.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (trimmed, None),
+        };
+
+        (
+            path.trim_end_matches('/').to_string(),
+            query.map(|value| value.to_string()),
+        )
+    }
+
+    fn urls_match_ignoring_trailing_slash(lhs: &str, rhs: &str) -> bool {
+        Self::normalize_url_for_profile_match(lhs) == Self::normalize_url_for_profile_match(rhs)
+    }
+
     /// Resolve provider reasoning level with backward-compatible runtime alias.
     ///
     /// Priority:
@@ -7785,6 +7859,53 @@ impl Config {
     /// - `sse`
     pub fn effective_provider_transport(&self) -> Option<String> {
         Self::normalize_provider_transport(self.provider.transport.as_deref(), "provider.transport")
+    }
+
+    /// Resolve custom provider auth header from a matching `[model_providers.*]` profile.
+    ///
+    /// This is used when `default_provider = "custom:<url>"` and a profile with the
+    /// same `base_url` declares `auth_header` (for example `api-key` for Azure OpenAI).
+    pub fn effective_custom_provider_auth_header(&self) -> Option<String> {
+        let custom_provider_url = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .and_then(|provider| provider.strip_prefix("custom:"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        let mut profile_keys = self.model_providers.keys().collect::<Vec<_>>();
+        profile_keys.sort_unstable();
+
+        for profile_key in profile_keys {
+            let Some(profile) = self.model_providers.get(profile_key) else {
+                continue;
+            };
+
+            let Some(header) = profile
+                .auth_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            let Some(base_url) = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            if Self::urls_match_ignoring_trailing_slash(custom_provider_url, base_url) {
+                return Some(header.to_string());
+            }
+        }
+
+        None
     }
 
     fn lookup_model_provider_profile(
@@ -7919,6 +8040,29 @@ impl Config {
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
+        }
+
+        // Reliability
+        let configured_fallbacks = self
+            .reliability
+            .fallback_providers
+            .iter()
+            .map(|provider| provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        for (entry, api_key) in &self.reliability.fallback_api_keys {
+            let normalized_entry = entry.trim();
+            if normalized_entry.is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys contains an empty key");
+            }
+            if api_key.trim().is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys.{normalized_entry} must not be empty");
+            }
+            if !configured_fallbacks.contains(normalized_entry) {
+                anyhow::bail!(
+                    "reliability.fallback_api_keys.{normalized_entry} has no matching entry in reliability.fallback_providers"
+                );
+            }
         }
 
         // Autonomy
@@ -8517,22 +8661,26 @@ impl Config {
             }
         }
 
+        let mut custom_auth_headers_by_base_url: Vec<(String, String, String)> = Vec::new();
         for (profile_key, profile) in &self.model_providers {
             let profile_name = profile_key.trim();
             if profile_name.is_empty() {
                 anyhow::bail!("model_providers contains an empty profile name");
             }
 
+            let normalized_base_url = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+
             let has_name = profile
                 .name
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
-            let has_base_url = profile
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
+            let has_base_url = normalized_base_url.is_some();
 
             if !has_name && !has_base_url {
                 anyhow::bail!(
@@ -8540,16 +8688,12 @@ impl Config {
                 );
             }
 
-            if let Some(base_url) = profile.base_url.as_deref().map(str::trim) {
-                if !base_url.is_empty() {
-                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                        format!("model_providers.{profile_name}.base_url is not a valid URL")
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") {
-                        anyhow::bail!(
-                            "model_providers.{profile_name}.base_url must use http/https"
-                        );
-                    }
+            if let Some(base_url) = normalized_base_url.as_deref() {
+                let parsed = reqwest::Url::parse(base_url).with_context(|| {
+                    format!("model_providers.{profile_name}.base_url is not a valid URL")
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("model_providers.{profile_name}.base_url must use http/https");
                 }
             }
 
@@ -8557,6 +8701,42 @@ impl Config {
                 if !wire_api.is_empty() && normalize_wire_api(wire_api).is_none() {
                     anyhow::bail!(
                         "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                    );
+                }
+            }
+
+            if let Some(auth_header) = profile.auth_header.as_deref().map(str::trim) {
+                if !auth_header.is_empty() {
+                    reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).with_context(
+                        || {
+                            format!(
+                                "model_providers.{profile_name}.auth_header is invalid; expected a valid HTTP header name"
+                            )
+                        },
+                    )?;
+
+                    if let Some(base_url) = normalized_base_url.as_deref() {
+                        custom_auth_headers_by_base_url.push((
+                            profile_name.to_string(),
+                            base_url.to_string(),
+                            auth_header.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for left_index in 0..custom_auth_headers_by_base_url.len() {
+            let (left_profile, left_url, left_header) =
+                &custom_auth_headers_by_base_url[left_index];
+            for right_index in (left_index + 1)..custom_auth_headers_by_base_url.len() {
+                let (right_profile, right_url, right_header) =
+                    &custom_auth_headers_by_base_url[right_index];
+                if Self::urls_match_ignoring_trailing_slash(left_url, right_url)
+                    && !left_header.eq_ignore_ascii_case(right_header)
+                {
+                    anyhow::bail!(
+                        "model_providers.{left_profile} and model_providers.{right_profile} define conflicting auth_header values for equivalent base_url {left_url}"
                     );
                 }
             }
@@ -9367,6 +9547,11 @@ impl Config {
             &store,
             &mut config_to_save.reliability.api_keys,
             "config.reliability.api_keys",
+        )?;
+        encrypt_map_secrets(
+            &store,
+            &mut config_to_save.reliability.fallback_api_keys,
+            "config.reliability.fallback_api_keys",
         )?;
         encrypt_vec_secrets(
             &store,
@@ -10652,6 +10837,10 @@ denied_tools = ["shell"]
         config.web_search.jina_api_key = Some("jina-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
+        config.reliability.fallback_api_keys.insert(
+            "custom:https://api-a.example.com/v1".into(),
+            "fallback-a-credential".into(),
+        );
         config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
         config.channels_config.telegram = Some(TelegramConfig {
             bot_token: "telegram-credential".into(),
@@ -10786,6 +10975,16 @@ denied_tools = ["shell"]
         let reliability_key = &stored.reliability.api_keys[0];
         assert!(crate::security::SecretStore::is_encrypted(reliability_key));
         assert_eq!(store.decrypt(reliability_key).unwrap(), "backup-credential");
+        let fallback_key = stored
+            .reliability
+            .fallback_api_keys
+            .get("custom:https://api-a.example.com/v1")
+            .expect("fallback key should exist");
+        assert!(crate::security::SecretStore::is_encrypted(fallback_key));
+        assert_eq!(
+            store.decrypt(fallback_key).unwrap(),
+            "fallback-a-credential"
+        );
 
         let paired_token = &stored.gateway.paired_tokens[0];
         assert!(crate::security::SecretStore::is_encrypted(paired_token));
@@ -12552,6 +12751,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: None,
                     api_key: None,
@@ -12573,6 +12773,105 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn model_provider_profile_surfaces_custom_auth_header_for_matching_custom_provider() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("azure".to_string()),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+            )
+        );
+        assert_eq!(
+            config.effective_custom_provider_auth_header().as_deref(),
+            Some("api-key")
+        );
+    }
+
+    #[test]
+    async fn model_provider_profile_custom_auth_header_requires_url_match() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("azure".to_string()),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/other-model/chat/completions?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        config.default_provider = Some(
+            "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                .to_string(),
+        );
+        assert!(config.effective_custom_provider_auth_header().is_none());
+    }
+
+    #[test]
+    async fn model_provider_profile_custom_auth_header_matches_slash_before_query() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                    .to_string(),
+            ),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions/?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.effective_custom_provider_auth_header().as_deref(),
+            Some("api-key")
+        );
+    }
+
+    #[test]
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12582,6 +12881,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue".to_string()),
+                    auth_header: None,
                     wire_api: Some("responses".to_string()),
                     default_model: None,
                     api_key: None,
@@ -12646,6 +12946,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: Some("ws".to_string()),
                     default_model: None,
                     api_key: None,
@@ -12662,6 +12963,77 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn validate_rejects_invalid_model_provider_auth_header() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: Some("not a header".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("auth_header is invalid"));
+    }
+
+    #[test]
+    async fn validate_rejects_conflicting_model_provider_auth_headers_for_same_base_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                    .to_string(),
+            ),
+            model_providers: HashMap::from([
+                (
+                    "azure_a".to_string(),
+                    ModelProviderConfig {
+                        name: Some("openai".to_string()),
+                        base_url: Some(
+                            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                                .to_string(),
+                        ),
+                        auth_header: Some("api-key".to_string()),
+                        wire_api: None,
+                        default_model: None,
+                        api_key: None,
+                        requires_openai_auth: false,
+                    },
+                ),
+                (
+                    "azure_b".to_string(),
+                    ModelProviderConfig {
+                        name: Some("openai".to_string()),
+                        base_url: Some(
+                            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions/?api-version=2024-02-01"
+                                .to_string(),
+                        ),
+                        auth_header: Some("x-api-key".to_string()),
+                        wire_api: None,
+                        default_model: None,
+                        api_key: None,
+                        requires_openai_auth: false,
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("conflicting auth_header values"));
+    }
+
+    #[test]
     async fn model_provider_profile_uses_profile_api_key_when_global_is_missing() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12672,6 +13044,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: None,
                     api_key: Some("profile-api-key".to_string()),
@@ -12696,6 +13069,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: Some("qwen-max".to_string()),
                     api_key: None,
@@ -14491,6 +14865,40 @@ sensitivity = 0.9
         assert!(err
             .to_string()
             .contains("security.url_access.enforce_domain_allowlist"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_empty_fallback_api_key_value() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("openrouter".to_string(), "   ".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys empty value validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.openrouter must not be empty"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_unmapped_fallback_api_key_entry() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("anthropic".to_string(), "sk-ant-test".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys mapping validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.anthropic has no matching entry"));
     }
 
     #[test]

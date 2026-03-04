@@ -46,6 +46,7 @@ Use named profiles to map a logical provider id to a provider name/base URL and 
 |---|---|---|
 | `name` | unset | Optional provider id override (for example `openai`, `openai-codex`) |
 | `base_url` | unset | Optional OpenAI-compatible endpoint URL |
+| `auth_header` | unset | Optional auth header for `custom:` endpoints (for example `api-key` for Azure OpenAI) |
 | `wire_api` | unset | Optional protocol mode: `responses` or `chat_completions` |
 | `model` | unset | Optional profile-scoped default model |
 | `api_key` | unset | Optional profile-scoped API key (used when top-level `api_key` is empty) |
@@ -55,6 +56,7 @@ Notes:
 
 - If both top-level `api_key` and profile `api_key` are present, top-level `api_key` wins.
 - If top-level `default_model` is still the global OpenRouter default, profile `model` is used as an automatic compatibility override.
+- `auth_header` is only applied when the resolved provider is `custom:<url>` and the profile `base_url` matches that custom URL.
 - Secrets encryption applies to profile API keys when `secrets.encrypt = true`.
 
 Example:
