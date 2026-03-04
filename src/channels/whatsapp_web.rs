@@ -960,19 +960,24 @@ impl Channel for WhatsAppWebChannel {
                                         );
                                         return;
                                     }
-                                } else if workspace_dir.is_none() {
-                                    tracing::debug!(
-                                        "WhatsApp Web: workspace_dir not configured, \
-                                         cannot save media from {}",
-                                        normalized
-                                    );
-                                    return;
                                 } else {
-                                    tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message \
-                                         from {}",
-                                        normalized
-                                    );
+                                    let has_media = msg.image_message.is_some()
+                                        || msg.document_message.is_some()
+                                        || msg.video_message.is_some()
+                                        || msg.sticker_message.is_some();
+                                    if has_media && workspace_dir.is_none() {
+                                        tracing::debug!(
+                                            "WhatsApp Web: workspace_dir not configured, \
+                                             cannot save media from {}",
+                                            normalized
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring empty or non-text message \
+                                             from {}",
+                                            normalized
+                                        );
+                                    }
                                     return;
                                 };
 
