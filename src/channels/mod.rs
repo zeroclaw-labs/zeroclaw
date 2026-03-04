@@ -4194,6 +4194,7 @@ fn collect_configured_channels(
                     dc.effective_group_reply_mode().requires_mention(),
                 )
                 .with_group_reply_allowed_senders(dc.group_reply_allowed_sender_ids())
+                .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
