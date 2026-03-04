@@ -319,3 +319,89 @@ async fn e2e_search_messages_with_query() {
         "messages should be an array"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires network + Telegram credentials"]
+async fn e2e_search_global_returns_results_from_multiple_chats() {
+    let result = run_telegram_reader(&[
+        "search_global",
+        "--query", "привет",
+        "--limit", "10",
+        "--dialogs-limit", "10"
+    ]).await;
+
+    // Validate JSON structure
+    assert_eq!(
+        result["success"], true,
+        "search_global should succeed, got: {result}"
+    );
+    assert!(
+        result["count"].is_number(),
+        "count should be a number"
+    );
+    assert!(
+        result["results"].is_array(),
+        "results should be an array"
+    );
+    assert!(
+        result["dialogs_scanned"].is_number(),
+        "dialogs_scanned should be a number"
+    );
+    assert_eq!(
+        result["query"], "привет",
+        "query should match the search term"
+    );
+
+    // Validate result structure if any found
+    if result["count"].as_u64().unwrap() > 0 {
+        let first_result = &result["results"][0];
+        assert!(
+            first_result["id"].is_number(),
+            "message id should be a number"
+        );
+        assert!(
+            first_result["date"].is_string(),
+            "message date should be a string"
+        );
+        assert!(
+            first_result["text"].is_string(),
+            "message text should be a string"
+        );
+        assert!(
+            first_result["chat"].is_object(),
+            "chat info should be an object"
+        );
+        assert!(
+            first_result["chat"]["name"].is_string(),
+            "chat name should be a string"
+        );
+        assert!(
+            first_result["chat"]["type"].is_string(),
+            "chat type should be a string"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires network + Telegram credentials"]
+async fn e2e_search_global_with_no_results_returns_empty() {
+    let result = run_telegram_reader(&[
+        "search_global",
+        "--query", "xyzqwertynonexistent12345",
+        "--limit", "5",
+        "--dialogs-limit", "5"
+    ]).await;
+
+    assert_eq!(
+        result["success"], true,
+        "search_global with no results should still succeed, got: {result}"
+    );
+    assert_eq!(
+        result["count"].as_u64().unwrap(), 0,
+        "count should be 0 when no results found"
+    );
+    assert!(
+        result["results"].as_array().unwrap().is_empty(),
+        "results array should be empty when no matches"
+    );
+}
