@@ -32,14 +32,15 @@
 
 備考：
 
-- `backend = "otel"` はブロッキングエクスポータークライアントを使用して OTLP HTTP エクスポートを行うため、非Tokio コンテキストからも安全に span と metric を送信できます。
+- `backend = "otel"` はブロッキングエクスポータークライアントを使用して OTLP HTTP エクスポートを行うため、非 Tokio コンテキストからも安全に span と metric を送信できます。
 - エイリアス値 `opentelemetry` と `otlp` は同じ OTel バックエンドにマッピングされます。
 - ランタイムトレースはツールコール失敗や不正なモデルツールペイロードのデバッグを目的としています。モデルの出力テキストが含まれる可能性があるため、共有ホストではデフォルトで無効にしてください。
 - `runtime_trace_record_http` は `runtime_trace_mode` が `rolling` または `full` の場合にのみ有効です。
-  - HTTP トレースペイロードは一般的な機密フィールド（例：Authorization ヘッダーや token のようなクエリ/本文フィールド）を編集しますが、trace ファイルは機密運用データとして扱ってください。
+  - HTTP トレースペイロードは一般的な機密フィールド（例：Authorization ヘッダーや token のようなクエリ/本文フィールド）をマスクしますが、trace ファイルは機密運用データとして扱ってください。
+  - ストリーミングリクエストでは、効率向上のためレスポンス本文の記録をスキップし、リクエスト本文のみを引き続き記録します（サイズ制限内）。
   - リクエスト/レスポンス/ヘッダー値は過大の場合に切り詰められます。ただし、大きなレスポンスを使用する高ボリューム LLM トラフィックは、メモリ使用量とトレースファイルサイズを急増させる可能性があります。
   - 本番環境では HTTP トレースを無効にすることを検討してください。
-- ランタイムトレースをクエリ：
+- ランタイムトレースを検索：
   - `zeroclaw doctor traces --limit 20`
   - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
   - `zeroclaw doctor traces --event llm_http_response --contains \"500\"`

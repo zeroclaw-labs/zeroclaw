@@ -56,9 +56,10 @@ Lưu ý:
 - Runtime traces dùng để debug tool-call failures và malformed model tool payloads. Có thể chứa model output text, nên giữ tắt mặc định trên shared hosts.
 - `runtime_trace_record_http` chỉ có hiệu lực khi `runtime_trace_mode` là `rolling` hoặc `full`.
   - HTTP trace payload ẩn các trường nhạy cảm phổ biến (ví dụ: tiêu đề Authorization và các trường query/body dạng token), nhưng vẫn coi tệp trace là dữ liệu vận hành nhạy cảm.
+  - Với yêu cầu streaming, để cải thiện hiệu quả, phần thân phản hồi sẽ được bỏ qua, trong khi phần thân yêu cầu vẫn được ghi lại (trong giới hạn kích thước).
   - Request/response/giá trị header bị cắt ngắn nếu quá lớn. Tuy nhiên, lưu lượng LLM cao với các phản hồi lớn vẫn có thể làm tăng đáng kể mức sử dụng bộ nhớ và kích thước tệp trace.
   - Cân nhắc tắt HTTP tracing trong môi trường sản xuất.
-- Query runtime traces với:
+- Truy vấn runtime trace bằng:
   - `zeroclaw doctor traces --limit 20`
   - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
   - `zeroclaw doctor traces --event llm_http_response --contains \"500\"`
