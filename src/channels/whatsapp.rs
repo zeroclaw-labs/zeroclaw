@@ -22,11 +22,47 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
 ///
 /// This Cloud API channel is automatically selected when `phone_number_id` is set in the config.
 /// Use `WhatsAppWebChannel` (with `session_path`) for native Web mode.
+/// Maximum file size for inbound WhatsApp Cloud API media downloads (20 MiB).
+const WA_CLOUD_MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Derive a file extension from a MIME type for incoming Cloud API media.
+fn wa_cloud_mime_to_ext(mime: &str) -> &str {
+    let base = mime.split(';').next().unwrap_or("").trim();
+    match base.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/3gpp" => "3gp",
+        "audio/ogg" | "audio/oga" => "ogg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/aac" => "m4a",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+/// Check whether a file path has a recognized image extension.
+fn wa_cloud_is_image_ext(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
     verify_token: String,
     allowed_numbers: Vec<String>,
+    /// Workspace directory for saving downloaded media attachments.
+    workspace_dir: Option<std::path::PathBuf>,
 }
 
 impl WhatsAppChannel {
@@ -41,7 +77,14 @@ impl WhatsAppChannel {
             endpoint_id,
             verify_token,
             allowed_numbers,
+            workspace_dir: None,
         }
+    }
+
+    /// Configure workspace directory for saving downloaded media attachments.
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -58,8 +101,162 @@ impl WhatsAppChannel {
         &self.verify_token
     }
 
-    /// Parse an incoming webhook payload from Meta and extract messages
-    pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+    /// Download media from WhatsApp Cloud API using a 2-step process:
+    /// 1. GET /v18.0/{media_id} → JSON with `url` field
+    /// 2. GET that URL with bearer token → binary data
+    async fn download_media_by_id(&self, media_id: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+        let meta_url = format!("https://graph.facebook.com/v18.0/{media_id}");
+        ensure_https(&meta_url)?;
+
+        let meta_resp = self
+            .http_client()
+            .get(&meta_url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+
+        if !meta_resp.status().is_success() {
+            let status = meta_resp.status();
+            anyhow::bail!("WhatsApp media metadata request failed: {status}");
+        }
+
+        let meta_json: serde_json::Value = meta_resp.json().await?;
+        let download_url = meta_json
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow::anyhow!("WhatsApp media response missing 'url' field"))?;
+        let mime_type = meta_json
+            .get("mime_type")
+            .and_then(|m| m.as_str())
+            .map(String::from);
+        let file_size = meta_json
+            .get("file_size")
+            .and_then(|s| s.as_u64());
+
+        if let Some(size) = file_size {
+            if size > WA_CLOUD_MAX_MEDIA_BYTES {
+                anyhow::bail!(
+                    "WhatsApp media too large ({size} bytes > {WA_CLOUD_MAX_MEDIA_BYTES})"
+                );
+            }
+        }
+
+        ensure_https(download_url)?;
+
+        let data_resp = self
+            .http_client()
+            .get(download_url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+
+        if !data_resp.status().is_success() {
+            let status = data_resp.status();
+            anyhow::bail!("WhatsApp media download failed: {status}");
+        }
+
+        let bytes = data_resp.bytes().await?.to_vec();
+        Ok((bytes, mime_type))
+    }
+
+    /// Try to download and save a media attachment from a webhook message.
+    /// Returns the formatted content string with `[IMAGE:]` or `[Document:]` markers,
+    /// or `None` if the message has no media or download fails.
+    async fn try_process_media_message(
+        &self,
+        msg: &serde_json::Value,
+        from: &str,
+    ) -> Option<String> {
+        let workspace = self.workspace_dir.as_ref()?;
+        let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        let (media_obj_key, default_ext, is_image_type) = match msg_type {
+            "image" => ("image", "jpg", true),
+            "document" => ("document", "bin", false),
+            "video" => ("video", "mp4", false),
+            "sticker" => ("sticker", "webp", true),
+            _ => return None,
+        };
+
+        let media_obj = msg.get(media_obj_key)?;
+        let media_id = media_obj.get("id").and_then(|i| i.as_str())?;
+        let caption = media_obj
+            .get("caption")
+            .and_then(|c| c.as_str())
+            .map(String::from);
+        let file_name = media_obj
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .map(String::from);
+        let mime_from_payload = media_obj
+            .get("mime_type")
+            .and_then(|m| m.as_str())
+            .map(String::from);
+
+        let (bytes, mime_from_download) = match self.download_media_by_id(media_id).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("WhatsApp: failed to download {msg_type} media {media_id}: {e}");
+                return None;
+            }
+        };
+
+        let mime = mime_from_payload
+            .as_deref()
+            .or(mime_from_download.as_deref());
+        let ext = if let Some(ref name) = file_name {
+            std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_else(|| mime.map(wa_cloud_mime_to_ext).unwrap_or(default_ext))
+        } else {
+            mime.map(wa_cloud_mime_to_ext).unwrap_or(default_ext)
+        };
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let save_filename = format!("wa_{msg_type}_{from}_{ts}.{ext}");
+        let save_dir = workspace.join("whatsapp_files");
+
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp: failed to create save dir: {e}");
+            return None;
+        }
+        let path = save_dir.join(&save_filename);
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::warn!("WhatsApp: failed to save {msg_type}: {e}");
+            return None;
+        }
+
+        tracing::info!(
+            "WhatsApp: saved inbound {msg_type} to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+
+        let display_name = file_name.as_deref().unwrap_or(&save_filename);
+        let mut content = if is_image_type || wa_cloud_is_image_ext(&path) {
+            format!("[IMAGE:{}]", path.display())
+        } else {
+            format!("[Document: {}] {}", display_name, path.display())
+        };
+
+        if let Some(ref cap) = caption {
+            if !cap.trim().is_empty() {
+                content = format!("{}\n\n{content}", cap.trim());
+            }
+        }
+
+        Some(content)
+    }
+
+    /// Parse an incoming webhook payload from Meta and extract messages.
+    ///
+    /// This method is async because media messages (image, document, video,
+    /// sticker) require downloading from the WhatsApp Cloud API.
+    pub async fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
         // WhatsApp Cloud API webhook structure:
@@ -105,16 +302,26 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Extract content: text messages directly, media messages
+                    // via download + [IMAGE:]/[Document:] markers.
                     let content = if let Some(text_obj) = msg.get("text") {
                         text_obj
                             .get("body")
                             .and_then(|b| b.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if let Some(media_content) =
+                        self.try_process_media_message(msg, from).await
+                    {
+                        media_content
                     } else {
-                        // Could be image, audio, etc. — skip for now
-                        tracing::debug!("WhatsApp: skipping non-text message from {from}");
+                        let msg_type = msg
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown");
+                        tracing::debug!(
+                            "WhatsApp: skipping unsupported message type '{msg_type}' from {from}"
+                        );
                         continue;
                     };
 
@@ -281,16 +488,16 @@ mod tests {
         assert!(!ch.is_number_allowed("+1234567890"));
     }
 
-    #[test]
-    fn whatsapp_parse_empty_payload() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_payload() {
         let ch = make_channel();
         let payload = serde_json::json!({});
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_valid_text_message() {
+    #[tokio::test]
+    async fn whatsapp_parse_valid_text_message() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "object": "whatsapp_business_account",
@@ -318,7 +525,7 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
@@ -326,8 +533,8 @@ mod tests {
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
     }
 
-    #[test]
-    fn whatsapp_parse_unauthorized_number() {
+    #[tokio::test]
+    async fn whatsapp_parse_unauthorized_number() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "object": "whatsapp_business_account",
@@ -345,12 +552,12 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Unauthorized numbers should be filtered");
     }
 
-    #[test]
-    fn whatsapp_parse_non_text_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_non_text_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -367,12 +574,12 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Non-text messages should be skipped");
     }
 
-    #[test]
-    fn whatsapp_parse_multiple_messages() {
+    #[tokio::test]
+    async fn whatsapp_parse_multiple_messages() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -387,14 +594,14 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "First");
         assert_eq!(msgs[1].content, "Second");
     }
 
-    #[test]
-    fn whatsapp_parse_normalizes_phone_with_plus() {
+    #[tokio::test]
+    async fn whatsapp_parse_normalizes_phone_with_plus() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -417,13 +624,13 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
     }
 
-    #[test]
-    fn whatsapp_empty_text_skipped() {
+    #[tokio::test]
+    async fn whatsapp_empty_text_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -440,7 +647,7 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
@@ -448,62 +655,62 @@ mod tests {
     // EDGE CASES — Comprehensive coverage
     // ══════════════════════════════════════════════════════════
 
-    #[test]
-    fn whatsapp_parse_missing_entry_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_entry_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "object": "whatsapp_business_account"
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_entry_not_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_entry_not_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": "not_an_array"
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_changes_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_changes_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{ "id": "123" }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_changes_not_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_changes_not_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": "not_an_array"
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_value() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_value() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{ "field": "messages" }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_messages_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_messages_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -514,12 +721,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_messages_not_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_messages_not_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -530,12 +737,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_from_field() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_from_field() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -550,12 +757,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Messages without 'from' should be skipped");
     }
 
-    #[test]
-    fn whatsapp_parse_missing_text_body() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_text_body() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -571,15 +778,15 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(
             msgs.is_empty(),
             "Messages with empty text object should be skipped"
         );
     }
 
-    #[test]
-    fn whatsapp_parse_null_text_body() {
+    #[tokio::test]
+    async fn whatsapp_parse_null_text_body() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -595,12 +802,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Messages with null body should be skipped");
     }
 
-    #[test]
-    fn whatsapp_parse_invalid_timestamp_uses_current() {
+    #[tokio::test]
+    async fn whatsapp_parse_invalid_timestamp_uses_current() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -616,14 +823,14 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         // Timestamp should be current time (non-zero)
         assert!(msgs[0].timestamp > 0);
     }
 
-    #[test]
-    fn whatsapp_parse_missing_timestamp_uses_current() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_timestamp_uses_current() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -638,13 +845,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].timestamp > 0);
     }
 
-    #[test]
-    fn whatsapp_parse_multiple_entries() {
+    #[tokio::test]
+    async fn whatsapp_parse_multiple_entries() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [
@@ -674,14 +881,14 @@ mod tests {
                 }
             ]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "Entry 1");
         assert_eq!(msgs[1].content, "Entry 2");
     }
 
-    #[test]
-    fn whatsapp_parse_multiple_changes() {
+    #[tokio::test]
+    async fn whatsapp_parse_multiple_changes() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -709,14 +916,14 @@ mod tests {
                 ]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "Change 1");
         assert_eq!(msgs[1].content, "Change 2");
     }
 
-    #[test]
-    fn whatsapp_parse_status_update_ignored() {
+    #[tokio::test]
+    async fn whatsapp_parse_status_update_ignored() {
         // Status updates have "statuses" instead of "messages"
         let ch = make_channel();
         let payload = serde_json::json!({
@@ -732,12 +939,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Status updates should be ignored");
     }
 
-    #[test]
-    fn whatsapp_parse_audio_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_audio_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -753,12 +960,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_video_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_video_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -774,12 +981,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_document_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_document_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -795,12 +1002,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_sticker_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_sticker_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -816,12 +1023,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_location_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_location_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -837,12 +1044,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_contacts_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_contacts_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -858,12 +1065,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_reaction_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_reaction_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -879,12 +1086,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_mixed_authorized_unauthorized() {
+    #[tokio::test]
+    async fn whatsapp_parse_mixed_authorized_unauthorized() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -904,14 +1111,14 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "Allowed");
         assert_eq!(msgs[1].content, "Also allowed");
     }
 
-    #[test]
-    fn whatsapp_parse_unicode_message() {
+    #[tokio::test]
+    async fn whatsapp_parse_unicode_message() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -927,13 +1134,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello 👋 世界 🌍 مرحبا");
     }
 
-    #[test]
-    fn whatsapp_parse_very_long_message() {
+    #[tokio::test]
+    async fn whatsapp_parse_very_long_message() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let long_text = "A".repeat(10_000);
         let payload = serde_json::json!({
@@ -950,13 +1157,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content.len(), 10_000);
     }
 
-    #[test]
-    fn whatsapp_parse_whitespace_only_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_whitespace_only_message_skipped() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -972,7 +1179,7 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         // Whitespace-only is NOT empty, so it passes through
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "   ");
@@ -1010,8 +1217,8 @@ mod tests {
         assert!(!ch.is_number_allowed("+1234567891"));
     }
 
-    #[test]
-    fn whatsapp_parse_phone_already_has_plus() {
+    #[tokio::test]
+    async fn whatsapp_parse_phone_already_has_plus() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1033,7 +1240,7 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
     }
@@ -1052,8 +1259,8 @@ mod tests {
         assert!(!ch.is_number_allowed("+333"));
     }
 
-    #[test]
-    fn whatsapp_parse_empty_messages_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_messages_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1064,34 +1271,34 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_empty_entry_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_entry_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": []
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_empty_changes_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_changes_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": []
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_newlines_preserved() {
+    #[tokio::test]
+    async fn whatsapp_parse_newlines_preserved() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -1107,13 +1314,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Line 1\nLine 2\nLine 3");
     }
 
-    #[test]
-    fn whatsapp_parse_special_characters() {
+    #[tokio::test]
+    async fn whatsapp_parse_special_characters() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
@@ -1129,11 +1336,82 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0].content,
             "<script>alert('xss')</script> & \"quotes\" 'apostrophe'"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // INBOUND MEDIA — Helper function tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn wa_cloud_mime_to_ext_known_types() {
+        assert_eq!(wa_cloud_mime_to_ext("image/jpeg"), "jpg");
+        assert_eq!(wa_cloud_mime_to_ext("image/png"), "png");
+        assert_eq!(wa_cloud_mime_to_ext("image/webp"), "webp");
+        assert_eq!(wa_cloud_mime_to_ext("image/gif"), "gif");
+        assert_eq!(wa_cloud_mime_to_ext("video/mp4"), "mp4");
+        assert_eq!(wa_cloud_mime_to_ext("video/3gpp"), "3gp");
+        assert_eq!(wa_cloud_mime_to_ext("audio/ogg"), "ogg");
+        assert_eq!(wa_cloud_mime_to_ext("audio/mpeg"), "mp3");
+        assert_eq!(wa_cloud_mime_to_ext("audio/mp4"), "m4a");
+        assert_eq!(wa_cloud_mime_to_ext("application/pdf"), "pdf");
+    }
+
+    #[test]
+    fn wa_cloud_mime_to_ext_unknown_fallback() {
+        assert_eq!(wa_cloud_mime_to_ext("application/octet-stream"), "bin");
+        assert_eq!(wa_cloud_mime_to_ext("text/plain"), "bin");
+        assert_eq!(wa_cloud_mime_to_ext(""), "bin");
+    }
+
+    #[test]
+    fn wa_cloud_mime_to_ext_with_params() {
+        assert_eq!(wa_cloud_mime_to_ext("image/jpeg; codecs=foo"), "jpg");
+        assert_eq!(wa_cloud_mime_to_ext("audio/ogg; codecs=opus"), "ogg");
+    }
+
+    #[test]
+    fn wa_cloud_is_image_ext_recognizes_images() {
+        assert!(wa_cloud_is_image_ext(std::path::Path::new("photo.png")));
+        assert!(wa_cloud_is_image_ext(std::path::Path::new("photo.jpg")));
+        assert!(wa_cloud_is_image_ext(std::path::Path::new("photo.jpeg")));
+        assert!(wa_cloud_is_image_ext(std::path::Path::new("photo.gif")));
+        assert!(wa_cloud_is_image_ext(std::path::Path::new("photo.webp")));
+        assert!(wa_cloud_is_image_ext(std::path::Path::new("PHOTO.PNG")));
+    }
+
+    #[test]
+    fn wa_cloud_is_image_ext_rejects_non_images() {
+        assert!(!wa_cloud_is_image_ext(std::path::Path::new("file.pdf")));
+        assert!(!wa_cloud_is_image_ext(std::path::Path::new("file.txt")));
+        assert!(!wa_cloud_is_image_ext(std::path::Path::new("file.mp4")));
+        assert!(!wa_cloud_is_image_ext(std::path::Path::new("file")));
+    }
+
+    #[tokio::test]
+    async fn whatsapp_media_skipped_without_workspace_dir() {
+        // Without workspace_dir, media messages should still be skipped
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "image",
+                            "image": { "id": "img123", "mime_type": "image/jpeg" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload).await;
+        assert!(msgs.is_empty(), "Media without workspace_dir should be skipped");
     }
 }

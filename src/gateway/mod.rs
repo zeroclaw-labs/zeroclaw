@@ -2059,7 +2059,7 @@ async fn handle_whatsapp_message(
     };
 
     // Parse messages from the webhook payload
-    let messages = wa.parse_webhook_payload(&payload);
+    let messages = wa.parse_webhook_payload(&payload).await;
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status updates)
