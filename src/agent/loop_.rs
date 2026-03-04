@@ -473,8 +473,9 @@ fn estimate_prompt_tokens(
 }
 
 fn apply_reserve_percent(tokens: u64, reserve_percent: u8) -> u64 {
-    let multiplier = 100_u64.saturating_add(u64::from(reserve_percent));
-    tokens.saturating_mul(multiplier).saturating_add(99) / 100
+    let multiplier = 100_u128 + u128::from(reserve_percent);
+    let adjusted = (u128::from(tokens) * multiplier + 99) / 100;
+    u64::try_from(adjusted).unwrap_or(u64::MAX)
 }
 
 fn lookup_model_pricing(
@@ -3792,6 +3793,16 @@ mod tests {
         );
 
         assert_eq!(args["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn apply_reserve_percent_rounds_up_for_regular_values() {
+        assert_eq!(apply_reserve_percent(101, 10), 112);
+    }
+
+    #[test]
+    fn apply_reserve_percent_clamps_large_overflowing_values() {
+        assert_eq!(apply_reserve_percent(u64::MAX, 100), u64::MAX);
     }
 
     #[test]

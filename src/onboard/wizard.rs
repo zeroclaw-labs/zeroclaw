@@ -34,7 +34,7 @@ use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -2557,14 +2557,30 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    if let Err(error) = crate::config::schema::persist_active_workspace_config_dir(config_dir).await {
-        tracing::warn!(
-            config_dir = %config_dir.display(),
-            error = %error,
-            "workspace selection marker persistence failed; continuing without marker update"
-        );
+    if let Err(error) = crate::config::schema::persist_active_workspace_config_dir(config_dir).await
+    {
+        if is_permission_denied_error(&error) {
+            tracing::warn!(
+                config_dir = %config_dir.display(),
+                error = %error,
+                "workspace selection marker persistence blocked by filesystem permissions; continuing without marker update"
+            );
+            return Ok(());
+        }
+        return Err(error.context(format!(
+            "Failed to persist workspace selection marker for {}",
+            config_dir.display()
+        )));
     }
     Ok(())
+}
+
+fn is_permission_denied_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::PermissionDenied)
+    })
 }
 
 // ── Step 1: Workspace ────────────────────────────────────────────
@@ -7156,6 +7172,18 @@ mod tests {
         );
         assert!(config.api_key.is_none());
         assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn permission_denied_detection_checks_error_chain() {
+        let permission_error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert!(is_permission_denied_error(&permission_error));
+
+        let other_error = anyhow::Error::new(std::io::Error::other("other"));
+        assert!(!is_permission_denied_error(&other_error));
     }
 
     #[tokio::test]
