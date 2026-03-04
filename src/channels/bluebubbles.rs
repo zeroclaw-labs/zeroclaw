@@ -816,7 +816,9 @@ impl BlueBubblesChannel {
             }
             Ok(None) => self.parse_webhook_payload(payload),
             Err(e) => {
-                tracing::warn!("BB audio transcription failed: {e}");
+                // Log the error class only; avoid embedding file paths or
+                // audio content details from the error chain.
+                tracing::warn!(error = %e, "BB audio transcription failed");
                 self.parse_webhook_payload(payload)
             }
         };

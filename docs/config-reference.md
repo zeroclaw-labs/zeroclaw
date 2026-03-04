@@ -1244,7 +1244,7 @@ BlueBubbles iMessage bridge — webhook receive + REST API send.
 | `dm_policy`          | Optional | `"open"` (default) \| `"allowlist"` \| `"disabled"` — gates direct messages                |
 | `group_policy`       | Optional | `"open"` (default) \| `"allowlist"` \| `"disabled"` — gates group chats                    |
 | `group_allow_from`   | Optional | Chat GUIDs allowed when `group_policy = "allowlist"`. Use `["*"]` for all groups           |
-| `send_read_receipts` | Optional | Post read receipt after each processed message. Default: `true`                            |
+| `send_read_receipts` | Optional | Send read receipt to the sender after each incoming message is processed. Default: `true`  |
 
 Notes:
 

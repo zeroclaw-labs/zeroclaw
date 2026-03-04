@@ -114,8 +114,21 @@ async fn transcribe_with_whisper_cpp(
     // Restrict to owner-only to protect temp audio content from other processes.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).await;
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = tokio::fs::set_permissions(
+            &out_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_dir_all(&out_dir).await;
+            if let Some(ref tmp) = caf_tmp {
+                let _ = tokio::fs::remove_file(tmp).await;
+            }
+            return Err(anyhow::anyhow!(
+                "Failed to restrict permissions on whisper-cli output dir: {e}"
+            ));
+        }
     }
     let stem = input_path
         .file_stem()
@@ -222,6 +235,20 @@ async fn transcribe_with_python_whisper(file_path: &str) -> anyhow::Result<Strin
     tokio::fs::create_dir_all(&tmp_dir)
         .await
         .context("Failed to create whisper temp dir")?;
+    // Restrict to owner-only before any output is written into it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = tokio::fs::set_permissions(
+            &tmp_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            anyhow::bail!("Failed to restrict permissions on Python whisper temp dir: {e}");
+        }
+    }
 
     let tmp_dir_str = match tmp_dir.to_str() {
         Some(s) => s,
