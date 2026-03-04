@@ -21,4 +21,4 @@ Source anglaise:
 
 - Ajout de `provider.reasoning_level` (OpenAI Codex `/responses`). Voir la source anglaise pour les détails.
 - Valeur par défaut de `agent.max_tool_iterations` augmentée à `20` (fallback sûr si `0`).
-- `[channels_config.bluebubbles]`: ajout de `dm_policy`, `group_policy`, `group_allow_from`, `send_read_receipts`, `require_mention_in_groups`, `mention_keyword`. Voir la source anglaise pour les détails.
+- `[channels_config.bluebubbles]`: ajout de `dm_policy`, `group_policy`, `group_allow_from`, `send_read_receipts`, `require_mention_in_groups`, `mention_keyword`, `groups`. Voir la source anglaise pour les détails.

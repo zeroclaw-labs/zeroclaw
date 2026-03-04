@@ -19,4 +19,4 @@
 
 ## Обновления
 
-- `[channels_config.bluebubbles]`: добавлены `dm_policy`, `group_policy`, `group_allow_from`, `send_read_receipts`, `require_mention_in_groups`, `mention_keyword`. Подробности в английском оригинале.
+- `[channels_config.bluebubbles]`: добавлены `dm_policy`, `group_policy`, `group_allow_from`, `send_read_receipts`, `require_mention_in_groups`, `mention_keyword`, `groups`. Подробности в английском оригинале.
