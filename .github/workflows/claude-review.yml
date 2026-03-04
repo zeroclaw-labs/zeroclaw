@@ -26,19 +26,23 @@ jobs:
       issues: write
       actions: read
     steps:
-      # For issue_comment events, checkout the PR head (not default branch)
+      # For issue_comment events, checkout the PR head by immutable SHA + repo
+      # to avoid mutable branch ref drift and fork repo ambiguity.
       - name: Resolve PR head ref
         id: pr-ref
         if: github.event_name == 'issue_comment' && github.event.issue.pull_request != null
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pr_head=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName -q '.headRefName')
-          echo "ref=$pr_head" >> "$GITHUB_OUTPUT"
+          pr_repo=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRepository -q '.headRepository.nameWithOwner')
+          pr_sha=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefOid -q '.headRefOid')
+          echo "repository=$pr_repo" >> "$GITHUB_OUTPUT"
+          echo "ref=$pr_sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ steps.pr-ref.outputs.ref || github.ref }}
+          repository: ${{ steps.pr-ref.outputs.repository || github.repository }}
+          ref: ${{ steps.pr-ref.outputs.ref || github.sha }}
           fetch-depth: 1
 
       - uses: anthropics/claude-code-action@220272d38887a1caed373da96a9ffdb0919c26cc # v1

@@ -329,11 +329,10 @@ impl BlueBubblesChannel {
             Err(e) => tracing::warn!("BlueBubbles mark_read failed: {}", e.without_url()),
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
                 if status.is_success() {
-                    tracing::info!("BlueBubbles mark_read ok status={status} body={body}");
+                    tracing::info!("BlueBubbles mark_read ok status={status}");
                 } else {
-                    tracing::warn!("BlueBubbles mark_read got {status} body={body}");
+                    tracing::warn!("BlueBubbles mark_read got {status}");
                 }
             }
         }
@@ -765,11 +764,13 @@ impl BlueBubblesChannel {
 
         // Start typing indicator before whisper runs — transcription can take >30 s
         // and without this the user sees no feedback during the slow CPU phase.
-        if let Some(chat_guid) = Self::extract_chat_guid(data) {
-            let _ = self.start_typing(&chat_guid).await;
+        // Capture guid once so we can stop typing on all exit paths.
+        let typing_guid = Self::extract_chat_guid(data).filter(|g| !g.is_empty());
+        if let Some(guid) = typing_guid.as_deref() {
+            let _ = self.start_typing(guid).await;
         }
 
-        match self.transcribe_local(&att).await {
+        let result = match self.transcribe_local(&att).await {
             Ok(Some(transcript)) => {
                 // Inject transcript as text; clear attachments so parse_webhook_payload
                 // skips the <media:audio> placeholder
@@ -813,7 +814,14 @@ impl BlueBubblesChannel {
                 tracing::warn!("BB audio transcription failed: {e}");
                 self.parse_webhook_payload(payload)
             }
+        };
+
+        // Stop typing on all transcription exit paths (success, None, or error).
+        if let Some(guid) = typing_guid.as_deref() {
+            let _ = self.stop_typing(guid).await;
         }
+
+        result
     }
 
     /// Parse a `type: "updated-message"` webhook for tapback reactions.
