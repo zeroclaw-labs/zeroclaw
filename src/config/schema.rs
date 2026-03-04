@@ -2888,6 +2888,12 @@ pub struct ReliabilityConfig {
     pub fallback_providers: Vec<String>,
     /// Optional per-fallback provider API keys keyed by fallback entry name.
     /// This allows distinct credentials for multiple `custom:<url>` endpoints.
+    ///
+    /// Contract:
+    /// - Default/omitted (`{}` via `#[serde(default)]`): no per-entry override is used.
+    /// - Compatibility: additive and non-breaking for existing configs that omit this field.
+    /// - Rollback/migration: remove this map (or specific entries) to revert to provider/env-based
+    ///   credential resolution.
     #[serde(default)]
     pub fallback_api_keys: std::collections::HashMap<String, String>,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
