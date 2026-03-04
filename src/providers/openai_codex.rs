@@ -74,6 +74,76 @@ impl std::fmt::Display for WebsocketRequestError {
 
 impl std::error::Error for WebsocketRequestError {}
 
+/// Timeout before any websocket event arrived.
+fn websocket_waiting_for_events_timeout_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "OpenAI Codex websocket stream timed out after {}s waiting for events",
+        CODEX_WS_READ_TIMEOUT.as_secs()
+    ))
+}
+
+/// Timeout after at least one websocket event but before any text output.
+fn websocket_no_response_before_timeout_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "No response from OpenAI Codex websocket stream before timeout"
+    ))
+}
+
+/// Websocket stream ended without any response text.
+fn websocket_no_response_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "No response from OpenAI Codex websocket stream"
+    ))
+}
+
+/// Normalizes explicit websocket frame/event failures to stream-classified errors.
+fn websocket_stream_classification_error<E>(error: E) -> WebsocketRequestError
+where
+    E: Into<anyhow::Error>,
+{
+    WebsocketRequestError::stream(error)
+}
+
+/// Classifies read-timeout state:
+/// - `Err` => no websocket events were observed (waiting-for-events timeout)
+/// - `Ok(false)` => timed out without any response text after at least one event
+/// - `Ok(true)` => timed out after response text signals were observed
+fn classify_websocket_read_timeout(
+    saw_any_event: bool,
+    saw_delta: bool,
+    has_fallback_text: bool,
+) -> Result<bool, WebsocketRequestError> {
+    if !saw_any_event {
+        Err(websocket_waiting_for_events_timeout_error())
+    } else if saw_delta || has_fallback_text {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Resolves terminal websocket state into either output text or a classified error.
+fn finalize_websocket_text(
+    saw_delta: bool,
+    delta_accumulator: &str,
+    fallback_text: Option<String>,
+    timed_out: bool,
+) -> Result<String, WebsocketRequestError> {
+    if saw_delta {
+        return nonempty_preserve(Some(delta_accumulator)).ok_or_else(|| {
+            WebsocketRequestError::stream(anyhow::anyhow!("No response from OpenAI Codex"))
+        });
+    }
+    if let Some(text) = fallback_text {
+        return Ok(text);
+    }
+    if timed_out {
+        return Err(websocket_no_response_before_timeout_error());
+    }
+
+    Err(websocket_no_response_error())
+}
+
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
@@ -785,52 +855,54 @@ impl OpenAiCodexProvider {
         let mut delta_accumulator = String::new();
         let mut fallback_text: Option<String> = None;
         let mut timed_out = false;
+        let mut saw_any_event = false;
 
         loop {
             let frame = match timeout(CODEX_WS_READ_TIMEOUT, ws_stream.next()).await {
                 Ok(frame) => frame,
                 Err(_) => {
                     let _ = ws_stream.close(None).await;
-                    if saw_delta || fallback_text.is_some() {
-                        timed_out = true;
-                        break;
-                    }
-                    return Err(WebsocketRequestError::stream(anyhow::anyhow!(
-                        "OpenAI Codex websocket stream timed out after {}s waiting for events",
-                        CODEX_WS_READ_TIMEOUT.as_secs()
-                    )));
+                    let timed_out_with_response = classify_websocket_read_timeout(
+                        saw_any_event,
+                        saw_delta,
+                        fallback_text.is_some(),
+                    )?;
+                    timed_out = !timed_out_with_response;
+                    break;
                 }
             };
 
             let Some(frame) = frame else {
                 break;
             };
-            let frame = frame.map_err(WebsocketRequestError::stream)?;
+            let frame = frame.map_err(websocket_stream_classification_error)?;
             let event: Value = match frame {
                 WsMessage::Text(text) => {
-                    serde_json::from_str(text.as_ref()).map_err(WebsocketRequestError::stream)?
+                    serde_json::from_str(text.as_ref())
+                        .map_err(websocket_stream_classification_error)?
                 }
                 WsMessage::Binary(binary) => {
                     let text = String::from_utf8(binary.to_vec()).map_err(|error| {
-                        WebsocketRequestError::stream(anyhow::anyhow!(
+                        websocket_stream_classification_error(anyhow::anyhow!(
                             "invalid UTF-8 websocket frame from OpenAI Codex: {error}"
                         ))
                     })?;
-                    serde_json::from_str(&text).map_err(WebsocketRequestError::stream)?
+                    serde_json::from_str(&text).map_err(websocket_stream_classification_error)?
                 }
                 WsMessage::Ping(payload) => {
                     ws_stream
                         .send(WsMessage::Pong(payload))
                         .await
-                        .map_err(WebsocketRequestError::stream)?;
+                        .map_err(websocket_stream_classification_error)?;
                     continue;
                 }
                 WsMessage::Close(_) => break,
                 _ => continue,
             };
+            saw_any_event = true;
 
             if let Some(message) = extract_stream_error_message(&event) {
-                return Err(WebsocketRequestError::stream(anyhow::anyhow!(
+                return Err(websocket_stream_classification_error(anyhow::anyhow!(
                     "OpenAI Codex websocket stream error: {message}"
                 )));
             }
@@ -860,7 +932,7 @@ impl OpenAiCodexProvider {
                 if saw_delta {
                     let _ = ws_stream.close(None).await;
                     return nonempty_preserve(Some(&delta_accumulator)).ok_or_else(|| {
-                        WebsocketRequestError::stream(anyhow::anyhow!(
+                        websocket_stream_classification_error(anyhow::anyhow!(
                             "No response from OpenAI Codex"
                         ))
                     });
@@ -872,23 +944,7 @@ impl OpenAiCodexProvider {
             }
         }
 
-        if saw_delta {
-            return nonempty_preserve(Some(&delta_accumulator)).ok_or_else(|| {
-                WebsocketRequestError::stream(anyhow::anyhow!("No response from OpenAI Codex"))
-            });
-        }
-        if let Some(text) = fallback_text {
-            return Ok(text);
-        }
-        if timed_out {
-            return Err(WebsocketRequestError::stream(anyhow::anyhow!(
-                "No response from OpenAI Codex websocket stream before timeout"
-            )));
-        }
-
-        Err(WebsocketRequestError::stream(anyhow::anyhow!(
-            "No response from OpenAI Codex websocket stream"
-        )))
+        finalize_websocket_text(saw_delta, &delta_accumulator, fallback_text, timed_out)
     }
 
     async fn send_responses_sse_request(
@@ -1588,6 +1644,51 @@ data: [DONE]
         assert_eq!(json[0]["type"], "input_text");
         assert_eq!(json[1]["type"], "input_image");
         assert_eq!(json[2]["type"], "input_image");
+    }
+
+    #[test]
+    fn websocket_initial_read_timeout_is_transport_unavailable() {
+        let err = classify_websocket_read_timeout(false, false, false)
+            .expect_err("no events before timeout should return transport-unavailable");
+        assert!(matches!(
+            err,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn websocket_timeout_after_non_text_event_has_no_response_signal() {
+        let timed_out_with_response = classify_websocket_read_timeout(true, false, false)
+            .expect("non-text events before timeout should classify without waiting-timeout");
+        assert!(!timed_out_with_response);
+    }
+
+    #[test]
+    fn websocket_no_response_before_timeout_is_transport_unavailable() {
+        let err = finalize_websocket_text(false, "", None, true)
+            .expect_err("timed out websocket without text should return transport-unavailable");
+        assert!(matches!(
+            err,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(err.to_string().contains("before timeout"));
+    }
+
+    #[test]
+    fn websocket_binary_decode_failure_remains_stream_error() {
+        let err = String::from_utf8(vec![0xFF])
+            .map(|_| ())
+            .map_err(|error| {
+                websocket_stream_classification_error(anyhow::anyhow!(
+                    "invalid UTF-8 websocket frame from OpenAI Codex: {error}"
+                ))
+            })
+            .expect_err("invalid websocket binary payload should be stream-classified");
+        assert!(matches!(err, WebsocketRequestError::Stream(_)));
+        assert!(err
+            .to_string()
+            .contains("invalid UTF-8 websocket frame from OpenAI Codex"));
     }
 
     #[test]
