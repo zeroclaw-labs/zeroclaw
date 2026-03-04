@@ -2584,11 +2584,16 @@ fn is_heartbeat_ok_sentinel(output: &str) -> bool {
     output.trim().eq_ignore_ascii_case(HEARTBEAT_OK)
 }
 
-pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+/// Sanitize channel response by removing tool artifacts and suppressing internal sentinels
+///
+/// Returns:
+/// - `Some(String)` - Normal sanitized response to send
+/// - `None` - Response should be suppressed entirely (e.g., HEARTBEAT_OK sentinel)
+pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> Option<String> {
     // Suppress HEARTBEAT_OK sentinel in channel replies (issue #2513)
     // This matches the daemon heartbeat path which already filters this sentinel
     if is_heartbeat_ok_sentinel(response) {
-        return String::new();
+        return None;
     }
 
     let without_tool_tags = strip_tool_call_tags(response);
@@ -2596,7 +2601,10 @@ pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>])
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(&without_tool_tags, &known_tool_names)
+    Some(strip_isolated_tool_json_artifacts(
+        &without_tool_tags,
+        &known_tool_names,
+    ))
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -3308,12 +3316,15 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty()
-                && !outbound_response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
+
+            // Skip delivery entirely for suppressed responses (e.g., HEARTBEAT_OK sentinel)
+            let delivered_response = match sanitized_response {
+                None => return Ok(()), // Suppress - don't send any message
+                Some(text) if text.is_empty() && !outbound_response.trim().is_empty() => {
+                    // Malformed tool-call output
+                    "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                }
+                Some(text) => text,
             };
             runtime_trace::record_event(
                 "channel_message_outbound",
@@ -9581,7 +9592,7 @@ This is an example JSON object for profile settings."#;
 {"result":{"symbol":"BTC","price_usd":65000}}
 BTC is currently around $65,000 based on latest tool output."#;
 
-        let result = sanitize_channel_response(input, &tools);
+        let result = sanitize_channel_response(input, &tools).expect("should return Some");
         let normalized = result
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -10161,27 +10172,27 @@ BTC is currently around $65,000 based on latest tool output."#;
         // Test for issue #2513: HEARTBEAT_OK should be suppressed in channel replies
         let tools: Vec<Box<dyn Tool>> = Vec::new();
 
-        // Exact match
+        // Exact match - should return None (suppress)
         let result = sanitize_channel_response("HEARTBEAT_OK", &tools);
-        assert_eq!(
-            result, "",
-            "HEARTBEAT_OK should be suppressed to empty string"
-        );
+        assert!(result.is_none(), "HEARTBEAT_OK should be suppressed (None)");
 
-        // With whitespace
+        // With whitespace - should return None (suppress)
         let result = sanitize_channel_response("  HEARTBEAT_OK  \n", &tools);
-        assert_eq!(
-            result, "",
+        assert!(
+            result.is_none(),
             "HEARTBEAT_OK with whitespace should be suppressed"
         );
 
-        // Case insensitive
+        // Case insensitive - should return None (suppress)
         let result = sanitize_channel_response("heartbeat_ok", &tools);
-        assert_eq!(result, "", "heartbeat_ok (lowercase) should be suppressed");
+        assert!(
+            result.is_none(),
+            "heartbeat_ok (lowercase) should be suppressed"
+        );
 
         // Normal text should pass through
         let result = sanitize_channel_response("Normal message", &tools);
-        assert_eq!(result, "Normal message");
+        assert_eq!(result, Some("Normal message".to_string()));
     }
 
     #[test]
