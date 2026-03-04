@@ -1,6 +1,6 @@
 use crate::channels::{
     Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
-    TelegramChannel,
+    TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -386,6 +386,39 @@ pub(crate) async fn deliver_announcement(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
             let channel = EmailChannel::new(email.clone());
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "whatsapp" => {
+            let wa = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+            if !wa.is_cloud_config() {
+                anyhow::bail!(
+                    "whatsapp delivery requires Cloud API config (phone_number_id, access_token, verify_token)"
+                );
+            }
+
+            let access_token = wa
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp access_token missing"))?;
+            let phone_number_id = wa
+                .phone_number_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp phone_number_id missing"))?;
+            let verify_token = wa
+                .verify_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp verify_token missing"))?;
+
+            let channel = WhatsAppChannel::new(
+                access_token,
+                phone_number_id,
+                verify_token,
+                wa.allowed_numbers.clone(),
+            );
             channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
@@ -1069,5 +1102,16 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_whatsapp_requires_channel_configuration() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+
+        let err = deliver_announcement(&config, "whatsapp", "+1234567890", "hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("whatsapp channel not configured"));
     }
 }

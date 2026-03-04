@@ -56,7 +56,7 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Email), set \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Email, WhatsApp), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -80,7 +80,7 @@ impl Tool for CronAddTool {
                     "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "email"], "description": "Channel type to deliver to" },
+                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "email", "whatsapp"], "description": "Channel type to deliver to" },
                         "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }
@@ -312,6 +312,26 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_whatsapp_channel() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+
+        let channels = schema
+            .pointer("/properties/delivery/properties/channel/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("delivery channel enum should exist");
+
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.as_str() == Some("whatsapp")),
+            "delivery channel enum should include whatsapp"
+        );
     }
 
     #[tokio::test]
