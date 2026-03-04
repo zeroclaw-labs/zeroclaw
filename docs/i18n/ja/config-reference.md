@@ -18,6 +18,15 @@
 - 実行時挙動の定義は英語版原文を優先します。
 - 追加キー: `observability.runtime_trace_record_http`（LLM の HTTP リクエスト/レスポンス詳細を `llm_http_request` / `llm_http_response` として記録）。デフォルト値 `false`、`runtime_trace_mode` が `rolling` または `full` の場合のみ有効。ペイロードは機密フィールドをマスクしますが、trace ファイルは機密運用データの扱いが必要です。リクエスト/レスポンス/ヘッダーはサイズ超過で切り捨てられます。本番環境では無効化を検討してください。詳細は英語版を参照してください。
 
+## 更新ノート（2026-03-03）
+
+- `[agent]` に `allowed_tools` / `denied_tools` が追加されました。
+  - `allowed_tools` が空でない場合、メインエージェントには許可リストのツールのみ公開されます。
+  - `denied_tools` は許可リスト適用後に追加でツールを除外します。
+- `allowed_tools` の未一致エントリは起動失敗にせず、debug ログのみ出力されます。
+- `allowed_tools` と `denied_tools` の組み合わせで実行可能ツールが 0 件になる場合は、明確な設定エラーで fail-fast します。
+- 詳細な表と例は英語版 `config-reference.md` の `[agent]` セクションを参照してください。
+
 ## `[observability]`
 
 | キー | デフォルト | 目的 |

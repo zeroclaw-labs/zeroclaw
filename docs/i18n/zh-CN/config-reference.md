@@ -18,6 +18,15 @@
 - 生产行为以英文原文定义为准。
 - 新增配置：`observability.runtime_trace_record_http`，用于记录 LLM HTTP 请求/响应明细（`llm_http_request` / `llm_http_response`），默认值 `false`，仅在 `runtime_trace_mode` 为 `rolling` 或 `full` 时生效。Payload 会脱敏敏感字段，但 trace 文件仍属敏感数据。请求/响应/头部过大时会被截断。生产环境建议禁用，详见英文原文。
 
+## 更新说明（2026-03-03）
+
+- `[agent]` 新增 `allowed_tools` 与 `denied_tools`：
+  - `allowed_tools` 非空时，只向主代理暴露白名单工具。
+  - `denied_tools` 在白名单过滤后继续移除工具。
+- 未匹配的 `allowed_tools` 项会被跳过（调试日志提示），不会导致启动失败。
+- 若同时配置 `allowed_tools` 与 `denied_tools` 且最终将可执行工具全部移除，启动会快速失败并给出明确错误。
+- 详细字段表与示例见英文原文 `config-reference.md` 的 `[agent]` 小节。
+
 ## `[observability]`
 
 | 键 | 默认值 | 用途 |

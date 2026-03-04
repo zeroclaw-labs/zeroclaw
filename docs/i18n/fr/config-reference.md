@@ -22,6 +22,11 @@ Source anglaise:
 - Ajout de `provider.reasoning_level` (OpenAI Codex `/responses`). Voir la source anglaise pour les détails.
 - Valeur par défaut de `agent.max_tool_iterations` augmentée à `20` (fallback sûr si `0`).
 - Ajout de `observability.runtime_trace_record_http` pour tracer les détails HTTP LLM (`llm_http_request` / `llm_http_response`) ; par défaut `false` ; effet uniquement lorsque `runtime_trace_mode` est `rolling` ou `full`. Les payloads masquent des champs sensibles, mais les fichiers de trace restent des données opérationnelles sensibles. Les requêtes/réponses/en-têtes sont tronqués s'ils sont trop grands. Envisagez de désactiver en production. Référence canonique: `docs/config-reference.md`.
+- Ajout de `agent.allowed_tools` et `agent.denied_tools` pour filtrer les outils visibles par l'agent principal.
+  - `allowed_tools` non vide: seuls les outils listés sont exposés.
+  - `denied_tools`: retrait supplémentaire appliqué après `allowed_tools`.
+- Les entrées inconnues dans `allowed_tools` sont ignorées (log debug), sans échec de démarrage.
+- Si `allowed_tools` + `denied_tools` suppriment tous les outils exécutables, le démarrage échoue immédiatement avec une erreur de configuration claire.
 
 ## `[observability]`
 

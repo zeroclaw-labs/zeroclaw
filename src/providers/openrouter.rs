@@ -383,10 +383,7 @@ impl Provider for OpenRouterProvider {
             self.http_client()
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "HTTP-Referer",
-                    "https://github.com/theonlyhennygod/zeroclaw",
-                )
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
                 .json(&request),
         )
@@ -435,10 +432,7 @@ impl Provider for OpenRouterProvider {
             self.http_client()
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "HTTP-Referer",
-                    "https://github.com/theonlyhennygod/zeroclaw",
-                )
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
                 .json(&request),
         )
@@ -485,10 +479,7 @@ impl Provider for OpenRouterProvider {
             self.http_client()
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "HTTP-Referer",
-                    "https://github.com/theonlyhennygod/zeroclaw",
-                )
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
                 .json(&native_request),
         )
@@ -580,10 +571,7 @@ impl Provider for OpenRouterProvider {
             self.http_client()
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "HTTP-Referer",
-                    "https://github.com/theonlyhennygod/zeroclaw",
-                )
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
                 .json(&native_request),
         )
