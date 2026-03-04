@@ -1005,4 +1005,44 @@ mod tests {
             "error should reference the 302 status: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn redirect_301_to_200_returns_body() {
+        // Regression: before the fix, fetch() returned the redirect URL rather
+        // than the final response body. Ensure a single 301→200 hop yields the
+        // target body content.
+        let port_b = spawn_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nfinal body",
+        )
+        .await;
+
+        let response_a = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:{port_b}/final\r\nContent-Length: 0\r\n\r\n"
+        );
+        let port_a = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        stream.read(&mut buf),
+                    )
+                    .await;
+                    let _ = stream.write_all(response_a.as_bytes()).await;
+                }
+            });
+            port
+        };
+
+        let tool = test_tool_loopback();
+        let result = tool
+            .fetch_with_http_provider(&format!("http://127.0.0.1:{port_a}/start"))
+            .await;
+
+        let body = result.expect("301→200 redirect should succeed");
+        assert_eq!(body, "final body", "body should be the final response content, not the redirect URL");
+    }
 }
