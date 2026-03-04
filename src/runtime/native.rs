@@ -84,6 +84,12 @@ where
             ("cmd.exe", ShellKind::Cmd),
         ] {
             if let Some(program) = resolve(name) {
+                // Windows may expose `C:\Windows\System32\bash.exe`, a legacy
+                // WSL launcher that executes commands inside Linux userspace.
+                // That breaks native Windows commands like `ipconfig`.
+                if name == "bash" && is_windows_wsl_bash_launcher(&program) {
+                    continue;
+                }
                 return Some(ShellProgram { kind, program });
             }
         }
@@ -102,6 +108,15 @@ where
         }
     }
     None
+}
+
+fn is_windows_wsl_bash_launcher(program: &Path) -> bool {
+    let normalized = program
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    normalized.ends_with("\\windows\\system32\\bash.exe")
+        || normalized.ends_with("\\windows\\sysnative\\bash.exe")
 }
 
 fn missing_shell_error() -> &'static str {
@@ -266,6 +281,59 @@ mod tests {
         )
         .expect("cmd fallback should be detected");
         assert_eq!(cmd_shell.kind, ShellKind::Cmd);
+    }
+
+    #[test]
+    fn detect_shell_windows_skips_system32_bash_wsl_launcher() {
+        let mut map = HashMap::new();
+        map.insert("bash", r"C:\Windows\System32\bash.exe");
+        map.insert(
+            "powershell",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        );
+        map.insert("cmd", r"C:\Windows\System32\cmd.exe");
+
+        let shell = detect_native_shell_with(
+            true,
+            |name| map.get(name).map(PathBuf::from),
+            Some(PathBuf::from(r"C:\Windows\System32\cmd.exe")),
+        )
+        .expect("windows shell should be detected");
+
+        assert_eq!(shell.kind, ShellKind::PowerShell);
+        assert_eq!(
+            shell.program,
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
+    }
+
+    #[test]
+    fn detect_shell_windows_uses_cmd_when_only_wsl_bash_exists() {
+        let mut map = HashMap::new();
+        map.insert("bash", r"C:\Windows\Sysnative\bash.exe");
+
+        let shell = detect_native_shell_with(
+            true,
+            |name| map.get(name).map(PathBuf::from),
+            Some(PathBuf::from(r"C:\Windows\System32\cmd.exe")),
+        )
+        .expect("cmd fallback should be detected");
+
+        assert_eq!(shell.kind, ShellKind::Cmd);
+        assert_eq!(shell.program, PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+    }
+
+    #[test]
+    fn wsl_launcher_detection_matches_known_paths() {
+        assert!(is_windows_wsl_bash_launcher(Path::new(
+            r"C:\Windows\System32\bash.exe"
+        )));
+        assert!(is_windows_wsl_bash_launcher(Path::new(
+            r"C:\Windows\Sysnative\bash.exe"
+        )));
+        assert!(!is_windows_wsl_bash_launcher(Path::new(
+            r"C:\Program Files\Git\bin\bash.exe"
+        )));
     }
 
     #[test]
