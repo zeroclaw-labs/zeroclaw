@@ -2,7 +2,7 @@ name: CI Queue Hygiene
 
 on:
     schedule:
-        - cron: "*/5 * * * *"
+        - cron: "15 3 * * *"
     workflow_dispatch:
         inputs:
             apply:
