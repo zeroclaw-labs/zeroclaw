@@ -11826,14 +11826,20 @@ BTC is currently around $65,000 based on latest tool output."#;
         let ChannelSanitizationResult::Sanitized(result) = result else {
             panic!("expected sanitized output");
         };
-        assert_eq!(result, "", "HEARTBEAT_OK should be suppressed to empty string");
+        assert_eq!(
+            result, "",
+            "HEARTBEAT_OK should be suppressed to empty string"
+        );
 
         // With whitespace
         let result = sanitize_channel_response("  HEARTBEAT_OK  \n", &tools, &leak_guard);
         let ChannelSanitizationResult::Sanitized(result) = result else {
             panic!("expected sanitized output");
         };
-        assert_eq!(result, "", "HEARTBEAT_OK with whitespace should be suppressed");
+        assert_eq!(
+            result, "",
+            "HEARTBEAT_OK with whitespace should be suppressed"
+        );
 
         // Case insensitive
         let result = sanitize_channel_response("heartbeat_ok", &tools, &leak_guard);
