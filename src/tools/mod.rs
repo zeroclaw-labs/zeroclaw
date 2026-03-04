@@ -640,7 +640,12 @@ pub fn all_tools_with_runtime(
         let server_url = bb.server_url.trim().to_string();
         // Keep raw password for auth; trim only to check for empty.
         let password = bb.password.clone();
-        if !server_url.is_empty() && !password.trim().is_empty() {
+        if server_url.is_empty() || password.trim().is_empty() {
+            tracing::warn!(
+                "BlueBubbles channel section present but server_url or password is empty \
+                 — BB tools will not be registered. Check your configuration."
+            );
+        } else {
             match BlueBubblesGroupTool::new(security.clone(), server_url.clone(), password.clone())
             {
                 Ok(tool) => tool_arcs.push(Arc::new(tool)),

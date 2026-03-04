@@ -2707,6 +2707,7 @@ mod tests {
         mode: Option<BlueBubblesChunkMode>,
     ) -> BlueBubblesChannel {
         BlueBubblesChannel::new("http://localhost".into(), "pw".into(), vec![], vec![])
+            .expect("BlueBubblesChannel::new should not fail with valid args")
             .with_chunking(limit, mode)
     }
 
@@ -2751,9 +2752,9 @@ mod tests {
     }
 
     #[test]
-    fn chunk_content_length_splits_at_word_boundary() {
+    fn chunk_content_length_splits_at_whitespace_boundary() {
         let ch = ch_with_chunking(Some(5), Some(BlueBubblesChunkMode::Length));
-        // "hello world" → "hello" (5), "world" (5)
+        // "hello world" → "hello" (5 chars), "world" (5 chars)
         let chunks = ch.chunk_content("hello world");
         assert_eq!(chunks, vec!["hello", "world"]);
     }
