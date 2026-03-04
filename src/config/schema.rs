@@ -405,6 +405,13 @@ pub struct ModelProviderConfig {
     pub base_url: Option<String>,
     /// Optional custom authentication header for `custom:` providers
     /// (for example `api-key` for Azure OpenAI).
+    ///
+    /// Contract:
+    /// - Default/omitted (`None`): uses the standard `Authorization: Bearer <token>` header.
+    /// - Compatibility: this key is additive and optional; older runtimes that do not support it
+    ///   ignore the field while continuing to use Bearer auth behavior.
+    /// - Rollback/migration: remove `auth_header` to return to Bearer-only auth if operators
+    ///   need to downgrade or revert custom-header behavior.
     #[serde(default)]
     pub auth_header: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
