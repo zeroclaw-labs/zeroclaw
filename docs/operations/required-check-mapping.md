@@ -7,9 +7,14 @@ This document maps merge-critical workflows to expected check names.
 | Required check name | Source workflow | Scope |
 | --- | --- | --- |
 | `CI Required Gate` | `.github/workflows/ci-run.yml` | core Rust/doc merge gate |
-| `Security Audit` | `.github/workflows/sec-audit.yml` | dependencies, secrets, governance |
-| `Feature Matrix Summary` | `.github/workflows/feature-matrix.yml` | feature-combination compile matrix |
-| `Workflow Sanity` | `.github/workflows/workflow-sanity.yml` | workflow syntax and lint |
+| `Security Required Gate` | `.github/workflows/sec-audit.yml` | aggregated security merge gate |
+
+Supplemental monitors (non-blocking unless added to branch protection contexts):
+
+- `CI Change Audit` (`.github/workflows/ci-change-audit.yml`)
+- `CodeQL Analysis` (`.github/workflows/sec-codeql.yml`)
+- `Workflow Sanity` (`.github/workflows/workflow-sanity.yml`)
+- `Feature Matrix Summary` (`.github/workflows/feature-matrix.yml`)
 
 Feature matrix lane check names (informational, non-required):
 
@@ -28,12 +33,14 @@ Feature matrix lane check names (informational, non-required):
 
 ## Verification Procedure
 
-1. Resolve latest workflow run IDs:
+1. Check active branch protection required contexts:
+   - `gh api repos/zeroclaw-labs/zeroclaw/branches/main/protection --jq '.required_status_checks.contexts[]'`
+2. Resolve latest workflow run IDs:
    - `gh run list --repo zeroclaw-labs/zeroclaw --workflow feature-matrix.yml --limit 1`
    - `gh run list --repo zeroclaw-labs/zeroclaw --workflow ci-run.yml --limit 1`
-2. Enumerate check/job names and compare to this mapping:
+3. Enumerate check/job names and compare to this mapping:
    - `gh run view <run_id> --repo zeroclaw-labs/zeroclaw --json jobs --jq '.jobs[].name'`
-3. If any merge-critical check name changed, update this file before changing branch protection policy.
+4. If any merge-critical check name changed, update this file before changing branch protection policy.
 
 ## Notes
 
