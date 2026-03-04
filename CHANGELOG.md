@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value if the input used the legacy `enc:` format
 - `SecretStore::needs_migration()` — Check if a value uses the legacy `enc:` format
 - `SecretStore::is_secure_encrypted()` — Check if a value uses the secure `enc2:` format
+- `feishu_doc` tool — Feishu/Lark document operations (`read`, `write`, `append`, `create`, `list_blocks`, `get_block`, `update_block`, `delete_block`, `create_table`, `write_table_cells`, `create_table_with_values`, `upload_image`, `upload_file`)
+- Agent session persistence guidance now includes explicit backend/strategy/TTL key names for rollout notes.
 - **Telegram mention_only mode** — New config option `mention_only` for Telegram channel.
   When enabled, bot only responds to messages that @-mention the bot in group chats.
   Direct messages always work regardless of this setting. Default: `false`.
@@ -27,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
 ### Fixed
+
 - **Gemini thinking model support** — Responses from thinking models (e.g. `gemini-3-pro-preview`)
   are now handled correctly. The provider skips internal reasoning parts (`thought: true`) and
   signature parts (`thoughtSignature`), extracting only the final answer text. Falls back to
@@ -64,4 +67,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace escape prevention
 - Forbidden system path protection (`/etc`, `/root`, `~/.ssh`)
 
-[0.1.0]: https://github.com/theonlyhennygod/zeroclaw/releases/tag/v0.1.0
+[0.1.0]: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/v0.1.0

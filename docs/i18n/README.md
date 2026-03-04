@@ -26,12 +26,6 @@ Narrative depth status: **enhanced bridge rollout completed for `zh-CN`/`ja`/`ru
   - `docs/i18n/el/`
 - Docs-root compatibility shims are limited to paths like `docs/SUMMARY.<locale>.md` when retained.
 
-## Structure
-
-- Docs structure map (language/part/function): [../structure/README.md](../structure/README.md)
-- Canonical Vietnamese tree: `docs/i18n/vi/`
-- Compatibility Vietnamese paths: `docs/vi/` and `docs/*.vi.md`
-
 See overall coverage and conventions in [../i18n-coverage.md](../i18n-coverage.md).
 See remaining localization depth gaps in [../i18n-gap-backlog.md](../i18n-gap-backlog.md).
 For required execution steps, use [../i18n-guide.md](../i18n-guide.md).

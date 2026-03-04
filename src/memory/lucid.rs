@@ -34,7 +34,14 @@ impl LucidMemory {
     pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
         let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD")
             .unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
+        Self::new_with_command(workspace_dir, local, lucid_cmd)
+    }
 
+    pub(crate) fn new_with_command(
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        lucid_cmd: String,
+    ) -> Self {
         let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())

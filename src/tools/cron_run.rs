@@ -116,7 +116,8 @@ impl Tool for CronRunTool {
         }
 
         let started_at = Utc::now();
-        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job).await;
+        let (success, output) =
+            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         let status = if success { "ok" } else { "error" };

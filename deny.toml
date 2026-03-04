@@ -15,6 +15,8 @@ ignore = [
     # derivative v2.2.0 via wasm_evt_listener -> matrix_indexed_db_futures -> matrix-sdk-indexeddb.
     # This chain is transitive under matrix-sdk's IndexedDB integration path; matrix-sdk remains pinned to 0.16 in current release line.
     { id = "RUSTSEC-2024-0388", reason = "Transitive via matrix-sdk indexeddb dependency chain; tracked until matrix-sdk ecosystem removes derivative." },
+    # paste v1.0.15 via wasmtime runtime stack.
+    { id = "RUSTSEC-2024-0436", reason = "Transitive via wasmtime dependency stack; tracked until upstream removes or replaces paste." },
 ]
 
 [licenses]

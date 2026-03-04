@@ -103,6 +103,9 @@ pub fn build_quota_summary(
                 rate_limit_remaining,
                 rate_limit_reset_at,
                 rate_limit_total,
+                account_id: profile.account_id.clone(),
+                token_expires_at: profile.token_set.as_ref().and_then(|ts| ts.expires_at),
+                plan_type: profile.metadata.get("plan_type").cloned(),
             });
     }
 
@@ -377,7 +380,14 @@ fn add_qwen_oauth_static_quota(
     provider_filter: Option<&str>,
 ) -> Result<()> {
     // Check if qwen-code or qwen-oauth is requested
-    let qwen_aliases = ["qwen", "qwen-code", "qwen-oauth", "qwen_oauth", "dashscope"];
+    let qwen_aliases = [
+        "qwen",
+        "qwen-coding-plan",
+        "qwen-code",
+        "qwen-oauth",
+        "qwen_oauth",
+        "dashscope",
+    ];
     let should_add_qwen = provider_filter
         .map(|f| qwen_aliases.contains(&f))
         .unwrap_or(true); // If no filter, always try to add
@@ -414,9 +424,12 @@ fn add_qwen_oauth_static_quota(
         profiles: vec![ProfileQuotaInfo {
             profile_name: "OAuth (portal.qwen.ai)".to_string(),
             status: QuotaStatus::Ok,
-            rate_limit_remaining: None, // Unknown without local tracking
-            rate_limit_reset_at: None,  // Daily reset (exact time unknown)
+            rate_limit_remaining: None,   // Unknown without local tracking
+            rate_limit_reset_at: None,    // Daily reset (exact time unknown)
             rate_limit_total: Some(1000), // OAuth free tier limit
+            account_id: None,
+            token_expires_at: None,
+            plan_type: Some("free".to_string()),
         }],
     });
 

@@ -1,25 +1,54 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use reqwest::header::HeaderMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+#[derive(Clone)]
+struct CachedSlackDisplayName {
+    display_name: String,
+    expires_at: Instant,
+}
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
     bot_token: String,
+    app_token: Option<String>,
     channel_id: Option<String>,
+    channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
+    user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
 }
 
+const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
+const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
+const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
+const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
+const SLACK_USER_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bot_token: String,
+        app_token: Option<String>,
+        channel_id: Option<String>,
+        channel_ids: Vec<String>,
+        allowed_users: Vec<String>,
+    ) -> Self {
         Self {
             bot_token,
+            app_token,
             channel_id,
+            channel_ids,
             allowed_users,
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
+            user_display_name_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -95,6 +124,30 @@ impl SlackChannel {
         Self::normalized_channel_id(self.channel_id.as_deref())
     }
 
+    /// Resolve the effective channel scope:
+    /// explicit `channel_ids` list first, then single `channel_id`, otherwise wildcard discovery.
+    fn scoped_channel_ids(&self) -> Option<Vec<String>> {
+        let mut seen = HashSet::new();
+        let ids: Vec<String> = self
+            .channel_ids
+            .iter()
+            .filter_map(|entry| Self::normalized_channel_id(Some(entry)))
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+        self.configured_channel_id().map(|id| vec![id])
+    }
+
+    fn configured_app_token(&self) -> Option<String> {
+        self.app_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
         let mut normalized = sender_ids
             .into_iter()
@@ -104,6 +157,137 @@ impl SlackChannel {
         normalized.sort();
         normalized.dedup();
         normalized
+    }
+
+    fn user_cache_ttl() -> Duration {
+        Duration::from_secs(SLACK_USER_CACHE_TTL_SECS)
+    }
+
+    fn sanitize_display_name(name: &str) -> Option<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn extract_user_display_name(payload: &serde_json::Value) -> Option<String> {
+        let user = payload.get("user")?;
+        let profile = user.get("profile");
+
+        let candidates = [
+            profile
+                .and_then(|p| p.get("display_name"))
+                .and_then(|v| v.as_str()),
+            profile
+                .and_then(|p| p.get("display_name_normalized"))
+                .and_then(|v| v.as_str()),
+            profile
+                .and_then(|p| p.get("real_name_normalized"))
+                .and_then(|v| v.as_str()),
+            profile
+                .and_then(|p| p.get("real_name"))
+                .and_then(|v| v.as_str()),
+            user.get("real_name").and_then(|v| v.as_str()),
+            user.get("name").and_then(|v| v.as_str()),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            if let Some(display_name) = Self::sanitize_display_name(candidate) {
+                return Some(display_name);
+            }
+        }
+
+        None
+    }
+
+    fn cached_sender_display_name(&self, user_id: &str) -> Option<String> {
+        let now = Instant::now();
+        let Ok(mut cache) = self.user_display_name_cache.lock() else {
+            return None;
+        };
+
+        if let Some(entry) = cache.get(user_id) {
+            if now <= entry.expires_at {
+                return Some(entry.display_name.clone());
+            }
+        }
+
+        cache.remove(user_id);
+        None
+    }
+
+    fn cache_sender_display_name(&self, user_id: &str, display_name: &str) {
+        let Ok(mut cache) = self.user_display_name_cache.lock() else {
+            return;
+        };
+        cache.insert(
+            user_id.to_string(),
+            CachedSlackDisplayName {
+                display_name: display_name.to_string(),
+                expires_at: Instant::now() + Self::user_cache_ttl(),
+            },
+        );
+    }
+
+    async fn fetch_sender_display_name(&self, user_id: &str) -> Option<String> {
+        let resp = match self
+            .http_client()
+            .get("https://slack.com/api/users.info")
+            .bearer_auth(&self.bot_token)
+            .query(&[("user", user_id)])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("Slack users.info request failed for {user_id}: {err}");
+                return None;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::warn!("Slack users.info failed for {user_id} ({status}): {sanitized}");
+            return None;
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = payload
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            tracing::warn!("Slack users.info returned error for {user_id}: {err}");
+            return None;
+        }
+
+        Self::extract_user_display_name(&payload)
+    }
+
+    async fn resolve_sender_identity(&self, user_id: &str) -> String {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return String::new();
+        }
+
+        if let Some(display_name) = self.cached_sender_display_name(user_id) {
+            return display_name;
+        }
+
+        if let Some(display_name) = self.fetch_sender_display_name(user_id).await {
+            self.cache_sender_display_name(user_id, &display_name);
+            return display_name;
+        }
+
+        user_id.to_string()
     }
 
     fn is_group_channel_id(channel_id: &str) -> bool {
@@ -259,6 +443,367 @@ impl SlackChannel {
             .or_insert_with(|| now_ts.to_string())
             .clone()
     }
+
+    async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
+        let app_token = self
+            .configured_app_token()
+            .ok_or_else(|| anyhow::anyhow!("Slack Socket Mode requires app_token"))?;
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/apps.connections.open")
+            .bearer_auth(app_token)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            anyhow::bail!("Slack apps.connections.open failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack apps.connections.open failed: {err}");
+        }
+
+        parsed
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open did not return url"))
+    }
+
+    async fn listen_socket_mode(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        bot_user_id: &str,
+        scoped_channels: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+
+        loop {
+            let ws_url = match self.open_socket_mode_url().await {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::warn!("Slack Socket Mode: failed to open websocket URL: {e}");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+
+            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+                Ok(connection) => connection,
+                Err(e) => {
+                    tracing::warn!("Slack Socket Mode: websocket connect failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+            tracing::info!("Slack Socket Mode: websocket connected");
+
+            let (mut write, mut read) = ws_stream.split();
+
+            while let Some(frame) = read.next().await {
+                let text = match frame {
+                    Ok(WsMessage::Text(text)) => text,
+                    Ok(WsMessage::Ping(payload)) => {
+                        if let Err(e) = write.send(WsMessage::Pong(payload)).await {
+                            tracing::warn!("Slack Socket Mode: pong send failed: {e}");
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(WsMessage::Close(_)) => {
+                        tracing::warn!("Slack Socket Mode: websocket closed by server");
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::warn!("Slack Socket Mode: websocket read failed: {e}");
+                        break;
+                    }
+                };
+
+                let envelope: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::warn!("Slack Socket Mode: invalid JSON payload: {e}");
+                        continue;
+                    }
+                };
+
+                if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
+                    let ack = serde_json::json!({ "envelope_id": envelope_id });
+                    if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
+                        tracing::warn!("Slack Socket Mode: ack send failed: {e}");
+                        break;
+                    }
+                }
+
+                let envelope_type = envelope
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if envelope_type == "disconnect" {
+                    tracing::warn!("Slack Socket Mode: received disconnect event");
+                    break;
+                }
+                if envelope_type != "events_api" {
+                    continue;
+                }
+
+                let Some(event) = envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("event"))
+                else {
+                    continue;
+                };
+                if event.get("type").and_then(|v| v.as_str()) != Some("message") {
+                    continue;
+                }
+                // Skip non-user message subtypes (e.g. channel_join/message_changed)
+                // to avoid invalid thread replies.
+                if event.get("subtype").is_some() {
+                    continue;
+                }
+
+                let channel_id = event
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                if channel_id.is_empty() {
+                    continue;
+                }
+                if let Some(ref configured_channels) = scoped_channels {
+                    if !configured_channels.iter().any(|id| id == &channel_id) {
+                        continue;
+                    }
+                }
+
+                let user = event
+                    .get("user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if user.is_empty() || user == bot_user_id {
+                    continue;
+                }
+                if !self.is_user_allowed(user) {
+                    tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                    continue;
+                }
+
+                let text = event
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+
+                let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or_default();
+                if ts.is_empty() {
+                    continue;
+                }
+                let last_ts = last_ts_by_channel
+                    .get(&channel_id)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if ts <= last_ts {
+                    continue;
+                }
+
+                let is_group_message = Self::is_group_channel_id(&channel_id);
+                let allow_sender_without_mention =
+                    is_group_message && self.is_group_sender_trigger_enabled(user);
+                let require_mention =
+                    self.mention_only && is_group_message && !allow_sender_without_mention;
+
+                let Some(normalized_text) =
+                    Self::normalize_incoming_content(text, require_mention, bot_user_id)
+                else {
+                    continue;
+                };
+
+                last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+                let sender = self.resolve_sender_identity(user).await;
+
+                let channel_msg = ChannelMessage {
+                    id: format!("slack_{channel_id}_{ts}"),
+                    sender,
+                    reply_target: channel_id.clone(),
+                    content: normalized_text,
+                    channel: "slack".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts: Self::inbound_thread_ts(event, ts),
+                };
+
+                if tx.send(channel_msg).await.is_err() {
+                    return Ok(());
+                }
+            }
+
+            tracing::warn!("Slack Socket Mode: reconnecting in 3 seconds...");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    fn parse_retry_after_secs(headers: &HeaderMap) -> Option<u64> {
+        let value = headers
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim();
+        Self::parse_retry_after_value(value)
+    }
+
+    fn parse_retry_after_value(value: &str) -> Option<u64> {
+        if value.is_empty() {
+            return None;
+        }
+
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(seconds);
+        }
+
+        let truncated = value
+            .split_once('.')
+            .map(|(whole, _)| whole)
+            .unwrap_or(value);
+        truncated.parse::<u64>().ok()
+    }
+
+    fn jitter_ms_from_clock(max_jitter_ms: u64) -> u64 {
+        if max_jitter_ms == 0 {
+            return 0;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()))
+            .unwrap_or(0);
+        nanos % (max_jitter_ms + 1)
+    }
+
+    fn compute_retry_delay(base_retry_after_secs: u64, attempt: u32, jitter_ms: u64) -> Duration {
+        let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
+        let backoff_secs = base_retry_after_secs
+            .saturating_mul(multiplier)
+            .min(SLACK_HISTORY_MAX_BACKOFF_SECS);
+        Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms)
+    }
+
+    fn next_retry_timestamp(wait: Duration) -> String {
+        match chrono::Duration::from_std(wait) {
+            Ok(delta) => (Utc::now() + delta).to_rfc3339(),
+            Err(_) => Utc::now().to_rfc3339(),
+        }
+    }
+
+    async fn fetch_history_with_retry(
+        &self,
+        channel_id: &str,
+        params: &[(&str, String)],
+    ) -> Option<serde_json::Value> {
+        let mut total_wait = Duration::from_secs(0);
+
+        for attempt in 0..=SLACK_HISTORY_MAX_RETRIES {
+            let resp = match self
+                .http_client()
+                .get("https://slack.com/api/conversations.history")
+                .bearer_auth(&self.bot_token)
+                .query(params)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Slack poll error for channel {channel_id}: {e}");
+                    return None;
+                }
+            };
+
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+            let is_ratelimited_http = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let is_ratelimited_payload = payload.get("ok") == Some(&serde_json::Value::Bool(false))
+                && payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|err| err == "ratelimited");
+
+            if is_ratelimited_http || is_ratelimited_payload {
+                if attempt >= SLACK_HISTORY_MAX_RETRIES {
+                    tracing::error!(
+                        "Slack rate limit retries exhausted for conversations.history on channel {}. Total wait: {}s across {} attempts. Proceeding without channel history.",
+                        channel_id,
+                        total_wait.as_secs(),
+                        SLACK_HISTORY_MAX_RETRIES
+                    );
+                    return None;
+                }
+
+                let retry_after_secs = Self::parse_retry_after_secs(&headers)
+                    .unwrap_or(SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS);
+                let jitter_ms = Self::jitter_ms_from_clock(SLACK_HISTORY_MAX_JITTER_MS);
+                let wait = Self::compute_retry_delay(retry_after_secs, attempt, jitter_ms);
+                total_wait += wait;
+                let next_retry_at = Self::next_retry_timestamp(wait);
+                tracing::warn!(
+                    "Slack conversations.history rate limited for channel {}. Retry-After: {}s. Attempt {}/{}. Next retry at {}.",
+                    channel_id,
+                    retry_after_secs,
+                    attempt + 1,
+                    SLACK_HISTORY_MAX_RETRIES,
+                    next_retry_at
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let sanitized = crate::providers::sanitize_api_error(&body);
+                tracing::warn!(
+                    "Slack history request failed for channel {} ({}): {}",
+                    channel_id,
+                    status,
+                    sanitized
+                );
+                return None;
+            }
+
+            if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                let err = payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown");
+                tracing::warn!("Slack history error for channel {channel_id}: {err}");
+                return None;
+            }
+
+            return Some(payload);
+        }
+
+        None
+    }
 }
 
 #[async_trait]
@@ -311,24 +856,35 @@ impl Channel for SlackChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
-        let scoped_channel = self.configured_channel_id();
+        let scoped_channels = self.scoped_channel_ids();
+        if self.configured_app_token().is_some() {
+            tracing::info!("Slack channel listening in Socket Mode");
+            return self
+                .listen_socket_mode(tx, &bot_user_id, scoped_channels)
+                .await;
+        }
+
         let mut discovered_channels: Vec<String> = Vec::new();
         let mut last_discovery = Instant::now();
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
 
-        if let Some(ref channel_id) = scoped_channel {
-            tracing::info!("Slack channel listening on #{channel_id}...");
+        if let Some(ref channel_ids) = scoped_channels {
+            tracing::info!(
+                "Slack channel listening on {} configured channel(s): {}",
+                channel_ids.len(),
+                channel_ids.join(", ")
+            );
         } else {
             tracing::info!(
-                "Slack channel_id not set (or '*'); listening across all accessible channels."
+                "Slack channel_id/channel_ids not set (or wildcard only); listening across all accessible channels."
             );
         }
 
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            let target_channels = if let Some(ref channel_id) = scoped_channel {
-                vec![channel_id.clone()]
+            let target_channels = if let Some(ref channel_ids) = scoped_channels {
+                channel_ids.clone()
             } else {
                 if discovered_channels.is_empty()
                     || last_discovery.elapsed() >= Duration::from_secs(60)
@@ -376,41 +932,18 @@ impl Channel for SlackChannel {
                     ("oldest", cursor_ts),
                 ];
 
-                let resp = match self
-                    .http_client()
-                    .get("https://slack.com/api/conversations.history")
-                    .bearer_auth(&self.bot_token)
-                    .query(&params)
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Slack poll error for channel {channel_id}: {e}");
-                        continue;
-                    }
-                };
-
-                let data: serde_json::Value = match resp.json().await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!("Slack parse error for channel {channel_id}: {e}");
-                        continue;
-                    }
-                };
-
-                if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
-                    let err = data
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("unknown");
-                    tracing::warn!("Slack history error for channel {channel_id}: {err}");
+                let Some(data) = self.fetch_history_with_retry(&channel_id, &params).await else {
                     continue;
-                }
+                };
 
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                     // Messages come newest-first, reverse to process oldest first
                     for msg in messages.iter().rev() {
+                        // Skip non-user message subtypes (e.g. channel_join/message_changed)
+                        // to avoid invalid thread replies.
+                        if msg.get("subtype").is_some() {
+                            continue;
+                        }
                         let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
                         let user = msg
                             .get("user")
@@ -452,10 +985,11 @@ impl Channel for SlackChannel {
                         };
 
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+                        let sender = self.resolve_sender_identity(user).await;
 
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
-                            sender: user.to_string(),
+                            sender,
                             reply_target: channel_id.clone(),
                             content: normalized_text,
                             channel: "slack".to_string(),
@@ -492,26 +1026,32 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_channel_with_channel_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C12345".into()),
+            vec![],
+            vec![],
+        );
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
     }
 
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
     }
 
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()])
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()])
             .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
 
         assert!(ch.mention_only);
@@ -534,6 +1074,57 @@ mod tests {
             SlackChannel::normalized_channel_id(Some(" C12345 ")),
             Some("C12345".to_string())
         );
+    }
+
+    #[test]
+    fn configured_app_token_ignores_blank_values() {
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("   ".into()), None, vec![], vec![]);
+        assert_eq!(ch.configured_app_token(), None);
+    }
+
+    #[test]
+    fn configured_app_token_trims_value() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            Some(" xapp-123 ".into()),
+            None,
+            vec![],
+            vec![],
+        );
+        assert_eq!(ch.configured_app_token().as_deref(), Some("xapp-123"));
+    }
+
+    #[test]
+    fn scoped_channel_ids_prefers_explicit_list() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C_SINGLE".into()),
+            vec!["C_LIST1".into(), "D_DM1".into()],
+            vec![],
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_LIST1".to_string(), "D_DM1".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_falls_back_to_single_channel_id() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C_SINGLE".into()),
+            vec![],
+            vec![],
+        );
+        assert_eq!(ch.scoped_channel_ids(), Some(vec!["C_SINGLE".to_string()]));
+    }
+
+    #[test]
+    fn scoped_channel_ids_returns_none_for_wildcard_mode() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert_eq!(ch.scoped_channel_ids(), None);
     }
 
     #[test]
@@ -561,15 +1152,81 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
         assert!(!ch.is_user_allowed("U12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
+    }
+
+    #[test]
+    fn extract_user_display_name_prefers_profile_display_name() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "profile": {
+                    "display_name": "Display Name",
+                    "real_name": "Real Name"
+                }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_user_display_name(&payload).as_deref(),
+            Some("Display Name")
+        );
+    }
+
+    #[test]
+    fn extract_user_display_name_falls_back_to_username() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "profile": {
+                    "display_name": "   ",
+                    "real_name": ""
+                }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_user_display_name(&payload).as_deref(),
+            Some("fallback_name")
+        );
+    }
+
+    #[test]
+    fn cached_sender_display_name_returns_none_when_expired() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        {
+            let mut cache = ch.user_display_name_cache.lock().unwrap();
+            cache.insert(
+                "U123".to_string(),
+                CachedSlackDisplayName {
+                    display_name: "Expired Name".to_string(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
+        }
+
+        assert_eq!(ch.cached_sender_display_name("U123"), None);
+    }
+
+    #[test]
+    fn cached_sender_display_name_returns_cached_value_when_valid() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        ch.cache_sender_display_name("U123", "Cached Name");
+
+        assert_eq!(
+            ch.cached_sender_display_name("U123").as_deref(),
+            Some("Cached Name")
+        );
     }
 
     #[test]
@@ -591,7 +1248,13 @@ mod tests {
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "U222".into()]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            None,
+            vec![],
+            vec!["U111".into(), "U222".into()],
+        );
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("U222"));
         assert!(!ch.is_user_allowed("U333"));
@@ -599,27 +1262,33 @@ mod tests {
 
     #[test]
     fn allowlist_exact_match_not_substring() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["U111".into()]);
         assert!(!ch.is_user_allowed("U1111"));
         assert!(!ch.is_user_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["U111".into()]);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["U111".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(!ch.is_user_allowed("u111"));
     }
 
     #[test]
     fn allowlist_wildcard_and_specific() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            None,
+            vec![],
+            vec!["U111".into(), "*".into()],
+        );
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("anyone"));
     }
@@ -722,5 +1391,34 @@ mod tests {
             cursors.get("C123").map(String::as_str),
             Some("1700000000.000001")
         );
+    }
+
+    #[test]
+    fn parse_retry_after_value_accepts_integer_seconds() {
+        assert_eq!(SlackChannel::parse_retry_after_value("30"), Some(30));
+    }
+
+    #[test]
+    fn parse_retry_after_value_accepts_decimal_seconds() {
+        assert_eq!(SlackChannel::parse_retry_after_value("2.9"), Some(2));
+    }
+
+    #[test]
+    fn parse_retry_after_value_rejects_non_numeric_values() {
+        assert_eq!(SlackChannel::parse_retry_after_value("later"), None);
+        assert_eq!(SlackChannel::parse_retry_after_value(""), None);
+    }
+
+    #[test]
+    fn parse_retry_after_secs_reads_header_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "45".parse().unwrap());
+        assert_eq!(SlackChannel::parse_retry_after_secs(&headers), Some(45));
+    }
+
+    #[test]
+    fn compute_retry_delay_applies_backoff_and_jitter_with_cap() {
+        let delay = SlackChannel::compute_retry_delay(30, 3, 250);
+        assert_eq!(delay, Duration::from_secs(120) + Duration::from_millis(250));
     }
 }

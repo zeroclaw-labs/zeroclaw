@@ -66,7 +66,7 @@ ssh arduino@<UNO_Q_IP>
 
 4. **Λήψη και Μεταγλώττιση**:
    ```bash
-   git clone https://github.com/theonlyhennygod/zeroclaw.git
+   git clone https://github.com/zeroclaw-labs/zeroclaw.git
    cd zeroclaw
    cargo build --release --features hardware
    ```

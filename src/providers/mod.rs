@@ -17,14 +17,20 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
+pub mod backoff;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
+pub mod cursor;
 pub mod gemini;
+pub mod health;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
+pub mod quota_adapter;
+pub mod quota_cli;
+pub mod quota_types;
 pub mod reliable;
 pub mod router;
 pub mod telnyx;
@@ -32,11 +38,13 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
-    ToolCall, ToolResultMessage,
+    is_user_or_assistant_role, ChatMessage, ChatRequest, ChatResponse, ConversationMessage,
+    NormalizedStopReason, Provider, ProviderCapabilityError, ToolCall, ToolResultMessage,
+    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER,
 };
 
 use crate::auth::AuthService;
+use crate::plugins;
 use compatible::{AuthStyle, CompatibleApiMode, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::Deserialize;
@@ -62,6 +70,7 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+const QWEN_CODING_PLAN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
@@ -73,8 +82,33 @@ const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
+const STEPFUN_BASE_URL: &str = "https://api.stepfun.com/v1";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
+struct PluginProvider {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for PluginProvider {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        plugins::runtime::execute_plugin_provider_chat(
+            &self.name,
+            system_prompt,
+            message,
+            model,
+            temperature,
+        )
+        .await
+    }
+}
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
         name,
@@ -146,11 +180,16 @@ pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
 }
 
+pub(crate) fn is_qwen_coding_plan_alias(name: &str) -> bool {
+    matches!(name, "qwen-coding-plan")
+}
+
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
     is_qwen_cn_alias(name)
         || is_qwen_intl_alias(name)
         || is_qwen_us_alias(name)
         || is_qwen_oauth_alias(name)
+        || is_qwen_coding_plan_alias(name)
 }
 
 pub(crate) fn is_zai_global_alias(name: &str) -> bool {
@@ -171,6 +210,14 @@ pub(crate) fn is_qianfan_alias(name: &str) -> bool {
 
 pub(crate) fn is_doubao_alias(name: &str) -> bool {
     matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
+}
+
+pub(crate) fn is_siliconflow_alias(name: &str) -> bool {
+    matches!(name, "siliconflow" | "silicon-cloud" | "siliconcloud")
+}
+
+pub(crate) fn is_stepfun_alias(name: &str) -> bool {
+    matches!(name, "stepfun" | "step" | "step-ai" | "step_ai")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,6 +659,10 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("qianfan")
     } else if is_doubao_alias(name) {
         Some("doubao")
+    } else if is_siliconflow_alias(name) {
+        Some("siliconflow")
+    } else if is_stepfun_alias(name) {
+        Some("stepfun")
     } else if matches!(name, "hunyuan" | "tencent") {
         Some("hunyuan")
     } else {
@@ -650,7 +701,9 @@ fn moonshot_base_url(name: &str) -> Option<&'static str> {
 }
 
 fn qwen_base_url(name: &str) -> Option<&'static str> {
-    if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
+    if is_qwen_coding_plan_alias(name) {
+        Some(QWEN_CODING_PLAN_BASE_URL)
+    } else if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
         Some(QWEN_CN_BASE_URL)
     } else if is_qwen_intl_alias(name) {
         Some(QWEN_INTL_BASE_URL)
@@ -671,10 +724,19 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
     }
 }
 
+fn stepfun_base_url(name: &str) -> Option<&'static str> {
+    if is_stepfun_alias(name) {
+        Some(STEPFUN_BASE_URL)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     pub provider_api_url: Option<String>,
+    pub provider_transport: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
@@ -689,6 +751,7 @@ impl Default for ProviderRuntimeOptions {
         Self {
             auth_profile_override: None,
             provider_api_url: None,
+            provider_transport: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
@@ -794,6 +857,57 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// True when HTTP status indicates request-shape/schema rejection for native tools.
+///
+/// 516 is included for OpenAI-compatible providers that surface mapper/schema
+/// errors via vendor-specific status codes instead of standard 4xx.
+pub(crate) fn is_native_tool_schema_rejection_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) || status.as_u16() == 516
+}
+
+/// Detect request-mapper/tool-schema incompatibility hints in provider errors.
+pub(crate) fn has_native_tool_schema_rejection_hint(error: &str) -> bool {
+    let lower = error.to_lowercase();
+
+    let direct_hints = [
+        "unknown parameter: tools",
+        "unsupported parameter: tools",
+        "unrecognized field `tools`",
+        "does not support tools",
+        "function calling is not supported",
+        "unknown parameter: tool_choice",
+        "unsupported parameter: tool_choice",
+        "unrecognized field `tool_choice`",
+        "invalid parameter: tool_choice",
+    ];
+    if direct_hints.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    let mapper_tool_schema_hint = lower.contains("mapper")
+        && (lower.contains("tool") || lower.contains("function"))
+        && (lower.contains("schema")
+            || lower.contains("parameter")
+            || lower.contains("validation"));
+    if mapper_tool_schema_hint {
+        return true;
+    }
+
+    lower.contains("tool schema")
+        && (lower.contains("mismatch")
+            || lower.contains("unsupported")
+            || lower.contains("invalid")
+            || lower.contains("incompatible"))
+}
+
+/// Combined predicate for native tool-schema rejection.
+pub(crate) fn is_native_tool_schema_rejection(status: reqwest::StatusCode, error: &str) -> bool {
+    is_native_tool_schema_rejection_status(status) && has_native_tool_schema_rejection_hint(error)
+}
+
 /// Build a sanitized provider error from a failed HTTP response.
 pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
@@ -864,8 +978,10 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "hunyuan" | "tencent" => vec!["HUNYUAN_API_KEY"],
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
+        name if is_siliconflow_alias(name) => vec!["SILICONFLOW_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
+        name if is_stepfun_alias(name) => vec!["STEP_API_KEY", "STEPFUN_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
@@ -910,6 +1026,14 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     }
 
     None
+}
+
+/// Check whether a provider credential can be resolved from override/env fallbacks.
+///
+/// This mirrors provider credential resolution while avoiding exposing the
+/// resolved secret value to callers that only need presence/absence.
+pub fn has_provider_credential(name: &str, credential_override: Option<&str>) -> bool {
+    resolve_provider_credential(name, credential_override).is_some()
 }
 
 /// Returns true if the provider can resolve any credential from the given override and/or
@@ -1037,16 +1161,17 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new_with_max_tokens(
-            key,
-            options.max_tokens_override,
-        ))),
+        "openrouter" => Ok(Box::new(
+            openrouter::OpenRouterProvider::new_with_max_tokens(key, options.max_tokens_override),
+        )),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url_and_max_tokens(
-            api_url,
-            key,
-            options.max_tokens_override,
-        ))),
+        "openai" => Ok(Box::new(
+            openai::OpenAiProvider::with_base_url_and_max_tokens(
+                api_url,
+                key,
+                options.max_tokens_override,
+            ),
+        )),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
@@ -1054,15 +1179,12 @@ fn create_provider_with_url_and_options(
             options.reasoning_enabled,
         ))),
         "gemini" | "google" | "google-gemini" => {
-            let state_dir = options
-                .zeroclaw_dir
-                .clone()
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new().map_or_else(
-                        || PathBuf::from(".zeroclaw"),
-                        |dirs| dirs.home_dir().join(".zeroclaw"),
-                    )
-                });
+            let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
             let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
             Ok(Box::new(gemini::GeminiProvider::new_with_auth(
                 key,
@@ -1074,7 +1196,10 @@ fn create_provider_with_url_and_options(
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
+            "Venice",
+            "https://api.venice.ai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
@@ -1094,20 +1219,26 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
-            OpenAiCompatibleProvider::new_with_user_agent(
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
+            Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
                 "https://api.kimi.com/coding/v1",
                 key,
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
-            ),
-        )),
+            )))
+        }
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
+            "Synthetic",
+            "https://api.synthetic.new/openai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
+            "OpenCode Zen",
+            "https://opencode.ai/zen/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI",
@@ -1115,21 +1246,21 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if glm_base_url(name).is_some() => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
+        name if glm_base_url(name).is_some() => Ok(Box::new(
+            OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            )))
-        }
+            ),
+        )),
         name if minimax_base_url(name).is_some() => Ok(Box::new(
             OpenAiCompatibleProvider::new_merge_system_into_user(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            )
+            ),
         )),
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
@@ -1137,18 +1268,23 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
-                .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
+                .or_else(|| {
+                    qwen_oauth_context
+                        .as_ref()
+                        .and_then(|context| context.base_url.clone())
+                })
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
             Ok(Box::new(
                 OpenAiCompatibleProvider::new_with_user_agent_and_vision(
-                "Qwen Code",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-                "QwenCode/1.0",
-                true,
-            )))
+                    "Qwen Code",
+                    &base_url,
+                    key,
+                    AuthStyle::Bearer,
+                    "QwenCode/1.0",
+                    true,
+                ),
+            ))
         }
         "hunyuan" | "tencent" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Hunyuan",
@@ -1157,7 +1293,10 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
+            "Qianfan",
+            "https://aip.baidubce.com",
+            key,
+            AuthStyle::Bearer,
         ))),
         name if is_doubao_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Doubao",
@@ -1165,40 +1304,88 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
-            "Qwen",
-            qwen_base_url(name).expect("checked in guard"),
+        name if is_siliconflow_alias(name) => {
+            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+                "SiliconFlow",
+                SILICONFLOW_BASE_URL,
+                key,
+                AuthStyle::Bearer,
+                true,
+            )))
+        }
+        name if stepfun_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "StepFun",
+            stepfun_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
-            true,
         ))),
+        name if qwen_base_url(name).is_some() => {
+            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+                "Qwen",
+                qwen_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+                true,
+            )))
+        }
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
+            "Groq",
+            "https://api.groq.com/openai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
+            "Mistral",
+            "https://api.mistral.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
+            "xAI",
+            "https://api.x.ai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
+            "DeepSeek",
+            "https://api.deepseek.com",
+            key,
+            AuthStyle::Bearer,
         ))),
         "together" | "together-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
+            "Together AI",
+            "https://api.together.xyz",
+            key,
+            AuthStyle::Bearer,
         ))),
         "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
+            "Fireworks AI",
+            "https://api.fireworks.ai/inference/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Novita AI",
+            "https://api.novita.ai/openai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
+            "Perplexity",
+            "https://api.perplexity.ai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
+            "Cohere",
+            "https://api.cohere.com/compatibility",
+            key,
+            AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
+        "cursor" => Ok(Box::new(cursor::CursorProvider::new())),
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = key
                 .map(str::trim)
@@ -1278,7 +1465,10 @@ fn create_provider_with_url_and_options(
 
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
+            "Astrai",
+            "https://as-trai.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
@@ -1323,11 +1513,19 @@ fn create_provider_with_url_and_options(
             )))
         }
 
-        _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard --interactive` to reconfigure.\n\
-             Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
-             Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
-        ),
+        _ => {
+            let registry = plugins::runtime::current_registry();
+            if registry.has_provider(name) {
+                return Ok(Box::new(PluginProvider {
+                    name: name.to_string(),
+                }));
+            }
+            anyhow::bail!(
+                "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard --interactive` to reconfigure.\n\
+                 Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
+                 Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
+            )
+        }
     }
 }
 
@@ -1471,21 +1669,52 @@ pub fn create_routed_provider_with_options(
         );
     }
 
-    // Keep a default provider for non-routed model hints.
-    let default_provider = create_resilient_provider_with_options(
+    let default_hint = default_model
+        .strip_prefix("hint:")
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty());
+
+    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    let mut has_primary_provider = false;
+
+    // Keep a default provider for non-routed requests. When default_model is a hint,
+    // route-specific providers can satisfy startup even if the primary fails.
+    match create_resilient_provider_with_options(
         primary_name,
         api_key,
         api_url,
         reliability,
         options,
-    )?;
-    let mut providers: Vec<(String, Box<dyn Provider>)> =
-        vec![(primary_name.to_string(), default_provider)];
+    ) {
+        Ok(default_provider) => {
+            providers.push((primary_name.to_string(), default_provider));
+            has_primary_provider = true;
+        }
+        Err(error) => {
+            if default_hint.is_some() {
+                tracing::warn!(
+                    provider = primary_name,
+                    model = default_model,
+                    "Primary provider failed during routed init; continuing with hint-based routes: {error}"
+                );
+            } else {
+                return Err(error);
+            }
+        }
+    }
 
     // Build hint routes with dedicated provider instances so per-route API keys
     // and max_tokens overrides do not bleed across routes.
     let mut routes: Vec<(String, router::Route)> = Vec::new();
     for route in model_routes {
+        let route_hint = route.hint.trim();
+        if route_hint.is_empty() {
+            tracing::warn!(
+                provider = route.provider.as_str(),
+                "Ignoring routed provider with empty hint"
+            );
+            continue;
+        }
         let routed_credential = route.api_key.as_ref().and_then(|raw_key| {
             let trimmed_key = raw_key.trim();
             (!trimmed_key.is_empty()).then_some(trimmed_key)
@@ -1496,7 +1725,15 @@ pub fn create_routed_provider_with_options(
             .then_some(api_url)
             .flatten();
 
-        let route_options = options.clone();
+        let mut route_options = options.clone();
+        if let Some(transport) = route
+            .transport
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            route_options.provider_transport = Some(transport.to_string());
+        }
 
         match create_resilient_provider_with_options(
             &route.provider,
@@ -1506,10 +1743,10 @@ pub fn create_routed_provider_with_options(
             &route_options,
         ) {
             Ok(provider) => {
-                let provider_id = format!("{}#{}", route.provider, route.hint);
+                let provider_id = format!("{}#{}", route.provider, route_hint);
                 providers.push((provider_id.clone(), provider));
                 routes.push((
-                    route.hint.clone(),
+                    route_hint.to_string(),
                     router::Route {
                         provider_name: provider_id,
                         model: route.model.clone(),
@@ -1519,30 +1756,42 @@ pub fn create_routed_provider_with_options(
             Err(error) => {
                 tracing::warn!(
                     provider = route.provider.as_str(),
-                    hint = route.hint.as_str(),
+                    hint = route_hint,
                     "Ignoring routed provider that failed to initialize: {error}"
                 );
             }
         }
     }
 
-    // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
-        .iter()
-        .map(|r| {
-            (
-                r.hint.clone(),
-                router::Route {
-                    provider_name: r.provider.clone(),
-                    model: r.model.clone(),
-                },
-            )
-        })
-        .collect();
+    if let Some(hint) = default_hint {
+        if !routes
+            .iter()
+            .any(|(route_hint, _)| route_hint.trim() == hint)
+        {
+            anyhow::bail!(
+                "default_model uses hint '{hint}', but no matching [[model_routes]] entry initialized successfully"
+            );
+        }
+    }
+
+    if providers.is_empty() {
+        anyhow::bail!("No providers initialized for routed configuration");
+    }
+
+    // Keep only successfully initialized routed providers and preserve
+    // their provider-id bindings (e.g. "<provider>#<hint>").
 
     Ok(Box::new(
-        router::RouterProvider::new(providers, routes, default_model.to_string())
-            .with_vision_override(options.model_support_vision),
+        router::RouterProvider::new(
+            providers,
+            routes,
+            if has_primary_provider {
+                String::new()
+            } else {
+                default_model.to_string()
+            },
+        )
+        .with_vision_override(options.model_support_vision),
     ))
 }
 
@@ -1627,6 +1876,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "stepfun",
+            display_name: "StepFun",
+            aliases: &["step", "step-ai", "step_ai"],
+            local: false,
+        },
+        ProviderInfo {
             name: "kimi-code",
             display_name: "Kimi Code",
             aliases: &["kimi_coding", "kimi_for_coding"],
@@ -1697,6 +1952,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "siliconflow",
+            display_name: "SiliconFlow",
+            aliases: &["silicon-cloud", "siliconcloud"],
+            local: false,
+        },
+        ProviderInfo {
             name: "qwen",
             display_name: "Qwen (DashScope / Qwen Code OAuth)",
             aliases: &[
@@ -1705,6 +1966,7 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "dashscope-intl",
                 "qwen-us",
                 "dashscope-us",
+                "qwen-coding-plan",
                 "qwen-code",
                 "qwen-oauth",
                 "qwen_oauth",
@@ -1764,6 +2026,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "GitHub Copilot",
             aliases: &["github-copilot"],
             local: false,
+        },
+        ProviderInfo {
+            name: "cursor",
+            display_name: "Cursor (headless CLI)",
+            aliases: &[],
+            local: true,
         },
         ProviderInfo {
             name: "lmstudio",
@@ -1906,6 +2174,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_credential_prefers_step_primary_env_key() {
+        let _env_lock = env_lock();
+        let _primary_guard = EnvGuard::set("STEP_API_KEY", Some("step-primary"));
+        let _fallback_guard = EnvGuard::set("STEPFUN_API_KEY", Some("step-fallback"));
+
+        let resolved = resolve_provider_credential("stepfun", None);
+        assert_eq!(resolved.as_deref(), Some("step-primary"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_stepfun_fallback_env_key() {
+        let _env_lock = env_lock();
+        let _primary_guard = EnvGuard::set("STEP_API_KEY", None);
+        let _fallback_guard = EnvGuard::set("STEPFUN_API_KEY", Some("step-fallback"));
+
+        let resolved = resolve_provider_credential("step-ai", None);
+        assert_eq!(resolved.as_deref(), Some("step-fallback"));
+    }
+
+    #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}", std::process::id());
@@ -2040,6 +2328,7 @@ mod tests {
         assert!(is_minimax_alias("minimax-portal-cn"));
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
+        assert!(is_qwen_alias("qwen-coding-plan"));
         assert!(is_qwen_alias("qwen-code"));
         assert!(is_qwen_oauth_alias("qwen-code"));
         assert!(is_qwen_oauth_alias("qwen_oauth"));
@@ -2051,6 +2340,13 @@ mod tests {
         assert!(is_doubao_alias("volcengine"));
         assert!(is_doubao_alias("ark"));
         assert!(is_doubao_alias("doubao-cn"));
+        assert!(is_siliconflow_alias("siliconflow"));
+        assert!(is_siliconflow_alias("silicon-cloud"));
+        assert!(is_siliconflow_alias("siliconcloud"));
+        assert!(is_stepfun_alias("stepfun"));
+        assert!(is_stepfun_alias("step"));
+        assert!(is_stepfun_alias("step-ai"));
+        assert!(is_stepfun_alias("step_ai"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
@@ -2058,6 +2354,8 @@ mod tests {
         assert!(!is_zai_alias("anthropic"));
         assert!(!is_qianfan_alias("cohere"));
         assert!(!is_doubao_alias("deepseek"));
+        assert!(!is_siliconflow_alias("volcengine"));
+        assert!(!is_stepfun_alias("moonshot"));
     }
 
     #[test]
@@ -2070,6 +2368,10 @@ mod tests {
         assert_eq!(canonical_china_provider_name("minimax-cn"), Some("minimax"));
         assert_eq!(canonical_china_provider_name("qwen"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("dashscope-us"), Some("qwen"));
+        assert_eq!(
+            canonical_china_provider_name("qwen-coding-plan"),
+            Some("qwen")
+        );
         assert_eq!(canonical_china_provider_name("qwen-code"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("zai"), Some("zai"));
         assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
@@ -2077,6 +2379,17 @@ mod tests {
         assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
         assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
+        assert_eq!(
+            canonical_china_provider_name("siliconflow"),
+            Some("siliconflow")
+        );
+        assert_eq!(
+            canonical_china_provider_name("silicon-cloud"),
+            Some("siliconflow")
+        );
+        assert_eq!(canonical_china_provider_name("stepfun"), Some("stepfun"));
+        assert_eq!(canonical_china_provider_name("step"), Some("stepfun"));
+        assert_eq!(canonical_china_provider_name("step-ai"), Some("stepfun"));
         assert_eq!(canonical_china_provider_name("hunyuan"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("tencent"), Some("hunyuan"));
         assert_eq!(canonical_china_provider_name("openai"), None);
@@ -2105,6 +2418,10 @@ mod tests {
         assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
+        assert_eq!(
+            qwen_base_url("qwen-coding-plan"),
+            Some(QWEN_CODING_PLAN_BASE_URL)
+        );
         assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
 
         assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
@@ -2113,6 +2430,10 @@ mod tests {
         assert_eq!(zai_base_url("z.ai-global"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("zai-cn"), Some(ZAI_CN_BASE_URL));
         assert_eq!(zai_base_url("z.ai-cn"), Some(ZAI_CN_BASE_URL));
+
+        assert_eq!(stepfun_base_url("stepfun"), Some(STEPFUN_BASE_URL));
+        assert_eq!(stepfun_base_url("step"), Some(STEPFUN_BASE_URL));
+        assert_eq!(stepfun_base_url("step-ai"), Some(STEPFUN_BASE_URL));
     }
 
     // ── Primary providers ────────────────────────────────────
@@ -2197,6 +2518,13 @@ mod tests {
         assert!(create_provider("moonshot-cn", Some("key")).is_ok());
         assert!(create_provider("kimi-intl", Some("key")).is_ok());
         assert!(create_provider("kimi-cn", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_stepfun() {
+        assert!(create_provider("stepfun", Some("key")).is_ok());
+        assert!(create_provider("step", Some("key")).is_ok());
+        assert!(create_provider("step-ai", Some("key")).is_ok());
     }
 
     #[test]
@@ -2291,6 +2619,13 @@ mod tests {
     }
 
     #[test]
+    fn factory_siliconflow() {
+        assert!(create_provider("siliconflow", Some("key")).is_ok());
+        assert!(create_provider("silicon-cloud", Some("key")).is_ok());
+        assert!(create_provider("siliconcloud", Some("key")).is_ok());
+    }
+
+    #[test]
     fn factory_qwen() {
         assert!(create_provider("qwen", Some("key")).is_ok());
         assert!(create_provider("dashscope", Some("key")).is_ok());
@@ -2302,6 +2637,7 @@ mod tests {
         assert!(create_provider("dashscope-international", Some("key")).is_ok());
         assert!(create_provider("qwen-us", Some("key")).is_ok());
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
+        assert!(create_provider("qwen-coding-plan", Some("key")).is_ok());
         assert!(create_provider("qwen-code", Some("key")).is_ok());
         assert!(create_provider("qwen-oauth", Some("key")).is_ok());
     }
@@ -2439,6 +2775,11 @@ mod tests {
     }
 
     #[test]
+    fn factory_cursor() {
+        assert!(create_provider("cursor", None).is_ok());
+    }
+
+    #[test]
     fn factory_nvidia() {
         assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
         assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
@@ -2562,6 +2903,36 @@ mod tests {
             ),
             Ok(_) => panic!("Expected error for unsupported anthropic-custom URL scheme"),
         }
+    }
+
+    #[test]
+    fn factory_plugin_provider_from_manifest_registry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("demo.plugin.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+id = "provider-demo"
+version = "1.0.0"
+module_path = "plugins/provider-demo.wasm"
+wit_packages = ["zeroclaw:providers@1.0.0"]
+providers = ["demo-plugin-provider"]
+"#,
+        )
+        .expect("write manifest");
+
+        let cfg = crate::config::PluginsConfig {
+            enabled: true,
+            load_paths: vec![dir.path().to_string_lossy().to_string()],
+            ..crate::config::PluginsConfig::default()
+        };
+        crate::plugins::runtime::initialize_from_config(&cfg)
+            .expect("plugin runtime should initialize");
+
+        assert!(
+            create_provider("demo-plugin-provider", None).is_ok(),
+            "manifest-declared plugin provider should resolve from factory"
+        );
     }
 
     // ── Error cases ──────────────────────────────────────────
@@ -2738,6 +3109,9 @@ mod tests {
             "kimi-code",
             "moonshot-cn",
             "kimi-code",
+            "stepfun",
+            "step",
+            "step-ai",
             "synthetic",
             "opencode",
             "zai",
@@ -2749,10 +3123,13 @@ mod tests {
             "bedrock",
             "qianfan",
             "doubao",
+            "volcengine",
+            "siliconflow",
             "qwen",
             "qwen-intl",
             "qwen-cn",
             "qwen-us",
+            "qwen-coding-plan",
             "qwen-code",
             "lmstudio",
             "llamacpp",
@@ -2769,6 +3146,7 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
+            "cursor",
             "nvidia",
             "astrai",
             "ovhcloud",
@@ -2831,6 +3209,67 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn native_tool_schema_rejection_status_covers_vendor_516() {
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        assert!(is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code")
+        ));
+        assert!(!is_native_tool_schema_rejection_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn native_tool_schema_rejection_hint_is_precise() {
+        assert!(has_native_tool_schema_rejection_hint(
+            "unknown parameter: tools"
+        ));
+        assert!(has_native_tool_schema_rejection_hint(
+            "mapper validation failed: tool schema is incompatible"
+        ));
+        let long_prefix = "x".repeat(300);
+        let long_hint = format!("{long_prefix} unknown parameter: tools");
+        assert!(has_native_tool_schema_rejection_hint(&long_hint));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "upstream gateway unavailable"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "temporary network timeout while contacting provider"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "tool_choice was set to auto by default policy"
+        ));
+        assert!(!has_native_tool_schema_rejection_hint(
+            "available tools: shell, weather, browser"
+        ));
+    }
+
+    #[test]
+    fn native_tool_schema_rejection_combines_status_and_hint() {
+        assert!(is_native_tool_schema_rejection(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "unknown parameter: tools"
+        ));
+        assert!(is_native_tool_schema_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            "unsupported parameter: tool_choice"
+        ));
+        assert!(!is_native_tool_schema_rejection(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "unknown parameter: tools"
+        ));
+        assert!(!is_native_tool_schema_rejection(
+            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
+            "upstream gateway unavailable"
+        ));
+    }
 
     #[test]
     fn sanitize_scrubs_sk_prefix() {
@@ -3021,6 +3460,7 @@ mod tests {
             model: "anthropic/claude-sonnet-4.6".to_string(),
             max_tokens: Some(4096),
             api_key: None,
+            transport: None,
         }];
 
         let provider = create_routed_provider_with_options(
@@ -3033,6 +3473,90 @@ mod tests {
             &ProviderRuntimeOptions::default(),
         );
         assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn routed_provider_supports_hint_default_when_primary_init_fails() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "lmstudio".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            "provider-that-does-not-exist",
+            None,
+            None,
+            &reliability,
+            &routes,
+            "hint:reasoning",
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(
+            provider.is_ok(),
+            "hint default should allow startup from route providers"
+        );
+    }
+
+    #[test]
+    fn routed_provider_normalizes_whitespace_in_hint_routes() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: " reasoning ".to_string(),
+            provider: "lmstudio".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            "provider-that-does-not-exist",
+            None,
+            None,
+            &reliability,
+            &routes,
+            "hint: reasoning ",
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(
+            provider.is_ok(),
+            "trimmed default hint should match trimmed route hint"
+        );
+    }
+
+    #[test]
+    fn routed_provider_rejects_unresolved_hint_default() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "lmstudio".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        }];
+
+        let err = match create_routed_provider_with_options(
+            "provider-that-does-not-exist",
+            None,
+            None,
+            &reliability,
+            &routes,
+            "hint:reasoning",
+            &ProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("missing default hint route should fail initialization"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("default_model uses hint 'reasoning'"));
     }
 
     // --- parse_provider_profile ---

@@ -1,6 +1,15 @@
 [audit]
 # Paths that the audit must cover (repo-root relative prefixes).
-include_paths = ["src", "crates", "tests", "benches", "fuzz", "firmware"]
+include_paths = [
+  "src",
+  "crates",
+  "tests",
+  "benches",
+  "fuzz",
+  "firmware",
+  "clients/android-bridge",
+  "templates/rust",
+]
 
 # Optional prefixes to exclude from the audit.
 ignore_paths = []

@@ -2,7 +2,7 @@
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
-Cập nhật lần cuối: **2026-02-19**.
+Cập nhật lần cuối: **2026-03-01**.
 
 ## Cách liệt kê các Provider
 
@@ -33,6 +33,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `vercel` | `vercel-ai` | Không | `VERCEL_API_KEY` |
 | `cloudflare` | `cloudflare-ai` | Không | `CLOUDFLARE_API_KEY` |
 | `moonshot` | `kimi` | Không | `MOONSHOT_API_KEY` |
+| `stepfun` | `step`, `step-ai`, `step_ai` | Không | `STEP_API_KEY`, `STEPFUN_API_KEY` |
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | Không | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | Không | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | Không | `OPENCODE_API_KEY` |
@@ -41,6 +42,8 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | Không | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | Không | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (tùy chọn: `AWS_REGION`) |
 | `qianfan` | `baidu` | Không | `QIANFAN_API_KEY` |
+| `doubao` | `volcengine`, `ark`, `doubao-cn` | Không | `ARK_API_KEY`, `DOUBAO_API_KEY` |
+| `siliconflow` | `silicon-cloud`, `siliconcloud` | Không | `SILICONFLOW_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | Không | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | Không | `GROQ_API_KEY` |
 | `mistral` | — | Không | `MISTRAL_API_KEY` |
@@ -60,6 +63,76 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 - Xác thực có thể dùng `GEMINI_API_KEY`, `GOOGLE_API_KEY`, hoặc Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
 - Request bằng API key dùng endpoint `generativelanguage.googleapis.com/v1beta`
 - Request OAuth qua Gemini CLI dùng endpoint `cloudcode-pa.googleapis.com/v1internal` theo chuẩn Code Assist request envelope
+
+### Ghi chú về Volcengine ARK (Doubao)
+
+- Runtime provider ID: `doubao` (alias: `volcengine`, `ark`, `doubao-cn`)
+- Tên hiển thị/canonical trong onboarding: `volcengine`
+- Base API URL: `https://ark.cn-beijing.volces.com/api/v3`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Xác thực: `ARK_API_KEY` (fallback: `DOUBAO_API_KEY`)
+- Model mặc định: `doubao-1-5-pro-32k-250115`
+
+Ví dụ thiết lập nhanh:
+
+```bash
+export ARK_API_KEY="your-ark-api-key"
+zeroclaw onboard --provider volcengine --api-key "$ARK_API_KEY" --model doubao-1-5-pro-32k-250115 --force
+```
+
+Kiểm tra nhanh:
+
+```bash
+zeroclaw models refresh --provider volcengine
+zeroclaw agent --provider volcengine --model doubao-1-5-pro-32k-250115 -m "ping"
+```
+
+### Ghi chú về StepFun
+
+- Provider ID: `stepfun` (alias: `step`, `step-ai`, `step_ai`)
+- Base API URL: `https://api.stepfun.com/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Xác thực: `STEP_API_KEY` (fallback: `STEPFUN_API_KEY`)
+- Model mặc định: `step-3.5-flash`
+
+Ví dụ thiết lập nhanh:
+
+```bash
+export STEP_API_KEY="your-stepfun-api-key"
+zeroclaw onboard --provider stepfun --api-key "$STEP_API_KEY" --model step-3.5-flash --force
+```
+
+Kiểm tra nhanh:
+
+```bash
+zeroclaw models refresh --provider stepfun
+zeroclaw agent --provider stepfun --model step-3.5-flash -m "ping"
+```
+
+### Ghi chú về SiliconFlow
+
+- Provider ID: `siliconflow` (alias: `silicon-cloud`, `siliconcloud`)
+- Base API URL: `https://api.siliconflow.cn/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Xác thực: `SILICONFLOW_API_KEY`
+- Model mặc định: `Pro/zai-org/GLM-4.7`
+
+Ví dụ thiết lập nhanh:
+
+```bash
+export SILICONFLOW_API_KEY="your-siliconflow-api-key"
+zeroclaw onboard --provider siliconflow --api-key "$SILICONFLOW_API_KEY" --model Pro/zai-org/GLM-4.7 --force
+```
+
+Kiểm tra nhanh:
+
+```bash
+zeroclaw models refresh --provider siliconflow
+zeroclaw agent --provider siliconflow --model Pro/zai-org/GLM-4.7 -m "ping"
+```
 
 ### Ghi chú về Ollama Vision
 

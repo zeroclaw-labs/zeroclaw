@@ -99,12 +99,12 @@ Maintain these branch protection rules on `dev` and `main`:
 - Require check `CI Required Gate`.
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths.
-- For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
-- Default workflow-owner allowlist includes `theonlyhennygod`, `willsarg`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
+- For CI/CD-related paths (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs), require an explicit approving review from `@chumyin` via `CI Required Gate`.
+- Keep branch/ruleset bypass limited to org owners.
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
-- Route normal contributor PRs to `dev`.
-- Allow `main` merges only through a promotion PR from `dev` (enforced by `Main Promotion Gate`).
+- Route normal contributor PRs to `main` by default (`dev` is optional for dedicated integration batching).
+- Allow direct merges to `main` once required checks and review policy pass.
 
 ---
 

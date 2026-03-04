@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,6 +9,22 @@ use tokio::time::Duration;
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Pre-flight: check if port is already in use by another zeroclaw daemon
+    if let Err(_e) = check_port_available(&host, port).await {
+        // Port is in use - check if it's our daemon
+        if is_zeroclaw_daemon_running(&host, port).await {
+            tracing::info!("ZeroClaw daemon already running on {host}:{port}");
+            println!("✓ ZeroClaw daemon already running on http://{host}:{port}");
+            println!("  Use 'zeroclaw restart' to restart, or 'zeroclaw status' to check health.");
+            return Ok(());
+        }
+        // Something else is using the port
+        bail!(
+            "Port {port} is already in use by another process. \
+             Run 'lsof -i :{port}' to identify it, or use a different port."
+        );
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -49,7 +65,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
+                    async move { Box::pin(crate::channels::start_channels(cfg)).await }
                 },
             ));
         } else {
@@ -198,7 +214,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            match crate::agent::run(
+            match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -206,31 +222,33 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 temp,
                 vec![],
                 false,
-            )
+                None,
+            ))
             .await
             {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
-                    let announcement = if output.trim().is_empty() {
-                        "heartbeat task executed".to_string()
-                    } else {
-                        output
-                    };
-                    if let Some((channel, target)) = &delivery {
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &announcement,
-                        )
-                        .await
-                        {
-                            crate::health::mark_component_error(
-                                "heartbeat",
-                                format!("delivery failed: {e}"),
-                            );
-                            tracing::warn!("Heartbeat delivery failed: {e}");
+                    if let Some(announcement) = heartbeat_announcement_text(&output) {
+                        if let Some((channel, target)) = &delivery {
+                            if let Err(e) = crate::cron::scheduler::deliver_announcement(
+                                &config,
+                                channel,
+                                target,
+                                &announcement,
+                            )
+                            .await
+                            {
+                                crate::health::mark_component_error(
+                                    "heartbeat",
+                                    format!("delivery failed: {e}"),
+                                );
+                                tracing::warn!("Heartbeat delivery failed: {e}");
+                            }
                         }
+                    } else {
+                        tracing::debug!(
+                            "Heartbeat returned sentinel (NO_REPLY/HEARTBEAT_OK); skipping delivery"
+                        );
                     }
                 }
                 Err(e) => {
@@ -240,6 +258,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             }
         }
     }
+}
+
+fn heartbeat_announcement_text(output: &str) -> Option<String> {
+    if crate::cron::scheduler::is_no_reply_sentinel(output) || is_heartbeat_ok_sentinel(output) {
+        return None;
+    }
+    if output.trim().is_empty() {
+        return Some("heartbeat task executed".to_string());
+    }
+    Some(output.to_string())
+}
+
+fn is_heartbeat_ok_sentinel(output: &str) -> bool {
+    const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
+    output
+        .trim()
+        .get(..HEARTBEAT_OK.len())
+        .map(|prefix| prefix.eq_ignore_ascii_case(HEARTBEAT_OK))
+        .unwrap_or(false)
 }
 
 fn heartbeat_tasks_for_tick(
@@ -283,7 +320,8 @@ fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
+    let normalized = channel.to_ascii_lowercase();
+    match normalized.as_str() {
         "telegram" => {
             if config.channels_config.telegram.is_none() {
                 anyhow::bail!(
@@ -312,6 +350,19 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
+        "whatsapp" | "whatsapp_web" => {
+            let wa = config.channels_config.whatsapp.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "heartbeat.target is set to {channel} but channels_config.whatsapp is not configured"
+                )
+            })?;
+
+            if normalized == "whatsapp_web" && wa.is_cloud_config() && !wa.is_web_config() {
+                anyhow::bail!(
+                    "heartbeat.target is set to whatsapp_web but channels_config.whatsapp is configured for cloud mode (set session_path for web mode)"
+                );
+            }
+        }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
@@ -324,6 +375,49 @@ fn has_supervised_channels(config: &Config) -> bool {
         .channels_except_webhook()
         .iter()
         .any(|(_, ok)| *ok)
+}
+
+/// Check if a port is available for binding
+async fn check_port_available(host: &str, port: u16) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            // Successfully bound - close it and return Ok
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            bail!("Port {} is already in use", port)
+        }
+        Err(e) => bail!("Failed to check port {}: {}", port, e),
+    }
+}
+
+/// Check if a running daemon on this port is our zeroclaw daemon
+async fn is_zeroclaw_daemon_running(host: &str, port: u16) -> bool {
+    let url = format!("http://{}:{}/health", host, port);
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    // Check if response looks like our health endpoint
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        // Our health endpoint has "status" and "runtime.components"
+                        json.get("status").is_some() && json.get("runtime").is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +498,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });
@@ -444,6 +540,7 @@ mod tests {
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -477,6 +574,37 @@ mod tests {
     fn heartbeat_tasks_ignore_empty_fallback_message() {
         let tasks = heartbeat_tasks_for_tick(vec![], Some("   "));
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_skips_no_reply_sentinel() {
+        assert!(heartbeat_announcement_text(" NO_reply ").is_none());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_skips_heartbeat_ok_sentinel() {
+        assert!(heartbeat_announcement_text(" heartbeat_ok ").is_none());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_skips_heartbeat_ok_prefix_case_insensitive() {
+        assert!(heartbeat_announcement_text(" heArTbEaT_oK - all clear ").is_none());
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_uses_default_for_empty_output() {
+        assert_eq!(
+            heartbeat_announcement_text(" \n\t "),
+            Some("heartbeat task executed".to_string())
+        );
+    }
+
+    #[test]
+    fn heartbeat_announcement_text_keeps_regular_output() {
+        assert_eq!(
+            heartbeat_announcement_text("system nominal"),
+            Some("system nominal".to_string())
+        );
     }
 
     #[test]
@@ -540,11 +668,56 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
             group_reply: None,
             base_url: None,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_whatsapp_web_target_in_web_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("whatsapp_web".to_string(), "+15551234567".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_whatsapp_web_target_in_cloud_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("token".into()),
+            phone_number_id: Some("123456".into()),
+            verify_token: Some("verify".into()),
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err.to_string().contains("configured for cloud mode"));
     }
 }

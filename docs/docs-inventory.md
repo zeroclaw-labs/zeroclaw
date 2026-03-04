@@ -2,7 +2,7 @@
 
 This inventory classifies documentation by intent and canonical location.
 
-Last reviewed: **February 24, 2026**.
+Last reviewed: **March 1, 2026**.
 
 ## Classification Legend
 
@@ -33,6 +33,7 @@ Last reviewed: **February 24, 2026**.
 | `docs/README.md` | Current Guide (hub) | all readers |
 | `docs/SUMMARY.md` | Current Guide (unified TOC) | all readers |
 | `docs/structure/README.md` | Current Guide (structure map) | maintainers |
+| `docs/structure/by-function.md` | Current Guide (function map) | maintainers/operators |
 | `docs/i18n-guide.md` | Current Guide (i18n completion contract) | contributors/agents |
 | `docs/i18n/README.md` | Current Guide (locale index) | maintainers/translators |
 | `docs/i18n-coverage.md` | Current Guide (coverage matrix) | maintainers/translators |
@@ -93,6 +94,7 @@ Compatibility shims such as `docs/SUMMARY.<locale>.md` and `docs/vi/**` remain v
 | `docs/datasheets/arduino-uno.md` | Current Hardware Reference | hardware builders |
 | `docs/datasheets/esp32.md` | Current Hardware Reference | hardware builders |
 | `docs/audit-event-schema.md` | Current CI/Security Reference | maintainers/security reviewers |
+| `docs/security/official-channels-and-fraud-prevention.md` | Current Security Guide | users/operators |
 
 ## Policy / Process Docs
 
@@ -122,6 +124,9 @@ These are valuable context, but **not strict runtime contracts**.
 |---|---|
 | `docs/project-triage-snapshot-2026-02-18.md` | Snapshot |
 | `docs/docs-audit-2026-02-24.md` | Snapshot (docs architecture audit) |
+| `docs/project/m4-5-rfi-spike-2026-02-28.md` | Snapshot (M4-5 workspace split RFI baseline and execution plan) |
+| `docs/project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md` | Snapshot (F1-3 lifecycle state machine RFI) |
+| `docs/project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md` | Snapshot (Q0-3 stop-reason/continuation RFI) |
 | `docs/i18n-gap-backlog.md` | Snapshot (i18n depth gap tracking) |
 
 ## Maintenance Contract

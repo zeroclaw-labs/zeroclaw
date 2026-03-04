@@ -1,0 +1,15 @@
+{
+  "name": "__SKILL_NAME__",
+  "version": "1",
+  "description": "Look up current weather for a city",
+  "parameters": {
+    "type": "object",
+    "required": ["city"],
+    "properties": {
+      "city": {
+        "type": "string",
+        "description": "City name (e.g. Hanoi, London, Tokyo, Singapore)"
+      }
+    }
+  }
+}

@@ -7,6 +7,7 @@ ZeroClaw's hardware subsystem enables direct control of microcontrollers and per
 ## Entry Points
 
 - Architecture and peripheral model: [../hardware-peripherals-design.md](../hardware-peripherals-design.md)
+- Raspberry Pi Zero W build: [raspberry-pi-zero-w-build.md](raspberry-pi-zero-w-build.md)
 - Add a new board/tool: [../adding-boards-and-tools.md](../adding-boards-and-tools.md)
 - Nucleo setup: [../nucleo-setup.md](../nucleo-setup.md)
 - Arduino Uno R4 WiFi setup: [../arduino-uno-q-setup.md](../arduino-uno-q-setup.md)

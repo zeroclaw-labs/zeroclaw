@@ -1,0 +1,35 @@
+package zeroclaw:hooks@1.0.0;
+
+interface hooks {
+  enum hook-kind {
+    gateway-start,
+    gateway-stop,
+    session-start,
+    session-end,
+    before-compaction,
+    after-compaction,
+    tool-result-persist,
+  }
+
+  record hook-event {
+    kind: hook-kind,
+    payload-json: string,
+  }
+
+  enum hook-result-kind {
+    continue,
+    cancel,
+  }
+
+  record hook-result {
+    kind: hook-result-kind,
+    payload-json: option<string>,
+    reason: option<string>,
+  }
+
+  handle-hook: func(event: hook-event) -> hook-result;
+}
+
+world plugin-hooks {
+  export hooks;
+}

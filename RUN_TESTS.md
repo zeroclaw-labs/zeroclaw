@@ -13,6 +13,8 @@
 cargo test telegram --lib
 ```
 
+Toolchain note: CI/release metadata is aligned with Rust `1.88`; use the same stable toolchain when reproducing release-facing checks locally.
+
 ## 📝 What Was Created For You
 
 ### 1. **test_telegram_integration.sh** (Main Test Suite)
@@ -298,6 +300,6 @@ If all tests pass:
 
 ## 📞 Support
 
-- Issues: https://github.com/theonlyhennygod/zeroclaw/issues
+- Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
 - Docs: `./TESTING_TELEGRAM.md`
 - Help: `zeroclaw --help`

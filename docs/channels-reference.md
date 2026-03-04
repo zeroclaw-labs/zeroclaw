@@ -56,6 +56,8 @@ Telegram/Discord sender-scoped model routing:
 Supervised tool approvals (all non-CLI channels):
 - `/approve-request <tool-name>` — create a pending approval request
 - `/approve-confirm <request-id>` — confirm pending request (same sender + same chat/channel only)
+- `/approve-allow <request-id>` — approve the current pending runtime execution request once (no policy persistence)
+- `/approve-deny <request-id>` — deny the current pending runtime execution request
 - `/approve-pending` — list pending requests for your current sender+chat/channel scope
 - `/approve <tool-name>` — direct one-step approve + persist (`autonomy.auto_approve`, compatibility path)
 - `/unapprove <tool-name>` — revoke and remove persisted approval
@@ -76,6 +78,7 @@ Notes:
 - You can restrict who can use approval-management commands via `[autonomy].non_cli_approval_approvers`.
 - Configure natural-language approval mode via `[autonomy].non_cli_natural_language_approval_mode`.
 - `autonomy.non_cli_excluded_tools` is reloaded from `config.toml` at runtime; `/approvals` shows the currently effective list.
+- Default non-CLI exclusions include both `shell` and `process`; remove `process` from `[autonomy].non_cli_excluded_tools` only when you explicitly want background command execution in chat channels.
 - Each incoming message injects a runtime tool-availability snapshot into the system prompt, derived from the same exclusion policy used by execution.
 
 ## Inbound Image Marker Protocol
@@ -119,7 +122,7 @@ cargo check --no-default-features --features hardware,channel-matrix
 cargo check --no-default-features --features hardware,channel-lark
 ```
 
-If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
+If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build. The same applies to cron delivery: setting `delivery.channel` to a feature-gated channel in a build without that feature will return an error at delivery time. For Matrix cron delivery, only plain rooms are supported; E2EE rooms require listener sessions via `zeroclaw daemon`.
 
 ---
 
@@ -143,8 +146,11 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
+| Napcat | websocket receive + HTTP send (OneBot) | No (typically local/LAN) |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
+| WATI | webhook (`/wati`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
+| ACP | stdio (JSON-RPC 2.0) | No |
 | Nostr | relay websocket (NIP-04 / NIP-17) | No |
 
 ---
@@ -159,9 +165,9 @@ For channels with inbound sender allowlists:
 
 Field names differ by channel:
 
-- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Nextcloud Talk)
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Napcat/Nextcloud Talk/ACP)
 - `allowed_from` (Signal)
-- `allowed_numbers` (WhatsApp)
+- `allowed_numbers` (WhatsApp/WATI)
 - `allowed_senders` (Email/Linq)
 - `allowed_contacts` (iMessage)
 - `allowed_pubkeys` (Nostr)
@@ -197,10 +203,11 @@ allowed_sender_ids = ["123456789", "987"] # optional; "*" allowed
 [channels_config.telegram]
 bot_token = "123456:telegram-token"
 allowed_users = ["*"]
-stream_mode = "off"               # optional: off | partial
+stream_mode = "off"               # optional: off | partial | on
 draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
 mention_only = false              # legacy fallback; used when group_reply.mode is not set
 interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
+ack_enabled = true                # optional: send emoji reaction acknowledgments (default: true)
 
 [channels_config.telegram.group_reply]
 mode = "all_messages"             # optional: all_messages | mention_only
@@ -211,6 +218,8 @@ Telegram notes:
 
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
+- `ack_enabled = false` disables the emoji reaction (⚡️, 👌, 👀, 🔥, 👍) sent to incoming messages as acknowledgment.
+- `stream_mode = "on"` uses Telegram's native `sendMessageDraft` flow for private chats. Non-private chats, or runtime `sendMessageDraft` API failures, automatically fall back to `partial`.
 
 ### 4.2 Discord
 
@@ -349,7 +358,11 @@ password = "email-password"
 from_address = "bot@example.com"
 poll_interval_secs = 60
 allowed_senders = ["*"]
+imap_id = { enabled = true, name = "zeroclaw", version = "0.1.7", vendor = "zeroclaw-labs" }
 ```
+
+`imap_id` sends RFC 2971 client metadata right after IMAP login. This is required by some providers
+(for example NetEase `163.com` / `126.com`) before mailbox selection is allowed.
 
 ### 4.10 IRC
 
@@ -459,16 +472,37 @@ app_id = "qq-app-id"
 app_secret = "qq-app-secret"
 allowed_users = ["*"]
 receive_mode = "webhook" # webhook (default) or websocket (legacy fallback)
+environment = "production" # production (default) or sandbox
 ```
 
 Notes:
 
 - `webhook` mode is now the default and serves inbound callbacks at `POST /qq`.
+- Set `environment = "sandbox"` to target `https://sandbox.api.sgroup.qq.com` for unpublished bot testing.
 - QQ validation challenge payloads (`op = 13`) are auto-signed using `app_secret`.
 - `X-Bot-Appid` is checked when present and must match `app_id`.
 - Set `receive_mode = "websocket"` to keep the legacy gateway WS receive path.
 
-### 4.16 Nextcloud Talk
+### 4.16 Napcat (QQ via OneBot)
+
+```toml
+[channels_config.napcat]
+websocket_url = "ws://127.0.0.1:3001"
+api_base_url = "http://127.0.0.1:3001"  # optional; auto-derived when omitted
+access_token = ""                         # optional
+allowed_users = ["*"]
+```
+
+Notes:
+
+- Inbound messages are consumed from Napcat's WebSocket stream.
+- Outbound sends use OneBot-compatible HTTP endpoints (`send_private_msg` / `send_group_msg`).
+- Recipients:
+  - `user:<qq_user_id>` for private messages
+  - `group:<qq_group_id>` for group messages
+- Outbound reply chaining uses incoming message ids via CQ reply tags.
+
+### 4.17 Nextcloud Talk
 
 ```toml
 [channels_config.nextcloud_talk]
@@ -486,7 +520,7 @@ Notes:
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](./nextcloud-talk-setup.md) for a full runbook.
 
-### 4.16 Linq
+### 4.18 Linq
 
 ```toml
 [channels_config.linq]
@@ -505,12 +539,53 @@ Notes:
 - `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
 - `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
 
-### 4.17 iMessage
+### 4.19 iMessage
 
 ```toml
 [channels_config.imessage]
 allowed_contacts = ["*"]
 ```
+
+### 4.20 WATI
+
+```toml
+[channels_config.wati]
+api_token = "wati-api-token"
+api_url = "https://live-mt-server.wati.io"  # optional
+webhook_secret = "required-shared-secret"
+tenant_id = "tenant-id"                      # optional
+allowed_numbers = ["*"]                      # optional, "*" = allow all
+```
+
+Notes:
+
+- Inbound webhook endpoint: `POST /wati`.
+- WATI webhook auth is fail-closed:
+  - `500` when `webhook_secret` is not configured.
+  - `401` when signature/bearer auth is missing or invalid.
+- Accepted auth methods:
+  - `X-Hub-Signature-256`, `X-Wati-Signature`, or `X-Webhook-Signature` HMAC-SHA256 (`sha256=<hex>` or raw hex)
+  - `Authorization: Bearer <webhook_secret>` fallback
+- `ZEROCLAW_WATI_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+
+### 4.21 ACP
+
+ACP (Agent Client Protocol) enables ZeroClaw to act as a client for OpenCode ACP server,
+allowing remote control of OpenCode behavior through JSON-RPC 2.0 communication over stdio.
+
+```toml
+[channels_config.acp]
+opencode_path = "opencode"  # optional, default: "opencode"
+workdir = "/path/to/workspace"  # optional
+extra_args = []  # optional additional arguments to `opencode acp`
+allowed_users = ["*"]  # empty = deny all, "*" = allow all
+```
+
+Notes:
+- ACP uses JSON-RPC 2.0 protocol over stdio with newline-delimited messages.
+- Requires `opencode` binary in PATH or specified via `opencode_path`.
+- The channel starts OpenCode subprocess via `opencode acp` command.
+- Responses from OpenCode can be sent back to the originating channel when configured.
 
 ---
 
@@ -560,7 +635,7 @@ RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
 Then filter channel/gateway events:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel|ACP" /tmp/zeroclaw.log
 ```
 
 ### 7.2 Keyword table
@@ -582,6 +657,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
 | Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
+| ACP | `ACP channel started` | `ACP: ignoring message from unauthorized user:` | `ACP process exited unexpectedly:` / `ACP JSON-RPC timeout:` / `ACP process spawn failed:` |
 | Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |
 
 ### 7.3 Runtime supervisor keywords

@@ -48,12 +48,17 @@ impl RouterProvider {
         let resolved_routes: HashMap<String, (usize, String)> = routes
             .into_iter()
             .filter_map(|(hint, route)| {
+                let normalized_hint = hint.trim();
+                if normalized_hint.is_empty() {
+                    tracing::warn!("Route hint is empty after trimming, skipping");
+                    return None;
+                }
                 let index = name_to_index.get(route.provider_name.as_str()).copied();
                 match index {
-                    Some(i) => Some((hint, (i, route.model))),
+                    Some(i) => Some((normalized_hint.to_string(), (i, route.model))),
                     None => {
                         tracing::warn!(
-                            hint = hint,
+                            hint = normalized_hint,
                             provider = route.provider_name,
                             "Route references unknown provider, skipping"
                         );
@@ -63,10 +68,17 @@ impl RouterProvider {
             })
             .collect();
 
+        let default_index = default_model
+            .strip_prefix("hint:")
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .and_then(|hint| resolved_routes.get(hint).map(|(idx, _)| *idx))
+            .unwrap_or(0);
+
         Self {
             routes: resolved_routes,
             providers,
-            default_index: 0,
+            default_index,
             default_model,
             vision_override: None,
         }
@@ -85,11 +97,12 @@ impl RouterProvider {
     /// Resolve a model parameter to a (provider_index, actual_model) pair.
     fn resolve(&self, model: &str) -> (usize, String) {
         if let Some(hint) = model.strip_prefix("hint:") {
-            if let Some((idx, resolved_model)) = self.routes.get(hint) {
+            let normalized_hint = hint.trim();
+            if let Some((idx, resolved_model)) = self.routes.get(normalized_hint) {
                 return (*idx, resolved_model.clone());
             }
             tracing::warn!(
-                hint = hint,
+                hint = normalized_hint,
                 "Unknown route hint, falling back to default provider"
             );
         }
@@ -368,6 +381,30 @@ mod tests {
         let (router, _) = make_router(
             vec![("fast", "ok"), ("smart", "ok")],
             vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        let (idx, model) = router.resolve("hint:reasoning");
+        assert_eq!(idx, 1);
+        assert_eq!(model, "claude-opus");
+    }
+
+    #[test]
+    fn resolve_trims_whitespace_in_hint_reference() {
+        let (router, _) = make_router(
+            vec![("fast", "ok"), ("smart", "ok")],
+            vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        let (idx, model) = router.resolve("hint: reasoning ");
+        assert_eq!(idx, 1);
+        assert_eq!(model, "claude-opus");
+    }
+
+    #[test]
+    fn resolve_matches_routes_with_whitespace_hint_config() {
+        let (router, _) = make_router(
+            vec![("fast", "ok"), ("smart", "ok")],
+            vec![(" reasoning ", "smart", "claude-opus")],
         );
 
         let (idx, model) = router.resolve("hint:reasoning");

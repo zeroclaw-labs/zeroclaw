@@ -4,6 +4,11 @@ This page defines the canonical documentation layout and compatibility layers.
 
 Last refreshed: **February 24, 2026**.
 
+Companion indexes:
+- Function-oriented map: [by-function.md](by-function.md)
+- Hub entry point: [../README.md](../README.md)
+- Unified TOC: [../SUMMARY.md](../SUMMARY.md)
+
 ## 1) Directory Spine (Canonical)
 
 ### Layer A: global entry points

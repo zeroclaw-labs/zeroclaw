@@ -1,0 +1,88 @@
+---
+name: Post-Release Validation
+
+on:
+    release:
+        types: ["published"]
+
+permissions:
+    contents: read
+
+jobs:
+    validate:
+        name: Validate Published Release
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Download and verify release assets
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+
+                  echo "Validating release: ${RELEASE_TAG}"
+
+                  # 1. Check release exists and is not draft
+                  release_json="$(gh api \
+                    "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+                  is_draft="$(echo "$release_json" \
+                    | python3 -c "import sys,json; print(json.load(sys.stdin)['draft'])")"
+                  if [ "$is_draft" = "True" ]; then
+                    echo "::warning::Release ${RELEASE_TAG} is still in draft."
+                  fi
+
+                  # 2. Check expected assets against artifact contract
+                  asset_count="$(echo "$release_json" \
+                    | python3 -c "import sys,json; print(len(json.load(sys.stdin)['assets']))")"
+                  contract=".github/release/release-artifact-contract.json"
+                  expected_count="$(python3 -c "
+                  import json
+                  c = json.load(open('$contract'))
+                  total = sum(len(c[k]) for k in c if k != 'schema_version')
+                  print(total)
+                  ")"
+                  echo "Release has ${asset_count} assets (contract expects ${expected_count})"
+                  if [ "$asset_count" -lt "$expected_count" ]; then
+                    echo "::error::Expected >=${expected_count} release assets (from ${contract}), found ${asset_count}"
+                    exit 1
+                  fi
+
+                  # 3. Download checksum file and one archive
+                  gh release download "${RELEASE_TAG}" \
+                    --pattern "SHA256SUMS" \
+                    --dir /tmp/release-check
+                  gh release download "${RELEASE_TAG}" \
+                    --pattern "zeroclaw-x86_64-unknown-linux-gnu.tar.gz" \
+                    --dir /tmp/release-check
+
+                  # 4. Verify checksum
+                  cd /tmp/release-check
+                  if sha256sum --check --ignore-missing SHA256SUMS; then
+                    echo "SHA256 checksum verification: passed"
+                  else
+                    echo "::error::SHA256 checksum verification failed"
+                    exit 1
+                  fi
+
+                  # 5. Extract binary
+                  tar xzf zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+
+            - name: Smoke-test release binary
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  set -euo pipefail
+                  cd /tmp/release-check
+                  if ./zeroclaw --version | grep -Fq "${RELEASE_TAG#v}"; then
+                    echo "Binary version check: passed (${RELEASE_TAG})"
+                  else
+                    actual="$(./zeroclaw --version)"
+                    echo "::error::Binary --version mismatch: ${actual}"
+                    exit 1
+                  fi
+                  echo "Post-release validation: all checks passed"

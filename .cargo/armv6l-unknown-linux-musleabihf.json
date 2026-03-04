@@ -1,0 +1,19 @@
+{
+  "arch": "arm",
+  "crt-static-defaults": true,
+  "data-layout": "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+  "emit-debug-gdb-scripts": false,
+  "env": "musl",
+  "executables": true,
+  "is-builtin": false,
+  "linker": "arm-linux-gnueabihf-gcc",
+  "linker-flavor": "gcc",
+  "llvm-target": "armv6-unknown-linux-musleabihf",
+  "max-atomic-width": 32,
+  "os": "linux",
+  "panic-strategy": "unwind",
+  "relocation-model": "static",
+  "target-endian": "little",
+  "target-pointer-width": "32",
+  "vendor": "unknown"
+}

@@ -29,6 +29,8 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 | See project PR/issue docs snapshot | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
 | Perform i18n completion for docs changes | [i18n-guide.md](i18n-guide.md) |
 
+Installation source-of-truth: keep install/run instructions in repository docs and README pages; issue comments are supplemental context only.
+
 ## Quick Decision Tree (10 seconds)
 
 - Need first-time setup or install? → [getting-started/README.md](getting-started/README.md)
@@ -79,6 +81,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 > Note: this area includes proposal/roadmap docs. For current behavior, start with [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
 
 - [security/README.md](security/README.md)
+- [security/official-channels-and-fraud-prevention.md](security/official-channels-and-fraud-prevention.md)
 - [agnostic-security.md](agnostic-security.md)
 - [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)
@@ -90,6 +93,7 @@ Localized hubs: [简体中文](i18n/zh-CN/README.md) · [日本語](i18n/ja/READ
 
 - Unified TOC: [SUMMARY.md](SUMMARY.md)
 - Docs structure map (language/part/function): [structure/README.md](structure/README.md)
+- Docs map by function: [structure/by-function.md](structure/by-function.md)
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
 - i18n docs index: [i18n/README.md](i18n/README.md)
 - i18n coverage map: [i18n-coverage.md](i18n-coverage.md)

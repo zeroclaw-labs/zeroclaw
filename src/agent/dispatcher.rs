@@ -263,6 +263,9 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+                quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -281,6 +284,9 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         let dispatcher = NativeToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);

@@ -8,6 +8,26 @@ use std::fmt::Write;
 use std::path::Path;
 
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+const DATETIME_HEADER: &str = "## Current Date & Time\n\n";
+
+/// Refresh the `## Current Date & Time` section in an existing system prompt.
+/// Long-lived sessions keep a stable system prompt; this updates only the
+/// timestamp payload so per-turn "current time" answers stay accurate.
+pub fn refresh_prompt_datetime(prompt: &mut String) {
+    let Some(section_start) = prompt.find(DATETIME_HEADER) else {
+        return;
+    };
+
+    let content_start = section_start + DATETIME_HEADER.len();
+    let content_end = prompt[content_start..]
+        .find('\n')
+        .map(|offset| content_start + offset)
+        .unwrap_or(prompt.len());
+
+    let now = Local::now();
+    let replacement = format!("{} ({})", now.format("%Y-%m-%d %H:%M:%S"), now.format("%Z"));
+    prompt.replace_range(content_start..content_end, &replacement);
+}
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
@@ -107,9 +127,21 @@ impl PromptSection for IdentitySection {
             "USER.md",
             "HEARTBEAT.md",
             "BOOTSTRAP.md",
-            "MEMORY.md",
         ] {
             inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
+        }
+        let memory_path = ctx.workspace_dir.join("MEMORY.md");
+        if memory_path.exists() {
+            inject_workspace_file(&mut prompt, ctx.workspace_dir, "MEMORY.md");
+        }
+
+        let extra_files = ctx
+            .identity_config
+            .map_or(&[][..], |cfg| cfg.extra_files.as_slice());
+        for file in extra_files {
+            if let Some(safe_relative) = normalize_openclaw_identity_extra_file(file) {
+                inject_workspace_file(&mut prompt, ctx.workspace_dir, safe_relative);
+            }
         }
 
         Ok(prompt)
@@ -257,6 +289,29 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
     }
 }
 
+fn normalize_openclaw_identity_extra_file(raw: &str) -> Option<&str> {
+    use std::path::{Component, Path};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return None;
+    }
+
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +359,7 @@ mod tests {
 
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
         };
@@ -330,6 +386,96 @@ mod tests {
             output.contains("AGENTS_MD_LOADED"),
             "AGENTS.md content should be present even when AIEOS is configured"
         );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn identity_section_openclaw_injects_extra_files() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_prompt_extra_files_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "agent baseline").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "soul baseline").unwrap();
+        std::fs::write(workspace.join("TOOLS.md"), "tools baseline").unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "identity baseline").unwrap();
+        std::fs::write(workspace.join("USER.md"), "user baseline").unwrap();
+        std::fs::write(workspace.join("FRAMEWORK.md"), "framework context").unwrap();
+        std::fs::write(workspace.join("memory").join("notes.md"), "memory notes").unwrap();
+
+        let identity_config = crate::config::IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: vec!["FRAMEWORK.md".into(), "memory/notes.md".into()],
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: Some(&identity_config),
+            dispatcher_instructions: "",
+        };
+
+        let section = IdentitySection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(output.contains("### FRAMEWORK.md"));
+        assert!(output.contains("framework context"));
+        assert!(output.contains("### memory/notes.md"));
+        assert!(output.contains("memory notes"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn identity_section_openclaw_rejects_unsafe_extra_files() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_prompt_extra_files_unsafe_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "agent baseline").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "soul baseline").unwrap();
+        std::fs::write(workspace.join("TOOLS.md"), "tools baseline").unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "identity baseline").unwrap();
+        std::fs::write(workspace.join("USER.md"), "user baseline").unwrap();
+        std::fs::write(workspace.join("SAFE.md"), "safe context").unwrap();
+
+        let identity_config = crate::config::IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: vec![
+                "SAFE.md".into(),
+                "../outside.md".into(),
+                "/tmp/absolute.md".into(),
+            ],
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: Some(&identity_config),
+            dispatcher_instructions: "",
+        };
+
+        let section = IdentitySection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(output.contains("### SAFE.md"));
+        assert!(!output.contains("outside.md"));
+        assert!(!output.contains("absolute.md"));
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -370,6 +516,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: None,
+            always: false,
         }];
 
         let ctx = PromptContext {
@@ -408,6 +555,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
+            always: false,
         }];
 
         let ctx = PromptContext {
@@ -426,6 +574,35 @@ mod tests {
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         assert!(!output.contains("<tools>"));
+    }
+
+    #[test]
+    fn refresh_prompt_datetime_updates_timestamp_in_place() {
+        let mut prompt = "## Runtime\n\nHost: test\n\n## Current Date & Time\n\n2000-01-01 00:00:00 (UTC)\n\n## Next Section".to_string();
+        super::refresh_prompt_datetime(&mut prompt);
+
+        assert!(prompt.contains("## Current Date & Time\n\n"));
+        assert!(prompt.contains("\n\n## Next Section"));
+        assert!(!prompt.contains("2000-01-01 00:00:00 (UTC)"));
+
+        let payload_start =
+            prompt.find("## Current Date & Time\n\n").unwrap() + "## Current Date & Time\n\n".len();
+        let payload_end = prompt[payload_start..]
+            .find('\n')
+            .map(|offset| payload_start + offset)
+            .unwrap_or(prompt.len());
+        let payload = &prompt[payload_start..payload_end];
+        assert!(payload.chars().any(|c| c.is_ascii_digit()));
+        assert!(payload.contains(" ("));
+        assert!(payload.ends_with(')'));
+    }
+
+    #[test]
+    fn refresh_prompt_datetime_noops_when_section_missing() {
+        let mut prompt = "## Runtime\n\nHost: test".to_string();
+        let original = prompt.clone();
+        super::refresh_prompt_datetime(&mut prompt);
+        assert_eq!(prompt, original);
     }
 
     #[test]
@@ -468,6 +645,7 @@ mod tests {
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
+            always: false,
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),

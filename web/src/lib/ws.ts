@@ -19,6 +19,7 @@ export interface WebSocketClientOptions {
 
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
+const WS_SESSION_STORAGE_KEY = 'zeroclaw.ws.session_id';
 
 export class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -35,6 +36,7 @@ export class WebSocketClient {
   private readonly reconnectDelay: number;
   private readonly maxReconnectDelay: number;
   private readonly autoReconnect: boolean;
+  private readonly sessionId: string;
 
   constructor(options: WebSocketClientOptions = {}) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -44,6 +46,7 @@ export class WebSocketClient {
     this.maxReconnectDelay = options.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
     this.autoReconnect = options.autoReconnect ?? true;
     this.currentDelay = this.reconnectDelay;
+    this.sessionId = this.resolveSessionId();
   }
 
   /** Open the WebSocket connection. */
@@ -52,7 +55,7 @@ export class WebSocketClient {
     this.clearReconnectTimer();
 
     const token = getToken();
-    const url = `${this.baseUrl}/ws/chat`;
+    const url = `${this.baseUrl}/ws/chat?session_id=${encodeURIComponent(this.sessionId)}`;
     const protocols = ['zeroclaw.v1'];
     if (token) {
       protocols.push(`bearer.${token}`);
@@ -125,5 +128,18 @@ export class WebSocketClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  private resolveSessionId(): string {
+    const existing = window.localStorage.getItem(WS_SESSION_STORAGE_KEY);
+    if (existing && /^[A-Za-z0-9_-]{1,128}$/.test(existing)) {
+      return existing;
+    }
+
+    const generated =
+      globalThis.crypto?.randomUUID?.().replace(/-/g, '_') ??
+      `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    window.localStorage.setItem(WS_SESSION_STORAGE_KEY, generated);
+    return generated;
   }
 }

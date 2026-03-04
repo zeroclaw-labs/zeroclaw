@@ -23,6 +23,9 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
+        crate::MemoryCommands::Reindex { yes, progress } => {
+            handle_reindex(config, yes, progress).await
+        }
     }
 }
 
@@ -294,6 +297,75 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     if mem.forget(&target).await? {
         println!("{} Deleted key: {target}", style("✓").green().bold());
     }
+
+    Ok(())
+}
+
+/// Rebuild embeddings for all memories using current embedding configuration.
+async fn handle_reindex(config: &Config, yes: bool, progress: bool) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Reindex requires full memory backend with embeddings
+    let mem = super::create_memory(&config.memory, &config.workspace_dir, None)?;
+
+    // Get total count for confirmation
+    let total = mem.count().await?;
+
+    if total == 0 {
+        println!("No memories to reindex.");
+        return Ok(());
+    }
+
+    println!(
+        "\n{} Found {} memories to reindex.",
+        style("ℹ").blue().bold(),
+        style(total).cyan().bold()
+    );
+    println!(
+        "  This will clear the embedding cache and recompute all embeddings\n  using the current embedding provider configuration.\n"
+    );
+
+    if !yes {
+        let confirmed = dialoguer::Confirm::new()
+            .with_prompt("  Proceed with reindex?")
+            .default(false)
+            .interact()?;
+        if !confirmed {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    println!("\n{} Reindexing memories...\n", style("⟳").yellow().bold());
+
+    // Create progress callback if enabled
+    let callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>> = if progress {
+        let last_percent = Arc::new(AtomicUsize::new(0));
+        Some(Box::new(move |current, total| {
+            let percent = (current * 100) / total.max(1);
+            let last = last_percent.load(Ordering::Relaxed);
+            // Only print every 10%
+            if percent >= last + 10 || current == total {
+                last_percent.store(percent, Ordering::Relaxed);
+                eprint!("\r  Progress: {current}/{total} ({percent}%)");
+                if current == total {
+                    eprintln!();
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Perform reindex
+    let reindexed = mem.reindex(callback).await?;
+
+    println!(
+        "\n{} Reindexed {} memories successfully.",
+        style("✓").green().bold(),
+        style(reindexed).cyan().bold()
+    );
 
     Ok(())
 }
