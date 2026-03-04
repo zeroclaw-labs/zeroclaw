@@ -631,6 +631,12 @@ pub(crate) async fn run_tool_call_loop(
         );
     }
 
+    // Hoist invariant owned strings outside the loop to avoid repeated
+    // heap allocation on every iteration. ObserverEvent and runtime_trace
+    // both require owned String, so we allocate once and clone cheaply.
+    let provider_str = provider_name.to_string();
+    let model_str = model.to_string();
+
     for iteration in 0..max_iterations {
         if cancellation_token
             .as_ref()
@@ -642,7 +648,7 @@ pub(crate) async fn run_tool_call_loop(
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
+                provider: provider_str.clone(),
                 capability: "vision".to_string(),
                 message: format!(
                     "received {image_marker_count} image marker(s), but this provider does not support vision input"
@@ -665,8 +671,8 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
-            provider: provider_name.to_string(),
-            model: model.to_string(),
+            provider: provider_str.clone(),
+            model: model_str.clone(),
             messages_count: history.len(),
         });
         runtime_trace::record_event(
@@ -726,8 +732,8 @@ pub(crate) async fn run_tool_call_loop(
                         .unwrap_or((None, None));
 
                     observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider: provider_str.clone(),
+                        model: model_str.clone(),
                         duration: llm_started_at.elapsed(),
                         success: true,
                         error_message: None,
@@ -824,8 +830,8 @@ pub(crate) async fn run_tool_call_loop(
                 Err(e) => {
                     let safe_error = crate::providers::sanitize_api_error(&e.to_string());
                     observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider: provider_str.clone(),
+                        model: model_str.clone(),
                         duration: llm_started_at.elapsed(),
                         success: false,
                         error_message: Some(safe_error.clone()),
@@ -937,25 +943,24 @@ pub(crate) async fn run_tool_call_loop(
             let mut tool_name = call.name.clone();
             let mut tool_args = call.arguments.clone();
             if let Some(hooks) = hooks {
-                match hooks
-                    .run_before_tool_call(tool_name.clone(), tool_args.clone())
-                    .await
-                {
+                // Pass by value — hook runner takes ownership; Continue returns
+                // the (possibly-mutated) name/args back, Cancel drops them.
+                match hooks.run_before_tool_call(tool_name, tool_args).await {
                     crate::hooks::HookResult::Cancel(reason) => {
                         tracing::info!(tool = %call.name, %reason, "tool call cancelled by hook");
                         let cancelled = format!("Cancelled by hook: {reason}");
                         runtime_trace::record_event(
                             "tool_call_result",
                             Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
+                            Some(&provider_str),
+                            Some(&model_str),
                             Some(&turn_id),
                             Some(false),
                             Some(&cancelled),
                             serde_json::json!({
                                 "iteration": iteration + 1,
                                 "tool": call.name,
-                                "arguments": scrub_credentials(&tool_args.to_string()),
+                                "arguments": scrub_credentials(&call.arguments.to_string()),
                             }),
                         );
                         ordered_results[idx] = Some((
@@ -1069,19 +1074,19 @@ pub(crate) async fn run_tool_call_loop(
                         runtime_trace::record_event(
                             "tool_call_result",
                             Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
+                            Some(&provider_str),
+                            Some(&model_str),
                             Some(&turn_id),
                             Some(false),
                             Some(&denied),
                             serde_json::json!({
                                 "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
+                                "tool": &tool_name,
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
                         ordered_results[idx] = Some((
-                            tool_name.clone(),
+                            tool_name,
                             call.tool_call_id.clone(),
                             ToolExecutionOutcome {
                                 output: denied.clone(),
@@ -1103,20 +1108,20 @@ pub(crate) async fn run_tool_call_loop(
                 runtime_trace::record_event(
                     "tool_call_result",
                     Some(channel_name),
-                    Some(provider_name),
-                    Some(model),
+                    Some(&provider_str),
+                    Some(&model_str),
                     Some(&turn_id),
                     Some(false),
                     Some(&duplicate),
                     serde_json::json!({
                         "iteration": iteration + 1,
-                        "tool": tool_name.clone(),
+                        "tool": &tool_name,
                         "arguments": scrub_credentials(&tool_args.to_string()),
                         "deduplicated": true,
                     }),
                 );
                 ordered_results[idx] = Some((
-                    tool_name.clone(),
+                    tool_name,
                     call.tool_call_id.clone(),
                     ToolExecutionOutcome {
                         output: duplicate.clone(),
@@ -1131,14 +1136,14 @@ pub(crate) async fn run_tool_call_loop(
             runtime_trace::record_event(
                 "tool_call_start",
                 Some(channel_name),
-                Some(provider_name),
-                Some(model),
+                Some(&provider_str),
+                Some(&model_str),
                 Some(&turn_id),
                 None,
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "tool": tool_name.clone(),
+                    "tool": &tool_name,
                     "arguments": scrub_credentials(&tool_args.to_string()),
                 }),
             );
@@ -1191,14 +1196,14 @@ pub(crate) async fn run_tool_call_loop(
             runtime_trace::record_event(
                 "tool_call_result",
                 Some(channel_name),
-                Some(provider_name),
-                Some(model),
+                Some(&provider_str),
+                Some(&model_str),
                 Some(&turn_id),
                 Some(outcome.success),
                 outcome.error_reason.as_deref(),
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "tool": call.name.clone(),
+                    "tool": &call.name,
                     "duration_ms": outcome.duration.as_millis(),
                     "output": scrub_credentials(&outcome.output),
                 }),
