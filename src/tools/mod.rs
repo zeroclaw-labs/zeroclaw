@@ -644,6 +644,7 @@ pub fn all_tools_with_runtime(
             custom_provider_api_mode: root_config
                 .provider_api
                 .map(|mode| mode.as_compatible_mode()),
+            custom_provider_auth_header: root_config.effective_custom_provider_auth_header(),
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };
