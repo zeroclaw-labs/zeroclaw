@@ -31,9 +31,37 @@ probe_rustfmt() {
     rustup run "${toolchain}" cargo fmt --version >/dev/null 2>&1
 }
 
+component_available() {
+    local toolchain="$1"
+    local component="$2"
+    rustup component list --toolchain "${toolchain}" \
+        | grep -Eq "^${component}(-[[:alnum:]_:-]+)? "
+}
+
+component_installed() {
+    local toolchain="$1"
+    local component="$2"
+    rustup component list --toolchain "${toolchain}" --installed \
+        | grep -Eq "^${component}(-[[:alnum:]_:-]+)? \\(installed\\)$"
+}
+
+install_component_or_fail() {
+    local toolchain="$1"
+    local component="$2"
+
+    if ! component_available "${toolchain}" "${component}"; then
+        echo "::error::component '${component}' is unavailable for toolchain ${toolchain}."
+        return 1
+    fi
+    if ! rustup component add --toolchain "${toolchain}" "${component}"; then
+        echo "::error::failed to install required component '${component}' for ${toolchain}."
+        return 1
+    fi
+}
+
 probe_rustdoc() {
     local toolchain="$1"
-    rustup run "${toolchain}" rustdoc --version >/dev/null 2>&1
+    component_installed "${toolchain}" "rust-docs"
 }
 
 ensure_required_tooling() {
@@ -45,12 +73,12 @@ ensure_required_tooling() {
     fi
 
     for component in ${required_components}; do
-        rustup component add --toolchain "${toolchain}" "${component}" || true
+        install_component_or_fail "${toolchain}" "${component}" || return 1
     done
 
     if [[ " ${required_components} " == *" rustfmt "* ]] && ! probe_rustfmt "${toolchain}"; then
         echo "::error::rustfmt is unavailable for toolchain ${toolchain}."
-        rustup component add --toolchain "${toolchain}" rustfmt || true
+        install_component_or_fail "${toolchain}" "rustfmt" || return 1
         if ! probe_rustfmt "${toolchain}"; then
             return 1
         fi
@@ -58,7 +86,7 @@ ensure_required_tooling() {
 
     if [[ " ${required_components} " == *" rust-docs "* ]] && ! probe_rustdoc "${toolchain}"; then
         echo "::error::rustdoc is unavailable for toolchain ${toolchain}."
-        rustup component add --toolchain "${toolchain}" rust-docs || true
+        install_component_or_fail "${toolchain}" "rust-docs" || return 1
         if ! probe_rustdoc "${toolchain}"; then
             return 1
         fi
@@ -67,11 +95,10 @@ ensure_required_tooling() {
 
 default_required_components() {
     local normalized_job_name="${1:-}"
-    case "${normalized_job_name}" in
-    *lint*) echo "rustfmt" ;;
-    *test*) echo "rust-docs" ;;
-    *) echo "" ;;
-    esac
+    local components=()
+    [[ "${normalized_job_name}" == *lint* ]] && components+=("rustfmt")
+    [[ "${normalized_job_name}" == *test* ]] && components+=("rust-docs")
+    echo "${components[*]}"
 }
 
 export_toolchain_for_next_steps() {

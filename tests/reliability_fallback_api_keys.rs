@@ -90,6 +90,7 @@ async fn fallback_api_keys_support_multiple_custom_endpoints() {
 
     assert_eq!(reply, "response-from-fallback-two");
 
+    primary_server.verify().await;
     fallback_server_one.verify().await;
     fallback_server_two.verify().await;
 }

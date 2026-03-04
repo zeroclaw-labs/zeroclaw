@@ -7961,6 +7961,29 @@ impl Config {
             anyhow::bail!("gateway.host must not be empty");
         }
 
+        // Reliability
+        let configured_fallbacks = self
+            .reliability
+            .fallback_providers
+            .iter()
+            .map(|provider| provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        for (entry, api_key) in &self.reliability.fallback_api_keys {
+            let normalized_entry = entry.trim();
+            if normalized_entry.is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys contains an empty key");
+            }
+            if api_key.trim().is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys.{normalized_entry} must not be empty");
+            }
+            if !configured_fallbacks.contains(normalized_entry) {
+                anyhow::bail!(
+                    "reliability.fallback_api_keys.{normalized_entry} has no matching entry in reliability.fallback_providers"
+                );
+            }
+        }
+
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
@@ -14550,6 +14573,40 @@ sensitivity = 0.9
         assert!(err
             .to_string()
             .contains("security.url_access.enforce_domain_allowlist"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_empty_fallback_api_key_value() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("openrouter".to_string(), "   ".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys empty value validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.openrouter must not be empty"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_unmapped_fallback_api_key_entry() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("anthropic".to_string(), "sk-ant-test".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys mapping validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.anthropic has no matching entry"));
     }
 
     #[test]
