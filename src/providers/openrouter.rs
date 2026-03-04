@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenRouterProvider {
     credential: Option<String>,
     max_tokens_override: Option<u32>,
+    client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +160,11 @@ impl OpenRouterProvider {
         Self {
             credential: credential.map(ToString::to_string),
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            client: crate::config::build_runtime_proxy_client_with_timeouts(
+                "provider.openrouter",
+                120,
+                10,
+            ),
         }
     }
 
@@ -305,8 +311,8 @@ impl OpenRouterProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", 120, 10)
+    fn http_client(&self) -> &Client {
+        &self.client
     }
 }
 
