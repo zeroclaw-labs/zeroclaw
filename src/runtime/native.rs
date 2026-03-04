@@ -76,12 +76,13 @@ where
 {
     if is_windows {
         for (name, kind) in [
-            ("bash", ShellKind::Bash),
-            ("sh", ShellKind::Sh),
             ("pwsh", ShellKind::Pwsh),
             ("powershell", ShellKind::PowerShell),
             ("cmd", ShellKind::Cmd),
             ("cmd.exe", ShellKind::Cmd),
+            ("bash", ShellKind::Bash),
+            ("sh", ShellKind::Sh),
+           
         ] {
             if let Some(program) = resolve(name) {
                 return Some(ShellProgram { kind, program });
