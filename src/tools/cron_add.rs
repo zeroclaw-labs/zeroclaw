@@ -78,7 +78,10 @@ impl Tool for CronAddTool {
                 "command": { "type": "string" },
                 "prompt": { "type": "string" },
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
-                "model": { "type": "string" },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for this job. Omit unless the user explicitly requests a different model; defaults to the active model/context."
+                },
                 "recurring_confirmed": {
                     "type": "boolean",
                     "description": "Required for agent recurring schedules (schedule.kind='cron' or 'every'). Set true only when recurring behavior is intentional.",
