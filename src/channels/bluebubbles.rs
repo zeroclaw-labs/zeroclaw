@@ -538,7 +538,27 @@ impl BlueBubblesChannel {
         if super::transcription::whisper_available() {
             let tmp_path =
                 std::env::temp_dir().join(format!("zc_bb_audio_{}.{ext}", uuid::Uuid::new_v4()));
-            tokio::fs::write(&tmp_path, &bytes).await?;
+            // Write with owner-only permissions from the start to avoid a
+            // race between creation and a subsequent chmod.
+            {
+                use tokio::io::AsyncWriteExt as _;
+                #[cfg(unix)]
+                let mut f = {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&tmp_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to create temp audio file: {e}"))?
+                };
+                #[cfg(not(unix))]
+                let mut f = tokio::fs::File::create(&tmp_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create temp audio file: {e}"))?;
+                f.write_all(&bytes).await?;
+            }
             let result =
                 super::transcription::transcribe_audio_local(tmp_path.to_str().ok_or_else(
                     || anyhow::anyhow!("Temp audio path contains non-UTF-8 characters"),

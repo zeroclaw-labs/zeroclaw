@@ -2308,14 +2308,8 @@ async fn handle_bluebubbles_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(ref bluebubbles) = state.bluebubbles else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "BlueBubbles not configured"})),
-        );
-    };
-
-    // Admission control — reject bursts before spawning background workers.
+    // Admission control first — rate limiting applies before any other processing,
+    // including the configured-channel check, to bound background worker spawning.
     let rate_key = client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         tracing::warn!("/bluebubbles rate limit exceeded");
@@ -2342,6 +2336,13 @@ async fn handle_bluebubbles_webhook(
             );
         }
     }
+
+    let Some(ref bluebubbles) = state.bluebubbles else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "BlueBubbles not configured"})),
+        );
+    };
 
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (
@@ -2381,11 +2382,8 @@ async fn handle_bluebubbles_webhook(
         }
 
         for msg in &messages {
-            tracing::info!(
-                "BlueBubbles iMessage from {}: {}",
-                msg.sender,
-                truncate_with_ellipsis(&msg.content, 50)
-            );
+            // Log sender only — content may include personal message text.
+            tracing::info!("BlueBubbles iMessage from {}", msg.sender);
 
             let session_id = gateway_message_session_id(msg);
             if state_bg.auto_save {
