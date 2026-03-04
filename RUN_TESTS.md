@@ -300,6 +300,6 @@ If all tests pass:
 
 ## 📞 Support
 
-- Issues: https://github.com/theonlyhennygod/zeroclaw/issues
+- Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
 - Docs: `./TESTING_TELEGRAM.md`
 - Help: `zeroclaw --help`

@@ -6,10 +6,11 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, NormalizedStopReason, Provider, ProviderCapabilityError,
+    ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{CanaryGuard, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -34,7 +35,7 @@ use uuid::Uuid;
 mod context;
 pub(crate) mod detection;
 mod execution;
-mod history;
+pub(crate) mod history;
 mod parsing;
 
 use context::{build_context, build_hardware_context};
@@ -45,7 +46,7 @@ use execution::{
 };
 #[cfg(test)]
 use history::{apply_compaction_summary, build_compaction_transcript};
-use history::{auto_compact_history, trim_history};
+use history::{auto_compact_history, extract_facts_from_turns, trim_history, TurnBuffer};
 #[allow(unused_imports)]
 use parsing::{
     default_param_for_tool, detect_tool_call_parse_issue, extract_json_values, map_tool_name_alias,
@@ -61,9 +62,71 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 
+/// Maximum continuation retries when a provider reports max-token truncation.
+const MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS: usize = 3;
+/// Absolute safety cap for merged continuation output.
+const MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS: usize = 120_000;
+/// Deterministic continuation instruction appended as a user message.
+const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Previous response was truncated by token limit.\nContinue exactly from where you left off.\nIf you intended a tool call, emit one complete tool call payload only.\nDo not repeat already-sent text.";
+/// Notice appended when continuation budget is exhausted before completion.
+const MAX_TOKENS_CONTINUATION_NOTICE: &str =
+    "\n\n[Response may be truncated due to continuation limits. Reply \"continue\" to resume.]";
+
+/// Returned when canary token exfiltration is detected in model output.
+const CANARY_EXFILTRATION_BLOCK_MESSAGE: &str =
+    "I blocked that response because it attempted to reveal protected internal context.";
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+fn filter_primary_agent_tools_or_fail(
+    config: &Config,
+    tools_registry: Vec<Box<dyn Tool>>,
+) -> Result<Vec<Box<dyn Tool>>> {
+    let (filtered_tools, report) = tools::filter_primary_agent_tools(
+        tools_registry,
+        &config.agent.allowed_tools,
+        &config.agent.denied_tools,
+    );
+
+    for unmatched in report.unmatched_allowed_tools {
+        tracing::debug!(
+            tool = %unmatched,
+            "agent.allowed_tools entry did not match any registered tool"
+        );
+    }
+
+    let has_agent_allowlist = config
+        .agent
+        .allowed_tools
+        .iter()
+        .any(|entry| !entry.trim().is_empty());
+    let has_agent_denylist = config
+        .agent
+        .denied_tools
+        .iter()
+        .any(|entry| !entry.trim().is_empty());
+    if has_agent_allowlist
+        && has_agent_denylist
+        && report.allowlist_match_count > 0
+        && filtered_tools.is_empty()
+    {
+        anyhow::bail!(
+            "agent.allowed_tools and agent.denied_tools removed all executable tools; update [agent] tool filters"
+        );
+    }
+
+    Ok(filtered_tools)
+}
+
+fn retain_visible_tool_descriptions<'a>(
+    tool_descs: &mut Vec<(&'a str, &'a str)>,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    let visible_tools: HashSet<&str> = tools_registry.iter().map(|tool| tool.name()).collect();
+    tool_descs.retain(|(name, _)| visible_tools.contains(*name));
+}
 
 fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
     if provider.supports_vision() {
@@ -267,6 +330,10 @@ pub(crate) const DRAFT_PROGRESS_SECTION_END: &str = "\n<!-- progress-end -->\n";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_CANARY_TOKENS_ENABLED: bool;
 }
 
 const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
@@ -559,11 +626,67 @@ fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
         && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
 }
 
+fn merge_continuation_text(existing: &str, next: &str) -> String {
+    if next.is_empty() {
+        return existing.to_string();
+    }
+    if existing.is_empty() {
+        return next.to_string();
+    }
+    if existing.ends_with(next) {
+        return existing.to_string();
+    }
+    if next.starts_with(existing) {
+        return next.to_string();
+    }
+
+    let mut prefix_ends: Vec<usize> = next.char_indices().map(|(idx, _)| idx).collect();
+    prefix_ends.push(next.len());
+    for prefix_end in prefix_ends.into_iter().rev() {
+        if prefix_end == 0 || prefix_end > existing.len() {
+            continue;
+        }
+        if existing.ends_with(&next[..prefix_end]) {
+            return format!("{existing}{}", &next[prefix_end..]);
+        }
+    }
+
+    format!("{existing}{next}")
+}
+
+fn add_optional_u64(lhs: Option<u64>, rhs: Option<u64>) -> Option<u64> {
+    match (lhs, rhs) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn stop_reason_name(reason: &NormalizedStopReason) -> &'static str {
+    match reason {
+        NormalizedStopReason::EndTurn => "end_turn",
+        NormalizedStopReason::ToolCall => "tool_call",
+        NormalizedStopReason::MaxTokens => "max_tokens",
+        NormalizedStopReason::ContextWindowExceeded => "context_window_exceeded",
+        NormalizedStopReason::SafetyBlocked => "safety_blocked",
+        NormalizedStopReason::Cancelled => "cancelled",
+        NormalizedStopReason::Unknown(_) => "unknown",
+    }
+}
+
+fn is_legacy_cron_model_fallback(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "gpt-4o-mini" | "openai/gpt-4o-mini")
+}
+
 fn maybe_inject_cron_add_delivery(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
     reply_target: Option<&str>,
+    provider_name: &str,
+    active_model: &str,
 ) {
     if tool_name != "cron_add"
         || !AUTO_CRON_DELIVERY_CHANNELS
@@ -630,6 +753,44 @@ fn maybe_inject_cron_add_delivery(
         delivery_obj.insert(
             "to".to_string(),
             serde_json::Value::String(reply_target.to_string()),
+        );
+    }
+
+    let active_model = active_model.trim();
+    if active_model.is_empty() {
+        return;
+    }
+
+    let model_missing = args_obj
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if model_missing {
+        args_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(active_model.to_string()),
+        );
+        return;
+    }
+
+    let is_custom_provider = provider_name
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("custom:");
+    if !is_custom_provider {
+        return;
+    }
+
+    let should_replace_model = args_obj
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| {
+            is_legacy_cron_model_fallback(value) && !value.trim().eq_ignore_ascii_case(active_model)
+        });
+    if should_replace_model {
+        args_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(active_model.to_string()),
         );
     }
 }
@@ -835,25 +996,29 @@ pub(crate) async fn agent_turn(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
-    run_tool_call_loop(
-        provider,
-        history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        None,
-        "channel",
-        multimodal_config,
-        max_tool_iterations,
-        None,
-        None,
-        None,
-        &[],
-    )
-    .await
+    TOOL_LOOP_CANARY_TOKENS_ENABLED
+        .scope(
+            false,
+            run_tool_call_loop(
+                provider,
+                history,
+                tools_registry,
+                observer,
+                provider_name,
+                model,
+                temperature,
+                silent,
+                None,
+                "channel",
+                multimodal_config,
+                max_tool_iterations,
+                None,
+                None,
+                None,
+                &[],
+            ),
+        )
+        .await
 }
 
 /// Run the tool loop with channel reply_target context, used by channel runtimes
@@ -882,25 +1047,28 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
     TOOL_LOOP_PROGRESS_MODE
         .scope(
             progress_mode,
-            TOOL_LOOP_REPLY_TARGET.scope(
-                reply_target.map(str::to_string),
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+            TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                false,
+                TOOL_LOOP_REPLY_TARGET.scope(
+                    reply_target.map(str::to_string),
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -929,6 +1097,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     excluded_tools: &[String],
     progress_mode: ProgressMode,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
+    canary_tokens_enabled: bool,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
@@ -939,27 +1108,30 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
             progress_mode,
             SAFETY_HEARTBEAT_CONFIG.scope(
                 safety_heartbeat,
-                TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
-                    non_cli_approval_context,
-                    TOOL_LOOP_REPLY_TARGET.scope(
-                        reply_target,
-                        run_tool_call_loop(
-                            provider,
-                            history,
-                            tools_registry,
-                            observer,
-                            provider_name,
-                            model,
-                            temperature,
-                            silent,
-                            approval,
-                            channel_name,
-                            multimodal_config,
-                            max_tool_iterations,
-                            cancellation_token,
-                            on_delta,
-                            hooks,
-                            excluded_tools,
+                TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                    canary_tokens_enabled,
+                    TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                        non_cli_approval_context,
+                        TOOL_LOOP_REPLY_TARGET.scope(
+                            reply_target,
+                            run_tool_call_loop(
+                                provider,
+                                history,
+                                tools_registry,
+                                observer,
+                                provider_name,
+                                model,
+                                temperature,
+                                silent,
+                                approval,
+                                channel_name,
+                                multimodal_config,
+                                max_tool_iterations,
+                                cancellation_token,
+                                on_delta,
+                                hooks,
+                                excluded_tools,
+                            ),
                         ),
                     ),
                 ),
@@ -1049,6 +1221,23 @@ pub async fn run_tool_call_loop(
         .flatten();
     let mut progress_tracker = ProgressTracker::default();
     let mut active_model = model.to_string();
+    let canary_guard = CanaryGuard::new(
+        TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false),
+    );
+    let mut turn_canary_token: Option<String> = None;
+    if let Some(system_message) = history.first_mut() {
+        if system_message.role == "system" {
+            let (updated_prompt, token) = canary_guard.inject_turn_token(&system_message.content);
+            system_message.content = updated_prompt;
+            turn_canary_token = token;
+        }
+    }
+    let redact_trace_text = |text: &str| -> String {
+        let scrubbed = scrub_credentials(text);
+        canary_guard.redact_token_from_text(&scrubbed, turn_canary_token.as_deref())
+    };
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -1086,8 +1275,12 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = multimodal::prepare_messages_for_provider_with_provider_hint(
+            history,
+            multimodal_config,
+            Some(provider_name),
+        )
+        .await?;
         let mut request_messages = prepared_messages.messages.clone();
         if let Some(prompt) = missing_tool_call_retry_prompt.take() {
             request_messages.push(ChatMessage::user(prompt));
@@ -1340,11 +1533,182 @@ pub async fn run_tool_call_loop(
             parse_issue_detected,
         ) = match chat_result {
             Ok(resp) => {
-                let (resp_input_tokens, resp_output_tokens) = resp
+                let mut response_text = resp.text_or_empty().to_string();
+                let mut native_calls = resp.tool_calls;
+                let mut reasoning_content = resp.reasoning_content.clone();
+                let mut stop_reason = resp.stop_reason.clone();
+                let mut raw_stop_reason = resp.raw_stop_reason.clone();
+                let (mut resp_input_tokens, mut resp_output_tokens) = resp
                     .usage
                     .as_ref()
                     .map(|u| (u.input_tokens, u.output_tokens))
                     .unwrap_or((None, None));
+
+                if let Some(reason) = stop_reason.as_ref() {
+                    runtime_trace::record_event(
+                        "stop_reason_observed",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "normalized_reason": stop_reason_name(reason),
+                            "raw_reason": raw_stop_reason.clone(),
+                        }),
+                    );
+                }
+
+                let mut continuation_attempts = 0usize;
+                let mut continuation_termination_reason: Option<&'static str> = None;
+                let mut continuation_error: Option<String> = None;
+                let mut output_chars = response_text.chars().count();
+
+                while matches!(stop_reason, Some(NormalizedStopReason::MaxTokens))
+                    && native_calls.is_empty()
+                    && continuation_attempts < MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS
+                    && output_chars < MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS
+                {
+                    continuation_attempts += 1;
+                    runtime_trace::record_event(
+                        "continuation_attempt",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "attempt": continuation_attempts,
+                            "output_chars": output_chars,
+                            "max_output_chars": MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS,
+                        }),
+                    );
+
+                    let mut continuation_messages = request_messages.clone();
+                    continuation_messages.push(ChatMessage::assistant(response_text.clone()));
+                    continuation_messages.push(ChatMessage::user(
+                        MAX_TOKENS_CONTINUATION_PROMPT.to_string(),
+                    ));
+
+                    let continuation_future = provider.chat(
+                        ChatRequest {
+                            messages: &continuation_messages,
+                            tools: request_tools,
+                        },
+                        active_model.as_str(),
+                        temperature,
+                    );
+                    let continuation_result = if let Some(token) = cancellation_token.as_ref() {
+                        tokio::select! {
+                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                            result = continuation_future => result,
+                        }
+                    } else {
+                        continuation_future.await
+                    };
+
+                    let continuation_resp = match continuation_result {
+                        Ok(response) => response,
+                        Err(error) => {
+                            continuation_termination_reason = Some("provider_error");
+                            continuation_error =
+                                Some(crate::providers::sanitize_api_error(&error.to_string()));
+                            break;
+                        }
+                    };
+
+                    if let Some(usage) = continuation_resp.usage.as_ref() {
+                        resp_input_tokens = add_optional_u64(resp_input_tokens, usage.input_tokens);
+                        resp_output_tokens =
+                            add_optional_u64(resp_output_tokens, usage.output_tokens);
+                    }
+
+                    let next_text = continuation_resp.text_or_empty().to_string();
+                    let merged_text = merge_continuation_text(&response_text, &next_text);
+                    let merged_chars = merged_text.chars().count();
+                    if merged_chars > MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS {
+                        response_text = merged_text
+                            .chars()
+                            .take(MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS)
+                            .collect();
+                        output_chars = MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS;
+                        stop_reason = Some(NormalizedStopReason::MaxTokens);
+                        continuation_termination_reason = Some("output_cap");
+                        break;
+                    }
+                    response_text = merged_text;
+                    output_chars = merged_chars;
+
+                    if continuation_resp.reasoning_content.is_some() {
+                        reasoning_content = continuation_resp.reasoning_content.clone();
+                    }
+                    if !continuation_resp.tool_calls.is_empty() {
+                        native_calls = continuation_resp.tool_calls;
+                    }
+                    stop_reason = continuation_resp.stop_reason;
+                    raw_stop_reason = continuation_resp.raw_stop_reason;
+
+                    if let Some(reason) = stop_reason.as_ref() {
+                        runtime_trace::record_event(
+                            "stop_reason_observed",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(active_model.as_str()),
+                            Some(&turn_id),
+                            Some(true),
+                            None,
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "continuation_attempt": continuation_attempts,
+                                "normalized_reason": stop_reason_name(reason),
+                                "raw_reason": raw_stop_reason.clone(),
+                            }),
+                        );
+                    }
+                }
+
+                if continuation_attempts > 0 && continuation_termination_reason.is_none() {
+                    continuation_termination_reason =
+                        if matches!(stop_reason, Some(NormalizedStopReason::MaxTokens)) {
+                            if output_chars >= MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS {
+                                Some("output_cap")
+                            } else {
+                                Some("retry_limit")
+                            }
+                        } else {
+                            Some("completed")
+                        };
+                }
+
+                if let Some(terminal_reason) = continuation_termination_reason {
+                    runtime_trace::record_event(
+                        "continuation_terminated",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(terminal_reason == "completed"),
+                        continuation_error.as_deref(),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "attempts": continuation_attempts,
+                            "terminal_reason": terminal_reason,
+                            "output_chars": output_chars,
+                        }),
+                    );
+                }
+
+                if continuation_attempts > 0
+                    && matches!(stop_reason, Some(NormalizedStopReason::MaxTokens))
+                    && native_calls.is_empty()
+                    && !response_text.ends_with(MAX_TOKENS_CONTINUATION_NOTICE)
+                {
+                    response_text.push_str(MAX_TOKENS_CONTINUATION_NOTICE);
+                }
 
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
@@ -1356,15 +1720,21 @@ pub async fn run_tool_call_loop(
                     output_tokens: resp_output_tokens,
                 });
 
-                let response_text = resp.text_or_empty().to_string();
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the provider returned no native calls —
                 // this ensures we support both native and prompt-guided models.
-                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let structured_parse = parse_structured_tool_calls(&native_calls);
+                let invalid_native_tool_json_count = structured_parse.invalid_json_arguments;
+                let mut calls = structured_parse.calls;
+                if invalid_native_tool_json_count > 0 {
+                    // Safety policy: when native tool-call args are partially truncated
+                    // or malformed, do not execute any parsed subset in this turn.
+                    calls.clear();
+                }
                 let mut parsed_text = String::new();
 
-                if calls.is_empty() {
+                if invalid_native_tool_json_count == 0 && calls.is_empty() {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
@@ -1372,7 +1742,12 @@ pub async fn run_tool_call_loop(
                     calls = fallback_calls;
                 }
 
-                let parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                let mut parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                if parse_issue.is_none() && invalid_native_tool_json_count > 0 {
+                    parse_issue = Some(format!(
+                        "provider returned {invalid_native_tool_json_count} native tool call(s) with invalid JSON arguments"
+                    ));
+                }
                 if let Some(parse_issue) = parse_issue.as_deref() {
                     runtime_trace::record_event(
                         "tool_call_parse_issue",
@@ -1384,8 +1759,9 @@ pub async fn run_tool_call_loop(
                         Some(parse_issue),
                         serde_json::json!({
                             "iteration": iteration + 1,
+                            "invalid_native_tool_json_count": invalid_native_tool_json_count,
                             "response_excerpt": truncate_with_ellipsis(
-                                &scrub_credentials(&response_text),
+                                &redact_trace_text(&response_text),
                                 600
                             ),
                         }),
@@ -1405,16 +1781,18 @@ pub async fn run_tool_call_loop(
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                         "input_tokens": resp_input_tokens,
                         "output_tokens": resp_output_tokens,
-                        "raw_response": scrub_credentials(&response_text),
-                        "native_tool_calls": resp.tool_calls.len(),
+                        "raw_response": redact_trace_text(&response_text),
+                        "native_tool_calls": native_calls.len(),
                         "parsed_tool_calls": calls.len(),
+                        "continuation_attempts": continuation_attempts,
+                        "stop_reason": stop_reason.as_ref().map(stop_reason_name),
+                        "raw_stop_reason": raw_stop_reason,
                     }),
                 );
 
                 // Preserve native tool call IDs in assistant history so role=tool
                 // follow-up messages can reference the exact call id.
-                let reasoning_content = resp.reasoning_content.clone();
-                let assistant_history_content = if resp.tool_calls.is_empty() {
+                let assistant_history_content = if native_calls.is_empty() {
                     if use_native_tools {
                         build_native_assistant_history_from_parsed_calls(
                             &response_text,
@@ -1428,12 +1806,11 @@ pub async fn run_tool_call_loop(
                 } else {
                     build_native_assistant_history(
                         &response_text,
-                        &resp.tool_calls,
+                        &native_calls,
                         reasoning_content.as_deref(),
                     )
                 };
 
-                let native_calls = resp.tool_calls;
                 (
                     response_text,
                     parsed_text,
@@ -1477,6 +1854,33 @@ pub async fn run_tool_call_loop(
             parsed_text
         };
 
+        let canary_exfiltration_detected = canary_guard
+            .response_contains_canary(&response_text, turn_canary_token.as_deref())
+            || canary_guard.response_contains_canary(&display_text, turn_canary_token.as_deref());
+        if canary_exfiltration_detected {
+            runtime_trace::record_event(
+                "security_canary_exfiltration_blocked",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(false),
+                Some("llm output contained turn canary token"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
+                }),
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string()).await;
+            }
+            history.push(ChatMessage::assistant(
+                CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string(),
+            ));
+            return Ok(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string());
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if should_emit_verbose_progress(progress_mode) {
             if let Some(ref tx) = on_delta {
@@ -1493,11 +1897,12 @@ pub async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            let missing_tool_call_signal =
+                parse_issue_detected || looks_like_deferred_action_without_tool_call(&display_text);
             let missing_tool_call_followthrough = !missing_tool_call_retry_used
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
-                && (parse_issue_detected
-                    || looks_like_deferred_action_without_tool_call(&display_text));
+                && missing_tool_call_signal;
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
                 missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
@@ -1518,7 +1923,7 @@ pub async fn run_tool_call_loop(
                     serde_json::json!({
                         "iteration": iteration + 1,
                         "reason": retry_reason,
-                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                        "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
                     }),
                 );
 
@@ -1535,6 +1940,25 @@ pub async fn run_tool_call_loop(
                 continue;
             }
 
+            if missing_tool_call_retry_used && !tool_specs.is_empty() && missing_tool_call_signal {
+                runtime_trace::record_event(
+                    "tool_call_followthrough_failed",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(active_model.as_str()),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("llm response still implied follow-up action but emitted no tool call after retry"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
+                    }),
+                );
+                anyhow::bail!(
+                    "Model deferred action without emitting a tool call after retry; refusing to return unverified completion."
+                );
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -1545,7 +1969,7 @@ pub async fn run_tool_call_loop(
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "text": scrub_credentials(&display_text),
+                    "text": redact_trace_text(&display_text),
                 }),
             );
             // No tool calls — this is the final response.
@@ -1649,6 +2073,8 @@ pub async fn run_tool_call_loop(
                 &mut tool_args,
                 channel_name,
                 channel_reply_target.as_deref(),
+                provider_name,
+                active_model.as_str(),
             );
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
@@ -1685,29 +2111,38 @@ pub async fn run_tool_call_loop(
             if let Some(mgr) = approval {
                 let non_cli_session_granted =
                     channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
-                if bypass_non_cli_approval_for_turn || non_cli_session_granted {
+                let requires_interactive_approval =
+                    mgr.needs_approval_for_call(&tool_name, &tool_args);
+                if bypass_non_cli_approval_for_turn {
+                    // One-time bypass token: bypass ALL approvals (including interactive)
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
                         ApprovalResponse::Yes,
                         channel_name,
                     );
-                    if non_cli_session_granted {
-                        runtime_trace::record_event(
-                            "approval_bypass_non_cli_session_grant",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(active_model.as_str()),
-                            Some(&turn_id),
-                            Some(true),
-                            Some("using runtime non-cli session approval grant"),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                            }),
-                        );
-                    }
-                } else if mgr.needs_approval(&tool_name) {
+                } else if non_cli_session_granted && !requires_interactive_approval {
+                    // Session grant: bypass only non-interactive approvals
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        ApprovalResponse::Yes,
+                        channel_name,
+                    );
+                    runtime_trace::record_event(
+                        "approval_bypass_non_cli_session_grant",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(true),
+                        Some("using runtime non-cli session approval grant"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": tool_name.clone(),
+                        }),
+                    );
+                } else if requires_interactive_approval {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
@@ -1775,6 +2210,24 @@ pub async fn run_tool_call_loop(
                             },
                         ));
                         continue;
+                    }
+
+                    if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                        match &mut tool_args {
+                            serde_json::Value::Object(map) => {
+                                map.insert("approved".to_string(), serde_json::Value::Bool(true));
+                            }
+                            serde_json::Value::String(command) => {
+                                let normalized_command = command.trim().to_string();
+                                if !normalized_command.is_empty() {
+                                    tool_args = serde_json::json!({
+                                        "command": normalized_command,
+                                        "approved": true
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -2241,6 +2694,7 @@ pub async fn run(
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
     }
+    let tools_registry = filter_primary_agent_tools_or_fail(&config, tools_registry)?;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -2429,6 +2883,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2519,23 +2974,26 @@ pub async fn run(
                 hb_cfg,
                 LOOP_DETECTION_CONFIG.scope(
                     ld_cfg,
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        provider_name,
-                        &model_name,
-                        temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        effective_hooks,
-                        &[],
+                    TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                        config.security.canary_tokens,
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            provider_name,
+                            &model_name,
+                            temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            effective_hooks,
+                            &[],
+                        ),
                     ),
                 ),
             ),
@@ -2555,6 +3013,19 @@ pub async fn run(
         }
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
+
+        // ── Post-turn fact extraction (single-message mode) ────────
+        if config.memory.auto_save {
+            let turns = vec![(msg.clone(), response.clone())];
+            let _ = extract_facts_from_turns(
+                provider.as_ref(),
+                &model_name,
+                &turns,
+                mem.as_ref(),
+                None,
+            )
+            .await;
+        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -2563,6 +3034,7 @@ pub async fn run(
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
         let mut interactive_turn: usize = 0;
+        let mut turn_buffer = TurnBuffer::new();
         // Reusable readline editor for UTF-8 input support
         let mut rl = Editor::with_config(
             RlConfig::builder()
@@ -2575,6 +3047,18 @@ pub async fn run(
             let input = match rl.readline("> ") {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                    // Flush any remaining buffered turns before exit.
+                    if config.memory.auto_save && !turn_buffer.is_empty() {
+                        let turns = turn_buffer.drain_for_extraction();
+                        let _ = extract_facts_from_turns(
+                            provider.as_ref(),
+                            &model_name,
+                            &turns,
+                            mem.as_ref(),
+                            None,
+                        )
+                        .await;
+                    }
                     break;
                 }
                 Err(e) => {
@@ -2589,7 +3073,21 @@ pub async fn run(
             }
             rl.add_history_entry(&input)?;
             match user_input.as_str() {
-                "/quit" | "/exit" => break,
+                "/quit" | "/exit" => {
+                    // Flush any remaining buffered turns before exit.
+                    if config.memory.auto_save && !turn_buffer.is_empty() {
+                        let turns = turn_buffer.drain_for_extraction();
+                        let _ = extract_facts_from_turns(
+                            provider.as_ref(),
+                            &model_name,
+                            &turns,
+                            mem.as_ref(),
+                            None,
+                        )
+                        .await;
+                    }
+                    break;
+                }
                 "/help" => {
                     println!("Available commands:");
                     println!("  /help        Show this help message");
@@ -2614,6 +3112,7 @@ pub async fn run(
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
                     interactive_turn = 0;
+                    turn_buffer = TurnBuffer::new();
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2704,23 +3203,26 @@ pub async fn run(
                     hb_cfg,
                     LOOP_DETECTION_CONFIG.scope(
                         ld_cfg,
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            provider_name,
-                            &model_name,
-                            temperature,
-                            false,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            None,
-                            None,
-                            effective_hooks,
-                            &[],
+                        TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                            config.security.canary_tokens,
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                provider_name,
+                                &model_name,
+                                temperature,
+                                false,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                None,
+                                None,
+                                effective_hooks,
+                                &[],
+                            ),
                         ),
                     ),
                 ),
@@ -2774,18 +3276,58 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
+            // ── Post-turn fact extraction ────────────────────────────
+            if config.memory.auto_save {
+                turn_buffer.push(&user_input, &response);
+                if turn_buffer.should_extract() {
+                    let turns = turn_buffer.drain_for_extraction();
+                    let result = extract_facts_from_turns(
+                        provider.as_ref(),
+                        &model_name,
+                        &turns,
+                        mem.as_ref(),
+                        None,
+                    )
+                    .await;
+                    if result.stored > 0 || result.no_facts {
+                        turn_buffer.mark_extract_success();
+                    }
+                }
+            }
+
             // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
+            // post_turn_active is only true when auto_save is on AND the
+            // turn buffer confirms recent extraction succeeded; otherwise
+            // compaction must fall back to its own flush_durable_facts.
+            let post_turn_active =
+                config.memory.auto_save && !turn_buffer.needs_compaction_fallback();
+            if let Ok((compacted, flush_ok)) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
                 &model_name,
                 config.agent.max_history_messages,
                 effective_hooks,
                 Some(mem.as_ref()),
+                None,
+                post_turn_active,
             )
             .await
             {
                 if compacted {
+                    if !post_turn_active {
+                        // Compaction ran its own flush_durable_facts as
+                        // fallback. Drain any buffered turns to prevent
+                        // duplicate extraction.
+                        if !turn_buffer.is_empty() {
+                            let _ = turn_buffer.drain_for_extraction();
+                        }
+                        // Only reset the failure flag when the fallback
+                        // flush actually succeeded; otherwise keep the
+                        // flag so subsequent compactions retry.
+                        if flush_ok {
+                            turn_buffer.mark_extract_success();
+                        }
+                    }
                     println!("🧹 Auto-compaction complete");
                 }
             }
@@ -2865,6 +3407,7 @@ pub async fn process_message_with_session(
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+    let tools_registry = filter_primary_agent_tools_or_fail(&config, tools_registry)?;
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = crate::config::resolve_default_model_id(
@@ -2966,6 +3509,7 @@ pub async fn process_message_with_session(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3022,7 +3566,7 @@ pub async fn process_message_with_session(
     } else {
         None
     };
-    scope_cost_enforcement_context(
+    let response = scope_cost_enforcement_context(
         cost_enforcement_context,
         SAFETY_HEARTBEAT_CONFIG.scope(
             hb_cfg,
@@ -3040,7 +3584,22 @@ pub async fn process_message_with_session(
             ),
         ),
     )
-    .await
+    .await?;
+
+    // ── Post-turn fact extraction (channel / single-message-with-session) ──
+    if config.memory.auto_save {
+        let turns = vec![(message.to_owned(), response.clone())];
+        let _ = extract_facts_from_turns(
+            provider.as_ref(),
+            &model_name,
+            &turns,
+            mem.as_ref(),
+            session_id,
+        )
+        .await;
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -3049,7 +3608,7 @@ mod tests {
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -3079,11 +3638,19 @@ mod tests {
             "prompt": "remind me later"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "custom:https://llm.example.com/v1",
+            "gpt-oss:20b",
+        );
 
         assert_eq!(args["delivery"]["mode"], "announce");
         assert_eq!(args["delivery"]["channel"], "telegram");
         assert_eq!(args["delivery"]["to"], "-10012345");
+        assert_eq!(args["model"], "gpt-oss:20b");
     }
 
     #[test]
@@ -3098,7 +3665,14 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert_eq!(args["delivery"]["channel"], "discord");
         assert_eq!(args["delivery"]["to"], "C123");
@@ -3111,7 +3685,14 @@ mod tests {
             "command": "echo hello"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert!(args.get("delivery").is_none());
     }
@@ -3122,7 +3703,14 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut lark_args,
+            "lark",
+            Some("oc_xxx"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(lark_args["delivery"]["channel"], "lark");
         assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
 
@@ -3130,9 +3718,56 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut feishu_args,
+            "feishu",
+            Some("oc_yyy"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(feishu_args["delivery"]["channel"], "feishu");
         assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_replaces_legacy_model_on_custom_provider() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "model": "gpt-4o-mini"
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("C123"),
+            "custom:https://somecoolai.endpoint.lan/api/v1",
+            "gpt-oss:20b",
+        );
+
+        assert_eq!(args["model"], "gpt-oss:20b");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_keeps_explicit_model_for_non_custom_provider() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "model": "gpt-4o-mini"
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("C123"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
+
+        assert_eq!(args["model"], "gpt-4o-mini");
     }
 
     #[test]
@@ -3235,6 +3870,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             })
         }
     }
@@ -3245,6 +3882,13 @@ mod tests {
     }
 
     impl ScriptedProvider {
+        fn from_scripted_responses(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+
         fn from_text_responses(responses: Vec<&str>) -> Self {
             let scripted = responses
                 .into_iter()
@@ -3254,12 +3898,11 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 })
                 .collect();
-            Self {
-                responses: Arc::new(Mutex::new(scripted)),
-                capabilities: ProviderCapabilities::default(),
-            }
+            Self::from_scripted_responses(scripted)
         }
 
         fn with_native_tool_support(mut self) -> Self {
@@ -3297,6 +3940,54 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct EchoCanaryProvider;
+
+    #[async_trait]
+    impl Provider for EchoCanaryProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in canary provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let canary = request
+                .messages
+                .iter()
+                .find(|msg| msg.role == "system")
+                .and_then(|msg| {
+                    msg.content.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix("Internal security canary token: ")
+                            .map(str::trim)
+                    })
+                })
+                .unwrap_or("NO_CANARY");
+            Ok(ChatResponse {
+                text: Some(format!("Leaking token for test: {canary}")),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+            })
         }
     }
 
@@ -3355,6 +4046,16 @@ mod tests {
         delay_ms: u64,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+    }
+
+    struct ApprovalFlagTool {
+        approved_seen: Arc<AtomicBool>,
+    }
+
+    impl ApprovalFlagTool {
+        fn new(approved_seen: Arc<AtomicBool>) -> Self {
+            Self { approved_seen }
+        }
     }
 
     impl DelayTool {
@@ -3472,6 +4173,44 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Tool for ApprovalFlagTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Captures the approved flag for approval-flow tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "approved": { "type": "boolean" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let approved = args
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.approved_seen.store(approved, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: approved,
+                output: format!("approved={approved}"),
+                error: (!approved).then(|| "missing approved=true".to_string()),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3542,6 +4281,87 @@ mod tests {
         .expect("anthropic route should not fail on a false-negative vision capability probe");
 
         assert_eq!(result, "vision-ok");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_when_canary_token_is_echoed() {
+        let provider = EchoCanaryProvider;
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .scope(
+                true,
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &tools_registry,
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "cli",
+                    &crate::config::MultimodalConfig::default(),
+                    3,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+            )
+            .await
+            .expect("canary leak should return a guarded message");
+
+        assert_eq!(result, CANARY_EXFILTRATION_BLOCK_MESSAGE);
+        assert_eq!(
+            history.last().map(|msg| msg.content.as_str()),
+            Some(result.as_str())
+        );
+        assert!(history[0].content.contains("ZC_CANARY_START"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_echo_provider_when_canary_guard_disabled() {
+        let provider = EchoCanaryProvider;
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .scope(
+                false,
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &tools_registry,
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "cli",
+                    &crate::config::MultimodalConfig::default(),
+                    3,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+            )
+            .await
+            .expect("without canary guard, response should pass through");
+
+        assert!(result.contains("NO_CANARY"));
     }
 
     #[tokio::test]
@@ -3679,6 +4499,76 @@ mod tests {
         ];
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_false_when_command_rule_requires_approval() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "rm -f ./tmp.txt"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                tool_call_id: None,
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string(), "file_read".to_string()],
+            always_ask: vec![],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".to_string(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(!should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_true_when_command_rule_does_not_match() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "ls -la"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                tool_call_id: None,
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string(), "file_read".to_string()],
+            always_ask: vec![],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".to_string(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
             ..crate::config::AutonomyConfig::default()
         };
         let approval_mgr = ApprovalManager::from_config(&approval_cfg);
@@ -3848,7 +4738,10 @@ mod tests {
             Arc::clone(&max_active),
         ))];
 
-        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         approval_mgr.grant_non_cli_session("shell");
 
         let mut history = vec![
@@ -3957,6 +4850,7 @@ mod tests {
             &[],
             ProgressMode::Verbose,
             None,
+            false,
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -3967,6 +4861,85 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_approved_flag_after_non_cli_approval() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"rm -f ./tmp.txt"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let approved_seen = Arc::new(AtomicBool::new(false));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(ApprovalFlagTool::new(Arc::clone(&approved_seen)))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let approval_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            approval_mgr_for_task
+                .confirm_non_cli_pending_request(
+                    &prompt.request_id,
+                    "alice",
+                    "telegram",
+                    "chat-approved-flag",
+                )
+                .expect("pending approval should confirm");
+            approval_mgr_for_task
+                .record_non_cli_pending_resolution(&prompt.request_id, ApprovalResponse::Yes);
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approved-flag".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            ProgressMode::Verbose,
+            None,
+            false,
+        )
+        .await
+        .expect("tool loop should continue after non-cli approval");
+
+        approval_task.await.expect("approval task should complete");
+        assert_eq!(result, "done");
+        assert!(
+            approved_seen.load(Ordering::SeqCst),
+            "approved=true should be injected after prompt approval"
         );
     }
 
@@ -4262,6 +5235,526 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_errors_when_deferred_action_repeats_without_tool_call() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I'll check that right away.",
+            "Let me inspect that in detail now.",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please check the workspace"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("second deferred response without tool call should hard-fail");
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("deferred action without emitting a tool call"),
+            "unexpected error text: {err_text}"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "tool should not execute when model never emits a tool call"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_retries_when_native_tool_args_are_truncated_json() {
+        let provider = ScriptedProvider::from_scripted_responses(vec![
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "call_bad".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: "{\"value\":\"truncated\"".to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "call_good".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: "{\"value\":\"fixed\"}".to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::ToolCall),
+                raw_stop_reason: Some("tool_calls".to_string()),
+            },
+            ChatResponse {
+                text: Some("done after native retry".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::EndTurn),
+                raw_stop_reason: Some("stop".to_string()),
+            },
+        ])
+        .with_native_tool_support();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native call"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("truncated native arguments should trigger safe retry");
+
+        assert_eq!(result, "done after native retry");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "only the repaired native tool call should execute"
+        );
+        assert!(
+            history.iter().any(|msg| {
+                msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_good\"")
+            }),
+            "tool history should include only the repaired tool_call_id"
+        );
+        assert!(
+            history.iter().all(|msg| {
+                !(msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_bad\""))
+            }),
+            "invalid truncated native call must not execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_ignores_text_fallback_when_native_tool_args_are_truncated_json() {
+        let provider = ScriptedProvider::from_scripted_responses(vec![
+            ChatResponse {
+                text: Some(
+                    r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"from_text_fallback"}}
+</tool_call>"#
+                        .to_string(),
+                ),
+                tool_calls: vec![ToolCall {
+                    id: "call_bad".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: "{\"value\":\"truncated\"".to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "call_good".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: "{\"value\":\"from_native_fixed\"}".to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::ToolCall),
+                raw_stop_reason: Some("tool_calls".to_string()),
+            },
+            ChatResponse {
+                text: Some("done after safe retry".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::EndTurn),
+                raw_stop_reason: Some("stop".to_string()),
+            },
+        ])
+        .with_native_tool_support();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native call"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("invalid native args should force retry without text fallback execution");
+
+        assert_eq!(result, "done after safe retry");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "only repaired native call should execute after retry"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("counted:from_text_fallback")),
+            "text fallback tool call must not execute when native JSON args are invalid"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("counted:from_native_fixed")),
+            "repaired native call should execute after retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_executes_valid_native_tool_call_with_max_tokens_stop_reason() {
+        let provider = ScriptedProvider::from_scripted_responses(vec![
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "call_valid".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: "{\"value\":\"from_valid_native\"}".to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some("done after valid native tool".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::EndTurn),
+                raw_stop_reason: Some("stop".to_string()),
+            },
+        ])
+        .with_native_tool_support();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native call"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("valid native tool calls must execute even when stop_reason is max_tokens");
+
+        assert_eq!(result, "done after valid native tool");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "valid native tool call should execute exactly once"
+        );
+        assert!(
+            history.iter().any(|msg| {
+                msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_valid\"")
+            }),
+            "tool history should preserve valid native tool_call_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_continues_when_stop_reason_is_max_tokens() {
+        let provider = ScriptedProvider::from_scripted_responses(vec![
+            ChatResponse {
+                text: Some("part 1 ".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some("part 2".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::EndTurn),
+                raw_stop_reason: Some("stop".to_string()),
+            },
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("continue this"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("max-token continuation should complete");
+
+        assert_eq!(result, "part 1 part 2");
+        assert!(
+            !result.contains("Response may be truncated"),
+            "continuation should not emit truncation notice when it ends cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_appends_notice_when_continuation_budget_exhausts() {
+        let provider = ScriptedProvider::from_scripted_responses(vec![
+            ChatResponse {
+                text: Some("A".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some("B".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some("C".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some("D".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("long output"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("continuation should degrade to partial output");
+
+        assert!(result.starts_with("ABCD"));
+        assert!(
+            result.contains("Response may be truncated due to continuation limits"),
+            "result should include truncation notice when continuation cap is hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_clamps_continuation_output_to_hard_cap() {
+        let oversized_chunk = "B".repeat(MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS);
+        let provider = ScriptedProvider::from_scripted_responses(vec![
+            ChatResponse {
+                text: Some("A".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::MaxTokens),
+                raw_stop_reason: Some("length".to_string()),
+            },
+            ChatResponse {
+                text: Some(oversized_chunk),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: Some(NormalizedStopReason::EndTurn),
+                raw_stop_reason: Some("stop".to_string()),
+            },
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("long output"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("continuation should clamp oversized merge");
+
+        assert!(
+            result.ends_with(MAX_TOKENS_CONTINUATION_NOTICE),
+            "hard-cap truncation should append continuation notice"
+        );
+        let capped_output = result
+            .strip_suffix(MAX_TOKENS_CONTINUATION_NOTICE)
+            .expect("result should end with continuation notice");
+        assert_eq!(
+            capped_output.chars().count(),
+            MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS
+        );
+        assert!(
+            capped_output.starts_with('A'),
+            "capped output should preserve earlier text before continuation chunk"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_preserves_failed_tool_error_for_after_hook() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -4309,6 +5802,18 @@ mod tests {
             .expect("hook error buffer lock should be valid");
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn merge_continuation_text_deduplicates_partial_overlap() {
+        let merged = merge_continuation_text("The result is wor", "world.");
+        assert_eq!(merged, "The result is world.");
+    }
+
+    #[test]
+    fn merge_continuation_text_handles_unicode_overlap() {
+        let merged = merge_continuation_text("你好世界", "世界和平");
+        assert_eq!(merged, "你好世界和平");
     }
 
     #[test]
@@ -5489,12 +6994,28 @@ Done."#;
             arguments: "ls -la".to_string(),
         }];
         let parsed = parse_structured_tool_calls(&calls);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "shell");
+        assert_eq!(parsed.invalid_json_arguments, 0);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "shell");
         assert_eq!(
-            parsed[0].arguments.get("command").and_then(|v| v.as_str()),
+            parsed.calls[0]
+                .arguments
+                .get("command")
+                .and_then(|v| v.as_str()),
             Some("ls -la")
         );
+    }
+
+    #[test]
+    fn parse_structured_tool_calls_skips_truncated_json_payloads() {
+        let calls = vec![ToolCall {
+            id: "call_bad".to_string(),
+            name: "count_tool".to_string(),
+            arguments: "{\"value\":\"unterminated\"".to_string(),
+        }];
+        let parsed = parse_structured_tool_calls(&calls);
+        assert_eq!(parsed.calls.len(), 0);
+        assert_eq!(parsed.invalid_json_arguments, 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

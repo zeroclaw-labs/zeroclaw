@@ -5,6 +5,38 @@ set -euo pipefail
 BASE_SHA="${BASE_SHA:-}"
 RUST_FILES_RAW="${RUST_FILES:-}"
 
+ensure_toolchain_bin_on_path() {
+    local toolchain_bin=""
+
+    if [ -n "${CARGO:-}" ]; then
+        toolchain_bin="$(dirname "${CARGO}")"
+    elif [ -n "${RUSTC:-}" ]; then
+        toolchain_bin="$(dirname "${RUSTC}")"
+    fi
+
+    if [ -z "$toolchain_bin" ] || [ ! -d "$toolchain_bin" ]; then
+        return 0
+    fi
+
+    case ":$PATH:" in
+        *":${toolchain_bin}:"*) ;;
+        *) export PATH="${toolchain_bin}:$PATH" ;;
+    esac
+}
+
+run_cargo_tool() {
+    local subcommand="$1"
+    shift
+
+    if [ -n "${RUSTUP_TOOLCHAIN:-}" ] && command -v rustup >/dev/null 2>&1; then
+        rustup run "${RUSTUP_TOOLCHAIN}" cargo "$subcommand" "$@"
+    else
+        cargo "$subcommand" "$@"
+    fi
+}
+
+ensure_toolchain_bin_on_path
+
 if [ -z "$BASE_SHA" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
     BASE_SHA="$(git merge-base origin/main HEAD)"
 fi
@@ -88,7 +120,7 @@ print(json.dumps(changed))
 PY
 
 set +e
-cargo clippy --quiet --locked --all-targets --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
+run_cargo_tool clippy --quiet --locked --all-targets --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
 CLIPPY_EXIT=$?
 set -e
 

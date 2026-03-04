@@ -24,3 +24,10 @@ linker = "clang"
 
 [target.aarch64-linux-android]
 linker = "clang"
+
+# Windows targets — increase stack size for large JsonSchema derives
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]

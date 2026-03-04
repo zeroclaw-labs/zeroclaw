@@ -4,3 +4,9 @@ self-hosted-runner:
         - X64
         - racknerd
         - aws-india
+        - light
+        - cpu40
+        - codeql
+        - codeql-general
+        - blacksmith-2vcpu-ubuntu-2404
+        - hetzner

@@ -81,6 +81,8 @@ Lưu ý cho người dùng container:
 | `max_history_messages` | `50` | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên |
 | `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
 | `tool_dispatcher` | `auto` | Chiến lược dispatch tool |
+| `allowed_tools` | `[]` | Allowlist tool cho agent chính. Khi không rỗng, chỉ các tool liệt kê mới được đưa vào context |
+| `denied_tools` | `[]` | Denylist tool cho agent chính, áp dụng sau `allowed_tools` |
 
 Lưu ý:
 
@@ -88,6 +90,25 @@ Lưu ý:
 - Nếu tin nhắn kênh vượt giá trị này, runtime trả về: `Agent exceeded maximum tool iterations (<value>)`.
 - Trong vòng lặp tool của CLI, gateway và channel, các lời gọi tool độc lập được thực thi đồng thời mặc định khi không cần phê duyệt; thứ tự kết quả giữ ổn định.
 - `parallel_tools` áp dụng cho API `Agent::turn()`. Không ảnh hưởng đến vòng lặp runtime của CLI, gateway hay channel.
+- `allowed_tools` / `denied_tools` được áp dụng lúc khởi động trước khi dựng prompt. Tool bị loại sẽ không xuất hiện trong system prompt hoặc tool specs.
+- Mục không khớp trong `allowed_tools` được bỏ qua (không làm lỗi khởi động) và ghi log mức debug.
+- Nếu đồng thời đặt `allowed_tools` và `denied_tools` rồi denylist loại toàn bộ tool đã allow, tiến trình sẽ fail-fast với lỗi cấu hình rõ ràng.
+
+Ví dụ:
+
+```toml
+[agent]
+allowed_tools = [
+  "delegate",
+  "subagent_spawn",
+  "subagent_list",
+  "subagent_manage",
+  "memory_recall",
+  "memory_store",
+  "task_plan",
+]
+denied_tools = ["shell", "file_write", "browser_open"]
+```
 
 ## `[agents.<name>]`
 
@@ -530,6 +551,7 @@ Lưu ý:
 - Allowlist kênh mặc định từ chối tất cả (`[]` nghĩa là từ chối tất cả)
 - Gateway mặc định yêu cầu ghép nối
 - Mặc định chặn public bind
+- `security.canary_tokens = true` bật canary token theo từng lượt để phát hiện rò rỉ ngữ cảnh hệ thống
 
 ## Lệnh kiểm tra
 

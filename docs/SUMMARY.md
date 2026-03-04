@@ -94,6 +94,7 @@ Last refreshed: **February 28, 2026**.
 - [pr-workflow.md](pr-workflow.md)
 - [reviewer-playbook.md](reviewer-playbook.md)
 - [ci-map.md](ci-map.md)
+- [ci-blacksmith.md](ci-blacksmith.md)
 - [actions-source-policy.md](actions-source-policy.md)
 - [cargo-slicer-speedup.md](cargo-slicer-speedup.md)
 

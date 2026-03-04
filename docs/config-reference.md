@@ -129,6 +129,8 @@ Operational note for container users:
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
+| `allowed_tools` | `[]` | Primary-agent tool allowlist. When non-empty, only listed tools are exposed in context |
+| `denied_tools` | `[]` | Primary-agent tool denylist applied after `allowed_tools` |
 | `loop_detection_no_progress_threshold` | `3` | Same tool+args producing identical output this many times triggers loop detection. `0` disables |
 | `loop_detection_ping_pong_cycles` | `2` | A→B→A→B alternating pattern cycle count threshold. `0` disables |
 | `loop_detection_failure_streak` | `3` | Same tool consecutive failure count threshold. `0` disables |
@@ -139,7 +141,125 @@ Notes:
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+- `allowed_tools` / `denied_tools` are applied at startup before prompt construction. Excluded tools are omitted from system prompt context and tool specs.
+- Unknown entries in `allowed_tools` are skipped and logged at debug level.
+- If both `allowed_tools` and `denied_tools` are configured and the denylist removes all allowlisted matches, startup fails fast with a clear config error.
 - **Loop detection** intervenes before `max_tool_iterations` is exhausted. On first detection the agent receives a self-correction prompt; if the loop persists the agent is stopped early. Detection is result-aware: repeated calls with *different* outputs (genuine progress) do not trigger. Set any threshold to `0` to disable that detector.
+
+Example:
+
+```toml
+[agent]
+allowed_tools = [
+  "delegate",
+  "subagent_spawn",
+  "subagent_list",
+  "subagent_manage",
+  "memory_recall",
+  "memory_store",
+  "task_plan",
+]
+denied_tools = ["shell", "file_write", "browser_open"]
+```
+
+## `[agent.teams]`
+
+Controls synchronous team delegation behavior (`delegate` tool).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable/disable agent-team delegation runtime |
+| `auto_activate` | `true` | Allow automatic team-agent selection when `delegate.agent` is omitted or `"auto"` |
+| `max_agents` | `32` | Max active delegate profiles considered for team selection |
+| `strategy` | `adaptive` | Load-balancing strategy: `semantic`, `adaptive`, `least_loaded` |
+| `load_window_secs` | `120` | Sliding window used for recent load/failure scoring |
+| `inflight_penalty` | `8` | Score penalty per in-flight task |
+| `recent_selection_penalty` | `2` | Score penalty per recent assignment within the load window |
+| `recent_failure_penalty` | `12` | Score penalty per recent failure within the load window |
+
+Notes:
+
+- `semantic` preserves lexical/metadata matching priority.
+- `adaptive` blends semantic signals with runtime load and recent outcomes (default).
+- `least_loaded` prioritizes healthy least-loaded agents before semantic tie-breakers.
+- `max_agents` has no hard-coded upper cap in tooling; use any positive integer that fits the platform.
+- `max_agents` and `load_window_secs` must be greater than `0`.
+
+Example:
+
+```toml
+[agent.teams]
+enabled = true
+auto_activate = true
+max_agents = 48
+strategy = "adaptive"
+load_window_secs = 180
+inflight_penalty = 10
+recent_selection_penalty = 3
+recent_failure_penalty = 14
+```
+
+## `[agent.subagents]`
+
+Controls asynchronous/background delegation (`subagent_spawn`, `subagent_list`, `subagent_manage`).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable/disable background sub-agent runtime |
+| `auto_activate` | `true` | Allow automatic sub-agent selection when `subagent_spawn.agent` is omitted or `"auto"` |
+| `max_concurrent` | `10` | Max number of concurrently running background sub-agents |
+| `strategy` | `adaptive` | Load-balancing strategy: `semantic`, `adaptive`, `least_loaded` |
+| `load_window_secs` | `180` | Sliding window used for recent load/failure scoring |
+| `inflight_penalty` | `10` | Score penalty per in-flight task |
+| `recent_selection_penalty` | `3` | Score penalty per recent assignment within the load window |
+| `recent_failure_penalty` | `16` | Score penalty per recent failure within the load window |
+| `queue_wait_ms` | `15000` | Wait duration for free concurrency slot before failing (`0` = fail-fast) |
+| `queue_poll_ms` | `200` | Poll interval while waiting for a slot |
+
+Notes:
+
+- `max_concurrent` has no hard-coded upper cap in tooling; use any positive integer that fits the platform.
+- `max_concurrent`, `load_window_secs`, and `queue_poll_ms` must be greater than `0`.
+- `queue_wait_ms = 0` is valid and forces immediate failure when at capacity.
+
+Example:
+
+```toml
+[agent.subagents]
+enabled = true
+auto_activate = true
+max_concurrent = 24
+strategy = "least_loaded"
+load_window_secs = 240
+inflight_penalty = 12
+recent_selection_penalty = 4
+recent_failure_penalty = 18
+queue_wait_ms = 30000
+queue_poll_ms = 250
+```
+
+## Runtime Orchestration Updates (Natural Language + Tool)
+
+You can update the orchestration controls in interactive chat with natural language requests (for example: "disable subagents", "set subagents max concurrent to 20", "switch team strategy to least-loaded").
+
+The runtime persists these updates via `model_routing_config` (`action = "set_orchestration"`), and delegation tools hot-apply them without requiring a process restart.
+
+Example tool payload:
+
+```json
+{
+  "action": "set_orchestration",
+  "teams_enabled": true,
+  "teams_strategy": "adaptive",
+  "max_team_agents": 64,
+  "subagents_enabled": true,
+  "subagents_auto_activate": true,
+  "max_concurrent_subagents": 32,
+  "subagents_strategy": "least_loaded",
+  "subagents_queue_wait_ms": 15000,
+  "subagents_queue_poll_ms": 200
+}
+```
 
 ## `[security.otp]`
 
@@ -277,6 +397,18 @@ Environment overrides:
 - `ZEROCLAW_URL_ACCESS_DOMAIN_ALLOWLIST` / `URL_ACCESS_DOMAIN_ALLOWLIST` (comma-separated)
 - `ZEROCLAW_URL_ACCESS_DOMAIN_BLOCKLIST` / `URL_ACCESS_DOMAIN_BLOCKLIST` (comma-separated)
 - `ZEROCLAW_URL_ACCESS_APPROVED_DOMAINS` / `URL_ACCESS_APPROVED_DOMAINS` (comma-separated)
+
+## `[security]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `canary_tokens` | `true` | Inject per-turn canary token into system prompt and block responses that echo it |
+
+Notes:
+
+- Canary tokens are generated per turn and are redacted from runtime traces.
+- This guard is additive to `security.outbound_leak_guard`: canary catches prompt-context leakage, while outbound leak guard catches credential-like material.
+- Set `canary_tokens = false` to disable this layer.
 
 ## `[security.syscall_anomaly]`
 
@@ -622,6 +754,11 @@ Notes:
 - Remote URL only when `allow_remote_fetch = true`
 - Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
 - When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+- In `proxy.scope = "services"` mode, remote image fetch uses service-key routing. For best compatibility include relevant selectors/keys such as:
+  - `channel.qq` (QQ media hosts like `multimedia.nt.qq.com.cn`)
+  - `tool.multimodal` (dedicated multimodal fetch path)
+  - `tool.http_request` (compatibility fallback path)
+  - `provider.*` or the active provider key (for example `provider.openai`)
 
 ## `[browser]`
 
@@ -857,7 +994,7 @@ Environment overrides:
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
-| `command_context_rules` | `[]` | per-command context-aware allow/deny rules (domain/path constraints, optional high-risk override) |
+| `command_context_rules` | `[]` | per-command context-aware allow/deny/require-approval rules (domain/path constraints, optional high-risk override) |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -882,6 +1019,7 @@ Notes:
 - `command_context_rules` can narrow or override `allowed_commands` for matching commands:
   - `action = "allow"` rules are restrictive when present for a command: at least one allow rule must match.
   - `action = "deny"` rules explicitly block matching contexts.
+  - `action = "require_approval"` forces explicit approval (`approved=true`) in supervised mode for matching segments, even if `shell` is in `auto_approve`.
   - `allow_high_risk = true` allows a matching high-risk command to pass the hard block, but supervised mode still requires `approved=true`.
 - `file_read` blocks sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_reads = true` only for controlled debugging sessions.
 - `file_write` and `file_edit` block sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_writes = true` only for controlled break-glass sessions.
@@ -930,6 +1068,10 @@ command = "rm"
 action = "allow"
 allowed_path_prefixes = ["/tmp"]
 allow_high_risk = true
+
+[[autonomy.command_context_rules]]
+command = "rm"
+action = "require_approval"
 ```
 
 ## `[memory]`

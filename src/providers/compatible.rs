@@ -5,8 +5,8 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
-    ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, StreamChunk, StreamError, StreamOptions, StreamResult,
+    TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, SinkExt, StreamExt};
@@ -481,6 +481,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -970,6 +972,8 @@ fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatRes
         usage: None,
         reasoning_content: None,
         quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1815,7 +1819,12 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
-    fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(choice: Choice) -> ProviderChatResponse {
+        let raw_stop_reason = choice.finish_reason;
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
+        let message = choice.message;
         let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
@@ -1847,6 +1856,8 @@ impl OpenAiCompatibleProvider {
             usage: None,
             reasoning_content,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 
@@ -1871,6 +1882,8 @@ impl OpenAiCompatibleProvider {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 }
@@ -2220,6 +2233,8 @@ impl Provider for OpenAiCompatibleProvider {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
         };
@@ -2268,6 +2283,11 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
+        let raw_stop_reason = choice.finish_reason;
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
+
         let text = choice.message.effective_content_optional();
         let reasoning_content = choice.message.reasoning_content;
         let tool_calls = choice
@@ -2293,6 +2313,8 @@ impl Provider for OpenAiCompatibleProvider {
             usage,
             reasoning_content,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         })
     }
 
@@ -2417,14 +2439,13 @@ impl Provider for OpenAiCompatibleProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let mut result = Self::parse_native_response(message);
+        let mut result = Self::parse_native_response(choice);
         result.usage = usage;
         Ok(result)
     }
@@ -3438,26 +3459,31 @@ mod tests {
 
     #[test]
     fn parse_native_response_preserves_tool_call_id() {
-        let message = ResponseMessage {
-            content: None,
-            tool_calls: Some(vec![ToolCall {
-                id: Some("call_123".to_string()),
-                kind: Some("function".to_string()),
-                function: Some(Function {
-                    name: Some("shell".to_string()),
-                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
-                }),
-                name: None,
-                arguments: None,
-                parameters: None,
-            }]),
-            reasoning_content: None,
+        let choice = Choice {
+            message: ResponseMessage {
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("call_123".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some("shell".to_string()),
+                        arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                }]),
+                reasoning_content: None,
+            },
+            finish_reason: Some("tool_calls".to_string()),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::ToolCall));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("tool_calls"));
     }
 
     #[test]
@@ -4548,39 +4574,49 @@ mod tests {
 
     #[test]
     fn parse_native_response_captures_reasoning_content() {
-        let message = ResponseMessage {
-            content: Some("answer".to_string()),
-            reasoning_content: Some("thinking step".to_string()),
-            tool_calls: Some(vec![ToolCall {
-                id: Some("call_1".to_string()),
-                kind: Some("function".to_string()),
-                function: Some(Function {
-                    name: Some("shell".to_string()),
-                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
-                }),
-                name: None,
-                arguments: None,
-                parameters: None,
-            }]),
+        let choice = Choice {
+            message: ResponseMessage {
+                content: Some("answer".to_string()),
+                reasoning_content: Some("thinking step".to_string()),
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("call_1".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some("shell".to_string()),
+                        arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                }]),
+            },
+            finish_reason: Some("length".to_string()),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::MaxTokens));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("length"));
     }
 
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
-        let message = ResponseMessage {
-            content: Some("hello".to_string()),
-            reasoning_content: None,
-            tool_calls: None,
+        let choice = Choice {
+            message: ResponseMessage {
+                content: Some("hello".to_string()),
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            finish_reason: Some("stop".to_string()),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
         assert!(parsed.reasoning_content.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
+        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::EndTurn));
+        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("stop"));
     }
 
     #[test]

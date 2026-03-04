@@ -124,12 +124,15 @@ pub fn discover_plugins(workspace_dir: Option<&Path>, extra_paths: &[PathBuf]) -
         seen.insert(plugin.manifest.id.clone(), i);
     }
     let mut deduped: Vec<DiscoveredPlugin> = Vec::with_capacity(seen.len());
-    // Collect in insertion order of the winning index
+    // Collect in insertion order of the winning index.
+    // Sort descending for safe `swap_remove` on a shrinking vec, then restore
+    // ascending order to preserve deterministic winner ordering.
     let mut indices: Vec<usize> = seen.values().copied().collect();
-    indices.sort_unstable();
+    indices.sort_unstable_by(|a, b| b.cmp(a));
     for i in indices {
         deduped.push(all_plugins.swap_remove(i));
     }
+    deduped.reverse();
 
     DiscoveryResult {
         plugins: deduped,
@@ -183,6 +186,24 @@ version = "0.1.0"
 
         let result = discover_plugins(None, &[ext_dir]);
         assert!(result.plugins.iter().any(|p| p.manifest.id == "custom-one"));
+    }
+
+    #[test]
+    fn discover_handles_multiple_plugins_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("custom-plugins");
+        fs::create_dir_all(&ext_dir).unwrap();
+        make_plugin_dir(&ext_dir, "custom-one");
+        make_plugin_dir(&ext_dir, "custom-two");
+
+        let result = discover_plugins(None, &[ext_dir]);
+        let ids: std::collections::HashSet<String> = result
+            .plugins
+            .iter()
+            .map(|p| p.manifest.id.clone())
+            .collect();
+        assert!(ids.contains("custom-one"));
+        assert!(ids.contains("custom-two"));
     }
 
     #[test]

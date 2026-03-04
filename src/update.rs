@@ -5,7 +5,6 @@
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -329,7 +328,7 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
             .context("Failed to set permissions on staged binary")?;
 
         if let Err(err) = fs::remove_file(&backup_path) {
-            if err.kind() != ErrorKind::NotFound {
+            if err.kind() != std::io::ErrorKind::NotFound {
                 return Err(err).context("Failed to remove stale backup binary");
             }
         }

@@ -89,7 +89,7 @@ env:
 jobs:
     canary-plan:
         name: Canary Plan
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 20
         outputs:
             mode: ${{ steps.inputs.outputs.mode }}
@@ -122,7 +122,8 @@ jobs:
                   trigger_rollback_on_abort="true"
                   rollback_branch="dev"
                   rollback_target_ref=""
-                  fail_on_violation="true"
+                  # Scheduled audits may not have live canary telemetry; report violations without failing by default.
+                  fail_on_violation="false"
 
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
                     mode="${{ github.event.inputs.mode || 'dry-run' }}"
@@ -237,7 +238,7 @@ jobs:
         name: Canary Execute
         needs: [canary-plan]
         if: github.event_name == 'workflow_dispatch' && needs.canary-plan.outputs.mode == 'execute' && needs.canary-plan.outputs.ready_to_execute == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 10
         permissions:
             contents: write

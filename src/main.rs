@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
@@ -90,6 +91,8 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+#[cfg(test)]
+mod test_locks;
 mod tools;
 mod tunnel;
 mod update;

@@ -104,7 +104,7 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_user_supplied_path(path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
@@ -243,6 +243,18 @@ mod tests {
         })
     }
 
+    fn test_security_allows_outside_workspace(
+        workspace: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn file_write_name() {
         let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
@@ -353,6 +365,37 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_write_expands_tilde_path_consistently_with_policy() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME should be available for tilde expansion tests");
+        let target_rel = format!("zeroclaw_tilde_write_{}.txt", uuid::Uuid::new_v4());
+        let target_path = home.join(&target_rel);
+        let _ = tokio::fs::remove_file(&target_path).await;
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_write_tilde_workspace");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security_allows_outside_workspace(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": format!("~/{}", target_rel), "content": "tilde-write"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "tilde path write should succeed when policy allows outside workspace: {:?}",
+            result.error
+        );
+
+        let content = tokio::fs::read_to_string(&target_path).await.unwrap();
+        assert_eq!(content, "tilde-write");
+
+        let _ = tokio::fs::remove_file(&target_path).await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
     #[tokio::test]

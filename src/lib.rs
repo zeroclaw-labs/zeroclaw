@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
@@ -73,6 +74,8 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+#[cfg(test)]
+pub(crate) mod test_locks;
 pub mod tools;
 pub(crate) mod tunnel;
 pub mod update;
