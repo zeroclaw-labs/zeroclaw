@@ -71,16 +71,25 @@ pub async fn transcribe_audio(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
-            std::env::var("GROQ_API_KEY")
-                .ok()
+            // Check MISTRAL_API_KEY if the URL is for Mistral, otherwise GROQ_API_KEY
+            if config.api_url.contains("mistral.ai") {
+                std::env::var("MISTRAL_API_KEY").ok()
+            } else {
+                std::env::var("GROQ_API_KEY").ok()
+            }
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
         .context(
-            "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable",
+            "Missing transcription API key: set [transcription].api_key, MISTRAL_API_KEY, or GROQ_API_KEY environment variable",
         )?;
 
-    let client = crate::config::build_runtime_proxy_client("transcription.groq");
+    let proxy_name = if config.api_url.contains("mistral.ai") {
+        "transcription.mistral"
+    } else {
+        "transcription.groq"
+    };
+    let client = crate::config::build_runtime_proxy_client(proxy_name);
 
     let file_part = Part::bytes(audio_data)
         .file_name(normalized_name)
