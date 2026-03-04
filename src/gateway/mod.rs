@@ -587,9 +587,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .map_err(|e| {
             tracing::error!("Failed to initialize BlueBubbles channel: {e}");
             e
-        })
-        .ok()
-        .flatten();
+        })?;
     let bluebubbles_webhook_secret: Option<Arc<str>> = config
         .channels_config
         .bluebubbles
