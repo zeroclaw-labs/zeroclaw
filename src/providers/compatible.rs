@@ -1089,6 +1089,64 @@ fn compact_sanitized_body_snippet(body: &str) -> String {
         .join(" ")
 }
 
+fn is_tls_or_certificate_error(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    let hints = [
+        "certificate",
+        "tls",
+        "ssl",
+        "x509",
+        "unknownissuer",
+        "unknown issuer",
+        "self-signed",
+        "self signed",
+        "invalid peer certificate",
+        "certificate verify failed",
+        "unable to get local issuer",
+        "ca cert",
+    ];
+    hints.iter().any(|hint| lower.contains(hint))
+}
+
+fn format_transport_error(error: &anyhow::Error) -> String {
+    let mut chain = Vec::new();
+    for cause in error.chain() {
+        let detail = compact_sanitized_body_snippet(&cause.to_string());
+        if detail.is_empty() {
+            continue;
+        }
+        if chain.last() != Some(&detail) {
+            chain.push(detail);
+        }
+    }
+
+    if chain.is_empty() {
+        return "transport error".to_string();
+    }
+
+    let tls_detail = chain
+        .iter()
+        .rev()
+        .find(|item| is_tls_or_certificate_error(item))
+        .cloned();
+    let specific_detail = tls_detail
+        .clone()
+        .unwrap_or_else(|| chain.last().cloned().unwrap_or_default());
+    let request_detail = chain.first().cloned().unwrap_or_default();
+
+    let mut formatted = if specific_detail == request_detail || request_detail.is_empty() {
+        specific_detail
+    } else {
+        format!("{specific_detail} (request: {request_detail})")
+    };
+
+    if tls_detail.is_some() {
+        formatted.push_str(" [hint: verify endpoint/proxy certificate trust]");
+    }
+
+    formatted
+}
+
 fn parse_chat_response_body(provider_name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
     serde_json::from_str::<ApiChatResponse>(body).map_err(|error| {
         let snippet = compact_sanitized_body_snippet(body);
@@ -1690,13 +1748,14 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(response) => response,
             Err(chat_error) => {
                 if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    let transport_error = format_transport_error(&anyhow::Error::new(chat_error));
                     return self
                         .chat_via_responses(credential, &fallback_messages, model)
                         .await
                         .map_err(|responses_err| {
+                            let responses_error = format_transport_error(&responses_err);
                             anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                "{} chat completions transport error: {transport_error} (responses fallback failed: {responses_error})",
                                 self.name
                             )
                         });
@@ -1716,8 +1775,9 @@ impl Provider for OpenAiCompatibleProvider {
                     .chat_via_responses(credential, &fallback_messages, model)
                     .await
                     .map_err(|responses_err| {
+                        let responses_error = format_transport_error(&responses_err);
                         anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_error})",
                             self.name
                         )
                     });
@@ -1807,13 +1867,14 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(response) => response,
             Err(chat_error) => {
                 if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    let transport_error = format_transport_error(&anyhow::Error::new(chat_error));
                     return self
                         .chat_via_responses(credential, &effective_messages, model)
                         .await
                         .map_err(|responses_err| {
+                            let responses_error = format_transport_error(&responses_err);
                             anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                "{} chat completions transport error: {transport_error} (responses fallback failed: {responses_error})",
                                 self.name
                             )
                         });
@@ -1832,8 +1893,9 @@ impl Provider for OpenAiCompatibleProvider {
                     .chat_via_responses(credential, &effective_messages, model)
                     .await
                     .map_err(|responses_err| {
+                        let responses_error = format_transport_error(&responses_err);
                         anyhow::anyhow!(
-                            "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
+                            "{} API error (chat completions unavailable; responses fallback failed: {responses_error})",
                             self.name
                         )
                     });
@@ -2060,7 +2122,7 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(response) => response,
             Err(chat_error) => {
                 if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    let transport_error = format_transport_error(&anyhow::Error::new(chat_error));
                     return self
                         .chat_via_responses_chat(
                             credential,
@@ -2070,8 +2132,9 @@ impl Provider for OpenAiCompatibleProvider {
                         )
                         .await
                         .map_err(|responses_err| {
+                            let responses_error = format_transport_error(&responses_err);
                             anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                "{} native chat transport error: {transport_error} (responses fallback failed: {responses_error})",
                                 self.name
                             )
                         });
@@ -2110,8 +2173,9 @@ impl Provider for OpenAiCompatibleProvider {
                     )
                     .await
                     .map_err(|responses_err| {
+                        let responses_error = format_transport_error(&responses_err);
                         anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_error})",
                             self.name
                         )
                     });
@@ -2268,9 +2332,48 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as StdError;
+    use std::fmt;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    #[derive(Debug)]
+    struct NestedTestError {
+        message: &'static str,
+        source: Option<Box<dyn StdError + Send + Sync>>,
+    }
+
+    impl NestedTestError {
+        fn leaf(message: &'static str) -> Self {
+            Self {
+                message,
+                source: None,
+            }
+        }
+
+        fn with_source(
+            message: &'static str,
+            source: impl StdError + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                message,
+                source: Some(Box::new(source)),
+            }
+        }
+    }
+
+    impl fmt::Display for NestedTestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl StdError for NestedTestError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source.as_deref().map(|err| err as _)
+        }
     }
 
     #[test]
@@ -2295,6 +2398,32 @@ mod tests {
     fn strips_trailing_slash() {
         let p = make_provider("test", "https://example.com/", None);
         assert_eq!(p.base_url, "https://example.com");
+    }
+
+    #[test]
+    fn format_transport_error_prioritizes_certificate_root_cause() {
+        let err = anyhow::Error::new(NestedTestError::with_source(
+            "error sending request for url (https://coding.dashscope.aliyuncs.com/v1/chat/completions)",
+            NestedTestError::leaf("invalid peer certificate: UnknownIssuer"),
+        ));
+
+        let detail = format_transport_error(&err);
+        assert!(detail.contains("invalid peer certificate: UnknownIssuer"));
+        assert!(detail.contains("request: error sending request for url"));
+        assert!(detail.contains("certificate trust"));
+    }
+
+    #[test]
+    fn format_transport_error_uses_deepest_non_tls_cause() {
+        let err = anyhow::Error::new(NestedTestError::with_source(
+            "error sending request for url (https://api.example.com/v1/chat/completions)",
+            NestedTestError::leaf("dns lookup failed"),
+        ));
+
+        let detail = format_transport_error(&err);
+        assert!(detail.contains("dns lookup failed"));
+        assert!(detail.contains("request: error sending request for url"));
+        assert!(!detail.contains("certificate trust"));
     }
 
     #[tokio::test]
