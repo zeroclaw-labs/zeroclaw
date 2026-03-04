@@ -1234,22 +1234,22 @@ Notes:
 
 BlueBubbles iMessage bridge — webhook receive + REST API send.
 
-| Key                         | Required | Purpose                                                                                     |
-| --------------------------- | -------- | ------------------------------------------------------------------------------------------- |
-| `server_url`                | Yes      | BlueBubbles server URL (e.g. `http://192.168.1.100:1234`)                                   |
-| `password`                  | Yes      | BlueBubbles server password                                                                 |
-| `allowed_senders`           | Optional | Sender allowlist — phone numbers or Apple IDs (`[]` = allow all when `dm_policy = "open"`)  |
-| `ignore_senders`            | Optional | Sender handles to silently drop (suppresses echoed outbound)                                |
-| `webhook_secret`            | Optional | Enables `Authorization: Bearer <secret>` verification on inbound webhooks                   |
-| `dm_policy`                 | Optional | `"open"` (default) \| `"allowlist"` \| `"disabled"` — gates direct messages                 |
-| `group_policy`              | Optional | `"open"` (default) \| `"allowlist"` \| `"disabled"` — gates group chats                     |
-| `group_allow_from`          | Optional | Chat GUIDs allowed when `group_policy = "allowlist"`. Use `["*"]` for all groups            |
-| `send_read_receipts`        | Optional | Post read receipt after each processed message. Default: `true`                             |
-| `text_chunk_limit`          | Optional | Max Unicode characters per outbound message chunk. Omit to disable chunking. Must be > 0    |
-| `chunk_mode`                | Optional | `"length"` (word-boundary split at limit) \| `"newline"` (split on `\n`; no limit required) |
-| `require_mention_in_groups` | Optional | When `true`, bot only responds in group chats when mentioned. Default: `false`              |
-| `mention_keyword`           | Optional | Case-insensitive keyword required in group messages. Falls back to first `allowed_senders`  |
-| `groups`                    | Optional | Per-group overrides — see `[channels_config.bluebubbles.groups."<chat-guid>"]` below        |
+| Key                         | Required | Purpose                                                                                                       |
+| --------------------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `server_url`                | Yes      | BlueBubbles server URL (e.g. `http://192.168.1.100:1234`)                                                     |
+| `password`                  | Yes      | BlueBubbles server password                                                                                   |
+| `allowed_senders`           | Optional | Sender allowlist — phone numbers or Apple IDs (`[]` = allow all when `dm_policy = "open"`)                    |
+| `ignore_senders`            | Optional | Sender handles to silently drop (suppresses echoed outbound)                                                  |
+| `webhook_secret`            | Optional | Enables `Authorization: Bearer <secret>` verification on inbound webhooks                                     |
+| `dm_policy`                 | Optional | `"open"` (default) \| `"allowlist"` \| `"disabled"` — gates direct messages                                   |
+| `group_policy`              | Optional | `"open"` (default) \| `"allowlist"` \| `"disabled"` — gates group chats                                       |
+| `group_allow_from`          | Optional | Chat GUIDs allowed when `group_policy = "allowlist"`. Use `["*"]` for all groups                              |
+| `send_read_receipts`        | Optional | Post read receipt after each processed message. Default: `true`                                               |
+| `text_chunk_limit`          | Optional | Max Unicode characters per outbound message chunk. Omit to disable chunking. Must be > 0                      |
+| `chunk_mode`                | Optional | `"length"` (Unicode char-count split, breaks at whitespace) \| `"newline"` (split on `\n`; no limit required) |
+| `require_mention_in_groups` | Optional | When `true`, bot only responds in group chats when mentioned. Default: `false`                                |
+| `mention_keyword`           | Optional | Case-insensitive keyword required in group messages. Falls back to first `allowed_senders`                    |
+| `groups`                    | Optional | Per-group overrides — see `[channels_config.bluebubbles.groups."<chat-guid>"]` below                          |
 
 **Per-group overrides** (`[channels_config.bluebubbles.groups."iMessage;+;chat123"]`):
 
