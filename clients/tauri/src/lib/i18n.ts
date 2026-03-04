@@ -150,7 +150,9 @@ type TranslationKey =
   | "sidebar_no_devices"
   | "sidebar_no_channels"
   | "sidebar_no_tools"
-  | "sidebar_chats";
+  | "sidebar_chats"
+  | "greeting_prompt"
+  | "greeting_prompt_returning";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -290,6 +292,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_no_channels: "No channels",
     sidebar_no_tools: "No tools",
     sidebar_chats: "Chats",
+    greeting_prompt: "[SYSTEM] The user just logged in for the first time. Their username is \"{username}\". Greet them warmly as their personal AI assistant. Introduce yourself briefly as MoA (Master of AI). Ask their name and what they do so you can assist them better. Keep it friendly and concise.",
+    greeting_prompt_returning: "[SYSTEM] The user \"{username}\" just logged in. You are their personal AI assistant MoA. Greet them like a secretary who knows them. Use any memories you have about them (name, job, preferences). If you remember their real name, use it. Be warm, concise, and proactive — mention anything relevant or ask how you can help today.",
   },
   ko: {
     app_title: "MoA",
@@ -428,6 +432,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_no_channels: "\uCC44\uB110 \uC5C6\uC74C",
     sidebar_no_tools: "\uB3C4\uAD6C \uC5C6\uC74C",
     sidebar_chats: "\uB300\uD654",
+    greeting_prompt: "[SYSTEM] \uC0AC\uC6A9\uC790\uAC00 \uCC98\uC74C \uB85C\uADF8\uC778\uD588\uC2B5\uB2C8\uB2E4. \uC544\uC774\uB514\uB294 \"{username}\"\uC785\uB2C8\uB2E4. MoA(\uAC1C\uC778 AI \uBE44\uC11C)\uB85C\uC11C \uB530\uB73B\uD558\uAC8C \uC778\uC0AC\uD558\uC138\uC694. \uAC04\uB2E8\uD788 \uC790\uAE30\uC18C\uAC1C\uB97C \uD558\uACE0, \uC0AC\uC6A9\uC790\uC758 \uC774\uB984\uACFC \uC9C1\uC5C5\uC744 \uBB3C\uC5B4\uBD10\uC8FC\uC138\uC694. \uCE5C\uADFC\uD558\uACE0 \uAC04\uACB0\uD558\uAC8C \uB9D0\uD574\uC8FC\uC138\uC694. \uD55C\uAD6D\uC5B4\uB85C \uB300\uD654\uD558\uC138\uC694.",
+    greeting_prompt_returning: "[SYSTEM] \uC0AC\uC6A9\uC790 \"{username}\"\uB2D8\uC774 \uB85C\uADF8\uC778\uD588\uC2B5\uB2C8\uB2E4. \uB2F9\uC2E0\uC740 \uAC1C\uC778 AI \uBE44\uC11C MoA\uC785\uB2C8\uB2E4. \uC0AC\uC6A9\uC790\uB97C \uC798 \uC544\uB294 \uBE44\uC11C\uCC98\uB7FC \uC778\uC0AC\uD558\uC138\uC694. \uAE30\uC5B5\uD558\uACE0 \uC788\uB294 \uC815\uBCF4(\uC774\uB984, \uC9C1\uC5C5, \uC120\uD638\uB3C4)\uB97C \uD65C\uC6A9\uD558\uC138\uC694. \uB530\uB73B\uD558\uACE0 \uAC04\uACB0\uD558\uAC8C, \uC624\uB298 \uBB34\uC5C7\uC744 \uB3C4\uC640\uB4DC\uB9B4\uC9C0 \uBB3C\uC5B4\uBD10\uC8FC\uC138\uC694. \uD55C\uAD6D\uC5B4\uB85C \uB300\uD654\uD558\uC138\uC694.",
   },
 };
 
