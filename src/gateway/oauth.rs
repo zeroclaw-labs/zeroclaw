@@ -127,9 +127,10 @@ fn callback_url(state: &AppState, service: &str) -> String {
 }
 
 fn auth_check(state: &AppState, headers: &HeaderMap) -> bool {
-    if !state.pairing.require_pairing() {
-        return true;
-    }
+    // Always delegate to PairingGuard.is_authenticated — no early-return bypass.
+    // When pairing is disabled, is_authenticated returns true for any token,
+    // so the operator's explicit choice to run without pairing is preserved
+    // while avoiding a redundant special-case that bypasses the guard entirely.
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
