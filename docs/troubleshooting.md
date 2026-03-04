@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **February 20, 2026**.
+Last verified: **March 2, 2026**.
 
 ## Installation / Bootstrap
 
@@ -141,6 +141,54 @@ which zeroclaw
 Persist in your shell profile if needed.
 
 ## Runtime / Gateway
+
+### Windows: shell tool unavailable or repeated shell failures
+
+Symptoms:
+
+- agent repeatedly fails shell calls and stops early
+- shell-based actions fail even though ZeroClaw starts
+- `zeroclaw doctor` reports runtime shell capability unavailable
+
+Why this happens:
+
+- Native Windows shell availability differs by machine setup.
+- Some environments do not have `sh` in `PATH`.
+- If both Git Bash and PowerShell are missing/misconfigured, shell tool execution will fail.
+
+What changed in ZeroClaw:
+
+- Native runtime now resolves shell with Windows fallbacks in this order:
+  - `bash` -> `sh` -> `pwsh` -> `powershell` -> `cmd`/`COMSPEC`
+- `zeroclaw doctor` now reports:
+  - selected native shell (kind + resolved executable path)
+  - candidate shell availability on Windows
+  - explicit warning when fallback is only `cmd`
+- WSL2 is optional, not required.
+
+Checks (PowerShell):
+
+```powershell
+where.exe bash
+where.exe pwsh
+where.exe powershell
+echo $env:COMSPEC
+zeroclaw doctor
+```
+
+Fix:
+
+1. Install at least one preferred shell:
+   - Git Bash (recommended for Unix-like command compatibility), or
+   - PowerShell 7 (`pwsh`)
+2. Confirm the shell executable is available in `PATH`.
+3. Ensure `COMSPEC` is set (normally points to `cmd.exe` on Windows).
+4. Reopen terminal and rerun `zeroclaw doctor`.
+
+Notes:
+
+- Running with only `cmd` fallback can work, but compatibility is lower than Git Bash or PowerShell.
+- If you already use WSL2, it can help with Unix-style workflows, but it is not mandatory for ZeroClaw shell tooling.
 
 ### Gateway unreachable
 
@@ -355,11 +403,12 @@ The `.cargo/config.toml` in this repository already pins `x86_64-apple-darwin` b
 Both still work:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
 ```
 
-`install.sh` is a compatibility entry and forwards/falls back to bootstrap behavior.
+Root `install.sh` is the canonical remote entrypoint and defaults to TUI onboarding for no-arg interactive sessions.
+`scripts/install.sh` remains a compatibility entry and forwards/falls back to bootstrap behavior.
 
 ## Still Stuck?
 

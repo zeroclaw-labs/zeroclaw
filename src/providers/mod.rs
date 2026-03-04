@@ -39,8 +39,8 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use traits::{
     is_user_or_assistant_role, ChatMessage, ChatRequest, ChatResponse, ConversationMessage,
-    Provider, ProviderCapabilityError, ToolCall, ToolResultMessage, ROLE_ASSISTANT, ROLE_SYSTEM,
-    ROLE_TOOL, ROLE_USER,
+    NormalizedStopReason, Provider, ProviderCapabilityError, ToolCall, ToolResultMessage,
+    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER,
 };
 
 use crate::auth::AuthService;
@@ -742,6 +742,7 @@ pub struct ProviderRuntimeOptions {
     pub reasoning_enabled: Option<bool>,
     pub reasoning_level: Option<String>,
     pub custom_provider_api_mode: Option<CompatibleApiMode>,
+    pub custom_provider_auth_header: Option<String>,
     pub max_tokens_override: Option<u32>,
     pub model_support_vision: Option<bool>,
 }
@@ -757,6 +758,7 @@ impl Default for ProviderRuntimeOptions {
             reasoning_enabled: None,
             reasoning_level: None,
             custom_provider_api_mode: None,
+            custom_provider_auth_header: None,
             max_tokens_override: None,
             model_support_vision: None,
         }
@@ -1095,6 +1097,35 @@ fn parse_custom_provider_url(
         _ => anyhow::bail!(
             "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
         ),
+    }
+}
+
+fn resolve_custom_provider_auth_style(options: &ProviderRuntimeOptions) -> AuthStyle {
+    let Some(header) = options
+        .custom_provider_auth_header
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return AuthStyle::Bearer;
+    };
+
+    if header.eq_ignore_ascii_case("authorization") {
+        return AuthStyle::Bearer;
+    }
+
+    if header.eq_ignore_ascii_case("x-api-key") {
+        return AuthStyle::XApiKey;
+    }
+
+    match reqwest::header::HeaderName::from_bytes(header.as_bytes()) {
+        Ok(_) => AuthStyle::Custom(header.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                "Ignoring invalid custom provider auth header and falling back to Bearer: {error}"
+            );
+            AuthStyle::Bearer
+        }
     }
 }
 
@@ -1488,11 +1519,12 @@ fn create_provider_with_url_and_options(
             let api_mode = options
                 .custom_provider_api_mode
                 .unwrap_or(CompatibleApiMode::OpenAiChatCompletions);
+            let auth_style = resolve_custom_provider_auth_style(options);
             Ok(Box::new(OpenAiCompatibleProvider::new_custom_with_mode(
                 "Custom",
                 &base_url,
                 key,
-                AuthStyle::Bearer,
+                auth_style,
                 true,
                 api_mode,
                 options.max_tokens_override,
@@ -1586,15 +1618,22 @@ pub fn create_resilient_provider_with_options(
 
         let (provider_name, profile_override) = parse_provider_profile(fallback);
 
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
+        // Fallback providers can use explicit per-entry API keys from
+        // `reliability.fallback_api_keys` (keyed by full fallback entry), or
+        // fall back to provider-name keys for compatibility.
+        //
+        // If no explicit map entry exists, pass `None` so
+        // `resolve_provider_credential` can resolve provider-specific env vars.
         //
         // When a profile override is present (e.g. "openai-codex:second"),
         // propagate it through `auth_profile_override` so the provider
         // picks up the correct OAuth credential set.
+        let fallback_api_key = reliability
+            .fallback_api_keys
+            .get(fallback)
+            .or_else(|| reliability.fallback_api_keys.get(provider_name))
+            .map(String::as_str);
+
         let fallback_options = match profile_override {
             Some(profile) => {
                 let mut opts = options.clone();
@@ -1604,11 +1643,11 @@ pub fn create_resilient_provider_with_options(
             None => options.clone(),
         };
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        match create_provider_with_options(provider_name, fallback_api_key, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
-                    fallback_provider = fallback,
+                    fallback_provider = provider_name,
                     "Ignoring invalid fallback provider during initialization"
                 );
             }
@@ -2852,6 +2891,51 @@ mod tests {
         assert!(p.is_ok());
     }
 
+    #[test]
+    fn custom_provider_auth_style_defaults_to_bearer() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::Bearer
+        ));
+    }
+
+    #[test]
+    fn custom_provider_auth_style_maps_x_api_key() {
+        let options = ProviderRuntimeOptions {
+            custom_provider_auth_header: Some("x-api-key".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::XApiKey
+        ));
+    }
+
+    #[test]
+    fn custom_provider_auth_style_maps_custom_header() {
+        let options = ProviderRuntimeOptions {
+            custom_provider_auth_header: Some("api-key".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::Custom(header) if header == "api-key"
+        ));
+    }
+
+    #[test]
+    fn custom_provider_auth_style_invalid_header_falls_back_to_bearer() {
+        let options = ProviderRuntimeOptions {
+            custom_provider_auth_header: Some("not a header".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+        assert!(matches!(
+            resolve_custom_provider_auth_style(&options),
+            AuthStyle::Bearer
+        ));
+    }
+
     // ── Anthropic-compatible custom endpoints ─────────────────
 
     #[test]
@@ -2962,6 +3046,7 @@ providers = ["demo-plugin-provider"]
                 "openai".into(),
                 "openai".into(),
             ],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3001,6 +3086,7 @@ providers = ["demo-plugin-provider"]
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["lmstudio".into(), "ollama".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3023,6 +3109,7 @@ providers = ["demo-plugin-provider"]
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3049,6 +3136,7 @@ providers = ["demo-plugin-provider"]
                 "nonexistent-provider".into(),
                 "lmstudio".into(),
             ],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3081,6 +3169,7 @@ providers = ["demo-plugin-provider"]
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3615,6 +3704,7 @@ providers = ["demo-plugin-provider"]
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["openai-codex:second".into()],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
@@ -3644,6 +3734,7 @@ providers = ["demo-plugin-provider"]
                 "lmstudio".into(),
                 "nonexistent-provider".into(),
             ],
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,

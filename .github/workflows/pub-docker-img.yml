@@ -17,6 +17,11 @@ on:
             - "scripts/ci/ghcr_publish_contract_guard.py"
             - "scripts/ci/ghcr_vulnerability_gate.py"
     workflow_dispatch:
+        inputs:
+            release_tag:
+                description: "Existing release tag to publish (e.g. v0.2.0). Leave empty for smoke-only run."
+                required: false
+                type: string
 
 concurrency:
     group: docker-${{ github.event.pull_request.number || github.ref }}
@@ -32,14 +37,28 @@ env:
 jobs:
     pr-smoke:
         name: PR Docker Smoke
-        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
-        runs-on: [self-hosted, aws-india]
+        if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.release_tag == '')
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 25
         permissions:
             contents: read
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Resolve Docker API version
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  server_api="$(docker version --format '{{.Server.APIVersion}}')"
+                  min_api="$(docker version --format '{{.Server.MinAPIVersion}}' 2>/dev/null || true)"
+                  if [[ -z "${server_api}" || "${server_api}" == "<no value>" ]]; then
+                    echo "::error::Unable to detect Docker server API version."
+                    docker version || true
+                    exit 1
+                  fi
+                  echo "DOCKER_API_VERSION=${server_api}" >> "$GITHUB_ENV"
+                  echo "Using Docker API version ${server_api} (server min: ${min_api:-unknown})"
 
             - name: Setup Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -72,9 +91,9 @@ jobs:
 
     publish:
         name: Build and Push Docker Image
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'zeroclaw-labs/zeroclaw'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 45
+        if: github.repository == 'zeroclaw-labs/zeroclaw' && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 90
         permissions:
             contents: read
             packages: write
@@ -82,6 +101,22 @@ jobs:
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+
+            - name: Resolve Docker API version
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  server_api="$(docker version --format '{{.Server.APIVersion}}')"
+                  min_api="$(docker version --format '{{.Server.MinAPIVersion}}' 2>/dev/null || true)"
+                  if [[ -z "${server_api}" || "${server_api}" == "<no value>" ]]; then
+                    echo "::error::Unable to detect Docker server API version."
+                    docker version || true
+                    exit 1
+                  fi
+                  echo "DOCKER_API_VERSION=${server_api}" >> "$GITHUB_ENV"
+                  echo "Using Docker API version ${server_api} (server min: ${min_api:-unknown})"
 
             - name: Setup Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -99,22 +134,42 @@ jobs:
               run: |
                   set -euo pipefail
                   IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-                  SHA_SUFFIX="sha-${GITHUB_SHA::12}"
+                  if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+                    if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+                      echo "::error::Docker publish is restricted to v* tag pushes."
+                      exit 1
+                    fi
+                    RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+                  elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+                    RELEASE_TAG="${{ inputs.release_tag }}"
+                    if [[ -z "${RELEASE_TAG}" ]]; then
+                      echo "::error::workflow_dispatch publish requires inputs.release_tag"
+                      exit 1
+                    fi
+                    if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+                      echo "::error::release_tag must be vX.Y.Z or vX.Y.Z-suffix (received: ${RELEASE_TAG})"
+                      exit 1
+                    fi
+                    if ! git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+                      echo "::error::release tag not found in checkout: ${RELEASE_TAG}"
+                      exit 1
+                    fi
+                  else
+                    echo "::error::Unsupported event for publish: ${GITHUB_EVENT_NAME}"
+                    exit 1
+                  fi
+                  RELEASE_SHA="$(git rev-parse HEAD)"
+                  SHA_SUFFIX="sha-${RELEASE_SHA::12}"
                   SHA_TAG="${IMAGE}:${SHA_SUFFIX}"
                   LATEST_SUFFIX="latest"
                   LATEST_TAG="${IMAGE}:${LATEST_SUFFIX}"
-                  if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
-                    echo "::error::Docker publish is restricted to v* tag pushes."
-                    exit 1
-                  fi
-
-                  RELEASE_TAG="${GITHUB_REF#refs/tags/}"
                   VERSION_TAG="${IMAGE}:${RELEASE_TAG}"
                   TAGS="${VERSION_TAG},${SHA_TAG},${LATEST_TAG}"
 
                   {
                     echo "tags=${TAGS}"
                     echo "release_tag=${RELEASE_TAG}"
+                    echo "release_sha=${RELEASE_SHA}"
                     echo "sha_tag=${SHA_SUFFIX}"
                     echo "latest_tag=${LATEST_SUFFIX}"
                   } >> "$GITHUB_OUTPUT"
@@ -124,6 +179,8 @@ jobs:
               with:
                   context: .
                   push: true
+                  build-args: |
+                      ZEROCLAW_CARGO_ALL_FEATURES=true
                   tags: ${{ steps.meta.outputs.tags }}
                   platforms: linux/amd64,linux/arm64
                   cache-from: type=gha
@@ -173,7 +230,7 @@ jobs:
                   python3 scripts/ci/ghcr_publish_contract_guard.py \
                     --repository "${GITHUB_REPOSITORY,,}" \
                     --release-tag "${{ steps.meta.outputs.release_tag }}" \
-                    --sha "${GITHUB_SHA}" \
+                    --sha "${{ steps.meta.outputs.release_sha }}" \
                     --policy-file .github/release/ghcr-tag-policy.json \
                     --output-json artifacts/ghcr-publish-contract.json \
                     --output-md artifacts/ghcr-publish-contract.md \
@@ -328,11 +385,25 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 21
 
-            - name: Upload Trivy SARIF
+            - name: Detect Trivy SARIF report
+              id: trivy-sarif
               if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  sarif_path="artifacts/trivy-${{ steps.meta.outputs.release_tag }}.sarif"
+                  if [ -f "${sarif_path}" ]; then
+                    echo "exists=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "exists=false" >> "$GITHUB_OUTPUT"
+                    echo "::notice::Trivy SARIF report not found at ${sarif_path}; skipping SARIF upload."
+                  fi
+
+            - name: Upload Trivy SARIF
+              if: always() && steps.trivy-sarif.outputs.exists == 'true'
               uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
               with:
-                  sarif_file: artifacts/trivy-${{ github.ref_name }}.sarif
+                  sarif_file: artifacts/trivy-${{ steps.meta.outputs.release_tag }}.sarif
                   category: ghcr-trivy
 
             - name: Upload Trivy report artifacts
@@ -341,9 +412,9 @@ jobs:
               with:
                   name: ghcr-trivy-report
                   path: |
-                      artifacts/trivy-${{ github.ref_name }}.sarif
-                      artifacts/trivy-${{ github.ref_name }}.txt
-                      artifacts/trivy-${{ github.ref_name }}.json
+                      artifacts/trivy-${{ steps.meta.outputs.release_tag }}.sarif
+                      artifacts/trivy-${{ steps.meta.outputs.release_tag }}.txt
+                      artifacts/trivy-${{ steps.meta.outputs.release_tag }}.json
                       artifacts/trivy-sha-*.txt
                       artifacts/trivy-sha-*.json
                       artifacts/trivy-latest.txt

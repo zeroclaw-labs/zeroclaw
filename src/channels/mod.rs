@@ -272,6 +272,7 @@ struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
     perplexity_filter: crate::config::PerplexityFilterConfig,
     outbound_leak_guard: crate::config::OutboundLeakGuardConfig,
+    canary_tokens: bool,
     last_applied_stamp: Option<ConfigFileStamp>,
 }
 
@@ -279,6 +280,7 @@ struct RuntimeConfigState {
 struct RuntimeAutonomyPolicy {
     auto_approve: Vec<String>,
     always_ask: Vec<String>,
+    command_context_rules: Vec<crate::config::CommandContextRuleConfig>,
     non_cli_excluded_tools: Vec<String>,
     non_cli_approval_approvers: Vec<String>,
     non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
@@ -286,6 +288,7 @@ struct RuntimeAutonomyPolicy {
         HashMap<String, NonCliNaturalLanguageApprovalMode>,
     perplexity_filter: crate::config::PerplexityFilterConfig,
     outbound_leak_guard: crate::config::OutboundLeakGuardConfig,
+    canary_tokens: bool,
 }
 
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
@@ -541,6 +544,24 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - The path MUST be an absolute filesystem path to a local file (e.g. [IMAGE:/home/nicolas/.zeroclaw/workspace/images/chart.png]).\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - You can combine text and media in one response — text is sent first, then each attachment.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "lark" | "feishu" => Some(
+            "When responding on Lark/Feishu:\n\
+             - For image attachments, use markers: [IMAGE:<path-or-url-or-data-uri>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Prefer one marker per line to keep delivery deterministic.\n\
+             - If you include both text and images, put text first, then image markers.\n\
+             - Be concise and direct. Skip filler phrases.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "qq" => Some(
+            "When responding on QQ:\n\
+             - For image attachments, use markers: [IMAGE:<path-or-url-or-data-uri>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Prefer one marker per line to keep delivery deterministic.\n\
+             - If you include both text and images, put text first, then image markers.\n\
+             - Be concise and direct. Skip filler phrases.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "bluebubbles" => Some(
@@ -1088,6 +1109,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
     RuntimeAutonomyPolicy {
         auto_approve: config.autonomy.auto_approve.clone(),
         always_ask: config.autonomy.always_ask.clone(),
+        command_context_rules: config.autonomy.command_context_rules.clone(),
         non_cli_excluded_tools: config.autonomy.non_cli_excluded_tools.clone(),
         non_cli_approval_approvers: config.autonomy.non_cli_approval_approvers.clone(),
         non_cli_natural_language_approval_mode: config
@@ -1099,6 +1121,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
             .clone(),
         perplexity_filter: config.security.perplexity_filter.clone(),
         outbound_leak_guard: config.security.outbound_leak_guard.clone(),
+        canary_tokens: config.security.canary_tokens,
     }
 }
 
@@ -1169,6 +1192,19 @@ fn runtime_outbound_leak_guard_snapshot(
     }
     crate::config::OutboundLeakGuardConfig::default()
 }
+
+fn runtime_canary_tokens_snapshot(ctx: &ChannelRuntimeContext) -> bool {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.canary_tokens;
+        }
+    }
+    false
+}
+
 fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
     ctx.non_cli_excluded_tools
         .lock()
@@ -1695,6 +1731,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
                 defaults: next_defaults.clone(),
                 perplexity_filter: next_autonomy_policy.perplexity_filter.clone(),
                 outbound_leak_guard: next_autonomy_policy.outbound_leak_guard.clone(),
+                canary_tokens: next_autonomy_policy.canary_tokens,
                 last_applied_stamp: Some(stamp),
             },
         );
@@ -1703,6 +1740,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     ctx.approval_manager.replace_runtime_non_cli_policy(
         &next_autonomy_policy.auto_approve,
         &next_autonomy_policy.always_ask,
+        &next_autonomy_policy.command_context_rules,
         &next_autonomy_policy.non_cli_approval_approvers,
         next_autonomy_policy.non_cli_natural_language_approval_mode,
         &next_autonomy_policy.non_cli_natural_language_approval_mode_by_channel,
@@ -1729,6 +1767,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         outbound_leak_guard_enabled = next_autonomy_policy.outbound_leak_guard.enabled,
         outbound_leak_guard_action = ?next_autonomy_policy.outbound_leak_guard.action,
         outbound_leak_guard_sensitivity = next_autonomy_policy.outbound_leak_guard.sensitivity,
+        canary_tokens = next_autonomy_policy.canary_tokens,
         "Applied updated channel runtime config from disk"
     );
 
@@ -2027,6 +2066,31 @@ async fn create_resilient_provider_nonblocking(
     })
     .await
     .context("failed to join provider initialization task")?
+}
+
+async fn create_routed_provider_nonblocking(
+    provider_name: &str,
+    api_key: Option<String>,
+    api_url: Option<String>,
+    reliability: crate::config::ReliabilityConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
+    default_model: String,
+    provider_runtime_options: providers::ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let provider_name = provider_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        providers::create_routed_provider_with_options(
+            &provider_name,
+            api_key.as_deref(),
+            api_url.as_deref(),
+            &reliability,
+            &model_routes,
+            &default_model,
+            &provider_runtime_options,
+        )
+    })
+    .await
+    .context("failed to join routed provider initialization task")?
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -3800,6 +3864,7 @@ or tune thresholds in config.",
                     &excluded_tools_snapshot,
                     progress_mode,
                     ctx.safety_heartbeat.clone(),
+                    runtime_canary_tokens_snapshot(ctx.as_ref()),
                 ),
             ),
         ) => LlmExecutionResult::Completed(result),
@@ -5346,6 +5411,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     let provider_name = resolved_default_provider(&config);
+    let model = resolved_default_model(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -5355,15 +5421,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
     let provider: Arc<dyn Provider> = Arc::from(
-        create_resilient_provider_nonblocking(
+        create_routed_provider_nonblocking(
             &provider_name,
             config.api_key.clone(),
             config.api_url.clone(),
             config.reliability.clone(),
+            config.model_routes.clone(),
+            model.clone(),
             provider_runtime_options.clone(),
         )
         .await?,
@@ -5386,6 +5455,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 defaults: runtime_defaults_from_config(&config),
                 perplexity_filter: config.security.perplexity_filter.clone(),
                 outbound_leak_guard: config.security.outbound_leak_guard.clone(),
+                canary_tokens: config.security.canary_tokens,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -5402,7 +5472,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
@@ -6949,7 +7018,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7023,7 +7092,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7111,7 +7180,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7198,7 +7267,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7344,7 +7413,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -9553,6 +9622,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
+                    canary_tokens: true,
                     last_applied_stamp: None,
                 },
             );
@@ -9895,6 +9965,40 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         store.remove(&config_path);
+    }
+
+    #[tokio::test]
+    async fn start_channels_uses_model_routes_when_global_provider_key_is_missing() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut cfg = Config::default();
+        cfg.workspace_dir = workspace_dir;
+        cfg.config_path = temp.path().join("config.toml");
+        cfg.default_provider = None;
+        cfg.api_key = None;
+        cfg.default_model = Some("hint:fast".to_string());
+        cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.3-codex".to_string(),
+            max_tokens: Some(512),
+            api_key: Some("route-specific-key".to_string()),
+            transport: Some("sse".to_string()),
+        }];
+
+        let config_path = cfg.config_path.clone();
+        let result = start_channels(cfg).await;
+        let mut store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.remove(&config_path);
+
+        assert!(
+            result.is_ok(),
+            "start_channels should support routed providers without global credentials: {result:?}"
+        );
     }
 
     #[tokio::test]

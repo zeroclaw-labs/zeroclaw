@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
@@ -90,6 +91,8 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+#[cfg(test)]
+mod test_locks;
 mod tools;
 mod tunnel;
 mod update;
@@ -151,6 +154,10 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
 
+        /// Run the full-screen TUI onboarding flow (ratatui)
+        #[arg(long)]
+        interactive_ui: bool,
+
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -159,7 +166,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive)
+        /// API key (used in quick mode, ignored with --interactive or --interactive-ui)
         #[arg(long)]
         api_key: Option<String>,
 
@@ -828,12 +835,14 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
+    // Onboard runs quick setup by default, interactive wizard with --interactive,
+    // or full-screen TUI with --interactive-ui.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
         interactive,
+        interactive_ui,
         force,
         channels_only,
         api_key,
@@ -847,6 +856,7 @@ async fn main() -> Result<()> {
     } = &cli.command
     {
         let interactive = *interactive;
+        let interactive_ui = *interactive_ui;
         let force = *force;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
@@ -860,8 +870,25 @@ async fn main() -> Result<()> {
         let openclaw_migration_enabled =
             migrate_openclaw || openclaw_source.is_some() || openclaw_config.is_some();
 
+        if interactive && interactive_ui {
+            bail!("Use either --interactive or --interactive-ui, not both");
+        }
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
+        }
+        if interactive_ui && channels_only {
+            bail!("Use either --interactive-ui or --channels-only, not both");
+        }
+        if interactive_ui
+            && (api_key.is_some()
+                || provider.is_some()
+                || model.is_some()
+                || memory.is_some()
+                || no_totp)
+        {
+            bail!(
+                "--interactive-ui does not accept --api-key, --provider, --model, --memory, or --no-totp"
+            );
         }
         if channels_only
             && (api_key.is_some()
@@ -882,6 +909,16 @@ async fn main() -> Result<()> {
         }
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if interactive_ui {
+            Box::pin(onboard::run_wizard_tui_with_migration(
+                force,
+                onboard::OpenClawOnboardMigrationOptions {
+                    enabled: openclaw_migration_enabled,
+                    source_workspace: openclaw_source,
+                    source_config: openclaw_config,
+                },
+            ))
+            .await
         } else if interactive {
             Box::pin(onboard::run_wizard_with_migration(
                 force,
@@ -2445,6 +2482,24 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_interactive_ui_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive-ui"])
+            .expect("onboard --interactive-ui should parse");
+
+        match cli.command {
+            Commands::Onboard {
+                interactive,
+                interactive_ui,
+                ..
+            } => {
+                assert!(!interactive);
+                assert!(interactive_ui);
+            }
             other => panic!("expected onboard command, got {other:?}"),
         }
     }

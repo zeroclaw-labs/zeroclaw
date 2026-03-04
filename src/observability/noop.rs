@@ -61,6 +61,11 @@ mod tests {
             channel: "cli".into(),
             direction: "inbound".into(),
         });
+        obs.record_event(&ObserverEvent::WebhookAuthFailure {
+            channel: "wati".into(),
+            signature: "invalid".into(),
+            bearer: "missing".into(),
+        });
         obs.record_event(&ObserverEvent::Error {
             component: "test".into(),
             message: "boom".into(),

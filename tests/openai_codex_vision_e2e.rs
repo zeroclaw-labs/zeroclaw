@@ -154,6 +154,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         reasoning_enabled: None,
         reasoning_level: None,
         custom_provider_api_mode: None,
+        custom_provider_auth_header: None,
         max_tokens_override: None,
         model_support_vision: None,
     };
