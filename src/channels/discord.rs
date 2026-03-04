@@ -292,7 +292,9 @@ fn is_audio_attachment(content_type: &str, filename: &str, url: &str) -> bool {
     let normalized_content_type = normalize_content_type(content_type);
 
     if !normalized_content_type.is_empty() {
-        if normalized_content_type.starts_with("audio/") {
+        if normalized_content_type.starts_with("audio/")
+            || audio_extension_from_content_type(&normalized_content_type).is_some()
+        {
             return true;
         }
         // Trust explicit non-audio MIME to avoid false positives from filename extensions.
@@ -2130,6 +2132,15 @@ mod tests {
             "application/octet-stream",
             "voice.ogg",
             "https://cdn.discordapp.com/attachments/123/456/voice.ogg"
+        ));
+    }
+
+    #[test]
+    fn is_audio_attachment_accepts_application_ogg_mime() {
+        assert!(is_audio_attachment(
+            "application/ogg",
+            "voice",
+            "https://cdn.discordapp.com/attachments/123/456/blob"
         ));
     }
 
