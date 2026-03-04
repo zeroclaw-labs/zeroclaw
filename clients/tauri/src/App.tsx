@@ -9,7 +9,7 @@ import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
-import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
+import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
 import {
   loadChats,
@@ -67,6 +67,14 @@ function App() {
       setIsConnected(true);
       setPage("chat");
       apiClient.startHeartbeat();
+
+      // Auto-greet returning user if no active chat
+      const existingChats = loadChats();
+      const savedActiveId = getActiveChatId();
+      const activeExists = existingChats.some((c) => c.id === savedActiveId);
+      if (!activeExists) {
+        sendAutoGreeting(existingChats.length === 0);
+      }
     } else {
       setPage("login");
     }
@@ -254,44 +262,88 @@ function App() {
     [activeChatId, handleSendMessage],
   );
 
+  // Send an automatic greeting from ZeroClaw when chat opens after login
+  const sendAutoGreeting = useCallback(
+    async (isFirstLogin: boolean) => {
+      const chat = createNewChat();
+      const chatId = chat.id;
+      setChats((prev) => [chat, ...prev]);
+      setActiveChatIdState(chatId);
+
+      const user = apiClient.getUser();
+      const username = user?.username ?? "User";
+
+      // Choose prompt based on whether this is a first-time or returning user
+      const promptKey = isFirstLogin ? "greeting_prompt" : "greeting_prompt_returning";
+      const prompt = t(promptKey, locale).replace("{username}", username);
+
+      try {
+        const response = await apiClient.chat(prompt, []);
+        const assistantMsg = createMessage("assistant", response.response, response.model);
+
+        setChats((prev) =>
+          prev.map((c) => {
+            if (c.id !== chatId) return c;
+            return {
+              ...c,
+              title: t("app_title", locale),
+              messages: [assistantMsg],
+              updatedAt: Date.now(),
+            };
+          }),
+        );
+      } catch {
+        // Greeting failed silently — user can still chat normally
+      }
+    },
+    [locale],
+  );
+
   const handleLoginSuccess = useCallback((devices: DeviceInfo[]) => {
-    if (devices.length <= 1) {
-      // 0 or 1 device → auto-connect
+    const proceedToChat = () => {
       setIsConnected(true);
       setPage("chat");
       apiClient.startHeartbeat();
-      // Auto-register this device if no devices yet
+
+      // Determine if first login (no previous chats)
+      const existingChats = loadChats();
+      const isFirstLogin = existingChats.length === 0;
+      sendAutoGreeting(isFirstLogin);
+    };
+
+    if (devices.length <= 1) {
+      // 0 or 1 device → auto-connect
       if (devices.length === 0) {
         apiClient.registerDevice("MoA Device").catch(() => {});
       }
+      proceedToChat();
     } else {
       // Multiple devices → show device selection
-      const onlineDevices = devices.filter((d) => d.is_online);
       const currentDeviceId = apiClient.getDeviceId();
       const currentInList = devices.find((d) => d.device_id === currentDeviceId);
+      const onlineDevices = devices.filter((d) => d.is_online);
 
       if (currentInList) {
-        // This device is in the list → auto-connect (local login)
-        setIsConnected(true);
-        setPage("chat");
-        apiClient.startHeartbeat();
+        proceedToChat();
       } else if (onlineDevices.length === 1 && !onlineDevices[0].has_pairing_code) {
-        // Only 1 online device without pairing code → auto-connect
-        setIsConnected(true);
-        setPage("chat");
-        apiClient.startHeartbeat();
+        proceedToChat();
       } else {
         // Show device selection
         setPendingDevices(devices);
         setPage("device_select");
       }
     }
-  }, []);
+  }, [sendAutoGreeting]);
 
   const handleDeviceSelected = useCallback(() => {
     setIsConnected(true);
     setPage("chat");
-  }, []);
+    apiClient.startHeartbeat();
+
+    const existingChats = loadChats();
+    const isFirstLogin = existingChats.length === 0;
+    sendAutoGreeting(isFirstLogin);
+  }, [sendAutoGreeting]);
 
   const handleLogout = useCallback(async () => {
     await apiClient.logout();
