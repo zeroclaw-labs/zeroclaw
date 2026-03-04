@@ -455,12 +455,127 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     (len_diff == 0) & (byte_diff == 0)
 }
 
-/// Check if a host string represents a non-localhost bind address.
+/// Check if a host string represents a truly public (internet-facing) bind address.
+///
+/// Returns `false` for loopback, RFC 1918 private, and link-local addresses.
+/// Returns `true` for wildcard (0.0.0.0/::) and routable public IPs.
 pub fn is_public_bind(host: &str) -> bool {
-    !matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0:0:0:0:0:0:0:1"
-    )
+    let h = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if matches!(h, "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1") {
+        return false;
+    }
+
+    if let Some([a, b, _, _]) = parse_ipv4(h) {
+        return !matches!(a, 10 | 127)
+            && !(a == 172 && (16..=31).contains(&b))
+            && !(a == 192 && b == 168)
+            && !(a == 169 && b == 254);
+    }
+
+    // IPv6: treat loopback, link-local (fe80::/10), and ULA (fc00::/7) as non-public
+    if let Some(bytes) = parse_ipv6(h) {
+        let is_loopback = bytes == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let is_link_local = bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80;
+        let is_ula = (bytes[0] & 0xfe) == 0xfc;
+        if is_loopback || is_link_local || is_ula {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Returns `true` if the host is a private-network address (RFC 1918 or link-local)
+/// rather than loopback or publicly routable.
+pub fn is_private_network(host: &str) -> bool {
+    let h = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Some([a, b, _, _]) = parse_ipv4(h) {
+        return a == 10
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 169 && b == 254);
+    }
+    if let Some(bytes) = parse_ipv6(h) {
+        let is_link_local = bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80;
+        let is_ula = (bytes[0] & 0xfe) == 0xfc;
+        return is_link_local || is_ula;
+    }
+    false
+}
+
+/// Parse a dotted-quad IPv4 string into four octets.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut parts = s.splitn(4, '.');
+    let a = parts.next()?.parse::<u8>().ok()?;
+    let b = parts.next()?.parse::<u8>().ok()?;
+    let c = parts.next()?.parse::<u8>().ok()?;
+    let d = parts.next()?.parse::<u8>().ok()?;
+    Some([a, b, c, d])
+}
+
+/// Parse an IPv6 string into 16 bytes. Supports `::` shorthand.
+fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
+    let s = s
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(s);
+    if s.contains('.') {
+        return None;
+    }
+    let mut result = [0u8; 16];
+    if s == "::" {
+        return Some(result);
+    }
+    let has_double_colon = s.contains("::");
+    let (head, tail) = if let Some(pos) = s.find("::") {
+        let h = &s[..pos];
+        let t = &s[pos + 2..];
+        (
+            if h.is_empty() {
+                vec![]
+            } else {
+                h.split(':').collect::<Vec<_>>()
+            },
+            if t.is_empty() {
+                vec![]
+            } else {
+                t.split(':').collect::<Vec<_>>()
+            },
+        )
+    } else {
+        (s.split(':').collect::<Vec<_>>(), vec![])
+    };
+    if !has_double_colon && head.len() != 8 {
+        return None;
+    }
+    if has_double_colon && head.len() + tail.len() > 7 {
+        return None;
+    }
+    let zero_groups = 8 - head.len() - tail.len();
+    let mut idx = 0;
+    for group in &head {
+        let val = u16::from_str_radix(group, 16).ok()?;
+        result[idx] = (val >> 8) as u8;
+        result[idx + 1] = val as u8;
+        idx += 2;
+    }
+    if has_double_colon {
+        idx += zero_groups * 2;
+    }
+    for group in &tail {
+        let val = u16::from_str_radix(group, 16).ok()?;
+        result[idx] = (val >> 8) as u8;
+        result[idx + 1] = val as u8;
+        idx += 2;
+    }
+    Some(result)
 }
 
 #[cfg(test)]
@@ -646,9 +761,54 @@ mod tests {
     }
 
     #[test]
-    async fn real_ip_is_public() {
-        assert!(is_public_bind("192.168.1.100"));
-        assert!(is_public_bind("10.0.0.1"));
+    async fn rfc1918_not_public() {
+        assert!(!is_public_bind("192.168.1.100"));
+        assert!(!is_public_bind("10.0.0.1"));
+        assert!(!is_public_bind("172.16.0.1"));
+        assert!(!is_public_bind("172.31.255.255"));
+        assert!(!is_public_bind("169.254.1.1"));
+    }
+
+    #[test]
+    async fn real_public_ip_is_public() {
+        assert!(is_public_bind("8.8.8.8"));
+        assert!(is_public_bind("1.2.3.4"));
+        assert!(is_public_bind("203.0.113.1"));
+
+        // IPv6 loopback
+        assert!(!is_public_bind("::1"));
+        assert!(!is_public_bind("[::1]"));
+        assert!(!is_public_bind("0:0:0:0:0:0:0:1"));
+
+        // IPv6 link-local (fe80::/10)
+        assert!(!is_public_bind("fe80::1"));
+        assert!(!is_public_bind("[fe80::1]"));
+        assert!(!is_public_bind("fe80::abcd:1234"));
+
+        // IPv6 ULA (fc00::/7)
+        assert!(!is_public_bind("fc00::1"));
+        assert!(!is_public_bind("fd12:3456::1"));
+
+        // IPv6 public should remain public
+        assert!(is_public_bind("2001:db8::1"));
+        assert!(is_public_bind("2607:f8b0::1"));
+    }
+
+    #[test]
+    async fn private_network_detection() {
+        assert!(is_private_network("192.168.1.100"));
+
+        // IPv6 private networks
+        assert!(is_private_network("fe80::1"));
+        assert!(is_private_network("fd12:3456::1"));
+        assert!(!is_private_network("2001:db8::1"));
+        assert!(!is_private_network("::1")); // loopback is not "private network"
+        assert!(is_private_network("10.0.0.1"));
+        assert!(is_private_network("172.16.0.1"));
+        assert!(is_private_network("169.254.1.1"));
+        assert!(!is_private_network("127.0.0.1"));
+        assert!(!is_private_network("8.8.8.8"));
+        assert!(!is_private_network("0.0.0.0"));
     }
 
     // ── constant_time_eq ─────────────────────────────────────
