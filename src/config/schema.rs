@@ -14363,6 +14363,8 @@ reserve_percent = 15
             group_policy: BlueBubblesGroupPolicy::Open,
             group_allow_from: vec![],
             send_read_receipts: true,
+            text_chunk_limit: None,
+            chunk_mode: None,
         });
         let err = config
             .validate()
@@ -14386,6 +14388,8 @@ reserve_percent = 15
             group_policy: BlueBubblesGroupPolicy::Allowlist,
             group_allow_from: vec![],
             send_read_receipts: true,
+            text_chunk_limit: None,
+            chunk_mode: None,
         });
         let err = config.validate().expect_err(
             "allowlist group_policy with empty group_allow_from should fail validation",
