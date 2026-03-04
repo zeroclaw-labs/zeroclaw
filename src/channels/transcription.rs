@@ -44,17 +44,25 @@ pub async fn transcribe_audio_local(file_path: &str) -> anyhow::Result<String> {
     // reason (missing ffmpeg, timeout, non-zero exit), fall back to Python
     // whisper rather than propagating the error immediately — the user may
     // have whisper.cpp installed but ffmpeg absent for a specific format.
+    let mut cpp_err: Option<anyhow::Error> = None;
     if let Some((bin, model)) = resolve_whisper_cpp() {
         match transcribe_with_whisper_cpp(file_path, bin, model).await {
             Ok(t) => return Ok(t),
             Err(e) => {
                 tracing::warn!("whisper-cli failed ({e:#}), falling back to Python whisper");
+                cpp_err = Some(e);
             }
         }
     }
 
-    // Fall back to Python whisper.
-    transcribe_with_python_whisper(file_path).await
+    // Fall back to Python whisper; if it also fails, surface both errors.
+    transcribe_with_python_whisper(file_path).await.map_err(|py_err| {
+        if let Some(cpp) = cpp_err {
+            anyhow::anyhow!("whisper-cli failed ({cpp:#}); Python whisper also failed: {py_err:#}")
+        } else {
+            py_err
+        }
+    })
 }
 
 /// Transcribe using whisper-cli (whisper.cpp). Converts CAF→WAV via ffmpeg first.
