@@ -148,8 +148,15 @@ Gợi ý: trong hội thoại agent, bề mặt tool `openclaw_migration` cho ph
 - `zeroclaw completions zsh`
 - `zeroclaw completions powershell`
 - `zeroclaw completions elvish`
+- `zeroclaw completions nushell`
 
 `completions` chỉ xuất ra stdout để script có thể được source trực tiếp mà không bị lẫn log/cảnh báo.
+
+Với nushell, lưu và source thủ công:
+```nushell
+zeroclaw completions nushell | save -f ~/.config/nushell/zeroclaw.nu
+# thêm vào ~/.config/nushell/config.nu: source ~/.config/nushell/zeroclaw.nu
+```
 
 ### `hardware`
 

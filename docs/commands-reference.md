@@ -321,8 +321,15 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 - `zeroclaw completions zsh`
 - `zeroclaw completions powershell`
 - `zeroclaw completions elvish`
+- `zeroclaw completions nushell`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
+
+For nushell, save and source the output explicitly:
+```nushell
+zeroclaw completions nushell | save -f ~/.config/nushell/zeroclaw.nu
+# add to ~/.config/nushell/config.nu: source ~/.config/nushell/zeroclaw.nu
+```
 
 ### `hardware`
 

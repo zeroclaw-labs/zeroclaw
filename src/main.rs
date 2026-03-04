@@ -118,6 +118,8 @@ enum CompletionShell {
     PowerShell,
     #[value(name = "elvish")]
     Elvish,
+    #[value(name = "nushell")]
+    Nushell,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -563,7 +565,8 @@ The script is printed to stdout so it can be sourced directly:
 Examples:
   source <(zeroclaw completions bash)
   zeroclaw completions zsh > ~/.zfunc/_zeroclaw
-  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+  zeroclaw completions nushell | save -f ~/.config/nushell/zeroclaw.nu  # then: source ~/.config/nushell/zeroclaw.nu")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -1583,7 +1586,12 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
         CompletionShell::PowerShell => {
             generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
         }
-        CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, writer),
+        CompletionShell::Elvish => {
+            generate(shells::Elvish, &mut cmd, bin_name.clone(), writer);
+        }
+        CompletionShell::Nushell => {
+            generate(clap_complete_nushell::Nushell, &mut cmd, bin_name, writer);
+        }
     }
 
     writer.flush()?;
@@ -2380,7 +2388,7 @@ mod tests {
 
     #[test]
     fn completions_cli_parses_supported_shells() {
-        for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
+        for shell in ["bash", "fish", "zsh", "powershell", "elvish", "nushell"] {
             let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
@@ -2438,6 +2446,23 @@ mod tests {
         assert!(
             script.contains("zeroclaw"),
             "completion script should reference binary name"
+        );
+    }
+
+    #[test]
+    fn nushell_completion_generates_valid_output() {
+        let mut output = Vec::new();
+        write_shell_completion(CompletionShell::Nushell, &mut output)
+            .expect("nushell completion generation should succeed");
+        let script =
+            String::from_utf8(output).expect("nushell completion output should be valid utf-8");
+        assert!(
+            script.contains("zeroclaw"),
+            "nushell completion script should reference binary name"
+        );
+        assert!(
+            !script.is_empty(),
+            "nushell completion output should not be empty"
         );
     }
 
