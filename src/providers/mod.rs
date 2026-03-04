@@ -1487,7 +1487,7 @@ fn create_provider_with_url_and_options(
             )?;
             let api_mode = options
                 .custom_provider_api_mode
-                .unwrap_or(CompatibleApiMode::OpenAiChatCompletions);
+                .unwrap_or(CompatibleApiMode::OpenaiChatCompletions);
             Ok(Box::new(OpenAiCompatibleProvider::new_custom_with_mode(
                 "Custom",
                 &base_url,
