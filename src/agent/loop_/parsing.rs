@@ -1625,6 +1625,20 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
         }
     }
 
+    // [Called tool `name` with: {args}] format — produced by convert_messages()
+    // in compatible.rs for history replay. Models that see this format in their
+    // conversation history sometimes echo it back instead of using <tool_call> tags.
+    if calls.is_empty() {
+        let (called_text, called_calls) = parse_called_tool_format(remaining);
+        if !called_calls.is_empty() {
+            calls = called_calls;
+            if !called_text.trim().is_empty() {
+                text_parts.push(called_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
@@ -1633,11 +1647,56 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
     // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
+    // 5. History-echo [Called tool `name` with: {args}] format
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
     if !remaining.trim().is_empty() {
         text_parts.push(remaining.trim().to_string());
+    }
+
+    (text_parts.join("\n"), calls)
+}
+
+/// Parse `[Called tool `name` with: {json_args}]` entries produced by
+/// `convert_messages()` in the compatible provider. Models echo this format
+/// when they see it in their conversation history.
+fn parse_called_tool_format(response: &str) -> (String, Vec<ParsedToolCall>) {
+    static CALLED_TOOL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)\[Called tool `([^`]+)` with:\s*(\{.+?\})\]").unwrap()
+    });
+
+    let mut calls = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut last_end = 0;
+
+    for cap in CALLED_TOOL_RE.captures_iter(response) {
+        let full_match = cap.get(0).unwrap();
+        let before = &response[last_end..full_match.start()];
+        if !before.trim().is_empty() {
+            text_parts.push(before.trim().to_string());
+        }
+
+        let name = cap[1].trim().to_string();
+        let raw_args = cap[2].trim();
+
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(raw_args) {
+            let arguments = normalize_tool_arguments(&name, args, None);
+            calls.push(ParsedToolCall {
+                name,
+                arguments,
+                tool_call_id: None,
+            });
+        } else {
+            text_parts.push(full_match.as_str().to_string());
+        }
+
+        last_end = full_match.end();
+    }
+
+    let after = &response[last_end..];
+    if !after.trim().is_empty() {
+        text_parts.push(after.trim().to_string());
     }
 
     (text_parts.join("\n"), calls)
@@ -1673,7 +1732,8 @@ pub(super) fn detect_tool_call_parse_issue(
         || trimmed.contains("```tool ") // Generic ```tool <name> pattern
         || trimmed.contains("\"tool_calls\"")
         || trimmed.contains("TOOL_CALL")
-        || trimmed.contains("<FunctionCall>");
+        || trimmed.contains("<FunctionCall>")
+        || trimmed.contains("[Called tool `");
 
     if looks_like_tool_payload {
         Some("response resembled a tool-call payload but no valid tool call could be parsed".into())

@@ -6922,4 +6922,62 @@ Let me check the result."#;
         assert!(completed.contains("✅ shell (2s)"));
         assert!(completed.contains("❌ web_search (1s)"));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // [Called tool ...] format parsing (history-echo recovery)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_called_tool_format_single_call() {
+        let input =
+            r#"[Called tool `shell` with: {"command":"npm exec -- capture-website-cli https://example.com --output=out.png"}]"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1, "should parse one tool call");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments["command"].as_str().unwrap(),
+            "npm exec -- capture-website-cli https://example.com --output=out.png"
+        );
+        assert!(text.is_empty(), "no surrounding text expected");
+    }
+
+    #[test]
+    fn parse_called_tool_format_multiple_calls() {
+        let input = r#"[Called tool `shell` with: {"command":"pwd"}]
+[Called tool `file_read` with: {"path":"/tmp/test.txt"}]"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 2, "should parse two tool calls");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "file_read");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_called_tool_format_with_surrounding_text() {
+        let input = r#"I'll run the command now.
+[Called tool `shell` with: {"command":"ls -la"}]
+Done."#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(text.contains("I'll run the command now."));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn parse_called_tool_format_invalid_json_ignored() {
+        let input = r#"[Called tool `shell` with: {broken json}]"#;
+        let (_text, calls) = parse_tool_calls(input);
+        assert!(calls.is_empty(), "invalid JSON should not produce a call");
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_called_tool_format() {
+        let input = r#"[Called tool `shell` with: {invalid}]"#;
+        let issue = detect_tool_call_parse_issue(input, &[]);
+        assert!(
+            issue.is_some(),
+            "[Called tool ...] with unparseable body should be flagged"
+        );
+    }
 }
