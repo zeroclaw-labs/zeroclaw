@@ -66,9 +66,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     strip /app/zeroclaw
 
 # Prepare runtime directory structure and default config inline (no extra stage)
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
-    cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF && \
-    chown -R 65534:65534 /zeroclaw-data
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace
+
+RUN cat > /zeroclaw-data/.zeroclaw/config.toml <<'EOF'
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = ""
@@ -81,6 +81,8 @@ port = 42617
 host = "127.0.0.1"
 allow_public_bind = false
 EOF
+
+RUN chown -R 65534:65534 /zeroclaw-data
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────
 FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
