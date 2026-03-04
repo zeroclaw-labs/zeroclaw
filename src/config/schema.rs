@@ -10024,6 +10024,7 @@ ws_url = "ws://127.0.0.1:3002"
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
             default_temperature: 0.5,
+            max_tokens: None,
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -10471,6 +10472,7 @@ tool_dispatcher = "xml"
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
             default_temperature: 0.9,
+            max_tokens: None,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
