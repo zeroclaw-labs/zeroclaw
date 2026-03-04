@@ -2840,6 +2840,36 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         run_cmd(["git", "tag", "-a", "v0.2.0", "-m", "v0.2.0"], cwd=repo)
         run_cmd(["git", "remote", "add", "origin", str(repo)], cwd=repo)
 
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                endpoint="${2:-}"
+                case "$endpoint" in
+                  repos/*/commits/*/check-runs)
+                    echo "success"
+                    ;;
+                  repos/*/actions/workflows/pub-release.yml/runs)
+                    echo "1"
+                    ;;
+                  *)
+                    echo "unexpected gh api endpoint: $endpoint" >&2
+                    exit 1
+                    ;;
+                esac
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
         out_json = self.tmp / "release-trigger-guard.json"
         out_md = self.tmp / "release-trigger-guard.md"
         proc = run_cmd(
@@ -2873,6 +2903,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                 "--fail-on-violation",
             ],
             cwd=repo,
+            env=env,
         )
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         report = json.loads(out_json.read_text(encoding="utf-8"))
