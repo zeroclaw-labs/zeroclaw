@@ -65,7 +65,7 @@ Usage: install-release.sh [--no-onboard]
 Installs the latest Linux ZeroClaw binary from official GitHub releases.
 
 Options:
-  --no-onboard   Install only; do not run `zeroclaw onboard`
+  --no-onboard   Install only; do not run onboarding
 
 Environment:
   ZEROCLAW_INSTALL_DIR  Override install directory
@@ -141,4 +141,9 @@ if [ "$NO_ONBOARD" -eq 1 ]; then
 fi
 
 echo "==> Starting onboarding"
+if [ -t 0 ] && [ -t 1 ]; then
+  exec "$BIN_PATH" onboard --interactive-ui
+fi
+
+echo "note: non-interactive shell detected; falling back to quick onboarding mode" >&2
 exec "$BIN_PATH" onboard

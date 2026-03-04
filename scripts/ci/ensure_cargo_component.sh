@@ -5,6 +5,8 @@ requested_toolchain="${1:-1.92.0}"
 fallback_toolchain="${2:-stable}"
 strict_mode_raw="${3:-${ENSURE_CARGO_COMPONENT_STRICT:-false}}"
 strict_mode="$(printf '%s' "${strict_mode_raw}" | tr '[:upper:]' '[:lower:]')"
+required_components_raw="${4:-${ENSURE_RUST_COMPONENTS:-auto}}"
+job_name="$(printf '%s' "${GITHUB_JOB:-}" | tr '[:upper:]' '[:lower:]')"
 
 is_truthy() {
     local value="${1:-}"
@@ -22,6 +24,81 @@ probe_cargo() {
 probe_rustc() {
     local toolchain="$1"
     rustup run "${toolchain}" rustc --version >/dev/null 2>&1
+}
+
+probe_rustfmt() {
+    local toolchain="$1"
+    rustup run "${toolchain}" cargo fmt --version >/dev/null 2>&1
+}
+
+component_available() {
+    local toolchain="$1"
+    local component="$2"
+    rustup component list --toolchain "${toolchain}" \
+        | grep -Eq "^${component}(-[[:alnum:]_:-]+)? "
+}
+
+component_installed() {
+    local toolchain="$1"
+    local component="$2"
+    rustup component list --toolchain "${toolchain}" --installed \
+        | grep -Eq "^${component}(-[[:alnum:]_:-]+)? \\(installed\\)$"
+}
+
+install_component_or_fail() {
+    local toolchain="$1"
+    local component="$2"
+
+    if ! component_available "${toolchain}" "${component}"; then
+        echo "::error::component '${component}' is unavailable for toolchain ${toolchain}."
+        return 1
+    fi
+    if ! rustup component add --toolchain "${toolchain}" "${component}"; then
+        echo "::error::failed to install required component '${component}' for ${toolchain}."
+        return 1
+    fi
+}
+
+probe_rustdoc() {
+    local toolchain="$1"
+    component_installed "${toolchain}" "rust-docs"
+}
+
+ensure_required_tooling() {
+    local toolchain="$1"
+    local required_components="${2:-}"
+
+    if [ -z "${required_components}" ]; then
+        return 0
+    fi
+
+    for component in ${required_components}; do
+        install_component_or_fail "${toolchain}" "${component}" || return 1
+    done
+
+    if [[ " ${required_components} " == *" rustfmt "* ]] && ! probe_rustfmt "${toolchain}"; then
+        echo "::error::rustfmt is unavailable for toolchain ${toolchain}."
+        install_component_or_fail "${toolchain}" "rustfmt" || return 1
+        if ! probe_rustfmt "${toolchain}"; then
+            return 1
+        fi
+    fi
+
+    if [[ " ${required_components} " == *" rust-docs "* ]] && ! probe_rustdoc "${toolchain}"; then
+        echo "::error::rustdoc is unavailable for toolchain ${toolchain}."
+        install_component_or_fail "${toolchain}" "rust-docs" || return 1
+        if ! probe_rustdoc "${toolchain}"; then
+            return 1
+        fi
+    fi
+}
+
+default_required_components() {
+    local normalized_job_name="${1:-}"
+    local components=()
+    [[ "${normalized_job_name}" == *lint* ]] && components+=("rustfmt")
+    [[ "${normalized_job_name}" == *test* ]] && components+=("rust-docs")
+    echo "${components[*]}"
 }
 
 export_toolchain_for_next_steps() {
@@ -93,6 +170,21 @@ fi
 
 if is_truthy "${strict_mode}" && [ "${selected_toolchain}" != "${requested_toolchain}" ]; then
     echo "::error::Strict mode enabled; refusing fallback toolchain ${selected_toolchain} (requested ${requested_toolchain})." >&2
+    exit 1
+fi
+
+required_components="${required_components_raw}"
+if [ "${required_components}" = "auto" ]; then
+    required_components="$(default_required_components "${job_name}")"
+fi
+
+if [ -n "${required_components}" ]; then
+    echo "Ensuring Rust components for job '${job_name:-unknown}': ${required_components}"
+fi
+
+if ! ensure_required_tooling "${selected_toolchain}" "${required_components}"; then
+    echo "Required Rust tooling unavailable for ${selected_toolchain}" >&2
+    rustup toolchain list || true
     exit 1
 fi
 

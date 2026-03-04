@@ -317,22 +317,26 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
-        let has_full_endpoint = reqwest::Url::parse(&self.base_url)
-            .map(|url| {
-                url.path()
-                    .trim_end_matches('/')
-                    .ends_with("/chat/completions")
-            })
-            .unwrap_or_else(|_| {
-                self.base_url
-                    .trim_end_matches('/')
-                    .ends_with("/chat/completions")
-            });
+        if let Ok(mut url) = reqwest::Url::parse(&self.base_url) {
+            let path = url.path().trim_end_matches('/').to_string();
+            if path.ends_with("/chat/completions") {
+                return url.to_string();
+            }
 
-        if has_full_endpoint {
-            self.base_url.clone()
+            let target_path = if path.is_empty() || path == "/" {
+                "/chat/completions".to_string()
+            } else {
+                format!("{path}/chat/completions")
+            };
+            url.set_path(&target_path);
+            return url.to_string();
+        }
+
+        let normalized = self.base_url.trim_end_matches('/');
+        if normalized.ends_with("/chat/completions") {
+            normalized.to_string()
         } else {
-            format!("{}/chat/completions", self.base_url)
+            format!("{normalized}/chat/completions")
         }
     }
 
@@ -355,19 +359,32 @@ impl OpenAiCompatibleProvider {
 
     /// Build the full URL for responses API, detecting if base_url already includes the path.
     fn responses_url(&self) -> String {
+        if let Ok(mut url) = reqwest::Url::parse(&self.base_url) {
+            let path = url.path().trim_end_matches('/').to_string();
+            let target_path = if path.ends_with("/responses") {
+                return url.to_string();
+            } else if let Some(prefix) = path.strip_suffix("/chat/completions") {
+                format!("{prefix}/responses")
+            } else if !path.is_empty() && path != "/" {
+                format!("{path}/responses")
+            } else {
+                "/v1/responses".to_string()
+            };
+
+            url.set_path(&target_path);
+            return url.to_string();
+        }
+
         if self.path_ends_with("/responses") {
             return self.base_url.clone();
         }
 
         let normalized_base = self.base_url.trim_end_matches('/');
 
-        // If chat endpoint is explicitly configured, derive sibling responses endpoint.
         if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
             return format!("{prefix}/responses");
         }
 
-        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
-        // append responses directly to avoid duplicate /v1 segments.
         if self.has_explicit_api_path() {
             format!("{normalized_base}/responses")
         } else {
@@ -3319,6 +3336,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_url_preserves_query_params_for_full_endpoint() {
+        let p = make_provider(
+            "custom",
+            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_appends_path_before_existing_query_params() {
+        let p = make_provider(
+            "custom",
+            "https://resource.openai.azure.com/openai/deployments/my-model?api-version=2024-02-01",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+        );
+    }
+
+    #[test]
     fn chat_completions_url_requires_exact_suffix_match() {
         let p = make_provider(
             "custom",
@@ -3362,6 +3405,19 @@ mod tests {
         assert_eq!(
             p.responses_url(),
             "https://my-api.example.com/api/v2/responses-proxy/responses"
+        );
+    }
+
+    #[test]
+    fn responses_url_preserves_query_params_from_chat_endpoint() {
+        let p = make_provider(
+            "custom",
+            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01",
+            None,
+        );
+        assert_eq!(
+            p.responses_url(),
+            "https://resource.openai.azure.com/openai/deployments/my-model/responses?api-version=2024-02-01"
         );
     }
 
