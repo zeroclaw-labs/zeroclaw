@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -138,6 +138,8 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
@@ -417,6 +419,10 @@ impl AnthropicProvider {
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let raw_stop_reason = response.stop_reason.clone();
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_anthropic_stop_reason);
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -460,6 +466,8 @@ impl AnthropicProvider {
             usage,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 

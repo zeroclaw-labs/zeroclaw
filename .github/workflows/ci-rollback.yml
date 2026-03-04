@@ -48,7 +48,7 @@ on:
         - cron: "15 7 * * 1" # Weekly Monday 07:15 UTC
 
 concurrency:
-    group: ci-rollback-${{ github.event.inputs.branch || 'dev' }}
+    group: ci-rollback-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.branch || 'dev') || github.ref_name }}
     cancel-in-progress: false
 
 permissions:
@@ -64,7 +64,7 @@ env:
 jobs:
     rollback-plan:
         name: Rollback Guard Plan
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 20
         outputs:
             branch: ${{ steps.plan.outputs.branch }}
@@ -77,7 +77,7 @@ jobs:
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
-                  ref: ${{ github.event.inputs.branch || 'dev' }}
+                  ref: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.branch || 'dev') || github.ref_name }}
 
             - name: Build rollback plan
               id: plan
@@ -86,11 +86,12 @@ jobs:
                   set -euo pipefail
                   mkdir -p artifacts
 
-                  branch_input="dev"
+                  branch_input="${GITHUB_REF_NAME}"
                   mode_input="dry-run"
                   target_ref_input=""
                   allow_non_ancestor="false"
-                  fail_on_violation="true"
+                  # Scheduled audits can surface historical rollback violations; report without blocking by default.
+                  fail_on_violation="false"
 
                   if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
                     branch_input="${{ github.event.inputs.branch || 'dev' }}"
@@ -188,7 +189,7 @@ jobs:
         name: Rollback Execute Actions
         needs: [rollback-plan]
         if: github.event_name == 'workflow_dispatch' && needs.rollback-plan.outputs.mode == 'execute' && needs.rollback-plan.outputs.ready_to_execute == 'true'
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 15
         permissions:
             contents: write

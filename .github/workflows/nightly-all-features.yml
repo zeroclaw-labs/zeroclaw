@@ -27,7 +27,7 @@ env:
 jobs:
     nightly-lanes:
         name: Nightly Lane (${{ matrix.name }})
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 70
         strategy:
             fail-fast: false
@@ -53,6 +53,11 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+            - name: Ensure cargo component
+              shell: bash
+              env:
+                  ENSURE_CARGO_COMPONENT_STRICT: "true"
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
 
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
@@ -137,7 +142,7 @@ jobs:
         name: Nightly Summary & Routing
         needs: [nightly-lanes]
         if: always()
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

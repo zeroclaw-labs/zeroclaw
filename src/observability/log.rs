@@ -44,6 +44,18 @@ impl Observer for LogObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 info!(channel = %channel, direction = %direction, "channel.message");
             }
+            ObserverEvent::WebhookAuthFailure {
+                channel,
+                signature,
+                bearer,
+            } => {
+                info!(
+                    channel = %channel,
+                    signature = %signature,
+                    bearer = %bearer,
+                    "webhook.auth.failure"
+                );
+            }
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
             }
@@ -170,6 +182,11 @@ mod tests {
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "outbound".into(),
+        });
+        obs.record_event(&ObserverEvent::WebhookAuthFailure {
+            channel: "wati".into(),
+            signature: "invalid".into(),
+            bearer: "missing".into(),
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {

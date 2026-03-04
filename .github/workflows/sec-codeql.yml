@@ -8,8 +8,11 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
             - ".github/codeql/**"
             - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
     pull_request:
         branches: [dev, main]
@@ -18,8 +21,11 @@ on:
             - "Cargo.lock"
             - "src/**"
             - "crates/**"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
             - ".github/codeql/**"
             - "scripts/ci/self_heal_rust_toolchain.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
     merge_group:
         branches: [dev, main]
@@ -43,15 +49,45 @@ env:
 
 
 jobs:
+    select-runner:
+        name: Select CodeQL Runner Lane
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        outputs:
+            labels: ${{ steps.lane.outputs.labels }}
+            lane: ${{ steps.lane.outputs.lane }}
+        steps:
+            - name: Resolve branch lane
+              id: lane
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+                  if [[ "$branch" == release/* ]]; then
+                    echo 'labels=["self-hosted","Linux","X64","hetzner","codeql"]' >> "$GITHUB_OUTPUT"
+                    echo 'lane=release' >> "$GITHUB_OUTPUT"
+                  else
+                    echo 'labels=["self-hosted","Linux","X64","hetzner","codeql","codeql-general"]' >> "$GITHUB_OUTPUT"
+                    echo 'lane=general' >> "$GITHUB_OUTPUT"
+                  fi
+
     codeql:
         name: CodeQL Analysis
-        runs-on: ubuntu-22.04
+        needs: [select-runner]
+        runs-on: ${{ fromJSON(needs.select-runner.outputs.labels) }}
         timeout-minutes: 120
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
 
             - name: Initialize CodeQL
               uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
@@ -69,6 +105,18 @@ jobs:
               with:
                   toolchain: 1.92.0
 
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: sec-codeql-build
+                  cache-targets: true
+                  cache-bin: false
+
             - name: Build
               run: cargo build --workspace --all-targets --locked
 
@@ -76,3 +124,14 @@ jobs:
               uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
               with:
                   category: "/language:rust"
+
+            - name: Summarize lane
+              if: always()
+              shell: bash
+              run: |
+                  {
+                    echo "### CodeQL Runner Lane"
+                    echo "- Branch: \`${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}\`"
+                    echo "- Lane: \`${{ needs.select-runner.outputs.lane }}\`"
+                    echo "- Labels: \`${{ needs.select-runner.outputs.labels }}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"

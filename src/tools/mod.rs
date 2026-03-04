@@ -15,6 +15,8 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agent_load_tracker;
+pub mod agent_selection;
 pub mod agents_ipc;
 pub mod apply_patch;
 pub mod auth_profile;
@@ -59,6 +61,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod openclaw_migration;
+pub mod orchestration_settings;
 pub mod pdf_read;
 pub mod pptx_read;
 pub mod process;
@@ -84,6 +87,7 @@ pub mod web_search_config;
 pub mod web_search_tool;
 pub mod xlsx_read;
 
+pub use agent_load_tracker::AgentLoadTracker;
 pub use apply_patch::ApplyPatchTool;
 #[allow(unused_imports)]
 pub use bg_run::{
@@ -195,6 +199,90 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrimaryAgentToolFilterReport {
+    /// `agent.allowed_tools` entries that did not match any registered tool name.
+    pub unmatched_allowed_tools: Vec<String>,
+    /// Number of tools kept after applying `agent.allowed_tools` and before denylist removal.
+    pub allowlist_match_count: usize,
+}
+
+fn matches_tool_rule(rule: &str, tool_name: &str) -> bool {
+    rule == "*" || rule.eq_ignore_ascii_case(tool_name)
+}
+
+/// Filter the primary-agent tool registry based on `[agent]` allow/deny settings.
+///
+/// Filtering is done at startup so excluded tools never enter model context.
+pub fn filter_primary_agent_tools(
+    tools: Vec<Box<dyn Tool>>,
+    allowed_tools: &[String],
+    denied_tools: &[String],
+) -> (Vec<Box<dyn Tool>>, PrimaryAgentToolFilterReport) {
+    let normalized_allowed: Vec<String> = allowed_tools
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let normalized_denied: Vec<String> = denied_tools
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let use_allowlist = !normalized_allowed.is_empty();
+    let tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
+
+    let unmatched_allowed_tools = if use_allowlist {
+        normalized_allowed
+            .iter()
+            .filter(|allowed| {
+                !tool_names
+                    .iter()
+                    .any(|tool_name| matches_tool_rule(allowed.as_str(), tool_name))
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut allowlist_match_count = 0usize;
+    let mut filtered = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let tool_name = tool.name();
+
+        if use_allowlist
+            && !normalized_allowed
+                .iter()
+                .any(|rule| matches_tool_rule(rule.as_str(), tool_name))
+        {
+            continue;
+        }
+        if use_allowlist {
+            allowlist_match_count += 1;
+        }
+
+        if normalized_denied
+            .iter()
+            .any(|rule| matches_tool_rule(rule.as_str(), tool_name))
+        {
+            continue;
+        }
+        filtered.push(tool);
+    }
+
+    (
+        filtered,
+        PrimaryAgentToolFilterReport {
+            unmatched_allowed_tools,
+            allowlist_match_count,
+        },
+    )
 }
 
 /// Add background tool execution capabilities to a tool registry
@@ -533,10 +621,11 @@ pub fn all_tools_with_runtime(
 
     // Add delegation and sub-agent orchestration tools when agents are configured
     if !agents.is_empty() {
-        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+        let all_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
+        let delegate_agents = all_agents.clone();
         let delegate_fallback_credential = fallback_api_key.and_then(|value| {
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
@@ -555,10 +644,13 @@ pub fn all_tools_with_runtime(
             custom_provider_api_mode: root_config
                 .provider_api
                 .map(|mode| mode.as_compatible_mode()),
+            custom_provider_auth_header: root_config.effective_custom_provider_auth_header(),
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };
+        let runtime_config_path = Some(root_config.config_path.clone());
         let parent_tools = Arc::new(tool_arcs.clone());
+        let load_tracker = AgentLoadTracker::new();
         let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents.clone(),
             delegate_fallback_credential.clone(),
@@ -566,7 +658,14 @@ pub fn all_tools_with_runtime(
             provider_runtime_options.clone(),
         )
         .with_parent_tools(parent_tools.clone())
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_load_tracker(load_tracker.clone())
+        .with_runtime_team_settings(
+            root_config.agent.teams.enabled,
+            root_config.agent.teams.auto_activate,
+            root_config.agent.teams.max_agents,
+            runtime_config_path.clone(),
+        );
 
         if root_config.coordination.enabled {
             let coordination_lead_agent = {
@@ -592,7 +691,7 @@ pub fn all_tools_with_runtime(
                     "delegate coordination: failed to register lead agent '{coordination_lead_agent}': {error}"
                 );
             }
-            for agent_name in agents.keys() {
+            for agent_name in delegate_agents.keys() {
                 if let Err(error) = coordination_bus.register_agent(agent_name.clone()) {
                     tracing::warn!(
                         "delegate coordination: failed to register agent '{agent_name}': {error}"
@@ -613,15 +712,22 @@ pub fn all_tools_with_runtime(
         }
 
         let subagent_registry = Arc::new(SubAgentRegistry::new());
-        tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
-            delegate_agents,
-            delegate_fallback_credential,
-            security.clone(),
-            provider_runtime_options,
-            subagent_registry.clone(),
-            parent_tools,
-            root_config.multimodal.clone(),
-        )));
+        tool_arcs.push(Arc::new(
+            SubAgentSpawnTool::new(
+                all_agents,
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+                subagent_registry.clone(),
+                parent_tools,
+                root_config.multimodal.clone(),
+                root_config.agent.subagents.enabled,
+                root_config.agent.subagents.max_concurrent,
+                root_config.agent.subagents.auto_activate,
+                runtime_config_path,
+            )
+            .with_load_tracker(load_tracker),
+        ));
         tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
         tool_arcs.push(Arc::new(SubAgentManageTool::new(
             subagent_registry,
@@ -688,6 +794,7 @@ mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig, WasmRuntimeConfig};
     use crate::runtime::WasmRuntime;
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -696,6 +803,96 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         }
+    }
+
+    struct DummyTool {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "dummy"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn sample_tools() -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(DummyTool { name: "shell" }),
+            Box::new(DummyTool { name: "file_read" }),
+            Box::new(DummyTool {
+                name: "browser_open",
+            }),
+        ]
+    }
+
+    fn names(tools: &[Box<dyn Tool>]) -> Vec<String> {
+        tools.iter().map(|tool| tool.name().to_string()).collect()
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_keeps_full_registry_when_allowlist_empty() {
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &[], &[]);
+        assert_eq!(names(&filtered), vec!["shell", "file_read", "browser_open"]);
+        assert_eq!(report.allowlist_match_count, 0);
+        assert!(report.unmatched_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_applies_allowlist() {
+        let allow = vec!["file_read".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &[]);
+        assert_eq!(names(&filtered), vec!["file_read"]);
+        assert_eq!(report.allowlist_match_count, 1);
+        assert!(report.unmatched_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_reports_unmatched_allow_entries() {
+        let allow = vec!["missing_tool".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &[]);
+        assert!(filtered.is_empty());
+        assert_eq!(report.allowlist_match_count, 0);
+        assert_eq!(report.unmatched_allowed_tools, vec!["missing_tool"]);
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_applies_denylist_after_allowlist() {
+        let allow = vec!["shell".to_string(), "file_read".to_string()];
+        let deny = vec!["shell".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &deny);
+        assert_eq!(names(&filtered), vec!["file_read"]);
+        assert_eq!(report.allowlist_match_count, 2);
+        assert!(report.unmatched_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_supports_star_rule() {
+        let allow = vec!["*".to_string()];
+        let deny = vec!["browser_open".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &deny);
+        assert_eq!(names(&filtered), vec!["shell", "file_read"]);
+        assert_eq!(report.allowlist_match_count, 3);
+        assert!(report.unmatched_allowed_tools.is_empty());
     }
 
     #[test]
@@ -1058,6 +1255,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1143,6 +1343,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1168,5 +1371,117 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
         assert!(!names.contains(&"delegate_coordination_status"));
+    }
+
+    #[test]
+    fn all_tools_keeps_delegate_registered_when_team_toggle_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.agent.teams.enabled = false;
+        cfg.agent.subagents.enabled = true;
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &agents,
+            Some("delegate-test-credential"),
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"subagent_spawn"));
+    }
+
+    #[test]
+    fn all_tools_keeps_subagent_tools_registered_when_toggle_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.agent.teams.enabled = true;
+        cfg.agent.subagents.enabled = false;
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &agents,
+            Some("delegate-test-credential"),
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"subagent_spawn"));
+        assert!(names.contains(&"subagent_list"));
+        assert!(names.contains(&"subagent_manage"));
     }
 }

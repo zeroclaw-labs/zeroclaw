@@ -113,14 +113,14 @@ Use when only part of the system should use proxy (for example specific provider
 ### 5.1 Target specific services
 
 ```json
-{"action":"set","enabled":true,"scope":"services","services":["provider.openai","tool.http_request","channel.telegram"],"all_proxy":"socks5h://127.0.0.1:1080","no_proxy":["localhost","127.0.0.1",".internal"]}
+{"action":"set","enabled":true,"scope":"services","services":["provider.openai","tool.multimodal","tool.http_request","channel.telegram"],"all_proxy":"socks5h://127.0.0.1:1080","no_proxy":["localhost","127.0.0.1",".internal"]}
 {"action":"get"}
 ```
 
 ### 5.2 Target by selectors
 
 ```json
-{"action":"set","enabled":true,"scope":"services","services":["provider.*","tool.*"],"http_proxy":"http://127.0.0.1:7890"}
+{"action":"set","enabled":true,"scope":"services","services":["provider.*","tool.*","channel.qq"],"http_proxy":"http://127.0.0.1:7890"}
 {"action":"get"}
 ```
 

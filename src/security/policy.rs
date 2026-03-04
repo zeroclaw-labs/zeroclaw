@@ -53,6 +53,7 @@ pub enum ToolOperation {
 pub enum CommandContextRuleAction {
     Allow,
     Deny,
+    RequireApproval,
 }
 
 /// Context-aware allow/deny rule for shell commands.
@@ -601,11 +602,13 @@ enum SegmentRuleDecision {
 struct SegmentRuleOutcome {
     decision: SegmentRuleDecision,
     allow_high_risk: bool,
+    requires_approval: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct CommandAllowlistEvaluation {
     high_risk_overridden: bool,
+    requires_explicit_approval: bool,
 }
 
 fn is_high_risk_base_command(base: &str) -> bool {
@@ -643,20 +646,22 @@ fn is_high_risk_base_command(base: &str) -> bool {
 }
 
 impl SecurityPolicy {
-    fn path_matches_rule_prefix(&self, candidate: &str, prefix: &str) -> bool {
-        let candidate_path = expand_user_path(candidate);
-        let prefix_path = expand_user_path(prefix);
+    /// Resolve a user-supplied path argument using the same semantics as
+    /// `is_path_allowed` (including `~` expansion).
+    ///
+    /// Absolute inputs remain absolute; relative inputs are workspace-relative.
+    pub fn resolve_user_supplied_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
+    }
 
-        let normalized_candidate = if candidate_path.is_absolute() {
-            candidate_path
-        } else {
-            self.workspace_dir.join(candidate_path)
-        };
-        let normalized_prefix = if prefix_path.is_absolute() {
-            prefix_path
-        } else {
-            self.workspace_dir.join(prefix_path)
-        };
+    fn path_matches_rule_prefix(&self, candidate: &str, prefix: &str) -> bool {
+        let normalized_candidate = self.resolve_user_supplied_path(candidate);
+        let normalized_prefix = self.resolve_user_supplied_path(prefix);
 
         normalized_candidate.starts_with(&normalized_prefix)
     }
@@ -784,7 +789,7 @@ impl SecurityPolicy {
                     .any(|prefix| self.path_matches_rule_prefix(path, prefix))
             });
             match rule.action {
-                CommandContextRuleAction::Allow => {
+                CommandContextRuleAction::Allow | CommandContextRuleAction::RequireApproval => {
                     if has_denied_path {
                         return false;
                     }
@@ -809,6 +814,7 @@ impl SecurityPolicy {
         let mut has_allow_rules = false;
         let mut allow_match = false;
         let mut allow_high_risk = false;
+        let mut requires_approval = false;
 
         for rule in &self.command_context_rules {
             if !is_allowlist_entry_match(&rule.command, executable, base_cmd) {
@@ -828,11 +834,15 @@ impl SecurityPolicy {
                     return SegmentRuleOutcome {
                         decision: SegmentRuleDecision::Deny,
                         allow_high_risk: false,
+                        requires_approval: false,
                     };
                 }
                 CommandContextRuleAction::Allow => {
                     allow_match = true;
                     allow_high_risk |= rule.allow_high_risk;
+                }
+                CommandContextRuleAction::RequireApproval => {
+                    requires_approval = true;
                 }
             }
         }
@@ -842,17 +852,20 @@ impl SecurityPolicy {
                 SegmentRuleOutcome {
                     decision: SegmentRuleDecision::Allow,
                     allow_high_risk,
+                    requires_approval,
                 }
             } else {
                 SegmentRuleOutcome {
                     decision: SegmentRuleDecision::Deny,
                     allow_high_risk: false,
+                    requires_approval: false,
                 }
             }
         } else {
             SegmentRuleOutcome {
                 decision: SegmentRuleDecision::NoMatch,
                 allow_high_risk: false,
+                requires_approval,
             }
         }
     }
@@ -892,6 +905,7 @@ impl SecurityPolicy {
         let mut has_cmd = false;
         let mut saw_high_risk_segment = false;
         let mut all_high_risk_segments_overridden = true;
+        let mut requires_explicit_approval = false;
 
         for segment in &segments {
             let cmd_part = skip_env_assignments(segment);
@@ -912,6 +926,7 @@ impl SecurityPolicy {
             if context_outcome.decision == SegmentRuleDecision::Deny {
                 return Err(format!("context rule denied command segment `{base_cmd}`"));
             }
+            requires_explicit_approval |= context_outcome.requires_approval;
 
             if context_outcome.decision != SegmentRuleDecision::Allow
                 && !self
@@ -947,6 +962,7 @@ impl SecurityPolicy {
 
         Ok(CommandAllowlistEvaluation {
             high_risk_overridden: saw_high_risk_segment && all_high_risk_segments_overridden,
+            requires_explicit_approval,
         })
     }
 
@@ -1036,7 +1052,9 @@ impl SecurityPolicy {
     // Validation follows a strict precedence order:
     //   1. Allowlist check (is the base command permitted at all?)
     //   2. Risk classification (high / medium / low)
-    //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
+    //   3. Policy flags and context approval rules
+    //      (block_high_risk_commands, require_approval_for_medium_risk,
+    //       command_context_rules[action=require_approval])
     //   4. Autonomy level × approval status (supervised requires explicit approval)
     // This ordering ensures deny-by-default: unknown commands are rejected
     // before any risk or autonomy logic runs.
@@ -1074,6 +1092,16 @@ impl SecurityPolicy {
                         .into(),
                 );
             }
+        }
+
+        if self.autonomy == AutonomyLevel::Supervised
+            && allowlist_eval.requires_explicit_approval
+            && !approved
+        {
+            return Err(
+                "Command requires explicit approval (approved=true): matched command_context_rules action=require_approval"
+                    .into(),
+            );
         }
 
         if risk == CommandRiskLevel::Medium
@@ -1538,6 +1566,9 @@ impl SecurityPolicy {
                         crate::config::CommandContextRuleAction::Deny => {
                             CommandContextRuleAction::Deny
                         }
+                        crate::config::CommandContextRuleAction::RequireApproval => {
+                            CommandContextRuleAction::RequireApproval
+                        }
                     },
                     allowed_domains: rule.allowed_domains.clone(),
                     allowed_path_prefixes: rule.allowed_path_prefixes.clone(),
@@ -1865,6 +1896,58 @@ mod tests {
     }
 
     #[test]
+    fn context_require_approval_rule_demands_approval_for_matching_low_risk_command() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: false,
+            allowed_commands: vec!["ls".into()],
+            command_context_rules: vec![CommandContextRule {
+                command: "ls".into(),
+                action: CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        let denied = p.validate_command_execution("ls -la", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("requires explicit approval"));
+
+        let allowed = p.validate_command_execution("ls -la", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::Low);
+    }
+
+    #[test]
+    fn context_require_approval_rule_is_still_constrained_by_domains() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            block_high_risk_commands: false,
+            allowed_commands: vec!["curl".into()],
+            command_context_rules: vec![CommandContextRule {
+                command: "curl".into(),
+                action: CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec!["api.example.com".into()],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        // Non-matching domain does not trigger the context approval rule.
+        let unmatched = p.validate_command_execution("curl https://other.example.com/health", true);
+        assert_eq!(unmatched.unwrap(), CommandRiskLevel::High);
+
+        // Matching domain triggers explicit approval requirement.
+        let denied = p.validate_command_execution("curl https://api.example.com/v1/health", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("requires explicit approval"));
+    }
+
+    #[test]
     fn command_risk_low_for_read_commands() {
         let p = default_policy();
         assert_eq!(p.command_risk_level("git status"), CommandRiskLevel::Low);
@@ -2012,6 +2095,29 @@ mod tests {
         assert!(p.is_path_allowed(".env"));
     }
 
+    #[test]
+    fn resolve_user_supplied_path_joins_workspace_for_relative_inputs() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_resolve_user_path_relative");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            p.resolve_user_supplied_path("src/main.rs"),
+            workspace.join("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_user_supplied_path_expands_home_tilde() {
+        let p = default_policy();
+        let expected = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join("notes/todo.txt");
+        assert_eq!(p.resolve_user_supplied_path("~/notes/todo.txt"), expected);
+    }
+
     // ── from_config ─────────────────────────────────────────
 
     #[test]
@@ -2064,6 +2170,29 @@ mod tests {
 
         assert_eq!(policy.allowed_roots[0], expected_home_root);
         assert_eq!(policy.allowed_roots[1], workspace.join("shared-data"));
+    }
+
+    #[test]
+    fn from_config_maps_command_rule_require_approval_action() {
+        let autonomy_config = crate::config::AutonomyConfig {
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".into(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        assert_eq!(policy.command_context_rules.len(), 1);
+        assert!(matches!(
+            policy.command_context_rules[0].action,
+            CommandContextRuleAction::RequireApproval
+        ));
     }
 
     #[test]
