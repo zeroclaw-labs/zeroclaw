@@ -27,8 +27,7 @@ impl std::fmt::Debug for MemoryEntry {
 }
 
 /// Memory categories for organization
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryCategory {
     /// Long-term facts, preferences, decisions
     Core,
@@ -54,6 +53,18 @@ impl std::fmt::Display for MemoryCategory {
 impl serde::Serialize for MemoryCategory {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MemoryCategory {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Ok(match raw.as_str() {
+            "core" => Self::Core,
+            "daily" => Self::Daily,
+            "conversation" => Self::Conversation,
+            other => Self::Custom(other.to_string()),
+        })
     }
 }
 
@@ -137,6 +148,17 @@ mod tests {
         assert_eq!(core, "\"core\"");
         assert_eq!(daily, "\"daily\"");
         assert_eq!(conversation, "\"conversation\"");
+    }
+
+    #[test]
+    fn memory_category_custom_roundtrip_uses_plain_string() {
+        let custom = MemoryCategory::Custom("user_category".into());
+
+        let json = serde_json::to_string(&custom).unwrap();
+        let parsed: MemoryCategory = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(json, "\"user_category\"");
+        assert_eq!(parsed, custom);
     }
 
     #[test]
