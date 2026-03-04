@@ -24,6 +24,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod health;
+pub mod lmstudio;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -991,6 +992,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "lmstudio" | "lm-studio" => vec!["LMSTUDIO_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1418,15 +1420,14 @@ fn create_provider_with_url_and_options(
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "cursor" => Ok(Box::new(cursor::CursorProvider::new())),
         "lmstudio" | "lm-studio" => {
-            let lm_studio_key = key
+            let base_url = api_url
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .unwrap_or("lm-studio");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "LM Studio",
-                "http://localhost:1234/v1",
-                Some(lm_studio_key),
-                AuthStyle::Bearer,
+                .unwrap_or("http://localhost:1234");
+            let lm_key = key.map(str::trim).filter(|value| !value.is_empty());
+            Ok(Box::new(lmstudio::LmStudioProvider::new(
+                Some(base_url),
+                lm_key,
             )))
         }
         "llamacpp" | "llama.cpp" => {
