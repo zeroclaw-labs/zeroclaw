@@ -67,6 +67,15 @@ impl ProcessTool {
         }
     }
 
+    fn prune_exited_processes(&self) {
+        if let Ok(mut processes) = self.processes.write() {
+            processes.retain(|_, entry| match entry.child.lock() {
+                Ok(mut child) => matches!(child.try_wait(), Ok(None)),
+                Err(_) => false,
+            });
+        }
+    }
+
     fn handle_spawn(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         if !self.runtime.supports_long_running() {
             return Ok(ToolResult {
@@ -81,18 +90,12 @@ impl ProcessTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter for spawn action"))?;
 
+        self.prune_exited_processes();
+
         // Check concurrent running process count.
         {
             let processes = self.processes.read().unwrap();
-            let running = processes
-                .values()
-                .filter(|e| {
-                    e.child
-                        .lock()
-                        .map(|mut c| matches!(c.try_wait(), Ok(None)))
-                        .unwrap_or(false)
-                })
-                .count();
+            let running = processes.len();
             if running >= MAX_PROCESSES {
                 return Ok(ToolResult {
                     success: false,
@@ -179,7 +182,17 @@ impl ProcessTool {
             }
         };
 
-        let pid = child.id().unwrap_or(0);
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                let _ = child.start_kill();
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Failed to capture process PID".to_string()),
+                });
+            }
+        };
 
         // Set up background output readers.
         let stdout_buf = Arc::new(Mutex::new(OutputBuffer::default()));
@@ -235,6 +248,8 @@ impl ProcessTool {
                 error: Some(e),
             });
         }
+
+        self.prune_exited_processes();
 
         let processes = self.processes.read().unwrap();
         let mut entries = Vec::new();
@@ -346,10 +361,10 @@ impl ProcessTool {
 
         let id = parse_id(args, "kill")?;
 
-        let pid = {
-            let processes = self.processes.read().unwrap();
-            match processes.get(&id) {
-                Some(entry) => entry.pid,
+        let entry = {
+            let mut processes = self.processes.write().unwrap();
+            match processes.remove(&id) {
+                Some(entry) => entry,
                 None => {
                     return Ok(ToolResult {
                         success: false,
@@ -359,31 +374,55 @@ impl ProcessTool {
                 }
             }
         };
+        let pid = entry.pid;
 
-        // Send SIGTERM via kill command.
-        let kill_result = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
+        enum KillOutcome {
+            Signaled,
+            AlreadyExited(i32),
+            Failed(String),
+        }
 
-        match kill_result {
-            Ok(output) if output.status.success() => Ok(ToolResult {
+        let outcome = {
+            let mut child = match entry.child.lock() {
+                Ok(child) => child,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to access process state for {id}")),
+                    });
+                }
+            };
+
+            match child.try_wait() {
+                Ok(Some(status)) => KillOutcome::AlreadyExited(status.code().unwrap_or(-1)),
+                Ok(None) => match child.start_kill() {
+                    Ok(()) => KillOutcome::Signaled,
+                    Err(e) => KillOutcome::Failed(format!("Failed to signal process {id}: {e}")),
+                },
+                Err(e) => KillOutcome::Failed(format!("Failed to inspect process {id}: {e}")),
+            }
+        };
+
+        match outcome {
+            KillOutcome::Signaled => Ok(ToolResult {
                 success: true,
-                output: format!("Sent SIGTERM to process {id} (pid {pid})"),
+                output: format!("Sent termination signal to process {id} (pid {pid})"),
                 error: None,
             }),
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            KillOutcome::AlreadyExited(code) => Ok(ToolResult {
+                success: true,
+                output: format!("Process {id} already exited ({code})"),
+                error: None,
+            }),
+            KillOutcome::Failed(reason) => {
+                self.processes.write().unwrap().insert(id, entry);
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to kill process {id} (pid {pid}): {stderr}")),
+                    error: Some(reason),
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute kill command: {e}")),
-            }),
         }
     }
 }
@@ -420,7 +459,7 @@ fn spawn_reader_task<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     buf: Arc<Mutex<OutputBuffer>>,
 ) {
     tokio::spawn(async move {
-        let mut chunk = vec![0u8; 8192];
+        let mut chunk = vec![0_u8; 8192];
         loop {
             match reader.read(&mut chunk).await {
                 Ok(n) if n > 0 => {
