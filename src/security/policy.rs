@@ -571,6 +571,7 @@ fn looks_like_path(candidate: &str) -> bool {
 /// Returns true for:
 /// - `C:relative` (drive-relative)
 /// - `c:path\to\file` (lowercase drive)
+///
 /// Returns false for:
 /// - `C:\absolute` (drive-absolute, handled by has_root())
 /// - `C:/unix/style` (forward slash style)
