@@ -212,6 +212,19 @@ impl ProcessTool {
             id
         };
 
+        let mut processes = self.processes.write().unwrap();
+        if processes.len() >= MAX_PROCESSES {
+            drop(processes);
+            let _ = child.start_kill();
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Maximum concurrent processes ({MAX_PROCESSES}) reached"
+                )),
+            });
+        }
+
         let entry = ProcessEntry {
             id,
             command: command.to_string(),
@@ -223,7 +236,7 @@ impl ProcessTool {
             analyzed_offsets: Mutex::new((0, 0)),
         };
 
-        self.processes.write().unwrap().insert(id, entry);
+        processes.insert(id, entry);
 
         Ok(ToolResult {
             success: true,
@@ -382,26 +395,16 @@ impl ProcessTool {
             Failed(String),
         }
 
-        let outcome = {
-            let mut child = match entry.child.lock() {
-                Ok(child) => child,
-                Err(_) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to access process state for {id}")),
-                    });
-                }
-            };
-
-            match child.try_wait() {
+        let outcome = match entry.child.lock() {
+            Ok(mut child) => match child.try_wait() {
                 Ok(Some(status)) => KillOutcome::AlreadyExited(status.code().unwrap_or(-1)),
                 Ok(None) => match child.start_kill() {
                     Ok(()) => KillOutcome::Signaled,
                     Err(e) => KillOutcome::Failed(format!("Failed to signal process {id}: {e}")),
                 },
                 Err(e) => KillOutcome::Failed(format!("Failed to inspect process {id}: {e}")),
-            }
+            },
+            Err(_) => KillOutcome::Failed(format!("Failed to access process state for {id}")),
         };
 
         match outcome {
@@ -415,8 +418,16 @@ impl ProcessTool {
                 output: format!("Process {id} already exited ({code})"),
                 error: None,
             }),
-            KillOutcome::Failed(reason) => {
-                self.processes.write().unwrap().insert(id, entry);
+            KillOutcome::Failed(mut reason) => {
+                match self.processes.write() {
+                    Ok(mut processes) => {
+                        processes.insert(id, entry);
+                    }
+                    Err(_) => {
+                        reason
+                            .push_str("; failed to restore process tracking due to poisoned state");
+                    }
+                }
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),
