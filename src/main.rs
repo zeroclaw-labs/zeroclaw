@@ -82,6 +82,7 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+mod sop;
 mod tools;
 mod tunnel;
 mod update;
@@ -92,7 +93,7 @@ use config::Config;
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
     ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
-    PeripheralCommands, ServiceCommands, SkillCommands,
+    PeripheralCommands, ServiceCommands, SkillCommands, SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -414,6 +415,12 @@ Examples:
         skill_command: SkillCommands,
     },
 
+    /// Manage SOPs (standard operating procedures)
+    Sop {
+        #[command(subcommand)]
+        sop_command: SopCommands,
+    },
+
     /// Migrate data from other agent runtimes
     Migrate {
         #[command(subcommand)]
@@ -640,19 +647,6 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a provider
-    List {
-        /// Provider name (defaults to configured default provider)
-        #[arg(long)]
-        provider: Option<String>,
-    },
-    /// Set the default model in config
-    Set {
-        /// Model name to set as default
-        model: String,
-    },
-    /// Show current model configuration and cache status
-    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -890,7 +884,38 @@ async fn main() -> Result<()> {
             } else {
                 info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
             }
-            gateway::run_gateway(&host, port, config).await
+            // Initialize SOP resources so /sop/* and webhook dispatch work in standalone gateway
+            let sop_engine = tools::create_sop_engine(&config.sop, &config.workspace_dir);
+            let sop_memory: Option<std::sync::Arc<dyn memory::traits::Memory>> = if sop_engine
+                .is_some()
+            {
+                match memory::create_memory(&config.memory, &config.workspace_dir, None) {
+                    Ok(m) => {
+                        Some(std::sync::Arc::from(m) as std::sync::Arc<dyn memory::traits::Memory>)
+                    }
+                    Err(e) => {
+                        warn!("SOP enabled but memory backend init failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let sop_audit = sop_memory
+                .as_ref()
+                .map(|m| std::sync::Arc::new(sop::SopAuditLogger::new(std::sync::Arc::clone(m))));
+            let sop_collector = if let Some(ref mem) = sop_memory {
+                match sop::SopMetricsCollector::rebuild_from_memory(mem.as_ref()).await {
+                    Ok(c) => Some(std::sync::Arc::new(c)),
+                    Err(e) => {
+                        warn!("SOP metrics warm-start failed, using empty collector: {e}");
+                        Some(std::sync::Arc::new(sop::SopMetricsCollector::new()))
+                    }
+                }
+            } else {
+                None
+            };
+            gateway::run_gateway(&host, port, config, sop_engine, sop_audit, sop_collector).await
         }
 
         Commands::Daemon { port, host } => {
@@ -1027,11 +1052,6 @@ async fn main() -> Result<()> {
                     onboard::run_models_refresh(&config, provider.as_deref(), force).await
                 }
             }
-            ModelCommands::List { provider } => {
-                onboard::run_models_list(&config, provider.as_deref()).await
-            }
-            ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
-            ModelCommands::Status => onboard::run_models_status(&config).await,
         },
 
         Commands::Providers => {
@@ -1106,6 +1126,8 @@ async fn main() -> Result<()> {
         } => integrations::handle_command(integration_command, &config),
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+
+        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await

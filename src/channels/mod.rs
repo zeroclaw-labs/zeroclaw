@@ -27,6 +27,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod mqtt;
 pub mod nextcloud_talk;
 pub mod nostr;
 pub mod qq;
@@ -4105,7 +4106,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             }
             if !cfg!(feature = "channel-lark") {
                 println!(
-                    "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
+                    "  ℹ️ Lark channel support is disabled in this build (enable `channel-lark`)."
                 );
             }
             println!("\nTo start channels: zeroclaw channel start");
@@ -4394,40 +4395,16 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
-        if lk.use_feishu {
-            if config.channels_config.feishu.is_some() {
-                tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                );
-            } else {
-                tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                );
-                channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
-                    channel: Arc::new(LarkChannel::from_config(lk)),
-                });
-            }
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "Lark",
-                channel: Arc::new(LarkChannel::from_lark_config(lk)),
-            });
-        }
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
-            display_name: "Feishu",
-            channel: Arc::new(LarkChannel::from_feishu_config(fs)),
+            display_name: "Lark",
+            channel: Arc::new(LarkChannel::from_config(lk)),
         });
     }
 
     #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
+    if config.channels_config.lark.is_some() {
         tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+            "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark health check."
         );
     }
 
@@ -4643,6 +4620,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None, // channel — SOP engine created internally if needed
+        None, // channel — no SOP metrics collector
+        #[cfg(feature = "ampersona-gates")]
+        None, // channel — no gate evaluation state wiring
+        #[cfg(not(feature = "ampersona-gates"))]
+        None,
     ));
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
