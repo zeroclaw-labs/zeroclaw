@@ -105,6 +105,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "ampersona-core"
 version = "1.0.0"
+source = "git+https://github.com/joyshmitz/ampersona.git?rev=f2ffb80bd3a4fc388f9c07180755ebdc3ebbd84d#f2ffb80bd3a4fc388f9c07180755ebdc3ebbd84d"
 dependencies = [
  "anyhow",
  "base64",
@@ -121,6 +122,7 @@ dependencies = [
 [[package]]
 name = "ampersona-engine"
 version = "1.0.0"
+source = "git+https://github.com/joyshmitz/ampersona.git?rev=f2ffb80bd3a4fc388f9c07180755ebdc3ebbd84d#f2ffb80bd3a4fc388f9c07180755ebdc3ebbd84d"
 dependencies = [
  "ampersona-core",
  "anyhow",

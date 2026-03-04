@@ -119,7 +119,7 @@ cargo check --no-default-features --features hardware,channel-matrix
 cargo check --no-default-features --features hardware,channel-lark
 ```
 
-If `[channels_config.matrix]` or `[channels_config.lark]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
+If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
 
 ---
 
@@ -139,7 +139,8 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 | Webhook | gateway endpoint (`/webhook`) | Usually yes |
 | Email | IMAP polling + SMTP send | No |
 | IRC | IRC socket | No |
-| Lark/Feishu | websocket (default) or webhook | Webhook mode only |
+| Lark | websocket (default) or webhook | Webhook mode only |
+| Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
@@ -158,7 +159,7 @@ For channels with inbound sender allowlists:
 
 Field names differ by channel:
 
-- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ/Nextcloud Talk)
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Nextcloud Talk)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
 - `allowed_senders` (Email/Linq)
@@ -366,7 +367,7 @@ sasl_password = ""                  # optional
 verify_tls = true
 ```
 
-### 4.11 Lark / Feishu
+### 4.11 Lark
 
 ```toml
 [channels_config.lark]
@@ -429,9 +430,8 @@ Interactive onboarding support:
 zeroclaw onboard --interactive
 ```
 
-The wizard now includes a dedicated **Lark/Feishu** step with:
+The wizard now includes dedicated **Lark** and **Feishu** steps with:
 
-- region selection (`Feishu (CN)` vs `Lark (International)`)
 - credential verification against official Open Platform auth endpoint
 - receive mode selection (`websocket` or `webhook`)
 - optional webhook verification token prompt (recommended for stronger callback authenticity checks)
@@ -442,7 +442,7 @@ Runtime token behavior:
 - send requests automatically retry once after token invalidation when Feishu/Lark returns either HTTP `401` or business error code `99991663` (`Invalid access token`).
 - if the retry still returns token-invalid responses, the send call fails with the upstream status/body for easier troubleshooting.
 
-### 4.13 DingTalk
+### 4.14 DingTalk
 
 ```toml
 [channels_config.dingtalk]
@@ -451,7 +451,7 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.14 QQ
+### 4.15 QQ
 
 ```toml
 [channels_config.qq]
@@ -524,9 +524,9 @@ zeroclaw onboard --channels-only
 zeroclaw daemon
 ```
 
-3. Send a message from an expected sender.
-4. Confirm a reply arrives.
-5. Tighten allowlist from `"*"` to explicit IDs.
+1. Send a message from an expected sender.
+2. Confirm a reply arrives.
+3. Tighten allowlist from `"*"` to explicit IDs.
 
 ---
 

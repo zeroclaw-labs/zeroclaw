@@ -182,10 +182,9 @@ wa-rs-proto = { version = "0.2", optional = true, default-features = false }
 wa-rs-ureq-http = { version = "0.2", optional = true }
 wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
 
-# Gate metrics integration (dev-only path dep — replace with git or version dep before merge to main)
-# Requires sibling repos: ../ampersona, ../toon_rust (transitive via ampersona-core → tru)
-ampersona-core = { path = "../ampersona/crates/ampersona-core", optional = true }
-ampersona-engine = { path = "../ampersona/crates/ampersona-engine", optional = true }
+# Gate metrics integration (optional)
+ampersona-core = { git = "https://github.com/joyshmitz/ampersona.git", package = "ampersona-core", rev = "f2ffb80bd3a4fc388f9c07180755ebdc3ebbd84d", optional = true }
+ampersona-engine = { git = "https://github.com/joyshmitz/ampersona.git", package = "ampersona-engine", rev = "f2ffb80bd3a4fc388f9c07180755ebdc3ebbd84d", optional = true }
 
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]

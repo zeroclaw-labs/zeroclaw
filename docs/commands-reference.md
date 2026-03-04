@@ -22,7 +22,6 @@ Last verified: **February 25, 2026**.
 | `channel` | Manage channels and channel health checks |
 | `integrations` | Inspect integration details |
 | `skills` | List/install/remove skills |
-| `sop` | Manage SOP definitions (`list/validate/show`) |
 | `migrate` | Import from external runtimes (currently OpenClaw) |
 | `config` | Export machine-readable config schema |
 | `completions` | Generate shell completion scripts to stdout |
@@ -226,12 +225,6 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 Use `skills audit` to manually validate a candidate skill directory (or an installed skill by name) before sharing it.
 
 Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injected into the agent system prompt at runtime, so the model can follow skill instructions without manually reading skill files.
-
-### `sop`
-
-- `zeroclaw sop list`
-- `zeroclaw sop validate [name]`
-- `zeroclaw sop show <name>`
 
 ### `migrate`
 
