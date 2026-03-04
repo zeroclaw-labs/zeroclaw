@@ -497,7 +497,7 @@ impl BrowserTool {
                             Err(err) => reasons.push(format!("computer_use invalid: {err}")),
                         },
                         BrowserBackendKind::Auto => {
-                            reasons.push("invalid auto backend priority entry: auto".into())
+                            reasons.push("invalid auto backend priority entry: auto".into());
                         }
                     }
                 }

@@ -502,7 +502,8 @@ pub fn all_tools_with_runtime(
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
-        let browser_choice = browser_open::BrowserChoice::from_str(&browser_config.browser_open);
+        let browser_choice =
+            browser_open::BrowserChoice::from_config_value(&browser_config.browser_open);
         if browser_choice != browser_open::BrowserChoice::Disable {
             tool_arcs.push(Arc::new(BrowserOpenTool::new(
                 security.clone(),

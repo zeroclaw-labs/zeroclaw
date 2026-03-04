@@ -25,7 +25,7 @@ impl CanaryGuard {
     ///
     /// Returns the updated prompt and the generated token when enabled.
     /// When disabled, any stale prior canary block is stripped and no token is returned.
-    pub fn inject_turn_token(&self, system_prompt: &str) -> (String, Option<String>) {
+    pub fn inject_turn_token(self, system_prompt: &str) -> (String, Option<String>) {
         let mut stripped = strip_canary_block(system_prompt);
         if !self.enabled {
             return (stripped, None);
@@ -50,7 +50,7 @@ impl CanaryGuard {
     }
 
     /// True when output appears to leak the per-turn canary token.
-    pub fn response_contains_canary(&self, response: &str, token: Option<&str>) -> bool {
+    pub fn response_contains_canary(self, response: &str, token: Option<&str>) -> bool {
         if !self.enabled {
             return false;
         }
@@ -61,7 +61,7 @@ impl CanaryGuard {
     }
 
     /// Remove token value from any trace/log text.
-    pub fn redact_token_from_text(&self, text: &str, token: Option<&str>) -> String {
+    pub fn redact_token_from_text(self, text: &str, token: Option<&str>) -> String {
         if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
             return text.replace(token, "[REDACTED_CANARY]");
         }

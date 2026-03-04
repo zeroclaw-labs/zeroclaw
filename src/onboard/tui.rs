@@ -1378,11 +1378,13 @@ impl TuiState {
 
                 match self.current_field_key() {
                     Some(FieldKey::Continue) => self.next_step()?,
-                    Some(field_key @ FieldKey::RunProviderProbe)
-                    | Some(field_key @ FieldKey::RunTelegramProbe)
-                    | Some(field_key @ FieldKey::RunDiscordProbe)
-                    | Some(field_key @ FieldKey::RunCloudflareProbe)
-                    | Some(field_key @ FieldKey::RunNgrokProbe) => {
+                    Some(
+                        field_key @ (FieldKey::RunProviderProbe
+                        | FieldKey::RunTelegramProbe
+                        | FieldKey::RunDiscordProbe
+                        | FieldKey::RunCloudflareProbe
+                        | FieldKey::RunNgrokProbe),
+                    ) => {
                         let _ = self.run_probe_for_field(field_key);
                     }
                     Some(field_key) if is_text_input_field(field_key) => self.start_editing(),
@@ -1802,7 +1804,11 @@ fn run_ngrok_probe(plan: &TuiOnboardPlan) -> CheckStatus {
 }
 
 pub async fn run_wizard_tui(force: bool) -> Result<Config> {
-    run_wizard_tui_with_migration(force, OpenClawOnboardMigrationOptions::default()).await
+    Box::pin(run_wizard_tui_with_migration(
+        force,
+        OpenClawOnboardMigrationOptions::default(),
+    ))
+    .await
 }
 
 pub async fn run_wizard_tui_with_migration(
@@ -1852,7 +1858,7 @@ pub async fn run_wizard_tui_with_migration(
     let memory_backend = plan.memory_backend().to_string();
     let api_key = (!plan.api_key.trim().is_empty()).then_some(plan.api_key.trim());
 
-    let mut config = run_quick_setup_with_migration(
+    let mut config = Box::pin(run_quick_setup_with_migration(
         api_key,
         Some(&provider),
         Some(&model),
@@ -1860,7 +1866,7 @@ pub async fn run_wizard_tui_with_migration(
         true,
         plan.disable_totp,
         migration_options,
-    )
+    ))
     .await?;
 
     apply_channel_overrides(&mut config, &plan);

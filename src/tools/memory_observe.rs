@@ -117,7 +117,8 @@ impl Tool for MemoryObserveTool {
             if let Some(confidence) = confidence {
                 metadata.push(format!("confidence={confidence:.3}"));
             }
-            content.push_str(&format!("\n\n[metadata] {}", metadata.join(", ")));
+            use std::fmt::Write as _;
+            let _ = write!(content, "\n\n[metadata] {}", metadata.join(", "));
         }
 
         if let Err(error) = self

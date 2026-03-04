@@ -361,13 +361,12 @@ impl HookRunner {
                             reason, "tool_result_persist cancelled by hook"
                         );
                         return HookResult::Cancel(reason);
-                    } else {
-                        tracing::warn!(
-                            hook = hook_name,
-                            reason,
-                            "hook attempted to cancel tool result without ModifyToolResults capability; ignoring cancellation"
-                        );
                     }
+                    tracing::warn!(
+                        hook = hook_name,
+                        reason,
+                        "hook attempted to cancel tool result without ModifyToolResults capability; ignoring cancellation"
+                    );
                 }
                 Err(_) => {
                     tracing::error!(

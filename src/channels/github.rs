@@ -50,7 +50,7 @@ impl GitHubChannel {
         raw.and_then(|value| {
             chrono::DateTime::parse_from_rfc3339(value)
                 .ok()
-                .map(|dt| dt.timestamp().max(0) as u64)
+                .map(|dt| u64::try_from(dt.timestamp().max(0)).unwrap_or(0))
         })
         .unwrap_or_else(Self::now_unix_secs)
     }
@@ -114,7 +114,7 @@ impl GitHubChannel {
     fn retry_delay_from_headers(headers: &HeaderMap) -> Option<Duration> {
         if let Some(raw) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
             if let Ok(secs) = raw.trim().parse::<u64>() {
-                return Some(Duration::from_secs(secs.max(1).min(60)));
+                return Some(Duration::from_secs(secs.clamp(1, 60)));
             }
         }
 
@@ -133,7 +133,7 @@ impl GitHubChannel {
             .and_then(|v| v.trim().parse::<u64>().ok())?;
         let now = Self::now_unix_secs();
         let wait = if reset > now { reset - now } else { 1 };
-        Some(Duration::from_secs(wait.max(1).min(60)))
+        Some(Duration::from_secs(wait.clamp(1, 60)))
     }
 
     async fn post_issue_comment(
