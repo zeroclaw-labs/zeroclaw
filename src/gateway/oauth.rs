@@ -69,8 +69,8 @@ fn token_path(dir: &PathBuf, service: &str) -> PathBuf {
     dir.join(format!("{service}.json"))
 }
 
-fn pkce_path(dir: &PathBuf, service: &str) -> PathBuf {
-    dir.join(format!("{service}_pkce.txt"))
+fn pkce_path(dir: &PathBuf, service: &str, state: &str) -> PathBuf {
+    dir.join(format!("{service}_{state}_pkce.txt"))
 }
 
 async fn ensure_oauth_dir(dir: &PathBuf) -> anyhow::Result<()> {
@@ -214,9 +214,10 @@ async fn start_google_oauth(state: &AppState) -> Response {
     // callback can validate it and reject replayed/forged callbacks.
     let state_token = pkce_verifier();
 
-    // Store "state\nverifier" so the callback can validate both.
-    // Use mode(0o600) at creation time to avoid the write-then-chmod TOCTOU window.
-    let pkce_file = pkce_path(&dir, "google");
+    // Store "state\nverifier" keyed by state in the filename so concurrent
+    // /auth/google starts each get their own session file and cannot clobber
+    // each other. Use mode(0o600) at creation time to avoid TOCTOU.
+    let pkce_file = pkce_path(&dir, "google", &state_token);
     let pkce_payload = format!("{state_token}\n{verifier}");
     {
         use tokio::io::AsyncWriteExt as _;
@@ -308,7 +309,19 @@ async fn handle_google_callback(state: &AppState, query: OAuthCallback) -> Respo
     };
 
     let dir = oauth_dir(state);
-    let pkce_file = pkce_path(&dir, "google");
+    // Validate state format before using it in the session filename to prevent
+    // path traversal. Only accept alphanumeric + dash + underscore.
+    let query_state = match query.state.as_deref() {
+        Some(s) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(error_page("OAuth Error", "Missing or invalid OAuth state")),
+            )
+                .into_response()
+        }
+    };
+    let pkce_file = pkce_path(&dir, "google", query_state);
 
     // Read the stored "state\nverifier" payload. Do NOT delete the file yet —
     // we must validate state first to prevent a forged callback from destroying
