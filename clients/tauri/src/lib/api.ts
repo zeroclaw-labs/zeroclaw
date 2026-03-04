@@ -431,6 +431,26 @@ export class MoAClient {
     }
   }
 
+  async purchaseCredits(packageId: string): Promise<{ payment_url?: string }> {
+    if (!this.token) throw new Error("Not authenticated");
+
+    const res = await fetch(`${this.relayUrl}/api/credits/purchase`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ package_id: packageId }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Payment failed" }));
+      throw new Error(data.error || `Payment failed (${res.status})`);
+    }
+
+    return await res.json();
+  }
+
   // ── API Key Management ──────────────────────────────────────
   // Save API keys to the local ZeroClaw agent config.
   // When user provides their own keys, ZeroClaw uses them directly.

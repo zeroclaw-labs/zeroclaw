@@ -50,19 +50,10 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     }
     if (isLoggedIn) {
       apiClient.getDevices().then(setDevices).catch(() => {});
-      // Load credit balance (try local gateway first, then relay)
-      const token = apiClient.getToken() || "";
-      fetch(`${apiClient.getServerUrl()}/api/credits/balance`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-        .then((r) => r.ok ? r.json() : null)
-        .then((d) => setCreditBalance(d?.balance ?? null))
-        .catch(() => {
-          // Fallback to relay server
-          apiClient.getCreditBalance()
-            .then((b: number) => setCreditBalance(b))
-            .catch(() => setCreditBalance(null));
-        });
+      // Load credit balance from relay server (billing is server-side)
+      apiClient.getCreditBalance()
+        .then((b: number) => setCreditBalance(b || null))
+        .catch(() => setCreditBalance(null));
     }
   }, [inTauri, isLoggedIn]);
 
@@ -400,26 +391,13 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                       style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "8px 4px", fontSize: 12 }}
                       onClick={async () => {
                         try {
-                          const res = await fetch(`${apiClient.getServerUrl()}/api/credits/purchase`, {
-                            method: "POST",
-                            headers: {
-                              "Content-Type": "application/json",
-                              "Authorization": `Bearer ${apiClient.getToken() || ""}`,
-                            },
-                            body: JSON.stringify({ package_id: pkg.id }),
-                          });
-                          if (!res.ok) {
-                            const err = await res.text().catch(() => "");
-                            setMessage({ type: "error", text: err || (locale === "ko" ? "\uACB0\uC81C \uC2E4\uD328" : "Payment failed") });
-                          } else {
-                            const data = await res.json();
-                            if (data.payment_url) {
-                              window.open(data.payment_url, "_blank");
-                            }
-                            setMessage({ type: "success", text: locale === "ko" ? "\uACB0\uC81C \uC694\uCCAD \uC644\uB8CC" : "Payment initiated" });
+                          const data = await apiClient.purchaseCredits(pkg.id);
+                          if (data.payment_url) {
+                            window.open(data.payment_url, "_blank");
                           }
-                        } catch {
-                          setMessage({ type: "error", text: `${pkg.name} - ${locale === "ko" ? "\uACB0\uC81C \uAE30\uB2A5 \uC900\uBE44 \uC911" : "Payment coming soon"}` });
+                          setMessage({ type: "success", text: locale === "ko" ? "\uACB0\uC81C \uC694\uCCAD \uC644\uB8CC" : "Payment initiated" });
+                        } catch (err) {
+                          setMessage({ type: "error", text: err instanceof Error ? err.message : (locale === "ko" ? "\uACB0\uC81C \uC2E4\uD328" : "Payment failed") });
                         }
                         clearMessage();
                       }}
