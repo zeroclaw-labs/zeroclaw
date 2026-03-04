@@ -2,6 +2,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
+use crate::agent::loop_::history::{extract_facts_from_turns, TurnBuffer};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::agent::research;
@@ -37,6 +38,8 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
+    session_id: Option<String>,
+    turn_buffer: TurnBuffer,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -60,6 +63,7 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    session_id: Option<String>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
@@ -84,6 +88,7 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
+            session_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
@@ -169,6 +174,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the session identifier for memory isolation across users/channels.
+    pub fn session_id(mut self, session_id: String) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
     pub fn classification_config(
         mut self,
         classification_config: crate::config::QueryClassificationConfig,
@@ -229,6 +240,8 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
+            session_id: self.session_id,
+            turn_buffer: TurnBuffer::new(),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -303,6 +316,36 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+        let (tools, tool_filter_report) = tools::filter_primary_agent_tools(
+            tools,
+            &config.agent.allowed_tools,
+            &config.agent.denied_tools,
+        );
+        for unmatched in tool_filter_report.unmatched_allowed_tools {
+            tracing::debug!(
+                tool = %unmatched,
+                "agent.allowed_tools entry did not match any registered tool"
+            );
+        }
+        let has_agent_allowlist = config
+            .agent
+            .allowed_tools
+            .iter()
+            .any(|entry| !entry.trim().is_empty());
+        let has_agent_denylist = config
+            .agent
+            .denied_tools
+            .iter()
+            .any(|entry| !entry.trim().is_empty());
+        if has_agent_allowlist
+            && has_agent_denylist
+            && tool_filter_report.allowlist_match_count > 0
+            && tools.is_empty()
+        {
+            anyhow::bail!(
+                "agent.allowed_tools and agent.denied_tools removed all executable tools; update [agent] tool filters"
+            );
+        }
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
@@ -408,37 +451,38 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
+        let (result, success) =
+            if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
+                match tool.execute(call.arguments.clone()).await {
+                    Ok(r) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            (r.output, true)
+                        } else {
+                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                        }
+                    }
+                    Err(e) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        (format!("Error executing {}: {e}", call.name), false)
                     }
                 }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
-                }
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
+            } else {
+                (format!("Unknown tool: {}", call.name), false)
+            };
 
         ToolExecutionResult {
             name: call.name.clone(),
             output: result,
-            success: true,
+            success,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
@@ -499,7 +543,12 @@ impl Agent {
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.session_id.as_deref(),
+                )
                 .await;
         }
 
@@ -616,11 +665,30 @@ impl Agent {
                             "assistant_resp",
                             &final_text,
                             MemoryCategory::Conversation,
-                            None,
+                            self.session_id.as_deref(),
                         )
                         .await;
                 }
                 self.trim_history();
+
+                // ── Post-turn fact extraction ──────────────────────
+                if self.auto_save {
+                    self.turn_buffer.push(user_message, &final_text);
+                    if self.turn_buffer.should_extract() {
+                        let turns = self.turn_buffer.drain_for_extraction();
+                        let result = extract_facts_from_turns(
+                            self.provider.as_ref(),
+                            &self.model_name,
+                            &turns,
+                            self.memory.as_ref(),
+                            self.session_id.as_deref(),
+                        )
+                        .await;
+                        if result.stored > 0 || result.no_facts {
+                            self.turn_buffer.mark_extract_success();
+                        }
+                    }
+                }
 
                 return Ok(final_text);
             }
@@ -677,8 +745,44 @@ impl Agent {
         )
     }
 
+    /// Flush any remaining buffered turns for fact extraction.
+    /// Call this when the session/conversation ends to avoid losing
+    /// facts from short (< 5 turn) sessions.
+    ///
+    /// On failure the turns are restored so callers that keep the agent
+    /// alive can still fall back to compaction-based extraction.
+    pub async fn flush_turn_buffer(&mut self) {
+        if !self.auto_save || self.turn_buffer.is_empty() {
+            return;
+        }
+        let turns = self.turn_buffer.drain_for_extraction();
+        let result = extract_facts_from_turns(
+            self.provider.as_ref(),
+            &self.model_name,
+            &turns,
+            self.memory.as_ref(),
+            self.session_id.as_deref(),
+        )
+        .await;
+        if result.stored > 0 || result.no_facts {
+            self.turn_buffer.mark_extract_success();
+        } else {
+            // Restore turns so compaction fallback can still pick them up
+            // if the agent isn't dropped immediately.
+            tracing::warn!(
+                "Exit flush failed; restoring {} turn(s) to buffer",
+                turns.len()
+            );
+            for (u, a) in turns {
+                self.turn_buffer.push(&u, &a);
+            }
+        }
+    }
+
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
+        let result = self.turn(message).await?;
+        self.flush_turn_buffer().await;
+        Ok(result)
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
@@ -704,6 +808,7 @@ impl Agent {
         }
 
         listen_handle.abort();
+        self.flush_turn_buffer().await;
         Ok(())
     }
 }
@@ -1031,6 +1136,7 @@ mod tests {
 
     #[test]
     fn from_config_loads_plugin_declared_tools() {
+        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
         let tmp = TempDir::new().expect("temp dir");
         let plugin_dir = tmp.path().join("plugins");
         std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
@@ -1067,5 +1173,78 @@ description = "plugin tool exposed for from_config tests"
             .tools
             .iter()
             .any(|tool| tool.name() == "__agent_from_config_plugin_tool"));
+    }
+
+    fn base_from_config_for_tool_filter_tests() -> Config {
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_agent_tool_filter_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("workspace")).expect("create workspace dir");
+
+        let mut config = Config::default();
+        config.workspace_dir = root.join("workspace");
+        config.config_path = root.join("config.toml");
+        config.default_provider = Some("ollama".to_string());
+        config.memory.backend = "none".to_string();
+        config
+    }
+
+    #[test]
+    fn from_config_primary_allowlist_filters_tools() {
+        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
+        let mut config = base_from_config_for_tool_filter_tests();
+        config.agent.allowed_tools = vec!["shell".to_string()];
+
+        let agent = Agent::from_config(&config).expect("agent should build");
+        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names, vec!["shell"]);
+    }
+
+    #[test]
+    fn from_config_empty_allowlist_preserves_default_toolset() {
+        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
+        let config = base_from_config_for_tool_filter_tests();
+
+        let agent = Agent::from_config(&config).expect("agent should build");
+        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"file_read"));
+    }
+
+    #[test]
+    fn from_config_primary_denylist_removes_tools() {
+        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
+        let mut config = base_from_config_for_tool_filter_tests();
+        config.agent.denied_tools = vec!["shell".to_string()];
+
+        let agent = Agent::from_config(&config).expect("agent should build");
+        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
+        assert!(!names.contains(&"shell"));
+    }
+
+    #[test]
+    fn from_config_unmatched_allowlist_entry_is_graceful() {
+        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
+        let mut config = base_from_config_for_tool_filter_tests();
+        config.agent.allowed_tools = vec!["missing_tool".to_string()];
+
+        let agent = Agent::from_config(&config).expect("agent should build with empty toolset");
+        assert!(agent.tools.is_empty());
+    }
+
+    #[test]
+    fn from_config_conflicting_allow_and_deny_fails_fast() {
+        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
+        let mut config = base_from_config_for_tool_filter_tests();
+        config.agent.allowed_tools = vec!["shell".to_string()];
+        config.agent.denied_tools = vec!["shell".to_string()];
+
+        let err = Agent::from_config(&config)
+            .err()
+            .expect("expected filter conflict");
+        assert!(err
+            .to_string()
+            .contains("agent.allowed_tools and agent.denied_tools removed all executable tools"));
     }
 }
