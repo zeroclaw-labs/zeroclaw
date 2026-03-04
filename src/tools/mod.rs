@@ -67,6 +67,8 @@ pub mod pptx_read;
 pub mod process;
 pub mod proxy_config;
 pub mod pushover;
+pub mod manage_outbound_queue;
+pub mod send_user_message;
 pub mod quota_tools;
 pub mod schedule;
 pub mod schema;
@@ -135,6 +137,8 @@ pub use pptx_read::PptxReadTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
+pub use manage_outbound_queue::ManageOutboundQueueTool;
+pub use send_user_message::SendUserMessageTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
@@ -379,6 +383,18 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    // Proactive messaging tools (gated by config)
+    if root_config.proactive_messaging.enabled {
+        tool_arcs.push(Arc::new(SendUserMessageTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(ManageOutboundQueueTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+    }
 
     if has_shell_access {
         tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(

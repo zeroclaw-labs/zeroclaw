@@ -209,6 +209,7 @@ pub async fn run_wizard_with_migration(
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
+        proactive_messaging: crate::config::ProactiveMessagingConfig::default(),
         goal_loop: crate::config::schema::GoalLoopConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
@@ -725,6 +726,7 @@ async fn run_quick_setup_with_home(
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
+        proactive_messaging: crate::config::ProactiveMessagingConfig::default(),
         goal_loop: crate::config::schema::GoalLoopConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,

@@ -84,6 +84,7 @@ mod observability;
 mod onboard;
 mod peripherals;
 mod plugins;
+mod proactive_messaging;
 mod providers;
 mod rag;
 mod runtime;

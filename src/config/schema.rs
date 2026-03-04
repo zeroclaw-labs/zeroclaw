@@ -276,6 +276,9 @@ pub struct Config {
     /// Cron job configuration (`[cron]`).
     #[serde(default)]
     pub cron: CronConfig,
+    /// Proactive messaging configuration (`[proactive_messaging]`).
+    #[serde(default)]
+    pub proactive_messaging: ProactiveMessagingConfig,
 
     /// Goal loop configuration for autonomous long-term goal execution (`[goal_loop]`).
     #[serde(default)]
@@ -4297,6 +4300,112 @@ impl Default for CronConfig {
     }
 }
 
+// ── Proactive Messaging ──────────────────────────────────────────
+
+/// Proactive messaging configuration (`[proactive_messaging]` section).
+///
+/// When enabled, agents can proactively send messages to users via
+/// `send_user_message`. Messages are gated by quiet hours and rate limits,
+/// and queued when delivery is denied by quiet hours.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProactiveMessagingConfig {
+    /// Enable the proactive messaging subsystem. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Quiet-hours windows during which messages are queued instead of sent.
+    #[serde(default)]
+    pub quiet_hours: Vec<QuietHoursWindow>,
+    /// Rate limits for proactive messages.
+    #[serde(default)]
+    pub rate_limits: ProactiveMessagingRateLimits,
+    /// Queue configuration for deferred messages.
+    #[serde(default)]
+    pub queue: ProactiveMessagingQueueConfig,
+}
+
+impl Default for ProactiveMessagingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quiet_hours: Vec::new(),
+            rate_limits: ProactiveMessagingRateLimits::default(),
+            queue: ProactiveMessagingQueueConfig::default(),
+        }
+    }
+}
+
+/// A time window during which proactive messages are queued for later delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QuietHoursWindow {
+    /// Start hour (0–23, inclusive). E.g. `22` for 10 PM.
+    pub start_hour: u8,
+    /// End hour (0–23, exclusive). E.g. `7` for 7 AM. Wraps past midnight when `end < start`.
+    pub end_hour: u8,
+    /// IANA timezone (e.g. `"America/New_York"`). Default: `"UTC"`.
+    #[serde(default = "default_quiet_hours_timezone")]
+    pub timezone: String,
+}
+
+fn default_quiet_hours_timezone() -> String {
+    "UTC".to_string()
+}
+
+/// Rate limits for the proactive messaging subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProactiveMessagingRateLimits {
+    /// Maximum proactive messages per hour. Default: `10`.
+    #[serde(default = "default_pm_max_per_hour")]
+    pub max_per_hour: u32,
+    /// Maximum proactive messages per day. Default: `50`.
+    #[serde(default = "default_pm_max_per_day")]
+    pub max_per_day: u32,
+}
+
+fn default_pm_max_per_hour() -> u32 {
+    10
+}
+
+fn default_pm_max_per_day() -> u32 {
+    50
+}
+
+impl Default for ProactiveMessagingRateLimits {
+    fn default() -> Self {
+        Self {
+            max_per_hour: default_pm_max_per_hour(),
+            max_per_day: default_pm_max_per_day(),
+        }
+    }
+}
+
+/// Queue settings for deferred proactive messages.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProactiveMessagingQueueConfig {
+    /// Maximum number of pending messages in the queue. Default: `100`.
+    #[serde(default = "default_pm_max_pending")]
+    pub max_pending: usize,
+    /// Time-to-live for queued messages in hours. Default: `24`.
+    #[serde(default = "default_pm_ttl_hours")]
+    pub ttl_hours: u64,
+}
+
+fn default_pm_max_pending() -> usize {
+    100
+}
+
+fn default_pm_ttl_hours() -> u64 {
+    24
+}
+
+impl Default for ProactiveMessagingQueueConfig {
+    fn default() -> Self {
+        Self {
+            max_pending: default_pm_max_pending(),
+            ttl_hours: default_pm_ttl_hours(),
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
@@ -6448,6 +6557,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            proactive_messaging: ProactiveMessagingConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -10067,6 +10177,7 @@ ws_url = "ws://127.0.0.1:3002"
                 to: Some("123456".into()),
             },
             cron: CronConfig::default(),
+            proactive_messaging: ProactiveMessagingConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
@@ -10481,6 +10592,7 @@ tool_dispatcher = "xml"
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            proactive_messaging: ProactiveMessagingConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
