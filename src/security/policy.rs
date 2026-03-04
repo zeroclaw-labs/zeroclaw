@@ -3267,6 +3267,8 @@ mod tests {
         assert!(!p.is_path_allowed("\\Windows\\System32"));
         // Drive-letter absolute paths should be blocked
         assert!(!p.is_path_allowed("C:\\Windows\\System32"));
+        // UNC paths should be blocked
+        assert!(!p.is_path_allowed("\\\\server\\share\\secret.txt"));
     }
 
     #[cfg(windows)]
