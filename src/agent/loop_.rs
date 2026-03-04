@@ -285,11 +285,11 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .unwrap_or("");
 
             // Preserve first 4 chars for context, then redact
-            let prefix: String = if val.chars().count() > 4 {
-                val.chars().take(4).collect()
-            } else {
-                String::new()
-            };
+            let prefix = val
+                .char_indices()
+                .nth(4)
+                .map(|(idx, _)| &val[..idx])
+                .unwrap_or("");
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
@@ -7278,17 +7278,14 @@ Let me check the result."#;
     #[test]
     fn scrub_credentials_multibyte_utf8_no_panic() {
         // Multi-byte UTF-8 value must not panic on char-boundary slicing
-        let input = r#"api_key="你的-tavily-api-key-placeholder""#;
+        let input = r#"api_key="你的-api-key""#;
         let result = scrub_credentials(input);
         assert!(
             result.contains("*[REDACTED]"),
             "multi-byte value should be redacted, got: {}",
             result
         );
-        assert!(
-            result.starts_with("api_key="),
-            "key should be preserved"
-        );
+        assert!(result.starts_with("api_key="), "key should be preserved");
     }
 
     // ─────────────────────────────────────────────────────────────────────
