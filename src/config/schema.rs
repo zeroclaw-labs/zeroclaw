@@ -439,7 +439,6 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub transport: Option<String>,
 }
-
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
@@ -1044,6 +1043,14 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Optional allowlist for primary-agent tool visibility.
+    /// When non-empty, only listed tools are exposed to the primary agent.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Optional denylist for primary-agent tool visibility.
+    /// Applied after `allowed_tools`.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
     /// Agent-team runtime controls for synchronous delegation.
     #[serde(default)]
     pub teams: AgentTeamsConfig,
@@ -1179,6 +1186,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
             teams: AgentTeamsConfig::default(),
             subagents: SubAgentsConfig::default(),
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
@@ -3348,9 +3357,13 @@ pub enum CommandContextRuleAction {
     Allow,
     /// Matching context is explicitly denied.
     Deny,
+    /// Matching context requires interactive approval in supervised mode.
+    ///
+    /// This does not allow a command by itself; allowlist and deny checks still apply.
+    RequireApproval,
 }
 
-/// Context-aware allow/deny rule for shell commands.
+/// Context-aware command rule for shell commands.
 ///
 /// Rules are evaluated per command segment. Command matching accepts command
 /// names (`curl`), explicit paths (`/usr/bin/curl`), and wildcard (`*`).
@@ -3359,6 +3372,8 @@ pub enum CommandContextRuleAction {
 /// - `action = "deny"`: if all constraints match, the segment is rejected.
 /// - `action = "allow"`: if at least one allow rule exists for a command,
 ///   segments must match at least one of those allow rules.
+/// - `action = "require_approval"`: matching segments require explicit
+///   `approved=true` in supervised mode, even when `shell` is auto-approved.
 ///
 /// Constraints are optional:
 /// - `allowed_domains`: require URL arguments to match these hosts/patterns.
@@ -3371,7 +3386,7 @@ pub struct CommandContextRuleConfig {
     /// Command name/path pattern (`git`, `/usr/bin/curl`, or `*`).
     pub command: String,
 
-    /// Rule action (`allow` | `deny`). Defaults to `allow`.
+    /// Rule action (`allow` | `deny` | `require_approval`). Defaults to `allow`.
     #[serde(default)]
     pub action: CommandContextRuleAction,
 
@@ -4620,6 +4635,8 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+    /// Native streaming for channels that support draft updates directly.
+    On,
 }
 
 /// Progress verbosity for channels that support draft streaming.
@@ -5636,7 +5653,7 @@ impl FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecurityConfig {
     /// Sandbox configuration
     #[serde(default)]
@@ -5674,9 +5691,31 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub outbound_leak_guard: OutboundLeakGuardConfig,
 
+    /// Enable per-turn canary tokens to detect system-context exfiltration.
+    #[serde(default = "default_true")]
+    pub canary_tokens: bool,
+
     /// Shared URL access policy for network-enabled tools.
     #[serde(default)]
     pub url_access: UrlAccessConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+            otp: OtpConfig::default(),
+            roles: Vec::default(),
+            estop: EstopConfig::default(),
+            syscall_anomaly: SyscallAnomalyConfig::default(),
+            perplexity_filter: PerplexityFilterConfig::default(),
+            outbound_leak_guard: OutboundLeakGuardConfig::default(),
+            canary_tokens: true,
+            url_access: UrlAccessConfig::default(),
+        }
+    }
 }
 
 /// Outbound leak handling mode for channel responses.
@@ -8102,6 +8141,30 @@ impl Config {
                 );
             }
         }
+        for (i, tool_name) in self.agent.allowed_tools.iter().enumerate() {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("agent.allowed_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+            {
+                anyhow::bail!("agent.allowed_tools[{i}] contains invalid characters: {normalized}");
+            }
+        }
+        for (i, tool_name) in self.agent.denied_tools.iter().enumerate() {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("agent.denied_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+            {
+                anyhow::bail!("agent.denied_tools[{i}] contains invalid characters: {normalized}");
+            }
+        }
         let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
         let mut custom_role_names = std::collections::HashSet::new();
         for (i, role) in self.security.roles.iter().enumerate() {
@@ -9833,6 +9896,34 @@ allowed_roots = []
     }
 
     #[test]
+    async fn autonomy_command_context_rule_supports_require_approval_action() {
+        let raw = r#"
+level = "supervised"
+workspace_only = true
+allowed_commands = ["ls", "rm"]
+forbidden_paths = ["/etc"]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = []
+auto_approve = ["shell"]
+always_ask = []
+allowed_roots = []
+
+[[command_context_rules]]
+command = "rm"
+action = "require_approval"
+"#;
+        let parsed: AutonomyConfig = toml::from_str(raw).expect("autonomy config should parse");
+        assert_eq!(parsed.command_context_rules.len(), 1);
+        assert_eq!(
+            parsed.command_context_rules[0].action,
+            CommandContextRuleAction::RequireApproval
+        );
+    }
+
+    #[test]
     async fn config_validate_rejects_duplicate_non_cli_excluded_tools() {
         let mut cfg = Config::default();
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".into(), "shell".into()];
@@ -10411,6 +10502,8 @@ reasoning_level = "high"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(cfg.allowed_tools.is_empty());
+        assert!(cfg.denied_tools.is_empty());
     }
 
     #[test]
@@ -10423,6 +10516,8 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+allowed_tools = ["delegate", "task_plan"]
+denied_tools = ["shell"]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -10430,6 +10525,11 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        assert_eq!(
+            parsed.agent.allowed_tools,
+            vec!["delegate".to_string(), "task_plan".to_string()]
+        );
+        assert_eq!(parsed.agent.denied_tools, vec!["shell".to_string()]);
     }
 
     #[tokio::test]
@@ -10776,6 +10876,13 @@ tool_dispatcher = "xml"
             GroupReplyMode::AllMessages
         );
         assert!(parsed.group_reply_allowed_sender_ids().is_empty());
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_stream_mode_on() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"stream_mode":"on"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stream_mode, StreamMode::On);
     }
 
     #[test]
@@ -11232,6 +11339,33 @@ channel_id = "C123"
         assert_eq!(
             parsed.group_reply_allowed_sender_ids(),
             vec!["U111".to_string()]
+        );
+    }
+
+    #[test]
+    async fn channels_slack_group_reply_toml_nested_table_deserializes() {
+        let toml_str = r#"
+cli = true
+
+[slack]
+bot_token = "xoxb-tok"
+app_token = "xapp-tok"
+channel_id = "C123"
+allowed_users = ["*"]
+
+[slack.group_reply]
+mode = "mention_only"
+allowed_sender_ids = ["U111", "U222"]
+"#;
+        let parsed: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        let slack = parsed.slack.expect("slack config should exist");
+        assert_eq!(
+            slack.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            slack.group_reply_allowed_sender_ids(),
+            vec!["U111".to_string(), "U222".to_string()]
         );
     }
 
@@ -14129,6 +14263,7 @@ default_temperature = 0.7
             OutboundLeakGuardAction::Redact
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.7);
+        assert!(parsed.security.canary_tokens);
     }
 
     #[test]
@@ -14138,6 +14273,9 @@ default_temperature = 0.7
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
+
+[security]
+canary_tokens = false
 
 [security.otp]
 enabled = true
@@ -14220,6 +14358,7 @@ sensitivity = 0.9
             OutboundLeakGuardAction::Block
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.9);
+        assert!(!parsed.security.canary_tokens);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         assert_eq!(
@@ -14240,6 +14379,50 @@ sensitivity = 0.9
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_empty_allowed_tool_entry() {
+        let mut config = Config::default();
+        config.agent.allowed_tools = vec!["   ".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent allowed_tools entry");
+        assert!(err.to_string().contains("agent.allowed_tools"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_invalid_allowed_tool_chars() {
+        let mut config = Config::default();
+        config.agent.allowed_tools = vec!["bad tool".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent allowed_tools chars");
+        assert!(err.to_string().contains("agent.allowed_tools"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_empty_denied_tool_entry() {
+        let mut config = Config::default();
+        config.agent.denied_tools = vec!["   ".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent denied_tools entry");
+        assert!(err.to_string().contains("agent.denied_tools"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_invalid_denied_tool_chars() {
+        let mut config = Config::default();
+        config.agent.denied_tools = vec!["bad/tool".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent denied_tools chars");
+        assert!(err.to_string().contains("agent.denied_tools"));
     }
 
     #[test]

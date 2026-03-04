@@ -47,6 +47,7 @@ env:
 jobs:
     prepare:
         name: Prepare Release Context
+        if: github.event_name != 'push' || !contains(github.ref_name, '-')
         runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         outputs:
             release_ref: ${{ steps.vars.outputs.release_ref }}

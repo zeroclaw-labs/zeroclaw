@@ -764,12 +764,16 @@ fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
 
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
     let location = resolve_skill_location(skill, workspace_dir);
-    if prefer_relative {
-        if let Ok(relative) = location.strip_prefix(workspace_dir) {
-            return relative.display().to_string();
+    let path_str = if prefer_relative {
+        match location.strip_prefix(workspace_dir) {
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => location.display().to_string(),
         }
-    }
-    location.display().to_string()
+    } else {
+        location.display().to_string()
+    };
+    // Normalize path separators to forward slashes for XML output (portable across Windows/Unix)
+    path_str.replace('\\', "/")
 }
 
 /// Build the "Available Skills" system prompt section with full skill instructions.
@@ -1759,19 +1763,32 @@ fn validate_artifact_url(
 // Zip contents follow the OpenClaw convention: `_meta.json` + `SKILL.md` + scripts.
 
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
+const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
+
+fn is_clawhub_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
+}
+
+fn parse_clawhub_url(source: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(source).ok()?;
+    match parsed.scheme() {
+        "https" | "http" => {}
+        _ => return None,
+    }
+    if !parsed.host_str().is_some_and(is_clawhub_host) {
+        return None;
+    }
+    Some(parsed)
+}
 
 /// Returns true if `source` is a ClawhHub skill reference.
 fn is_clawhub_source(source: &str) -> bool {
     if source.starts_with("clawhub:") {
         return true;
     }
-    // Auto-detect from domain: https://clawhub.ai/...
-    if let Some(rest) = source.strip_prefix("https://") {
-        let host = rest.split('/').next().unwrap_or("");
-        return host == CLAWHUB_DOMAIN;
-    }
-    false
+    // Auto-detect from URL host, supporting both clawhub.ai and www.clawhub.ai.
+    parse_clawhub_url(source).is_some()
 }
 
 /// Convert a ClawhHub source string into the zip download URL.
@@ -1794,14 +1811,16 @@ fn clawhub_download_url(source: &str) -> Result<String> {
         }
         return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
     }
-    // Profile URL: https://clawhub.ai/<owner>/<slug>  or  https://clawhub.ai/<slug>
+    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>.
     // Forward the full path as the slug so the API can resolve owner-namespaced skills.
-    if let Some(rest) = source.strip_prefix("https://") {
-        let path = rest
-            .strip_prefix(CLAWHUB_DOMAIN)
-            .unwrap_or("")
-            .trim_start_matches('/');
-        let path = path.trim_end_matches('/');
+    if let Some(parsed) = parse_clawhub_url(source) {
+        let path = parsed
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
         if path.is_empty() {
             anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
         }
@@ -3230,6 +3249,8 @@ description = "Bare minimum"
         assert!(is_clawhub_source("https://clawhub.ai/steipete/gog"));
         assert!(is_clawhub_source("https://clawhub.ai/gog"));
         assert!(is_clawhub_source("https://clawhub.ai/user/my-skill"));
+        assert!(is_clawhub_source("https://www.clawhub.ai/steipete/gog"));
+        assert!(is_clawhub_source("http://clawhub.ai/steipete/gog"));
     }
 
     #[test]
@@ -3249,6 +3270,12 @@ description = "Bare minimum"
     fn clawhub_download_url_from_profile_url() {
         // Owner-namespaced URL: full path forwarded as slug with literal slash
         let url = clawhub_download_url("https://clawhub.ai/steipete/gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=steipete/gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_from_www_profile_url() {
+        let url = clawhub_download_url("https://www.clawhub.ai/steipete/gog").unwrap();
         assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=steipete/gog");
     }
 
