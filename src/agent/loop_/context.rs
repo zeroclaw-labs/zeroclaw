@@ -4,7 +4,7 @@ use std::fmt::Write;
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-pub(super) async fn build_context(
+pub(crate) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-mod context;
+pub(crate) mod context;
 mod execution;
 mod history;
 mod parsing;
