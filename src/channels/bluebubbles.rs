@@ -331,13 +331,9 @@ impl BlueBubblesChannel {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 if status.is_success() {
-                    tracing::info!(
-                        "BlueBubbles mark_read ok guid={normalised} status={status} body={body}"
-                    );
+                    tracing::info!("BlueBubbles mark_read ok status={status} body={body}");
                 } else {
-                    tracing::warn!(
-                        "BlueBubbles mark_read got {status} guid={chat_guid} body={body}"
-                    );
+                    tracing::warn!("BlueBubbles mark_read got {status} body={body}");
                 }
             }
         }

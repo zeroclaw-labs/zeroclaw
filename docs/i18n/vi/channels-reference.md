@@ -115,7 +115,7 @@ Nếu `[channels_config.matrix]`, `[channels_config.lark]`, hoặc `[channels_co
 | Lark/Feishu | websocket (mặc định) hoặc webhook             | Chỉ ở chế độ Webhook                                      |
 | DingTalk    | stream mode                                   | Không                                                     |
 | QQ          | bot gateway                                   | Không                                                     |
-| iMessage    | BlueBubbles webhook (`/bluebubbles`)          | Có (cần máy chủ BlueBubbles truy cập được)                |
+| BlueBubbles | BlueBubbles webhook (`/bluebubbles`)          | Có (cần máy chủ BlueBubbles truy cập được)                |
 
 ---
 
