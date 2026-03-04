@@ -207,7 +207,17 @@ async fn try_download_wa_web_media(
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let safe_sender: String = sender_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let sender_component = if safe_sender.is_empty() {
+        "unknown"
+    } else {
+        &safe_sender
+    };
     let save_dir = workspace.join("whatsapp_files");
 
     // ── Image ──────────────────────────────────────────────────────────
@@ -223,12 +233,20 @@ async fn try_download_wa_web_media(
                 return None;
             }
         };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded image exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
         let ext = image_msg
             .mimetype
             .as_deref()
             .map(mime_to_wa_extension)
             .unwrap_or("jpg");
-        let filename = format!("wa_image_{sender_id}_{ts}.{ext}");
+        let filename = format!("wa_image_{sender_component}_{ts}_{nonce}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
             return None;
@@ -265,6 +283,14 @@ async fn try_download_wa_web_media(
                 return None;
             }
         };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded document exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
         let original_name = doc_msg.file_name.as_deref().unwrap_or("document");
         let ext = std::path::Path::new(original_name)
             .extension()
@@ -276,7 +302,7 @@ async fn try_download_wa_web_media(
                     .map(mime_to_wa_extension)
                     .unwrap_or("bin")
             });
-        let filename = format!("wa_doc_{sender_id}_{ts}.{ext}");
+        let filename = format!("wa_doc_{sender_component}_{ts}_{nonce}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
             return None;
@@ -318,12 +344,20 @@ async fn try_download_wa_web_media(
                 return None;
             }
         };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded video exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
         let ext = video_msg
             .mimetype
             .as_deref()
             .map(mime_to_wa_extension)
             .unwrap_or("mp4");
-        let filename = format!("wa_video_{sender_id}_{ts}.{ext}");
+        let filename = format!("wa_video_{sender_component}_{ts}_{nonce}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
             return None;
@@ -360,12 +394,20 @@ async fn try_download_wa_web_media(
                 return None;
             }
         };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded sticker exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
         let ext = sticker_msg
             .mimetype
             .as_deref()
             .map(mime_to_wa_extension)
             .unwrap_or("webp");
-        let filename = format!("wa_sticker_{sender_id}_{ts}.{ext}");
+        let filename = format!("wa_sticker_{sender_component}_{ts}_{nonce}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
             return None;

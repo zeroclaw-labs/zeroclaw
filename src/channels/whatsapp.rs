@@ -156,7 +156,21 @@ impl WhatsAppChannel {
             anyhow::bail!("WhatsApp media download failed: {status}");
         }
 
+        if let Some(content_len) = data_resp.content_length() {
+            if content_len > WA_CLOUD_MAX_MEDIA_BYTES {
+                anyhow::bail!(
+                    "WhatsApp media too large ({content_len} bytes > {WA_CLOUD_MAX_MEDIA_BYTES})"
+                );
+            }
+        }
+
         let bytes = data_resp.bytes().await?.to_vec();
+        if bytes.len() as u64 > WA_CLOUD_MAX_MEDIA_BYTES {
+            anyhow::bail!(
+                "WhatsApp media too large ({} bytes > {WA_CLOUD_MAX_MEDIA_BYTES})",
+                bytes.len()
+            );
+        }
         Ok((bytes, mime_type))
     }
 
@@ -217,8 +231,15 @@ impl WhatsAppChannel {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        let save_filename = format!("wa_{msg_type}_{from}_{ts}.{ext}");
+            .as_millis();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let safe_from: String = from.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let sender_component = if safe_from.is_empty() {
+            "unknown"
+        } else {
+            &safe_from
+        };
+        let save_filename = format!("wa_{msg_type}_{sender_component}_{ts}_{nonce}.{ext}");
         let save_dir = workspace.join("whatsapp_files");
 
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
