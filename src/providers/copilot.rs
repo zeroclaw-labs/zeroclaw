@@ -667,7 +667,7 @@ impl Provider for CopilotProvider {
         }
         messages.push(ApiMessage {
             role: "user".to_string(),
-            content: Some(ApiContent::Text(message.to_string())),
+            content: Self::to_api_content("user", message),
             tool_call_id: None,
             tool_calls: None,
         });
@@ -785,5 +785,36 @@ mod tests {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    #[test]
+    fn to_api_content_user_with_image_returns_parts() {
+        let content = "describe this [IMAGE:data:image/png;base64,abc123]";
+        let result = CopilotProvider::to_api_content("user", content).unwrap();
+        match result {
+            ApiContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], ContentPart::Text { text } if text == "describe this"));
+                assert!(
+                    matches!(&parts[1], ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,abc123")
+                );
+            }
+            _ => panic!("expected ApiContent::Parts for user message with image marker"),
+        }
+    }
+
+    #[test]
+    fn to_api_content_user_plain_returns_text() {
+        let result = CopilotProvider::to_api_content("user", "hello world").unwrap();
+        assert!(matches!(result, ApiContent::Text(ref s) if s == "hello world"));
+    }
+
+    #[test]
+    fn to_api_content_non_user_returns_text() {
+        let result = CopilotProvider::to_api_content("system", "you are helpful").unwrap();
+        assert!(matches!(result, ApiContent::Text(ref s) if s == "you are helpful"));
+
+        let result = CopilotProvider::to_api_content("assistant", "sure").unwrap();
+        assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
     }
 }
