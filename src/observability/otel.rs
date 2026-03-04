@@ -21,6 +21,7 @@ pub struct OtelObserver {
     tool_calls: Counter<u64>,
     tool_duration: Histogram<f64>,
     channel_messages: Counter<u64>,
+    webhook_auth_failures: Counter<u64>,
     heartbeat_ticks: Counter<u64>,
     errors: Counter<u64>,
     request_latency: Histogram<f64>,
@@ -121,6 +122,11 @@ impl OtelObserver {
             .with_description("Total channel messages")
             .build();
 
+        let webhook_auth_failures = meter
+            .u64_counter("zeroclaw.webhook.auth.failures")
+            .with_description("Total webhook authentication failures")
+            .build();
+
         let heartbeat_ticks = meter
             .u64_counter("zeroclaw.heartbeat.ticks")
             .with_description("Total heartbeat ticks")
@@ -162,6 +168,7 @@ impl OtelObserver {
             tool_calls,
             tool_duration,
             channel_messages,
+            webhook_auth_failures,
             heartbeat_ticks,
             errors,
             request_latency,
@@ -313,6 +320,20 @@ impl Observer for OtelObserver {
                     &[
                         KeyValue::new("channel", channel.clone()),
                         KeyValue::new("direction", direction.clone()),
+                    ],
+                );
+            }
+            ObserverEvent::WebhookAuthFailure {
+                channel,
+                signature,
+                bearer,
+            } => {
+                self.webhook_auth_failures.add(
+                    1,
+                    &[
+                        KeyValue::new("channel", channel.clone()),
+                        KeyValue::new("signature", signature.clone()),
+                        KeyValue::new("bearer", bearer.clone()),
                     ],
                 );
             }

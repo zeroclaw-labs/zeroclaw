@@ -3,7 +3,7 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
-use crate::config::{AutonomyConfig, NonCliNaturalLanguageApprovalMode};
+use crate::config::{AutonomyConfig, CommandContextRuleAction, NonCliNaturalLanguageApprovalMode};
 use crate::security::AutonomyLevel;
 use chrono::{Duration, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -75,6 +75,11 @@ pub struct ApprovalManager {
     auto_approve: RwLock<HashSet<String>>,
     /// Tools that always need approval, ignoring session allowlist (config + runtime updates).
     always_ask: RwLock<HashSet<String>>,
+    /// Command patterns requiring approval even when a tool is auto-approved.
+    ///
+    /// Sourced from `autonomy.command_context_rules` entries where
+    /// `action = "require_approval"`.
+    command_level_require_approval_rules: RwLock<Vec<String>>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
     /// Session-scoped allowlist built from "Always" responses.
@@ -124,11 +129,24 @@ impl ApprovalManager {
             .collect()
     }
 
+    fn extract_command_level_approval_rules(config: &AutonomyConfig) -> Vec<String> {
+        config
+            .command_context_rules
+            .iter()
+            .filter(|rule| rule.action == CommandContextRuleAction::RequireApproval)
+            .map(|rule| rule.command.trim().to_string())
+            .filter(|command| !command.is_empty())
+            .collect()
+    }
+
     /// Create from autonomy config.
     pub fn from_config(config: &AutonomyConfig) -> Self {
         Self {
             auto_approve: RwLock::new(config.auto_approve.iter().cloned().collect()),
             always_ask: RwLock::new(config.always_ask.iter().cloned().collect()),
+            command_level_require_approval_rules: RwLock::new(
+                Self::extract_command_level_approval_rules(config),
+            ),
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
             non_cli_allowlist: Mutex::new(HashSet::new()),
@@ -182,6 +200,33 @@ impl ApprovalManager {
 
         // Default: supervised mode requires approval.
         true
+    }
+
+    /// Check whether a specific tool call (including arguments) needs interactive approval.
+    ///
+    /// This extends [`Self::needs_approval`] with command-level approval matching:
+    /// when a call carries a `command` argument that matches a
+    /// `command_context_rules[action=require_approval]` pattern, the call is
+    /// approval-gated in supervised mode even if the tool is in `auto_approve`.
+    pub fn needs_approval_for_call(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        if self.needs_approval(tool_name) {
+            return true;
+        }
+
+        if self.autonomy_level != AutonomyLevel::Supervised {
+            return false;
+        }
+
+        let rules = self.command_level_require_approval_rules.read();
+        if rules.is_empty() {
+            return false;
+        }
+
+        let Some(command) = extract_command_argument(args) else {
+            return false;
+        };
+
+        command_matches_require_approval_rules(&command, &rules)
     }
 
     /// Record an approval decision and update session state.
@@ -356,6 +401,7 @@ impl ApprovalManager {
         &self,
         auto_approve: &[String],
         always_ask: &[String],
+        command_context_rules: &[crate::config::CommandContextRuleConfig],
         non_cli_approval_approvers: &[String],
         non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
         non_cli_natural_language_approval_mode_by_channel: &HashMap<
@@ -370,6 +416,15 @@ impl ApprovalManager {
         {
             let mut always = self.always_ask.write();
             *always = always_ask.iter().cloned().collect();
+        }
+        {
+            let mut rules = self.command_level_require_approval_rules.write();
+            *rules = command_context_rules
+                .iter()
+                .filter(|rule| rule.action == CommandContextRuleAction::RequireApproval)
+                .map(|rule| rule.command.trim().to_string())
+                .filter(|command| !command.is_empty())
+                .collect();
         }
         {
             let mut approvers = self.non_cli_approval_approvers.write();
@@ -638,6 +693,186 @@ fn summarize_args(args: &serde_json::Value) -> String {
     }
 }
 
+fn extract_command_argument(args: &serde_json::Value) -> Option<String> {
+    for alias in ["command", "cmd", "shell_command", "bash", "sh", "input"] {
+        if let Some(command) = args
+            .get(alias)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+        {
+            return Some(command.to_string());
+        }
+    }
+
+    args.as_str()
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .map(ToString::to_string)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+}
+
+fn split_unquoted_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
+        let trimmed = current.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed.to_string());
+        }
+        current.clear();
+    };
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
+                }
+
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        current.push(ch);
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        current.push(ch);
+                    }
+                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    '|' => {
+                        if chars.next_if_eq(&'|').is_some() {
+                            // consume full `||`
+                        }
+                        push_segment(&mut segments, &mut current);
+                    }
+                    '&' => {
+                        if chars.next_if_eq(&'&').is_some() {
+                            // consume full `&&`
+                            push_segment(&mut segments, &mut current);
+                        } else {
+                            current.push(ch);
+                        }
+                    }
+                    _ => current.push(ch),
+                }
+            }
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+
+    segments
+}
+
+fn skip_env_assignments(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        let Some(word) = rest.split_whitespace().next() else {
+            return rest;
+        };
+
+        if word.contains('=')
+            && word
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            rest = rest[word.len()..].trim_start();
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn strip_wrapping_quotes(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    }
+}
+
+fn command_rule_matches(rule: &str, executable: &str, executable_base: &str) -> bool {
+    let normalized_rule = strip_wrapping_quotes(rule).trim();
+    if normalized_rule.is_empty() {
+        return false;
+    }
+
+    if normalized_rule == "*" {
+        return true;
+    }
+
+    if normalized_rule.contains('/') {
+        strip_wrapping_quotes(executable).trim() == normalized_rule
+    } else {
+        normalized_rule == executable_base
+    }
+}
+
+fn command_matches_require_approval_rules(command: &str, rules: &[String]) -> bool {
+    split_unquoted_segments(command).into_iter().any(|segment| {
+        let cmd_part = skip_env_assignments(&segment);
+        let mut words = cmd_part.split_whitespace();
+        let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+        let base_cmd = executable.rsplit('/').next().unwrap_or("").trim();
+
+        if base_cmd.is_empty() {
+            return false;
+        }
+
+        rules
+            .iter()
+            .any(|rule| command_rule_matches(rule, executable, base_cmd))
+    })
+}
+
 fn truncate_for_summary(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
@@ -667,7 +902,7 @@ fn prune_expired_pending_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AutonomyConfig;
+    use crate::config::{AutonomyConfig, CommandContextRuleConfig};
 
     fn supervised_config() -> AutonomyConfig {
         AutonomyConfig {
@@ -681,6 +916,23 @@ mod tests {
     fn full_config() -> AutonomyConfig {
         AutonomyConfig {
             level: AutonomyLevel::Full,
+            ..AutonomyConfig::default()
+        }
+    }
+
+    fn shell_auto_approve_with_command_rule_approval() -> AutonomyConfig {
+        AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: vec!["shell".into()],
+            always_ask: vec![],
+            command_context_rules: vec![CommandContextRuleConfig {
+                command: "rm".into(),
+                action: CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
             ..AutonomyConfig::default()
         }
     }
@@ -705,6 +957,21 @@ mod tests {
         let mgr = ApprovalManager::from_config(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
         assert!(mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn command_level_rule_requires_prompt_even_when_tool_is_auto_approved() {
+        let mgr = ApprovalManager::from_config(&shell_auto_approve_with_command_rule_approval());
+        assert!(!mgr.needs_approval("shell"));
+
+        assert!(!mgr.needs_approval_for_call("shell", &serde_json::json!({"command": "ls -la"})));
+        assert!(
+            mgr.needs_approval_for_call("shell", &serde_json::json!({"command": "rm -f tmp.txt"}))
+        );
+        assert!(mgr.needs_approval_for_call(
+            "shell",
+            &serde_json::json!({"command": "ls && rm -f tmp.txt"})
+        ));
     }
 
     #[test]
@@ -1029,9 +1296,19 @@ mod tests {
             NonCliNaturalLanguageApprovalMode::RequestConfirm,
         );
 
+        let command_context_rules = vec![CommandContextRuleConfig {
+            command: "rm".to_string(),
+            action: CommandContextRuleAction::RequireApproval,
+            allowed_domains: vec![],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+
         mgr.replace_runtime_non_cli_policy(
             &["mock_price".to_string()],
             &["shell".to_string()],
+            &command_context_rules,
             &["telegram:alice".to_string()],
             NonCliNaturalLanguageApprovalMode::Direct,
             &mode_overrides,
@@ -1053,6 +1330,8 @@ mod tests {
             mgr.non_cli_natural_language_approval_mode_for_channel("slack"),
             NonCliNaturalLanguageApprovalMode::Direct
         );
+        assert!(mgr
+            .needs_approval_for_call("shell", &serde_json::json!({"command": "rm -f notes.txt"})));
     }
 
     // ── audit log ────────────────────────────────────────────

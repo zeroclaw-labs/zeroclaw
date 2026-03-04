@@ -67,6 +67,8 @@ impl Provider for MockProvider {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             });
         }
         Ok(guard.remove(0))
@@ -194,6 +196,8 @@ impl Provider for RecordingProvider {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             });
         }
         Ok(guard.remove(0))
@@ -244,6 +248,8 @@ fn text_response(text: &str) -> ChatResponse {
         usage: None,
         reasoning_content: None,
         quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -254,6 +260,8 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
         usage: None,
         reasoning_content: None,
         quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -380,6 +388,8 @@ async fn e2e_xml_dispatcher_tool_call() {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         },
         text_response("XML tool executed"),
     ]));
@@ -1019,6 +1029,8 @@ async fn e2e_agent_research_prompt_guided() {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1038,6 +1050,8 @@ async fn e2e_agent_research_prompt_guided() {
         usage: None,
         reasoning_content: None,
         quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     // Response 2: Research complete
@@ -1047,6 +1061,8 @@ async fn e2e_agent_research_prompt_guided() {
         usage: None,
         reasoning_content: None,
         quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     };
 
     // Response 3: Main turn response

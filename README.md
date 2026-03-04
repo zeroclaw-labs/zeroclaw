@@ -25,7 +25,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="docs/i18n/zh-CN/README.md">简体中文</a> · <a href="docs/i18n/ja/README.md">日本語</a> · <a href="docs/i18n/ru/README.md">Русский</a> · <a href="docs/i18n/fr/README.md">Français</a> · <a href="docs/i18n/vi/README.md">Tiếng Việt</a> · <a href="docs/i18n/el/README.md">Ελληνικά</a>
+  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="docs/i18n/zh-CN/README.md">简体中文</a> · <a href="docs/i18n/es/README.md">Español</a> · <a href="docs/i18n/pt/README.md">Português</a> · <a href="docs/i18n/it/README.md">Italiano</a> · <a href="docs/i18n/ja/README.md">日本語</a> · <a href="docs/i18n/ru/README.md">Русский</a> · <a href="docs/i18n/fr/README.md">Français</a> · <a href="docs/i18n/vi/README.md">Tiếng Việt</a> · <a href="docs/i18n/el/README.md">Ελληνικά</a>
 </p>
 
 <p align="center">
@@ -82,6 +82,12 @@ Use this board for important notices (breaking changes, security advisories, mai
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
 ## Quick Start
+
+### Option 0: One-line Installer (Default TUI Onboarding)
+
+```bash
+curl -fsSL https://zeroclawlabs.ai/install.sh | bash
+```
 
 ### Option 1: Homebrew (macOS/Linuxbrew)
 

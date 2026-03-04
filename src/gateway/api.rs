@@ -703,6 +703,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     }
     if let Some(wati) = masked.channels_config.wati.as_mut() {
         mask_required_secret(&mut wati.api_token);
+        mask_optional_secret(&mut wati.webhook_secret);
     }
     if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
         mask_required_secret(&mut nextcloud.app_token);
@@ -874,6 +875,7 @@ fn restore_masked_sensitive_fields(
         current.channels_config.wati.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.nextcloud_talk.as_mut(),
@@ -1067,6 +1069,7 @@ mod tests {
         cfg.channels_config.wati = Some(WatiConfig {
             api_token: "wati-real-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
+            webhook_secret: Some("wati-hook-secret".to_string()),
             tenant_id: Some("tenant-1".to_string()),
             allowed_numbers: vec!["*".to_string()],
         });
@@ -1136,6 +1139,14 @@ mod tests {
         assert_eq!(
             masked
                 .channels_config
+                .wati
+                .as_ref()
+                .and_then(|value| value.webhook_secret.as_deref()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked
+                .channels_config
                 .email
                 .as_ref()
                 .map(|value| value.password.as_str()),
@@ -1175,6 +1186,7 @@ mod tests {
         current.channels_config.wati = Some(WatiConfig {
             api_token: "wati-real-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
+            webhook_secret: Some("wati-hook-secret".to_string()),
             tenant_id: Some("tenant-1".to_string()),
             allowed_numbers: vec!["*".to_string()],
         });
@@ -1253,6 +1265,14 @@ mod tests {
                 .as_ref()
                 .map(|value| value.api_token.as_str()),
             Some("wati-real-token")
+        );
+        assert_eq!(
+            restored
+                .channels_config
+                .wati
+                .as_ref()
+                .and_then(|value| value.webhook_secret.as_deref()),
+            Some("wati-hook-secret")
         );
         assert_eq!(
             restored

@@ -1098,7 +1098,12 @@ impl Provider for OpenAiCodexProvider {
 
         // Normalize images: convert file paths to data URIs
         let config = crate::config::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+        let prepared = crate::multimodal::prepare_messages_for_provider_with_provider_hint(
+            &messages,
+            &config,
+            Some("openai"),
+        )
+        .await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
@@ -1113,7 +1118,12 @@ impl Provider for OpenAiCodexProvider {
     ) -> anyhow::Result<String> {
         // Normalize image markers: convert file paths to data URIs
         let config = crate::config::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared = crate::multimodal::prepare_messages_for_provider_with_provider_hint(
+            messages,
+            &config,
+            Some("openai"),
+        )
+        .await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
@@ -1591,6 +1601,7 @@ data: [DONE]
             reasoning_enabled: None,
             reasoning_level: None,
             custom_provider_api_mode: None,
+            custom_provider_auth_header: None,
             max_tokens_override: None,
             model_support_vision: None,
         };

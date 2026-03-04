@@ -1,5 +1,8 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use crate::config::{
+    AgentLoadBalanceStrategy, AgentTeamsConfig, ClassificationRule, Config, DelegateAgentConfig,
+    ModelRouteConfig, SubAgentsConfig,
+};
 use crate::providers::has_provider_credential;
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
@@ -238,6 +241,42 @@ impl ModelRoutingConfigTool {
         Ok(Some(value))
     }
 
+    fn parse_load_strategy(raw: &str, field: &str) -> anyhow::Result<AgentLoadBalanceStrategy> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "semantic" | "score_first" | "scored" => Ok(AgentLoadBalanceStrategy::Semantic),
+            "adaptive" | "balanced" | "load_adaptive" => Ok(AgentLoadBalanceStrategy::Adaptive),
+            "least_loaded" | "leastload" | "least_load" => {
+                Ok(AgentLoadBalanceStrategy::LeastLoaded)
+            }
+            _ => anyhow::bail!("'{field}' must be one of: semantic, adaptive, least_loaded"),
+        }
+    }
+
+    fn parse_optional_load_strategy_update(
+        args: &Value,
+        field: &str,
+    ) -> anyhow::Result<MaybeSet<AgentLoadBalanceStrategy>> {
+        let Some(raw) = args.get(field) else {
+            return Ok(MaybeSet::Unset);
+        };
+
+        if raw.is_null() {
+            return Ok(MaybeSet::Null);
+        }
+
+        let value = raw
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
+            .trim();
+
+        if value.is_empty() {
+            return Ok(MaybeSet::Null);
+        }
+
+        Ok(MaybeSet::Set(Self::parse_load_strategy(value, field)?))
+    }
+
     fn scenario_row(route: &ModelRouteConfig, rule: Option<&ClassificationRule>) -> Value {
         let classification = rule.map(|r| {
             json!({
@@ -303,6 +342,9 @@ impl ModelRoutingConfigTool {
                         &agent.provider,
                         agent.api_key.as_deref()
                     ),
+                    "enabled": agent.enabled,
+                    "capabilities": agent.capabilities,
+                    "priority": agent.priority,
                     "temperature": agent.temperature,
                     "max_depth": agent.max_depth,
                     "agentic": agent.agentic,
@@ -325,6 +367,30 @@ impl ModelRoutingConfigTool {
             "scenarios": scenarios,
             "classification_only_rules": classification_only_rules,
             "agents": agents,
+            "agent_orchestration": {
+                "teams": {
+                    "enabled": cfg.agent.teams.enabled,
+                    "auto_activate": cfg.agent.teams.auto_activate,
+                    "max_agents": cfg.agent.teams.max_agents,
+                    "strategy": cfg.agent.teams.strategy,
+                    "load_window_secs": cfg.agent.teams.load_window_secs,
+                    "inflight_penalty": cfg.agent.teams.inflight_penalty,
+                    "recent_selection_penalty": cfg.agent.teams.recent_selection_penalty,
+                    "recent_failure_penalty": cfg.agent.teams.recent_failure_penalty,
+                },
+                "subagents": {
+                    "enabled": cfg.agent.subagents.enabled,
+                    "auto_activate": cfg.agent.subagents.auto_activate,
+                    "max_concurrent": cfg.agent.subagents.max_concurrent,
+                    "strategy": cfg.agent.subagents.strategy,
+                    "load_window_secs": cfg.agent.subagents.load_window_secs,
+                    "inflight_penalty": cfg.agent.subagents.inflight_penalty,
+                    "recent_selection_penalty": cfg.agent.subagents.recent_selection_penalty,
+                    "recent_failure_penalty": cfg.agent.subagents.recent_failure_penalty,
+                    "queue_wait_ms": cfg.agent.subagents.queue_wait_ms,
+                    "queue_poll_ms": cfg.agent.subagents.queue_poll_ms,
+                }
+            }
         })
     }
 
@@ -402,6 +468,27 @@ impl ModelRoutingConfigTool {
                         "keywords": ["code", "bug", "refactor", "test"],
                         "patterns": ["```"],
                         "priority": 50
+                    },
+                    "orchestration": {
+                        "action": "set_orchestration",
+                        "teams_enabled": true,
+                        "teams_auto_activate": true,
+                        "max_team_agents": 12,
+                        "teams_strategy": "adaptive",
+                        "teams_load_window_secs": 120,
+                        "teams_inflight_penalty": 8,
+                        "teams_recent_selection_penalty": 2,
+                        "teams_recent_failure_penalty": 12,
+                        "subagents_enabled": true,
+                        "subagents_auto_activate": true,
+                        "max_concurrent_subagents": 4,
+                        "subagents_strategy": "adaptive",
+                        "subagents_load_window_secs": 180,
+                        "subagents_inflight_penalty": 10,
+                        "subagents_recent_selection_penalty": 3,
+                        "subagents_recent_failure_penalty": 16,
+                        "subagents_queue_wait_ms": 15000,
+                        "subagents_queue_poll_ms": 200
                     }
                 }
             }))?,
@@ -455,6 +542,201 @@ impl ModelRoutingConfigTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "message": "Default provider/model settings updated",
+                "config": Self::snapshot(&cfg),
+            }))?,
+            error: None,
+        })
+    }
+
+    async fn handle_set_orchestration(&self, args: &Value) -> anyhow::Result<ToolResult> {
+        let teams_enabled = Self::parse_optional_bool(args, "teams_enabled")?;
+        let teams_auto_activate = Self::parse_optional_bool(args, "teams_auto_activate")?;
+        let max_team_agents_update = Self::parse_optional_usize_update(args, "max_team_agents")?;
+        let teams_strategy_update =
+            Self::parse_optional_load_strategy_update(args, "teams_strategy")?;
+        let teams_load_window_secs_update =
+            Self::parse_optional_usize_update(args, "teams_load_window_secs")?;
+        let teams_inflight_penalty_update =
+            Self::parse_optional_usize_update(args, "teams_inflight_penalty")?;
+        let teams_recent_selection_penalty_update =
+            Self::parse_optional_usize_update(args, "teams_recent_selection_penalty")?;
+        let teams_recent_failure_penalty_update =
+            Self::parse_optional_usize_update(args, "teams_recent_failure_penalty")?;
+
+        let subagents_enabled = Self::parse_optional_bool(args, "subagents_enabled")?;
+        let subagents_auto_activate = Self::parse_optional_bool(args, "subagents_auto_activate")?;
+        let max_concurrent_subagents_update =
+            Self::parse_optional_usize_update(args, "max_concurrent_subagents")?;
+        let subagents_strategy_update =
+            Self::parse_optional_load_strategy_update(args, "subagents_strategy")?;
+        let subagents_load_window_secs_update =
+            Self::parse_optional_usize_update(args, "subagents_load_window_secs")?;
+        let subagents_inflight_penalty_update =
+            Self::parse_optional_usize_update(args, "subagents_inflight_penalty")?;
+        let subagents_recent_selection_penalty_update =
+            Self::parse_optional_usize_update(args, "subagents_recent_selection_penalty")?;
+        let subagents_recent_failure_penalty_update =
+            Self::parse_optional_usize_update(args, "subagents_recent_failure_penalty")?;
+        let subagents_queue_wait_ms_update =
+            Self::parse_optional_usize_update(args, "subagents_queue_wait_ms")?;
+        let subagents_queue_poll_ms_update =
+            Self::parse_optional_usize_update(args, "subagents_queue_poll_ms")?;
+
+        let any_update = teams_enabled.is_some()
+            || teams_auto_activate.is_some()
+            || subagents_enabled.is_some()
+            || subagents_auto_activate.is_some()
+            || !matches!(max_team_agents_update, MaybeSet::Unset)
+            || !matches!(teams_strategy_update, MaybeSet::Unset)
+            || !matches!(teams_load_window_secs_update, MaybeSet::Unset)
+            || !matches!(teams_inflight_penalty_update, MaybeSet::Unset)
+            || !matches!(teams_recent_selection_penalty_update, MaybeSet::Unset)
+            || !matches!(teams_recent_failure_penalty_update, MaybeSet::Unset)
+            || !matches!(max_concurrent_subagents_update, MaybeSet::Unset)
+            || !matches!(subagents_strategy_update, MaybeSet::Unset)
+            || !matches!(subagents_load_window_secs_update, MaybeSet::Unset)
+            || !matches!(subagents_inflight_penalty_update, MaybeSet::Unset)
+            || !matches!(subagents_recent_selection_penalty_update, MaybeSet::Unset)
+            || !matches!(subagents_recent_failure_penalty_update, MaybeSet::Unset)
+            || !matches!(subagents_queue_wait_ms_update, MaybeSet::Unset)
+            || !matches!(subagents_queue_poll_ms_update, MaybeSet::Unset);
+        if !any_update {
+            anyhow::bail!(
+                "set_orchestration requires at least one field: \
+                 teams_enabled, teams_auto_activate, max_team_agents, \
+                 teams_strategy, teams_load_window_secs, teams_inflight_penalty, \
+                 teams_recent_selection_penalty, teams_recent_failure_penalty, \
+                 subagents_enabled, subagents_auto_activate, max_concurrent_subagents, \
+                 subagents_strategy, subagents_load_window_secs, subagents_inflight_penalty, \
+                 subagents_recent_selection_penalty, subagents_recent_failure_penalty, \
+                 subagents_queue_wait_ms, subagents_queue_poll_ms"
+            );
+        }
+
+        let mut cfg = self.load_config_without_env()?;
+        let team_defaults = AgentTeamsConfig::default();
+        let subagent_defaults = SubAgentsConfig::default();
+
+        if let Some(value) = teams_enabled {
+            cfg.agent.teams.enabled = value;
+        }
+        if let Some(value) = teams_auto_activate {
+            cfg.agent.teams.auto_activate = value;
+        }
+        match max_team_agents_update {
+            MaybeSet::Set(value) => cfg.agent.teams.max_agents = value,
+            MaybeSet::Null => cfg.agent.teams.max_agents = team_defaults.max_agents,
+            MaybeSet::Unset => {}
+        }
+        match teams_strategy_update {
+            MaybeSet::Set(value) => cfg.agent.teams.strategy = value,
+            MaybeSet::Null => cfg.agent.teams.strategy = team_defaults.strategy,
+            MaybeSet::Unset => {}
+        }
+        match teams_load_window_secs_update {
+            MaybeSet::Set(value) => cfg.agent.teams.load_window_secs = value,
+            MaybeSet::Null => cfg.agent.teams.load_window_secs = team_defaults.load_window_secs,
+            MaybeSet::Unset => {}
+        }
+        match teams_inflight_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.teams.inflight_penalty = value,
+            MaybeSet::Null => cfg.agent.teams.inflight_penalty = team_defaults.inflight_penalty,
+            MaybeSet::Unset => {}
+        }
+        match teams_recent_selection_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.teams.recent_selection_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.teams.recent_selection_penalty = team_defaults.recent_selection_penalty;
+            }
+            MaybeSet::Unset => {}
+        }
+        match teams_recent_failure_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.teams.recent_failure_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.teams.recent_failure_penalty = team_defaults.recent_failure_penalty;
+            }
+            MaybeSet::Unset => {}
+        }
+
+        if let Some(value) = subagents_enabled {
+            cfg.agent.subagents.enabled = value;
+        }
+        if let Some(value) = subagents_auto_activate {
+            cfg.agent.subagents.auto_activate = value;
+        }
+        match max_concurrent_subagents_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.max_concurrent = value,
+            MaybeSet::Null => cfg.agent.subagents.max_concurrent = subagent_defaults.max_concurrent,
+            MaybeSet::Unset => {}
+        }
+        match subagents_strategy_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.strategy = value,
+            MaybeSet::Null => cfg.agent.subagents.strategy = subagent_defaults.strategy,
+            MaybeSet::Unset => {}
+        }
+        match subagents_load_window_secs_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.load_window_secs = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.load_window_secs = subagent_defaults.load_window_secs;
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_inflight_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.inflight_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.inflight_penalty = subagent_defaults.inflight_penalty;
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_recent_selection_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.recent_selection_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.recent_selection_penalty =
+                    subagent_defaults.recent_selection_penalty;
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_recent_failure_penalty_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.recent_failure_penalty = value,
+            MaybeSet::Null => {
+                cfg.agent.subagents.recent_failure_penalty =
+                    subagent_defaults.recent_failure_penalty;
+            }
+            MaybeSet::Unset => {}
+        }
+        match subagents_queue_wait_ms_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.queue_wait_ms = value,
+            MaybeSet::Null => cfg.agent.subagents.queue_wait_ms = subagent_defaults.queue_wait_ms,
+            MaybeSet::Unset => {}
+        }
+        match subagents_queue_poll_ms_update {
+            MaybeSet::Set(value) => cfg.agent.subagents.queue_poll_ms = value,
+            MaybeSet::Null => cfg.agent.subagents.queue_poll_ms = subagent_defaults.queue_poll_ms,
+            MaybeSet::Unset => {}
+        }
+
+        if cfg.agent.teams.max_agents == 0 {
+            anyhow::bail!("'max_team_agents' must be greater than 0");
+        }
+        if cfg.agent.teams.load_window_secs == 0 {
+            anyhow::bail!("'teams_load_window_secs' must be greater than 0");
+        }
+        if cfg.agent.subagents.max_concurrent == 0 {
+            anyhow::bail!("'max_concurrent_subagents' must be greater than 0");
+        }
+        if cfg.agent.subagents.load_window_secs == 0 {
+            anyhow::bail!("'subagents_load_window_secs' must be greater than 0");
+        }
+        if cfg.agent.subagents.queue_poll_ms == 0 {
+            anyhow::bail!("'subagents_queue_poll_ms' must be greater than 0");
+        }
+
+        cfg.save().await?;
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "message": "Agent orchestration settings updated",
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
@@ -659,9 +941,16 @@ impl ModelRoutingConfigTool {
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
+        let enabled_update = Self::parse_optional_bool(args, "enabled")?;
+        let priority_update = Self::parse_optional_i32_update(args, "priority")?;
 
         let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
             Some(Self::parse_string_list(raw, "allowed_tools")?)
+        } else {
+            None
+        };
+        let capabilities_update = if let Some(raw) = args.get("capabilities") {
+            Some(Self::parse_string_list(raw, "capabilities")?)
         } else {
             None
         };
@@ -677,6 +966,9 @@ impl ModelRoutingConfigTool {
                 model: model.clone(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: DEFAULT_AGENT_MAX_DEPTH,
                 agentic: false,
@@ -696,6 +988,20 @@ impl ModelRoutingConfigTool {
         match api_key_update {
             MaybeSet::Set(value) => next_agent.api_key = Some(value),
             MaybeSet::Null => next_agent.api_key = None,
+            MaybeSet::Unset => {}
+        }
+
+        if let Some(enabled) = enabled_update {
+            next_agent.enabled = enabled;
+        }
+
+        if let Some(capabilities) = capabilities_update {
+            next_agent.capabilities = capabilities;
+        }
+
+        match priority_update {
+            MaybeSet::Set(value) => next_agent.priority = value,
+            MaybeSet::Null => next_agent.priority = 0,
             MaybeSet::Unset => {}
         }
 
@@ -787,7 +1093,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
+        "Manage default model settings, scenario routes, classification rules, delegate profiles, and agent team/subagent orchestration controls. Designed for natural-language runtime reconfiguration (enable/disable, strategy, and capacity tuning)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -800,6 +1106,7 @@ impl Tool for ModelRoutingConfigTool {
                         "get",
                         "list_hints",
                         "set_default",
+                        "set_orchestration",
                         "upsert_scenario",
                         "remove_scenario",
                         "upsert_agent",
@@ -858,7 +1165,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "priority": {
                     "type": ["integer", "null"],
-                    "description": "Classification priority (higher runs first)"
+                    "description": "Priority value. For scenarios: classifier order (higher runs first). For upsert_agent: delegate selection priority."
                 },
                 "classification_enabled": {
                     "type": "boolean",
@@ -875,6 +1182,17 @@ impl Tool for ModelRoutingConfigTool {
                 "system_prompt": {
                     "type": ["string", "null"],
                     "description": "Optional system prompt override for delegate agent"
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Enable or disable a delegate profile for selection/invocation"
+                },
+                "capabilities": {
+                    "description": "Capability tags for automatic agent selection (string or string array)",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
+                    ]
                 },
                 "max_depth": {
                     "type": ["integer", "null"],
@@ -896,12 +1214,99 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "description": "Maximum tool-call iterations for agentic delegate mode"
+                },
+                "teams_enabled": {
+                    "type": "boolean",
+                    "description": "Enable/disable synchronous agent-team delegation tools"
+                },
+                "teams_auto_activate": {
+                    "type": "boolean",
+                    "description": "Enable/disable automatic team-agent selection when agent is omitted or 'auto'"
+                },
+                "max_team_agents": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Maximum number of delegate profiles activated for teams (positive integer, no hard-coded upper cap)"
+                },
+                "teams_strategy": {
+                    "type": ["string", "null"],
+                    "enum": ["semantic", "adaptive", "least_loaded", null],
+                    "description": "Team auto-selection strategy"
+                },
+                "teams_load_window_secs": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Recent-event window for team load balancing (seconds)"
+                },
+                "teams_inflight_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Team score penalty per in-flight task"
+                },
+                "teams_recent_selection_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Team score penalty per recent assignment in the load window"
+                },
+                "teams_recent_failure_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Team score penalty per recent failure in the load window"
+                },
+                "subagents_enabled": {
+                    "type": "boolean",
+                    "description": "Enable/disable background sub-agent tools"
+                },
+                "subagents_auto_activate": {
+                    "type": "boolean",
+                    "description": "Enable/disable automatic sub-agent selection when agent is omitted or 'auto'"
+                },
+                "max_concurrent_subagents": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Maximum number of concurrently running background sub-agents (positive integer, no hard-coded upper cap)"
+                },
+                "subagents_strategy": {
+                    "type": ["string", "null"],
+                    "enum": ["semantic", "adaptive", "least_loaded", null],
+                    "description": "Sub-agent auto-selection strategy"
+                },
+                "subagents_load_window_secs": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Recent-event window for sub-agent load balancing (seconds)"
+                },
+                "subagents_inflight_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Sub-agent score penalty per in-flight task"
+                },
+                "subagents_recent_selection_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Sub-agent score penalty per recent assignment in the load window"
+                },
+                "subagents_recent_failure_penalty": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Sub-agent score penalty per recent failure in the load window"
+                },
+                "subagents_queue_wait_ms": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "How long to wait for sub-agent capacity before failing (milliseconds)"
+                },
+                "subagents_queue_poll_ms": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Poll interval while waiting for sub-agent capacity (milliseconds)"
                 }
             },
             "additionalProperties": false
         })
     }
 
+    #[allow(clippy::large_futures)]
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")
@@ -913,6 +1318,7 @@ impl Tool for ModelRoutingConfigTool {
             "get" => self.handle_get(),
             "list_hints" => self.handle_list_hints(),
             "set_default"
+            | "set_orchestration"
             | "upsert_scenario"
             | "remove_scenario"
             | "upsert_agent"
@@ -923,6 +1329,7 @@ impl Tool for ModelRoutingConfigTool {
 
                 match action.as_str() {
                     "set_default" => self.handle_set_default(&args).await,
+                    "set_orchestration" => self.handle_set_orchestration(&args).await,
                     "upsert_scenario" => self.handle_upsert_scenario(&args).await,
                     "remove_scenario" => self.handle_remove_scenario(&args).await,
                     "upsert_agent" => self.handle_upsert_agent(&args).await,
@@ -931,7 +1338,7 @@ impl Tool for ModelRoutingConfigTool {
                 }
             }
             _ => anyhow::bail!(
-                "Unknown action '{action}'. Valid: get, list_hints, set_default, upsert_scenario, remove_scenario, upsert_agent, remove_agent"
+                "Unknown action '{action}'. Valid: get, list_hints, set_default, set_orchestration, upsert_scenario, remove_scenario, upsert_agent, remove_agent"
             ),
         };
 
@@ -947,6 +1354,7 @@ impl Tool for ModelRoutingConfigTool {
 }
 
 #[cfg(test)]
+#[allow(clippy::large_futures)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -1196,6 +1604,312 @@ mod tests {
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(output["agents"]["coder"].is_null());
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_persists_selection_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let upsert = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "planner",
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "enabled": false,
+                "capabilities": ["planning", "analysis"],
+                "priority": 7
+            }))
+            .await
+            .unwrap();
+        assert!(upsert.success, "{:?}", upsert.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(output["agents"]["planner"]["enabled"], json!(false));
+        assert_eq!(
+            output["agents"]["planner"]["capabilities"],
+            json!(["planning", "analysis"])
+        );
+        assert_eq!(output["agents"]["planner"]["priority"], json!(7));
+
+        let reset = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "planner",
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "priority": null
+            }))
+            .await
+            .unwrap();
+        assert!(reset.success, "{:?}", reset.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(output["agents"]["planner"]["priority"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_updates_team_and_subagent_controls() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let updated = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "teams_enabled": false,
+                "teams_auto_activate": false,
+                "max_team_agents": 5,
+                "teams_strategy": "least_loaded",
+                "teams_load_window_secs": 90,
+                "teams_inflight_penalty": 6,
+                "teams_recent_selection_penalty": 2,
+                "teams_recent_failure_penalty": 14,
+                "subagents_enabled": true,
+                "subagents_auto_activate": false,
+                "max_concurrent_subagents": 3,
+                "subagents_strategy": "semantic",
+                "subagents_load_window_secs": 60,
+                "subagents_inflight_penalty": 4,
+                "subagents_recent_selection_penalty": 1,
+                "subagents_recent_failure_penalty": 9,
+                "subagents_queue_wait_ms": 500,
+                "subagents_queue_poll_ms": 20
+            }))
+            .await
+            .unwrap();
+        assert!(updated.success, "{:?}", updated.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["enabled"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["auto_activate"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["max_agents"],
+            json!(5)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["strategy"],
+            json!("least_loaded")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["load_window_secs"],
+            json!(90)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["inflight_penalty"],
+            json!(6)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["recent_selection_penalty"],
+            json!(2)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["recent_failure_penalty"],
+            json!(14)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["enabled"],
+            json!(true)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["auto_activate"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["max_concurrent"],
+            json!(3)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["strategy"],
+            json!("semantic")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["load_window_secs"],
+            json!(60)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["inflight_penalty"],
+            json!(4)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["recent_selection_penalty"],
+            json!(1)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["recent_failure_penalty"],
+            json!(9)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_wait_ms"],
+            json!(500)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_poll_ms"],
+            json!(20)
+        );
+
+        let reset = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_team_agents": null,
+                "teams_strategy": null,
+                "teams_load_window_secs": null,
+                "teams_inflight_penalty": null,
+                "teams_recent_selection_penalty": null,
+                "teams_recent_failure_penalty": null,
+                "max_concurrent_subagents": null,
+                "subagents_strategy": null,
+                "subagents_load_window_secs": null,
+                "subagents_inflight_penalty": null,
+                "subagents_recent_selection_penalty": null,
+                "subagents_recent_failure_penalty": null,
+                "subagents_queue_wait_ms": null,
+                "subagents_queue_poll_ms": null
+            }))
+            .await
+            .unwrap();
+        assert!(reset.success, "{:?}", reset.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["max_agents"],
+            json!(32)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["max_concurrent"],
+            json!(10)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["strategy"],
+            json!("adaptive")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["strategy"],
+            json!("adaptive")
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_wait_ms"],
+            json!(15000)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_poll_ms"],
+            json!(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_rejects_invalid_strategy() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(config, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "teams_strategy": "randomized"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("teams_strategy"));
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_accepts_large_capacity_values_without_hard_cap() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_team_agents": 512,
+                "max_concurrent_subagents": 256,
+                "subagents_queue_wait_ms": 0,
+                "subagents_queue_poll_ms": 25
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+
+        assert_eq!(
+            output["agent_orchestration"]["teams"]["max_agents"],
+            json!(512)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["max_concurrent"],
+            json!(256)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_wait_ms"],
+            json!(0)
+        );
+        assert_eq!(
+            output["agent_orchestration"]["subagents"]["queue_poll_ms"],
+            json!(25)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_orchestration_rejects_zero_capacity_and_poll_interval() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let zero_team_agents = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_team_agents": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!zero_team_agents.success);
+        assert!(zero_team_agents
+            .error
+            .unwrap_or_default()
+            .contains("max_team_agents"));
+
+        let zero_subagents = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "max_concurrent_subagents": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!zero_subagents.success);
+        assert!(zero_subagents
+            .error
+            .unwrap_or_default()
+            .contains("max_concurrent_subagents"));
+
+        let zero_poll = tool
+            .execute(json!({
+                "action": "set_orchestration",
+                "subagents_queue_poll_ms": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!zero_poll.success);
+        assert!(zero_poll
+            .error
+            .unwrap_or_default()
+            .contains("subagents_queue_poll_ms"));
     }
 
     #[tokio::test]

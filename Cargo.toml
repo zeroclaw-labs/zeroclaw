@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 build = "build.rs"
 authors = ["theonlyhennygod"]
@@ -63,8 +63,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML to plain text conversion (web_fetch tool)
+# HTML to plain text / markdown conversion (web_fetch tool)
 nanohtml2text = "0.2"
+html2md = { package = "fast_html2md", version = "0.0.58", optional = true }
 
 # Zip archive extraction
 zip = { version = "8.1", default-features = false, features = ["deflate"] }
@@ -124,6 +125,8 @@ cron = "0.15"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 rustyline = "17.0"
 console = "0.16"
+crossterm = "0.29"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
@@ -245,7 +248,7 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 # Optional provider feature flags used by cfg(feature = "...") guards.
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []
-web-fetch-html2md = []
+web-fetch-html2md = ["dep:html2md"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
