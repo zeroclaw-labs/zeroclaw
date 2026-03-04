@@ -6786,7 +6786,13 @@ async fn write_active_workspace_marker(marker_root: &Path, config_dir: &Path) ->
 
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
     let default_config_dir = default_config_dir()?;
+    persist_active_workspace_config_dir_with_default_root(config_dir, &default_config_dir).await
+}
 
+pub(crate) async fn persist_active_workspace_config_dir_with_default_root(
+    config_dir: &Path,
+    default_config_dir: &Path,
+) -> Result<()> {
     // Guard: never persist a temp-directory path as the active workspace.
     // This prevents transient test runs or one-off invocations from hijacking
     // the daemon's config resolution.
@@ -6819,9 +6825,9 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     }
 
     #[cfg(unix)]
-    sync_directory(&default_config_dir).await?;
+    sync_directory(default_config_dir).await?;
     #[cfg(not(unix))]
-    sync_directory(&default_config_dir)?;
+    sync_directory(default_config_dir)?;
     Ok(())
 }
 
@@ -13712,6 +13718,43 @@ default_model = "legacy-model"
             std::env::remove_var("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn persist_active_workspace_marker_can_use_explicit_default_root() {
+        let _env_guard = env_override_lock().await;
+        let temp_root =
+            std::env::temp_dir().join(format!("zeroclaw_test_root_{}", uuid::Uuid::new_v4()));
+        let default_config_dir = temp_root.join("selected-default-root");
+        let custom_config_dir = temp_root.join("profiles").join("custom-profile");
+        let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        persist_active_workspace_config_dir_with_default_root(
+            &custom_config_dir,
+            &default_config_dir,
+        )
+        .await
+        .unwrap();
+        assert!(
+            marker_path.exists(),
+            "marker should be written to explicit root"
+        );
+
+        let raw = fs::read_to_string(&marker_path).await.unwrap();
+        assert!(raw.contains(custom_config_dir.to_string_lossy().as_ref()));
+
+        persist_active_workspace_config_dir_with_default_root(
+            &default_config_dir,
+            &default_config_dir,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !marker_path.exists(),
+            "marker should be cleared when config dir equals explicit root"
+        );
+
+        let _ = fs::remove_dir_all(temp_root).await;
     }
 
     #[test]

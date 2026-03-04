@@ -12,8 +12,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `.github/workflows/ci-run.yml` (`CI`)
     - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate on changed Rust lines, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
-    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `quality-gate` + `test-and-build` (no PR build-only bypass)
-    - Additional behavior: `quality-gate` and `test-and-build` run in parallel (all depend only on `changes` job) to minimize critical path duration
+    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `quality-gate` + `test-and-build` + `restricted-profile` (no PR build-only bypass)
+    - Additional behavior: `quality-gate` and `test-and-build` run in parallel (both depend only on `changes`); `restricted-profile` runs after `quality-gate`
+    - Additional behavior: `restricted-profile` runs a constrained-capability subset (`scripts/ci/restricted_profile.sh`) with restricted `HOME` and `RUST_TEST_THREADS=1` to catch environment-coupling regressions early
     - Additional behavior: rust-cache is shared across all Rust CI jobs via unified `prefix-key` (`zeroclaw-ci-v1`) and `shared-key` (`${{ runner.os }}-rust`) to reduce redundant compilation
     - Additional behavior: flake detection is integrated into the `test` job via single-retry probe; emits `test-flake-probe` artifact when flake is suspected; optional blocking can be enabled with repository variable `CI_BLOCK_ON_FLAKE_SUSPECTED=true`
     - Additional behavior: PRs that change CI/CD-governed paths require an explicit approving review from `@chumyin` (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs)
@@ -151,6 +152,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep production build reproducibility anchored to `cargo build --release --locked` in `.github/workflows/release-build.yml`.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
+- Keep restricted-capability validation aligned across CI and local runs via `./scripts/ci/restricted_profile.sh`.
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).

@@ -117,12 +117,15 @@ pub(crate) async fn migrate_openclaw(
         bail!("Nothing to migrate: both memory and config migration are disabled");
     }
 
-    let source_workspace = resolve_openclaw_workspace(options.source_workspace.clone())?;
-    let source_config = resolve_openclaw_config(options.source_config.clone())?;
-
     let mut report = OpenClawMigrationReport {
-        source_workspace: source_workspace.clone(),
-        source_config: source_config.clone(),
+        source_workspace: options
+            .source_workspace
+            .clone()
+            .unwrap_or_else(default_openclaw_workspace_hint),
+        source_config: options
+            .source_config
+            .clone()
+            .unwrap_or_else(default_openclaw_config_hint),
         target_workspace: config.workspace_dir.clone(),
         include_memory: options.include_memory,
         include_config: options.include_config,
@@ -130,7 +133,43 @@ pub(crate) async fn migrate_openclaw(
         ..OpenClawMigrationReport::default()
     };
 
-    if options.include_memory {
+    let resolved_workspace = if options.include_memory {
+        match resolve_openclaw_workspace(options.source_workspace.clone()) {
+            Ok(path) => {
+                report.source_workspace = path.clone();
+                Some(path)
+            }
+            Err(error) if options.source_workspace.is_none() => {
+                report.notes.push(format!(
+                    "Could not resolve default OpenClaw workspace path; skipped memory migration ({error})"
+                ));
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+
+    let resolved_config = if options.include_config {
+        match resolve_openclaw_config(options.source_config.clone()) {
+            Ok(path) => {
+                report.source_config = path.clone();
+                Some(path)
+            }
+            Err(error) if options.source_config.is_none() => {
+                report.notes.push(format!(
+                    "Could not resolve default OpenClaw config path; skipped config/agents migration ({error})"
+                ));
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+
+    if let Some(source_workspace) = resolved_workspace {
         if source_workspace.exists() {
             let (memory_stats, backup) =
                 migrate_openclaw_memory(config, &source_workspace, options.dry_run).await?;
@@ -151,7 +190,7 @@ pub(crate) async fn migrate_openclaw(
         }
     }
 
-    if options.include_config {
+    if let Some(source_config) = resolved_config {
         if source_config.exists() {
             let (config_stats, backup, notes) =
                 migrate_openclaw_config(config, &source_config, options.dry_run).await?;
@@ -174,6 +213,22 @@ pub(crate) async fn migrate_openclaw(
     }
 
     Ok(report)
+}
+
+fn default_openclaw_workspace_hint() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("<home-unavailable>"))
+        .join(".openclaw")
+        .join("workspace")
+}
+
+fn default_openclaw_config_hint() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("<home-unavailable>"))
+        .join(".openclaw")
+        .join("openclaw.json")
 }
 
 async fn migrate_openclaw_memory(
@@ -1315,7 +1370,37 @@ mod tests {
     use crate::memory::{Memory, SqliteMemory};
     use rusqlite::params;
     use serde_json::json;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn test_config(workspace: &Path) -> Config {
         Config {
@@ -1598,6 +1683,36 @@ mod tests {
             err.to_string().contains("Nothing to migrate"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn migrate_openclaw_dry_run_skips_missing_default_sources() {
+        let _env_guard = env_lock().lock().await;
+        let source_home = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", source_home.path().to_string_lossy().as_ref());
+        let config = test_config(target.path());
+
+        let report = migrate_openclaw(
+            &config,
+            OpenClawMigrationOptions {
+                dry_run: true,
+                ..OpenClawMigrationOptions::default()
+            },
+        )
+        .await
+        .expect("dry-run should tolerate missing default OpenClaw sources");
+
+        assert_eq!(report.memory.candidates, 0);
+        assert!(!report.config.source_loaded);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("skipped memory migration")));
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("skipped config/agents migration")));
     }
 
     #[tokio::test]
