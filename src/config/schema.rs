@@ -220,6 +220,10 @@ pub struct Config {
     pub provider: ProviderConfig,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
+    /// Optional global max_tokens override for all model providers.
+    /// When set, provider requests cap output tokens to this value.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
@@ -6474,6 +6478,7 @@ impl Default for Config {
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
             default_temperature: 0.7,
+            max_tokens: None,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -10110,6 +10115,7 @@ ws_url = "ws://127.0.0.1:3002"
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
             default_temperature: 0.5,
+            max_tokens: None,
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -10566,6 +10572,7 @@ denied_tools = ["shell"]
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
             default_temperature: 0.9,
+            max_tokens: None,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
