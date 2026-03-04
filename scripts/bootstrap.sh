@@ -1463,7 +1463,7 @@ if [[ "$GUIDED_MODE" == "auto" ]]; then
   fi
 fi
 
-if [[ "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
+if [[ "$ORIGINAL_ARG_COUNT" -eq 0 && -t 1 ]] && (: </dev/tty) 2>/dev/null; then
   RUN_ONBOARD=true
   INTERACTIVE_ONBOARD=true
 fi
@@ -1719,7 +1719,17 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
     info "Running TUI onboarding"
-    "$ZEROCLAW_BIN" onboard --interactive-ui
+    if [[ -t 0 && -t 1 ]]; then
+      "$ZEROCLAW_BIN" onboard --interactive-ui
+    elif (: </dev/tty) 2>/dev/null; then
+      # `curl ... | bash` leaves stdin as a pipe; hand off terminal control to
+      # the onboarding TUI using the controlling tty.
+      "$ZEROCLAW_BIN" onboard --interactive-ui </dev/tty >/dev/tty 2>/dev/tty
+    else
+      error "TUI onboarding requires an interactive terminal."
+      error "Re-run from a terminal: zeroclaw onboard --interactive-ui"
+      exit 1
+    fi
   else
     if [[ -z "$API_KEY" ]]; then
       cat <<'MSG'

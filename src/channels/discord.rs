@@ -1,6 +1,7 @@
 use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::AckReactionConfig;
+use crate::config::TranscriptionConfig;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -25,6 +26,7 @@ pub struct DiscordChannel {
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     ack_reaction: Option<AckReactionConfig>,
+    transcription: Option<TranscriptionConfig>,
     workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
@@ -45,6 +47,7 @@ impl DiscordChannel {
             mention_only,
             group_reply_allowed_sender_ids: Vec::new(),
             ack_reaction: None,
+            transcription: None,
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
@@ -59,6 +62,14 @@ impl DiscordChannel {
     /// Configure ACK reaction policy.
     pub fn with_ack_reaction(mut self, ack_reaction: Option<AckReactionConfig>) -> Self {
         self.ack_reaction = ack_reaction;
+        self
+    }
+
+    /// Configure voice/audio transcription.
+    pub fn with_transcription(mut self, config: TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
         self
     }
 
@@ -149,11 +160,13 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 /// `image/*` attachments are forwarded as `[IMAGE:<url>]` markers. For
 /// `application/octet-stream` or missing MIME types, image-like filename/url
 /// extensions are also treated as images.
+/// `audio/*` attachments are transcribed when `[transcription].enabled = true`.
 /// `text/*` MIME types are fetched and inlined. Other types are skipped.
 /// Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
+    transcription: Option<&TranscriptionConfig>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     for att in attachments {
@@ -171,6 +184,60 @@ async fn process_attachments(
         };
         if is_image_attachment(ct, name, url) {
             parts.push(format!("[IMAGE:{url}]"));
+        } else if is_audio_attachment(ct, name, url) {
+            let Some(config) = transcription else {
+                tracing::debug!(
+                    name,
+                    content_type = ct,
+                    "discord: skipping audio attachment because transcription is disabled"
+                );
+                continue;
+            };
+
+            if let Some(duration_secs) = parse_attachment_duration_secs(att) {
+                if duration_secs > config.max_duration_secs {
+                    tracing::warn!(
+                        name,
+                        duration_secs,
+                        max_duration_secs = config.max_duration_secs,
+                        "discord: skipping audio attachment that exceeds transcription duration limit"
+                    );
+                    continue;
+                }
+            }
+
+            let audio_data = match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(bytes) => bytes.to_vec(),
+                    Err(error) => {
+                        tracing::warn!(name, error = %error, "discord: failed to read audio attachment body");
+                        continue;
+                    }
+                },
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord audio attachment fetch failed");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(name, error = %error, "discord audio attachment fetch error");
+                    continue;
+                }
+            };
+
+            let file_name = infer_audio_filename(name, url, ct);
+            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
+                Ok(transcript) => {
+                    let transcript = transcript.trim();
+                    if transcript.is_empty() {
+                        tracing::info!(name, "discord: transcription returned empty text");
+                    } else {
+                        parts.push(format!("[Voice:{file_name}] {transcript}"));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(name, error = %error, "discord: audio transcription failed");
+                }
+            }
         } else if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -196,13 +263,17 @@ async fn process_attachments(
     parts.join("\n---\n")
 }
 
-fn is_image_attachment(content_type: &str, filename: &str, url: &str) -> bool {
-    let normalized_content_type = content_type
+fn normalize_content_type(content_type: &str) -> String {
+    content_type
         .split(';')
         .next()
         .unwrap_or("")
         .trim()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+fn is_image_attachment(content_type: &str, filename: &str, url: &str) -> bool {
+    let normalized_content_type = normalize_content_type(content_type);
 
     if !normalized_content_type.is_empty() {
         if normalized_content_type.starts_with("image/") {
@@ -217,13 +288,92 @@ fn is_image_attachment(content_type: &str, filename: &str, url: &str) -> bool {
     has_image_extension(filename) || has_image_extension(url)
 }
 
-fn has_image_extension(value: &str) -> bool {
+fn is_audio_attachment(content_type: &str, filename: &str, url: &str) -> bool {
+    let normalized_content_type = normalize_content_type(content_type);
+
+    if !normalized_content_type.is_empty() {
+        if normalized_content_type.starts_with("audio/")
+            || audio_extension_from_content_type(&normalized_content_type).is_some()
+        {
+            return true;
+        }
+        // Trust explicit non-audio MIME to avoid false positives from filename extensions.
+        if normalized_content_type != "application/octet-stream" {
+            return false;
+        }
+    }
+
+    has_audio_extension(filename) || has_audio_extension(url)
+}
+
+fn parse_attachment_duration_secs(attachment: &serde_json::Value) -> Option<u64> {
+    let raw = attachment
+        .get("duration_secs")
+        .and_then(|value| value.as_f64().or_else(|| value.as_u64().map(|v| v as f64)))?;
+    if !raw.is_finite() || raw.is_sign_negative() {
+        return None;
+    }
+    Some(raw.ceil() as u64)
+}
+
+fn extension_from_media_path(value: &str) -> Option<String> {
     let base = value.split('?').next().unwrap_or(value);
     let base = base.split('#').next().unwrap_or(base);
-    let ext = Path::new(base)
+    Path::new(base)
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn is_supported_audio_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "flac" | "mp3" | "mpeg" | "mpga" | "mp4" | "m4a" | "ogg" | "oga" | "opus" | "wav" | "webm"
+    )
+}
+
+fn has_audio_extension(value: &str) -> bool {
+    matches!(
+        extension_from_media_path(value).as_deref(),
+        Some(ext) if is_supported_audio_extension(ext)
+    )
+}
+
+fn audio_extension_from_content_type(content_type: &str) -> Option<&'static str> {
+    match normalize_content_type(content_type).as_str() {
+        "audio/flac" | "audio/x-flac" => Some("flac"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/mpga" => Some("mpga"),
+        "audio/mp4" | "audio/x-m4a" | "audio/m4a" => Some("m4a"),
+        "audio/ogg" | "application/ogg" => Some("ogg"),
+        "audio/opus" => Some("opus"),
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+        "audio/webm" => Some("webm"),
+        _ => None,
+    }
+}
+
+fn infer_audio_filename(filename: &str, url: &str, content_type: &str) -> String {
+    let trimmed_name = filename.trim();
+    if !trimmed_name.is_empty() && has_audio_extension(trimmed_name) {
+        return trimmed_name.to_string();
+    }
+
+    if let Some(ext) =
+        extension_from_media_path(url).filter(|ext| is_supported_audio_extension(ext))
+    {
+        return format!("audio.{ext}");
+    }
+
+    if let Some(ext) = audio_extension_from_content_type(content_type) {
+        return format!("audio.{ext}");
+    }
+
+    "audio.ogg".to_string()
+}
+
+fn has_image_extension(value: &str) -> bool {
+    let ext = extension_from_media_path(value);
 
     matches!(
         ext.as_deref(),
@@ -1013,7 +1163,8 @@ impl Channel for DiscordChannel {
                             .and_then(|a| a.as_array())
                             .cloned()
                             .unwrap_or_default();
-                        process_attachments(&atts, &self.http_client()).await
+                        process_attachments(&atts, &self.http_client(), self.transcription.as_ref())
+                            .await
                     };
                     let final_content = if attachment_text.is_empty() {
                         clean_content
@@ -1266,6 +1417,8 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::get, routing::post, Json, Router};
+    use serde_json::json as json_value;
 
     #[test]
     fn discord_channel_name() {
@@ -1824,7 +1977,7 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &client).await;
+        let result = process_attachments(&[], &client, None).await;
         assert!(result.is_empty());
     }
 
@@ -1836,10 +1989,11 @@ mod tests {
             "filename": "doc.pdf",
             "content_type": "application/pdf"
         })];
-        let result = process_attachments(&attachments, &client).await;
+        let result = process_attachments(&attachments, &client, None).await;
         assert!(result.is_empty());
     }
 
+    #[tokio::test]
     async fn process_attachments_emits_image_marker_for_image_content_type() {
         let client = reqwest::Client::new();
         let attachments = vec![serde_json::json!({
@@ -1847,7 +2001,7 @@ mod tests {
             "filename": "photo.png",
             "content_type": "image/png"
         })];
-        let result = process_attachments(&attachments, &client).await;
+        let result = process_attachments(&attachments, &client, None).await;
         assert_eq!(
             result,
             "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.png]"
@@ -1869,7 +2023,7 @@ mod tests {
                 "content_type": "image/webp"
             }),
         ];
-        let result = process_attachments(&attachments, &client).await;
+        let result = process_attachments(&attachments, &client, None).await;
         assert_eq!(
             result,
             "[IMAGE:https://cdn.discordapp.com/attachments/123/456/one.jpg]\n---\n[IMAGE:https://cdn.discordapp.com/attachments/123/456/two.webp]"
@@ -1883,11 +2037,75 @@ mod tests {
             "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024",
             "filename": "photo.jpeg"
         })];
-        let result = process_attachments(&attachments, &client).await;
+        let result = process_attachments(&attachments, &client, None).await;
         assert_eq!(
             result,
             "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024]"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local loopback TCP bind"]
+    async fn process_attachments_transcribes_audio_when_enabled() {
+        async fn audio_handler() -> ([(String, String); 1], Vec<u8>) {
+            (
+                [(
+                    "content-type".to_string(),
+                    "audio/ogg; codecs=opus".to_string(),
+                )],
+                vec![1_u8, 2, 3, 4, 5, 6],
+            )
+        }
+
+        async fn transcribe_handler() -> Json<serde_json::Value> {
+            Json(json_value!({ "text": "hello from discord audio" }))
+        }
+
+        let app = Router::new()
+            .route("/audio.ogg", get(audio_handler))
+            .route("/transcribe", post(transcribe_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut transcription = TranscriptionConfig::default();
+        transcription.enabled = true;
+        transcription.api_url = format!("http://{addr}/transcribe");
+        transcription.model = "whisper-test".to_string();
+
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": format!("http://{addr}/audio.ogg"),
+            "filename": "voice.ogg",
+            "content_type": "audio/ogg",
+            "duration_secs": 4
+        })];
+
+        let result = process_attachments(&attachments, &client, Some(&transcription)).await;
+        assert_eq!(result, "[Voice:voice.ogg] hello from discord audio");
+    }
+
+    #[tokio::test]
+    async fn process_attachments_skips_audio_when_duration_exceeds_limit() {
+        let mut transcription = TranscriptionConfig::default();
+        transcription.enabled = true;
+        transcription.api_url = "http://127.0.0.1:1/transcribe".to_string();
+        transcription.max_duration_secs = 5;
+
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "http://127.0.0.1:1/audio.ogg",
+            "filename": "voice.ogg",
+            "content_type": "audio/ogg",
+            "duration_secs": 120
+        })];
+
+        let result = process_attachments(&attachments, &client, Some(&transcription)).await;
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -1897,6 +2115,43 @@ mod tests {
             "photo.png",
             "https://cdn.discordapp.com/attachments/123/456/photo.png"
         ));
+    }
+
+    #[test]
+    fn is_audio_attachment_prefers_non_audio_content_type_over_extension() {
+        assert!(!is_audio_attachment(
+            "text/plain",
+            "voice.ogg",
+            "https://cdn.discordapp.com/attachments/123/456/voice.ogg"
+        ));
+    }
+
+    #[test]
+    fn is_audio_attachment_allows_octet_stream_extension_fallback() {
+        assert!(is_audio_attachment(
+            "application/octet-stream",
+            "voice.ogg",
+            "https://cdn.discordapp.com/attachments/123/456/voice.ogg"
+        ));
+    }
+
+    #[test]
+    fn is_audio_attachment_accepts_application_ogg_mime() {
+        assert!(is_audio_attachment(
+            "application/ogg",
+            "voice",
+            "https://cdn.discordapp.com/attachments/123/456/blob"
+        ));
+    }
+
+    #[test]
+    fn infer_audio_filename_uses_content_type_when_name_lacks_extension() {
+        let file_name = infer_audio_filename(
+            "voice_upload",
+            "https://cdn.discordapp.com/attachments/123/456/blob",
+            "audio/ogg; codecs=opus",
+        );
+        assert_eq!(file_name, "audio.ogg");
     }
 
     #[test]
@@ -1969,6 +2224,23 @@ mod tests {
             rendered,
             "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
         );
+    }
+
+    #[test]
+    fn with_transcription_sets_config_when_enabled() {
+        let mut tc = TranscriptionConfig::default();
+        tc.enabled = true;
+        let channel =
+            DiscordChannel::new("fake".into(), None, vec![], false, false).with_transcription(tc);
+        assert!(channel.transcription.is_some());
+    }
+
+    #[test]
+    fn with_transcription_skips_when_disabled() {
+        let tc = TranscriptionConfig::default();
+        let channel =
+            DiscordChannel::new("fake".into(), None, vec![], false, false).with_transcription(tc);
+        assert!(channel.transcription.is_none());
     }
 
     #[test]
