@@ -616,7 +616,12 @@ impl Tool for ChannelAckConfigTool {
                         {"type": "null"}
                     ]
                 },
-                "rules": {"type": ["array", "null"]},
+                "rules": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "object"}},
+                        {"type": "null"}
+                    ]
+                },
                 "rule": {"type": "object"},
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},
@@ -889,5 +894,29 @@ mod tests {
             output["aggregate"]["source_counts"]["channel_pool"],
             json!(5)
         );
+    }
+
+    #[test]
+    fn parameters_schema_rules_array_declares_items() {
+        let tool = ChannelAckConfigTool::new(Arc::new(Config::default()), test_security());
+
+        let schema = tool.parameters_schema();
+        let rules_any_of = schema
+            .get("properties")
+            .and_then(|props| props.get("rules"))
+            .and_then(|rules| rules.get("anyOf"))
+            .and_then(Value::as_array)
+            .expect("rules should use anyOf");
+
+        let array_variant = rules_any_of
+            .iter()
+            .find(|entry| entry.get("type").and_then(Value::as_str) == Some("array"))
+            .expect("rules anyOf should include an array variant");
+
+        let item_type = array_variant
+            .get("items")
+            .and_then(|items| items.get("type"))
+            .and_then(Value::as_str);
+        assert_eq!(item_type, Some("object"));
     }
 }
