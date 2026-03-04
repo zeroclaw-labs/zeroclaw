@@ -1904,10 +1904,16 @@ impl Channel for LarkChannel {
         let (text_content, image_targets) = parse_outgoing_content(&message.content);
 
         if !text_content.is_empty() {
-            let content = serde_json::json!({ "text": text_content }).to_string();
+            // Auto-detect best rendering mode based on content
+            let (msg_type, content) = if should_use_card(&text_content) {
+                ("interactive", build_card_message_content(&text_content))
+            } else {
+                ("post", build_post_message_content(&text_content))
+            };
+
             let body = serde_json::json!({
                 "receive_id": message.recipient,
-                "msg_type": "text",
+                "msg_type": msg_type,
                 "content": content,
             });
             self.send_text_with_retry(&url, &body).await?;
@@ -2397,6 +2403,58 @@ fn parse_post_content_details_value(content: &serde_json::Value) -> Option<Parse
 
 fn parse_post_content(content: &str) -> Option<String> {
     parse_post_content_details(content).map(|details| details.text)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Message rendering helpers for Markdown support (following OpenClaw's approach)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Detect if text contains markdown elements that benefit from card rendering.
+/// This matches OpenClaw's shouldUseCard logic.
+fn should_use_card(text: &str) -> bool {
+    // Check for code blocks (```...```)
+    let has_code_blocks = regex::Regex::new(r"```[\s\S]*?```").unwrap().is_match(text);
+    // Check for tables (|...| with separator row)
+    let has_tables = regex::Regex::new(r"\|.+\|[\r\n]+\|[-:| ]+\|")
+        .unwrap()
+        .is_match(text);
+    has_code_blocks || has_tables
+}
+
+/// Build a Feishu/Lark post (rich text) message payload.
+/// Following OpenClaw's buildFeishuPostMessagePayload pattern.
+fn build_post_message_content(text: &str) -> String {
+    serde_json::json!({
+        "zh_cn": {
+            "content": [[
+                {
+                    "tag": "md",
+                    "text": text,
+                },
+            ]],
+        },
+    })
+    .to_string()
+}
+
+/// Build a Feishu/Lark interactive card message payload with full Markdown support.
+/// Following OpenClaw's buildMarkdownCard pattern.
+fn build_card_message_content(text: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": true,
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": text,
+                },
+            ],
+        },
+    })
+    .to_string()
 }
 
 /// Remove `@_user_N` placeholder tokens injected by Feishu in group chats.
