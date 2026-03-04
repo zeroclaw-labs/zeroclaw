@@ -1622,7 +1622,6 @@ impl Channel for BlueBubblesChannel {
             }
         }
 
-
         Ok(())
     }
 
