@@ -2577,7 +2577,24 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Check if response is the HEARTBEAT_OK sentinel (issue #2513)
+/// Matches the daemon implementation to ensure consistency across code paths
+fn is_heartbeat_ok_sentinel(output: &str) -> bool {
+    const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
+    output
+        .trim()
+        .get(..HEARTBEAT_OK.len())
+        .map(|prefix| prefix.eq_ignore_ascii_case(HEARTBEAT_OK))
+        .unwrap_or(false)
+}
+
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    // Suppress HEARTBEAT_OK sentinel in channel replies (issue #2513)
+    // This matches the daemon heartbeat path which already filters this sentinel
+    if is_heartbeat_ok_sentinel(response) {
+        return String::new();
+    }
+
     let without_tool_tags = strip_tool_call_tags(response);
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -10139,5 +10156,48 @@ BTC is currently around $65,000 based on latest tool output."#;
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
         );
+    }
+
+    // ── HEARTBEAT_OK sentinel suppression (issue #2513) ───
+
+    #[test]
+    fn sanitize_channel_response_suppresses_heartbeat_ok_sentinel() {
+        // Test for issue #2513: HEARTBEAT_OK should be suppressed in channel replies
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        // Exact match
+        let result = sanitize_channel_response("HEARTBEAT_OK", &tools);
+        assert_eq!(
+            result, "",
+            "HEARTBEAT_OK should be suppressed to empty string"
+        );
+
+        // With whitespace
+        let result = sanitize_channel_response("  HEARTBEAT_OK  \n", &tools);
+        assert_eq!(
+            result, "",
+            "HEARTBEAT_OK with whitespace should be suppressed"
+        );
+
+        // Case insensitive
+        let result = sanitize_channel_response("heartbeat_ok", &tools);
+        assert_eq!(result, "", "heartbeat_ok (lowercase) should be suppressed");
+
+        // Normal text should pass through
+        let result = sanitize_channel_response("Normal message", &tools);
+        assert_eq!(result, "Normal message");
+    }
+
+    #[test]
+    fn is_heartbeat_ok_sentinel_detects_variations() {
+        // Test the helper function directly
+        assert!(is_heartbeat_ok_sentinel("HEARTBEAT_OK"));
+        assert!(is_heartbeat_ok_sentinel("  HEARTBEAT_OK  "));
+        assert!(is_heartbeat_ok_sentinel("heartbeat_ok"));
+        assert!(is_heartbeat_ok_sentinel("Heartbeat_Ok"));
+        assert!(is_heartbeat_ok_sentinel("HEARTBEAT_OK\n"));
+        assert!(!is_heartbeat_ok_sentinel("HEARTBEAT_OK with more text"));
+        assert!(!is_heartbeat_ok_sentinel(""));
+        assert!(!is_heartbeat_ok_sentinel("normal text"));
     }
 }
