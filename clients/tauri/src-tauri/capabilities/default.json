@@ -6,6 +6,8 @@
   "platforms": ["linux", "macOS", "windows", "android", "iOS"],
   "permissions": [
     "core:default",
-    "shell:allow-open"
+    "shell:allow-open",
+    "shell:allow-execute",
+    "shell:allow-spawn"
   ]
 }

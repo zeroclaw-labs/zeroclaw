@@ -189,6 +189,27 @@ export async function isZeroClawConfigured(): Promise<boolean | null> {
   return invoke("is_zeroclaw_configured") as Promise<boolean>;
 }
 
+// ── Gateway status event listener ────────────────────────────────
+
+export interface GatewayStatusEvent {
+  status: "starting" | "ready" | "failed";
+  message: string;
+}
+
+/**
+ * Listen for gateway-status events emitted by the Rust backend.
+ * Returns an unlisten function.
+ */
+export async function onGatewayStatus(
+  handler: (event: GatewayStatusEvent) => void,
+): Promise<() => void> {
+  const listen = await getListen();
+  if (!listen) return () => {};
+  return listen("gateway-status", (e) => {
+    handler(e.payload as GatewayStatusEvent);
+  });
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */

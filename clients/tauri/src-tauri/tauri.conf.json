@@ -71,16 +71,10 @@
   },
   "plugins": {
     "shell": {
-      "open": true,
-      "sidecar": true
+      "open": true
     },
     "updater": {
-      "active": true,
-      "dialog": true,
-      "endpoints": [
-        "https://releases.moa-agent.com/{{target}}/{{arch}}/{{current_version}}"
-      ],
-      "pubkey": ""
+      "active": false
     }
   }
 }
