@@ -13741,7 +13741,9 @@ default_model = "legacy-model"
         );
 
         let raw = fs::read_to_string(&marker_path).await.unwrap();
-        assert!(raw.contains(custom_config_dir.to_string_lossy().as_ref()));
+        let parsed_state: ActiveWorkspaceState =
+            toml::from_str(&raw).expect("active workspace marker should parse");
+        assert_eq!(PathBuf::from(parsed_state.config_dir), custom_config_dir);
 
         persist_active_workspace_config_dir_with_default_root(
             &default_config_dir,
