@@ -20,12 +20,20 @@ pub use store::{
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
-fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
+pub fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    validate_shell_command_with_security(&security, command, approved)
+}
+
+pub(crate) fn validate_shell_command_with_security(
+    security: &SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Result<()> {
     security
         .validate_command_execution(command, approved)
         .map(|_| ())
-        .map_err(|reason| anyhow!("Command blocked by security policy: {reason}"))
+        .map_err(|reason| anyhow!("blocked by security policy: {reason}"))
 }
 
 pub fn add_shell_job(
@@ -70,6 +78,46 @@ pub fn update_shell_job_with_approval(
         validate_shell_command(config, command, approved)?;
     }
     update_job(config, job_id, patch)
+}
+
+pub fn add_validated_shell_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    add_shell_job_with_approval(config, name, schedule, command, approved)
+}
+
+pub fn update_validated_shell_job(
+    config: &Config,
+    id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
+    update_shell_job_with_approval(config, id, patch, approved)
+}
+
+pub fn add_once_validated(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    let duration = parse_delay(delay)?;
+    let at = chrono::Utc::now() + duration;
+    add_once_at_validated(config, at, command, approved)
+}
+
+pub fn add_once_at_validated(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    let schedule = Schedule::At { at };
+    add_shell_job_with_approval(config, None, schedule, command, approved)
 }
 
 #[allow(clippy::needless_pass_by_value)]

@@ -589,8 +589,10 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    if let Err(reason) = security.validate_command_execution(&job.command, approved) {
-        return (false, format!("blocked by security policy: {reason}"));
+    if let Err(error) =
+        crate::cron::validate_shell_command_with_security(security, &job.command, approved)
+    {
+        return (false, error.to_string());
     }
 
     if !security.record_action() {
