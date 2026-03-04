@@ -104,7 +104,10 @@ impl WhatsAppChannel {
     /// Download media from WhatsApp Cloud API using a 2-step process:
     /// 1. GET /v18.0/{media_id} → JSON with `url` field
     /// 2. GET that URL with bearer token → binary data
-    async fn download_media_by_id(&self, media_id: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+    async fn download_media_by_id(
+        &self,
+        media_id: &str,
+    ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
         let meta_url = format!("https://graph.facebook.com/v18.0/{media_id}");
         ensure_https(&meta_url)?;
 
@@ -129,9 +132,7 @@ impl WhatsAppChannel {
             .get("mime_type")
             .and_then(|m| m.as_str())
             .map(String::from);
-        let file_size = meta_json
-            .get("file_size")
-            .and_then(|s| s.as_u64());
+        let file_size = meta_json.get("file_size").and_then(|s| s.as_u64());
 
         if let Some(size) = file_size {
             if size > WA_CLOUD_MAX_MEDIA_BYTES {
@@ -1412,6 +1413,9 @@ mod tests {
             }]
         });
         let msgs = ch.parse_webhook_payload(&payload).await;
-        assert!(msgs.is_empty(), "Media without workspace_dir should be skipped");
+        assert!(
+            msgs.is_empty(),
+            "Media without workspace_dir should be skipped"
+        );
     }
 }

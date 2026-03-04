@@ -218,18 +218,31 @@ async fn try_download_wa_web_media(
         }
         let bytes = match client.download(image_msg.as_ref()).await {
             Ok(b) => b,
-            Err(e) => { tracing::warn!("WhatsApp Web: failed to download image: {e}"); return None; }
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download image: {e}");
+                return None;
+            }
         };
-        let ext = image_msg.mimetype.as_deref().map(mime_to_wa_extension).unwrap_or("jpg");
+        let ext = image_msg
+            .mimetype
+            .as_deref()
+            .map(mime_to_wa_extension)
+            .unwrap_or("jpg");
         let filename = format!("wa_image_{sender_id}_{ts}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("WhatsApp Web: failed to create save dir: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
         }
         let path = save_dir.join(&filename);
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
-            tracing::warn!("WhatsApp Web: failed to save image: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to save image: {e}");
+            return None;
         }
-        tracing::info!("WhatsApp Web: saved inbound image to {} ({} bytes)", path.display(), bytes.len());
+        tracing::info!(
+            "WhatsApp Web: saved inbound image to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
         let mut content = format!("[IMAGE:{}]", path.display());
         if let Some(ref caption) = image_msg.caption {
             if !caption.trim().is_empty() {
@@ -247,22 +260,38 @@ async fn try_download_wa_web_media(
         }
         let bytes = match client.download(doc_msg.as_ref()).await {
             Ok(b) => b,
-            Err(e) => { tracing::warn!("WhatsApp Web: failed to download document: {e}"); return None; }
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download document: {e}");
+                return None;
+            }
         };
         let original_name = doc_msg.file_name.as_deref().unwrap_or("document");
         let ext = std::path::Path::new(original_name)
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or_else(|| doc_msg.mimetype.as_deref().map(mime_to_wa_extension).unwrap_or("bin"));
+            .unwrap_or_else(|| {
+                doc_msg
+                    .mimetype
+                    .as_deref()
+                    .map(mime_to_wa_extension)
+                    .unwrap_or("bin")
+            });
         let filename = format!("wa_doc_{sender_id}_{ts}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("WhatsApp Web: failed to create save dir: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
         }
         let path = save_dir.join(&filename);
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
-            tracing::warn!("WhatsApp Web: failed to save document: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to save document: {e}");
+            return None;
         }
-        tracing::info!("WhatsApp Web: saved inbound document '{}' to {} ({} bytes)", original_name, path.display(), bytes.len());
+        tracing::info!(
+            "WhatsApp Web: saved inbound document '{}' to {} ({} bytes)",
+            original_name,
+            path.display(),
+            bytes.len()
+        );
         let mut content = if is_wa_image_extension(&path) {
             format!("[IMAGE:{}]", path.display())
         } else {
@@ -284,18 +313,31 @@ async fn try_download_wa_web_media(
         }
         let bytes = match client.download(video_msg.as_ref()).await {
             Ok(b) => b,
-            Err(e) => { tracing::warn!("WhatsApp Web: failed to download video: {e}"); return None; }
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download video: {e}");
+                return None;
+            }
         };
-        let ext = video_msg.mimetype.as_deref().map(mime_to_wa_extension).unwrap_or("mp4");
+        let ext = video_msg
+            .mimetype
+            .as_deref()
+            .map(mime_to_wa_extension)
+            .unwrap_or("mp4");
         let filename = format!("wa_video_{sender_id}_{ts}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("WhatsApp Web: failed to create save dir: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
         }
         let path = save_dir.join(&filename);
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
-            tracing::warn!("WhatsApp Web: failed to save video: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to save video: {e}");
+            return None;
         }
-        tracing::info!("WhatsApp Web: saved inbound video to {} ({} bytes)", path.display(), bytes.len());
+        tracing::info!(
+            "WhatsApp Web: saved inbound video to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
         let mut content = format!("[Document: {}] {}", filename, path.display());
         if let Some(ref caption) = video_msg.caption {
             if !caption.trim().is_empty() {
@@ -313,18 +355,31 @@ async fn try_download_wa_web_media(
         }
         let bytes = match client.download(sticker_msg.as_ref()).await {
             Ok(b) => b,
-            Err(e) => { tracing::warn!("WhatsApp Web: failed to download sticker: {e}"); return None; }
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download sticker: {e}");
+                return None;
+            }
         };
-        let ext = sticker_msg.mimetype.as_deref().map(mime_to_wa_extension).unwrap_or("webp");
+        let ext = sticker_msg
+            .mimetype
+            .as_deref()
+            .map(mime_to_wa_extension)
+            .unwrap_or("webp");
         let filename = format!("wa_sticker_{sender_id}_{ts}.{ext}");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("WhatsApp Web: failed to create save dir: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
         }
         let path = save_dir.join(&filename);
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
-            tracing::warn!("WhatsApp Web: failed to save sticker: {e}"); return None;
+            tracing::warn!("WhatsApp Web: failed to save sticker: {e}");
+            return None;
         }
-        tracing::info!("WhatsApp Web: saved inbound sticker to {} ({} bytes)", path.display(), bytes.len());
+        tracing::info!(
+            "WhatsApp Web: saved inbound sticker to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
         return Some(format!("[IMAGE:{}]", path.display()));
     }
 
@@ -1355,10 +1410,7 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn with_workspace_dir_sets_field() {
         let ch = make_channel().with_workspace_dir(std::path::PathBuf::from("/tmp/ws"));
-        assert_eq!(
-            ch.workspace_dir,
-            Some(std::path::PathBuf::from("/tmp/ws"))
-        );
+        assert_eq!(ch.workspace_dir, Some(std::path::PathBuf::from("/tmp/ws")));
     }
 
     #[test]
