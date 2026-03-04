@@ -185,6 +185,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
+    // Build Telegram channel once if configured
+    let telegram = config.channels_config.telegram.as_ref().map(|tg| {
+        crate::channels::TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.mention_only,
+        )
+    });
+
     loop {
         interval.tick().await;
 
@@ -196,7 +205,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(
+            match crate::agent::loop_::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -207,10 +216,30 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-            } else {
-                crate::health::mark_component_ok("heartbeat");
+                Ok(response) => {
+                    crate::health::mark_component_ok("heartbeat");
+                    if let Some(ref tg) = telegram {
+                        let recipients = config
+                            .channels_config
+                            .telegram
+                            .as_ref()
+                            .map(|t| t.allowed_users.clone())
+                            .unwrap_or_default();
+                        for user_id in &recipients {
+                            let msg = crate::channels::SendMessage::new(
+                                response.clone(),
+                                user_id.clone(),
+                            );
+                            if let Err(e) = crate::channels::Channel::send(tg, &msg).await {
+                                tracing::warn!("Heartbeat: Telegram send failed: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::health::mark_component_error("heartbeat", e.to_string());
+                    tracing::warn!("Heartbeat task failed: {e}");
+                }
             }
         }
     }
