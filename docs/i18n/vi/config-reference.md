@@ -499,7 +499,7 @@ Lưu ý:
 - Chat GUID nhóm chứa `;+;`; DM GUID chứa `;-;`.
 - `chunk_mode = "newline"` tự đủ mà không cần `text_chunk_limit`.
 - `text_chunk_limit = 0` bị từ chối khi khởi động với thông báo lỗi rõ ràng.
-- Xem [channels-reference.md §4.15](channels-reference.md#415-bluebubbles-imessage-qua-máy-chủ-bluebubbles) để biết bảng hành vi chính sách.
+- Xem [channels-reference.md §4.20](channels-reference.md#420-bluebubbles-imessage-qua-máy-chủ-bluebubbles) để biết bảng hành vi chính sách.
 
 ## `[hardware]`
 
