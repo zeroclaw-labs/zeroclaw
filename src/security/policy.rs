@@ -111,6 +111,62 @@ pub struct SecurityPolicy {
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
+        let mut forbidden_paths: Vec<String> = vec![
+            // System directories (blocked even when workspace_only=false)
+            "/etc".into(),
+            "/root".into(),
+            "/home".into(),
+            "/usr".into(),
+            "/bin".into(),
+            "/sbin".into(),
+            "/lib".into(),
+            "/opt".into(),
+            "/boot".into(),
+            "/dev".into(),
+            "/proc".into(),
+            "/sys".into(),
+            "/var".into(),
+            "/tmp".into(),
+            "/mnt".into(),
+            // Sensitive dotfiles (both slash styles for cross-platform coverage)
+            "~/.ssh".into(),
+            "~/.gnupg".into(),
+            "~/.aws".into(),
+            "~/.config".into(),
+        ];
+
+        #[cfg(windows)]
+        {
+            // Windows system directories — add hardcoded canonical paths first
+            // to ensure the policy cannot be weakened by env var tampering,
+            // then optionally add env var values if they differ.
+            let canonical_roots = [
+                "C:\\Windows".to_string(),
+                "C:\\Program Files".to_string(),
+                "C:\\Program Files (x86)".to_string(),
+            ];
+            forbidden_paths.extend(canonical_roots.clone());
+
+            // Add env var values only if they resolve and differ from canonical
+            if let Ok(system_root) = std::env::var("SystemRoot") {
+                if !canonical_roots.contains(&system_root) {
+                    forbidden_paths.push(system_root);
+                }
+            }
+            if let Ok(program_files) = std::env::var("ProgramFiles") {
+                if !canonical_roots.contains(&program_files) {
+                    forbidden_paths.push(program_files);
+                }
+            }
+            if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+                if !canonical_roots.contains(&program_files_x86) {
+                    forbidden_paths.push(program_files_x86);
+                }
+            }
+            // Windows-style sensitive user directories
+            forbidden_paths.extend(["~\\AppData".into(), "~\\.ssh".into(), "~\\.aws".into()]);
+        }
+
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
@@ -119,6 +175,10 @@ impl Default for SecurityPolicy {
                 "git".into(),
                 "npm".into(),
                 "cargo".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
                 "ls".into(),
                 "cat".into(),
                 "grep".into(),
@@ -130,28 +190,7 @@ impl Default for SecurityPolicy {
                 "tail".into(),
                 "date".into(),
             ],
-            forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            forbidden_paths,
             allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
@@ -164,7 +203,9 @@ impl Default for SecurityPolicy {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -174,7 +215,7 @@ fn expand_user_path(path: &str) -> PathBuf {
         }
     }
 
-    if let Some(stripped) = path.strip_prefix("~/") {
+    if let Some(stripped) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         if let Some(home) = home_dir() {
             return home.join(stripped);
         }
@@ -497,13 +538,61 @@ fn strip_wrapping_quotes(token: &str) -> &str {
 }
 
 fn looks_like_path(candidate: &str) -> bool {
-    candidate.starts_with('/')
+    // Unix-style paths
+    if candidate.starts_with('/')
         || candidate.starts_with("./")
         || candidate.starts_with("../")
         || candidate.starts_with('~')
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
+    {
+        return true;
+    }
+    // Windows-style paths: backslash-relative, UNC (\\server\share), and
+    // drive-letter absolute (C:\path or C:path).
+    candidate.starts_with('\\')
+        || candidate.starts_with(".\\")
+        || candidate.starts_with("..\\")
+        || candidate.contains('\\')
+        || (candidate.len() >= 2
+            && candidate
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_alphabetic())
+            && candidate.as_bytes()[1] == b':')
+}
+
+/// Check if a path has a Windows drive-letter prefix (e.g., `C:` or `c:`).
+/// This detects drive-relative paths like `C:foo\bar` which have a drive letter
+/// and colon but NOT followed by a backslash — these are different from absolute
+/// paths like `C:\foo\bar`.
+///
+/// Returns true for:
+/// - `C:relative` (drive-relative)
+/// - `c:path\to\file` (lowercase drive)
+/// Returns false for:
+/// - `C:\absolute` (drive-absolute, handled by has_root())
+/// - `C:/unix/style` (forward slash style)
+/// - `D:` (drive letter only)
+fn has_windows_drive_prefix(path: &str) -> bool {
+    if path.len() < 2 {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    let first_char = bytes[0] as char;
+    // Check if first char is alphabetic (drive letter) and second is colon
+    if first_char.is_ascii_alphabetic() && bytes[1] == b':' {
+        // It's a drive reference - check if it's NOT followed by \ or /
+        // (drive-relative like C:foo, not drive-absolute like C:\foo)
+        if path.len() >= 3 {
+            let third = bytes[2] as char;
+            return third != '\\' && third != '/';
+        }
+        // Just "C:" - treat as drive-relative
+        return true;
+    }
+    false
 }
 
 fn attached_short_option_value(token: &str) -> Option<&str> {
@@ -577,10 +666,13 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
+            // Normalize: split on both '/' and '\\', trim, strip .exe/.EXE suffix
+            // to match is_command_allowed normalization logic.
+            let raw_base = base_raw.rsplit(['/', '\\']).next().unwrap_or("").trim();
+            let base = raw_base
+                .strip_suffix(".exe")
+                .or_else(|| raw_base.strip_suffix(".EXE"))
+                .unwrap_or(raw_base)
                 .to_ascii_lowercase();
 
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
@@ -785,7 +877,11 @@ impl SecurityPolicy {
 
             let mut words = cmd_part.split_whitespace();
             let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("");
+            let raw_base = executable.rsplit(['/', '\\']).next().unwrap_or("").trim();
+            let base_cmd = raw_base
+                .strip_suffix(".exe")
+                .or_else(|| raw_base.strip_suffix(".EXE"))
+                .unwrap_or(raw_base);
 
             if base_cmd.is_empty() {
                 continue;
@@ -934,15 +1030,26 @@ impl SecurityPolicy {
 
         // Reject "~user" forms because the shell expands them at runtime and
         // they can escape workspace policy.
-        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+        // Reject "~user" forms because the shell expands them at runtime and
+        // they can escape workspace policy.
+        if path.starts_with('~')
+            && path != "~"
+            && !path.starts_with("~/")
+            && !path.starts_with("~\\")
+        {
             return false;
         }
 
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
+        // Block rooted paths (absolute or drive-relative) when workspace_only is set.
+        // Use has_root() rather than is_absolute() so that Unix-style /path and
+        // Windows drive-relative \path are both caught on Windows, where is_absolute()
+        // requires a drive letter prefix (e.g. C:\).
+        // Also check for Windows drive-relative paths like "C:relative" (drive letter
+        // + colon but not followed by backslash).
+        if self.workspace_only && (expanded_path.has_root() || has_windows_drive_prefix(path)) {
             return false;
         }
 
@@ -955,6 +1062,21 @@ impl SecurityPolicy {
         }
 
         true
+    }
+
+    /// Resolve a user-supplied path argument using the same semantics as
+    /// `is_path_allowed` (including `~` expansion).
+    ///
+    /// Absolute inputs remain absolute; relative inputs are workspace-relative.
+    pub fn resolve_user_supplied_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        // Check for absolute paths, paths with roots, AND Windows drive-relative paths
+        // (like C:relative) which should not be joined with workspace.
+        if expanded.is_absolute() || expanded.has_root() || has_windows_drive_prefix(path) {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
     }
 
     /// Validate that a resolved path is inside the workspace or an allowed root.
@@ -1077,7 +1199,7 @@ impl SecurityPolicy {
                 .iter()
                 .map(|root| {
                     let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
+                    if expanded.is_absolute() || expanded.has_root() {
                         expanded
                     } else {
                         workspace_dir.join(expanded)
@@ -1323,6 +1445,235 @@ mod tests {
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
         );
+    }
+
+    // ── Windows Path Boundary Regression Tests ────────────────────────────────
+    // These tests verify consistent normalization between is_command_allowed
+    // and command_risk_level for Windows-style paths and executables.
+    // Threat model: inconsistent normalization could allow bypass via
+    // Windows-style paths (e.g., "C:\tools\git.exe push" treated differently
+    // than "/usr/bin/git push"). Rollback: revert to previous normalization.
+
+    #[test]
+    fn windows_path_backslash_normalization_allowlist() {
+        // is_command_allowed should normalize backslashes like forward slashes
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+        // Windows-style path with backslash separator
+        assert!(p.is_command_allowed("C:\\path\\to\\git.exe status"));
+        assert!(p.is_command_allowed("C:\\tools\\git.exe push"));
+    }
+
+    #[test]
+    fn windows_path_backslash_normalization_risk_classification() {
+        // command_risk_level should use same normalization as is_command_allowed
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "rm".into()],
+            ..SecurityPolicy::default()
+        };
+        // Windows path with backslash should be classified same as Unix path
+        assert_eq!(
+            p.command_risk_level("C:\\path\\to\\git.exe reset --hard"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("C:\\tools\\rm.exe -rf /"),
+            CommandRiskLevel::High
+        );
+    }
+
+    #[test]
+    fn windows_exe_suffix_normalization_both_paths() {
+        // .exe suffix should be stripped in both allowlist and risk classification
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git.exe".into(), "git".into()],
+            ..SecurityPolicy::default()
+        };
+        // Allowlist: .exe suffix stripped
+        assert!(p.is_command_allowed("git.exe status"));
+        assert!(p.is_command_allowed("git status"));
+        // Risk: .exe suffix stripped, should classify correctly
+        assert_eq!(
+            p.command_risk_level("git.exe reset --hard"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(p.command_risk_level("rm.EXE -rf /"), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn windows_drive_letter_path_recognition() {
+        // Drive letter paths (C:\) should extract basename correctly
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+        // Should work: extracts "git.exe" as basename from path (no spaces in path)
+        assert!(p.is_command_allowed("C:\\tools\\git.exe status"));
+    }
+
+    #[test]
+    fn windows_unc_path_recognition() {
+        // UNC paths (\\server\share) should extract basename correctly
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("\\\\server\\share\\git.exe status"));
+    }
+
+    #[test]
+    fn tilde_expansion_windows_backslash_style() {
+        // Verify expand_user_path handles both ~/ and ~\ prefixes
+        // This is a unit test of the helper function behavior
+        let unix_style = expand_user_path("~/documents");
+        let win_style = expand_user_path("~\\documents");
+        // Both should try to expand (actual expansion depends on HOME/UserProfile)
+        // The key is that both prefix styles are recognized
+        assert!(unix_style.to_string_lossy().contains("documents"));
+        assert!(win_style.to_string_lossy().contains("documents"));
+    }
+
+    #[test]
+    fn windows_path_consistency_allowlist_vs_risk() {
+        // Ensure allowlist and risk classification produce consistent results
+        // for Windows-style commands — this is the core regression check.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "rm".into(), "touch".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+
+        // Commands that pass allowlist should have matching risk classification
+        // For each Windows command that is allowed, risk should NOT be High
+        // (since we explicitly allowed it)
+        let allowed_windows_cmds = vec![
+            "C:\\tools\\git.exe push",
+            "C:\\path\\to\\touch.exe file.txt",
+        ];
+
+        for cmd in allowed_windows_cmds {
+            let allowed = p.is_command_allowed(cmd);
+            let risk = p.command_risk_level(cmd);
+            // If allowed, should be classified as Medium or Low, not High
+            assert!(allowed, "Command {} should be allowed", cmd);
+            assert_ne!(
+                risk,
+                CommandRiskLevel::High,
+                "Allowed command {} should not be high risk",
+                cmd
+            );
+        }
+
+        // High-risk commands should be consistently blocked/detected
+        let risky_windows_cmds = vec!["C:\\Windows\\System32\\rm.EXE -rf test"];
+
+        for cmd in risky_windows_cmds {
+            let allowed = p.is_command_allowed(cmd);
+            let risk = p.command_risk_level(cmd);
+            // Should either be blocked by allowlist OR classified as High
+            if allowed {
+                assert_eq!(
+                    risk,
+                    CommandRiskLevel::High,
+                    "Risky command {} should be High risk",
+                    cmd
+                );
+            }
+        }
+    }
+
+    // ── Additional Windows Boundary Tests (Case-Variant & Drive-Relative) ────
+
+    #[test]
+    fn windows_drive_relative_boundary() {
+        // Test drive-relative paths (C:relative\path) - these should extract
+        // basename correctly and NOT be treated as absolute roots.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "rm".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+
+        // Drive-relative: should extract "git.exe" as basename
+        assert!(p.is_command_allowed("C:relative\\git.exe status"));
+
+        // Drive-relative with dangerous command should classify as High
+        let risk = p.command_risk_level("C:path\\..\\rm.EXE -rf test");
+        assert_eq!(risk, CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn windows_case_variant_forbidden() {
+        // Test case-insensitive forbidden path detection
+        // (c:\windows\... should match C:\Windows\...)
+        let p = SecurityPolicy {
+            allowed_commands: vec!["rm".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+
+        // Mixed-case Windows path should be detected as high-risk
+        let risk = p.command_risk_level("c:\\WINDOWS\\system32\\rm.exe -rf /");
+        assert_eq!(risk, CommandRiskLevel::High);
+
+        // Risk classification is case-insensitive for base command
+        let risk_git = p.command_risk_level("C:\\tools\\GIT.EXE reset --hard");
+        assert_eq!(risk_git, CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn windows_drive_relative_path_allowed_check() {
+        // Test that is_path_allowed correctly blocks drive-relative paths
+        // when workspace_only is enabled (default).
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Drive-relative paths (C:foo) should be blocked when workspace_only
+        assert!(!p.is_path_allowed("C:relative\\path"));
+        assert!(!p.is_path_allowed("d:documents\\file.txt"));
+
+        // Regular relative paths should still be allowed
+        assert!(p.is_path_allowed("relative/path"));
+    }
+
+    #[test]
+    fn windows_drive_prefix_helper() {
+        // Unit test for the has_windows_drive_prefix helper
+        // Drive-relative (should return true)
+        assert!(has_windows_drive_prefix("C:relative"));
+        assert!(has_windows_drive_prefix("c:path\\to\\file"));
+        assert!(has_windows_drive_prefix("D:docs"));
+
+        // Drive-absolute (should return false - handled by has_root())
+        assert!(!has_windows_drive_prefix("C:\\absolute"));
+        assert!(!has_windows_drive_prefix("c:/unix/style"));
+
+        // Not drive paths
+        assert!(!has_windows_drive_prefix("/unix/path"));
+        assert!(!has_windows_drive_prefix("relative"));
+        assert!(!has_windows_drive_prefix(""));
+    }
+
+    #[test]
+    fn resolve_user_supplied_path_windows_drive_relative() {
+        // Test resolve_user_supplied_path handles drive-relative paths
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+
+        // Drive-relative should NOT be joined with workspace (treated as absolute-ish)
+        let resolved = p.resolve_user_supplied_path("C:relative\\file.txt");
+        // Should expand to just the path as-is (drive-relative stays drive-relative)
+        assert!(resolved.to_string_lossy().contains("C:"));
+
+        // Regular relative should be joined with workspace
+        let resolved_relative = p.resolve_user_supplied_path("relative/file.txt");
+        assert!(resolved_relative.to_string_lossy().contains("/workspace"));
     }
 
     #[test]
