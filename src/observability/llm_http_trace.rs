@@ -89,7 +89,32 @@ pub async fn send_with_middleware(
             if !streaming_request && !is_streaming_response(&response) {
                 let http_response: HttpResponse<reqwest::Body> = response.into();
                 let (parts, body) = http_response.into_parts();
-                let body_bytes = BodyExt::collect(body).await?.to_bytes();
+                let body_bytes = match BodyExt::collect(body).await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(err) => {
+                        let message = crate::providers::sanitize_api_error(&err.to_string());
+                        runtime_trace::record_event(
+                            "llm_http_response",
+                            None,
+                            provider,
+                            None,
+                            None,
+                            Some(false),
+                            Some(&message),
+                            json!({
+                                "request_id": request_id,
+                                "service_key": service_key,
+                                "status": status.as_u16(),
+                                "headers": response_headers.clone(),
+                                "content_length": response_content_length,
+                                "duration_ms": duration_ms,
+                                "content": Value::Null,
+                                "content_truncated": false,
+                            }),
+                        );
+                        return Err(anyhow::anyhow!("{err}"));
+                    }
+                };
                 let (response_content, truncated) =
                     response_content_payload_from_bytes(&body_bytes, MAX_RESPONSE_CONTENT_BYTES);
 
