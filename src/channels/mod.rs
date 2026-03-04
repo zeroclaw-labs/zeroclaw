@@ -2581,11 +2581,7 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
 /// Matches the daemon implementation to ensure consistency across code paths
 fn is_heartbeat_ok_sentinel(output: &str) -> bool {
     const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
-    output
-        .trim()
-        .get(..HEARTBEAT_OK.len())
-        .map(|prefix| prefix.eq_ignore_ascii_case(HEARTBEAT_OK))
-        .unwrap_or(false)
+    output.trim().eq_ignore_ascii_case(HEARTBEAT_OK)
 }
 
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
