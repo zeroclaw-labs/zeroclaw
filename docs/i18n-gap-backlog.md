@@ -13,6 +13,7 @@ Gap baseline = top-level English docs set under `docs/*.md` (excluding README/SU
 | Locale | Missing top-level docs parity count | Current status |
 |---|---:|---|
 | `zh-CN` | 0 | Full top-level parity (bridge + localized) |
+| `zh-TW` | 0 | Full top-level parity (bridge + localized, converted from zh-CN) |
 | `ja` | 0 | Full top-level parity (bridge + localized) |
 | `ru` | 0 | Full top-level parity (bridge + localized) |
 | `fr` | 0 | Full top-level parity (bridge + localized) |

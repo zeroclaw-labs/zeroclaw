@@ -9,6 +9,7 @@
 - Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [../../structure/README.md](../../structure/README.md)
 - README tiếng Việt: [docs/i18n/vi/README.md](README.md)
 - Docs hub tiếng Việt: [README.md](README.md)
+- README tiếng Trung (phồn thể): [../zh-TW/README.md](../zh-TW/README.md)
 
 ## Danh mục
 

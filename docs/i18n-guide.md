@@ -16,7 +16,7 @@ Primary docs surfaces:
 Supported locales:
 
 - `en` (source of truth)
-- `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el` (full top-level parity in `docs/i18n/<locale>/`)
+- `zh-CN`, `zh-TW`, `ja`, `ru`, `fr`, `vi`, `el` (full top-level parity in `docs/i18n/<locale>/`)
 
 ## Canonical Layout
 
@@ -99,7 +99,7 @@ Examples:
 
 ```bash
 # search locale references
-rg -n "docs/i18n/(zh-CN|ja|ru|fr|vi|el)/README\.md|SUMMARY\.(zh-CN|ja|ru|fr|vi|el)\.md" README.md docs/SUMMARY*.md docs/i18n/*/README.md docs/i18n/*/SUMMARY.md
+rg -n "docs/i18n/(zh-CN|zh-TW|ja|ru|fr|vi|el)/README\.md|SUMMARY\.(zh-CN|zh-TW|ja|ru|fr|vi|el)\.md" README.md docs/SUMMARY*.md docs/i18n/*/README.md docs/i18n/*/SUMMARY.md
 
 # check changed markdown files
 git status --short

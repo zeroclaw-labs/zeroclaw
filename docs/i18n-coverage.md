@@ -2,7 +2,7 @@
 
 This document defines the localization structure for ZeroClaw docs and tracks current coverage.
 
-Last refreshed: **February 24, 2026**.
+Last refreshed: **March 2, 2026**.
 
 Execution guide: [i18n-guide.md](i18n-guide.md)
 Gap backlog: [i18n-gap-backlog.md](i18n-gap-backlog.md)
@@ -23,6 +23,7 @@ Use these i18n paths:
 |---|---|---|---|---|---|---|
 | `en` | `README.md` | `docs/README.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | Source of truth |
 | `zh-CN` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/commands-reference.md` | `docs/i18n/zh-CN/config-reference.md` | `docs/i18n/zh-CN/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `zh-TW` | `docs/i18n/zh-TW/README.md` | `docs/i18n/zh-TW/README.md` | `docs/i18n/zh-TW/commands-reference.md` | `docs/i18n/zh-TW/config-reference.md` | `docs/i18n/zh-TW/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `ja` | `docs/i18n/ja/README.md` | `docs/i18n/ja/README.md` | `docs/i18n/ja/commands-reference.md` | `docs/i18n/ja/config-reference.md` | `docs/i18n/ja/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `ru` | `docs/i18n/ru/README.md` | `docs/i18n/ru/README.md` | `docs/i18n/ru/commands-reference.md` | `docs/i18n/ru/config-reference.md` | `docs/i18n/ru/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `fr` | `docs/i18n/fr/README.md` | `docs/i18n/fr/README.md` | `docs/i18n/fr/commands-reference.md` | `docs/i18n/fr/config-reference.md` | `docs/i18n/fr/troubleshooting.md` | Full top-level parity (bridge + localized) |
@@ -36,6 +37,7 @@ Baseline on 2026-02-24 uses 40 top-level English docs (`docs/*.md`, locale root 
 | Locale | Missing top-level parity count |
 |---|---:|
 | `zh-CN` | 0 |
+| `zh-TW` | 0 |
 | `ja` | 0 |
 | `ru` | 0 |
 | `fr` | 0 |
@@ -49,6 +51,7 @@ As of 2026-02-24:
 | Locale | Enhanced bridge pages | Notes |
 |---|---:|---|
 | `zh-CN` | 33 | Bridge pages include topic positioning + source section map + execution hints |
+| `zh-TW` | 33 | Bridge pages (converted from zh-CN via OpenCC s2twp + Taiwan IT terminology) |
 | `ja` | 33 | Bridge pages include topic positioning + source section map + execution hints |
 | `ru` | 33 | Bridge pages include topic positioning + source section map + execution hints |
 | `fr` | 33 | Bridge pages include topic positioning + source section map + execution hints |
@@ -63,6 +66,7 @@ Not all localized landing pages are full translations of `README.md`:
 |---|---|---|
 | `en` | Full source | 100% |
 | `zh-CN` | Hub-style entry point | ~26% |
+| `zh-TW` | Hub-style entry point | ~26% |
 | `ja` | Hub-style entry point | ~26% |
 | `ru` | Hub-style entry point | ~26% |
 | `fr` | Near-complete translation | ~90% |
@@ -71,7 +75,7 @@ Not all localized landing pages are full translations of `README.md`:
 
 Hub-style entry points provide quick-start orientation and language navigation but do not replicate the full English README content. This is an accurate status record, not a gap to be immediately resolved.
 
-For `zh-CN`, `ja`, `ru`, and `fr`, canonical `docs/i18n/<locale>/` hubs include full top-level parity coverage and maintain language navigation through canonical i18n paths.
+For `zh-CN`, `zh-TW`, `ja`, `ru`, and `fr`, canonical `docs/i18n/<locale>/` hubs include full top-level parity coverage and maintain language navigation through canonical i18n paths.
 
 ## Collection Index i18n
 

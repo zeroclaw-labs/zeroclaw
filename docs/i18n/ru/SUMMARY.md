@@ -9,6 +9,7 @@
 - Русский i18n Hub: [README.md](README.md)
 - Русский совместимый Hub: [docs/i18n/ru/README.md](README.md)
 - Русский совместимый SUMMARY: [../../SUMMARY.ru.md](../../SUMMARY.ru.md)
+- Кит. (традиц.) i18n Hub: [../zh-TW/README.md](../zh-TW/README.md)
 - Индекс i18n: [../README.md](../README.md)
 - Карта покрытия i18n: [../../i18n-coverage.md](../../i18n-coverage.md)
 

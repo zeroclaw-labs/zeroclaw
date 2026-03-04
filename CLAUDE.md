@@ -153,14 +153,14 @@ Treat documentation as a first-class product surface, not a post-merge artifact.
 
 Canonical entry points:
 
-- repository landing + localized hubs: `README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
-- docs hubs: `docs/README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
+- repository landing + localized hubs: `README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/zh-TW/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
+- docs hubs: `docs/README.md`, `docs/i18n/zh-CN/README.md`, `docs/i18n/zh-TW/README.md`, `docs/i18n/ja/README.md`, `docs/i18n/ru/README.md`, `docs/i18n/fr/README.md`, `docs/i18n/vi/README.md`, `docs/i18n/el/README.md`
 - unified TOC: `docs/SUMMARY.md`
 - i18n governance docs: `docs/i18n-guide.md`, `docs/i18n/README.md`, `docs/i18n-coverage.md`
 
 Supported locales (current contract):
 
-- `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`
+- `en`, `zh-CN`, `zh-TW`, `ja`, `ru`, `fr`, `vi`, `el`
 
 Collection indexes (category navigation):
 
@@ -185,7 +185,7 @@ Runtime-contract references (must track behavior changes):
 Required docs governance rules:
 
 - Keep README/hub top navigation and quick routes intuitive and non-duplicative.
-- Keep entry-point parity across all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`) when changing navigation architecture.
+- Keep entry-point parity across all supported locales (`en`, `zh-CN`, `zh-TW`, `ja`, `ru`, `fr`, `vi`, `el`) when changing navigation architecture.
 - If a change touches docs IA, runtime-contract references, or user-facing wording in shared docs, perform i18n follow-through for currently supported locales in the same PR:
   - Update locale navigation links (`README*`, `docs/README*`, `docs/SUMMARY.md`).
   - Update canonical locale hubs and summaries under `docs/i18n/<locale>/` for every supported locale.
@@ -228,7 +228,7 @@ When uncertain, classify as higher risk.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
-    - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`).
+    - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `zh-TW`, `ja`, `ru`, `fr`, `vi`, `el`).
     - Run through `docs/i18n-guide.md` and record any explicit i18n deferrals in the PR summary.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
@@ -344,7 +344,7 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Treat docs navigation as product UX: preserve clear pathing from README -> docs hub -> SUMMARY -> category index.
 - Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
 - When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
-- Keep multilingual entry-point parity for all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`) when nav or key wording changes.
+- Keep multilingual entry-point parity for all supported locales (`en`, `zh-CN`, `zh-TW`, `ja`, `ru`, `fr`, `vi`, `el`) when nav or key wording changes.
 - When shared docs wording changes, sync corresponding localized docs for supported locales in the same PR (or explicitly document deferral and follow-up PR).
 - Treat `docs/i18n/<locale>/**` as canonical for localized hubs/summaries; keep docs-root compatibility shims aligned when edited.
 - Apply `docs/i18n-guide.md` completion checklist before merge and include i18n status in PR notes.

@@ -7,14 +7,16 @@
 ## Είσοδος ανά γλώσσα
 
 - Αγγλικό README: [../README.md](../README.md)
-- Κινεζικό README: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- Κινεζικό (απλοπ.) README: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- Κινεζικό (παραδ.) README: [docs/i18n/zh-TW/README.md](i18n/zh-TW/README.md)
 - Ιαπωνικό README: [docs/i18n/ja/README.md](i18n/ja/README.md)
 - Ρωσικό README: [docs/i18n/ru/README.md](i18n/ru/README.md)
 - Γαλλικό README: [docs/i18n/fr/README.md](i18n/fr/README.md)
 - Βιετναμικό README: [docs/i18n/vi/README.md](i18n/vi/README.md)
 - Ελληνικό README: [docs/i18n/el/README.md](i18n/el/README.md)
 - Αγγλικό Κέντρο Τεκμηρίωσης: [README.md](README.md)
-- Κινεζικό Κέντρο Τεκμηρίωσης: [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- Κινεζικό (απλοπ.) Κέντρο Τεκμηρίωσης: [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
+- Κινεζικό (παραδ.) Κέντρο Τεκμηρίωσης: [i18n/zh-TW/README.md](i18n/zh-TW/README.md)
 - Ιαπωνικό Κέντρο Τεκμηρίωσης: [i18n/ja/README.md](i18n/ja/README.md)
 - Ρωσικό Κέντρο Τεκμηρίωσης: [i18n/ru/README.md](i18n/ru/README.md)
 - Γαλλικό Κέντρο Τεκμηρίωσης: [i18n/fr/README.md](i18n/fr/README.md)

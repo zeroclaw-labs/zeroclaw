@@ -44,6 +44,7 @@
 ## 其他语言
 
 - English: [../../README.md](../../README.md)
+- 繁體中文: [../zh-TW/README.md](../zh-TW/README.md)
 - 日本語: [../ja/README.md](../ja/README.md)
 - Русский: [../ru/README.md](../ru/README.md)
 - Français: [../fr/README.md](../fr/README.md)
