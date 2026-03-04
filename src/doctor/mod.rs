@@ -625,10 +625,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                     .map(|v| v.trim().to_string())
             })
             .filter(|value| !value.is_empty());
-        if let Some(url) = qdrant_url {
+        if qdrant_url.is_some() {
             items.push(DiagItem::ok(
                 cat,
-                format!("postgres_qdrant_hybrid: qdrant endpoint configured ({url})"),
+                "postgres_qdrant_hybrid: qdrant endpoint configured",
             ));
         } else {
             items.push(DiagItem::error(
@@ -1200,7 +1200,13 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
@@ -1412,6 +1418,60 @@ mod tests {
         });
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_errors_when_postgres_hybrid_missing_db_url() {
+        let mut config = Config::default();
+        config.memory.backend = "postgres_qdrant_hybrid".into();
+        config.memory.qdrant.url = Some("http://127.0.0.1:6333".into());
+        config.storage.provider.config.db_url = None;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let item = items
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("postgres_qdrant_hybrid requires [storage.provider.config].db_url")
+            })
+            .expect("expected missing db_url error");
+        assert_eq!(item.severity, Severity::Error);
+    }
+
+    #[test]
+    fn config_validation_errors_when_postgres_hybrid_missing_qdrant_endpoint() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        struct QdrantUrlRestore(Option<String>);
+        impl Drop for QdrantUrlRestore {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("QDRANT_URL", value);
+                } else {
+                    std::env::remove_var("QDRANT_URL");
+                }
+            }
+        }
+        let _restore = QdrantUrlRestore(std::env::var("QDRANT_URL").ok());
+        std::env::remove_var("QDRANT_URL");
+
+        let mut config = Config::default();
+        config.memory.backend = "postgres_qdrant_hybrid".into();
+        config.storage.provider.config.db_url = Some("postgres://localhost:5432/zeroclaw".into());
+        config.memory.qdrant.url = None;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let item = items
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("postgres_qdrant_hybrid requires [memory.qdrant].url or QDRANT_URL")
+            })
+            .expect("expected missing qdrant endpoint error");
+        assert_eq!(item.severity, Severity::Error);
     }
 
     #[test]

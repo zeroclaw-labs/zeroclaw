@@ -59,7 +59,7 @@ impl PostgresQdrantHybridMemory {
         content: &str,
         category: MemoryCategory,
         session_id: Option<&str>,
-    ) {
+    ) -> Result<()> {
         let hash = Self::content_hash(key, content, &category, session_id);
         if let Err(err) = self
             .sync_state
@@ -74,12 +74,14 @@ impl PostgresQdrantHybridMemory {
                 if let Err(err) = self.sync_state.mark_synced(key).await {
                     tracing::warn!(key, error = %err, "Failed to mark sync state synced");
                 }
+                Ok(())
             }
             Err(err) => {
                 tracing::warn!(key, error = %err, "Hybrid Qdrant upsert failed");
                 if let Err(sync_err) = self.sync_state.mark_failed(key, &err.to_string()).await {
                     tracing::warn!(key, error = %sync_err, "Failed to mark sync state failed");
                 }
+                Err(err)
             }
         }
     }
@@ -121,8 +123,12 @@ impl Memory for PostgresQdrantHybridMemory {
         self.postgres
             .store(key, content, category.clone(), session_id)
             .await?;
-        self.sync_after_store(key, content, category, session_id)
-            .await;
+        if let Err(err) = self
+            .sync_after_store(key, content, category, session_id)
+            .await
+        {
+            tracing::warn!(key, error = %err, "Hybrid sync after store failed");
+        }
         Ok(())
     }
 
@@ -132,6 +138,10 @@ impl Memory for PostgresQdrantHybridMemory {
         limit: usize,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return self.postgres.recall(query, limit, session_id).await;
@@ -224,14 +234,19 @@ impl Memory for PostgresQdrantHybridMemory {
         let mut synced = 0usize;
 
         for (idx, entry) in entries.into_iter().enumerate() {
-            self.sync_after_store(
-                &entry.key,
-                &entry.content,
-                entry.category.clone(),
-                entry.session_id.as_deref(),
-            )
-            .await;
-            synced += 1;
+            if let Err(err) = self
+                .sync_after_store(
+                    &entry.key,
+                    &entry.content,
+                    entry.category.clone(),
+                    entry.session_id.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(key = %entry.key, error = %err, "Hybrid reindex sync failed");
+            } else {
+                synced += 1;
+            }
             if let Some(cb) = progress_callback.as_ref() {
                 cb(idx + 1, total);
             }
