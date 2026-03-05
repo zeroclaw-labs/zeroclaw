@@ -78,7 +78,7 @@ impl DingTalkChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.dingtalk")
+        crate::config::build_runtime_proxy_client_with_timeouts("channel.dingtalk", 120, 10)
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
@@ -453,11 +453,16 @@ impl Channel for DingTalkChannel {
             let drafts = self.draft_states.read().await;
             drafts.get(message_id).map(|state| state.recipient.clone())
         };
-        if let Some(known) = known_recipient {
-            if known != recipient {
+        match known_recipient {
+            Some(known) if known == recipient => {}
+            Some(known) => {
                 tracing::debug!(
                     "DingTalk: skipping draft update due to recipient mismatch (expected {known}, got {recipient})"
                 );
+                return Ok(None);
+            }
+            None => {
+                tracing::debug!("DingTalk: skipping draft update for unknown message_id: {message_id}");
                 return Ok(None);
             }
         }
@@ -486,6 +491,26 @@ impl Channel for DingTalkChannel {
                 .await;
         }
 
+        let known_recipient = {
+            let drafts = self.draft_states.read().await;
+            drafts.get(message_id).map(|state| state.recipient.clone())
+        };
+        match known_recipient {
+            Some(known) if known == recipient => {}
+            Some(known) => {
+                tracing::debug!(
+                    "DingTalk: skipping draft finalize due to recipient mismatch (expected {known}, got {recipient})"
+                );
+                return Ok(());
+            }
+            None => {
+                tracing::debug!(
+                    "DingTalk: skipping draft finalize for unknown message_id: {message_id}"
+                );
+                return Ok(());
+            }
+        }
+
         let stream_result = self.stream_card(message_id, text, true).await;
         {
             let mut drafts = self.draft_states.write().await;
@@ -508,9 +533,29 @@ impl Channel for DingTalkChannel {
         Ok(())
     }
 
-    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         if !self.card_streaming_enabled() {
             return Ok(());
+        }
+
+        let known_recipient = {
+            let drafts = self.draft_states.read().await;
+            drafts.get(message_id).map(|state| state.recipient.clone())
+        };
+        match known_recipient {
+            Some(known) if known == recipient => {}
+            Some(known) => {
+                tracing::debug!(
+                    "DingTalk: skipping draft cancel due to recipient mismatch (expected {known}, got {recipient})"
+                );
+                return Ok(());
+            }
+            None => {
+                tracing::debug!(
+                    "DingTalk: skipping draft cancel for unknown message_id: {message_id}"
+                );
+                return Ok(());
+            }
         }
 
         let fallback_content = {
@@ -853,5 +898,85 @@ client_secret = "secret"
         });
         let chat_id = DingTalkChannel::resolve_chat_id(&data, "staff-1");
         assert_eq!(chat_id, "cid-group");
+    }
+
+    #[tokio::test]
+    async fn update_draft_skips_unknown_message_id() {
+        let card = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            vec!["*".into()],
+            crate::config::schema::DingTalkMessageType::Card,
+            Some("tpl-1".into()),
+            None,
+            "content".into(),
+        );
+
+        let result = card
+            .update_draft("cid-group", "unknown-draft", "partial")
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_skips_recipient_mismatch() {
+        let card = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            vec!["*".into()],
+            crate::config::schema::DingTalkMessageType::Card,
+            Some("tpl-1".into()),
+            None,
+            "content".into(),
+        );
+        {
+            let mut drafts = card.draft_states.write().await;
+            drafts.insert(
+                "draft-1".to_string(),
+                CardDraftState {
+                    recipient: "cid-group-a".to_string(),
+                    last_content: "hello".to_string(),
+                },
+            );
+        }
+
+        let result = card
+            .finalize_draft("cid-group-b", "draft-1", "final")
+            .await;
+
+        assert!(result.is_ok());
+        let drafts = card.draft_states.read().await;
+        assert!(drafts.contains_key("draft-1"));
+    }
+
+    #[tokio::test]
+    async fn cancel_draft_skips_recipient_mismatch() {
+        let card = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            vec!["*".into()],
+            crate::config::schema::DingTalkMessageType::Card,
+            Some("tpl-1".into()),
+            None,
+            "content".into(),
+        );
+        {
+            let mut drafts = card.draft_states.write().await;
+            drafts.insert(
+                "draft-1".to_string(),
+                CardDraftState {
+                    recipient: "cid-group-a".to_string(),
+                    last_content: "hello".to_string(),
+                },
+            );
+        }
+
+        let result = card.cancel_draft("cid-group-b", "draft-1").await;
+
+        assert!(result.is_ok());
+        let drafts = card.draft_states.read().await;
+        assert!(drafts.contains_key("draft-1"));
     }
 }

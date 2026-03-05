@@ -335,7 +335,7 @@ allowed_users = ["*"]
 # Tùy chọn: bật phản hồi streaming bằng template card
 message_type = "card"                  # "markdown" (mặc định) hoặc "card"
 card_template_id = "tpl_xxxxx"         # bắt buộc khi message_type = "card"
-card_template_key = "content"          # key biến trong template để stream nội dung
+card_template_key = "content"          # tùy chọn; mặc định "content" nếu bỏ qua
 robot_code = "ding-robot-code"         # tùy chọn, mặc định dùng client_id
 ```
 

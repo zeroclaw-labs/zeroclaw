@@ -453,7 +453,7 @@ allowed_users = ["*"]
 # Optional: enable template-card streaming replies
 message_type = "card"                  # "markdown" (default) or "card"
 card_template_id = "tpl_xxxxx"         # required when message_type = "card"
-card_template_key = "content"          # template variable key to stream into
+card_template_key = "content"          # optional; defaults to "content" when omitted
 robot_code = "ding-robot-code"         # optional, falls back to client_id when omitted
 ```
 

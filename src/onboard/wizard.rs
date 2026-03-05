@@ -1,7 +1,7 @@
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, QQReceiveMode, SignalConfig, StreamMode,
-    WhatsAppConfig,
+    default_dingtalk_card_template_key, default_nostr_relays, DingTalkConfig, IrcConfig,
+    LarkReceiveMode, LinqConfig, NextcloudTalkConfig, NostrConfig, QQConfig, QQReceiveMode,
+    SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -4902,7 +4902,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     message_type: crate::config::schema::DingTalkMessageType::Markdown,
                     card_template_id: None,
-                    card_template_key: "content".to_string(),
+                    card_template_key: default_dingtalk_card_template_key(),
                     robot_code: None,
                 });
             }

@@ -4574,7 +4574,7 @@ pub enum DingTalkMessageType {
     Card,
 }
 
-fn default_dingtalk_card_template_key() -> String {
+pub fn default_dingtalk_card_template_key() -> String {
     "content".to_string()
 }
 
@@ -4588,19 +4588,43 @@ pub struct DingTalkConfig {
     /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// Reply mode: markdown (default) or template card.
+    /// Reply mode for outbound DingTalk replies.
+    ///
+    /// Compatibility: defaults to `markdown`, which preserves pre-card behavior
+    /// for existing configs that do not set any of the new card fields.
+    ///
+    /// Migration: set to `card` to opt into template-card streaming.
+    ///
+    /// Rollback: set back to `markdown` (or remove this key) to restore
+    /// legacy markdown webhook replies.
     #[serde(default)]
     pub message_type: DingTalkMessageType,
-    /// DingTalk card template ID for card mode.
-    /// Required only when `message_type = "card"`.
+    /// DingTalk template ID used when `message_type = "card"`.
+    ///
+    /// Compatibility: optional for markdown mode and ignored there.
+    ///
+    /// Migration: must be set to a non-empty value when enabling card mode.
+    ///
+    /// Rollback: when returning to markdown mode, this key can be removed.
     #[serde(default)]
     pub card_template_id: Option<String>,
-    /// Template variable key used for card streaming body updates.
-    /// Optional; defaults to `content` when omitted.
+    /// Template variable key updated during card streaming.
+    ///
+    /// Compatibility: optional; defaults to `content` when omitted.
+    ///
+    /// Migration: set this only if your template variable is not `content`.
+    ///
+    /// Rollback: remove this key to return to the default `content` behavior.
     #[serde(default = "default_dingtalk_card_template_key")]
     pub card_template_key: String,
-    /// Optional robot code override for proactive/card APIs.
-    /// When omitted, channel falls back to `client_id`.
+    /// Optional robot code override for card delivery APIs.
+    ///
+    /// Compatibility: optional; when omitted, runtime falls back to `client_id`.
+    ///
+    /// Migration: set this only when your DingTalk setup requires a distinct
+    /// robot code.
+    ///
+    /// Rollback: remove this key to use `client_id` again.
     #[serde(default)]
     pub robot_code: Option<String>,
 }
@@ -5992,6 +6016,25 @@ impl Config {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
         }
 
+        if let Some(dingtalk) = self.channels_config.dingtalk.as_ref() {
+            if dingtalk.message_type == DingTalkMessageType::Card {
+                let has_template_id = dingtalk
+                    .card_template_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !has_template_id {
+                    anyhow::bail!(
+                        "channels_config.dingtalk.card_template_id is required when channels_config.dingtalk.message_type = 'card'"
+                    );
+                }
+                if dingtalk.card_template_key.trim().is_empty() {
+                    anyhow::bail!(
+                        "channels_config.dingtalk.card_template_key must not be empty when channels_config.dingtalk.message_type = 'card'"
+                    );
+                }
+            }
+        }
+
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
@@ -6850,6 +6893,25 @@ allowed_roots = []
         assert!(err
             .to_string()
             .contains("autonomy.non_cli_excluded_tools contains duplicate entry"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_dingtalk_card_without_template_id() {
+        let mut cfg = Config::default();
+        cfg.channels_config.dingtalk = Some(DingTalkConfig {
+            client_id: "app-key".into(),
+            client_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+            message_type: DingTalkMessageType::Card,
+            card_template_id: None,
+            card_template_key: default_dingtalk_card_template_key(),
+            robot_code: None,
+        });
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("channels_config.dingtalk.card_template_id is required"));
     }
 
     #[test]
