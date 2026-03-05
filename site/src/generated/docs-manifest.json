@@ -220,7 +220,7 @@
       "guide",
       "onboarding"
     ],
-    "readingMinutes": 1,
+    "readingMinutes": 2,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/android-setup.md"
   },
@@ -320,7 +320,7 @@
       "channels-reference.md",
       "reference"
     ],
-    "readingMinutes": 11,
+    "readingMinutes": 13,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/channels-reference.md"
   },
@@ -360,7 +360,7 @@
       "commands-reference.md",
       "reference"
     ],
-    "readingMinutes": 6,
+    "readingMinutes": 8,
     "startHere": true,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/commands-reference.md"
   },
@@ -398,7 +398,7 @@
       "config-reference.md",
       "reference"
     ],
-    "readingMinutes": 24,
+    "readingMinutes": 34,
     "startHere": true,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/config-reference.md"
   },
@@ -442,6 +442,27 @@
     "readingMinutes": 1,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/contributing/README.md"
+  },
+  {
+    "id": "docs-cron-scheduling-md",
+    "path": "docs/cron-scheduling.md",
+    "title": "Cron & Scheduling System",
+    "summary": "ZeroClaw includes a full-featured job scheduling system for running tasks on a schedule, at specific times, or at regular intervals.",
+    "section": "cron-scheduling.md",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "cron-scheduling.md",
+      "guide",
+      "operations"
+    ],
+    "readingMinutes": 3,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/cron-scheduling.md"
   },
   {
     "id": "docs-custom-providers-md",
@@ -712,6 +733,24 @@
     "readingMinutes": 7,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/hardware-peripherals-design.md"
+  },
+  {
+    "id": "docs-hardware-raspberry-pi-zero-w-build-md",
+    "path": "docs/hardware/raspberry-pi-zero-w-build.md",
+    "title": "Building ZeroClaw on Raspberry Pi Zero W",
+    "summary": "Complete guide to compile ZeroClaw on Raspberry Pi Zero W (512MB RAM, ARMv6).",
+    "section": "hardware",
+    "language": "en",
+    "journey": "hardware",
+    "audience": "hardware",
+    "kind": "guide",
+    "tags": [
+      "guide",
+      "hardware"
+    ],
+    "readingMinutes": 5,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/hardware/raspberry-pi-zero-w-build.md"
   },
   {
     "id": "docs-hardware-readme-md",
@@ -1030,7 +1069,7 @@
       "localize",
       "reference"
     ],
-    "readingMinutes": 2,
+    "readingMinutes": 3,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/i18n/el/commands-reference.md"
   },
@@ -5148,7 +5187,7 @@
       "localize",
       "reference"
     ],
-    "readingMinutes": 4,
+    "readingMinutes": 5,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/i18n/vi/commands-reference.md"
   },
@@ -5196,6 +5235,27 @@
     "readingMinutes": 1,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/i18n/vi/contributing/README.md"
+  },
+  {
+    "id": "docs-i18n-vi-cron-scheduling-md",
+    "path": "docs/i18n/vi/cron-scheduling.md",
+    "title": "Hệ thống Cron & Lập lịch",
+    "summary": "ZeroClaw bao gồm hệ thống lập lịch công việc đầy đủ tính năng để chạy các tác vụ theo lịch trình, tại thời điểm cụ thể, hoặc theo khoảng thời gian đều đặn.",
+    "section": "i18n/vi",
+    "language": "vi",
+    "journey": "localize",
+    "audience": "contributor",
+    "kind": "guide",
+    "tags": [
+      "contributor",
+      "guide",
+      "i18n",
+      "i18n/vi",
+      "localize"
+    ],
+    "readingMinutes": 4,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/i18n/vi/cron-scheduling.md"
   },
   {
     "id": "docs-i18n-vi-custom-providers-md",
@@ -5770,7 +5830,7 @@
       "localize",
       "operations"
     ],
-    "readingMinutes": 12,
+    "readingMinutes": 13,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/i18n/vi/pr-workflow.md"
   },
@@ -7086,6 +7146,28 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/mattermost-setup.md"
   },
   {
+    "id": "docs-migration-openclaw-migration-guide-md",
+    "path": "docs/migration/openclaw-migration-guide.md",
+    "title": "OpenClaw → ZeroClaw Migration Guide",
+    "summary": "This guide walks you through migrating an OpenClaw deployment to ZeroClaw. It covers configuration conversion, endpoint changes, and the architectural differences you need to know.",
+    "section": "migration",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "deployment",
+      "guide",
+      "migration",
+      "reference"
+    ],
+    "readingMinutes": 5,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/migration/openclaw-migration-guide.md"
+  },
+  {
     "id": "docs-network-deployment-md",
     "path": "docs/network-deployment.md",
     "title": "Network Deployment — ZeroClaw on Raspberry Pi and Local Network",
@@ -7441,6 +7523,87 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/operations/required-check-mapping.md"
   },
   {
+    "id": "docs-operations-self-hosted-runner-remediation-md",
+    "path": "docs/operations/self-hosted-runner-remediation.md",
+    "title": "Self-Hosted Runner Remediation Runbook",
+    "summary": "This runbook provides operational steps for self-hosted runner capacity incidents.",
+    "section": "operations",
+    "language": "en",
+    "journey": "operate",
+    "audience": "operator",
+    "kind": "runbook",
+    "tags": [
+      "operate",
+      "operations",
+      "operator",
+      "runbook"
+    ],
+    "readingMinutes": 2,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/operations/self-hosted-runner-remediation.md"
+  },
+  {
+    "id": "docs-plans-2026-02-22-wasm-plugin-runtime-design-md",
+    "path": "docs/plans/2026-02-22-wasm-plugin-runtime-design.md",
+    "title": "WASM Plugin Runtime Design (Capability-Segmented, WASI Preview 2)",
+    "summary": "ZeroClaw currently uses in-process trait/factory extension points for providers, tools, channels, memory, runtime adapters, observers, peripherals, and hooks. Hook interfaces exist, but several lifecycle events are eithe",
+    "section": "plans",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "plans",
+      "reference"
+    ],
+    "readingMinutes": 3,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/plans/2026-02-22-wasm-plugin-runtime-design.md"
+  },
+  {
+    "id": "docs-plans-2026-02-22-wasm-plugin-runtime-md",
+    "path": "docs/plans/2026-02-22-wasm-plugin-runtime.md",
+    "title": "WASM Plugin Runtime Implementation Plan",
+    "summary": "hook points, ObserverBridge, and hot-reload with safe fallback.",
+    "section": "plans",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "plans"
+    ],
+    "readingMinutes": 6,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/plans/2026-02-22-wasm-plugin-runtime.md"
+  },
+  {
+    "id": "docs-plugins-md",
+    "path": "docs/PLUGINS.md",
+    "title": "ZeroClaw Plugin System",
+    "summary": "A plugin architecture for ZeroClaw modeled after OpenClaw's plugin system, adapted for Rust.",
+    "section": "PLUGINS.md",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "PLUGINS.md"
+    ],
+    "readingMinutes": 2,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/PLUGINS.md"
+  },
+  {
     "id": "docs-pr-workflow-md",
     "path": "docs/pr-workflow.md",
     "title": "ZeroClaw PR Workflow (High-Volume Collaboration)",
@@ -7484,6 +7647,69 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/project-triage-snapshot-2026-02-18.md"
   },
   {
+    "id": "docs-project-f1-3-agent-lifecycle-state-machine-rfi-2026-03-01-md",
+    "path": "docs/project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md",
+    "title": "F1-3 Agent Lifecycle State Machine RFI (2026-03-01)",
+    "summary": "Status: RFI complete, implementation planning ready.",
+    "section": "project",
+    "language": "en",
+    "journey": "contribute",
+    "audience": "contributor",
+    "kind": "guide",
+    "tags": [
+      "contribute",
+      "contributing",
+      "contributor",
+      "guide",
+      "project"
+    ],
+    "readingMinutes": 5,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md"
+  },
+  {
+    "id": "docs-project-m4-5-rfi-spike-2026-02-28-md",
+    "path": "docs/project/m4-5-rfi-spike-2026-02-28.md",
+    "title": "M4-5 Multi-Crate Workspace RFI Spike (2026-02-28)",
+    "summary": "Status: RFI complete, extraction execution pending.",
+    "section": "project",
+    "language": "en",
+    "journey": "contribute",
+    "audience": "contributor",
+    "kind": "guide",
+    "tags": [
+      "contribute",
+      "contributing",
+      "contributor",
+      "guide",
+      "project"
+    ],
+    "readingMinutes": 3,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/project/m4-5-rfi-spike-2026-02-28.md"
+  },
+  {
+    "id": "docs-project-q0-3-stop-reason-state-machine-rfi-2026-03-01-md",
+    "path": "docs/project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md",
+    "title": "Q0-3 Stop-Reason State Machine + Max-Tokens Continuation RFI (2026-03-01)",
+    "summary": "Status: RFI complete, implementation planning ready.",
+    "section": "project",
+    "language": "en",
+    "journey": "contribute",
+    "audience": "contributor",
+    "kind": "guide",
+    "tags": [
+      "contribute",
+      "contributing",
+      "contributor",
+      "guide",
+      "project"
+    ],
+    "readingMinutes": 4,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md"
+  },
+  {
     "id": "docs-project-readme-md",
     "path": "docs/project/README.md",
     "title": "Project Snapshot & Triage Docs",
@@ -7521,7 +7747,7 @@
       "providers-reference.md",
       "reference"
     ],
-    "readingMinutes": 8,
+    "readingMinutes": 9,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/providers-reference.md"
   },
@@ -7672,6 +7898,46 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/reviewer-playbook.md"
   },
   {
+    "id": "docs-rfc-001-aww-agent-wide-web-md",
+    "path": "docs/rfc/001-aww-agent-wide-web.md",
+    "title": "RFC 001: AWW (Agent Wide Web) — A World Wide Web for AI Agent Experiences",
+    "summary": "1. Experience Cannot Be Reused — Agent A solves a problem, Agent B rediscovers it",
+    "section": "rfc",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "rfc"
+    ],
+    "readingMinutes": 6,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/rfc/001-aww-agent-wide-web.md"
+  },
+  {
+    "id": "docs-ros2-integration-guidance-md",
+    "path": "docs/ros2-integration-guidance.md",
+    "title": "ROS2 Integration Guidance",
+    "summary": "This note captures the recommended integration shape for ROS2/ROS1 environments.",
+    "section": "ros2-integration-guidance.md",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "ros2-integration-guidance.md"
+    ],
+    "readingMinutes": 2,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/ros2-integration-guidance.md"
+  },
+  {
     "id": "docs-sandboxing-md",
     "path": "docs/sandboxing.md",
     "title": "ZeroClaw Sandboxing Strategies",
@@ -7786,6 +8052,65 @@
     "readingMinutes": 1,
     "startHere": false,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/security/advisory-metadata-template.zh-CN.md"
+  },
+  {
+    "id": "docs-security-enject-inspired-hardening-md",
+    "path": "docs/security/enject-inspired-hardening.md",
+    "title": "Enject-Inspired Hardening Notes",
+    "summary": "This document records a focused security review of GreatScott/enject and maps the useful controls to ZeroClaw runtime/tooling.",
+    "section": "security",
+    "language": "en",
+    "journey": "secure",
+    "audience": "security",
+    "kind": "guide",
+    "tags": [
+      "guide",
+      "secure",
+      "security"
+    ],
+    "readingMinutes": 4,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/security/enject-inspired-hardening.md"
+  },
+  {
+    "id": "docs-security-official-channels-and-fraud-prevention-md",
+    "path": "docs/security/official-channels-and-fraud-prevention.md",
+    "title": "Official Channels And Fraud Prevention",
+    "summary": "This page is the evergreen security statement for community safety and impersonation defense.",
+    "section": "security",
+    "language": "en",
+    "journey": "secure",
+    "audience": "security",
+    "kind": "guide",
+    "tags": [
+      "guide",
+      "operations",
+      "reference",
+      "secure",
+      "security"
+    ],
+    "readingMinutes": 1,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/security/official-channels-and-fraud-prevention.md"
+  },
+  {
+    "id": "docs-security-perplexity-filter-md",
+    "path": "docs/security/perplexity-filter.md",
+    "title": "Perplexity Filter (Opt-In)",
+    "summary": "ZeroClaw provides an opt-in lightweight statistical filter that detects",
+    "section": "security",
+    "language": "en",
+    "journey": "secure",
+    "audience": "security",
+    "kind": "guide",
+    "tags": [
+      "guide",
+      "secure",
+      "security"
+    ],
+    "readingMinutes": 1,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/security/perplexity-filter.md"
   },
   {
     "id": "docs-security-private-vulnerability-report-template-md",
@@ -7975,6 +8300,26 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/sop/syntax.md"
   },
   {
+    "id": "docs-structure-by-function-md",
+    "path": "docs/structure/by-function.md",
+    "title": "ZeroClaw Docs By Function",
+    "summary": "This index groups documentation by operational function instead of folder path.",
+    "section": "structure",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "structure"
+    ],
+    "readingMinutes": 1,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/structure/by-function.md"
+  },
+  {
     "id": "docs-structure-readme-md",
     "path": "docs/structure/README.md",
     "title": "ZeroClaw Docs Structure Map",
@@ -8154,7 +8499,7 @@
       "troubleshooting",
       "troubleshooting.md"
     ],
-    "readingMinutes": 3,
+    "readingMinutes": 1,
     "startHere": true,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/troubleshooting.md"
   },
@@ -8200,6 +8545,26 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/vi/datasheets/README.md"
   },
   {
+    "id": "docs-wasm-tools-guide-md",
+    "path": "docs/wasm-tools-guide.md",
+    "title": "WASM Tools Guide",
+    "summary": "This guide covers everything you need to build, install, and use WASM-based tools",
+    "section": "wasm-tools-guide.md",
+    "language": "en",
+    "journey": "build",
+    "audience": "builder",
+    "kind": "guide",
+    "tags": [
+      "build",
+      "builder",
+      "guide",
+      "wasm-tools-guide.md"
+    ],
+    "readingMinutes": 7,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/wasm-tools-guide.md"
+  },
+  {
     "id": "docs-zai-glm-setup-md",
     "path": "docs/zai-glm-setup.md",
     "title": "Z.AI GLM Setup",
@@ -8222,10 +8587,30 @@
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/zai-glm-setup.md"
   },
   {
+    "id": "pr-description-update-md",
+    "path": "PR_DESCRIPTION_UPDATE.md",
+    "title": "Android Phase 3 - Agent Integration",
+    "summary": "This PR implements the Android client for ZeroClaw with full agent integration, including foreground service, Quick Settings tile, boot receiver, and background heartbeat support.",
+    "section": "root",
+    "language": "en",
+    "journey": "start",
+    "audience": "newcomer",
+    "kind": "guide",
+    "tags": [
+      "guide",
+      "newcomer",
+      "root",
+      "start"
+    ],
+    "readingMinutes": 2,
+    "startHere": false,
+    "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/PR_DESCRIPTION_UPDATE.md"
+  },
+  {
     "id": "readme-md",
     "path": "README.md",
-    "title": "Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)",
-    "summary": "⚡️ Runs on $10 hardware with",
+    "title": "Quick Start",
+    "summary": "⚡️ Runs on any hardware with",
     "section": "root",
     "language": "en",
     "journey": "start",
@@ -8236,11 +8621,10 @@
       "hardware",
       "newcomer",
       "onboarding",
-      "operations",
       "root",
       "start"
     ],
-    "readingMinutes": 18,
+    "readingMinutes": 4,
     "startHere": true,
     "sourceUrl": "https://github.com/zeroclaw-labs/zeroclaw/blob/main/README.md"
   },

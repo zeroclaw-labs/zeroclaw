@@ -41,6 +41,7 @@ pub mod policy;
 pub mod prompt_guard;
 pub mod roles;
 pub mod secrets;
+pub mod semantic_guard;
 pub mod sensitive_paths;
 pub mod syscall_anomaly;
 pub mod traits;
@@ -64,6 +65,8 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use roles::{RoleRegistry, ToolAccess};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
+#[allow(unused_imports)]
+pub use semantic_guard::{GuardCorpusUpdateReport, SemanticGuard, SemanticGuardStartupStatus};
 #[allow(unused_imports)]
 pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};
 #[allow(unused_imports)]

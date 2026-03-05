@@ -1,5 +1,5 @@
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
+    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NapcatConfig,
     NextcloudTalkConfig, NostrConfig, ProgressMode, QQConfig, QQEnvironment, QQReceiveMode,
     SignalConfig, StreamMode, WhatsAppConfig,
 };
@@ -980,6 +980,8 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
+        "samba-nova" => "sambanova",
+        "hf" => "huggingface",
         "llama.cpp" => "llamacpp",
         _ => provider_name,
     }
@@ -1028,6 +1030,11 @@ fn default_model_for_provider(provider: &str) -> String {
         "novita" => "minimax/minimax-m2.5".into(),
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
+        "ai21" => "jamba-1.5-large".into(),
+        "cerebras" => "llama3.1-70b".into(),
+        "sambanova" => "Meta-Llama-3.3-70B-Instruct".into(),
+        "huggingface" => "meta-llama/Llama-3.3-70B-Instruct".into(),
+        "replicate" => "meta/meta-llama-3-70b-instruct".into(),
         "moonshot" => "kimi-k2.5".into(),
         "stepfun" => "step-3.5-flash".into(),
         "hunyuan" => "hunyuan-t1-latest".into(),
@@ -1288,6 +1295,56 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "command-r-08-2024".to_string(),
                 "Command R (stable fast baseline)".to_string(),
+            ),
+        ],
+        "ai21" => vec![
+            (
+                "jamba-1.5-large".to_string(),
+                "Jamba 1.5 Large (recommended)".to_string(),
+            ),
+            (
+                "jamba-1.5-mini".to_string(),
+                "Jamba 1.5 Mini (faster, lower cost)".to_string(),
+            ),
+        ],
+        "cerebras" => vec![
+            (
+                "llama3.1-70b".to_string(),
+                "Llama 3.1 70B (Cerebras fast inference)".to_string(),
+            ),
+            (
+                "llama3.1-8b".to_string(),
+                "Llama 3.1 8B (lower latency)".to_string(),
+            ),
+        ],
+        "sambanova" => vec![
+            (
+                "Meta-Llama-3.3-70B-Instruct".to_string(),
+                "Meta Llama 3.3 70B Instruct (recommended)".to_string(),
+            ),
+            (
+                "DeepSeek-R1".to_string(),
+                "DeepSeek R1 (reasoning-focused)".to_string(),
+            ),
+        ],
+        "huggingface" => vec![
+            (
+                "meta-llama/Llama-3.3-70B-Instruct".to_string(),
+                "Llama 3.3 70B Instruct (HF router default)".to_string(),
+            ),
+            (
+                "Qwen/Qwen2.5-Coder-32B-Instruct".to_string(),
+                "Qwen 2.5 Coder 32B (coding-focused)".to_string(),
+            ),
+        ],
+        "replicate" => vec![
+            (
+                "meta/meta-llama-3-70b-instruct".to_string(),
+                "Llama 3 70B Instruct (recommended)".to_string(),
+            ),
+            (
+                "deepseek-ai/deepseek-v3".to_string(),
+                "DeepSeek V3 (strong value)".to_string(),
             ),
         ],
         "kimi-code" => vec![
@@ -1568,6 +1625,11 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "fireworks"
             | "novita"
             | "cohere"
+            | "ai21"
+            | "cerebras"
+            | "sambanova"
+            | "huggingface"
+            | "replicate"
             | "moonshot"
             | "stepfun"
             | "glm"
@@ -1601,6 +1663,11 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "fireworks" => Some("https://api.fireworks.ai/inference/v1/models"),
             "novita" => Some("https://api.novita.ai/openai/v1/models"),
             "cohere" => Some("https://api.cohere.com/compatibility/v1/models"),
+            "ai21" => Some("https://api.ai21.com/studio/v1/models"),
+            "cerebras" => Some("https://api.cerebras.ai/v1/models"),
+            "sambanova" => Some("https://api.sambanova.ai/v1/models"),
+            "huggingface" => Some("https://router.huggingface.co/v1/models"),
+            "replicate" => Some("https://api.replicate.com/v1/models"),
             "moonshot" => Some("https://api.moonshot.ai/v1/models"),
             "stepfun" => Some("https://api.stepfun.com/v1/models"),
             "glm" => Some("https://api.z.ai/api/paas/v4/models"),
@@ -2474,14 +2541,14 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    crate::config::schema::persist_active_workspace_config_dir(config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to persist active workspace selection for {}",
-                config_dir.display()
-            )
-        })
+    if let Err(error) = crate::config::schema::persist_active_workspace_config_dir(config_dir).await
+    {
+        tracing::warn!(
+            config_dir = %config_dir.display(),
+            "Could not persist active workspace marker; continuing without marker: {error}"
+        );
+    }
+    Ok(())
 }
 
 // ── Step 1: Workspace ────────────────────────────────────────────
@@ -2577,6 +2644,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("novita", "Novita AI — affordable open-source inference"),
             ("together-ai", "Together AI — open-source model hosting"),
             ("nvidia", "NVIDIA NIM — DeepSeek, Llama, & more"),
+            ("cerebras", "Cerebras — low-latency hosted inference"),
+            ("sambanova", "SambaNova — enterprise hosted inference"),
+            ("huggingface", "Hugging Face — hosted model router"),
+            ("replicate", "Replicate — hosted open-source models"),
         ],
         2 => vec![
             ("vercel", "Vercel AI Gateway"),
@@ -2628,6 +2699,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("synthetic", "Synthetic — Synthetic AI models"),
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
+            ("ai21", "AI21 Labs — Jamba model family"),
         ],
         4 => local_provider_choices(),
         _ => vec![], // Custom — handled below
@@ -3037,6 +3109,11 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "perplexity" => "https://www.perplexity.ai/settings/api",
                 "xai" => "https://console.x.ai",
                 "cohere" => "https://dashboard.cohere.com/api-keys",
+                "ai21" => "https://studio.ai21.com/account/api-key",
+                "cerebras" => "https://cloud.cerebras.ai/platform/api-keys",
+                "sambanova" | "samba-nova" => "https://cloud.sambanova.ai/apis",
+                "huggingface" | "hf" => "https://huggingface.co/settings/tokens",
+                "replicate" => "https://replicate.com/account/api-tokens",
                 "vercel" => "https://vercel.com/account/tokens",
                 "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
                 "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
@@ -3329,6 +3406,11 @@ fn provider_env_var(name: &str) -> &'static str {
         "novita" => "NOVITA_API_KEY",
         "perplexity" => "PERPLEXITY_API_KEY",
         "cohere" => "COHERE_API_KEY",
+        "ai21" => "AI21_API_KEY",
+        "cerebras" => "CEREBRAS_API_KEY",
+        "sambanova" | "samba-nova" => "SAMBANOVA_API_KEY",
+        "huggingface" | "hf" => "HUGGINGFACE_API_KEY",
+        "replicate" => "REPLICATE_API_TOKEN",
         "kimi-code" => "KIMI_CODE_API_KEY",
         "moonshot" => "MOONSHOT_API_KEY",
         "stepfun" => "STEP_API_KEY",
@@ -4342,6 +4424,7 @@ enum ChannelMenuChoice {
     NextcloudTalk,
     DingTalk,
     QqOfficial,
+    Napcat,
     LarkFeishu,
     Nostr,
     Done,
@@ -4361,6 +4444,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
+    ChannelMenuChoice::Napcat,
     ChannelMenuChoice::LarkFeishu,
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
@@ -4485,6 +4569,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ connected"
                     } else {
                         "— Tencent QQ Bot"
+                    }
+                ),
+                ChannelMenuChoice::Napcat => format!(
+                    "Napcat/OneBot {}",
+                    if config.napcat.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— QQ via OneBot v11"
                     }
                 ),
                 ChannelMenuChoice::LarkFeishu => format!(
@@ -5790,6 +5882,62 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     receive_mode,
                     environment,
                 });
+            }
+            ChannelMenuChoice::Napcat => {
+                // ── Napcat / OneBot ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Napcat / OneBot Setup").white().bold(),
+                    style("— QQ via OneBot v11 (Napcat)").dim()
+                );
+                print_bullet("1. Start your Napcat/OneBot gateway");
+                print_bullet("2. Enable OneBot v11 WebSocket endpoint");
+                print_bullet("3. Paste the WebSocket URL and optional token below");
+                println!();
+
+                let websocket_url: String = Input::new()
+                    .with_prompt("  WebSocket URL")
+                    .default("ws://127.0.0.1:3001".into())
+                    .interact_text()?;
+                let websocket_url = websocket_url.trim().to_string();
+                if websocket_url.is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let api_base_url: String = Input::new()
+                    .with_prompt("  HTTP API base URL (optional, Enter to auto-derive)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let access_token: String = Input::new()
+                    .with_prompt("  Access token (optional)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed QQ user IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                config.napcat = Some(NapcatConfig {
+                    websocket_url,
+                    api_base_url: api_base_url.trim().to_string(),
+                    access_token: if access_token.trim().is_empty() {
+                        None
+                    } else {
+                        Some(access_token.trim().to_string())
+                    },
+                    allowed_users,
+                });
+
+                println!("  {} Napcat configured", style("✅").green().bold());
             }
             ChannelMenuChoice::LarkFeishu => {
                 // ── Lark/Feishu ──
@@ -7938,6 +8086,28 @@ mod tests {
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("copilot"), "default");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
+        assert_eq!(default_model_for_provider("ai21"), "jamba-1.5-large");
+        assert_eq!(default_model_for_provider("cerebras"), "llama3.1-70b");
+        assert_eq!(
+            default_model_for_provider("sambanova"),
+            "Meta-Llama-3.3-70B-Instruct"
+        );
+        assert_eq!(
+            default_model_for_provider("samba-nova"),
+            "Meta-Llama-3.3-70B-Instruct"
+        );
+        assert_eq!(
+            default_model_for_provider("huggingface"),
+            "meta-llama/Llama-3.3-70B-Instruct"
+        );
+        assert_eq!(
+            default_model_for_provider("hf"),
+            "meta-llama/Llama-3.3-70B-Instruct"
+        );
+        assert_eq!(
+            default_model_for_provider("replicate"),
+            "meta/meta-llama-3-70b-instruct"
+        );
         assert_eq!(
             default_model_for_provider("bedrock"),
             "anthropic.claude-sonnet-4-5-20250929-v1:0"
@@ -8007,6 +8177,8 @@ mod tests {
         assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
+        assert_eq!(canonical_provider_name("samba-nova"), "sambanova");
+        assert_eq!(canonical_provider_name("hf"), "huggingface");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
     }
 
@@ -8198,6 +8370,14 @@ mod tests {
         assert!(supports_live_model_fetch("stepfun"));
         assert!(supports_live_model_fetch("step"));
         assert!(supports_live_model_fetch("step-ai"));
+
+        assert!(supports_live_model_fetch("ai21"));
+        assert!(supports_live_model_fetch("cerebras"));
+        assert!(supports_live_model_fetch("sambanova"));
+        assert!(supports_live_model_fetch("samba-nova"));
+        assert!(supports_live_model_fetch("huggingface"));
+        assert!(supports_live_model_fetch("hf"));
+        assert!(supports_live_model_fetch("replicate"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
         assert!(supports_live_model_fetch("qwen-coding-plan"));
@@ -8288,6 +8468,14 @@ mod tests {
             curated_models_for_provider("siliconflow"),
             curated_models_for_provider("siliconcloud")
         );
+        assert_eq!(
+            curated_models_for_provider("sambanova"),
+            curated_models_for_provider("samba-nova")
+        );
+        assert_eq!(
+            curated_models_for_provider("huggingface"),
+            curated_models_for_provider("hf")
+        );
     }
 
     #[test]
@@ -8347,6 +8535,34 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("cohere"),
             Some("https://api.cohere.com/compatibility/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("ai21"),
+            Some("https://api.ai21.com/studio/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("cerebras"),
+            Some("https://api.cerebras.ai/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("sambanova"),
+            Some("https://api.sambanova.ai/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("samba-nova"),
+            Some("https://api.sambanova.ai/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("huggingface"),
+            Some("https://router.huggingface.co/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("hf"),
+            Some("https://router.huggingface.co/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("replicate"),
+            Some("https://api.replicate.com/v1/models")
         );
         assert_eq!(
             models_endpoint_for_provider("moonshot"),
@@ -8650,6 +8866,13 @@ mod tests {
         assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
+        assert_eq!(provider_env_var("ai21"), "AI21_API_KEY");
+        assert_eq!(provider_env_var("cerebras"), "CEREBRAS_API_KEY");
+        assert_eq!(provider_env_var("sambanova"), "SAMBANOVA_API_KEY");
+        assert_eq!(provider_env_var("samba-nova"), "SAMBANOVA_API_KEY");
+        assert_eq!(provider_env_var("huggingface"), "HUGGINGFACE_API_KEY");
+        assert_eq!(provider_env_var("hf"), "HUGGINGFACE_API_KEY");
+        assert_eq!(provider_env_var("replicate"), "REPLICATE_API_TOKEN");
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
         assert_eq!(provider_env_var("together-ai"), "TOGETHER_API_KEY");
         assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
@@ -8867,14 +9090,15 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_nextcloud_and_dingtalk() {
+    fn channel_menu_choices_include_signal_nextcloud_dingtalk_and_napcat() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::DingTalk));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Napcat));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_dingtalk() {
+    fn launchable_channels_include_signal_mattermost_qq_nextcloud_dingtalk_and_napcat() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -8923,6 +9147,15 @@ mod tests {
         channels.dingtalk = Some(crate::config::schema::DingTalkConfig {
             client_id: "client-id".into(),
             client_secret: "client-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.dingtalk = None;
+        channels.napcat = Some(crate::config::schema::NapcatConfig {
+            websocket_url: "ws://127.0.0.1:3001".into(),
+            api_base_url: String::new(),
+            access_token: None,
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));

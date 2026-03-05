@@ -552,6 +552,9 @@ Lưu ý:
 - Gateway mặc định yêu cầu ghép nối
 - Mặc định chặn public bind
 - `security.canary_tokens = true` bật canary token theo từng lượt để phát hiện rò rỉ ngữ cảnh hệ thống
+- `security.semantic_guard = false` mặc định tắt lớp phát hiện prompt-injection theo ngữ nghĩa (VectorDB)
+- `security.semantic_guard_collection = "semantic_guard"` là collection Qdrant mặc định cho tập corpus guard
+- `security.semantic_guard_threshold = 0.82` là ngưỡng similarity mặc định để chặn
 
 ## Lệnh kiểm tra
 
