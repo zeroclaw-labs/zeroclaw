@@ -104,13 +104,6 @@ impl Tool for BlueBubblesGroupTool {
                 error: Some("Action blocked: read-only autonomy level".into()),
             });
         }
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) if !a.trim().is_empty() => a.trim().to_string(),
             _ => {
@@ -137,6 +130,15 @@ impl Tool for BlueBubblesGroupTool {
         }
 
         let encoded_guid = urlencoding::encode(&chat_guid).into_owned();
+
+        // All common inputs validated; charge rate-limit only before mutation.
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+            });
+        }
 
         match action.as_str() {
             "rename_group" => {

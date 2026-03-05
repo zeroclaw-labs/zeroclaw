@@ -50,6 +50,37 @@ cli = true # Ενεργοποίηση διεπαφής τερματικού (CLI
 
 ---
 
+### 4.1 BlueBubbles (iMessage μέσω BlueBubbles server)
+
+Το [BlueBubbles](https://bluebubbles.app) είναι ένας αυτο-φιλοξενούμενος διακομιστής macOS που εκθέτει το iMessage μέσω REST API και webhook push.
+
+```toml
+[channels_config.bluebubbles]
+server_url = "http://192.168.1.100:1234"  # ή ngrok URL
+password   = "your-bb-password"
+
+# Προαιρετική λίστα αποδεκτών αποστολέων (αριθμοί τηλεφώνου ή Apple ID).
+# Προεπιλογή: αποδοχή όλων.
+allowed_senders = ["+15551234567", "user@example.com"]
+# Αποστολείς που αγνοούνται σιωπηρά.
+ignore_senders  = []
+# Κοινό μυστικό για αυθεντικοποίηση εισερχόμενου webhook.
+webhook_secret  = "optional-secret"
+
+# Πολιτική DM: "open" | "allowlist" | "disabled". Προεπιλογή: "open".
+dm_policy = "open"
+# Πολιτική ομάδας: "open" | "allowlist" | "disabled". Προεπιλογή: "open".
+group_policy = "open"
+# Επιτρεπόμενα GUIDs ομάδας όταν group_policy = "allowlist".
+group_allow_from = ["iMessage;+;chat-abc123"]
+# Αποστολή αναγνώρισης ανάγνωσης μετά από κάθε μήνυμα. Προεπιλογή: true.
+send_read_receipts = true
+```
+
+**Σημείωση:** Απαιτείται δημόσια προσβάσιμη HTTPS διεύθυνση ή τούνελ (π.χ. ngrok) για την παράδοση webhook από τον διακομιστή BlueBubbles.
+
+---
+
 ## 5. Πολιτική Ασφαλείας (Allowlist)
 
 Η πρόσβαση στο bot ελέγχεται μέσω της ρύθμισης `allowed_users`:

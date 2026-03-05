@@ -98,13 +98,6 @@ impl Tool for BlueBubblesSendAttachmentTool {
                 error: Some("Action blocked: read-only autonomy level".into()),
             });
         }
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
         let chat_guid = match args.get("chat_guid").and_then(|v| v.as_str()) {
             Some(g) if !g.trim().is_empty() => g.trim().to_string(),
             _ => {
@@ -175,6 +168,15 @@ impl Tool for BlueBubblesSendAttachmentTool {
                 success: false,
                 output: String::new(),
                 error: Some("as_voice=true requires an audio/* mime_type (e.g. audio/m4a)".into()),
+            });
+        }
+
+        // All inputs validated; charge rate-limit only if we are about to mutate.
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
 
