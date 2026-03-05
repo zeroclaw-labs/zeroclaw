@@ -18,6 +18,7 @@ env:
     GIT_CONFIG_KEY_0: core.hooksPath
     GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
+      ENSURE_RUST_COMPONENTS: "rustfmt clippy"
 
 jobs:
     build-and-test:
