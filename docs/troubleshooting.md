@@ -403,11 +403,12 @@ The `.cargo/config.toml` in this repository already pins `x86_64-apple-darwin` b
 Both still work:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
 ```
 
-`install.sh` is a compatibility entry and forwards/falls back to bootstrap behavior.
+Root `install.sh` is the canonical remote entrypoint and defaults to TUI onboarding for no-arg interactive sessions.
+`scripts/install.sh` remains a compatibility entry and forwards/falls back to bootstrap behavior.
 
 ## Still Stuck?
 

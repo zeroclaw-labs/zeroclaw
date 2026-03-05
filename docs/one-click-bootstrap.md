@@ -2,7 +2,7 @@
 
 This page defines the fastest supported path to install and initialize ZeroClaw.
 
-Last verified: **February 20, 2026**.
+Last verified: **March 4, 2026**.
 
 ## Option 0: Homebrew (macOS/Linuxbrew)
 
@@ -22,6 +22,7 @@ What it does by default:
 
 1. `cargo build --release --locked`
 2. `cargo install --path . --force --locked`
+3. In interactive no-flag sessions, launches TUI onboarding (`zeroclaw onboard --interactive-ui`)
 
 ### Resource preflight and pre-built flow
 
@@ -50,7 +51,8 @@ To bypass pre-built flow and force source compilation:
 
 ## Dual-mode bootstrap
 
-Default behavior is **app-only** (build/install ZeroClaw) and expects existing Rust toolchain.
+Default behavior builds/install ZeroClaw and, for interactive no-flag runs, starts TUI onboarding.
+It still expects an existing Rust toolchain unless you enable bootstrap flags below.
 
 For fresh machines, enable environment bootstrap explicitly:
 
@@ -69,10 +71,18 @@ Notes:
 ## Option B: Remote one-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://zeroclawlabs.ai/install.sh | bash
+```
+
+Equivalent GitHub-hosted installer entrypoint:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 ```
 
 For high-security environments, prefer Option A so you can review the script before execution.
+
+No-arg interactive runs default to full-screen TUI onboarding.
 
 Legacy compatibility:
 
@@ -123,6 +133,8 @@ ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./bootstrap.sh --onboar
 ```bash
 ./bootstrap.sh --interactive-onboard
 ```
+
+This launches the full-screen TUI onboarding flow (`zeroclaw onboard --interactive-ui`).
 
 ## Useful flags
 
