@@ -2448,12 +2448,9 @@ pub async fn run_models_refresh_all(config: &Config, force: bool) -> Result<()> 
 
 fn print_step(current: u8, total: u8, title: &str) {
     let total = total.max(1);
-    let completed = current
-        .saturating_sub(1)
-        .min(total)
-        .saturating_mul(STEP_PROGRESS_BAR_WIDTH_U8)
-        / total;
-    let completed = usize::from(completed);
+    let completed = usize::from(current.saturating_sub(1).min(total))
+        .saturating_mul(usize::from(STEP_PROGRESS_BAR_WIDTH_U8))
+        / usize::from(total);
     let remaining = STEP_PROGRESS_BAR_WIDTH.saturating_sub(completed);
     let progress = format!("[{}{}]", "=".repeat(completed), ".".repeat(remaining));
 
