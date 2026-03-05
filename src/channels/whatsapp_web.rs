@@ -161,6 +161,15 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
 #[cfg(feature = "whatsapp-web")]
 const WA_WEB_MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Sanitize a user-provided filename for embedding inside `[Document: ...]` markers.
+/// Strips characters that could break marker parsing (`[`, `]`, newlines, control chars).
+#[cfg(feature = "whatsapp-web")]
+fn sanitize_marker_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '[' | ']' | '\n' | '\r') && !c.is_control())
+        .collect()
+}
+
 /// Check whether a file path has a recognized image extension.
 #[cfg(feature = "whatsapp-web")]
 fn is_wa_image_extension(path: &std::path::Path) -> bool {
@@ -222,7 +231,14 @@ async fn try_download_wa_web_media(
 
     // ── Image ──────────────────────────────────────────────────────────
     if let Some(ref image_msg) = msg.image_message {
-        if image_msg.file_length.unwrap_or(0) > WA_WEB_MAX_MEDIA_BYTES {
+        let declared_len = match image_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: image missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
             tracing::info!("WhatsApp Web: image too large, skipping");
             return None;
         }
@@ -272,7 +288,14 @@ async fn try_download_wa_web_media(
 
     // ── Document ───────────────────────────────────────────────────────
     if let Some(ref doc_msg) = msg.document_message {
-        if doc_msg.file_length.unwrap_or(0) > WA_WEB_MAX_MEDIA_BYTES {
+        let declared_len = match doc_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: document missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
             tracing::info!("WhatsApp Web: document too large, skipping");
             return None;
         }
@@ -313,15 +336,15 @@ async fn try_download_wa_web_media(
             return None;
         }
         tracing::info!(
-            "WhatsApp Web: saved inbound document '{}' to {} ({} bytes)",
-            original_name,
+            "WhatsApp Web: saved inbound document to {} ({} bytes)",
             path.display(),
             bytes.len()
         );
+        let safe_name = sanitize_marker_text(original_name);
         let mut content = if is_wa_image_extension(&path) {
             format!("[IMAGE:{}]", path.display())
         } else {
-            format!("[Document: {}] {}", original_name, path.display())
+            format!("[Document: {}] {}", safe_name, path.display())
         };
         if let Some(ref caption) = doc_msg.caption {
             if !caption.trim().is_empty() {
@@ -333,7 +356,14 @@ async fn try_download_wa_web_media(
 
     // ── Video ──────────────────────────────────────────────────────────
     if let Some(ref video_msg) = msg.video_message {
-        if video_msg.file_length.unwrap_or(0) > WA_WEB_MAX_MEDIA_BYTES {
+        let declared_len = match video_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: video missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
             tracing::info!("WhatsApp Web: video too large, skipping");
             return None;
         }
@@ -383,7 +413,14 @@ async fn try_download_wa_web_media(
 
     // ── Sticker ────────────────────────────────────────────────────────
     if let Some(ref sticker_msg) = msg.sticker_message {
-        if sticker_msg.file_length.unwrap_or(0) > WA_WEB_MAX_MEDIA_BYTES {
+        let declared_len = match sticker_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: sticker missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
             tracing::info!("WhatsApp Web: sticker too large, skipping");
             return None;
         }

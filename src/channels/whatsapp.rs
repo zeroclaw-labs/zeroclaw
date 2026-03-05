@@ -43,6 +43,14 @@ fn wa_cloud_mime_to_ext(mime: &str) -> &str {
     }
 }
 
+/// Sanitize a user-provided filename for embedding inside `[Document: ...]` markers.
+/// Strips characters that could break marker parsing (`[`, `]`, newlines, control chars).
+fn sanitize_marker_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '[' | ']' | '\n' | '\r') && !c.is_control())
+        .collect()
+}
+
 /// Check whether a file path has a recognized image extension.
 fn wa_cloud_is_image_ext(path: &std::path::Path) -> bool {
     path.extension()
@@ -164,14 +172,21 @@ impl WhatsAppChannel {
             }
         }
 
-        let bytes = data_resp.bytes().await?.to_vec();
-        if bytes.len() as u64 > WA_CLOUD_MAX_MEDIA_BYTES {
-            anyhow::bail!(
-                "WhatsApp media too large ({} bytes > {WA_CLOUD_MAX_MEDIA_BYTES})",
-                bytes.len()
-            );
+        // Stream the body chunk-by-chunk to avoid buffering unbounded responses.
+        use futures_util::StreamExt;
+        let mut stream = data_resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() as u64 > WA_CLOUD_MAX_MEDIA_BYTES {
+                anyhow::bail!(
+                    "WhatsApp media too large ({} bytes > {WA_CLOUD_MAX_MEDIA_BYTES})",
+                    buf.len()
+                );
+            }
         }
-        Ok((bytes, mime_type))
+        Ok((buf, mime_type))
     }
 
     /// Try to download and save a media attachment from a webhook message.
@@ -216,17 +231,14 @@ impl WhatsAppChannel {
             }
         };
 
-        let mime = mime_from_payload
+        // Prefer download metadata MIME (authoritative) over payload MIME
+        // to prevent spoofed filenames from influencing classification.
+        let mime = mime_from_download
             .as_deref()
-            .or(mime_from_download.as_deref());
-        let ext = if let Some(ref name) = file_name {
-            std::path::Path::new(name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_else(|| mime.map(wa_cloud_mime_to_ext).unwrap_or(default_ext))
-        } else {
-            mime.map(wa_cloud_mime_to_ext).unwrap_or(default_ext)
-        };
+            .or(mime_from_payload.as_deref());
+        // Derive extension from authoritative MIME; never trust user-provided
+        // filename extension to determine file type.
+        let ext = mime.map(wa_cloud_mime_to_ext).unwrap_or(default_ext);
 
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -258,7 +270,8 @@ impl WhatsAppChannel {
             bytes.len()
         );
 
-        let display_name = file_name.as_deref().unwrap_or(&save_filename);
+        let raw_name = file_name.as_deref().unwrap_or(&save_filename);
+        let display_name = sanitize_marker_text(raw_name);
         let mut content = if is_image_type || wa_cloud_is_image_ext(&path) {
             format!("[IMAGE:{}]", path.display())
         } else {
@@ -1395,6 +1408,17 @@ mod tests {
     fn wa_cloud_mime_to_ext_with_params() {
         assert_eq!(wa_cloud_mime_to_ext("image/jpeg; codecs=foo"), "jpg");
         assert_eq!(wa_cloud_mime_to_ext("audio/ogg; codecs=opus"), "ogg");
+    }
+
+    #[test]
+    fn sanitize_marker_text_strips_brackets_and_control() {
+        assert_eq!(sanitize_marker_text("normal.pdf"), "normal.pdf");
+        assert_eq!(sanitize_marker_text("file[injected].pdf"), "fileinjected.pdf");
+        assert_eq!(sanitize_marker_text("file]\nbreak"), "filebreak");
+        assert_eq!(sanitize_marker_text("clean_name"), "clean_name");
+        assert_eq!(sanitize_marker_text("with\r\nnewlines"), "withnewlines");
+        // Control chars (e.g. \x00) are stripped
+        assert_eq!(sanitize_marker_text("a\x00b"), "ab");
     }
 
     #[test]
