@@ -181,7 +181,7 @@ export default function AgentChat() {
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+    <div className="flex min-h-[28rem] flex-col h-[calc(100dvh-8.5rem)]">
       {/* Connection status bar */}
       {error && (
         <div className="px-4 py-2 bg-red-900/30 border-b border-red-700 flex items-center gap-2 text-sm text-red-300">
@@ -259,7 +259,7 @@ export default function AgentChat() {
       </div>
 
       {/* Input area */}
-      <div className="border-t border-gray-800 bg-gray-900 p-4">
+      <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
         <div className="flex items-center gap-3 max-w-4xl mx-auto">
           <div className="flex-1 relative">
             <input

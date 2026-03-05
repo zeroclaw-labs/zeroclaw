@@ -103,7 +103,7 @@ async fn compare_recall_quality() {
         ),
         (
             "deploy",
-            "Deploys to Hetzner VPS via Docker",
+            "Deploys to VPS via Docker",
             MemoryCategory::Core,
         ),
         (

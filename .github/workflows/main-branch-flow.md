@@ -201,7 +201,6 @@ Canary policy lane:
 
 1. Workflow-file changes (`.github/workflows/**`) are validated through `pr-intake-checks.yml`, `ci-change-audit.yml`, and `CI Required Gate` without a dedicated owner-approval gate.
 2. PR lint/test strictness is intentionally controlled by `ci:full` label.
-3. `pr-intake-checks.yml` now blocks PRs missing a Linear issue key (`RMN-*`, `CDV-*`, `COM-*`) to keep execution mapped to Linear.
 4. `sec-audit.yml` runs on PR/push/merge queue (`merge_group`), plus scheduled weekly.
 5. `ci-change-audit.yml` enforces pinned `uses:` references for CI/security workflow changes.
 6. `sec-audit.yml` includes deny policy hygiene checks (`deny_policy_guard.py`) before cargo-deny.

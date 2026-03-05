@@ -46,18 +46,6 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
-            name: "Webhooks",
-            description: "HTTP endpoint for triggers",
-            category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels_config.webhook.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
             name: "WhatsApp",
             description: "Meta Cloud API via webhook",
             category: IntegrationCategory::Chat,
@@ -82,11 +70,23 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
-            name: "iMessage",
-            description: "macOS AppleScript bridge",
+            name: "Matrix",
+            description: "Matrix protocol (Element)",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.imessage.is_some() {
+                if c.channels_config.matrix.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Email",
+            description: "IMAP/SMTP email channel",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.email.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -100,11 +100,11 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
-            name: "Matrix",
-            description: "Matrix protocol (Element)",
+            name: "Mattermost",
+            description: "Self-hosted team chat",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.matrix.is_some() {
+                if c.channels_config.mattermost.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -112,14 +112,164 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
-            name: "Nostr",
-            description: "Decentralized DMs (NIP-04)",
+            name: "Google Chat",
+            description: "Google Workspace bot chat",
             category: IntegrationCategory::Chat,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
-            name: "WebChat",
-            description: "Browser-based chat UI",
+            name: "Webex",
+            description: "Cisco Webex messaging",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Feishu",
+            description: "Feishu bot messaging",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.feishu.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Lark",
+            description: "Lark bot messaging",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.lark.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Zulip",
+            description: "Topic-based team chat",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "LINE",
+            description: "LINE Messaging API",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Viber",
+            description: "Viber bot API",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Facebook Messenger",
+            description: "Meta Messenger platform",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Mastodon",
+            description: "Fediverse social messaging",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Bluesky",
+            description: "AT Protocol social channel",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Reddit",
+            description: "Reddit messages and replies",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "LinkedIn",
+            description: "LinkedIn messaging workflows",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Twitch",
+            description: "Twitch chat integrations",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "IRC",
+            description: "IRC over TLS",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.irc.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "XMPP",
+            description: "Federated XMPP/Jabber",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Guilded",
+            description: "Guilded server messaging",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Revolt",
+            description: "Open-source chat platform",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Keybase",
+            description: "Encrypted team chat",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Discourse",
+            description: "Community forum integration",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Gitter",
+            description: "Developer community chat",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Threema",
+            description: "Privacy-first messaging",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Nostr",
+            description: "Decentralized DMs (NIP-04)",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.nostr.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Mumble",
+            description: "Low-latency voice channels",
             category: IntegrationCategory::Chat,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
@@ -127,11 +277,47 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Nextcloud Talk",
             description: "Self-hosted Nextcloud chat",
             category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.nextcloud_talk.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Rocket.Chat",
+            description: "Open-source workplace chat",
+            category: IntegrationCategory::Chat,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
-            name: "Zalo",
-            description: "Zalo Bot API",
+            name: "Ntfy",
+            description: "Pub/sub push notifications",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Gotify",
+            description: "Self-hosted push notifications",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Pumble",
+            description: "Team messaging workspace",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Flock",
+            description: "Work chat platform",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Twist",
+            description: "Async team communication",
             category: IntegrationCategory::Chat,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
@@ -146,6 +332,42 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
                     IntegrationStatus::Available
                 }
             },
+        },
+        IntegrationEntry {
+            name: "Zalo",
+            description: "Zalo Bot API",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
+        },
+        IntegrationEntry {
+            name: "Webhooks",
+            description: "HTTP endpoint for triggers",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.webhook.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "iMessage",
+            description: "macOS AppleScript bridge",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.imessage.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "WebChat",
+            description: "Browser-based chat UI",
+            category: IntegrationCategory::Chat,
+            status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "QQ Official",
@@ -302,7 +524,16 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "LM Studio",
             description: "Local model server",
             category: IntegrationCategory::AiModel,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.default_provider.as_deref().is_some_and(|provider| {
+                    provider.eq_ignore_ascii_case("lmstudio")
+                        || provider.eq_ignore_ascii_case("lm-studio")
+                }) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Venice",
@@ -590,12 +821,6 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::Productivity,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
-        IntegrationEntry {
-            name: "Linear",
-            description: "Issue tracking",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
         // ── Music & Audio ───────────────────────────────────────
         IntegrationEntry {
             name: "Spotify",
@@ -721,18 +946,6 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::Social,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
-        IntegrationEntry {
-            name: "Email",
-            description: "IMAP/SMTP email channel",
-            category: IntegrationCategory::Social,
-            status_fn: |c| {
-                if c.channels_config.email.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
         // ── Platforms ───────────────────────────────────────────
         IntegrationEntry {
             name: "macOS",
@@ -783,7 +996,8 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 mod tests {
     use super::*;
     use crate::config::schema::{
-        IMessageConfig, MatrixConfig, ProgressMode, StreamMode, TelegramConfig,
+        IMessageConfig, MatrixConfig, NextcloudTalkConfig, NostrConfig, ProgressMode, StreamMode,
+        TelegramConfig,
     };
     use crate::config::Config;
 
@@ -926,11 +1140,131 @@ mod tests {
     fn coming_soon_integrations_stay_coming_soon() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["Nostr", "Spotify", "Home Assistant"] {
+        for name in ["Microsoft Teams", "Spotify", "Home Assistant"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::ComingSoon),
                 "{name} should be ComingSoon"
+            );
+        }
+    }
+
+    #[test]
+    fn nostr_active_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.nostr = Some(NostrConfig {
+            private_key: "nsec1example".into(),
+            relays: vec!["wss://relay.example.com".into()],
+            allowed_pubkeys: vec!["*".into()],
+        });
+        let entries = all_integrations();
+        let nostr = entries.iter().find(|e| e.name == "Nostr").unwrap();
+        assert!(matches!(
+            (nostr.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn lm_studio_available_when_not_selected_as_default_provider() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let lm_studio = entries.iter().find(|e| e.name == "LM Studio").unwrap();
+        assert!(matches!(
+            (lm_studio.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn lm_studio_active_for_lmstudio_default_provider_aliases() {
+        let entries = all_integrations();
+        let lm_studio = entries.iter().find(|e| e.name == "LM Studio").unwrap();
+
+        let mut config = Config {
+            default_provider: Some("lmstudio".to_string()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            (lm_studio.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("lm-studio".to_string());
+        assert!(matches!(
+            (lm_studio.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn nextcloud_talk_active_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.nextcloud_talk = Some(NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "token".into(),
+            webhook_secret: None,
+            allowed_users: vec!["*".into()],
+        });
+        let entries = all_integrations();
+        let nextcloud = entries.iter().find(|e| e.name == "Nextcloud Talk").unwrap();
+        assert!(matches!(
+            (nextcloud.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn adapter_catalog_includes_requested_multi_platform_set() {
+        let entries = all_integrations();
+        let names: std::collections::HashSet<_> = entries.iter().map(|e| e.name).collect();
+        for name in [
+            "Telegram",
+            "Discord",
+            "Slack",
+            "WhatsApp",
+            "Signal",
+            "Matrix",
+            "Email",
+            "Microsoft Teams",
+            "Mattermost",
+            "Google Chat",
+            "Webex",
+            "Feishu",
+            "Lark",
+            "Zulip",
+            "LINE",
+            "Viber",
+            "Facebook Messenger",
+            "Mastodon",
+            "Bluesky",
+            "Reddit",
+            "LinkedIn",
+            "Twitch",
+            "IRC",
+            "XMPP",
+            "Guilded",
+            "Revolt",
+            "Keybase",
+            "Discourse",
+            "Gitter",
+            "Threema",
+            "Nostr",
+            "Mumble",
+            "Nextcloud Talk",
+            "Rocket.Chat",
+            "Ntfy",
+            "Gotify",
+            "Pumble",
+            "Flock",
+            "Twist",
+            "DingTalk",
+            "Zalo",
+            "Webhooks",
+        ] {
+            assert!(
+                names.contains(name),
+                "missing chat adapter catalog entry: {name}"
             );
         }
     }

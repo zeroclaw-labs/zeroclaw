@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 28, 2026**.
+Last verified: **March 4, 2026**.
 
 ## Top-Level Commands
 
@@ -17,6 +17,7 @@ Last verified: **February 28, 2026**.
 | `status` | Print current configuration and system summary |
 | `update` | Check or install latest ZeroClaw release |
 | `estop` | Engage/resume emergency stop levels and inspect estop state |
+| `security` | Run security maintenance operations (semantic guard corpus updates) |
 | `cron` | Manage scheduled tasks |
 | `models` | Refresh provider model catalogs |
 | `providers` | List provider IDs, aliases, and active provider |
@@ -95,6 +96,20 @@ Notes:
 - `estop` commands require `[security.estop].enabled = true`.
 - When `[security.estop].require_otp_to_resume = true`, `resume` requires OTP validation.
 - OTP prompt appears automatically if `--otp` is omitted.
+
+### `security`
+
+- `zeroclaw security update-guard-corpus`
+- `zeroclaw security update-guard-corpus --source builtin`
+- `zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl`
+- `zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>`
+
+Notes:
+
+- `update-guard-corpus` upserts semantic guard seed records into `security.semantic_guard_collection`.
+- `--source` accepts `builtin`, a local file path, or an `http(s)` URL.
+- `--checksum` enforces SHA-256 integrity verification before import.
+- The command requires semantic guard vector prerequisites (configured Qdrant URL and non-zero embedding dimensions).
 
 ### `service`
 

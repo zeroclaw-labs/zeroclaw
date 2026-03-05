@@ -65,7 +65,7 @@ Examples:
   ./bootstrap.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+  curl -fsSL https://zeroclawlabs.ai/install.sh | bash
 
 Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
