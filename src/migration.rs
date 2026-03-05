@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use anyhow::{bail, Context, Result};
-use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::fs;
@@ -48,7 +47,7 @@ async fn migrate_openclaw_memory(
     source_workspace: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
-    let source_workspace = resolve_openclaw_workspace(source_workspace);
+    let source_workspace = resolve_openclaw_workspace(config, source_workspace);
     if !source_workspace.path.exists() {
         return handle_missing_source_workspace(config, &source_workspace, dry_run);
     }
@@ -362,7 +361,7 @@ fn pick_column_expr(columns: &[String], candidates: &[&str], fallback: &str) -> 
     pick_optional_column_expr(columns, candidates).unwrap_or_else(|| fallback.to_string())
 }
 
-fn resolve_openclaw_workspace(source: Option<PathBuf>) -> SourceWorkspace {
+fn resolve_openclaw_workspace(config: &Config, source: Option<PathBuf>) -> SourceWorkspace {
     if let Some(src) = source {
         return SourceWorkspace {
             path: src,
@@ -370,15 +369,20 @@ fn resolve_openclaw_workspace(source: Option<PathBuf>) -> SourceWorkspace {
         };
     }
 
-    let path = UserDirs::new().map_or_else(
-        || PathBuf::from(".openclaw").join("workspace"),
-        |dirs| dirs.home_dir().join(".openclaw").join("workspace"),
-    );
+    let path = default_openclaw_workspace_from_env()
+        .unwrap_or_else(|| config.workspace_dir.join(".openclaw").join("workspace"));
 
     SourceWorkspace {
         path,
         kind: SourceWorkspaceKind::Default,
     }
+}
+
+fn default_openclaw_workspace_from_env() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".openclaw").join("workspace"))
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -500,6 +504,7 @@ mod tests {
     use crate::config::{Config, MemoryConfig};
     use crate::memory::SqliteMemory;
     use rusqlite::params;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_config(workspace: &Path) -> Config {
@@ -512,6 +517,37 @@ mod tests {
             },
             ..Config::default()
         }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(key);
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
     #[test]
@@ -663,6 +699,39 @@ mod tests {
         let err = handle_missing_source_workspace(&config, &source, true)
             .expect_err("explicit source must still error when missing");
         assert!(err.to_string().contains("OpenClaw workspace not found"));
+    }
+
+    #[test]
+    fn default_source_prefers_home_env_when_available() {
+        let _env_guard = env_lock();
+        let target = TempDir::new().unwrap();
+        let fake_home = target.path().join("fake-home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.to_str().unwrap()));
+        let _userprofile_guard = EnvGuard::set("USERPROFILE", None);
+
+        let config = test_config(target.path());
+        let source = resolve_openclaw_workspace(&config, None);
+
+        assert_eq!(source.kind, SourceWorkspaceKind::Default);
+        assert_eq!(source.path, fake_home.join(".openclaw").join("workspace"));
+    }
+
+    #[test]
+    fn default_source_is_workspace_scoped_without_home_env() {
+        let _env_guard = env_lock();
+        let target = TempDir::new().unwrap();
+        let _home_guard = EnvGuard::set("HOME", None);
+        let _userprofile_guard = EnvGuard::set("USERPROFILE", None);
+
+        let config = test_config(target.path());
+        let source = resolve_openclaw_workspace(&config, None);
+
+        assert_eq!(source.kind, SourceWorkspaceKind::Default);
+        assert_eq!(
+            source.path,
+            target.path().join(".openclaw").join("workspace")
+        );
     }
 
     #[test]
