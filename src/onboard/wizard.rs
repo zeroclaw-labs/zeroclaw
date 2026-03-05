@@ -1173,10 +1173,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "moonshotai/kimi-k2.5".to_string(),
                 "Kimi K2.5 (131K context)".to_string(),
             ),
-            (
-                "z-ai/glm-5".to_string(),
-                "GLM-5 (131K context)".to_string(),
-            ),
+            ("z-ai/glm-5".to_string(), "GLM-5 (131K context)".to_string()),
             (
                 "minimax/minimax-m2.5".to_string(),
                 "MiniMax M2.5 (1M context)".to_string(),
