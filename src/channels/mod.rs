@@ -3885,11 +3885,106 @@ fn load_openclaw_bootstrap_files(
     inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
 }
 
+fn preview_string_list(items: &[String], limit: usize) -> String {
+    let total = items.len();
+    let mut rendered = items
+        .iter()
+        .take(limit)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > limit {
+        rendered.push_str(&format!(", … (+{} more)", total - limit));
+    }
+    rendered
+}
+
+fn preview_path_list(items: &[PathBuf], limit: usize) -> String {
+    let total = items.len();
+    let mut rendered = items
+        .iter()
+        .take(limit)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > limit {
+        rendered.push_str(&format!(", … (+{} more)", total - limit));
+    }
+    rendered
+}
+
+fn build_security_constraints_prompt(
+    workspace_dir: &Path,
+    security_policy: Option<&SecurityPolicy>,
+) -> String {
+    let fallback_policy = SecurityPolicy {
+        workspace_dir: workspace_dir.to_path_buf(),
+        ..SecurityPolicy::default()
+    };
+    let policy = security_policy.unwrap_or(&fallback_policy);
+
+    let autonomy = match policy.autonomy {
+        crate::security::AutonomyLevel::ReadOnly => "read_only",
+        crate::security::AutonomyLevel::Supervised => "supervised",
+        crate::security::AutonomyLevel::Full => "full",
+    };
+
+    let mut section = String::new();
+    section.push_str("## Security Constraints\n\n");
+    let _ = writeln!(section, "- Autonomy level: `{autonomy}`");
+    let _ = writeln!(
+        section,
+        "- Workspace boundary: `{}`",
+        policy.workspace_dir.display()
+    );
+    let _ = writeln!(
+        section,
+        "- Workspace-only mode: `{}`",
+        if policy.workspace_only {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
+    if !policy.allowed_roots.is_empty() {
+        let _ = writeln!(
+            section,
+            "- Additional allowed roots: `{}`",
+            preview_path_list(&policy.allowed_roots, 6)
+        );
+    }
+
+    if policy.allowed_commands.iter().any(|cmd| cmd == "*") {
+        section.push_str(
+            "- Allowed shell commands: `*` (all commands; still subject to path/risk policy)\n",
+        );
+    } else {
+        let _ = writeln!(
+            section,
+            "- Allowed shell commands: `{}`",
+            preview_string_list(&policy.allowed_commands, 16)
+        );
+    }
+
+    let _ = writeln!(
+        section,
+        "- Forbidden paths: `{}`",
+        preview_string_list(&policy.forbidden_paths, 12)
+    );
+    section.push_str(
+        "- If a request violates these constraints, explain the violated constraint briefly and suggest a safe alternative.\n\n",
+    );
+
+    section
+}
+
 /// Load workspace identity files and build a system prompt.
 ///
 /// Follows the `OpenClaw` framework structure by default:
 /// 1. Tooling — tool list + descriptions
 /// 2. Safety — guardrail reminder
+/// 2b. Security Constraints — explicit autonomy/workspace/path/tool bounds
 /// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
 /// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
@@ -3918,6 +4013,7 @@ pub fn build_system_prompt(
         bootstrap_max_chars,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
+        None,
     )
 }
 
@@ -3930,6 +4026,7 @@ pub fn build_system_prompt_with_mode(
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    security_policy: Option<&SecurityPolicy>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -3991,6 +4088,12 @@ pub fn build_system_prompt_with_mode(
          - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
          - When in doubt, ask before acting externally.\n\n",
     );
+
+    // ── 2b. Security constraints (explicit policy guidance) ───────
+    prompt.push_str(&build_security_constraints_prompt(
+        workspace_dir,
+        security_policy,
+    ));
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -4942,6 +5045,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
+    let security_policy = SecurityPolicy::from_config(&config.autonomy, &workspace);
     let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
@@ -4951,6 +5055,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        Some(&security_policy),
     );
     if !native_tools {
         let filtered_specs = filtered_tool_specs_for_runtime(tools_registry.as_ref(), excluded);
@@ -9296,6 +9401,7 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             false,
             crate::config::SkillsPromptInjectionMode::Compact,
+            None,
         );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
@@ -9408,6 +9514,43 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
         );
+    }
+
+    #[test]
+    fn prompt_includes_security_constraints_from_policy() {
+        let ws = make_workspace();
+
+        let policy = SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig {
+                level: crate::security::AutonomyLevel::ReadOnly,
+                workspace_only: true,
+                allowed_commands: vec!["git".into(), "cargo".into()],
+                forbidden_paths: vec!["/etc".into(), "~/.ssh".into()],
+                ..crate::config::AutonomyConfig::default()
+            },
+            ws.path(),
+        );
+
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+            Some(&policy),
+        );
+
+        assert!(
+            prompt.contains("## Security Constraints"),
+            "security constraints section should be present"
+        );
+        assert!(prompt.contains("Autonomy level: `read_only`"));
+        assert!(prompt.contains("Workspace-only mode: `enabled`"));
+        assert!(prompt.contains("Allowed shell commands: `git, cargo`"));
+        assert!(prompt.contains("Forbidden paths: `/etc, ~/.ssh`"));
     }
 
     #[test]
