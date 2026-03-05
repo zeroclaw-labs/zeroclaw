@@ -23,6 +23,15 @@ pub mod introspect;
 #[cfg(feature = "hardware")]
 pub mod serial;
 
+#[cfg(feature = "hardware")]
+pub mod uf2;
+
+#[cfg(feature = "hardware")]
+pub mod pico_flash;
+
+#[cfg(feature = "hardware")]
+pub mod pico_code;
+
 use crate::config::Config;
 use anyhow::Result;
 
@@ -40,6 +49,12 @@ pub use protocol::{ZcCommand, ZcResponse};
 #[allow(unused_imports)]
 pub use transport::{Transport, TransportError, TransportKind};
 
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
+pub use pico_code::{device_code_tools, DeviceExecTool, DeviceReadCodeTool, DeviceWriteCodeTool};
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
+pub use pico_flash::PicoFlashTool;
 #[cfg(feature = "hardware")]
 #[allow(unused_imports)]
 pub use serial::HardwareSerialTransport;
