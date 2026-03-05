@@ -116,6 +116,44 @@ impl OpenAiCodexProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
+
+    /// Extract and persist quota metadata from response headers.
+    async fn extract_and_persist_quota(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+        profile_override: &str,
+    ) -> anyhow::Result<()> {
+        use crate::providers::quota_adapter::UniversalQuotaExtractor;
+
+        let extractor = UniversalQuotaExtractor::new();
+        if let Some(quota) = extractor.extract("openai-codex", headers, None) {
+            tracing::debug!(
+                provider = "openai-codex",
+                profile = profile_override,
+                remaining = ?quota.rate_limit_remaining,
+                reset_at = ?quota.rate_limit_reset_at,
+                "Extracted quota metadata from response headers"
+            );
+
+            self.auth
+                .store
+                .update_quota_metadata(
+                    profile_override,
+                    quota.rate_limit_remaining,
+                    quota.rate_limit_reset_at,
+                    quota.rate_limit_total,
+                )
+                .await?;
+
+            tracing::debug!(
+                provider = "openai-codex",
+                profile = profile_override,
+                "Persisted quota metadata to auth profiles store"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -641,7 +679,26 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        // Capture headers for quota metadata extraction before consuming response.
+        let headers = response.headers().clone();
+        let result = decode_responses_body(response).await?;
+
+        // Persist quota metadata for the active auth profile when available.
+        if let Some(profile_override) = &self.auth_profile_override {
+            if let Err(err) = self
+                .extract_and_persist_quota(&headers, profile_override)
+                .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    provider = "openai-codex",
+                    profile = profile_override,
+                    "Failed to persist quota metadata"
+                );
+            }
+        }
+
+        Ok(result)
     }
 }
 
