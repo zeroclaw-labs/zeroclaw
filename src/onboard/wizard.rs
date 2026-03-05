@@ -7055,15 +7055,9 @@ fn print_summary(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::home_env_lock_for_tests;
     use serde_json::json;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -7103,7 +7097,7 @@ mod tests {
         no_totp: bool,
         home: &Path,
     ) -> Result<Config> {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
@@ -7330,7 +7324,7 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_respects_zero_claw_workspace_env_layout() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let tmp = TempDir::new().unwrap();
         let workspace_root = tmp.path().join("zeroclaw-data");
         let workspace_dir = workspace_root.join("workspace");
@@ -7360,7 +7354,7 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_avoids_writing_workspace_marker_to_ambient_home() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let selected_home = TempDir::new().unwrap();
         let ambient_home = TempDir::new().unwrap();
 
@@ -7416,7 +7410,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_workspace_selection_is_non_fatal_when_marker_root_is_invalid() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let tmp = TempDir::new().unwrap();
         let marker_root_file = tmp.path().join("marker-root-file");
         tokio::fs::write(&marker_root_file, "not-a-directory")
@@ -9053,7 +9047,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_api_key_from_env_prefers_primary_over_fallback() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let _primary = EnvVarGuard::set("STEP_API_KEY", "primary-step-key");
         let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
 
@@ -9065,7 +9059,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_api_key_from_env_uses_stepfun_fallback_key() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let _unset_primary = EnvVarGuard::unset("STEP_API_KEY");
         let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
 

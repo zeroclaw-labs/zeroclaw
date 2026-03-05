@@ -1362,6 +1362,12 @@ fn backup_target_config(config_path: &Path) -> Result<Option<PathBuf>> {
 }
 
 #[cfg(test)]
+pub(crate) fn home_env_lock_for_tests() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
@@ -1370,14 +1376,7 @@ mod tests {
     use crate::memory::{Memory, SqliteMemory};
     use rusqlite::params;
     use serde_json::json;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1687,7 +1686,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_openclaw_dry_run_skips_missing_default_sources() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let source_home = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let _home_guard = EnvVarGuard::set("HOME", source_home.path().to_string_lossy().as_ref());
