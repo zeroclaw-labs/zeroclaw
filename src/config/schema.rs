@@ -3439,12 +3439,14 @@ pub enum GroupReplyMode {
     /// **Default:** Not set by default; opt-in by setting `group_reply.mode = "mention_or_reply"`
     /// in `config.toml`.
     ///
-    /// **Compatibility:** Existing deployments are unaffected — this value is only
-    /// active when explicitly configured. Older ZeroClaw versions that do not
-    /// recognise this variant will fall back to channel-specific legacy behaviour.
+    /// **Compatibility:** This value is only active when explicitly configured via
+    /// `group_reply.mode = "mention_or_reply"`. Older ZeroClaw versions that do not
+    /// recognise this variant will **fail config deserialization** with an error on
+    /// startup — they will not silently fall back. Downgrading requires removing or
+    /// changing this value first.
     ///
-    /// **Rollback:** Change `group_reply.mode` back to `"mention_only"` or `"reply_only"`
-    /// (or remove the key entirely to restore legacy behaviour) and restart the daemon.
+    /// **Rollback:** Change `group_reply.mode` back to `"mention_only"` or `"all_messages"`
+    /// (or remove the key entirely to restore default behaviour) and restart the daemon.
     /// No data migration is required.
     MentionOrReply,
 }
