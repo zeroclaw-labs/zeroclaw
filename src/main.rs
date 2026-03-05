@@ -93,6 +93,7 @@ mod skillforge;
 mod skills;
 #[cfg(test)]
 mod test_locks;
+mod test_utils;
 mod tools;
 mod tunnel;
 mod update;
