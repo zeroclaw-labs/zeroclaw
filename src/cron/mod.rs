@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::security::SecurityPolicy;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 pub mod consolidation;
 mod schedule;
