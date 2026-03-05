@@ -3,14 +3,16 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::providers::traits::StreamOptions;
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use rustyline::error::ReadlineError;
 use std::collections::{BTreeSet, HashSet};
@@ -638,6 +640,73 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
         .await
 }
 
+struct StreamedHistoryResponse {
+    text: String,
+    forwarded_delta: bool,
+}
+
+async fn stream_provider_history_response_for_draft(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    model: &str,
+    temperature: f64,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> Result<Option<StreamedHistoryResponse>> {
+    let mut provider_stream =
+        provider.stream_chat_with_history(messages, model, temperature, StreamOptions::new(true));
+
+    let mut response_text = String::new();
+    let mut saw_chunk = false;
+    let mut sent_clear = false;
+    let mut forwarded_delta = false;
+
+    loop {
+        let next = if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                chunk = provider_stream.next() => chunk,
+            }
+        } else {
+            provider_stream.next().await
+        };
+
+        let Some(chunk_result) = next else {
+            break;
+        };
+        saw_chunk = true;
+
+        let chunk = chunk_result.map_err(anyhow::Error::new)?;
+        if chunk.is_final {
+            break;
+        }
+        if chunk.delta.is_empty() {
+            continue;
+        }
+
+        response_text.push_str(&chunk.delta);
+
+        if let Some(tx) = on_delta {
+            if !sent_clear {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                sent_clear = true;
+            }
+            if tx.send(chunk.delta).await.is_ok() {
+                forwarded_delta = true;
+            }
+        }
+    }
+
+    if !saw_chunk {
+        return Ok(None);
+    }
+
+    Ok(Some(StreamedHistoryResponse {
+        text: response_text,
+        forwarded_delta,
+    }))
+}
+
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -787,23 +856,70 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let chat_future = provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            model,
-            temperature,
-        );
+        let mut used_upstream_streaming_for_turn = false;
+        let mut streamed_draft_delta_for_turn = false;
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
-            }
-        } else {
-            chat_future.await
-        };
+        let chat_result =
+            if on_delta.is_some() && provider.supports_streaming() && request_tools.is_none() {
+                match stream_provider_history_response_for_draft(
+                    provider,
+                    &prepared_messages.messages,
+                    model,
+                    temperature,
+                    cancellation_token.as_ref(),
+                    on_delta.as_ref(),
+                )
+                .await?
+                {
+                    Some(streamed) => {
+                        used_upstream_streaming_for_turn = true;
+                        streamed_draft_delta_for_turn = streamed.forwarded_delta;
+                        Ok(ChatResponse {
+                            text: Some(streamed.text),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        })
+                    }
+                    None => {
+                        let chat_future = provider.chat(
+                            ChatRequest {
+                                messages: &prepared_messages.messages,
+                                tools: request_tools,
+                            },
+                            model,
+                            temperature,
+                        );
+
+                        if let Some(token) = cancellation_token.as_ref() {
+                            tokio::select! {
+                                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                                result = chat_future => result,
+                            }
+                        } else {
+                            chat_future.await
+                        }
+                    }
+                }
+            } else {
+                let chat_future = provider.chat(
+                    ChatRequest {
+                        messages: &prepared_messages.messages,
+                        tools: request_tools,
+                    },
+                    model,
+                    temperature,
+                );
+
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = chat_future => result,
+                    }
+                } else {
+                    chat_future.await
+                }
+            };
 
         let (
             response_text,
@@ -951,6 +1067,16 @@ pub(crate) async fn run_tool_call_loop(
             parsed_text
         };
 
+        if used_upstream_streaming_for_turn
+            && streamed_draft_delta_for_turn
+            && !tool_calls.is_empty()
+        {
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+            }
+            streamed_draft_delta_for_turn = false;
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -1013,6 +1139,11 @@ pub(crate) async fn run_tool_call_loop(
                         ))
                         .await;
                 }
+                if streamed_draft_delta_for_turn {
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    }
+                }
                 continue;
             }
 
@@ -1056,30 +1187,32 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            // If a streaming sender is provided, relay the text in small chunks
-            // so the channel can progressively update the draft message.
+            // If provider streaming already supplied draft deltas this turn,
+            // avoid post-hoc chunking to prevent duplicate output.
             if let Some(ref tx) = on_delta {
-                // Clear accumulated progress lines before streaming the final answer.
-                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
-                // Split on whitespace boundaries, accumulating chunks of at least
-                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
-                let mut chunk = String::new();
-                for word in display_text.split_inclusive(char::is_whitespace) {
-                    if cancellation_token
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
-                        return Err(ToolLoopCancelled.into());
+                if !streamed_draft_delta_for_turn {
+                    // Clear accumulated progress lines before streaming the final answer.
+                    let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    // Split on whitespace boundaries, accumulating chunks of at least
+                    // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+                    let mut chunk = String::new();
+                    for word in display_text.split_inclusive(char::is_whitespace) {
+                        if cancellation_token
+                            .as_ref()
+                            .is_some_and(CancellationToken::is_cancelled)
+                        {
+                            return Err(ToolLoopCancelled.into());
+                        }
+                        chunk.push_str(word);
+                        if chunk.len() >= STREAM_CHUNK_MIN_CHARS
+                            && tx.send(std::mem::take(&mut chunk)).await.is_err()
+                        {
+                            break; // receiver dropped
+                        }
                     }
-                    chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
-                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
-                    {
-                        break; // receiver dropped
+                    if !chunk.is_empty() {
+                        let _ = tx.send(chunk).await;
                     }
-                }
-                if !chunk.is_empty() {
-                    let _ = tx.send(chunk).await;
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
@@ -2370,7 +2503,9 @@ mod tests {
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::traits::ProviderCapabilities;
+    use crate::providers::traits::{
+        ProviderCapabilities, StreamChunk, StreamOptions, StreamResult,
+    };
     use crate::providers::ChatResponse;
     use tempfile::TempDir;
 
@@ -2498,6 +2633,65 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct DraftStreamingProvider {
+        chat_calls: Arc<AtomicUsize>,
+        stream_calls: Arc<AtomicUsize>,
+        chat_text: String,
+        stream_chunks: Vec<String>,
+        supports_streaming: bool,
+    }
+
+    #[async_trait]
+    impl Provider for DraftStreamingProvider {
+        fn supports_streaming(&self) -> bool {
+            self.supports_streaming
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in DraftStreamingProvider tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some(self.chat_text.clone()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let mut chunks = self
+                .stream_chunks
+                .iter()
+                .cloned()
+                .map(|delta| Ok(StreamChunk::delta(delta)))
+                .collect::<Vec<_>>();
+            chunks.push(Ok(StreamChunk::final_chunk()));
+            futures_util::stream::iter(chunks).boxed()
         }
     }
 
@@ -2741,6 +2935,134 @@ mod tests {
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_uses_upstream_streaming_for_draft_updates() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = DraftStreamingProvider {
+            chat_calls: Arc::clone(&chat_calls),
+            stream_calls: Arc::clone(&stream_calls),
+            chat_text: "fallback should not be used".to_string(),
+            stream_chunks: vec!["Hello ".to_string(), "streamed world".to_string()],
+            supports_streaming: true,
+        };
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hello"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            Some(delta_tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("streaming draft path should succeed");
+
+        assert_eq!(result, "Hello streamed world");
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+
+        let mut deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            deltas.push(delta);
+        }
+
+        assert!(
+            deltas.iter().any(|delta| delta == DRAFT_CLEAR_SENTINEL),
+            "expected draft clear sentinel in streaming path"
+        );
+        assert!(
+            deltas.iter().any(|delta| delta == "Hello "),
+            "expected first upstream delta to be forwarded"
+        );
+        assert!(
+            deltas.iter().any(|delta| delta == "streamed world"),
+            "expected second upstream delta to be forwarded"
+        );
+        assert!(
+            deltas.iter().all(|delta| delta != "Hello streamed world"),
+            "streaming path should avoid post-hoc whole-text chunking"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_falls_back_to_non_streaming_when_provider_lacks_streaming() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = DraftStreamingProvider {
+            chat_calls: Arc::clone(&chat_calls),
+            stream_calls: Arc::clone(&stream_calls),
+            chat_text: "fallback final text".to_string(),
+            stream_chunks: vec!["unused".to_string()],
+            supports_streaming: false,
+        };
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hello"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            Some(delta_tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("fallback non-streaming path should succeed");
+
+        assert_eq!(result, "fallback final text");
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+
+        let mut deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            deltas.push(delta);
+        }
+
+        assert!(
+            deltas.iter().any(|delta| delta == DRAFT_CLEAR_SENTINEL),
+            "expected draft clear sentinel in fallback path"
+        );
+        assert!(
+            deltas.iter().any(|delta| delta == "fallback final text"),
+            "expected fallback final text to be post-hoc streamed"
+        );
     }
 
     #[test]
