@@ -17,10 +17,6 @@ module.exports = async ({ github, context, core }) => {
     "## Rollback Plan (required)",
   ];
   const body = pr.body || "";
-  const linearKeyRegex = /\b(?:RMN|CDV|COM)-\d+\b/g;
-  const linearKeys = Array.from(
-    new Set([...(pr.title.match(linearKeyRegex) || []), ...(body.match(linearKeyRegex) || [])]),
-  );
 
   const missingSections = requiredSections.filter((section) => !body.includes(section));
   const missingFields = [];
@@ -87,11 +83,6 @@ module.exports = async ({ github, context, core }) => {
   if (dangerousProblems.length > 0) {
     blockingFindings.push(`Dangerous patch markers found (${dangerousProblems.length})`);
   }
-  if (linearKeys.length === 0) {
-    advisoryFindings.push(
-      "Missing Linear issue key reference (`RMN-<id>`, `CDV-<id>`, or `COM-<id>`) in PR title/body (recommended for traceability, non-blocking).",
-    );
-  }
 
   const comments = await github.paginate(github.rest.issues.listComments, {
     owner,
@@ -156,14 +147,12 @@ module.exports = async ({ github, context, core }) => {
     "",
     "Action items:",
     "1. Complete required PR template sections/fields.",
-    "2. (Recommended) Link this PR to one active Linear issue key (`RMN-xxx`/`CDV-xxx`/`COM-xxx`) for traceability.",
-    "3. Remove tabs, trailing whitespace, and merge conflict markers from added lines.",
+    "2. Remove tabs, trailing whitespace, and merge conflict markers from added lines.",
     "4. Re-run local checks before pushing:",
     "   - `./scripts/ci/rust_quality_gate.sh`",
     "   - `./scripts/ci/rust_strict_delta_gate.sh`",
     "   - `./scripts/ci/docs_quality_gate.sh`",
     "",
-    `Detected Linear keys: ${linearKeys.length > 0 ? linearKeys.join(", ") : "none"}`,
     "",
     `Run logs: ${runUrl}`,
     "",

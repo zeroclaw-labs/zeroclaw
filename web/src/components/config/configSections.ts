@@ -271,7 +271,7 @@ export const CONFIG_SECTIONS: SectionDef[] = [
       { key: 'kind', label: 'Kind', type: 'select', defaultValue: 'native', options: [
         { value: 'native', label: 'Native' },
         { value: 'docker', label: 'Docker' },
-        { value: 'wasm', label: 'WASM' },
+        { value: 'wasm', label: 'Sandboxed' },
       ]},
       { key: 'reasoning_enabled', label: 'Reasoning Enabled', type: 'toggle', description: 'Enable model reasoning mode' },
     ],
@@ -640,6 +640,22 @@ export const CONFIG_SECTIONS: SectionDef[] = [
     ],
   },
 
+  // ── Napcat (OneBot) ───────────────────────────────────────────────
+  {
+    path: 'channels_config.napcat',
+    category: 'channels',
+    title: 'Napcat (OneBot)',
+    description: 'QQ via OneBot v11 (Napcat)',
+    icon: MessageCircle,
+    defaultCollapsed: true,
+    fields: [
+      { key: 'websocket_url', label: 'WebSocket URL', type: 'text', description: 'e.g. ws://127.0.0.1:3001' },
+      { key: 'api_base_url', label: 'HTTP API Base URL', type: 'text', description: 'Optional. Leave empty to auto-derive from websocket_url' },
+      { key: 'access_token', label: 'Access Token', type: 'password', sensitive: true, description: 'Optional bearer token for Napcat/OneBot API' },
+      { key: 'allowed_users', label: 'Allowed Users', type: 'tag-list', tagPlaceholder: "e.g. 10001 or '*'" },
+    ],
+  },
+
   // ── Memory ────────────────────────────────────────────────────────
   {
     path: 'memory',
@@ -975,8 +991,8 @@ export const CONFIG_SECTIONS: SectionDef[] = [
   {
     path: 'wasm',
     category: 'runtime',
-    title: 'WASM Plugins',
-    description: 'WebAssembly plugin engine',
+    title: 'Plugin Engine',
+    description: 'Sandboxed plugin engine',
     icon: Play,
     defaultCollapsed: true,
     fields: [
