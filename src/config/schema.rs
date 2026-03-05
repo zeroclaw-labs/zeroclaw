@@ -39,6 +39,8 @@ fn canonical_provider_for_model_defaults(provider_name: &str) -> String {
         "kimi_coding" | "kimi_for_coding" => "kimi-code".to_string(),
         "nvidia-nim" | "build.nvidia.com" => "nvidia".to_string(),
         "aws-bedrock" => "bedrock".to_string(),
+        "samba-nova" => "sambanova".to_string(),
+        "hf" => "huggingface".to_string(),
         "llama.cpp" => "llamacpp".to_string(),
         _ => provider_name.to_string(),
     }
@@ -76,6 +78,11 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "novita" => "minimax/minimax-m2.5",
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "cohere" => "command-a-03-2025",
+        "ai21" => "jamba-1.5-large",
+        "cerebras" => "llama3.1-70b",
+        "sambanova" => "Meta-Llama-3.3-70B-Instruct",
+        "huggingface" => "meta-llama/Llama-3.3-70B-Instruct",
+        "replicate" => "meta/meta-llama-3-70b-instruct",
         "moonshot" => "kimi-k2.5",
         "stepfun" => "step-3.5-flash",
         "hunyuan" => "hunyuan-t1-latest",
@@ -4252,6 +4259,12 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Maximum heartbeat tasks to execute per tick. Default: `3`.
+    #[serde(default = "default_heartbeat_max_tasks_per_tick")]
+    pub max_tasks_per_tick: usize,
+    /// Skip duplicate task text within this cooldown window (minutes). Default: `0` (disabled).
+    #[serde(default = "default_heartbeat_dedupe_window_minutes")]
+    pub dedupe_window_minutes: u32,
     /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
     #[serde(default)]
     pub message: Option<String>,
@@ -4263,11 +4276,21 @@ pub struct HeartbeatConfig {
     pub to: Option<String>,
 }
 
+fn default_heartbeat_max_tasks_per_tick() -> usize {
+    3
+}
+
+fn default_heartbeat_dedupe_window_minutes() -> u32 {
+    0
+}
+
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             interval_minutes: 30,
+            max_tasks_per_tick: default_heartbeat_max_tasks_per_tick(),
+            dedupe_window_minutes: default_heartbeat_dedupe_window_minutes(),
             message: None,
             target: None,
             to: None,
@@ -5718,6 +5741,21 @@ pub struct SecurityConfig {
     #[serde(default = "default_true")]
     pub canary_tokens: bool,
 
+    /// Enable semantic prompt-injection guard backed by vector similarity.
+    ///
+    /// This guard is additive to lexical prompt detection and only runs when
+    /// `PromptGuard` does not already block the input.
+    #[serde(default)]
+    pub semantic_guard: bool,
+
+    /// Qdrant collection used by the semantic guard.
+    #[serde(default = "default_semantic_guard_collection")]
+    pub semantic_guard_collection: String,
+
+    /// Cosine similarity threshold for semantic-guard detections.
+    #[serde(default = "default_semantic_guard_threshold")]
+    pub semantic_guard_threshold: f64,
+
     /// Shared URL access policy for network-enabled tools.
     #[serde(default)]
     pub url_access: UrlAccessConfig,
@@ -5736,9 +5774,20 @@ impl Default for SecurityConfig {
             perplexity_filter: PerplexityFilterConfig::default(),
             outbound_leak_guard: OutboundLeakGuardConfig::default(),
             canary_tokens: true,
+            semantic_guard: false,
+            semantic_guard_collection: default_semantic_guard_collection(),
+            semantic_guard_threshold: default_semantic_guard_threshold(),
             url_access: UrlAccessConfig::default(),
         }
     }
+}
+
+fn default_semantic_guard_collection() -> String {
+    "semantic_guard".into()
+}
+
+fn default_semantic_guard_threshold() -> f64 {
+    0.82
 }
 
 /// Outbound leak handling mode for channel responses.
@@ -7721,7 +7770,8 @@ impl Config {
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
                 source = resolution_source.as_str(),
-                initialized = false,
+                initialized = true,
+                created = false,
                 "Config loaded"
             );
             Ok(config)
@@ -7745,6 +7795,7 @@ impl Config {
                 workspace = %config.workspace_dir.display(),
                 source = resolution_source.as_str(),
                 initialized = true,
+                created = true,
                 "Config loaded"
             );
             Ok(config)
@@ -8474,6 +8525,12 @@ impl Config {
         if !(0.0..=1.0).contains(&self.security.outbound_leak_guard.sensitivity) {
             anyhow::bail!("security.outbound_leak_guard.sensitivity must be between 0.0 and 1.0");
         }
+        if self.security.semantic_guard_collection.trim().is_empty() {
+            anyhow::bail!("security.semantic_guard_collection must not be empty");
+        }
+        if !(0.0..=1.0).contains(&self.security.semantic_guard_threshold) {
+            anyhow::bail!("security.semantic_guard_threshold must be between 0.0 and 1.0");
+        }
 
         // Browser
         if normalize_browser_open_choice(&self.browser.browser_open).is_none() {
@@ -8571,6 +8628,12 @@ impl Config {
         }
 
         // Scheduler
+        if self.heartbeat.interval_minutes == 0 {
+            anyhow::bail!("heartbeat.interval_minutes must be greater than 0");
+        }
+        if self.heartbeat.max_tasks_per_tick == 0 {
+            anyhow::bail!("heartbeat.max_tasks_per_tick must be greater than 0");
+        }
         if self.scheduler.max_concurrent == 0 {
             anyhow::bail!("scheduler.max_concurrent must be greater than 0");
         }
@@ -10156,6 +10219,8 @@ action = "require_approval"
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
+        assert_eq!(h.max_tasks_per_tick, 3);
+        assert_eq!(h.dedupe_window_minutes, 0);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
@@ -10166,6 +10231,8 @@ action = "require_approval"
         let raw = r#"
 enabled = true
 interval_minutes = 10
+max_tasks_per_tick = 5
+dedupe_window_minutes = 30
 message = "Ping"
 channel = "telegram"
 recipient = "42"
@@ -10173,6 +10240,8 @@ recipient = "42"
         let parsed: HeartbeatConfig = toml::from_str(raw).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.interval_minutes, 10);
+        assert_eq!(parsed.max_tasks_per_tick, 5);
+        assert_eq!(parsed.dedupe_window_minutes, 30);
         assert_eq!(parsed.message.as_deref(), Some("Ping"));
         assert_eq!(parsed.target.as_deref(), Some("telegram"));
         assert_eq!(parsed.to.as_deref(), Some("42"));
@@ -10339,6 +10408,8 @@ ws_url = "ws://127.0.0.1:3002"
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                max_tasks_per_tick: 4,
+                dedupe_window_minutes: 10,
                 message: Some("Check London time".into()),
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
@@ -10426,6 +10497,8 @@ ws_url = "ws://127.0.0.1:3002"
         assert_eq!(parsed.runtime.kind, "docker");
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
+        assert_eq!(parsed.heartbeat.max_tasks_per_tick, 4);
+        assert_eq!(parsed.heartbeat.dedupe_window_minutes, 10);
         assert_eq!(
             parsed.heartbeat.message.as_deref(),
             Some("Check London time")
@@ -10454,6 +10527,8 @@ default_temperature = 0.7
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);
+        assert_eq!(parsed.heartbeat.max_tasks_per_tick, 3);
+        assert_eq!(parsed.heartbeat.dedupe_window_minutes, 0);
         assert!(parsed.channels_config.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
@@ -12725,6 +12800,12 @@ provider_api = "not-a-real-mode"
 
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
+
+        let ai21 = resolve_default_model_id(None, Some("ai21"));
+        assert_eq!(ai21, "jamba-1.5-large");
+
+        let huggingface = resolve_default_model_id(None, Some("huggingface"));
+        assert_eq!(huggingface, "meta-llama/Llama-3.3-70B-Instruct");
     }
 
     #[test]
@@ -12740,6 +12821,12 @@ provider_api = "not-a-real-mode"
 
         let step_ai_alias = resolve_default_model_id(None, Some("step-ai"));
         assert_eq!(step_ai_alias, "step-3.5-flash");
+
+        let samba_nova_alias = resolve_default_model_id(None, Some("samba-nova"));
+        assert_eq!(samba_nova_alias, "Meta-Llama-3.3-70B-Instruct");
+
+        let hf_alias = resolve_default_model_id(None, Some("hf"));
+        assert_eq!(hf_alias, "meta-llama/Llama-3.3-70B-Instruct");
     }
 
     #[test]
@@ -14639,6 +14726,9 @@ default_temperature = 0.7
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.7);
         assert!(parsed.security.canary_tokens);
+        assert!(!parsed.security.semantic_guard);
+        assert_eq!(parsed.security.semantic_guard_collection, "semantic_guard");
+        assert!((parsed.security.semantic_guard_threshold - 0.82).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -14651,6 +14741,9 @@ default_temperature = 0.7
 
 [security]
 canary_tokens = false
+semantic_guard = true
+semantic_guard_collection = "semantic_guard_custom"
+semantic_guard_threshold = 0.91
 
 [security.otp]
 enabled = true
@@ -14734,6 +14827,12 @@ sensitivity = 0.9
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.9);
         assert!(!parsed.security.canary_tokens);
+        assert!(parsed.security.semantic_guard);
+        assert_eq!(
+            parsed.security.semantic_guard_collection,
+            "semantic_guard_custom"
+        );
+        assert!((parsed.security.semantic_guard_threshold - 0.91).abs() < f64::EPSILON);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         assert_eq!(
@@ -15066,6 +15165,19 @@ sensitivity = 0.9
     }
 
     #[test]
+    async fn heartbeat_validation_rejects_zero_max_tasks_per_tick() {
+        let mut config = Config::default();
+        config.heartbeat.max_tasks_per_tick = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected heartbeat max_tasks_per_tick validation failure");
+        assert!(err
+            .to_string()
+            .contains("heartbeat.max_tasks_per_tick must be greater than 0"));
+    }
+
+    #[test]
     async fn security_validation_rejects_denied_threshold_above_total_threshold() {
         let mut config = Config::default();
         config.security.syscall_anomaly.max_denied_events_per_minute = 10;
@@ -15112,6 +15224,32 @@ sensitivity = 0.9
         assert!(err
             .to_string()
             .contains("security.outbound_leak_guard.sensitivity"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_empty_semantic_guard_collection() {
+        let mut config = Config::default();
+        config.security.semantic_guard_collection = "   ".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("expected semantic_guard_collection validation failure");
+        assert!(err
+            .to_string()
+            .contains("security.semantic_guard_collection"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_semantic_guard_threshold() {
+        let mut config = Config::default();
+        config.security.semantic_guard_threshold = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected semantic_guard_threshold validation failure");
+        assert!(err
+            .to_string()
+            .contains("security.semantic_guard_threshold"));
     }
 
     #[test]
