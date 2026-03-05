@@ -49,11 +49,9 @@ pub struct OAuthCallback {
 }
 
 /// Query params for initiating OAuth.
+/// Currently no query params are used; struct is kept for forward compatibility.
 #[derive(Debug, Deserialize)]
-pub struct OAuthStartQuery {
-    /// Optional redirect URL after successful auth (must be same-origin).
-    pub redirect: Option<String>,
-}
+pub struct OAuthStartQuery {}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -560,23 +558,24 @@ pub async fn handle_auth_revoke(
     let dir = oauth_dir(&state);
     let path = token_path(&dir, service);
 
-    if !path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("{service} is not connected") })),
-        )
-            .into_response();
-    }
-
-    // Revoke Google token if applicable
+    // Revoke Google token if applicable before deleting the local file.
     if service == "google" {
         if let Some(token) = read_token(&path).await {
-            let _ = revoke_google_token(&token.access_token).await;
+            if let Err(e) = revoke_google_token(&token.access_token).await {
+                tracing::warn!("Failed to revoke Google OAuth token server-side: {e:#}");
+            }
         }
     }
 
+    // Remove the token file. Handle NotFound directly to avoid a TOCTOU race
+    // between an existence check and the actual delete.
     match tokio::fs::remove_file(&path).await {
         Ok(_) => Json(json!({ "success": true, "service": service })).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("{service} is not connected") })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Failed to delete token: {e}") })),
