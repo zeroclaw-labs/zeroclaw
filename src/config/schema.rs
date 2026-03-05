@@ -408,6 +408,7 @@ impl std::fmt::Debug for Config {
             self.model_providers.keys().map(String::as_str).collect();
         let delegate_agent_ids: Vec<&str> = self.agents.keys().map(String::as_str).collect();
         let enabled_channel_count = [
+            self.channels_config.bridge.is_some(),
             self.channels_config.telegram.is_some(),
             self.channels_config.discord.is_some(),
             self.channels_config.slack.is_some(),
@@ -3292,6 +3293,8 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
+    /// Local bridge websocket channel configuration.
+    pub bridge: Option<BridgeConfig>,
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
@@ -3345,6 +3348,10 @@ impl ChannelsConfig {
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
+            (
+                Box::new(ConfigWrapper::new(self.bridge.as_ref())),
+                self.bridge.is_some(),
+            ),
             (
                 Box::new(ConfigWrapper::new(self.telegram.as_ref())),
                 self.telegram.is_some(),
@@ -3444,6 +3451,7 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             cli: true,
+            bridge: None,
             telegram: None,
             discord: None,
             slack: None,
@@ -3539,6 +3547,54 @@ fn clone_group_reply_allowed_sender_ids(group_reply: Option<&GroupReplyConfig>) 
     group_reply
         .map(|cfg| cfg.allowed_sender_ids.clone())
         .unwrap_or_default()
+}
+
+fn default_bridge_bind_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_bridge_bind_port() -> u16 {
+    8765
+}
+
+fn default_bridge_path() -> String {
+    "/ws".into()
+}
+
+/// Bridge WebSocket channel configuration.
+///
+/// This listener is local-only by default (`127.0.0.1`) for safety.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BridgeConfig {
+    /// Local bind host for the bridge listener.
+    #[serde(default = "default_bridge_bind_host")]
+    pub bind_host: String,
+    /// TCP port for incoming websocket bridge clients.
+    #[serde(default = "default_bridge_bind_port")]
+    pub bind_port: u16,
+    /// HTTP path for websocket upgrade requests.
+    #[serde(default = "default_bridge_path")]
+    pub path: String,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            bind_host: default_bridge_bind_host(),
+            bind_port: default_bridge_bind_port(),
+            path: default_bridge_path(),
+        }
+    }
+}
+
+impl ChannelConfig for BridgeConfig {
+    fn name() -> &'static str {
+        "Bridge"
+    }
+
+    fn desc() -> &'static str {
+        "Local websocket bridge"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -7182,6 +7238,7 @@ default_temperature = 0.7
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
+                bridge: None,
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
@@ -8181,6 +8238,7 @@ allowed_users = ["@ops:matrix.org"]
     async fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            bridge: None,
             telegram: None,
             discord: None,
             slack: None,
@@ -8226,6 +8284,31 @@ allowed_users = ["@ops:matrix.org"]
         let c = ChannelsConfig::default();
         assert!(c.imessage.is_none());
         assert!(c.matrix.is_none());
+    }
+
+    #[test]
+    async fn bridge_config_deserializes_with_safe_defaults() {
+        let parsed: BridgeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.bind_host, "127.0.0.1");
+        assert_eq!(parsed.bind_port, 8765);
+        assert_eq!(parsed.path, "/ws");
+    }
+
+    #[test]
+    async fn channels_config_supports_bridge_section() {
+        let toml_str = r#"
+cli = true
+
+[bridge]
+bind_host = "127.0.0.1"
+bind_port = 9010
+path = "/bridge"
+"#;
+        let parsed: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        let bridge = parsed.bridge.expect("bridge should be present");
+        assert_eq!(bridge.bind_host, "127.0.0.1");
+        assert_eq!(bridge.bind_port, 9010);
+        assert_eq!(bridge.path, "/bridge");
     }
 
     // ── Edge cases: serde(default) for allowed_users ─────────
@@ -8460,6 +8543,7 @@ channel_id = "C123"
     async fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
+            bridge: None,
             telegram: None,
             discord: None,
             slack: None,
