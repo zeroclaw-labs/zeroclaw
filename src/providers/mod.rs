@@ -1372,6 +1372,18 @@ fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+fn resolve_fallback_api_key<'a>(
+    reliability: &'a crate::config::ReliabilityConfig,
+    fallback_entry: &str,
+    provider_name: &str,
+) -> Option<&'a str> {
+    reliability
+        .fallback_api_keys
+        .get(fallback_entry)
+        .or_else(|| reliability.fallback_api_keys.get(provider_name))
+        .map(String::as_str)
+}
+
 /// Create provider chain with retry and fallback behavior.
 pub fn create_resilient_provider(
     primary_name: &str,
@@ -1423,11 +1435,7 @@ pub fn create_resilient_provider_with_options(
         // When a profile override is present (e.g. "openai-codex:second"),
         // propagate it through `auth_profile_override` so the provider
         // picks up the correct OAuth credential set.
-        let fallback_api_key = reliability
-            .fallback_api_keys
-            .get(fallback)
-            .or_else(|| reliability.fallback_api_keys.get(provider_name))
-            .map(String::as_str);
+        let fallback_api_key = resolve_fallback_api_key(reliability, fallback, provider_name);
 
         let fallback_options = match profile_override {
             Some(profile) => {
@@ -3184,6 +3192,39 @@ mod tests {
         let (name, profile) = parse_provider_profile("provider:profile:extra");
         assert_eq!(name, "provider");
         assert_eq!(profile, Some("profile:extra"));
+    }
+
+    #[test]
+    fn resolve_fallback_api_key_prefers_exact_entry_over_provider_name() {
+        let mut fallback_api_keys = std::collections::HashMap::new();
+        fallback_api_keys.insert(
+            "custom:https://one.example.com/v1".to_string(),
+            "entry-key".to_string(),
+        );
+        fallback_api_keys.insert("custom".to_string(), "provider-key".to_string());
+
+        let reliability = crate::config::ReliabilityConfig {
+            fallback_api_keys,
+            ..crate::config::ReliabilityConfig::default()
+        };
+
+        let resolved =
+            resolve_fallback_api_key(&reliability, "custom:https://one.example.com/v1", "custom");
+        assert_eq!(resolved, Some("entry-key"));
+    }
+
+    #[test]
+    fn resolve_fallback_api_key_uses_provider_name_as_compat_fallback() {
+        let mut fallback_api_keys = std::collections::HashMap::new();
+        fallback_api_keys.insert("openrouter".to_string(), "provider-key".to_string());
+
+        let reliability = crate::config::ReliabilityConfig {
+            fallback_api_keys,
+            ..crate::config::ReliabilityConfig::default()
+        };
+
+        let resolved = resolve_fallback_api_key(&reliability, "openrouter:secondary", "openrouter");
+        assert_eq!(resolved, Some("provider-key"));
     }
 
     // --- resilient fallback with profile syntax ---
