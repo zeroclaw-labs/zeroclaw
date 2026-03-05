@@ -2509,6 +2509,7 @@ mod tests {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -3399,6 +3400,7 @@ mod tests {
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
