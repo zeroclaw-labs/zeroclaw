@@ -4900,6 +4900,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     client_id,
                     client_secret,
                     allowed_users,
+                    message_type: crate::config::schema::DingTalkMessageType::Markdown,
+                    card_template_id: None,
+                    card_template_key: "content".to_string(),
+                    robot_code: None,
                 });
             }
             ChannelMenuChoice::QqOfficial => {

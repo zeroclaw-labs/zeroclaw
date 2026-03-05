@@ -534,6 +534,10 @@ mod tests {
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
             allowed_users: vec!["*".into()],
+            message_type: crate::config::schema::DingTalkMessageType::Markdown,
+            card_template_id: None,
+            card_template_key: "content".to_string(),
+            robot_code: None,
         });
         assert!(has_supervised_channels(&config));
     }

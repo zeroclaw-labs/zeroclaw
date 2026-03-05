@@ -4566,6 +4566,19 @@ impl Default for AuditConfig {
 }
 
 /// DingTalk configuration for Stream Mode messaging
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DingTalkMessageType {
+    #[default]
+    Markdown,
+    Card,
+}
+
+fn default_dingtalk_card_template_key() -> String {
+    "content".to_string()
+}
+
+/// DingTalk configuration for Stream Mode messaging
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DingTalkConfig {
     /// Client ID (AppKey) from DingTalk developer console
@@ -4575,6 +4588,21 @@ pub struct DingTalkConfig {
     /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Reply mode: markdown (default) or template card.
+    #[serde(default)]
+    pub message_type: DingTalkMessageType,
+    /// DingTalk card template ID for card mode.
+    /// Required only when `message_type = "card"`.
+    #[serde(default)]
+    pub card_template_id: Option<String>,
+    /// Template variable key used for card streaming body updates.
+    /// Optional; defaults to `content` when omitted.
+    #[serde(default = "default_dingtalk_card_template_key")]
+    pub card_template_key: String,
+    /// Optional robot code override for proactive/card APIs.
+    /// When omitted, channel falls back to `client_id`.
+    #[serde(default)]
+    pub robot_code: Option<String>,
 }
 
 impl ChannelConfig for DingTalkConfig {
