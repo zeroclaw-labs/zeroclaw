@@ -56,6 +56,7 @@ pub struct RusqliteStore {
 
 /// Helper macro to convert rusqlite errors to StoreError
 /// For execute statements that return usize, maps to ()
+#[cfg(feature = "whatsapp-web")]
 macro_rules! to_store_err {
     // For expressions returning Result<usize, E>
     (execute: $expr:expr) => {
