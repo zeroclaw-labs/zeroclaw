@@ -24,7 +24,7 @@ env:
 jobs:
     changes:
         name: Detect Change Scope
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         outputs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
@@ -412,12 +412,8 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - name: ubuntu-24.04
-                      os: ubuntu-24.04
-                      shell: bash
-                      command: cargo test --locked --lib --bins --verbose
-                    - name: ubuntu-22.04
-                      os: ubuntu-22.04
+                    - name: blacksmith-2vcpu-ubuntu-2404
+                      os: blacksmith-2vcpu-ubuntu-2404
                       shell: bash
                       command: cargo test --locked --lib --bins --verbose
                     - name: windows-2022
@@ -445,7 +441,7 @@ jobs:
         name: Linux Distro Container (${{ matrix.name }})
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-24.04
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 90
         strategy:
             fail-fast: false
@@ -453,7 +449,7 @@ jobs:
                 include:
                     - name: debian-bookworm
                       image: debian:bookworm-slim
-                    - name: ubuntu-24.04
+                    - name: blacksmith-2vcpu-ubuntu-2404
                       image: ubuntu:24.04
                     - name: fedora-41
                       image: fedora:41
@@ -495,7 +491,7 @@ jobs:
         name: Docker Container Smoke
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-24.04
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 90
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -514,7 +510,7 @@ jobs:
         name: Docs-Only Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only == 'true'
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         steps:
             - name: Skip heavy jobs for docs-only change
               run: echo "Docs-only change detected. Rust lint/test/build skipped."
@@ -523,7 +519,7 @@ jobs:
         name: Non-Rust Fast Path
         needs: [changes]
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         steps:
             - name: Skip Rust jobs for non-Rust change scope
               run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
@@ -532,7 +528,7 @@ jobs:
         name: Docs Quality
         needs: [changes]
         if: needs.changes.outputs.docs_changed == 'true'
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -591,7 +587,7 @@ jobs:
         name: Lint Feedback
         if: github.event_name == 'pull_request'
         needs: [changes, lint, docs-quality]
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         permissions:
             contents: read
             pull-requests: write
@@ -617,7 +613,7 @@ jobs:
         name: License File Owner Guard
         needs: [changes]
         if: github.event_name == 'pull_request'
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         permissions:
             contents: read
             pull-requests: read
@@ -635,7 +631,7 @@ jobs:
         name: CI Required Gate
         if: always()
         needs: [changes, lint, workspace-check, package-check, test, restricted-hermetic, build, binary-size-regression, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         steps:
             - name: Enforce required status
               shell: bash

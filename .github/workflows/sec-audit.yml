@@ -70,6 +70,7 @@ env:
     CARGO_TERM_COLOR: always
 
 jobs:
+    # Run all security lanes on the same Blacksmith-tagged Linux pool for consistent routing.
     audit:
         name: Security Audit
         runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
@@ -251,7 +252,7 @@ jobs:
 
     secrets:
         name: Secrets Governance (Gitleaks)
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -446,7 +447,7 @@ jobs:
 
     sbom:
         name: SBOM Snapshot
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -511,7 +512,7 @@ jobs:
 
     unsafe-debt:
         name: Unsafe Debt Audit
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -656,7 +657,7 @@ jobs:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
         needs: [audit, deny, security-regressions, secrets, sbom, unsafe-debt]
-        runs-on: [self-hosted, Linux, X64, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         steps:
             - name: Enforce security gate
               shell: bash
