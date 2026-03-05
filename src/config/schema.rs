@@ -61,12 +61,13 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 /// Protocol mode for `custom:` OpenAI-compatible providers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
 pub enum ProviderApiMode {
     /// Default behavior: `/chat/completions` first, optional `/responses`
     /// fallback when supported.
+    #[serde(rename = "openai-chat-completions", alias = "open-ai-chat-completions")]
     OpenAiChatCompletions,
     /// Responses-first behavior: call `/responses` directly.
+    #[serde(rename = "openai-responses", alias = "open-ai-responses")]
     OpenAiResponses,
 }
 
@@ -9217,6 +9218,30 @@ provider_api = "not-a-real-mode"
             parsed.is_err(),
             "invalid provider_api should fail to deserialize"
         );
+    }
+
+    #[test]
+    async fn provider_api_accepts_documented_openai_spelling() {
+        let toml = r#"
+default_provider = "custom:https://example.com/v1"
+default_model = "gpt-4o"
+default_temperature = 0.7
+provider_api = "openai-responses"
+"#;
+        let parsed = toml::from_str::<Config>(toml).expect("openai-responses should deserialize");
+        assert_eq!(parsed.provider_api, Some(ProviderApiMode::OpenAiResponses));
+    }
+
+    #[test]
+    async fn provider_api_accepts_legacy_open_ai_spelling_alias() {
+        let toml = r#"
+default_provider = "custom:https://example.com/v1"
+default_model = "gpt-4o"
+default_temperature = 0.7
+provider_api = "open-ai-responses"
+"#;
+        let parsed = toml::from_str::<Config>(toml).expect("open-ai-responses should deserialize");
+        assert_eq!(parsed.provider_api, Some(ProviderApiMode::OpenAiResponses));
     }
 
     #[test]
