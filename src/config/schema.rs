@@ -4674,6 +4674,14 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    // Respect HOME environment variable if set (useful for testing and Docker)
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        if !home_path.as_os_str().is_empty() {
+            return Ok(home_path.join(".zeroclaw"));
+        }
+    }
+
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
