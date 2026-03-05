@@ -81,6 +81,62 @@ Use this board for important notices (breaking changes, security advisories, mai
 - **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
+## Quick Start
+
+### Option 1: Homebrew (macOS/Linuxbrew)
+
+```bash
+brew install zeroclaw
+```
+
+### Option 2: Clone + Bootstrap
+
+```bash
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+./bootstrap.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+.\bootstrap.ps1
+```
+
+> **Note:** Source builds require ~2GB RAM and ~6GB disk. For resource-constrained systems, use `./bootstrap.sh --prefer-prebuilt` to download a pre-built binary instead.
+
+### Option 3: Cargo Install
+
+```bash
+cargo install zeroclaw
+```
+
+### First Run
+
+```bash
+# Start the gateway (serves the Web Dashboard API/UI)
+zeroclaw gateway
+
+# Open the dashboard URL shown in startup logs
+# (default: http://127.0.0.1:3000/)
+
+# Or chat directly
+zeroclaw chat "Hello!"
+```
+
+For detailed setup options, see [docs/one-click-bootstrap.md](docs/one-click-bootstrap.md).
+
+### Installation Docs (Canonical Source)
+
+Use repository docs as the source of truth for install/setup instructions:
+
+- [README Quick Start](#quick-start)
+- [docs/one-click-bootstrap.md](docs/one-click-bootstrap.md)
+- [docs/getting-started/README.md](docs/getting-started/README.md)
+
+Issue comments can provide context, but they are not canonical installation documentation.
 ## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
 
 Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.

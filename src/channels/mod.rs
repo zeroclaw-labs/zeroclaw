@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod bridge;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -42,6 +43,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bridge::BridgeChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -1015,6 +1017,18 @@ fn build_runtime_tool_visibility_prompt(
         );
     }
 
+    prompt.push_str(
+        "- Do not claim tools are unavailable when they are listed above; call the appropriate tool directly.\n",
+    );
+    if specs
+        .iter()
+        .any(|spec| matches!(spec.name.as_str(), "file_write" | "file_edit"))
+    {
+        prompt.push_str(
+            "- File changes are supported in this turn (`file_write`/`file_edit`) when requested and policy permits.\n",
+        );
+    }
+
     if native_tools {
         prompt.push_str(
             "Tool calling for this turn uses native provider function-calling. \
@@ -1601,6 +1615,19 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
 
 fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
     crate::agent::loop_::is_tool_iteration_limit_error(err)
+}
+
+fn is_heartbeat_ok_sentinel(output: &str) -> bool {
+    const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
+    output
+        .trim_start()
+        .get(..HEARTBEAT_OK.len())
+        .map(|prefix| prefix.eq_ignore_ascii_case(HEARTBEAT_OK))
+        .unwrap_or(false)
+}
+
+fn is_agent_noop_sentinel(output: &str) -> bool {
+    output.trim().eq_ignore_ascii_case("no_reply") || is_heartbeat_ok_sentinel(output)
 }
 
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
@@ -3434,63 +3461,91 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
             } else {
                 sanitized_response
             };
-            runtime_trace::record_event(
-                "channel_message_outbound",
-                Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
-                None,
-                Some(true),
-                None,
-                serde_json::json!({
-                    "sender": msg.sender,
-                    "elapsed_ms": started_at.elapsed().as_millis(),
-                    "response": scrub_credentials(&delivered_response),
-                }),
-            );
-
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
+            if is_agent_noop_sentinel(&delivered_response) {
+                tracing::debug!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    response = %truncate_with_ellipsis(&delivered_response, 64),
+                    "Suppressing noop sentinel response in channel flow"
+                );
+                runtime_trace::record_event(
+                    "channel_message_outbound_suppressed_noop",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(true),
+                    Some("suppressed noop sentinel"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "response": scrub_credentials(&delivered_response),
+                    }),
+                );
+                if let (Some(channel), Some(draft_id)) =
+                    (target_channel.as_ref(), draft_message_id.as_deref())
+                {
+                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                }
             } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
+                runtime_trace::record_event(
+                    "channel_message_outbound",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "response": scrub_credentials(&delivered_response),
+                    }),
+                );
 
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                // Extract condensed tool-use context from the history messages
+                // added during run_tool_call_loop, so the LLM retains awareness
+                // of what it did on subsequent turns.
+                let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
+                let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+                    delivered_response.clone()
+                } else {
+                    format!("{tool_summary}\n{delivered_response}")
+                };
+
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    truncate_with_ellipsis(&delivered_response, 80)
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        if let Err(e) = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                            .await
+                        {
+                            tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&delivered_response, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
+                        }
+                    } else if let Err(e) = channel
+                        .send(
+                            &SendMessage::new(delivered_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
                         .await
                     {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
         }
@@ -4292,6 +4347,13 @@ fn collect_configured_channels(
     // `#[cfg(not(feature = "channel-matrix"))]` blocks are removed.
     let _ = matrix_skip_context;
     let mut channels = Vec::new();
+
+    if let Some(ref bridge_cfg) = config.channels_config.bridge {
+        channels.push(ConfiguredChannel {
+            display_name: "Bridge",
+            channel: Arc::new(BridgeChannel::new(bridge_cfg.clone())),
+        });
+    }
 
     if let Some(ref tg) = config.channels_config.telegram {
         let mut telegram = TelegramChannel::new(
@@ -5228,6 +5290,21 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_ok_sentinel_detection_supports_prefix_and_case_insensitive() {
+        assert!(is_heartbeat_ok_sentinel("HEARTBEAT_OK"));
+        assert!(is_heartbeat_ok_sentinel(" heartbeat_ok - no updates"));
+        assert!(is_heartbeat_ok_sentinel("\nHeArTbEaT_oK still nominal"));
+        assert!(!is_heartbeat_ok_sentinel("The heartbeat is healthy"));
+    }
+
+    #[test]
+    fn agent_noop_sentinel_detection_supports_heartbeat_ok_and_no_reply() {
+        assert!(is_agent_noop_sentinel("HEARTBEAT_OK"));
+        assert!(is_agent_noop_sentinel(" no_reply "));
+        assert!(!is_agent_noop_sentinel("status update available"));
+    }
+
+    #[test]
     fn memory_context_skip_rules_exclude_history_blobs() {
         assert!(should_skip_memory_context_entry(
             "telegram_123_history",
@@ -5496,6 +5573,21 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
+        }
+    }
+
+    struct HeartbeatOkProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for HeartbeatOkProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("HEARTBEAT_OK".to_string())
         }
     }
 
@@ -6014,12 +6106,20 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(non_native.contains("Excluded by runtime policy: mock_price"));
         assert!(non_native.contains("`mock_echo`"));
         assert!(!non_native.contains("**mock_price**:"));
+        assert!(non_native.contains("Do not claim tools are unavailable"));
         assert!(non_native.contains("## Tool Use Protocol"));
 
         let native = build_runtime_tool_visibility_prompt(&tools, &excluded, true);
         assert!(native.contains("Runtime Tool Availability (Authoritative)"));
+        assert!(native.contains("Do not claim tools are unavailable"));
         assert!(native.contains("native provider function-calling"));
         assert!(!native.contains("## Tool Use Protocol"));
+    }
+
+    fn autonomy_with_mock_price_auto_approve() -> crate::config::AutonomyConfig {
+        let mut autonomy = crate::config::AutonomyConfig::default();
+        autonomy.auto_approve.push("mock_price".to_string());
+        autonomy
     }
 
     #[tokio::test]
@@ -6064,7 +6164,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
         });
 
@@ -6139,7 +6239,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6203,7 +6303,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6279,7 +6379,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6356,7 +6456,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6429,7 +6529,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
         });
 
@@ -6493,7 +6593,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
         });
 
@@ -6566,7 +6666,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
         });
 
@@ -7837,7 +7937,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &autonomy_with_mock_price_auto_approve(),
             )),
         });
 
@@ -8239,6 +8339,8 @@ BTC is currently around $65,000 based on latest tool output."#
     async fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut autonomy_cfg = autonomy_with_mock_price_auto_approve();
+        autonomy_cfg.level = crate::security::AutonomyLevel::Full;
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -8266,16 +8368,14 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            message_timeout_secs: 5,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
         process_channel_message(
@@ -8304,6 +8404,8 @@ BTC is currently around $65,000 based on latest tool output."#
     async fn process_channel_message_reports_configured_max_tool_iterations_limit() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut autonomy_cfg = autonomy_with_mock_price_auto_approve();
+        autonomy_cfg.level = crate::security::AutonomyLevel::Full;
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -8331,16 +8433,14 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            message_timeout_secs: 5,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
         process_channel_message(
@@ -8876,6 +8976,85 @@ BTC is currently around $65,000 based on latest tool output."#
         let removed = channel_impl.reactions_removed.lock().await;
         assert_eq!(removed.len(), 1, "eyes reaction should be removed once");
         assert_eq!(removed[0].2, "\u{1F440}");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_suppresses_heartbeat_ok_sentinel() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(HeartbeatOkProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "heartbeat-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-heartbeat".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.is_empty(),
+            "HEARTBEAT_OK sentinel should not be sent as a channel reply"
+        );
+        drop(sent_messages);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let history_key = "test-channel_alice";
+        let turns = histories
+            .get(history_key)
+            .expect("user turn should still be retained");
+        assert_eq!(turns.len(), 1, "assistant sentinel should not be persisted");
+        assert_eq!(turns[0].role, "user");
+        assert!(
+            turns[0].content.contains("hello"),
+            "expected user content to retain original message"
+        );
     }
 
     #[test]
@@ -9946,6 +10125,19 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(channels
             .iter()
             .any(|entry| entry.channel.name() == "mattermost"));
+    }
+
+    #[test]
+    fn collect_configured_channels_includes_bridge_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.bridge = Some(crate::config::schema::BridgeConfig::default());
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels.iter().any(|entry| entry.display_name == "Bridge"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry.channel.name() == "bridge"));
     }
 
     struct AlwaysFailChannel {

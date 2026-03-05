@@ -1157,6 +1157,71 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertGreaterEqual(report["summary"]["new_write_permissions"], 1)
         self.assertIn("write-all", "\n".join(report["violations"]))
 
+    def test_ci_change_audit_blocks_unsafe_workflow_script_patterns(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+        workflow_scripts_dir = repo / ".github" / "workflows" / "scripts"
+        workflow_scripts_dir.mkdir(parents=True, exist_ok=True)
+        helper = workflow_scripts_dir / "unsafe_helper.js"
+        helper.write_text(
+            textwrap.dedent(
+                """
+                module.exports = async function runSafe() {
+                  const value = "ok";
+                  return value;
+                };
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "base"], cwd=repo)
+        base_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        helper.write_text(
+            textwrap.dedent(
+                """
+                module.exports = async function runUnsafe() {
+                  const output = child_process.exec("echo unsafe");
+                  return output;
+                };
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        out_json = self.tmp / "audit-unsafe-workflow-script.json"
+        out_md = self.tmp / "audit-unsafe-workflow-script.md"
+        proc = run_cmd(
+            [
+                "python3",
+                str(SCRIPTS_DIR / "ci_change_audit.py"),
+                "--base-sha",
+                base_sha,
+                "--head-sha",
+                head_sha,
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violations",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(report["summary"]["new_unsafe_js_patterns"], 1)
+        self.assertIn("unsafe workflow-script JS pattern introduced", "\n".join(report["violations"]))
+
     def test_ci_change_audit_ignores_fixture_signatures_in_python_ci_tests(self) -> None:
         repo = self.tmp / "repo"
         repo.mkdir(parents=True, exist_ok=True)
@@ -1211,6 +1276,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["violations"], [])
         self.assertEqual(report["summary"]["new_unpinned_actions"], 0)
         self.assertEqual(report["summary"]["new_pipe_to_shell_commands"], 0)
+        self.assertEqual(report["summary"]["new_unsafe_js_patterns"], 0)
         self.assertEqual(report["summary"]["new_write_permissions"], 0)
         self.assertEqual(report["summary"]["new_pull_request_target_triggers"], 0)
 

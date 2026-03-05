@@ -2,7 +2,7 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **February 25, 2026**.
+Last verified: **March 5, 2026**.
 
 ## Release Goals
 
@@ -44,6 +44,7 @@ Publish-mode guardrails:
 - Trigger provenance is recorded in `release-trigger-guard.json` and `audit-event-release-trigger-guard.json`.
 - Multi-arch artifact contract is enforced by `.github/release/release-artifact-contract.json` through `release_artifact_guard.py`.
 - Release notes include a generated supply-chain evidence preface (`release-notes-supply-chain.md`) plus GitHub-generated commit-window notes.
+- GitHub release note categories are defined in `.github/release.yml` to keep generated notes grouped by label intent.
 
 ## Maintainer Procedure
 
