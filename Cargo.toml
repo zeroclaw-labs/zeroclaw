@@ -71,7 +71,7 @@ html2md = { package = "fast_html2md", version = "0.0.58", optional = true }
 zip = { version = "8.1", default-features = false, features = ["deflate"] }
 
 # XML parsing (DOCX text extraction)
-quick-xml = "0.37"
+quick-xml = "0.39"
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
