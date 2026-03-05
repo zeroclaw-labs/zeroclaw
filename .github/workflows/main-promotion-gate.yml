@@ -1,11 +1,9 @@
 name: Enforce Dev -> Main Promotion
 
 on:
-    pull_request_target:
+    pull_request:
         branches: [main]
         types: [opened, reopened, synchronize, ready_for_review, edited]
-    merge_group:
-        branches: [main]
 
 concurrency:
     group: main-promotion-gate-${{ github.event.pull_request.number || github.run_id }}
@@ -30,14 +28,7 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  event_name="${{ github.event_name }}"
                   repo_full_name="${{ github.repository }}"
-
-                  if [ "${event_name}" = "merge_group" ]; then
-                    echo "merge_group validation for main detected."
-                    echo "Source-branch policy is enforced at PR stage."
-                    exit 0
-                  fi
 
                   base_ref="${{ github.event.pull_request.base.ref }}"
                   head_ref="${{ github.event.pull_request.head.ref }}"
