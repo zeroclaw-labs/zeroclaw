@@ -1770,7 +1770,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             text.to_string()
         };
 
-        let content = if let Some(quote) = self.extract_reply_context(message) {
+        let content = if content.trim_start().starts_with('/') {
+            content
+        } else if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
         } else {
             content
@@ -4966,6 +4968,46 @@ mod tests {
             parsed.content.contains("Bonjour le monde"),
             "content should contain quoted text"
         );
+    }
+
+    #[test]
+    fn parse_update_message_reply_slash_new_preserves_command_prefix() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false, true);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 11,
+                "text": "/new",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "reply_to_message": {
+                    "from": { "username": "bot" },
+                    "text": "Prior response"
+                }
+            }
+        });
+
+        let parsed = ch.parse_update_message(&update).unwrap();
+        assert_eq!(parsed.content, "/new");
+    }
+
+    #[test]
+    fn parse_update_message_reply_slash_clear_with_bot_suffix_preserves_command_prefix() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false, true);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 12,
+                "text": "/clear@mybot",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "reply_to_message": {
+                    "from": { "username": "bot" },
+                    "text": "Prior response"
+                }
+            }
+        });
+
+        let parsed = ch.parse_update_message(&update).unwrap();
+        assert_eq!(parsed.content, "/clear@mybot");
     }
 
     #[test]
