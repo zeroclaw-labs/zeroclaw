@@ -127,12 +127,14 @@ Với các channel có allowlist người gửi:
 - `"*"`: cho phép tất cả người gửi (chỉ dùng để xác minh tạm thời).
 - Danh sách tường minh: chỉ cho phép những người gửi được liệt kê.
 
+**Ngoại lệ BlueBubbles:** khi `dm_policy = "open"` (mặc định), allowlist trống cho phép tất cả người gửi để bảo toàn hành vi cũ. Đặt `dm_policy = "allowlist"` để áp dụng từ chối tất cả khi `allowed_senders` trống cho DM. Quyền truy cập chat nhóm được kiểm soát riêng qua `group_policy` và `group_allow_from`.
+
 Tên trường khác nhau theo channel:
 
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
-- `allowed_senders` (Email)
+- `allowed_senders` (Email/Linq/BlueBubbles)
 - `allowed_contacts` (iMessage)
 
 ---
