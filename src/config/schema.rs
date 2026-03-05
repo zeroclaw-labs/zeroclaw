@@ -6821,7 +6821,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     #[cfg(unix)]
     sync_directory(&default_config_dir).await?;
     #[cfg(not(unix))]
-    sync_directory(&default_config_dir)?;
+    sync_directory(&default_config_dir).await?;
     Ok(())
 }
 
@@ -9752,7 +9752,7 @@ impl Config {
         #[cfg(unix)]
         sync_directory(parent_dir).await?;
         #[cfg(not(unix))]
-        sync_directory(parent_dir)?;
+        sync_directory(parent_dir).await?;
 
         if had_existing_config {
             let _ = fs::remove_file(&backup_path).await;
@@ -9774,8 +9774,8 @@ async fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(path: &Path) -> Result<()> {
-    let _ = path;
+/// No-op on non-Unix systems (fsync is Unix-specific).
+async fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
