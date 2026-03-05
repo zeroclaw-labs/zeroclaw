@@ -179,7 +179,7 @@ fn probe_rs_memory_map(chip: &str) -> anyhow::Result<String> {
 }
 
 fn append_region_line(out: &mut String, label: &str, start: u64, end: u64) {
-    let size_kb = (end - start) / 1024;
+    let size_kb = end.saturating_sub(start) / 1024;
     let _ = writeln!(out, "{label}: 0x{start:08X} - 0x{end:08X} ({size_kb} KB)");
 }
 
