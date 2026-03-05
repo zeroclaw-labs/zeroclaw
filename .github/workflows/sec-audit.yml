@@ -9,6 +9,7 @@ on:
             - "src/**"
             - "crates/**"
             - "deny.toml"
+            - "supply-chain/**"
             - ".gitleaks.toml"
             - ".github/security/gitleaks-allowlist-governance.json"
             - ".github/security/deny-ignore-governance.json"
@@ -181,6 +182,14 @@ jobs:
             - name: Run cargo-deny checks
               shell: bash
               run: cargo-deny check advisories licenses sources
+
+            - name: Install cargo-vet
+              shell: bash
+              run: cargo install cargo-vet --locked --version 0.10.2
+
+            - name: Run cargo-vet checks
+              shell: bash
+              run: cargo vet check --locked
 
             - name: Emit deny audit event
               if: always()

@@ -42,7 +42,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: legacy/dev-only nightly template; primary nightly signal is emitted by `feature-matrix.yml` nightly profile
     - Additional behavior: owner routing + escalation policy is documented in `docs/operations/nightly-all-features-runbook.md`
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
-    - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA), policy/license checks (`cargo deny`), gitleaks-based secrets governance (allowlist policy metadata + expiry guard), and SBOM snapshot artifacts (`CycloneDX` + `SPDX`)
+    - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA), policy/license checks (`cargo deny` + `cargo vet`), gitleaks-based secrets governance (allowlist policy metadata + expiry guard), and SBOM snapshot artifacts (`CycloneDX` + `SPDX`)
 - `.github/workflows/test-coverage.yml` (`Test Coverage`)
     - Purpose: non-blocking coverage lane using `cargo-llvm-cov` with `lcov` artifact upload for trend tracking before hard-gating coverage
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
@@ -117,7 +117,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
    - For tag-publish failures, inspect `ghcr-publish-contract.json` / `audit-event-ghcr-publish-contract.json`, `ghcr-vulnerability-gate.json` / `audit-event-ghcr-vulnerability-gate.json`, and Trivy artifacts from `pub-docker-img.yml`.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+4. Security failures: inspect `.github/workflows/sec-audit.yml`, `deny.toml`, and `supply-chain/` policy files.
 5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
 6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs. If intake policy changed recently, trigger a fresh `pull_request_target` event (for example close/reopen PR) because `Re-run jobs` can reuse the original workflow snapshot.
 7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
