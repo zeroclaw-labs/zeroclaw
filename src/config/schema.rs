@@ -5900,6 +5900,11 @@ impl Config {
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.transcription.api_key,
+                "config.transcription.api_key",
+            )?;
             decrypt_vec_secrets(
                 &store,
                 &mut config.reliability.api_keys,
@@ -6768,6 +6773,11 @@ impl Config {
             &store,
             &mut config_to_save.storage.provider.config.db_url,
             "config.storage.provider.config.db_url",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.transcription.api_key,
+            "config.transcription.api_key",
         )?;
         encrypt_vec_secrets(
             &store,
