@@ -379,6 +379,10 @@ impl Memory for LucidMemory {
         self.local.count().await
     }
 
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        self.local.reindex().await
+    }
+
     async fn health_check(&self) -> bool {
         self.local.health_check().await
     }

@@ -321,6 +321,8 @@ pub enum MemoryCommands {
     },
     /// Show memory backend statistics and health
     Stats,
+    /// Rebuild memory indexes/embeddings where supported
+    Reindex,
     /// Clear memories by category, by key, or clear all
     Clear {
         /// Delete a single entry by key (supports prefix match)
