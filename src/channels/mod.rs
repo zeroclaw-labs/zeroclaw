@@ -4163,6 +4163,32 @@ If this input is legitimate, rephrase the request and avoid instruction-override
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            // ── Suppress internal sentinels (HEARTBEAT_OK / NO_REPLY) ──
+            if crate::daemon::is_heartbeat_ok_sentinel(&response)
+                || crate::cron::scheduler::is_no_reply_sentinel(&response)
+            {
+                tracing::debug!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Suppressed sentinel response in channel reply"
+                );
+                if let (Some(channel), Some(draft_id)) =
+                    (target_channel.as_ref(), draft_message_id.as_deref())
+                {
+                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                }
+                // Swap 👀 → ✅ before returning so the reaction doesn't stay stuck
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+                        .await;
+                    let _ = channel
+                        .add_reaction(&msg.reply_target, &msg.id, "\u{2705}")
+                        .await;
+                }
+                return;
+            }
+
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
             if let Some(hooks) = &ctx.hooks {
@@ -12908,5 +12934,26 @@ BTC is currently around $65,000 based on latest tool output."#;
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
         );
+    }
+
+    #[test]
+    fn channel_sentinel_heartbeat_ok_detected() {
+        assert!(crate::daemon::is_heartbeat_ok_sentinel("HEARTBEAT_OK"));
+        assert!(crate::daemon::is_heartbeat_ok_sentinel(" heartbeat_ok "));
+        assert!(crate::daemon::is_heartbeat_ok_sentinel(
+            "HEARTBEAT_OK - all clear"
+        ));
+        assert!(!crate::daemon::is_heartbeat_ok_sentinel("hello world"));
+        assert!(!crate::daemon::is_heartbeat_ok_sentinel(""));
+    }
+
+    #[test]
+    fn channel_sentinel_no_reply_detected() {
+        assert!(crate::cron::scheduler::is_no_reply_sentinel("NO_REPLY"));
+        assert!(crate::cron::scheduler::is_no_reply_sentinel(" no_reply "));
+        assert!(!crate::cron::scheduler::is_no_reply_sentinel(
+            "NO_REPLY extra"
+        ));
+        assert!(!crate::cron::scheduler::is_no_reply_sentinel("hello"));
     }
 }
