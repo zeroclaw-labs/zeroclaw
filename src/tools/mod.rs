@@ -781,12 +781,7 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Attach background execution wrappers to the finalized registry.
-    // This ensures `bg_run` / `bg_status` are available anywhere the
-    // runtime tool graph is used.
-    let built_tools = boxed_registry_from_arcs(tool_arcs);
-    let (extended_tools, _bg_job_store) = add_bg_tools(built_tools);
-    extended_tools
+    boxed_registry_from_arcs(tool_arcs)
 }
 
 #[cfg(test)]
@@ -1130,6 +1125,14 @@ mod tests {
             &cfg,
         );
 
+        // bg_run/bg_status are now added by callers (after skill tools),
+        // so all_tools_with_runtime no longer includes them directly.
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"bg_run"));
+        assert!(!names.contains(&"bg_status"));
+
+        // After add_bg_tools, they should be present.
+        let (tools, _store) = add_bg_tools(tools);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"bg_run"));
         assert!(names.contains(&"bg_status"));

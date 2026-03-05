@@ -115,12 +115,18 @@ impl SkillToolHandler {
             // Infer type from description or use String as default
             let param_type = Self::infer_parameter_type(&description);
 
-            // All parameters are optional by default (can be omitted)
-            // This matches the shell command behavior where missing params are just skipped
+            // Infer required from description hints
+            let is_optional = {
+                let desc_lower = description.to_lowercase();
+                desc_lower.contains("(optional)")
+                    || desc_lower.contains("default:")
+                    || desc_lower.contains("default ")
+            };
+
             parameters.push(SkillToolParameter {
                 name: placeholder,
                 description,
-                required: false,
+                required: !is_optional,
                 param_type,
             });
         }
@@ -239,10 +245,16 @@ impl SkillToolHandler {
             .map(|p| (p.name.clone(), p.param_type.clone()))
             .collect();
 
-        // Build a map of available arguments
+        // Build a map of available arguments (skip nulls so placeholder removal handles them)
         let mut arg_values = HashMap::new();
         for (key, value) in args_obj {
+            if value.is_null() {
+                continue;
+            }
             let value_str = self.format_argument_value(value)?;
+            if value_str.is_empty() {
+                continue; // skip empty strings — treat same as null for optional params
+            }
             arg_values.insert(key.clone(), value_str);
         }
 
@@ -365,6 +377,13 @@ impl Tool for SkillToolHandler {
             .context("Failed to render skill tool command")?;
 
         if let Err(e) = self.security.validate_command_execution(&command, false) {
+            tracing::warn!(
+                skill = %self.skill_name,
+                tool = %self.tool_def.name,
+                reason = %e,
+                command = %command.chars().take(200).collect::<String>(),
+                "Skill tool blocked by security policy"
+            );
             return Ok(ToolResult {
                 output: format!("Blocked by security policy: {e}"),
                 success: false,
@@ -402,13 +421,23 @@ impl Tool for SkillToolHandler {
         let scrubbed_stdout = crate::agent::loop_::scrub_credentials(&stdout);
         let scrubbed_stderr = crate::agent::loop_::scrub_credentials(&stderr);
 
-        tracing::debug!(
-            skill = %self.skill_name,
-            tool = %self.tool_def.name,
-            success = success,
-            exit_code = ?output.status.code(),
-            "Skill tool execution completed"
-        );
+        if success {
+            tracing::debug!(
+                skill = %self.skill_name,
+                tool = %self.tool_def.name,
+                exit_code = ?output.status.code(),
+                "Skill tool execution completed"
+            );
+        } else {
+            tracing::warn!(
+                skill = %self.skill_name,
+                tool = %self.tool_def.name,
+                exit_code = ?output.status.code(),
+                stderr = %scrubbed_stderr.chars().take(500).collect::<String>(),
+                command = %command.chars().take(200).collect::<String>(),
+                "Skill tool execution failed"
+            );
+        }
 
         Ok(ToolResult {
             success,
@@ -623,6 +652,44 @@ mod tests {
     }
 
     #[test]
+    fn null_param_skipped_in_render_command() {
+        let tool_def = SkillTool {
+            name: "telegram_search".to_string(),
+            description: "Search Telegram".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 script.py --query {query} --channel-filter {channel_filter} --limit {limit}".to_string(),
+            args: [
+                ("query".to_string(), "Search query".to_string()),
+                ("channel_filter".to_string(), "Channel filter (optional)".to_string()),
+                ("limit".to_string(), "Maximum number of results".to_string()),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+        };
+
+        let security = Arc::new(SecurityPolicy::default());
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+
+        // null value should cause the entire --channel-filter {channel_filter} to be removed
+        let args = serde_json::json!({
+            "query": "test search",
+            "channel_filter": null,
+            "limit": 50
+        });
+
+        let command = handler.render_command(&args).unwrap();
+
+        assert!(command.contains("--query 'test search'"));
+        assert!(command.contains("--limit 50"));
+        // null param should be completely removed, not rendered as empty string
+        assert!(
+            !command.contains("--channel-filter"),
+            "null param should remove --channel-filter entirely, got: {command}"
+        );
+    }
+
+    #[test]
     fn render_command_quotes_numeric_strings() {
         let tool_def = SkillTool {
             name: "telegram_search".to_string(),
@@ -658,5 +725,87 @@ mod tests {
         // limit should NOT be quoted (it's an Integer type)
         assert!(command.contains("--limit 100"));
         assert!(!command.contains("--limit '100'"));
+    }
+
+    #[test]
+    fn empty_string_param_skipped_in_render_command() {
+        let tool_def = SkillTool {
+            name: "telegram_search".to_string(),
+            description: "Search Telegram".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 script.py --query {query} --date-from {date_from} --channel-filter {channel_filter}".to_string(),
+            args: [
+                ("query".to_string(), "Search query".to_string()),
+                ("date_from".to_string(), "Start date (optional)".to_string()),
+                ("channel_filter".to_string(), "Channel filter (optional)".to_string()),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+        };
+
+        let security = Arc::new(SecurityPolicy::default());
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+
+        // LLM sends "" for optional params — should be treated same as null
+        let args = serde_json::json!({
+            "query": "test search",
+            "date_from": "",
+            "channel_filter": ""
+        });
+
+        let command = handler.render_command(&args).unwrap();
+
+        assert!(command.contains("--query 'test search'"));
+        assert!(
+            !command.contains("--date-from"),
+            "empty string param should remove --date-from entirely, got: {command}"
+        );
+        assert!(
+            !command.contains("--channel-filter"),
+            "empty string param should remove --channel-filter entirely, got: {command}"
+        );
+    }
+
+    #[test]
+    fn infer_required_from_description() {
+        let tool_def = SkillTool {
+            name: "telegram_search".to_string(),
+            description: "Search Telegram".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 script.py --query {query} --date-from {date_from} --channel-filter {channel_filter} --limit {limit}".to_string(),
+            args: [
+                ("query".to_string(), "Search query text".to_string()),
+                ("date_from".to_string(), "Start date (optional)".to_string()),
+                ("channel_filter".to_string(), "Channel name (optional)".to_string()),
+                ("limit".to_string(), "Maximum number of results. Default: 50".to_string()),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+        };
+
+        let security = Arc::new(SecurityPolicy::default());
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+
+        let by_name: HashMap<&str, &SkillToolParameter> = handler
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p))
+            .collect();
+
+        assert!(by_name["query"].required, "query should be required");
+        assert!(
+            !by_name["date_from"].required,
+            "date_from should be optional"
+        );
+        assert!(
+            !by_name["channel_filter"].required,
+            "channel_filter should be optional"
+        );
+        assert!(
+            !by_name["limit"].required,
+            "limit with default should be optional"
+        );
     }
 }

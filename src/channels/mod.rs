@@ -5842,9 +5842,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill tools as native function-calling tools so the LLM can
+    // call them directly instead of composing raw shell commands.
+    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security));
+    if !skill_tools.is_empty() {
+        tracing::info!("Registered {} native skill tool(s)", skill_tools.len());
+        built_tools.extend(skill_tools);
+    }
+
+    let (built_tools, _bg_job_store) = crate::tools::add_bg_tools(built_tools);
+    let tools_registry = Arc::new(built_tools);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
