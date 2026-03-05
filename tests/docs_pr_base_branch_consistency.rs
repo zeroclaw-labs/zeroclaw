@@ -28,4 +28,9 @@ fn contributor_docs_use_main_as_default_pr_base_branch() {
         !contributing.contains("Open a PR against `dev` using the PR template"),
         "CONTRIBUTING.md still contains stale dev-first PR guidance"
     );
+
+    assert!(
+        !pr_workflow.contains("Open a PR against `dev` using the PR template"),
+        "docs/pr-workflow.md still contains stale dev-first PR guidance"
+    );
 }
