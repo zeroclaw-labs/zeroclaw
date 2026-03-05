@@ -67,6 +67,34 @@ impl ProcessTool {
         }
     }
 
+    fn prune_exited_processes(&self) {
+        if let Ok(mut processes) = self.processes.write() {
+            processes.retain(|id, entry| match entry.child.lock() {
+                Ok(mut child) => match child.try_wait() {
+                    Ok(None) => true,
+                    Ok(Some(_)) => false,
+                    Err(error) => {
+                        tracing::warn!(
+                            process_id = *id,
+                            process_pid = entry.pid,
+                            %error,
+                            "Failed to inspect process state during prune; retaining tracking entry"
+                        );
+                        true
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        process_id = *id,
+                        process_pid = entry.pid,
+                        "Failed to access process state during prune; retaining tracking entry"
+                    );
+                    true
+                }
+            });
+        }
+    }
+
     fn handle_spawn(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         if !self.runtime.supports_long_running() {
             return Ok(ToolResult {
@@ -81,18 +109,12 @@ impl ProcessTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter for spawn action"))?;
 
+        self.prune_exited_processes();
+
         // Check concurrent running process count.
         {
             let processes = self.processes.read().unwrap();
-            let running = processes
-                .values()
-                .filter(|e| {
-                    e.child
-                        .lock()
-                        .map(|mut c| matches!(c.try_wait(), Ok(None)))
-                        .unwrap_or(false)
-                })
-                .count();
+            let running = processes.len();
             if running >= MAX_PROCESSES {
                 return Ok(ToolResult {
                     success: false,
@@ -179,7 +201,22 @@ impl ProcessTool {
             }
         };
 
-        let pid = child.id().unwrap_or(0);
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                let error = match child.start_kill() {
+                    Ok(()) => "Failed to capture process PID".to_string(),
+                    Err(kill_error) => format!(
+                        "Failed to capture process PID; additionally failed to terminate spawned child: {kill_error}"
+                    ),
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        };
 
         // Set up background output readers.
         let stdout_buf = Arc::new(Mutex::new(OutputBuffer::default()));
@@ -199,6 +236,27 @@ impl ProcessTool {
             id
         };
 
+        let mut processes = self.processes.write().unwrap();
+        if processes.len() >= MAX_PROCESSES {
+            drop(processes);
+            if let Err(error) = child.start_kill() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Maximum concurrent processes ({MAX_PROCESSES}) reached; failed to terminate overflow child (pid {pid}): {error}"
+                    )),
+                });
+            }
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Maximum concurrent processes ({MAX_PROCESSES}) reached"
+                )),
+            });
+        }
+
         let entry = ProcessEntry {
             id,
             command: command.to_string(),
@@ -210,7 +268,7 @@ impl ProcessTool {
             analyzed_offsets: Mutex::new((0, 0)),
         };
 
-        self.processes.write().unwrap().insert(id, entry);
+        processes.insert(id, entry);
 
         Ok(ToolResult {
             success: true,
@@ -235,6 +293,8 @@ impl ProcessTool {
                 error: Some(e),
             });
         }
+
+        self.prune_exited_processes();
 
         let processes = self.processes.read().unwrap();
         let mut entries = Vec::new();
@@ -346,10 +406,22 @@ impl ProcessTool {
 
         let id = parse_id(args, "kill")?;
 
-        let pid = {
-            let processes = self.processes.read().unwrap();
-            match processes.get(&id) {
-                Some(entry) => entry.pid,
+        let entry = {
+            let mut processes = match self.processes.write() {
+                Ok(processes) => processes,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Failed to access process table for kill action: poisoned state"
+                                .to_string(),
+                        ),
+                    });
+                }
+            };
+            match processes.remove(&id) {
+                Some(entry) => entry,
                 None => {
                     return Ok(ToolResult {
                         success: false,
@@ -359,31 +431,53 @@ impl ProcessTool {
                 }
             }
         };
+        let pid = entry.pid;
 
-        // Send SIGTERM via kill command.
-        let kill_result = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
+        enum KillOutcome {
+            Signaled,
+            AlreadyExited(i32),
+            Failed(String),
+        }
 
-        match kill_result {
-            Ok(output) if output.status.success() => Ok(ToolResult {
+        let outcome = match entry.child.lock() {
+            Ok(mut child) => match child.try_wait() {
+                Ok(Some(status)) => KillOutcome::AlreadyExited(status.code().unwrap_or(-1)),
+                Ok(None) => match child.start_kill() {
+                    Ok(()) => KillOutcome::Signaled,
+                    Err(e) => KillOutcome::Failed(format!("Failed to signal process {id}: {e}")),
+                },
+                Err(e) => KillOutcome::Failed(format!("Failed to inspect process {id}: {e}")),
+            },
+            Err(_) => KillOutcome::Failed(format!("Failed to access process state for {id}")),
+        };
+
+        match outcome {
+            KillOutcome::Signaled => Ok(ToolResult {
                 success: true,
-                output: format!("Sent SIGTERM to process {id} (pid {pid})"),
+                output: format!("Sent termination signal to process {id} (pid {pid})"),
                 error: None,
             }),
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            KillOutcome::AlreadyExited(code) => Ok(ToolResult {
+                success: true,
+                output: format!("Process {id} already exited ({code})"),
+                error: None,
+            }),
+            KillOutcome::Failed(mut reason) => {
+                match self.processes.write() {
+                    Ok(mut processes) => {
+                        processes.insert(id, entry);
+                    }
+                    Err(_) => {
+                        reason
+                            .push_str("; failed to restore process tracking due to poisoned state");
+                    }
+                }
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to kill process {id} (pid {pid}): {stderr}")),
+                    error: Some(reason),
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute kill command: {e}")),
-            }),
         }
     }
 }
@@ -420,7 +514,7 @@ fn spawn_reader_task<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     buf: Arc<Mutex<OutputBuffer>>,
 ) {
     tokio::spawn(async move {
-        let mut chunk = vec![0u8; 8192];
+        let mut chunk = vec![0_u8; 8192];
         loop {
             match reader.read(&mut chunk).await {
                 Ok(n) if n > 0 => {
@@ -900,6 +994,74 @@ mod tests {
         assert_eq!(
             second_lines, first_lines,
             "incremental offsets should prevent duplicate detector emissions for unchanged output"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_returns_structured_error_when_process_table_is_poisoned() {
+        let tool = make_tool();
+        let processes = Arc::clone(&tool.processes);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = processes.write().expect("process table write lock should be acquired");
+            panic!("poison process lock");
+        })
+        .join();
+
+        let result = tool
+            .execute(json!({
+                "action": "kill",
+                "id": 0
+            }))
+            .await
+            .expect("kill action should return ToolResult even on lock poison");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("poisoned state"));
+    }
+
+    #[tokio::test]
+    async fn prune_retains_entry_when_child_lock_is_poisoned() {
+        let tool = make_tool();
+        let spawn_result = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo prune_poison_test"
+            }))
+            .await
+            .expect("spawn should return result");
+        assert!(spawn_result.success);
+        let spawn_output: serde_json::Value =
+            serde_json::from_str(&spawn_result.output).expect("spawn output should be json");
+        let id = spawn_output["id"]
+            .as_u64()
+            .expect("process id should exist");
+        let id = usize::try_from(id).expect("process id should fit in usize");
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let processes = tool
+                .processes
+                .read()
+                .expect("process table read lock should be acquired");
+            let entry = processes.get(&id).expect("spawned process should be tracked");
+            let _guard = entry.child.lock().expect("child lock should be acquired");
+            panic!("poison child lock");
+        }));
+        assert!(panic_result.is_err(), "expected panic to poison child lock");
+
+        tool.prune_exited_processes();
+
+        let processes = tool
+            .processes
+            .read()
+            .expect("process table read lock should be acquired");
+        assert!(
+            processes.contains_key(&id),
+            "prune should retain entries when child state lock is poisoned"
         );
     }
 }
