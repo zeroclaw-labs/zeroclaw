@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::config::{Config, StreamMode};
+use crate::config::{Config, GroupReplyMode, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -457,8 +457,10 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    group_reply_mode: GroupReplyMode,
     group_reply_allowed_sender_ids: Vec<String>,
     bot_username: Mutex<Option<String>>,
+    bot_id: Mutex<Option<i64>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -491,8 +493,14 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            group_reply_mode: if mention_only {
+                GroupReplyMode::MentionOnly
+            } else {
+                GroupReplyMode::AllMessages
+            },
             group_reply_allowed_sender_ids: Vec::new(),
             bot_username: Mutex::new(None),
+            bot_id: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
@@ -503,6 +511,15 @@ impl TelegramChannel {
     /// Configure workspace directory for saving downloaded attachments.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Override the group reply trigger mode.
+    ///
+    /// This supersedes the `mention_only` flag passed to [`Self::new`].
+    pub fn with_group_reply_mode(mut self, mode: GroupReplyMode) -> Self {
+        self.group_reply_mode = mode;
+        self.mention_only = mode.requires_mention();
         self
     }
 
@@ -827,9 +844,19 @@ impl TelegramChannel {
         }
 
         let data: serde_json::Value = resp.json().await?;
-        let username = data
+        let result = data
             .get("result")
-            .and_then(|r| r.get("username"))
+            .context("No 'result' in getMe response")?;
+
+        // Cache the bot's numeric ID alongside the username so that
+        // `is_reply_to_bot` can compare without an extra API call.
+        if let Some(id) = result.get("id").and_then(|v| v.as_i64()) {
+            let mut id_cache = self.bot_id.lock();
+            *id_cache = Some(id);
+        }
+
+        let username = result
+            .get("username")
             .and_then(|u| u.as_str())
             .context("Bot username not found in response")?;
 
@@ -855,6 +882,18 @@ impl TelegramChannel {
                 None
             }
         }
+    }
+
+    /// Returns `true` when `message` is a direct reply to a message sent by
+    /// this bot.  Used by [`GroupReplyMode::MentionOrReply`].
+    fn is_reply_to_bot(message: &serde_json::Value, bot_id: i64) -> bool {
+        message
+            .get("reply_to_message")
+            .and_then(|r| r.get("from"))
+            .and_then(|f| f.get("id"))
+            .and_then(|id| id.as_i64())
+            .map(|id| id == bot_id)
+            .unwrap_or(false)
     }
 
     fn is_telegram_username_char(ch: char) -> bool {
@@ -1334,7 +1373,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
                 let text_to_check = attachment.caption.as_deref().unwrap_or("");
-                if !Self::contains_bot_mention(text_to_check, bot_username) {
+                let has_mention = Self::contains_bot_mention(text_to_check, bot_username);
+                let is_reply = self.group_reply_mode == GroupReplyMode::MentionOrReply
+                    && self
+                        .bot_id
+                        .lock()
+                        .map(|id| Self::is_reply_to_bot(message, id))
+                        .unwrap_or(false);
+                if !has_mention && !is_reply {
                     return None;
                 }
             } else {
@@ -1370,9 +1416,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
-                // Check if caption contains bot mention
+                // Check if caption contains bot mention or message is a reply to the bot
                 let caption_text = attachment.caption.as_deref().unwrap_or("");
-                if !Self::contains_bot_mention(caption_text, bot_username) {
+                let has_mention = Self::contains_bot_mention(caption_text, bot_username);
+                let is_reply = self.group_reply_mode == GroupReplyMode::MentionOrReply
+                    && self
+                        .bot_id
+                        .lock()
+                        .map(|id| Self::is_reply_to_bot(message, id))
+                        .unwrap_or(false);
+                if !has_mention && !is_reply {
                     return None;
                 }
             } else {
@@ -1516,12 +1569,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         // Voice messages have no text to mention the bot, so ignore in mention_only mode when in groups.
+        // Exception: MentionOrReply allows voice messages that are direct replies to the bot.
         // Private chats are always processed.
         let is_group = Self::is_group_message(message);
         let allow_sender_without_mention =
             is_group && self.is_group_sender_trigger_enabled(sender_id.as_deref());
         if self.mention_only && is_group && !allow_sender_without_mention {
-            return None;
+            let is_reply = self.group_reply_mode == GroupReplyMode::MentionOrReply
+                && self
+                    .bot_id
+                    .lock()
+                    .map(|id| Self::is_reply_to_bot(message, id))
+                    .unwrap_or(false);
+            if !is_reply {
+                return None;
+            }
         }
 
         let chat_id = message
@@ -1547,10 +1609,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         };
 
         // Check mention_only for group messages
-        // Voice messages cannot contain mentions, so skip in group chats when mention_only is set
+        // Voice messages cannot contain mentions, so skip in group chats when mention_only is set.
+        // Exception: MentionOrReply allows voice messages that are direct replies to the bot.
         let is_group = Self::is_group_message(message);
         if self.mention_only && is_group {
-            return None;
+            let is_reply = self.group_reply_mode == GroupReplyMode::MentionOrReply
+                && self
+                    .bot_id
+                    .lock()
+                    .map(|id| Self::is_reply_to_bot(message, id))
+                    .unwrap_or(false);
+            if !is_reply {
+                return None;
+            }
         }
 
         // Download and transcribe
@@ -1721,7 +1792,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if self.mention_only && is_group && !allow_sender_without_mention {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
-                if !Self::contains_bot_mention(text, bot_username) {
+                let has_mention = Self::contains_bot_mention(text, bot_username);
+                let is_reply = self.group_reply_mode == GroupReplyMode::MentionOrReply
+                    && self
+                        .bot_id
+                        .lock()
+                        .map(|id| Self::is_reply_to_bot(message, id))
+                        .unwrap_or(false);
+                if !has_mention && !is_reply {
                     return None;
                 }
             } else {
@@ -1756,7 +1834,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let content = if self.mention_only && is_group && !allow_sender_without_mention {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            Self::normalize_incoming_content(text, bot_username)?
+            // Only strip the mention from content if the message actually contains one.
+            // For MentionOrReply, the trigger may have been a reply without a mention.
+            if Self::contains_bot_mention(text, bot_username) {
+                Self::normalize_incoming_content(text, bot_username)?
+            } else {
+                text.to_string()
+            }
         } else {
             text.to_string()
         };

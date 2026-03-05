@@ -3433,12 +3433,15 @@ pub enum GroupReplyMode {
     MentionOnly,
     /// Reply to every message in group chats.
     AllMessages,
+    /// Reply when the bot is @-mentioned OR when a user replies directly to
+    /// one of the bot's own messages in a group chat.
+    MentionOrReply,
 }
 
 impl GroupReplyMode {
     #[must_use]
     pub fn requires_mention(self) -> bool {
-        matches!(self, Self::MentionOnly)
+        matches!(self, Self::MentionOnly | Self::MentionOrReply)
     }
 }
 

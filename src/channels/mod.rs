@@ -4299,6 +4299,7 @@ fn collect_configured_channels(
             tg.allowed_users.clone(),
             tg.effective_group_reply_mode().requires_mention(),
         )
+        .with_group_reply_mode(tg.effective_group_reply_mode())
         .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
         .with_transcription(config.transcription.clone())
