@@ -1506,6 +1506,16 @@ impl Channel for BlueBubblesChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // Fail fast on empty identifiers before making a network call.
+        if channel_id.is_empty() {
+            anyhow::bail!("add_reaction: channel_id must not be empty");
+        }
+        if message_id.is_empty() {
+            anyhow::bail!("add_reaction: message_id must not be empty");
+        }
+        if emoji.is_empty() {
+            anyhow::bail!("add_reaction: emoji must not be empty");
+        }
         let Some(reaction) = emoji_to_bb_tapback(emoji) else {
             anyhow::bail!(
                 "Unsupported tapback emoji '{emoji}' — supported: \
@@ -1552,6 +1562,16 @@ impl Channel for BlueBubblesChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // Fail fast on empty identifiers before making a network call.
+        if channel_id.is_empty() {
+            anyhow::bail!("remove_reaction: channel_id must not be empty");
+        }
+        if message_id.is_empty() {
+            anyhow::bail!("remove_reaction: message_id must not be empty");
+        }
+        if emoji.is_empty() {
+            anyhow::bail!("remove_reaction: emoji must not be empty");
+        }
         let Some(reaction) = emoji_to_bb_tapback(emoji) else {
             anyhow::bail!(
                 "Unsupported tapback emoji '{emoji}' — supported: \

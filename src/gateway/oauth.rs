@@ -1,8 +1,7 @@
 //! OAuth gateway routes for third-party service authentication.
 //!
-//! Provides browser-based OAuth connect flows for Google (Gmail, Calendar)
-//! and DocuSign JWT credential storage. Tokens are stored in the ZeroClaw
-//! workspace directory under `oauth/`.
+//! Provides browser-based OAuth connect flows for Google (Gmail, Calendar).
+//! Tokens are stored in the ZeroClaw workspace directory under `oauth/`.
 //!
 //! Routes:
 //! - `GET  /auth/{service}`          — start OAuth flow (redirect to provider)
@@ -48,11 +47,10 @@ pub struct OAuthCallback {
 }
 
 /// Query params for initiating OAuth.
+/// Query params for initiating OAuth.
+/// Currently no query params are used; struct is kept for forward compatibility.
 #[derive(Debug, Deserialize)]
-pub struct OAuthStartQuery {
-    /// Optional redirect URL after successful auth (must be same-origin).
-    pub redirect: Option<String>,
-}
+pub struct OAuthStartQuery {}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -564,10 +562,13 @@ pub async fn handle_auth_revoke(
             .into_response();
     }
 
-    // Revoke Google token if applicable
+    // Best-effort Google token revocation — failure is logged but does not block
+    // local deletion since the local token is always removed below.
     if service == "google" {
         if let Some(token) = read_token(&path).await {
-            let _ = revoke_google_token(&token.access_token).await;
+            if let Err(e) = revoke_google_token(&token.access_token).await {
+                tracing::warn!("Failed to revoke Google OAuth token server-side: {e:#}");
+            }
         }
     }
 

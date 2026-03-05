@@ -11,6 +11,7 @@ Với các phòng Matrix được mã hóa, xem hướng dẫn chuyên biệt:
 - Cần tham khảo config đầy đủ theo từng channel: xem mục `## 4. Ví dụ cấu hình theo từng channel`.
 - Cần chẩn đoán khi không nhận được phản hồi: xem mục `## 6. Danh sách kiểm tra xử lý sự cố`.
 - Cần hỗ trợ phòng Matrix được mã hóa: dùng [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md).
+- Cần thiết lập bot Nextcloud Talk: dùng [Thiết lập Nextcloud Talk](nextcloud-talk-setup.md).
 - Cần thông tin triển khai/mạng (polling vs webhook): dùng [Network Deployment](network-deployment.md).
 
 ## FAQ: Cấu hình Matrix thành công nhưng không có phản hồi
@@ -127,12 +128,14 @@ Với các channel có allowlist người gửi:
 - `"*"`: cho phép tất cả người gửi (chỉ dùng để xác minh tạm thời).
 - Danh sách tường minh: chỉ cho phép những người gửi được liệt kê.
 
+**Ngoại lệ BlueBubbles:** khi `dm_policy = "open"` (mặc định), allowlist trống cho phép tất cả người gửi để bảo toàn hành vi cũ. Đặt `dm_policy = "allowlist"` để áp dụng từ chối tất cả khi `allowed_senders` trống cho DM. Quyền truy cập chat nhóm được kiểm soát riêng qua `group_policy` và `group_allow_from`.
+
 Tên trường khác nhau theo channel:
 
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
-- `allowed_senders` (Email)
+- `allowed_senders` (Email/Linq/BlueBubbles)
 - `allowed_contacts` (iMessage)
 
 ---
@@ -357,6 +360,42 @@ Ghi chú:
 [channels_config.imessage]
 allowed_contacts = ["*"]
 ```
+
+### 4.15 BlueBubbles (iMessage qua máy chủ BlueBubbles)
+
+[BlueBubbles](https://bluebubbles.app) là máy chủ macOS tự lưu trữ cho phép iMessage qua REST API và webhook.
+
+```toml
+[channels_config.bluebubbles]
+server_url = "http://192.168.1.100:1234"  # hoặc URL ngrok
+password   = "mật-khẩu-bb"
+
+# Allowlist người gửi (số điện thoại hoặc Apple ID). Mặc định: cho phép tất cả.
+allowed_senders = ["+15551234567", "user@example.com"]
+# Bí mật chia sẻ để xác thực webhook đầu vào (Authorization: Bearer <secret>).
+webhook_secret  = "bí-mật-tùy-chọn"
+
+# Chính sách DM: "open" | "allowlist" | "disabled". Mặc định: "open".
+dm_policy = "open"
+# Chính sách nhóm: "open" | "allowlist" | "disabled". Mặc định: "open".
+group_policy = "open"
+# Chat GUID nhóm được phép khi group_policy = "allowlist". Dùng ["*"] cho tất cả.
+group_allow_from = ["iMessage;+;chat-abc123"]
+# Gửi read receipt đến BB sau mỗi tin nhắn đã xử lý. Mặc định: true.
+send_read_receipts = true
+```
+
+Hành vi chính sách:
+
+| `dm_policy` | `allowed_senders` | Kết quả                           |
+| ----------- | ----------------- | --------------------------------- |
+| `open`      | rỗng              | cho phép tất cả DM                |
+| `open`      | không rỗng        | chỉ cho phép người gửi đã liệt kê |
+| `allowlist` | rỗng              | từ chối tất cả DM                 |
+| `allowlist` | không rỗng        | chỉ cho phép người gửi đã liệt kê |
+| `disabled`  | bất kỳ            | bỏ qua tất cả DM (không phản hồi) |
+
+Chính sách nhóm hoạt động tương tự bằng cách sử dụng `group_allow_from` (chat GUID) thay cho `allowed_senders`.
 
 ---
 

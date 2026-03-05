@@ -1099,7 +1099,7 @@ impl Default for WasmConfig {
 }
 
 /// Google OAuth credentials for browser-based connect flows (`[oauth.google]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct GoogleOAuthConfig {
     /// Google OAuth client ID (from Google Cloud Console).
     #[serde(default)]
@@ -1107,6 +1107,23 @@ pub struct GoogleOAuthConfig {
     /// Google OAuth client secret (from Google Cloud Console).
     #[serde(default)]
     pub client_secret: String,
+}
+
+impl std::fmt::Debug for GoogleOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact client_secret to prevent accidental secret leakage via Debug output.
+        f.debug_struct("GoogleOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                if self.client_secret.is_empty() {
+                    &"(not set)"
+                } else {
+                    &"[redacted]"
+                },
+            )
+            .finish()
+    }
 }
 
 /// OAuth browser-based connect flows configuration (`[oauth]`).
