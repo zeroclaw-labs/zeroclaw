@@ -4839,6 +4839,8 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
+    pairing_store: Option<Arc<pairing::ChannelPairingStore>>,
+    gateway_url: Option<String>,
 ) -> Vec<ConfiguredChannel> {
     // Keep this symbol used even when Matrix support is compiled in and
     // `#[cfg(not(feature = "channel-matrix"))]` blocks are removed.
@@ -4927,8 +4929,8 @@ fn collect_configured_channels(
             display_name: "iMessage",
             channel: Arc::new(IMessageChannel::new(
                 im.allowed_contacts.clone(),
-                None,
-                None,
+                pairing_store.clone(),
+                gateway_url.clone(),
             )),
         });
     }
@@ -5202,7 +5204,7 @@ fn collect_configured_channels(
     if let Some(ref kakao) = config.channels_config.kakao {
         channels.push(ConfiguredChannel {
             display_name: "KakaoTalk",
-            channel: Arc::new(KakaoTalkChannel::from_config(kakao, None, None)),
+            channel: Arc::new(KakaoTalkChannel::from_config(kakao, pairing_store.clone(), gateway_url.clone())),
         });
     }
 
@@ -5213,8 +5215,8 @@ fn collect_configured_channels(
                 line.channel_access_token.clone(),
                 line.channel_secret.clone(),
                 line.allowed_users.clone(),
-                None,
-                None,
+                pairing_store.clone(),
+                gateway_url.clone(),
             )),
         });
     }
@@ -5246,7 +5248,7 @@ async fn append_nostr_channel_if_available(
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check", None, None);
     let mut init_failures = Vec::new();
 
     if let Some(reason) =
@@ -5562,8 +5564,31 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
+    // Open channel pairing store so messaging channels can auto-pair users.
+    let channel_pairing_store = {
+        let pairing_db_path =
+            std::path::Path::new(&config.workspace_dir).join("channel_pairing.db");
+        match pairing::ChannelPairingStore::open(&pairing_db_path) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::warn!("Failed to open channel pairing store: {e}");
+                None
+            }
+        }
+    };
+
+    // Determine the gateway URL for channel auto-pair links.
+    let channel_gateway_url = std::env::var("ZEROCLAW_PUBLIC_URL")
+        .ok()
+        .or_else(|| {
+            Some(format!(
+                "http://localhost:{}",
+                config.gateway.port
+            ))
+        });
+
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut configured_channels = collect_configured_channels(&config, "runtime startup");
+    let mut configured_channels = collect_configured_channels(&config, "runtime startup", channel_pairing_store, channel_gateway_url);
     let mut init_failures = Vec::new();
     if let Some(reason) =
         append_nostr_channel_if_available(&config, &mut configured_channels, "runtime startup")
@@ -11839,7 +11864,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             group_reply: None,
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", None, None);
 
         assert!(channels
             .iter()
@@ -11858,7 +11883,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             allowed_users: vec!["*".to_string()],
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", None, None);
 
         assert!(channels
             .iter()
