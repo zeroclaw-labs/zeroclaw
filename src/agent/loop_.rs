@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::providers::traits::StreamEvent;
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
@@ -500,6 +501,7 @@ pub(crate) fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
 }
 
@@ -540,13 +542,17 @@ async fn call_provider_chat(
 async fn consume_provider_streaming_response(
     provider: &dyn Provider,
     messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
     model: &str,
     temperature: f64,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = provider.stream_chat_with_history(
-        messages,
+    let mut provider_stream = provider.stream_chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+        },
         model,
         temperature,
         crate::providers::traits::StreamOptions::new(true),
@@ -566,51 +572,63 @@ async fn consume_provider_streaming_response(
             provider_stream.next().await
         };
 
-        let Some(chunk_result) = next_chunk else {
+        let Some(event_result) = next_chunk else {
             break;
         };
 
-        let chunk = chunk_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
-        if chunk.is_final {
-            break;
-        }
-        if chunk.delta.is_empty() {
-            continue;
-        }
-
-        outcome.response_text.push_str(&chunk.delta);
-        marker_window.push_str(&chunk.delta);
-
-        if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
-            let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
-            let boundary = marker_window
-                .char_indices()
-                .find(|(idx, _)| *idx >= keep_from)
-                .map_or(0, |(idx, _)| idx);
-            marker_window.drain(..boundary);
-        }
-
-        if !suppress_forwarding && looks_like_streamed_tool_payload(&marker_window) {
-            suppress_forwarding = true;
-            if outcome.forwarded_live_deltas {
-                if let Some(tx) = delta_sender {
-                    let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+        let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
+        match event {
+            StreamEvent::Final => break,
+            StreamEvent::ToolCall(tool_call) => {
+                outcome.tool_calls.push(tool_call);
+                suppress_forwarding = true;
+                if outcome.forwarded_live_deltas {
+                    if let Some(tx) = delta_sender {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    }
+                    outcome.forwarded_live_deltas = false;
                 }
-                outcome.forwarded_live_deltas = false;
             }
-        }
+            StreamEvent::TextDelta(chunk) => {
+                if chunk.delta.is_empty() {
+                    continue;
+                }
 
-        if suppress_forwarding {
-            continue;
-        }
+                outcome.response_text.push_str(&chunk.delta);
+                marker_window.push_str(&chunk.delta);
 
-        if let Some(tx) = delta_sender {
-            if !outcome.forwarded_live_deltas {
-                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
-                outcome.forwarded_live_deltas = true;
-            }
-            if tx.send(chunk.delta).await.is_err() {
-                delta_sender = None;
+                if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
+                    let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
+                    let boundary = marker_window
+                        .char_indices()
+                        .find(|(idx, _)| *idx >= keep_from)
+                        .map_or(0, |(idx, _)| idx);
+                    marker_window.drain(..boundary);
+                }
+
+                if !suppress_forwarding && looks_like_streamed_tool_payload(&marker_window) {
+                    suppress_forwarding = true;
+                    if outcome.forwarded_live_deltas {
+                        if let Some(tx) = delta_sender {
+                            let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        }
+                        outcome.forwarded_live_deltas = false;
+                    }
+                }
+
+                if suppress_forwarding {
+                    continue;
+                }
+
+                if let Some(tx) = delta_sender {
+                    if !outcome.forwarded_live_deltas {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        outcome.forwarded_live_deltas = true;
+                    }
+                    if tx.send(chunk.delta).await.is_err() {
+                        delta_sender = None;
+                    }
+                }
             }
         }
     }
@@ -903,14 +921,16 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
-        let should_consume_provider_stream =
-            on_delta.is_some() && provider.supports_streaming() && request_tools.is_none();
+        let should_consume_provider_stream = on_delta.is_some()
+            && provider.supports_streaming()
+            && (request_tools.is_none() || provider.supports_streaming_tool_events());
         let mut streamed_live_deltas = false;
 
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
                 provider,
                 &prepared_messages.messages,
+                request_tools,
                 model,
                 temperature,
                 cancellation_token.as_ref(),
@@ -922,7 +942,7 @@ pub(crate) async fn run_tool_call_loop(
                     streamed_live_deltas = streamed.forwarded_live_deltas;
                     Ok(crate::providers::ChatResponse {
                         text: Some(streamed.response_text),
-                        tool_calls: Vec::new(),
+                        tool_calls: streamed.tool_calls,
                         usage: None,
                         reasoning_content: None,
                     })
@@ -2566,7 +2586,8 @@ mod tests {
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::traits::{ProviderCapabilities, StreamChunk, StreamOptions};
+    use crate::providers::router::{Route, RouterProvider};
+    use crate::providers::traits::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
     use crate::providers::ChatResponse;
     use crate::runtime::NativeRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy, ShellRedirectPolicy};
@@ -2769,6 +2790,177 @@ mod tests {
 
             Box::pin(futures_util::stream::iter(vec![
                 Ok(StreamChunk::delta(response)),
+                Ok(StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    enum NativeStreamTurn {
+        ToolCall(ToolCall),
+        Text(String),
+    }
+
+    struct StreamingNativeToolEventProvider {
+        turns: Arc<Mutex<VecDeque<NativeStreamTurn>>>,
+        stream_calls: Arc<AtomicUsize>,
+        stream_tool_requests: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    impl StreamingNativeToolEventProvider {
+        fn with_turns(turns: Vec<NativeStreamTurn>) -> Self {
+            Self {
+                turns: Arc::new(Mutex::new(turns.into())),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                stream_tool_requests: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingNativeToolEventProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "chat_with_system should not be used in streaming native tool event provider tests"
+            );
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when native streaming events succeed")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamEvent>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if request.tools.is_some_and(|tools| !tools.is_empty()) {
+                self.stream_tool_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            let turn = self
+                .turns
+                .lock()
+                .expect("turns lock should be valid")
+                .pop_front()
+                .expect("streaming turns should have scripted output");
+            match turn {
+                NativeStreamTurn::ToolCall(tool_call) => {
+                    Box::pin(futures_util::stream::iter(vec![
+                        Ok(StreamEvent::ToolCall(tool_call)),
+                        Ok(StreamEvent::Final),
+                    ]))
+                }
+                NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
+                    Ok(StreamEvent::Final),
+                ])),
+            }
+        }
+    }
+
+    struct RouteAwareStreamingProvider {
+        response: String,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        last_model: Arc<Mutex<String>>,
+    }
+
+    impl RouteAwareStreamingProvider {
+        fn new(response: &str) -> Self {
+            Self {
+                response: response.to_string(),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+                last_model: Arc::new(Mutex::new(String::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RouteAwareStreamingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when routed streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_model
+                .lock()
+                .expect("last_model lock should be valid") = model.to_string();
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(self.response.clone())),
                 Ok(StreamChunk::final_chunk()),
             ]))
         }
@@ -3916,6 +4108,146 @@ mod tests {
         assert!(
             !visible_deltas.contains("<tool_call"),
             "draft text should not leak streamed tool payload markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_native_tool_events_without_chat_fallback() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::ToolCall(ToolCall {
+                id: "call_native_1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: r#"{"value":"A"}"#.to_string(),
+            }),
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native tools"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("native streaming events should preserve tool loop semantics");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL || delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.stream_tool_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_routed_streaming_uses_live_provider_deltas_once() {
+        let default_provider = RouteAwareStreamingProvider::new("default answer");
+        let default_stream_calls = Arc::clone(&default_provider.stream_calls);
+        let default_chat_calls = Arc::clone(&default_provider.chat_calls);
+
+        let routed_provider = RouteAwareStreamingProvider::new("routed streamed answer");
+        let routed_stream_calls = Arc::clone(&routed_provider.stream_calls);
+        let routed_chat_calls = Arc::clone(&routed_provider.chat_calls);
+        let routed_last_model = Arc::clone(&routed_provider.last_model);
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".to_string(), Box::new(default_provider)),
+                ("fast".to_string(), Box::new(routed_provider)),
+            ],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "fast".to_string(),
+                    model: "routed-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hi"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+
+        let result = run_tool_call_loop(
+            &router,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "router",
+            "hint:fast",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("routed streaming provider should complete");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL || delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "routed streamed answer");
+        assert_eq!(
+            visible_deltas, "routed streamed answer",
+            "routed draft should receive upstream deltas once without post-hoc duplication"
+        );
+        assert_eq!(default_stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(default_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            routed_last_model
+                .lock()
+                .expect("routed_last_model lock should be valid")
+                .as_str(),
+            "routed-model"
         );
     }
 
