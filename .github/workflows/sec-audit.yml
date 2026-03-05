@@ -73,7 +73,7 @@ jobs:
     # --- Change detection for fast-path on non-Rust PRs ---
     changes:
         name: Detect Change Scope
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         outputs:
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
         steps:
@@ -237,14 +237,14 @@ jobs:
             needs.changes.outputs.rust_changed != 'true' &&
             github.event_name != 'schedule' &&
             github.event_name != 'workflow_dispatch'
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         steps:
             - name: Skip Rust security for non-Rust PR
               run: echo "Non-Rust PR; Rust security checks skipped."
 
     secrets:
         name: Secrets Governance (Gitleaks)
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -440,7 +440,7 @@ jobs:
     # --- Compliance: SBOM + unsafe debt (no Rust compilation needed) ---
     compliance:
         name: Compliance (SBOM + Unsafe Debt)
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -639,7 +639,7 @@ jobs:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
         needs: [changes, rust-security, rust-security-skipped, secrets, compliance]
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         steps:
             - name: Enforce security gate
               shell: bash

@@ -42,7 +42,7 @@ env:
 jobs:
     audit:
         name: CI Change Audit
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         timeout-minutes: 15
         steps:
             - name: Checkout

@@ -22,7 +22,7 @@ jobs:
   tag:
     name: Create release tag from Cargo.toml
     if: github.event.workflow_run.conclusion == 'success'
-    runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Checkout
