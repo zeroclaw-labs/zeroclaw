@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod bridge;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -42,6 +43,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bridge::BridgeChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -4292,6 +4294,13 @@ fn collect_configured_channels(
     // `#[cfg(not(feature = "channel-matrix"))]` blocks are removed.
     let _ = matrix_skip_context;
     let mut channels = Vec::new();
+
+    if let Some(ref bridge_cfg) = config.channels_config.bridge {
+        channels.push(ConfiguredChannel {
+            display_name: "Bridge",
+            channel: Arc::new(BridgeChannel::new(bridge_cfg.clone())),
+        });
+    }
 
     if let Some(ref tg) = config.channels_config.telegram {
         let mut telegram = TelegramChannel::new(
@@ -9946,6 +9955,19 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(channels
             .iter()
             .any(|entry| entry.channel.name() == "mattermost"));
+    }
+
+    #[test]
+    fn collect_configured_channels_includes_bridge_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.bridge = Some(crate::config::schema::BridgeConfig::default());
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels.iter().any(|entry| entry.display_name == "Bridge"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry.channel.name() == "bridge"));
     }
 
     struct AlwaysFailChannel {
