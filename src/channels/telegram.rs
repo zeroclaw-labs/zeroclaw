@@ -1411,28 +1411,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        // Check mention_only for group messages
-        let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                // Check if caption contains bot mention or message is a reply to the bot
-                let caption_text = attachment.caption.as_deref().unwrap_or("");
-                let has_mention = Self::contains_bot_mention(caption_text, bot_username);
-                let is_reply = self.group_reply_mode == GroupReplyMode::MentionOrReply
-                    && self
-                        .bot_id
-                        .lock()
-                        .map(|id| Self::is_reply_to_bot(message, id))
-                        .unwrap_or(false);
-                if !has_mention && !is_reply {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        }
-
         // Ensure workspace directory is configured
         let workspace = self.workspace_dir.as_ref().or_else(|| {
             tracing::warn!("Cannot save attachment: workspace_dir not configured");

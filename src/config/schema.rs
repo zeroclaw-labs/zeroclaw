@@ -3435,6 +3435,17 @@ pub enum GroupReplyMode {
     AllMessages,
     /// Reply when the bot is @-mentioned OR when a user replies directly to
     /// one of the bot's own messages in a group chat.
+    ///
+    /// **Default:** Not set by default; opt-in by setting `group_reply.mode = "mention_or_reply"`
+    /// in `config.toml`.
+    ///
+    /// **Compatibility:** Existing deployments are unaffected — this value is only
+    /// active when explicitly configured. Older ZeroClaw versions that do not
+    /// recognise this variant will fall back to channel-specific legacy behaviour.
+    ///
+    /// **Rollback:** Change `group_reply.mode` back to `"mention_only"` or `"reply_only"`
+    /// (or remove the key entirely to restore legacy behaviour) and restart the daemon.
+    /// No data migration is required.
     MentionOrReply,
 }
 
