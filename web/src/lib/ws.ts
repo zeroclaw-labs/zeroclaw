@@ -69,8 +69,10 @@ export class WebSocketClient {
       try {
         const msg = JSON.parse(ev.data) as WsMessage;
         this.onMessage?.(msg);
-      } catch {
-        // Ignore non-JSON frames
+      } catch (err) {
+        const preview =
+          typeof ev.data === 'string' ? ev.data.slice(0, 120) : '[binary frame]';
+        console.warn('[ws] non-JSON frame received:', preview, err);
       }
     };
 

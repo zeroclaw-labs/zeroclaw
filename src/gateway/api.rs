@@ -820,7 +820,20 @@ pub async fn handle_api_doctor(
     }
 
     let config = state.config.lock().clone();
-    let results = crate::doctor::diagnose(&config);
+    let results = match tokio::task::spawn_blocking(move || crate::doctor::diagnose(&config)).await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!("doctor task panicked: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "doctor diagnostics failed",
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let ok_count = results
         .iter()

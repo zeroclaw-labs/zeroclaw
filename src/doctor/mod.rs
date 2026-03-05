@@ -4,10 +4,13 @@ use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
 
+use std::time::Duration;
+
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+const PROVIDER_PROBE_TIMEOUT_SECS: u64 = 5;
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
@@ -80,6 +83,7 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     let mut items: Vec<DiagItem> = Vec::new();
 
     check_config_semantics(config, &mut items);
+    check_provider_reachability(config, &mut items);
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
@@ -653,6 +657,116 @@ fn embedding_provider_validation_error(name: &str) -> Option<String> {
             parsed.scheme()
         )),
         Err(err) => Some(format!("invalid custom provider URL: {err}")),
+    }
+}
+
+// ── Provider reachability ─────────────────────────────────────────
+
+/// Redact credentials and query parameters from a URL before logging.
+fn redact_probe_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                let _ = parsed.set_username("redacted");
+                let _ = parsed.set_password(Some("redacted"));
+            }
+            if parsed.query().is_some() {
+                parsed.set_query(Some("redacted"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => raw.to_string(),
+    }
+}
+
+fn check_provider_reachability(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "provider";
+
+    let Some(ref provider) = config.default_provider else {
+        // No provider configured — check_config_semantics already flags this.
+        return;
+    };
+
+    let probe_url = resolve_provider_probe_url(provider, config.api_url.as_deref());
+    let Some(url) = probe_url else {
+        items.push(DiagItem::warn(
+            cat,
+            format!("cannot determine probe URL for provider \"{provider}\" — skipping reachability check"),
+        ));
+        return;
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(PROVIDER_PROBE_TIMEOUT_SECS))
+        .build();
+
+    let client = match client {
+        Ok(c) => c,
+        Err(err) => {
+            items.push(DiagItem::warn(
+                cat,
+                format!("failed to build HTTP client for provider probe: {err}"),
+            ));
+            return;
+        }
+    };
+
+    let redacted = redact_probe_url(&url);
+
+    match client.get(&url).send() {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                items.push(DiagItem::ok(
+                    cat,
+                    format!("provider \"{provider}\" reachable (GET {redacted} → {status})"),
+                ));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!("provider \"{provider}\" returned HTTP {status} (GET {redacted})"),
+                ));
+            }
+        }
+        Err(err) => {
+            let msg = if err.is_timeout() {
+                format!("provider \"{provider}\" unreachable — timed out after {PROVIDER_PROBE_TIMEOUT_SECS}s (GET {redacted})")
+            } else if err.is_connect() {
+                format!("provider \"{provider}\" unreachable — connection refused (GET {redacted})")
+            } else {
+                format!("provider \"{provider}\" unreachable — {err} (GET {redacted})")
+            };
+            items.push(DiagItem::error(cat, msg));
+        }
+    }
+}
+
+/// Determine a lightweight probe URL for the given provider.
+/// Returns `None` if no sensible probe URL can be derived.
+fn resolve_provider_probe_url(provider: &str, api_url: Option<&str>) -> Option<String> {
+    let provider_lower = provider.to_ascii_lowercase();
+
+    if provider_lower == "ollama" {
+        let base = api_url
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .unwrap_or("http://localhost:11434");
+        let base = base.trim_end_matches('/').trim_end_matches("/api");
+        Some(format!("{base}/api/tags"))
+    } else {
+        // Prefer explicit api_url; fallback to URL embedded in custom provider ids
+        // (e.g. "custom:https://my-server.com" or "openai-custom:https://proxy.local").
+        let provider_url = provider
+            .split_once(':')
+            .and_then(|(prefix, url)| prefix.ends_with("custom").then_some(url))
+            .map(str::trim)
+            .filter(|u| !u.is_empty());
+        let url = api_url
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .or(provider_url)?;
+        let url = url.trim_end_matches('/');
+        Some(format!("{url}/models"))
     }
 }
 
