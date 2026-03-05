@@ -353,7 +353,18 @@ async fn handle_google_callback(state: &AppState, query: OAuthCallback) -> Respo
     }
 
     // State validated — consume the PKCE session file to prevent replay.
-    let _ = tokio::fs::remove_file(&pkce_file).await;
+    // Fail closed: if we cannot delete the file the session is unconsumed and
+    // a replay could succeed, so abort rather than continue.
+    if let Err(e) = tokio::fs::remove_file(&pkce_file).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(error_page(
+                "OAuth Error",
+                &format!("Failed to consume PKCE session: {e}"),
+            )),
+        )
+            .into_response();
+    }
 
     let (client_id, client_secret) = {
         let cfg = state.config.lock();

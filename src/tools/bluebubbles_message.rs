@@ -114,17 +114,9 @@ impl Tool for BlueBubblesMessageTool {
             }
         };
 
-        // All common inputs validated; charge rate-limit only before mutation.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         match action.as_str() {
             "reply" => {
+                // Validate all action-specific inputs before charging rate-limit quota.
                 let chat_guid = match args.get("chat_guid").and_then(|v| v.as_str()) {
                     Some(g) if !g.trim().is_empty() => g.trim().to_string(),
                     _ => {
@@ -145,6 +137,14 @@ impl Tool for BlueBubblesMessageTool {
                         })
                     }
                 };
+                // All inputs validated; charge rate-limit only before mutation.
+                if !self.security.record_action() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                    });
+                }
                 let url = self.api_url("/api/v1/message/text");
                 let body = serde_json::json!({
                     "chatGuid": chat_guid,
@@ -189,6 +189,7 @@ impl Tool for BlueBubblesMessageTool {
             }
 
             "edit" => {
+                // Validate all action-specific inputs before charging rate-limit quota.
                 let text = match args.get("text").and_then(|v| v.as_str()) {
                     Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                     _ => {
@@ -199,6 +200,14 @@ impl Tool for BlueBubblesMessageTool {
                         })
                     }
                 };
+                // All inputs validated; charge rate-limit only before mutation.
+                if !self.security.record_action() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                    });
+                }
                 let encoded_id = urlencoding::encode(&message_id).into_owned();
                 let url = self.api_url(&format!("/api/v1/message/{encoded_id}/edit"));
                 let body = serde_json::json!({
@@ -241,6 +250,14 @@ impl Tool for BlueBubblesMessageTool {
             }
 
             "unsend" => {
+                // No action-specific params; charge rate-limit before mutation.
+                if !self.security.record_action() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                    });
+                }
                 let encoded_id = urlencoding::encode(&message_id).into_owned();
                 let url = self.api_url(&format!("/api/v1/message/{encoded_id}/unsend"));
                 // partIndex 0 targets the text body; multi-part unsend is not yet exposed.

@@ -382,6 +382,12 @@ group_policy = "open"
 group_allow_from = ["iMessage;+;chat-abc123"]
 # Gửi read receipt đến BB sau mỗi tin nhắn đã xử lý. Mặc định: true.
 send_read_receipts = true
+
+# --- Phân đoạn văn bản (tùy chọn) ---
+# Số ký tự Unicode tối đa mỗi tin nhắn gửi đi. Bỏ qua để tắt phân đoạn.
+# text_chunk_limit = 4000
+# Chiến lược phân đoạn: "length" (cắt theo byte tại giới hạn) | "newline" (cắt theo \n).
+# chunk_mode = "length"
 ```
 
 Hành vi chính sách:
