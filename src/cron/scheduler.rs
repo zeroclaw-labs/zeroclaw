@@ -58,14 +58,23 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+    execute_job_now_with_approval(config, job, false).await
+}
+
+pub async fn execute_job_now_with_approval(
+    config: &Config,
+    job: &CronJob,
+    approved: bool,
+) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    Box::pin(execute_job_with_retry(config, &security, job)).await
+    execute_job_with_retry(config, &security, job, approved).await
 }
 
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    approved: bool,
 ) -> (bool, String) {
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
@@ -73,8 +82,8 @@ async fn execute_job_with_retry(
 
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
+            JobType::Shell => run_job_command_with_approval(config, security, job, approved).await,
+            JobType::Agent => run_agent_job(config, security, job).await,
         };
         last_output = output;
 
@@ -140,7 +149,7 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let (success, output) = execute_job_with_retry(config, security, job, false).await;
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
@@ -540,11 +549,21 @@ async fn run_job_command(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
+    run_job_command_with_approval(config, security, job, false).await
+}
+
+async fn run_job_command_with_approval(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    approved: bool,
+) -> (bool, String) {
     run_job_command_with_timeout(
         config,
         security,
         job,
         Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
+        approved,
     )
     .await
 }
@@ -554,6 +573,7 @@ async fn run_job_command_with_timeout(
     security: &SecurityPolicy,
     job: &CronJob,
     timeout: Duration,
+    approved: bool,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -569,21 +589,8 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    if !security.is_command_allowed(&job.command) {
-        return (
-            false,
-            format!(
-                "blocked by security policy: command not allowed: {}",
-                job.command
-            ),
-        );
-    }
-
-    if let Some(path) = security.forbidden_path_argument(&job.command) {
-        return (
-            false,
-            format!("blocked by security policy: forbidden path argument: {path}"),
-        );
+    if let Err(reason) = security.validate_command_execution(&job.command, approved) {
+        return (false, format!("blocked by security policy: {reason}"));
     }
 
     if !security.record_action() {
@@ -769,8 +776,14 @@ mod tests {
         let job = test_job("sleep 1");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) =
-            run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
+        let (success, output) = run_job_command_with_timeout(
+            &config,
+            &security,
+            &job,
+            Duration::from_millis(50),
+            false,
+        )
+        .await;
         assert!(!success);
         assert!(output.contains("job timed out after"));
     }
@@ -786,7 +799,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
+        assert!(output.contains("Command not allowed"));
     }
 
     #[tokio::test]
@@ -800,7 +813,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("Path blocked by security policy"));
         assert!(output.contains("/etc/passwd"));
     }
 
@@ -815,7 +828,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("Path blocked by security policy"));
         assert!(output.contains("/etc/passwd"));
     }
 
@@ -830,7 +843,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("Path blocked by security policy"));
         assert!(output.contains("/etc/passwd"));
     }
 
@@ -845,7 +858,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("Path blocked by security policy"));
         assert!(output.contains("~root/.ssh/id_rsa"));
     }
 
@@ -860,7 +873,39 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
+        assert!(output.contains("Command not allowed"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_medium_risk_without_explicit_approval() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        let job = test_job("touch cron-scheduler-approval-needed");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("explicit approval"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_now_with_approval_allows_medium_risk_shell_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        let marker = "scheduler-approved-marker";
+        let marker_path = config.workspace_dir.join(marker);
+        let job = test_job(&format!("touch {marker}"));
+
+        let (denied, denied_output) = execute_job_now(&config, &job).await;
+        assert!(!denied);
+        assert!(denied_output.contains("explicit approval"));
+
+        let (approved, output) = execute_job_now_with_approval(&config, &job, true).await;
+        assert!(approved, "{output}");
+        assert!(marker_path.exists());
     }
 
     #[tokio::test]
@@ -908,7 +953,7 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job, false).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -923,7 +968,7 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job, false).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
