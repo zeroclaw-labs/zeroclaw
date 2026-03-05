@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use reqwest::multipart::{Form, Part};
+use reqwest::Url;
 
 use crate::config::TranscriptionConfig;
 
@@ -31,11 +32,31 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
+/// Returns `true` when `api_url` points to a Mistral endpoint.
+///
+/// Parses the URL and inspects the host (case-insensitive).  Falls back to
+/// `false` on parse errors so the Groq default path is used.
+fn is_mistral_host(api_url: &str) -> bool {
+    Url::parse(api_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .map_or(false, |host| {
+            host == "mistral.ai" || host.ends_with(".mistral.ai")
+        })
+}
+
 /// Transcribe audio bytes via a Whisper-compatible transcription API.
 ///
-/// Returns the transcribed text on success.  Requires `GROQ_API_KEY` in the
-/// environment.  The caller is responsible for enforcing duration limits
-/// *before* downloading the file; this function enforces the byte-size cap.
+/// Supports Groq Whisper (default) and Mistral Voxtral endpoints.
+/// The provider is detected from `config.api_url` by inspecting the host.
+///
+/// API key resolution order:
+/// 1. Explicit `config.api_key` (highest priority).
+/// 2. `MISTRAL_API_KEY` env var (when the endpoint is `*.mistral.ai`).
+/// 3. `GROQ_API_KEY` env var (all other endpoints).
+///
+/// The caller is responsible for enforcing duration limits *before*
+/// downloading the file; this function enforces the byte-size cap.
 pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
@@ -59,6 +80,8 @@ pub async fn transcribe_audio(
         )
     })?;
 
+    let mistral = is_mistral_host(&config.api_url);
+
     let api_key = config
         .api_key
         .as_deref()
@@ -66,20 +89,21 @@ pub async fn transcribe_audio(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
-            // Check MISTRAL_API_KEY if the URL is for Mistral, otherwise GROQ_API_KEY
-            if config.api_url.contains("mistral.ai") {
-                std::env::var("MISTRAL_API_KEY").ok()
+            let var = if mistral {
+                "MISTRAL_API_KEY"
             } else {
-                std::env::var("GROQ_API_KEY").ok()
-            }
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+                "GROQ_API_KEY"
+            };
+            std::env::var(var)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
         })
         .context(
             "Missing transcription API key: set [transcription].api_key, MISTRAL_API_KEY, or GROQ_API_KEY environment variable",
         )?;
 
-    let proxy_name = if config.api_url.contains("mistral.ai") {
+    let proxy_name = if mistral {
         "transcription.mistral"
     } else {
         "transcription.groq"
@@ -156,10 +180,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("GROQ_API_KEY"),
+            err.to_string().contains("Missing transcription API key"),
             "expected missing-key error, got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn uses_config_api_key_without_groq_env() {
+        std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("MISTRAL_API_KEY");
+
+        let mut config = TranscriptionConfig::default();
+        config.api_key = Some("explicit-key".to_string());
+
+        // Will fail on the HTTP request (no real server), but should NOT
+        // fail on API key resolution.
+        let err = transcribe_audio(vec![0u8; 100], "test.ogg", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("Missing transcription API key"),
+            "should not fail on key resolution when config.api_key is set, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mistral_url_falls_back_to_mistral_env_key() {
+        std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("MISTRAL_API_KEY");
+
+        let mut config = TranscriptionConfig::default();
+        config.api_url = "https://api.mistral.ai/v1/audio/transcriptions".to_string();
+        config.api_key = None;
+
+        // Without MISTRAL_API_KEY set, should get the missing-key error.
+        let err = transcribe_audio(vec![0u8; 100], "test.ogg", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Missing transcription API key"),
+            "expected missing-key error for Mistral URL without env key, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_api_key_is_rejected() {
+        std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("MISTRAL_API_KEY");
+
+        let mut config = TranscriptionConfig::default();
+        config.api_key = Some("   ".to_string());
+
+        let err = transcribe_audio(vec![0u8; 100], "test.ogg", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Missing transcription API key"),
+            "whitespace-only api_key should be treated as missing, got: {err}"
+        );
+    }
+
+    // ── is_mistral_host tests ───────────────────────────────────────
+
+    #[test]
+    fn is_mistral_host_detects_api_subdomain() {
+        assert!(is_mistral_host(
+            "https://api.mistral.ai/v1/audio/transcriptions"
+        ));
+    }
+
+    #[test]
+    fn is_mistral_host_detects_bare_domain() {
+        assert!(is_mistral_host("https://mistral.ai/endpoint"));
+    }
+
+    #[test]
+    fn is_mistral_host_case_insensitive() {
+        assert!(is_mistral_host(
+            "https://API.MISTRAL.AI/v1/audio/transcriptions"
+        ));
+    }
+
+    #[test]
+    fn is_mistral_host_rejects_groq_url() {
+        assert!(!is_mistral_host(
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        ));
+    }
+
+    #[test]
+    fn is_mistral_host_rejects_spoofed_path() {
+        // "mistral.ai" in path but not in host
+        assert!(!is_mistral_host(
+            "https://evil.com/mistral.ai/v1/audio/transcriptions"
+        ));
+    }
+
+    #[test]
+    fn is_mistral_host_returns_false_for_invalid_url() {
+        assert!(!is_mistral_host("not-a-url"));
+        assert!(!is_mistral_host(""));
+    }
+
+    // ── MIME / filename tests ───────────────────────────────────────
 
     #[test]
     fn mime_for_audio_maps_accepted_formats() {

@@ -539,22 +539,50 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq, Mistral, etc.).
+/// Voice transcription configuration (Groq Whisper default; also supports Mistral Voxtral endpoints).
+///
+/// # Defaults
+///
+/// - `enabled`: `false` — transcription is opt-in.
+/// - `api_url`: `https://api.groq.com/openai/v1/audio/transcriptions`
+/// - `model`: `whisper-large-v3-turbo`
+///
+/// # Compatibility
+///
+/// Additive and backward-compatible for existing Groq configurations.
+/// New providers may differ in supported models, encoding, or rate limits.
+///
+/// # Migration / Rollback
+///
+/// To switch to Mistral: set `api_url` to the Mistral endpoint, `model`
+/// to e.g. `voxtral-mini-latest`, and provide `api_key` or `MISTRAL_API_KEY`.
+/// To revert: restore `api_url`/`model` to the Groq defaults above (or
+/// remove the keys to use serde defaults).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
+    /// Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// Whisper API endpoint URL.
+    /// API key used for transcription requests.
+    ///
+    /// If unset, runtime falls back to `MISTRAL_API_KEY` (for Mistral
+    /// endpoints) or `GROQ_API_KEY` (all others).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Transcription API endpoint URL.
+    /// Default: `https://api.groq.com/openai/v1/audio/transcriptions`.
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
     /// Whisper or Voxtral model name (e.g. `whisper-large-v3-turbo`, `voxtral-mini-latest`).
+    /// Default: `whisper-large-v3-turbo`.
     #[serde(default = "default_transcription_model")]
     pub model: String,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
+    /// Default: `120`.
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
 }
@@ -563,6 +591,7 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
