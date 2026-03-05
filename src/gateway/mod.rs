@@ -407,7 +407,14 @@ pub struct AppState {
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    sop_collector: Option<Arc<crate::sop::SopMetricsCollector>>,
+) -> Result<()> {
     if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
         tracing::warn!("plugin registry initialization skipped: {error}");
     }

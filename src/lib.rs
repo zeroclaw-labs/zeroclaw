@@ -108,6 +108,7 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub mod sop;
 #[cfg(test)]
 pub(crate) mod test_locks;
 pub mod tools;

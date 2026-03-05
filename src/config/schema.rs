@@ -396,6 +396,10 @@ pub struct Config {
     #[serde(default)]
     pub model_support_vision: Option<bool>,
 
+    /// Standard Operating Procedures (SOP) configuration.
+    #[serde(default)]
+    pub sop: SopConfig,
+
     /// WASM plugin engine configuration (`[wasm]` section).
     #[serde(default)]
     pub wasm: WasmConfig,
@@ -934,6 +938,81 @@ impl Default for CoordinationConfig {
             max_dead_letters: default_coordination_max_dead_letters(),
             max_context_entries: default_coordination_max_context_entries(),
             max_seen_message_ids: default_coordination_max_seen_message_ids(),
+        }
+    }
+}
+
+// ── SOP Config ──────────────────────────────────────────────────
+
+/// Configuration for the Standard Operating Procedures system.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SopConfig {
+    /// Enable the SOP subsystem (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Directory containing SOP definitions (default: `<workspace>/sops`).
+    #[serde(default)]
+    pub sops_dir: Option<String>,
+
+    /// Default execution mode for SOPs that don't specify one.
+    #[serde(default)]
+    pub default_execution_mode: crate::sop::SopExecutionMode,
+
+    /// Maximum total concurrent SOP executions across all SOPs.
+    #[serde(default = "default_sop_max_concurrent_total")]
+    pub max_concurrent_total: usize,
+
+    /// Seconds to wait for operator approval before timeout action.
+    /// For Critical-priority SOPs, timeout falls back to Auto execution.
+    /// For others, the run stays in WaitingApproval indefinitely (0 = no timeout).
+    #[serde(default = "default_sop_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+
+    /// Maximum number of finished runs to keep in memory for status queries.
+    /// Oldest runs are evicted when the limit is exceeded (0 = unlimited).
+    #[serde(default = "default_sop_max_finished_runs")]
+    pub max_finished_runs: usize,
+
+    /// Path to ampersona persona file with gate definitions.
+    /// If not set, no gates are loaded and gate evaluation is a no-op.
+    /// Only effective with `ampersona-gates` feature.
+    #[serde(default)]
+    pub gates_file: Option<String>,
+
+    /// Gate evaluation tick interval in seconds. 0 = gate evaluation disabled
+    /// (no ticks will fire). Only effective with `ampersona-gates` feature.
+    #[serde(default = "default_gate_eval_interval_secs")]
+    pub gate_eval_interval_secs: u64,
+}
+
+fn default_sop_max_concurrent_total() -> usize {
+    5
+}
+
+fn default_sop_approval_timeout_secs() -> u64 {
+    300
+}
+
+fn default_sop_max_finished_runs() -> usize {
+    1000
+}
+
+fn default_gate_eval_interval_secs() -> u64 {
+    60
+}
+
+impl Default for SopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sops_dir: None,
+            default_execution_mode: crate::sop::SopExecutionMode::default(),
+            max_concurrent_total: default_sop_max_concurrent_total(),
+            approval_timeout_secs: default_sop_approval_timeout_secs(),
+            max_finished_runs: default_sop_max_finished_runs(),
+            gates_file: None,
+            gate_eval_interval_secs: default_gate_eval_interval_secs(),
         }
     }
 }
@@ -6613,6 +6692,7 @@ impl Default for Config {
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            sop: SopConfig::default(),
             wasm: WasmConfig::default(),
         }
     }
@@ -10460,6 +10540,7 @@ ws_url = "ws://127.0.0.1:3002"
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            sop: SopConfig::default(),
             wasm: WasmConfig::default(),
         };
 
@@ -10838,6 +10919,7 @@ denied_tools = ["shell"]
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            sop: SopConfig::default(),
             wasm: WasmConfig::default(),
         };
 

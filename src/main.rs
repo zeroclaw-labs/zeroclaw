@@ -173,6 +173,7 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+mod sop;
 #[cfg(test)]
 mod test_locks;
 mod tools;
@@ -1142,7 +1143,36 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            gateway::run_gateway(&host, port, config).await
+            // Initialize SOP resources so /sop/* and webhook dispatch work in standalone gateway.
+            let sop_engine = tools::create_sop_engine(&config.sop, &config.workspace_dir);
+            let sop_memory: Option<std::sync::Arc<dyn memory::traits::Memory>> =
+                if sop_engine.is_some() {
+                    let mem = memory::create_memory(&config.memory, &config.workspace_dir, None)
+                        .map_err(|e| {
+                            warn!("SOP enabled but memory backend init failed: {e}");
+                            anyhow::anyhow!(
+                                "SOP requires a working memory backend but init failed: {e}"
+                            )
+                        })?;
+                    Some(std::sync::Arc::from(mem) as std::sync::Arc<dyn memory::traits::Memory>)
+                } else {
+                    None
+                };
+            let sop_audit = sop_memory
+                .as_ref()
+                .map(|m| std::sync::Arc::new(sop::SopAuditLogger::new(std::sync::Arc::clone(m))));
+            let sop_collector = if let Some(ref mem) = sop_memory {
+                match sop::SopMetricsCollector::rebuild_from_memory(mem.as_ref()).await {
+                    Ok(c) => Some(std::sync::Arc::new(c)),
+                    Err(e) => {
+                        warn!("SOP metrics warm-start failed, using empty collector: {e}");
+                        Some(std::sync::Arc::new(sop::SopMetricsCollector::new()))
+                    }
+                }
+            } else {
+                None
+            };
+            gateway::run_gateway(&host, port, config, sop_engine, sop_audit, sop_collector).await
         }
 
         Commands::Daemon { port, host } => {
