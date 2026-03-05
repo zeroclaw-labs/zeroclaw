@@ -671,7 +671,29 @@ impl BlueBubblesChannel {
         if super::transcription::whisper_available() {
             let tmp_path =
                 std::env::temp_dir().join(format!("zc_bb_audio_{}.{ext}", uuid::Uuid::new_v4()));
-            tokio::fs::write(&tmp_path, &bytes).await?;
+            // Write with owner-only permissions to protect audio content on shared hosts.
+            {
+                use tokio::io::AsyncWriteExt as _;
+                let mut f = {
+                    #[cfg(unix)]
+                    {
+                        tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&tmp_path)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to create temp audio file: {e}"))?
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        tokio::fs::File::create(&tmp_path)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to create temp audio file: {e}"))?
+                    }
+                };
+                f.write_all(&bytes).await?;
+            }
             let result =
                 super::transcription::transcribe_audio_local(tmp_path.to_str().ok_or_else(
                     || anyhow::anyhow!("Temp audio path contains non-UTF-8 characters"),
@@ -1496,6 +1518,16 @@ impl Channel for BlueBubblesChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // Fail fast on empty identifiers before making a network call.
+        if channel_id.is_empty() {
+            anyhow::bail!("add_reaction: channel_id must not be empty");
+        }
+        if message_id.is_empty() {
+            anyhow::bail!("add_reaction: message_id must not be empty");
+        }
+        if emoji.is_empty() {
+            anyhow::bail!("add_reaction: emoji must not be empty");
+        }
         let Some(reaction) = emoji_to_bb_tapback(emoji) else {
             anyhow::bail!(
                 "Unsupported tapback emoji '{emoji}' — supported: \
@@ -1542,6 +1574,16 @@ impl Channel for BlueBubblesChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // Fail fast on empty identifiers before making a network call.
+        if channel_id.is_empty() {
+            anyhow::bail!("remove_reaction: channel_id must not be empty");
+        }
+        if message_id.is_empty() {
+            anyhow::bail!("remove_reaction: message_id must not be empty");
+        }
+        if emoji.is_empty() {
+            anyhow::bail!("remove_reaction: emoji must not be empty");
+        }
         let Some(reaction) = emoji_to_bb_tapback(emoji) else {
             anyhow::bail!(
                 "Unsupported tapback emoji '{emoji}' — supported: \

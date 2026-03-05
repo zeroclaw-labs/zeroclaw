@@ -2419,18 +2419,23 @@ async fn handle_bluebubbles_webhook(
                     });
                 if let Some(ref guid) = delivery_guid {
                     if guid.contains(";+;") {
-                        bb.mark_read(guid).await;
+                        let bb_mark = bb.clone();
+                        let g = guid.clone();
+                        tokio::spawn(async move { bb_mark.mark_read(&g).await });
                     }
                 }
             }
         }
 
         for msg in &messages {
-            tracing::info!(
-                "BlueBubbles iMessage from {}: {}",
-                msg.sender,
-                truncate_with_ellipsis(&msg.content, 50)
-            );
+            // Hash the sender to avoid logging raw PII (phone numbers / emails).
+            let sender_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                msg.sender.hash(&mut h);
+                h.finish()
+            };
+            tracing::info!("BlueBubbles iMessage (sender_id={sender_hash:08x})");
 
             let session_id = gateway_message_session_id(msg);
             if state_bg.auto_save {
@@ -2447,9 +2452,12 @@ async fn handle_bluebubbles_webhook(
             }
 
             let _ = bb.start_typing(&msg.reply_target).await;
-            // Mark the chat as read immediately — mirrors OpenClaw behaviour and ensures
-            // the read receipt reaches the sender even when the outbound send fails.
-            bb.mark_read(&msg.reply_target).await;
+            // Fire-and-forget: mark_read has a 30 s timeout; don't block the LLM call.
+            {
+                let bb_mark = bb.clone();
+                let target = msg.reply_target.clone();
+                tokio::spawn(async move { bb_mark.mark_read(&target).await });
+            }
             let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state_bg);
 
             match run_gateway_chat_with_tools(&state_bg, &msg.content, Some(&session_id)).await {
