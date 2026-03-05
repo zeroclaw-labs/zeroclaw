@@ -54,6 +54,11 @@ pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_OAUTH_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 pub const GEMINI_OAUTH_REDIRECT_URI: &str = "http://localhost:1456/auth/callback";
 
+/// Well-known public client secret used by the Gemini CLI.
+/// This is a non-sensitive, publicly embedded constant (identical to the value
+/// shipped in the Gemini CLI source).
+pub const GEMINI_CLI_DEFAULT_CLIENT_SECRET: &str = "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";
+
 /// Scopes required for Gemini API access.
 pub const GEMINI_OAUTH_SCOPES: &str =
     "openid profile email https://www.googleapis.com/auth/cloud-platform";
@@ -500,6 +505,97 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     anyhow::bail!("Could not parse OAuth code from input")
 }
 
+/// Extract the OAuth client ID (`aud` or `azp` claim) from a Google ID token.
+///
+/// Prefers the `aud` claim; falls back to `azp` if `aud` is absent or empty.
+pub fn extract_client_id_from_id_token(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+
+    #[derive(Deserialize)]
+    struct IdTokenClaims {
+        aud: Option<String>,
+        azp: Option<String>,
+    }
+
+    let claims: IdTokenClaims = serde_json::from_slice(&decoded).ok()?;
+    normalize_non_empty_opt(claims.aud.as_deref())
+        .or_else(|| normalize_non_empty_opt(claims.azp.as_deref()))
+}
+
+/// Trim and reject empty/whitespace-only strings.
+fn normalize_non_empty_opt(value: Option<&str>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// Refresh an access token using explicit client credentials.
+///
+/// Use this when the caller already knows `client_id` and `client_secret`
+/// (e.g. extracted from a stored id_token + the well-known public secret).
+pub async fn refresh_access_token_with_credentials(
+    client: &Client,
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<TokenSet> {
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+
+    let response = client
+        .post(GOOGLE_OAUTH_TOKEN_URL)
+        .form(&form)
+        .send()
+        .await
+        .context("Failed to send refresh token request")?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("Failed to read refresh response body")?;
+
+    if !status.is_success() {
+        if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&body) {
+            anyhow::bail!(
+                "Google OAuth refresh error: {} - {}",
+                err.error,
+                err.error_description.unwrap_or_default()
+            );
+        }
+        anyhow::bail!("Google OAuth refresh failed ({}): {}", status, body);
+    }
+
+    let token_response: TokenResponse =
+        serde_json::from_str(&body).context("Failed to parse refresh response")?;
+
+    let expires_at = token_response
+        .expires_in
+        .map(|secs| Utc::now() + chrono::Duration::seconds(secs));
+
+    Ok(TokenSet {
+        access_token: token_response.access_token,
+        refresh_token: token_response.refresh_token,
+        id_token: token_response.id_token,
+        expires_at,
+        token_type: token_response.token_type.or_else(|| Some("Bearer".into())),
+        scope: token_response.scope,
+    })
+}
+
 /// Extract account email from Google ID token.
 pub fn extract_account_email_from_id_token(id_token: &str) -> Option<String> {
     let parts: Vec<&str> = id_token.split('.').collect();
@@ -595,5 +691,42 @@ mod tests {
 
         let email = extract_account_email_from_id_token(&token);
         assert_eq!(email, Some("test@example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_client_id_from_id_token_prefers_aud_claim() {
+        let payload = serde_json::json!({
+            "aud": "aud-client-id",
+            "azp": "azp-client-id"
+        });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("header.{payload_b64}.sig");
+
+        assert_eq!(
+            extract_client_id_from_id_token(&token),
+            Some("aud-client-id".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_client_id_from_id_token_uses_azp_when_aud_missing() {
+        let payload = serde_json::json!({
+            "azp": "azp-client-id"
+        });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("header.{payload_b64}.sig");
+
+        assert_eq!(
+            extract_client_id_from_id_token(&token),
+            Some("azp-client-id".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_client_id_from_id_token_returns_none_for_invalid_tokens() {
+        assert_eq!(extract_client_id_from_id_token("invalid"), None);
+        assert_eq!(extract_client_id_from_id_token("a.b.c"), None);
     }
 }
