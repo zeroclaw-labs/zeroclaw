@@ -11,6 +11,7 @@ use matrix_sdk::{
         events::Mentions,
         OwnedRoomId, OwnedUserId,
     },
+    store::{StateStoreDataKey, StateStoreDataValue},
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
@@ -118,6 +119,39 @@ impl MatrixChannel {
     fn is_otk_conflict_message(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
         lower.contains("one time key") && lower.contains("already exists")
+    }
+
+    fn has_otk_conflict_state_marker(value: Option<StateStoreDataValue>) -> bool {
+        matches!(value, Some(StateStoreDataValue::OneTimeKeyAlreadyUploaded))
+    }
+
+    fn mark_otk_conflict_detected(flag: &AtomicBool, source: &str) {
+        let first_detection = !flag.swap(true, Ordering::SeqCst);
+        if first_detection {
+            tracing::error!(
+                "Matrix detected one-time key upload conflict via {source}; stopping listener to avoid retry loop."
+            );
+        }
+    }
+
+    async fn sync_otk_conflict_marker_from_store(client: &MatrixSdkClient, flag: &AtomicBool) {
+        match client
+            .state_store()
+            .get_kv_data(StateStoreDataKey::OneTimeKeyAlreadyUploaded)
+            .await
+        {
+            Ok(marker) => {
+                if Self::has_otk_conflict_state_marker(marker) {
+                    Self::mark_otk_conflict_detected(flag, "state-store marker");
+                }
+            }
+            Err(error) => {
+                let safe_error = Self::sanitize_error_for_log(&error);
+                tracing::warn!(
+                    "Matrix failed reading OTK conflict marker from state store: {safe_error}"
+                );
+            }
+        }
     }
 
     fn otk_conflict_recovery_message(&self) -> String {
@@ -559,6 +593,12 @@ Resolve by deregistering the stale Matrix device for this bot account, resetting
                     );
                 }
 
+                Self::sync_otk_conflict_marker_from_store(
+                    &client,
+                    self.otk_conflict_detected.as_ref(),
+                )
+                .await;
+
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
             .await?;
@@ -724,6 +764,9 @@ impl Channel for MatrixChannel {
         }
 
         let client = self.matrix_client().await?;
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
         let target_room_id = self.target_room_id().await?;
         let target_room: OwnedRoomId = target_room_id.parse()?;
 
@@ -771,6 +814,9 @@ impl Channel for MatrixChannel {
             }
         };
         let client = self.matrix_client().await?;
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            anyhow::bail!("{}", self.otk_conflict_recovery_message());
+        }
 
         self.log_e2ee_diagnostics(&client).await;
 
@@ -933,25 +979,33 @@ impl Channel for MatrixChannel {
 
         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
         let otk_conflict_detected = Arc::clone(&self.otk_conflict_detected);
+        let client_for_conflict_check = client.clone();
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
                 let tx = tx.clone();
                 let otk_conflict_detected = Arc::clone(&otk_conflict_detected);
+                let client_for_conflict_check = client_for_conflict_check.clone();
                 async move {
                     if tx.is_closed() {
+                        return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
+                    }
+
+                    MatrixChannel::sync_otk_conflict_marker_from_store(
+                        &client_for_conflict_check,
+                        otk_conflict_detected.as_ref(),
+                    )
+                    .await;
+                    if otk_conflict_detected.load(Ordering::Relaxed) {
                         return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
                     }
 
                     if let Err(error) = sync_result {
                         let raw_error = error.to_string();
                         if MatrixChannel::is_otk_conflict_message(&raw_error) {
-                            let first_detection =
-                                !otk_conflict_detected.swap(true, Ordering::SeqCst);
-                            if first_detection {
-                                tracing::error!(
-                                    "Matrix detected one-time key upload conflict; stopping listener to avoid retry loop."
-                                );
-                            }
+                            MatrixChannel::mark_otk_conflict_detected(
+                                otk_conflict_detected.as_ref(),
+                                "sync error payload",
+                            );
                             return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
                         }
 
@@ -985,7 +1039,11 @@ impl Channel for MatrixChannel {
             return false;
         }
 
-        self.matrix_client().await.is_ok()
+        if self.matrix_client().await.is_err() {
+            return false;
+        }
+
+        !self.otk_conflict_detected.load(Ordering::Relaxed)
     }
 }
 
@@ -1125,6 +1183,14 @@ mod tests {
         assert!(!MatrixChannel::is_otk_conflict_message(
             "Matrix sync timeout while waiting for long poll"
         ));
+    }
+
+    #[test]
+    fn otk_conflict_state_marker_detection_matches_store_values() {
+        assert!(MatrixChannel::has_otk_conflict_state_marker(Some(
+            StateStoreDataValue::OneTimeKeyAlreadyUploaded
+        )));
+        assert!(!MatrixChannel::has_otk_conflict_state_marker(None));
     }
 
     #[test]

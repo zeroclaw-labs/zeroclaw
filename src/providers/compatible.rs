@@ -1519,10 +1519,13 @@ impl OpenAiCompatibleProvider {
                                     })
                                     .collect::<Vec<_>>();
 
+                                // Some strict OpenAI-compatible providers reject assistant
+                                // tool-call history when `content` is omitted entirely.
                                 let content = value
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
-                                    .map(|value| MessageContent::Text(value.to_string()));
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default();
 
                                 let reasoning_content = value
                                     .get("reasoning_content")
@@ -1531,7 +1534,7 @@ impl OpenAiCompatibleProvider {
 
                                 return NativeMessage {
                                     role: "assistant".to_string(),
-                                    content,
+                                    content: Some(MessageContent::Text(content)),
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                     reasoning_content,
@@ -3061,6 +3064,28 @@ mod tests {
         assert_eq!(converted.len(), 1);
 
         let serialized = serde_json::to_value(&converted[0]).unwrap();
+        let tool_call = &serialized["tool_calls"][0];
+        assert_eq!(tool_call["id"], "call_abc");
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "shell");
+        assert_eq!(tool_call["function"]["arguments"], "{\"command\":\"pwd\"}");
+        assert!(tool_call.get("name").is_none());
+        assert!(tool_call.get("arguments").is_none());
+        assert!(tool_call.get("parameters").is_none());
+    }
+
+    #[test]
+    fn convert_messages_for_native_sets_empty_content_when_history_omits_it() {
+        let input = vec![ChatMessage::assistant(
+            r#"{"tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+
+        let serialized = serde_json::to_value(&converted[0]).unwrap();
+        assert_eq!(serialized["content"], "");
+
         let tool_call = &serialized["tool_calls"][0];
         assert_eq!(tool_call["id"], "call_abc");
         assert_eq!(tool_call["type"], "function");

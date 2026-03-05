@@ -57,6 +57,9 @@ jobs:
             RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
             CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
+            - name: Capture lint job start timestamp
+              shell: bash
+              run: echo "CI_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
@@ -75,7 +78,8 @@ jobs:
             - name: Ensure cargo component
               shell: bash
               run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - id: rust-cache
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
                   cache-bin: false
@@ -85,6 +89,19 @@ jobs:
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
+            - name: Publish lint telemetry
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  now="$(date +%s)"
+                  start="${CI_JOB_STARTED_AT:-$now}"
+                  elapsed="$((now - start))"
+                  {
+                    echo "### CI Telemetry: lint"
+                    echo "- rust-cache hit: \`${{ steps.rust-cache.outputs.cache-hit || 'unknown' }}\`"
+                    echo "- Duration (s): \`${elapsed}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
 
     workspace-check:
         name: Workspace Check
@@ -143,6 +160,9 @@ jobs:
             RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
             CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
         steps:
+            - name: Capture test job start timestamp
+              shell: bash
+              run: echo "CI_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - name: Ensure C toolchain
               shell: bash
@@ -158,7 +178,8 @@ jobs:
             - name: Ensure cargo component
               shell: bash
               run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - id: rust-cache
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-check
                   cache-bin: false
@@ -210,10 +231,15 @@ jobs:
                   if [ -f artifacts/flake-probe.json ]; then
                     status=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['status'])")
                     flake=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['flake_suspected'])")
+                    now="$(date +%s)"
+                    start="${CI_JOB_STARTED_AT:-$now}"
+                    elapsed="$((now - start))"
                     {
                       echo "### Test Flake Probe"
                       echo "- Status: \`${status}\`"
                       echo "- Flake suspected: \`${flake}\`"
+                      echo "- rust-cache hit: \`${{ steps.rust-cache.outputs.cache-hit || 'unknown' }}\`"
+                      echo "- Duration (s): \`${elapsed}\`"
                     } >> "$GITHUB_STEP_SUMMARY"
                   fi
             - name: Upload flake probe artifact
@@ -263,6 +289,9 @@ jobs:
             CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
 
         steps:
+            - name: Capture build job start timestamp
+              shell: bash
+              run: echo "CI_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - name: Ensure C toolchain
               shell: bash
@@ -278,7 +307,8 @@ jobs:
             - name: Ensure cargo component
               shell: bash
               run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - id: rust-cache
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
                   prefix-key: ci-run-build
                   cache-targets: true
@@ -294,6 +324,83 @@ jobs:
                   BINARY_SIZE_ADVISORY_MB: 20
                   BINARY_SIZE_TARGET_MB: 5
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
+            - name: Publish build telemetry
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  now="$(date +%s)"
+                  start="${CI_JOB_STARTED_AT:-$now}"
+                  elapsed="$((now - start))"
+                  {
+                    echo "### CI Telemetry: build"
+                    echo "- rust-cache hit: \`${{ steps.rust-cache.outputs.cache-hit || 'unknown' }}\`"
+                    echo "- Duration (s): \`${elapsed}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+    binary-size-regression:
+        name: Binary Size Regression (PR)
+        needs: [changes]
+        if: github.event_name == 'pull_request' && needs.changes.outputs.rust_changed == 'true'
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 120
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target-head
+        steps:
+            - name: Capture binary-size regression job start timestamp
+              shell: bash
+              run: echo "CI_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+            - id: rust-cache
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-binary-size-regression
+                  cache-bin: false
+            - name: Build head binary
+              shell: bash
+              run: cargo build --profile release-fast --locked --bin zeroclaw
+            - name: Compare binary size against base branch
+              shell: bash
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  BINARY_SIZE_REGRESSION_MAX_PERCENT: 10
+              run: |
+                  set -euo pipefail
+                  bash scripts/ci/check_binary_size_regression.sh \
+                    "$BASE_SHA" \
+                    "$CARGO_TARGET_DIR/release-fast/zeroclaw" \
+                    "${BINARY_SIZE_REGRESSION_MAX_PERCENT}"
+            - name: Publish binary-size regression telemetry
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  now="$(date +%s)"
+                  start="${CI_JOB_STARTED_AT:-$now}"
+                  elapsed="$((now - start))"
+                  {
+                    echo "### CI Telemetry: binary-size-regression"
+                    echo "- rust-cache hit: \`${{ steps.rust-cache.outputs.cache-hit || 'unknown' }}\`"
+                    echo "- Duration (s): \`${elapsed}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
 
     cross-platform-vm:
         name: Cross-Platform VM (${{ matrix.name }})
@@ -527,7 +634,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, workspace-check, package-check, test, restricted-hermetic, build, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
+        needs: [changes, lint, workspace-check, package-check, test, restricted-hermetic, build, binary-size-regression, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
         runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         steps:
             - name: Enforce required status
@@ -589,6 +696,7 @@ jobs:
                   cross_platform_vm_result="${{ needs.cross-platform-vm.result }}"
                   linux_distro_container_result="${{ needs.linux-distro-container.result }}"
                   docker_smoke_result="${{ needs.docker-smoke.result }}"
+                  binary_size_regression_result="${{ needs.binary-size-regression.result }}"
 
                   echo "lint=${lint_result}"
                   echo "workspace-check=${workspace_check_result}"
@@ -599,6 +707,7 @@ jobs:
                   echo "cross-platform-vm=${cross_platform_vm_result}"
                   echo "linux-distro-container=${linux_distro_container_result}"
                   echo "docker-smoke=${docker_smoke_result}"
+                  echo "binary-size-regression=${binary_size_regression_result}"
                   echo "docs=${docs_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
@@ -606,6 +715,11 @@ jobs:
 
                   if [ "$lint_result" != "success" ] || [ "$workspace_check_result" != "success" ] || [ "$package_check_result" != "success" ] || [ "$test_result" != "success" ] || [ "$restricted_hermetic_result" != "success" ] || [ "$build_result" != "success" ] || [ "$cross_platform_vm_result" != "success" ] || [ "$linux_distro_container_result" != "success" ] || [ "$docker_smoke_result" != "success" ]; then
                     echo "Required CI jobs did not pass: lint=${lint_result} workspace-check=${workspace_check_result} package-check=${package_check_result} test=${test_result} restricted-hermetic=${restricted_hermetic_result} build=${build_result} cross-platform-vm=${cross_platform_vm_result} linux-distro-container=${linux_distro_container_result} docker-smoke=${docker_smoke_result}"
+                    exit 1
+                  fi
+
+                  if [ "$event_name" = "pull_request" ] && [ "$binary_size_regression_result" != "success" ]; then
+                    echo "Binary size regression guard did not pass for PR."
                     exit 1
                   fi
 
