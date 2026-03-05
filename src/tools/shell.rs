@@ -13,7 +13,15 @@ const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
+///
+/// This list includes only functional runtime variables necessary for shell execution.
+/// It deliberately excludes any variables containing sensitive information:
+/// - No API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)
+/// - No secret tokens (ZEROCLAW_API_KEY, API_TOKEN, etc.)
+/// - No auth credentials (PASSWORD, SECRET, BEARER_TOKEN, etc.)
+///
+/// Additional variables can be added via `shell_env_passthrough` config option,
+/// but they should be functional only, not credentials.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "HOME",
