@@ -21,3 +21,4 @@
 
 - `zeroclaw gateway` поддерживает `--new-pairing`: флаг очищает сохранённые paired-токены и генерирует новый код сопряжения.
 - В английский оригинал добавлены поверхности миграции OpenClaw: `zeroclaw onboard --migrate-openclaw`, `zeroclaw migrate openclaw` и агентный инструмент `openclaw_migration` (полная локализация этих пунктов в процессе).
+- `zeroclaw security audit --fail-on <warn|error>` — параметр CI-шлюза. При превышении порога команда завершается с exit 1. Подробнее в английском оригинале.

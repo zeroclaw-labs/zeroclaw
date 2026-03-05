@@ -21,3 +21,4 @@ Source anglaise:
 
 - `zeroclaw gateway` prend en charge `--new-pairing` pour effacer les tokens appairés et générer un nouveau code d'appairage.
 - Le guide anglais inclut désormais les surfaces de migration OpenClaw: `zeroclaw onboard --migrate-openclaw`, `zeroclaw migrate openclaw` et l'outil agent `openclaw_migration` (traduction complète en cours).
+- `zeroclaw security audit --fail-on <warn|error>` — paramètre de gate CI. Exit 1 si les résultats dépassent le seuil. Voir la source anglaise pour les détails.

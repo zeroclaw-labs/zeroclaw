@@ -73,6 +73,20 @@
 
 ---
 
+### 6. `security` (Έλεγχος Ασφάλειας)
+
+- `zeroclaw security audit` -- στατικός έλεγχος ασφάλειας ρυθμίσεων
+- `zeroclaw security audit --json` -- έξοδος σε JSON (για CI pipelines)
+- `zeroclaw security audit --memory` -- σάρωση περιεχομένου μνήμης
+- `zeroclaw security audit --fail-on warn` -- exit 1 αν υπάρχουν προειδοποιήσεις ή σφάλματα (CI gate)
+- `zeroclaw security audit --fail-on error` -- exit 1 αν υπάρχουν σφάλματα (CI gate)
+
+Το `--fail-on` εκτυπώνει πάντα την πλήρη αναφορά στο stdout πριν ελέγξει το κατώφλι. Aliases: `--fail-on warning`, `--fail-on err`.
+
+Πλήρης τεκμηρίωση: [Αγγλική αναφορά](../../commands-reference.md#security).
+
+---
+
 ## Βοήθεια και Τεκμηρίωση
 
 Για αναλυτικές πληροφορίες σχετικά με τις παραμέτρους κάθε εντολής, χρησιμοποιήστε το flag `--help`:

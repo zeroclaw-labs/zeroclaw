@@ -65,10 +65,20 @@ Xác minh lần cuối: **2026-03-04**.
 
 ### `security`
 
+- `zeroclaw security audit` -- chạy kiểm tra bảo mật cấu hình tĩnh
+- `zeroclaw security audit --json` -- xuất kết quả dạng JSON (dùng cho CI)
+- `zeroclaw security audit --memory` -- bao gồm quét nội dung bộ nhớ
+- `zeroclaw security audit --fail-on warn` -- exit 1 nếu có cảnh báo hoặc lỗi (CI gate)
+- `zeroclaw security audit --fail-on error` -- exit 1 nếu có lỗi (CI gate)
+- `zeroclaw security audit --json --fail-on error` -- JSON + CI gate
 - `zeroclaw security update-guard-corpus`
 - `zeroclaw security update-guard-corpus --source builtin`
 - `zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl`
 - `zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>`
+
+`--fail-on` luôn xuất toàn bộ báo cáo (JSON hoặc human-readable) ra stdout trước khi kiểm tra ngưỡng. Nếu vượt ngưỡng, thông báo lỗi ra stderr và exit 1. Alias: `--fail-on warning`, `--fail-on err`.
+
+Chi tiết đầy đủ: xem [bản tiếng Anh](../../commands-reference.md#security).
 
 Ghi chú:
 

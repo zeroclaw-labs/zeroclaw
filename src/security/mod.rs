@@ -19,6 +19,7 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod audit_cli;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod canary_guard;

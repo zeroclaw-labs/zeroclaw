@@ -472,17 +472,17 @@ Examples:
         tools: Vec<String>,
     },
 
-    /// Manage security maintenance tasks
+    /// Security tools, configuration audit, and maintenance
     #[command(long_about = "\
-Manage security maintenance tasks.
+Security tools, configuration audit, and maintenance.
 
-Commands in this group maintain security-related data stores used at runtime.
+Commands in this group perform security audits and maintain security-related data stores.
 
 Examples:
+  zeroclaw security audit
+  zeroclaw security audit --json --fail-on error
   zeroclaw security update-guard-corpus
-  zeroclaw security update-guard-corpus --source builtin
-  zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl
-  zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>")]
+  zeroclaw security update-guard-corpus --source builtin")]
     Security {
         #[command(subcommand)]
         security_command: SecurityCommands,
@@ -677,6 +677,7 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
 }
 
 #[derive(Subcommand, Debug)]
@@ -722,6 +723,41 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum SecurityCommands {
+    /// Run a static security configuration audit
+    #[command(long_about = "\
+Perform a read-only posture assessment of the current configuration \
+against security best practices. Each check is graded as ok, warn, or error, \
+and an overall risk grade (A-F) is computed.
+
+Use --json for machine-readable output suitable for CI pipelines.
+Use --memory to include memory content scanning (adds 5 checks for a total of 32).
+Use --fail-on <warn|error> to exit non-zero when findings reach the threshold (CI gate).
+
+Note: when --memory is used, the grade reflects both configuration posture \
+and memory content (32 checks). This is not directly comparable to \
+configuration-only audit (27 checks).
+
+Examples:
+  zeroclaw security audit
+  zeroclaw security audit --json
+  zeroclaw security audit --memory
+  zeroclaw security audit --memory --json
+  zeroclaw security audit --fail-on warn
+  zeroclaw security audit --json --fail-on error")]
+    Audit {
+        /// Output results as JSON (for CI/programmatic consumption)
+        #[arg(long)]
+        json: bool,
+
+        /// Scan memory content for credential leaks, injection patterns, and adversarial content
+        #[arg(long)]
+        memory: bool,
+
+        /// Fail (exit 1) when findings reach the specified severity threshold
+        #[arg(long, value_enum)]
+        fail_on: Option<security::audit_cli::FailThreshold>,
+    },
+
     /// Upsert semantic prompt-injection corpus records into the configured vector collection
     UpdateGuardCorpus {
         /// Corpus source: `builtin`, filesystem path, or HTTP(S) URL
@@ -1533,6 +1569,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
     }
 }
 
@@ -1770,6 +1807,11 @@ async fn handle_security_command(
     security_command: SecurityCommands,
 ) -> Result<()> {
     match security_command {
+        SecurityCommands::Audit {
+            json,
+            memory,
+            fail_on,
+        } => security::audit_cli::run(config, json, memory, fail_on).await,
         SecurityCommands::UpdateGuardCorpus { source, checksum } => {
             let report = security::semantic_guard::update_guard_corpus(
                 config,
