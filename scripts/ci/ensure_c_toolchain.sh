@@ -1,58 +1,85 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-have_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-with_privileges() {
-    if [ "$(id -u)" -eq 0 ]; then
-        "$@"
-    elif have_cmd sudo; then
-        sudo -n "$@"
-    else
-        return 1
+set_env_var() {
+    local key="$1"
+    local value="$2"
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        echo "${key}=${value}" >>"${GITHUB_ENV}"
     fi
 }
 
-if have_cmd cc && have_cmd c++; then
-    echo "C toolchain already available: cc=$(command -v cc), c++=$(command -v c++)"
+configure_linker() {
+    local linker="$1"
+    if [ ! -x "${linker}" ]; then
+        return 1
+    fi
+
+    set_env_var "CC" "${linker}"
+    set_env_var "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER" "${linker}"
+
+    if command -v g++ >/dev/null 2>&1; then
+        set_env_var "CXX" "$(command -v g++)"
+    elif command -v clang++ >/dev/null 2>&1; then
+        set_env_var "CXX" "$(command -v clang++)"
+    fi
+
+    echo "Using C linker: ${linker}"
+    "${linker}" --version | head -n 1 || true
+    return 0
+}
+
+echo "Ensuring C toolchain is available for Rust native dependencies"
+
+if command -v cc >/dev/null 2>&1; then
+    configure_linker "$(command -v cc)"
     exit 0
 fi
 
-echo "C toolchain missing; attempting installation for $(uname -s)..."
-
-case "$(uname -s)" in
-Linux)
-    if have_cmd apt-get; then
-        with_privileges apt-get update -y
-        with_privileges apt-get install -y --no-install-recommends build-essential
-    elif have_cmd dnf; then
-        with_privileges dnf install -y gcc gcc-c++ make
-    elif have_cmd yum; then
-        with_privileges yum install -y gcc gcc-c++ make
-    elif have_cmd apk; then
-        with_privileges apk add --no-cache build-base
-    else
-        echo "Unsupported Linux package manager; cannot install C toolchain automatically." >&2
-        exit 1
-    fi
-    ;;
-Darwin)
-    if ! xcode-select -p >/dev/null 2>&1; then
-        echo "Xcode Command Line Tools are required but not installed." >&2
-        exit 1
-    fi
-    ;;
-*)
-    echo "Unsupported OS: $(uname -s)" >&2
-    exit 1
-    ;;
-esac
-
-if ! have_cmd cc || ! have_cmd c++; then
-    echo "C toolchain installation failed: cc/c++ still unavailable." >&2
-    exit 1
+if command -v gcc >/dev/null 2>&1; then
+    configure_linker "$(command -v gcc)"
+    exit 0
 fi
 
-echo "C toolchain ready: cc=$(command -v cc), c++=$(command -v c++)"
+if command -v clang >/dev/null 2>&1; then
+    configure_linker "$(command -v clang)"
+    exit 0
+fi
+
+resolve_cc_after_bootstrap() {
+    if command -v cc >/dev/null 2>&1; then
+        command -v cc
+        return 0
+    fi
+
+    local shim_dir="${RUNNER_TEMP:-/tmp}/cc-shim"
+    local shim_cc="${shim_dir}/cc"
+    if [ -x "${shim_cc}" ]; then
+        export PATH="${shim_dir}:${PATH}"
+        command -v cc
+        return 0
+    fi
+
+    return 1
+}
+
+# Prefer the resilient provisioning path (package manager + Zig fallback) used by CI Rust jobs.
+if [ -x "${script_dir}/ensure_cc.sh" ]; then
+    if bash "${script_dir}/ensure_cc.sh"; then
+        if cc_path="$(resolve_cc_after_bootstrap)"; then
+            configure_linker "${cc_path}"
+            exit 0
+        fi
+        echo "::warning::C toolchain bootstrap reported success but 'cc' is still unavailable in current step."
+    fi
+fi
+
+if [ "${ALLOW_MISSING_C_TOOLCHAIN:-}" = "1" ] || [ "${ALLOW_MISSING_C_TOOLCHAIN:-}" = "true" ]; then
+    echo "::warning::No usable C compiler found; continuing because ALLOW_MISSING_C_TOOLCHAIN is enabled."
+    exit 0
+fi
+
+echo "No usable C compiler found (cc/gcc/clang)." >&2
+exit 1
