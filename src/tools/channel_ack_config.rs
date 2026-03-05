@@ -618,7 +618,27 @@ impl Tool for ChannelAckConfigTool {
                 },
                 "rules": {
                     "anyOf": [
-                        {"type": "array", "items": {"type": "object"}},
+                        {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type": "boolean"},
+                                "contains_any": {"type": "array", "items": {"type": "string"}},
+                                "contains_all": {"type": "array", "items": {"type": "string"}},
+                                "contains_none": {"type": "array", "items": {"type": "string"}},
+                                "regex_any": {"type": "array", "items": {"type": "string"}},
+                                "regex_all": {"type": "array", "items": {"type": "string"}},
+                                "regex_none": {"type": "array", "items": {"type": "string"}},
+                                "sender_ids": {"type": "array", "items": {"type": "string"}},
+                                "chat_ids": {"type": "array", "items": {"type": "string"}},
+                                "chat_types": {"type": "array", "items": {"type": "string", "enum": ["direct", "group"]}},
+                                "locale_any": {"type": "array", "items": {"type": "string"}},
+                                "action": {"type": "string", "enum": ["react", "suppress"]},
+                                "sample_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "strategy": {"type": "string", "enum": ["random", "first"]},
+                                "emojis": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "additionalProperties": false
+                        }},
                         {"type": "null"}
                     ]
                 },
@@ -640,7 +660,8 @@ impl Tool for ChannelAckConfigTool {
                         "sample_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                         "strategy": {"type": "string", "enum": ["random", "first"]},
                         "emojis": {"type": "array", "items": {"type": "string"}}
-                    }
+                    },
+                    "additionalProperties": false
                 },
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},
