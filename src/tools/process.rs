@@ -69,9 +69,28 @@ impl ProcessTool {
 
     fn prune_exited_processes(&self) {
         if let Ok(mut processes) = self.processes.write() {
-            processes.retain(|_, entry| match entry.child.lock() {
-                Ok(mut child) => matches!(child.try_wait(), Ok(None)),
-                Err(_) => false,
+            processes.retain(|id, entry| match entry.child.lock() {
+                Ok(mut child) => match child.try_wait() {
+                    Ok(None) => true,
+                    Ok(Some(_)) => false,
+                    Err(error) => {
+                        tracing::warn!(
+                            process_id = *id,
+                            process_pid = entry.pid,
+                            %error,
+                            "Failed to inspect process state during prune; retaining tracking entry"
+                        );
+                        true
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        process_id = *id,
+                        process_pid = entry.pid,
+                        "Failed to access process state during prune; retaining tracking entry"
+                    );
+                    true
+                }
             });
         }
     }
@@ -185,11 +204,16 @@ impl ProcessTool {
         let pid = match child.id() {
             Some(pid) => pid,
             None => {
-                let _ = child.start_kill();
+                let error = match child.start_kill() {
+                    Ok(()) => "Failed to capture process PID".to_string(),
+                    Err(kill_error) => format!(
+                        "Failed to capture process PID; additionally failed to terminate spawned child: {kill_error}"
+                    ),
+                };
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Failed to capture process PID".to_string()),
+                    error: Some(error),
                 });
             }
         };
@@ -998,5 +1022,46 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("poisoned state"));
+    }
+
+    #[tokio::test]
+    async fn prune_retains_entry_when_child_lock_is_poisoned() {
+        let tool = make_tool();
+        let spawn_result = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo prune_poison_test"
+            }))
+            .await
+            .expect("spawn should return result");
+        assert!(spawn_result.success);
+        let spawn_output: serde_json::Value =
+            serde_json::from_str(&spawn_result.output).expect("spawn output should be json");
+        let id = spawn_output["id"]
+            .as_u64()
+            .expect("process id should exist");
+        let id = usize::try_from(id).expect("process id should fit in usize");
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let processes = tool
+                .processes
+                .read()
+                .expect("process table read lock should be acquired");
+            let entry = processes.get(&id).expect("spawned process should be tracked");
+            let _guard = entry.child.lock().expect("child lock should be acquired");
+            panic!("poison child lock");
+        }));
+        assert!(panic_result.is_err(), "expected panic to poison child lock");
+
+        tool.prune_exited_processes();
+
+        let processes = tool
+            .processes
+            .read()
+            .expect("process table read lock should be acquired");
+        assert!(
+            processes.contains_key(&id),
+            "prune should retain entries when child state lock is poisoned"
+        );
     }
 }
