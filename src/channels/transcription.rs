@@ -111,7 +111,11 @@ async fn transcribe_with_whisper_cpp(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await;
+            if let Err(e) =
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await
+            {
+                tracing::warn!("Failed to restrict temp WAV file permissions: {e}");
+            }
         }
         (tmp.clone(), Some(tmp))
     };
@@ -129,7 +133,11 @@ async fn transcribe_with_whisper_cpp(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).await;
+        if let Err(e) =
+            tokio::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).await
+        {
+            tracing::warn!("Failed to restrict whisper-cli output dir permissions: {e}");
+        }
     }
     let stem = input_path
         .file_stem()
@@ -240,7 +248,11 @@ async fn transcribe_with_python_whisper(file_path: &str) -> anyhow::Result<Strin
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700)).await;
+        if let Err(e) =
+            tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700)).await
+        {
+            tracing::warn!("Failed to restrict Python whisper temp dir permissions: {e}");
+        }
     }
 
     let tmp_dir_str = match tmp_dir.to_str() {

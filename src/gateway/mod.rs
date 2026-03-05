@@ -2379,8 +2379,14 @@ async fn handle_bluebubbles_webhook(
         }
 
         for msg in &messages {
-            // Log sender only — content may include personal message text.
-            tracing::info!("BlueBubbles iMessage from {}", msg.sender);
+            // Hash the sender to avoid logging raw identifiers (phone numbers / emails).
+            let sender_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                msg.sender.hash(&mut h);
+                h.finish()
+            };
+            tracing::info!("BlueBubbles iMessage (sender_id={sender_hash:08x})");
 
             let session_id = gateway_message_session_id(msg);
             if state_bg.auto_save {

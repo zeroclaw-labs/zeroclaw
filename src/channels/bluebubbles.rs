@@ -540,16 +540,13 @@ impl BlueBubblesChannel {
             {
                 use tokio::io::AsyncWriteExt as _;
                 #[cfg(unix)]
-                let mut f = {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-                    tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&tmp_path)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to create temp audio file: {e}"))?
-                };
+                let mut f = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create temp audio file: {e}"))?;
                 #[cfg(not(unix))]
                 let mut f = tokio::fs::File::create(&tmp_path)
                     .await
