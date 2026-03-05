@@ -31,6 +31,8 @@ export interface AuthState {
   pair: (code: string) => Promise<void>;
   /** Clear the stored token and sign out. */
   logout: () => void;
+  /** Re-check auth state (e.g. after external login sets a token). */
+  refreshAuth: () => void;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -96,12 +98,19 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setAuthenticated(false);
   }, []);
 
+  const refreshAuth = useCallback((): void => {
+    const t = readToken();
+    setTokenState(t);
+    setAuthenticated(t !== null && t.length > 0);
+  }, []);
+
   const value: AuthState = {
     token,
     isAuthenticated: authenticated,
     loading,
     pair,
     logout,
+    refreshAuth,
   };
 
   return React.createElement(AuthContext.Provider, { value }, children);

@@ -354,6 +354,253 @@ pub async fn handle_auth_heartbeat(
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
+// ── POST /api/auth/kakao/callback ────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct KakaoCallbackBody {
+    pub code: String,
+}
+
+pub async fn handle_auth_kakao_callback(
+    State(state): State<AppState>,
+    Json(body): Json<KakaoCallbackBody>,
+) -> impl IntoResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "Auth not configured" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Get Kakao REST API key from config
+    let kakao_rest_key = match std::env::var("ZEROCLAW_KAKAO_REST_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+    {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "Kakao OAuth not configured" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Exchange authorization code for access token
+    let client = reqwest::Client::new();
+    // Use ZEROCLAW_PUBLIC_URL env var if set, otherwise fall back to localhost
+    let redirect_uri = match std::env::var("ZEROCLAW_PUBLIC_URL").ok().filter(|u| !u.is_empty()) {
+        Some(base) => format!("{base}/api/auth/kakao/redirect"),
+        None => {
+            let port = state.config.lock().gateway.port;
+            format!("http://localhost:{port}/api/auth/kakao/redirect")
+        }
+    };
+
+    let token_resp = client
+        .post("https://kauth.kakao.com/oauth/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &kakao_rest_key),
+            ("redirect_uri", &redirect_uri),
+            ("code", &body.code),
+        ])
+        .send()
+        .await;
+
+    let token_resp = match token_resp {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Kakao token exchange failed: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Failed to contact Kakao auth server" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !token_resp.status().is_success() {
+        let status = token_resp.status();
+        let body_text = token_resp.text().await.unwrap_or_default();
+        tracing::error!("Kakao token exchange error ({status}): {body_text}");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Kakao token exchange failed: {status}") })),
+        )
+            .into_response();
+    }
+
+    let token_data: serde_json::Value = match token_resp.json().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Kakao token parse error: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Invalid response from Kakao" })),
+            )
+                .into_response();
+        }
+    };
+
+    let access_token = match token_data.get("access_token").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "No access token from Kakao" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Get user profile from Kakao
+    let profile_resp = client
+        .get("https://kapi.kakao.com/v2/user/me")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .await;
+
+    let profile_resp = match profile_resp {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Kakao profile fetch failed: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Failed to fetch Kakao profile" })),
+            )
+                .into_response();
+        }
+    };
+
+    let profile_data: serde_json::Value = match profile_resp.json().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Kakao profile parse error: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Invalid Kakao profile response" })),
+            )
+                .into_response();
+        }
+    };
+
+    let kakao_id = profile_data
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
+    let nickname = profile_data
+        .get("kakao_account")
+        .and_then(|a| a.get("profile"))
+        .and_then(|p| p.get("nickname"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("kakao_user");
+
+    if kakao_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Could not get Kakao user ID" })),
+        )
+            .into_response();
+    }
+
+    // Ensure channel_links table exists
+    let _ = auth_store.ensure_channel_links_table();
+
+    // Check if this Kakao ID is already linked to a user
+    let existing_user = auth_store.find_channel_link("kakao", &kakao_id).ok().flatten();
+
+    let (user_id, username) = if let Some(user) = existing_user {
+        (user.id, user.username)
+    } else {
+        // Auto-register a new user with Kakao identity
+        let auto_username = format!("kakao_{}", &kakao_id);
+        // Generate a random password (user won't need it for Kakao login)
+        let auto_password: String = (0..24)
+            .map(|_| {
+                let idx: u8 = rand::random::<u8>() % 62;
+                match idx {
+                    0..=9 => (b'0' + idx) as char,
+                    10..=35 => (b'a' + idx - 10) as char,
+                    _ => (b'A' + idx - 36) as char,
+                }
+            })
+            .collect();
+
+        match auth_store.register(&auto_username, &auto_password) {
+            Ok(uid) => {
+                let _ = auth_store.link_channel("kakao", &kakao_id, &uid);
+                (uid, auto_username)
+            }
+            Err(e) => {
+                // If username already exists (race condition), try to find the link again
+                if e.to_string().contains("already taken") {
+                    match auth_store.find_channel_link("kakao", &kakao_id).ok().flatten() {
+                        Some(user) => (user.id, user.username),
+                        None => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({ "error": "Account creation conflict. Please try again." })),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("Registration failed: {e}") })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // Create session
+    let session_token = match auth_store.create_session(&user_id, None, Some("kakao_web")) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Session error: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "token": session_token,
+            "user_id": user_id,
+            "username": username,
+            "kakao_id": kakao_id,
+            "kakao_nickname": nickname,
+        })),
+    )
+        .into_response()
+}
+
+// ── GET /api/auth/kakao/redirect ────────────────────────────────
+// Browser redirect endpoint — receives ?code=xxx from Kakao and redirects to SPA
+
+pub async fn handle_auth_kakao_redirect(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let code = params.get("code").cloned().unwrap_or_default();
+    // Redirect to the SPA Kakao callback route
+    let redirect_url = format!("/auth/kakao/callback?code={}", urlencoding::encode(&code));
+    axum::response::Redirect::temporary(&redirect_url).into_response()
+}
+
 // ── GET /api/agent/info ─────────────────────────────────────────
 
 pub async fn handle_agent_info(State(state): State<AppState>) -> impl IntoResponse {

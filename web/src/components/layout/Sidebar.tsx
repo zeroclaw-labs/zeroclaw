@@ -62,7 +62,7 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
               className="h-8 w-8 rounded-lg object-cover"
             />
             <span className="text-lg font-semibold text-white tracking-wide">
-              ZeroClaw
+              MoA
             </span>
           </div>
           <button

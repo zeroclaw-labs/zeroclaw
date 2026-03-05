@@ -1086,6 +1086,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(auth_api::handle_auth_device_verify_pairing),
         )
         .route("/api/auth/heartbeat", post(auth_api::handle_auth_heartbeat))
+        .route("/api/auth/kakao/callback", post(auth_api::handle_auth_kakao_callback))
+        .route("/api/auth/kakao/redirect", get(auth_api::handle_auth_kakao_redirect))
         .route("/api/agent/info", get(auth_api::handle_agent_info))
         // ── Remote device access ──
         .route("/api/remote/login", post(remote::handle_remote_login))

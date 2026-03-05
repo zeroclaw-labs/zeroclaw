@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useSearchParams } from 'react-router-dom';
 import { useState, useEffect, createContext, useContext } from 'react';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
@@ -12,8 +12,11 @@ import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
+import AuthPage from './pages/AuthPage';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { setLocale, type Locale } from './lib/i18n';
+import { authKakaoCallback } from './lib/api';
+import { setToken } from './lib/auth';
 
 // Locale context
 interface LocaleContextType {
@@ -28,66 +31,68 @@ export const LocaleContext = createContext<LocaleContextType>({
 
 export const useLocaleContext = () => useContext(LocaleContext);
 
-// Pairing dialog component
-function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
-  const [code, setCode] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
+// Kakao OAuth callback handler
+function KakaoCallback() {
+  const [searchParams] = useSearchParams();
+  const [error, setError] = useState<string | null>(null);
+  const { refreshAuth } = useAuth();
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError('');
-    try {
-      await onPair(code);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Pairing failed');
-    } finally {
-      setLoading(false);
+  useEffect(() => {
+    const code = searchParams.get('code');
+    if (!code) {
+      setError('No authorization code received from Kakao');
+      return;
     }
-  };
+
+    authKakaoCallback(code)
+      .then(() => {
+        refreshAuth();
+        window.location.href = '/';
+      })
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : 'Kakao login failed');
+      });
+  }, [searchParams, refreshAuth]);
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <div className="bg-gray-900 rounded-xl p-8 max-w-md border border-gray-800 text-center">
+          <p className="text-red-400 mb-4">{error}</p>
+          <a href="/" className="text-blue-400 hover:text-blue-300">Back to login</a>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-      <div className="bg-gray-900 rounded-xl p-8 w-full max-w-md border border-gray-800">
-        <div className="text-center mb-6">
-          <h1 className="text-2xl font-bold text-white mb-2">ZeroClaw</h1>
-          <p className="text-gray-400">Enter the pairing code from your terminal</p>
-        </div>
-        <form onSubmit={handleSubmit}>
-          <input
-            type="text"
-            value={code}
-            onChange={(e) => setCode(e.target.value)}
-            placeholder="6-digit code"
-            className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-center text-2xl tracking-widest focus:outline-none focus:border-blue-500 mb-4"
-            maxLength={6}
-            autoFocus
-          />
-          {error && (
-            <p className="text-red-400 text-sm mb-4 text-center">{error}</p>
-          )}
-          <button
-            type="submit"
-            disabled={loading || code.length < 6}
-            className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
-          >
-            {loading ? 'Pairing...' : 'Pair'}
-          </button>
-        </form>
-      </div>
+      <p className="text-gray-400">Processing Kakao login...</p>
     </div>
   );
 }
 
 function AppContent() {
-  const { isAuthenticated, loading, pair, logout } = useAuth();
+  const { isAuthenticated, loading, pair, logout, refreshAuth } = useAuth();
   const [locale, setLocaleState] = useState<Locale>('tr');
+  const [requiresPairing, setRequiresPairing] = useState(true);
 
   const setAppLocale = (newLocale: Locale) => {
     setLocaleState(newLocale);
     setLocale(newLocale);
   };
+
+  // Check health to determine if pairing is required
+  useEffect(() => {
+    fetch('/health')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && typeof data.require_pairing === 'boolean') {
+          setRequiresPairing(data.require_pairing);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // Listen for 401 events to force logout
   useEffect(() => {
@@ -101,18 +106,46 @@ function AppContent() {
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-        <p className="text-gray-400">Connecting...</p>
+        <div className="text-center">
+          <img
+            src={`${import.meta.env.BASE_URL}MoA_icon_128px.png`}
+            alt="MoA"
+            className="h-16 w-16 rounded-2xl object-cover mx-auto mb-4 animate-pulse"
+          />
+          <p className="text-gray-400">Connecting...</p>
+        </div>
       </div>
     );
   }
 
   if (!isAuthenticated) {
-    return <PairingDialog onPair={pair} />;
+    return (
+      <Routes>
+        <Route
+          path="/auth/kakao/callback"
+          element={<KakaoCallback />}
+        />
+        <Route
+          path="*"
+          element={
+            <AuthPage
+              onAuthSuccess={(token) => {
+                setToken(token);
+                refreshAuth();
+              }}
+              onPair={pair}
+              showPairing={requiresPairing}
+            />
+          }
+        />
+      </Routes>
+    );
   }
 
   return (
     <LocaleContext.Provider value={{ locale, setAppLocale }}>
       <Routes>
+        <Route path="/auth/kakao/callback" element={<KakaoCallback />} />
         <Route element={<Layout />}>
           <Route path="/" element={<Dashboard />} />
           <Route path="/agent" element={<AgentChat />} />

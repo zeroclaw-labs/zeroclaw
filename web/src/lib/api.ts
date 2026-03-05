@@ -283,3 +283,105 @@ export function getCliTools(): Promise<CliTool[]> {
     unwrapField(data, 'cli_tools'),
   );
 }
+
+// ---------------------------------------------------------------------------
+// User Auth (register / login / logout)
+// ---------------------------------------------------------------------------
+
+export interface AuthRegisterResponse {
+  status: string;
+  user_id: string;
+}
+
+export interface AuthLoginResponse {
+  status: string;
+  token: string;
+  user_id: string;
+  username: string;
+  devices: unknown[];
+}
+
+export async function authRegister(
+  username: string,
+  password: string,
+): Promise<AuthRegisterResponse> {
+  const response = await fetch('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Registration failed (${response.status})`);
+  }
+
+  return response.json() as Promise<AuthRegisterResponse>;
+}
+
+export async function authLogin(
+  username: string,
+  password: string,
+  deviceId?: string,
+  deviceName?: string,
+): Promise<AuthLoginResponse> {
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username,
+      password,
+      device_id: deviceId,
+      device_name: deviceName,
+    }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Login failed (${response.status})`);
+  }
+
+  const data = (await response.json()) as AuthLoginResponse;
+  setToken(data.token);
+  return data;
+}
+
+export async function authLogout(): Promise<void> {
+  const token = getToken();
+  if (token) {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+  clearToken();
+}
+
+// ---------------------------------------------------------------------------
+// Kakao OAuth
+// ---------------------------------------------------------------------------
+
+export interface KakaoAuthResponse {
+  status: string;
+  token: string;
+  user_id: string;
+  username: string;
+  kakao_id: string;
+}
+
+export async function authKakaoCallback(code: string): Promise<KakaoAuthResponse> {
+  const response = await fetch('/api/auth/kakao/callback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Kakao login failed (${response.status})`);
+  }
+
+  const data = (await response.json()) as KakaoAuthResponse;
+  setToken(data.token);
+  return data;
+}
