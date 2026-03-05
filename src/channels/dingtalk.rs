@@ -297,15 +297,19 @@ impl DingTalkChannel {
         Ok(())
     }
 
-    async fn send_markdown_via_session(&self, message: &SendMessage) -> anyhow::Result<()> {
+    async fn lookup_session_webhook(&self, recipient: &str) -> anyhow::Result<String> {
         let webhooks = self.session_webhooks.read().await;
-        let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
+        webhooks.get(recipient).cloned().ok_or_else(|| {
             anyhow::anyhow!(
                 "No session webhook found for chat {}. \
                  The user must send a message first to establish a session.",
-                message.recipient
+                recipient
             )
-        })?;
+        })
+    }
+
+    async fn send_markdown_via_session(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let webhook_url = self.lookup_session_webhook(&message.recipient).await?;
 
         let title = message.subject.as_deref().unwrap_or("ZeroClaw");
         let body = serde_json::json!({
@@ -318,7 +322,7 @@ impl DingTalkChannel {
 
         let resp = self
             .http_client()
-            .post(webhook_url)
+            .post(&webhook_url)
             .json(&body)
             .send()
             .await?;
@@ -978,5 +982,26 @@ client_secret = "secret"
         assert!(result.is_ok());
         let drafts = card.draft_states.read().await;
         assert!(drafts.contains_key("draft-1"));
+    }
+
+    #[tokio::test]
+    async fn lookup_session_webhook_returns_cloned_url() {
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            vec!["*".into()],
+            crate::config::schema::DingTalkMessageType::Markdown,
+            None,
+            None,
+            "content".into(),
+        );
+
+        {
+            let mut webhooks = ch.session_webhooks.write().await;
+            webhooks.insert("chat-1".to_string(), "https://example.com/hook".to_string());
+        }
+
+        let url = ch.lookup_session_webhook("chat-1").await.unwrap();
+        assert_eq!(url, "https://example.com/hook");
     }
 }

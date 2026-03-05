@@ -6915,6 +6915,25 @@ allowed_roots = []
     }
 
     #[test]
+    async fn config_validate_rejects_dingtalk_card_with_empty_template_key() {
+        let mut cfg = Config::default();
+        cfg.channels_config.dingtalk = Some(DingTalkConfig {
+            client_id: "app-key".into(),
+            client_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+            message_type: DingTalkMessageType::Card,
+            card_template_id: Some("tpl-id".into()),
+            card_template_key: "   ".into(),
+            robot_code: None,
+        });
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("channels_config.dingtalk.card_template_key must not be empty"));
+    }
+
+    #[test]
     async fn runtime_config_default() {
         let r = RuntimeConfig::default();
         assert_eq!(r.kind, "native");
