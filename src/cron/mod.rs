@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::security::SecurityPolicy;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 pub mod consolidation;
 mod schedule;
@@ -15,11 +15,71 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, due_jobs, get_job, list_jobs, list_runs, record_last_run, record_run,
+    remove_job, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
+fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    security
+        .validate_command_execution(command, approved)
+        .map(|_| ())
+        .map_err(|reason| anyhow!("Command blocked by security policy: {reason}"))
+}
+
+pub fn add_shell_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+) -> Result<CronJob> {
+    add_shell_job_with_approval(config, name, schedule, command, false)
+}
+
+pub fn add_shell_job_with_approval(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    validate_shell_command(config, command, approved)?;
+    store::add_shell_job(config, name, schedule, command)
+}
+
+pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+    add_job_approved(config, expression, command, false)
+}
+
+pub fn add_job_approved(
+    config: &Config,
+    expression: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    let schedule = Schedule::Cron {
+        expr: expression.to_string(),
+        tz: None,
+    };
+    add_shell_job_with_approval(config, None, schedule, command, approved)
+}
+
+pub fn update_shell_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    update_shell_job_with_approval(config, job_id, patch, false)
+}
+
+pub fn update_shell_job_with_approval(
+    config: &Config,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
+    if let Some(command) = patch.command.as_deref() {
+        validate_shell_command(config, command, approved)?;
+    }
+    update_job(config, job_id, patch)
+}
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
@@ -165,9 +225,18 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 }
 
 pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
+    add_once_approved(config, delay, command, false)
+}
+
+pub fn add_once_approved(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at(config, at, command)
+    add_once_at_approved(config, at, command, approved)
 }
 
 pub fn add_once_at(
@@ -175,8 +244,17 @@ pub fn add_once_at(
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
+    add_once_at_approved(config, at, command, false)
+}
+
+pub fn add_once_at_approved(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job_with_approval(config, None, schedule, command, approved)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {

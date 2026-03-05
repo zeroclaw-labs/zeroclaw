@@ -118,6 +118,16 @@ Notes:
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
+#### Live model availability test
+
+```bash
+./dev/test_models.sh              # test all Gemini models + profile rotation
+./dev/test_models.sh models       # test model availability only
+./dev/test_models.sh profiles     # test profile rotation only
+```
+
+Runs a Rust integration test (`tests/gemini_model_availability.rs`) that verifies each model against the OAuth endpoint (cloudcode-pa). Requires valid Gemini OAuth credentials in `auth-profiles.json`.
+
 ### `doctor`
 
 - `zeroclaw doctor`

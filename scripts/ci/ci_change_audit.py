@@ -9,6 +9,7 @@ The report is designed for change-control traceability and light policy checks:
 - detect risky pipe-to-shell commands (e.g. `curl ... | sh`)
 - detect newly introduced `pull_request_target` triggers in supported YAML forms
 - detect broad `permissions: write-all` grants
+- detect unsafe JS execution patterns in workflow helper scripts
 - detect newly introduced `${{ secrets.* }}` references
 """
 
@@ -46,12 +47,27 @@ WORKFLOW_PATH_PREFIXES = (
 )
 WORKFLOW_EXTENSIONS = (".yml", ".yaml")
 SHELL_EXTENSIONS = (".sh", ".bash")
+JS_EXTENSIONS = (".js", ".cjs", ".mjs")
 USES_RE = re.compile(r"^\+\s*(?:-\s*)?uses:\s*([^\s#]+)")
 SECRETS_RE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*}}")
 SHA_PIN_RE = re.compile(r"^[0-9a-f]{40}$")
 PIPE_TO_SHELL_RE = re.compile(r"\b(?:curl|wget)\b.*\|\s*(?:sh|bash)\b")
 PERMISSION_WRITE_RE = re.compile(r"^\+\s*([a-z-]+):\s*write\s*$")
 PERMISSIONS_WRITE_ALL_RE = re.compile(r"^\+\s*permissions\s*:\s*write-all\s*$", re.IGNORECASE)
+UNSAFE_JS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("eval()", re.compile(r"\beval\s*\(")),
+    ("Function()", re.compile(r"\bFunction\s*\(")),
+    (
+        "vm.* execution",
+        re.compile(r"\bvm\.(?:runInContext|runInNewContext|runInThisContext|Script)\b"),
+    ),
+    (
+        "child_process dynamic execution",
+        re.compile(
+            r"\bchild_process\.(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*\("
+        ),
+    ),
+)
 
 
 def line_adds_pull_request_target(added_text: str) -> bool:
@@ -90,6 +106,18 @@ def is_shell_path(path: str) -> bool:
     return path.endswith(SHELL_EXTENSIONS) or path.startswith(".githooks/")
 
 
+def is_workflow_script_js_path(path: str) -> bool:
+    return path.startswith(".github/workflows/scripts/") and path.endswith(JS_EXTENSIONS)
+
+
+def detect_unsafe_js_patterns(added_text: str) -> list[str]:
+    stripped = added_text.lstrip()
+    # Ignore comments for this policy check to reduce false positives in docs/comments.
+    if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+        return []
+    return [label for label, pattern in UNSAFE_JS_PATTERNS if pattern.search(added_text)]
+
+
 @dataclass
 class FileAudit:
     path: str
@@ -102,6 +130,7 @@ class FileAudit:
     added_pipe_to_shell: list[str] = field(default_factory=list)
     added_write_permissions: list[str] = field(default_factory=list)
     added_pull_request_target: int = 0
+    added_unsafe_js_patterns: list[str] = field(default_factory=list)
 
     @property
     def risk_level(self) -> str:
@@ -109,6 +138,7 @@ class FileAudit:
             self.unpinned_actions
             or self.added_pipe_to_shell
             or self.added_pull_request_target
+            or self.added_unsafe_js_patterns
             or "write-all" in self.added_write_permissions
         ):
             return "high"
@@ -179,7 +209,8 @@ def build_markdown(
     lines.append(
         f"- Policy violations: `{len(violations)}` "
         "(currently: unpinned `uses:`, pipe-to-shell commands, broad "
-        "`permissions: write-all`, and new `pull_request_target` triggers)"
+        "`permissions: write-all`, unsafe workflow-script JS execution patterns, "
+        "and new `pull_request_target` triggers)"
     )
     lines.append("")
 
@@ -197,14 +228,15 @@ def build_markdown(
     lines.append("")
     lines.append(
         "| Path | Status | +Lines | -Lines | New Actions | New Secret Refs | "
-        "Pipe-to-Shell | New `*: write` | New `pull_request_target` | Risk |"
+        "Pipe-to-Shell | Unsafe JS Patterns | New `*: write` | New `pull_request_target` | Risk |"
     )
-    lines.append("| --- | --- | ---:| ---:| ---:| ---:| ---:| ---:| ---:| --- |")
+    lines.append("| --- | --- | ---:| ---:| ---:| ---:| ---:| ---:| ---:| ---:| --- |")
     for audit in sorted(audits, key=lambda x: x.path):
         lines.append(
             f"| `{audit.path}` | `{audit.status}` | {audit.added} | {audit.deleted} | "
             f"{len(audit.added_actions)} | {len(audit.added_secret_refs)} | "
-            f"{len(audit.added_pipe_to_shell)} | {len(set(audit.added_write_permissions))} | "
+            f"{len(audit.added_pipe_to_shell)} | {len(set(audit.added_unsafe_js_patterns))} | "
+            f"{len(set(audit.added_write_permissions))} | "
             f"{audit.added_pull_request_target} | "
             f"`{audit.risk_level}` |"
         )
@@ -228,6 +260,10 @@ def build_markdown(
                 lines.append("- Added pipe-to-shell commands (high risk):")
                 for cmd in audit.added_pipe_to_shell:
                     lines.append(f"  - `{cmd}`")
+            if audit.added_unsafe_js_patterns:
+                lines.append("- Added unsafe workflow-script JS patterns (high risk):")
+                for pattern_name in sorted(set(audit.added_unsafe_js_patterns)):
+                    lines.append(f"  - `{pattern_name}`")
             if audit.added_write_permissions:
                 lines.append("- Added write permissions:")
                 for permission_name in sorted(set(audit.added_write_permissions)):
@@ -272,6 +308,7 @@ def main() -> int:
         audit = FileAudit(path=path, status=status, added=added, deleted=deleted)
         workflow_yaml = is_workflow_yaml_path(path)
         shell_script = is_shell_path(path)
+        workflow_script_js = is_workflow_script_js_path(path)
 
         for line in parse_patch_added_lines(args.base_sha, args.head_sha, path):
             added_text = line[1:].strip()
@@ -295,6 +332,14 @@ def main() -> int:
                 violations.append(
                     f"{path}: pipe-to-shell command introduced -> `{command}`"
                 )
+
+            if workflow_script_js:
+                unsafe_matches = detect_unsafe_js_patterns(added_text)
+                for pattern_name in unsafe_matches:
+                    audit.added_unsafe_js_patterns.append(pattern_name)
+                    violations.append(
+                        f"{path}: unsafe workflow-script JS pattern introduced -> `{pattern_name}`"
+                    )
 
             permission_match = PERMISSION_WRITE_RE.match(line)
             if permission_match and workflow_yaml:
@@ -323,6 +368,7 @@ def main() -> int:
         "new_unpinned_actions": sum(len(a.unpinned_actions) for a in audits),
         "new_secret_references": sum(len(a.added_secret_refs) for a in audits),
         "new_pipe_to_shell_commands": sum(len(a.added_pipe_to_shell) for a in audits),
+        "new_unsafe_js_patterns": sum(len(set(a.added_unsafe_js_patterns)) for a in audits),
         "new_write_permissions": sum(len(set(a.added_write_permissions)) for a in audits),
         "new_pull_request_target_triggers": sum(a.added_pull_request_target for a in audits),
         "violations": len(violations),
@@ -342,6 +388,7 @@ def main() -> int:
                 "unpinned_actions": a.unpinned_actions,
                 "added_secret_refs": sorted(set(a.added_secret_refs)),
                 "added_pipe_to_shell": a.added_pipe_to_shell,
+                "added_unsafe_js_patterns": sorted(set(a.added_unsafe_js_patterns)),
                 "added_write_permissions": sorted(set(a.added_write_permissions)),
                 "added_pull_request_target": a.added_pull_request_target,
                 "risk_level": a.risk_level,

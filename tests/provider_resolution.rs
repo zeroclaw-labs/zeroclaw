@@ -472,3 +472,115 @@ fn factory_anthropic_custom_endpoint_resolves() {
         None,
     );
 }
+
+#[tokio::test]
+async fn model_fallback_within_same_provider() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use zeroclaw::providers::reliable::ReliableProvider;
+    use zeroclaw::providers::traits::{ChatMessage, Provider};
+
+    // Mock provider that fails for gemini-2.0 but succeeds for gemini-1.5-pro
+    struct GeminiMock {
+        calls: Arc<AtomicUsize>,
+        requested_models: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for GeminiMock {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temp: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_models
+                .lock()
+                .unwrap()
+                .push(model.to_string());
+
+            if model == "gemini-2.0-flash-exp" {
+                // Simulate quota exceeded for gemini-2.0
+                anyhow::bail!("429 Rate Limited: quota exceeded for gemini-2.0-flash-exp")
+            } else if model == "gemini-1.5-pro" {
+                Ok(format!("success with {}", model))
+            } else {
+                anyhow::bail!("Unknown model: {}", model)
+            }
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temp: f64,
+        ) -> anyhow::Result<String> {
+            unimplemented!()
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temp: f64,
+        ) -> anyhow::Result<zeroclaw::providers::traits::ChatResponse> {
+            unimplemented!()
+        }
+    }
+
+    let requested_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let gemini = GeminiMock {
+        calls: Arc::new(AtomicUsize::new(0)),
+        requested_models: Arc::clone(&requested_models),
+    };
+
+    // Configure model fallback: gemini-2.0-flash-exp → gemini-1.5-pro
+    let mut model_fallbacks = HashMap::new();
+    model_fallbacks.insert(
+        "gemini-2.0-flash-exp".to_string(),
+        vec!["gemini-1.5-pro".to_string()],
+    );
+
+    let provider = ReliableProvider::new(
+        vec![("gemini".to_string(), Box::new(gemini) as Box<dyn Provider>)],
+        1,  // 1 retry
+        10, // 10ms backoff
+    )
+    .with_model_fallbacks(model_fallbacks);
+
+    // Request with gemini-2.0-flash-exp (will fail due to quota)
+    let result = provider
+        .chat_with_system(None, "test", "gemini-2.0-flash-exp", 0.7)
+        .await
+        .unwrap();
+
+    // Verify model fallback worked
+    let models = requested_models.lock().unwrap();
+
+    // Should try gemini-2.0 (with retries), then fallback to gemini-1.5-pro
+    assert!(
+        models.len() >= 2,
+        "Should try at least 2 models (with retries): {:?}",
+        models
+    );
+
+    // First attempts should be gemini-2.0 (potentially multiple due to retries)
+    assert_eq!(models[0], "gemini-2.0-flash-exp", "First try gemini-2.0");
+
+    // Last attempt should be the fallback model
+    assert_eq!(
+        models.last().unwrap(),
+        "gemini-1.5-pro",
+        "Should eventually fallback to gemini-1.5-pro"
+    );
+
+    assert!(
+        result.contains("gemini-1.5-pro"),
+        "Final response should be from fallback model"
+    );
+}

@@ -29,7 +29,7 @@ env:
 jobs:
     authorize-main-build:
         name: Access and Execution Gate
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, light, cpu40]
         outputs:
             run_pipeline: ${{ steps.gate.outputs.run_pipeline }}
         steps:
@@ -79,7 +79,7 @@ jobs:
     build-and-test:
         needs: authorize-main-build
         if: needs.authorize-main-build.outputs.run_pipeline == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 90
         steps:
             - name: Checkout code
@@ -126,7 +126,7 @@ jobs:
               run: cargo fmt -- --check
 
     security-scans:
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 60
         needs: build-and-test
         permissions:
@@ -190,7 +190,7 @@ jobs:
                   config: auto
 
     fuzz-testing:
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 90
         needs: build-and-test
         strategy:
@@ -230,7 +230,7 @@ jobs:
                   cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -max_len=4096
 
     container-build-and-scan:
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 45
         needs: security-scans
         steps:
@@ -261,7 +261,7 @@ jobs:
                     ghcr.io/${{ github.repository }}:ci-security
 
     publish:
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 60
         if: github.event_name == 'release'
         needs:

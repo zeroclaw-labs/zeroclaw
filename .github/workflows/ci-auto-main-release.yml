@@ -20,7 +20,7 @@ env:
 jobs:
     tag-and-bump:
         name: Tag current main + prepare next patch version
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, light, cpu40]
         timeout-minutes: 20
         steps:
             - name: Checkout

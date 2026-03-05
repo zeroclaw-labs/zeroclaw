@@ -20,7 +20,7 @@ pub use schema::{
     SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
     SyscallAnomalyConfig, TelegramConfig, TranscriptionConfig, TunnelConfig,
     WasmCapabilityEscalationMode, WasmModuleHashPolicy, WasmRuntimeConfig, WasmSecurityConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspacesConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

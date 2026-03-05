@@ -72,7 +72,7 @@ env:
 jobs:
     audit:
         name: Security Audit
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 45
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
@@ -107,7 +107,7 @@ jobs:
 
     deny:
         name: License & Supply Chain
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 20
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
@@ -216,7 +216,7 @@ jobs:
 
     security-regressions:
         name: Security Regression Tests
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 30
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
@@ -251,7 +251,7 @@ jobs:
 
     secrets:
         name: Secrets Governance (Gitleaks)
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, light, cpu40]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -446,7 +446,7 @@ jobs:
 
     sbom:
         name: SBOM Snapshot
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, light, cpu40]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -511,7 +511,7 @@ jobs:
 
     unsafe-debt:
         name: Unsafe Debt Audit
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, light, cpu40]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -656,7 +656,7 @@ jobs:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
         needs: [audit, deny, security-regressions, secrets, sbom, unsafe-debt]
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, light, cpu40]
         steps:
             - name: Enforce security gate
               shell: bash

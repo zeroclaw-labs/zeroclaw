@@ -444,6 +444,15 @@ fn is_token_boundary_char(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, ';' | '\n' | '|' | '&' | ')' | '(')
 }
 
+fn has_token_boundary_before(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    chars
+        .get(index - 1)
+        .is_some_and(|ch| is_token_boundary_char(*ch))
+}
+
 fn starts_with_literal(chars: &[char], start: usize, literal: &str) -> bool {
     let literal_chars: Vec<char> = literal.chars().collect();
     chars
@@ -456,6 +465,12 @@ fn consume_stream_merge_redirect(chars: &[char], start: usize) -> Option<usize> 
     // - 2>&1
     // - 1>&2
     // - >&1
+    // `n>&m` should not consume trailing digits from command words
+    // (e.g. `python3>&1` should keep `python3`).
+    if chars[start].is_ascii_digit() && !has_token_boundary_before(chars, start) {
+        return None;
+    }
+
     let mut i = start;
     while i < chars.len() && chars[i].is_ascii_digit() {
         i += 1;
@@ -499,6 +514,9 @@ fn consume_dev_null_redirect(chars: &[char], start: usize) -> Option<usize> {
         }
         i += 1;
     } else {
+        if chars[i].is_ascii_digit() && !has_token_boundary_before(chars, start) {
+            return None;
+        }
         while i < chars.len() && chars[i].is_ascii_digit() {
             i += 1;
         }
@@ -1930,6 +1948,37 @@ mod tests {
 
         let quoted = p.apply_shell_redirect_policy("echo '2>&1' \"|&\" '2>/dev/null'");
         assert_eq!(quoted, "echo '2>&1' \"|&\" '2>/dev/null'");
+    }
+
+    #[test]
+    fn strip_policy_preserves_command_trailing_digits_when_stripping() {
+        let p = SecurityPolicy {
+            shell_redirect_policy: ShellRedirectPolicy::Strip,
+            ..default_policy()
+        };
+
+        let merged = p.apply_shell_redirect_policy("python3>&1 -V");
+        assert_eq!(merged, "python3 -V");
+
+        let devnull = p.apply_shell_redirect_policy("python3>/dev/null -V");
+        assert_eq!(devnull, "python3 -V");
+
+        let stdin_devnull = p.apply_shell_redirect_policy("python3</dev/null -V");
+        assert_eq!(stdin_devnull, "python3 -V");
+    }
+
+    #[test]
+    fn strip_policy_keeps_digit_suffixed_commands_allowlisted() {
+        let p = SecurityPolicy {
+            shell_redirect_policy: ShellRedirectPolicy::Strip,
+            allowed_commands: vec!["python3".into()],
+            ..default_policy()
+        };
+
+        assert!(p.validate_command_execution("python3>&1 -V", false).is_ok());
+        assert!(p
+            .validate_command_execution("python3>/dev/null -V", false)
+            .is_ok());
     }
 
     #[test]

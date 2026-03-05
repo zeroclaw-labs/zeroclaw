@@ -116,6 +116,7 @@ impl OpenAiCodexProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
+
 }
 
 fn default_zeroclaw_dir() -> PathBuf {

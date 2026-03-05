@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::providers::traits::StreamEvent;
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
@@ -11,6 +12,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use rustyline::error::ReadlineError;
 use std::collections::{BTreeSet, HashSet};
@@ -44,6 +46,8 @@ use parsing::{
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
+/// Rolling window size for detecting streamed tool-call payload markers.
+const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -67,7 +71,7 @@ static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
 });
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)(["']?\s*[:=]\s*)(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
@@ -76,33 +80,26 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
-            let full_match = &caps[0];
             let key = &caps[1];
+            let delimiter = caps.get(2).map(|m| m.as_str()).unwrap_or(": ");
             let val = caps
-                .get(2)
-                .or(caps.get(3))
+                .get(3)
                 .or(caps.get(4))
+                .or(caps.get(5))
                 .map(|m| m.as_str())
                 .unwrap_or("");
+            let quote = if caps.get(3).is_some() {
+                "\""
+            } else if caps.get(4).is_some() {
+                "'"
+            } else {
+                ""
+            };
 
-            // Preserve first 4 chars for context, then redact
+            // Preserve first 4 chars for context, then redact.
             let prefix = if val.len() > 4 { &val[..4] } else { "" };
 
-            if full_match.contains(':') {
-                if full_match.contains('"') {
-                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}: {}*[REDACTED]", key, prefix)
-                }
-            } else if full_match.contains('=') {
-                if full_match.contains('"') {
-                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}={}*[REDACTED]", key, prefix)
-                }
-            } else {
-                format!("{}: {}*[REDACTED]", key, prefix)
-            }
+            format!("{key}{delimiter}{quote}{prefix}*[REDACTED]{quote}")
         })
         .to_string()
 }
@@ -132,6 +129,7 @@ const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "
 const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
 const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
 const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply implied a follow-up action or claimed action completion, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
+const TOOL_UNAVAILABLE_RETRY_PROMPT_PREFIX: &str = "Internal correction: your prior reply claimed required tools were unavailable. Use only the runtime-allowed tools listed below. If file changes are requested and `file_write`/`file_edit` are listed, call them directly.";
 
 /// Detect completion claims that imply state-changing work already happened
 /// without an accompanying tool call.
@@ -154,6 +152,26 @@ static SIDE_EFFECT_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 static SIDE_EFFECT_ACTION_OBJECT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?ix)\b(file|files|folder|folders|directory|directories|workspace|cwd|current\s+working\s+directory|command|commands|script|scripts|path|paths)\b",
+    )
+    .unwrap()
+});
+
+/// Detect responses that incorrectly claim file tooling is unavailable even
+/// when runtime policy allows file tools in this turn.
+static TOOL_UNAVAILABLE_CLAIM_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(
+            i\s+(?:do\s+not|don't)\s+have\s+access|
+            i\s+(?:cannot|can't)\s+(?:access|use|perform|create|edit|write)|
+            i\s+am\s+unable\s+to|
+            no\s+(?:tool|tools|function|functions)\s+(?:available|access)
+        )\b
+        [^.!?\n]{0,220}
+        \b(
+            tool|tools|function|functions|file|file_write|file_edit|
+            create|write|edit|delete
+        )\b",
     )
     .unwrap()
 });
@@ -432,6 +450,31 @@ fn looks_like_unverified_action_completion_without_tool_call(text: &str) -> bool
         && SIDE_EFFECT_ACTION_OBJECT_REGEX.is_match(trimmed)
 }
 
+fn looks_like_tool_unavailability_claim(text: &str, tool_specs: &[crate::tools::ToolSpec]) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !TOOL_UNAVAILABLE_CLAIM_REGEX.is_match(trimmed) {
+        return false;
+    }
+
+    tool_specs
+        .iter()
+        .any(|spec| matches!(spec.name.as_str(), "file_write" | "file_edit"))
+}
+
+fn build_tool_unavailable_retry_prompt(tool_specs: &[crate::tools::ToolSpec]) -> String {
+    const MAX_TOOLS_IN_PROMPT: usize = 24;
+    let tool_list = tool_specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .take(MAX_TOOLS_IN_PROMPT)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "{TOOL_UNAVAILABLE_RETRY_PROMPT_PREFIX}\nRuntime tools: {tool_list}\nEmit the correct tool call now if tool use is required. Otherwise provide the final answer without claiming missing tools."
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
 
@@ -453,6 +496,144 @@ pub(crate) fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
             .to_string()
             .contains("Agent exceeded maximum tool iterations")
     })
+}
+
+#[derive(Debug, Default)]
+struct StreamedChatOutcome {
+    response_text: String,
+    tool_calls: Vec<ToolCall>,
+    forwarded_live_deltas: bool,
+}
+
+fn looks_like_streamed_tool_payload(window: &str) -> bool {
+    let lowered = window.to_ascii_lowercase();
+    lowered.contains("<tool_call")
+        || lowered.contains("<toolcall")
+        || lowered.contains("\"tool_calls\"")
+}
+
+async fn call_provider_chat(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
+    model: &str,
+    temperature: f64,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<crate::providers::ChatResponse> {
+    let chat_future = provider.chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+        },
+        model,
+        temperature,
+    );
+
+    if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+            result = chat_future => result,
+        }
+    } else {
+        chat_future.await
+    }
+}
+
+async fn consume_provider_streaming_response(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
+    model: &str,
+    temperature: f64,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> Result<StreamedChatOutcome> {
+    let mut provider_stream = provider.stream_chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+        },
+        model,
+        temperature,
+        crate::providers::traits::StreamOptions::new(true),
+    );
+    let mut outcome = StreamedChatOutcome::default();
+    let mut delta_sender = on_delta;
+    let mut suppress_forwarding = false;
+    let mut marker_window = String::new();
+
+    loop {
+        let next_chunk = if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                chunk = provider_stream.next() => chunk,
+            }
+        } else {
+            provider_stream.next().await
+        };
+
+        let Some(event_result) = next_chunk else {
+            break;
+        };
+
+        let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
+        match event {
+            StreamEvent::Final => break,
+            StreamEvent::ToolCall(tool_call) => {
+                outcome.tool_calls.push(tool_call);
+                suppress_forwarding = true;
+                if outcome.forwarded_live_deltas {
+                    if let Some(tx) = delta_sender {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    }
+                    outcome.forwarded_live_deltas = false;
+                }
+            }
+            StreamEvent::TextDelta(chunk) => {
+                if chunk.delta.is_empty() {
+                    continue;
+                }
+
+                outcome.response_text.push_str(&chunk.delta);
+                marker_window.push_str(&chunk.delta);
+
+                if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
+                    let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
+                    let boundary = marker_window
+                        .char_indices()
+                        .find(|(idx, _)| *idx >= keep_from)
+                        .map_or(0, |(idx, _)| idx);
+                    marker_window.drain(..boundary);
+                }
+
+                if !suppress_forwarding && looks_like_streamed_tool_payload(&marker_window) {
+                    suppress_forwarding = true;
+                    if outcome.forwarded_live_deltas {
+                        if let Some(tx) = delta_sender {
+                            let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        }
+                        outcome.forwarded_live_deltas = false;
+                    }
+                }
+
+                if suppress_forwarding {
+                    continue;
+                }
+
+                if let Some(tx) = delta_sender {
+                    if !outcome.forwarded_live_deltas {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        outcome.forwarded_live_deltas = true;
+                    }
+                    if tx.send(chunk.delta).await.is_err() {
+                        delta_sender = None;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -740,23 +921,76 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
+        let should_consume_provider_stream = on_delta.is_some()
+            && provider.supports_streaming()
+            && (request_tools.is_none() || provider.supports_streaming_tool_events());
+        let mut streamed_live_deltas = false;
 
-        let chat_future = provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            model,
-            temperature,
-        );
-
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        let chat_result = if should_consume_provider_stream {
+            match consume_provider_streaming_response(
+                provider,
+                &prepared_messages.messages,
+                request_tools,
+                model,
+                temperature,
+                cancellation_token.as_ref(),
+                on_delta.as_ref(),
+            )
+            .await
+            {
+                Ok(streamed) => {
+                    streamed_live_deltas = streamed.forwarded_live_deltas;
+                    Ok(crate::providers::ChatResponse {
+                        text: Some(streamed.response_text),
+                        tool_calls: streamed.tool_calls,
+                        usage: None,
+                        reasoning_content: None,
+                    })
+                }
+                Err(stream_err) => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        model = model,
+                        iteration = iteration + 1,
+                        "provider streaming failed, falling back to non-streaming chat: {stream_err}"
+                    );
+                    runtime_trace::record_event(
+                        "llm_stream_fallback",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some("provider stream failed; fallback to non-streaming chat"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "error": scrub_credentials(&stream_err.to_string()),
+                        }),
+                    );
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    }
+                    call_provider_chat(
+                        provider,
+                        &prepared_messages.messages,
+                        request_tools,
+                        model,
+                        temperature,
+                        cancellation_token.as_ref(),
+                    )
+                    .await
+                }
             }
         } else {
-            chat_future.await
+            call_provider_chat(
+                provider,
+                &prepared_messages.messages,
+                request_tools,
+                model,
+                temperature,
+                cancellation_token.as_ref(),
+            )
+            .await
         };
 
         let (
@@ -766,6 +1000,7 @@ pub(crate) async fn run_tool_call_loop(
             assistant_history_content,
             native_tool_calls,
             parse_issue_detected,
+            response_streamed_live,
         ) = match chat_result {
             Ok(resp) => {
                 let (resp_input_tokens, resp_output_tokens) = resp
@@ -869,6 +1104,7 @@ pub(crate) async fn run_tool_call_loop(
                     assistant_history_content,
                     native_calls,
                     parse_issue.is_some(),
+                    streamed_live_deltas,
                 )
             }
             Err(e) => {
@@ -921,7 +1157,10 @@ pub(crate) async fn run_tool_call_loop(
         if tool_calls.is_empty() {
             let completion_claim_signal =
                 looks_like_unverified_action_completion_without_tool_call(&display_text);
-            let missing_tool_call_signal = parse_issue_detected || completion_claim_signal;
+            let tool_unavailable_signal =
+                looks_like_tool_unavailability_claim(&display_text, &tool_specs);
+            let missing_tool_call_signal =
+                parse_issue_detected || completion_claim_signal || tool_unavailable_signal;
             let missing_tool_call_followthrough = !missing_tool_call_retry_used
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
@@ -929,9 +1168,15 @@ pub(crate) async fn run_tool_call_loop(
 
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
-                missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
+                missing_tool_call_retry_prompt = Some(if tool_unavailable_signal {
+                    build_tool_unavailable_retry_prompt(&tool_specs)
+                } else {
+                    MISSING_TOOL_CALL_RETRY_PROMPT.to_string()
+                });
                 let retry_reason = if parse_issue_detected {
                     "parse_issue_detected"
+                } else if tool_unavailable_signal {
+                    "tool_unavailable_claim_detected"
                 } else {
                     "completion_claim_text_detected"
                 };
@@ -978,7 +1223,13 @@ pub(crate) async fn run_tool_call_loop(
                         ),
                     }),
                 );
-                anyhow::bail!("Model repeatedly deferred action without emitting a tool call");
+                if tool_unavailable_signal && !parse_issue_detected && !completion_claim_signal {
+                    tracing::warn!(
+                        "Model still claims missing tools after corrective retry; returning text response."
+                    );
+                } else {
+                    anyhow::bail!("Model repeatedly deferred action without emitting a tool call");
+                }
             }
 
             runtime_trace::record_event(
@@ -998,6 +1249,12 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
+                let should_emit_post_hoc_chunks =
+                    !response_streamed_live || display_text != response_text;
+                if !should_emit_post_hoc_chunks {
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    return Ok(display_text);
+                }
                 // Clear accumulated progress lines before streaming the final answer.
                 let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 // Split on whitespace boundaries, accumulating chunks of at least
@@ -1519,6 +1776,23 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
     instructions
 }
 
+fn build_runtime_tool_availability_notice(tools_registry: &[Box<dyn Tool>]) -> String {
+    const MAX_LISTED_TOOLS: usize = 40;
+    let names = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .take(MAX_LISTED_TOOLS)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "\n## Runtime Tool Availability (Authoritative)\n\n\
+         Use only these runtime-available tools for this turn.\n\
+         Tools: {names}\n\
+         Do not claim tools are unavailable when they are listed here.\n"
+    )
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG, peripherals) and enters either single-shot or
@@ -1718,6 +1992,12 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
+    if config.channels_config.discord.is_some() {
+        tool_descs.push((
+            "discord_history_fetch",
+            "Fetch Discord message history on demand for current conversation context or explicit channel_id.",
+        ));
+    }
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
@@ -1784,6 +2064,7 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+    system_prompt.push_str(&build_runtime_tool_availability_notice(&tools_registry));
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
@@ -2133,6 +2414,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
     }
+    if config.channels_config.discord.is_some() {
+        tool_descs.push((
+            "discord_history_fetch",
+            "Fetch Discord message history on demand for current conversation context or explicit channel_id.",
+        ));
+    }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
         tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
         tool_descs.push((
@@ -2180,6 +2467,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+    system_prompt.push_str(&build_runtime_tool_availability_notice(&tools_registry));
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2245,6 +2533,14 @@ mod tests {
     }
 
     #[test]
+    fn test_scrub_credentials_toml_value_with_colon_preserves_equals_delimiter() {
+        let input = r#"api_key = "enc2:QmFzZTY0VG9rZW4=""#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains(r#"api_key = "enc2*[REDACTED]""#));
+        assert!(!scrubbed.contains(r#""api_key":"#));
+    }
+
+    #[test]
     fn maybe_inject_cron_add_delivery_populates_agent_delivery_from_channel_context() {
         let mut args = serde_json::json!({
             "job_type": "agent",
@@ -2290,8 +2586,11 @@ mod tests {
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::traits::ProviderCapabilities;
+    use crate::providers::router::{Route, RouterProvider};
+    use crate::providers::traits::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
     use crate::providers::ChatResponse;
+    use crate::runtime::NativeRuntime;
+    use crate::security::{AutonomyLevel, SecurityPolicy, ShellRedirectPolicy};
     use tempfile::TempDir;
 
     struct NonVisionProvider {
@@ -2418,6 +2717,252 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct StreamingScriptedProvider {
+        responses: Arc<Mutex<VecDeque<String>>>,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    impl StreamingScriptedProvider {
+        fn from_text_responses(responses: Vec<&str>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(
+                    responses.into_iter().map(ToString::to_string).collect(),
+                )),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingScriptedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "chat_with_system should not be used in streaming scripted provider tests"
+            );
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            let response = self
+                .responses
+                .lock()
+                .expect("responses lock should be valid")
+                .pop_front()
+                .unwrap_or_default();
+
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(response)),
+                Ok(StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    enum NativeStreamTurn {
+        ToolCall(ToolCall),
+        Text(String),
+    }
+
+    struct StreamingNativeToolEventProvider {
+        turns: Arc<Mutex<VecDeque<NativeStreamTurn>>>,
+        stream_calls: Arc<AtomicUsize>,
+        stream_tool_requests: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    impl StreamingNativeToolEventProvider {
+        fn with_turns(turns: Vec<NativeStreamTurn>) -> Self {
+            Self {
+                turns: Arc::new(Mutex::new(turns.into())),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                stream_tool_requests: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingNativeToolEventProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "chat_with_system should not be used in streaming native tool event provider tests"
+            );
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when native streaming events succeed")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamEvent>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if request.tools.is_some_and(|tools| !tools.is_empty()) {
+                self.stream_tool_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            let turn = self
+                .turns
+                .lock()
+                .expect("turns lock should be valid")
+                .pop_front()
+                .expect("streaming turns should have scripted output");
+            match turn {
+                NativeStreamTurn::ToolCall(tool_call) => {
+                    Box::pin(futures_util::stream::iter(vec![
+                        Ok(StreamEvent::ToolCall(tool_call)),
+                        Ok(StreamEvent::Final),
+                    ]))
+                }
+                NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
+                    Ok(StreamEvent::Final),
+                ])),
+            }
+        }
+    }
+
+    struct RouteAwareStreamingProvider {
+        response: String,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        last_model: Arc<Mutex<String>>,
+    }
+
+    impl RouteAwareStreamingProvider {
+        fn new(response: &str) -> Self {
+            Self {
+                response: response.to_string(),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+                last_model: Arc::new(Mutex::new(String::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RouteAwareStreamingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when routed streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_model
+                .lock()
+                .expect("last_model lock should be valid") = model.to_string();
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(self.response.clone())),
+                Ok(StreamChunk::final_chunk()),
+            ]))
         }
     }
 
@@ -3130,6 +3675,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_shell_strip_policy_handles_repeated_redirect_calls() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo redirect-loop-ok 2>&1"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo redirect-loop-ok 2>&1"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo redirect-loop-ok 2>&1"}}
+</tool_call>"#,
+            "done after shell redirect retries",
+        ]);
+
+        let workspace = TempDir::new().expect("temp workspace");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            shell_redirect_policy: ShellRedirectPolicy::Strip,
+            ..SecurityPolicy::default()
+        });
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::ShellTool::new(
+            Arc::clone(&security),
+            Arc::new(NativeRuntime::new()),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run repeated shell redirects"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should complete when strip policy normalizes redirects");
+
+        assert_eq!(result, "done after shell redirect retries");
+
+        let tool_result_messages: Vec<_> = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .collect();
+        assert_eq!(
+            tool_result_messages.len(),
+            3,
+            "expected one tool result payload per scripted shell call"
+        );
+        for message in tool_result_messages {
+            assert!(
+                message.content.contains("<tool_result name=\"shell\">"),
+                "tool results should include shell execution payloads"
+            );
+            assert!(
+                !message
+                    .content
+                    .contains("Command not allowed by security policy"),
+                "strip policy should avoid redirect-policy rejections"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_retries_when_response_claims_completion_without_tool_call() {
         let provider = ScriptedProvider::from_text_responses(vec![
             "Done — I've created the `names` folder in the current working directory.",
@@ -3233,6 +3857,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_retries_when_model_claims_missing_file_tools() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I don't have access to a file creation tool in my current set of available functions.",
+            r#"<tool_call>
+{"name":"file_write","arguments":{"value":"retry"}}
+</tool_call>"#,
+            "done after file tool",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("create a test file"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should retry once when model wrongly claims file tools are unavailable");
+
+        assert_eq!(result, "done after file tool");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_text_only_planning_without_tool_call() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "We were previously discussing gmail integration. Goal 1 is done. Our next task is Goal 2 — Gmail API via OAuth. Here is the implementation plan before any tool actions.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("we finished goal one, what is next"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("planning-only text should be returned without forced tool-call rejection");
+
+        assert!(result.contains("implementation plan"));
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
@@ -3289,6 +4001,256 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_tool_call_loop_consumes_provider_stream_for_final_response() {
+        let provider =
+            StreamingScriptedProvider::from_text_responses(vec!["streamed final answer"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hi"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("streaming provider should complete");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL || delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "streamed final answer");
+        assert_eq!(
+            visible_deltas, "streamed final answer",
+            "draft should receive upstream deltas once without post-hoc duplication"
+        );
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streaming_path_preserves_tool_loop_semantics() {
+        let provider = StreamingScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("streaming tool loop should execute tool and finish");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL || delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(visible_deltas, "done");
+        assert!(
+            !visible_deltas.contains("<tool_call"),
+            "draft text should not leak streamed tool payload markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_native_tool_events_without_chat_fallback() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::ToolCall(ToolCall {
+                id: "call_native_1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: r#"{"value":"A"}"#.to_string(),
+            }),
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native tools"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("native streaming events should preserve tool loop semantics");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL || delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.stream_tool_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_routed_streaming_uses_live_provider_deltas_once() {
+        let default_provider = RouteAwareStreamingProvider::new("default answer");
+        let default_stream_calls = Arc::clone(&default_provider.stream_calls);
+        let default_chat_calls = Arc::clone(&default_provider.chat_calls);
+
+        let routed_provider = RouteAwareStreamingProvider::new("routed streamed answer");
+        let routed_stream_calls = Arc::clone(&routed_provider.stream_calls);
+        let routed_chat_calls = Arc::clone(&routed_provider.chat_calls);
+        let routed_last_model = Arc::clone(&routed_provider.last_model);
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".to_string(), Box::new(default_provider)),
+                ("fast".to_string(), Box::new(routed_provider)),
+            ],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "fast".to_string(),
+                    model: "routed-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hi"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+
+        let result = run_tool_call_loop(
+            &router,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "router",
+            "hint:fast",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("routed streaming provider should complete");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL || delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "routed streamed answer");
+        assert_eq!(
+            visible_deltas, "routed streamed answer",
+            "routed draft should receive upstream deltas once without post-hoc duplication"
+        );
+        assert_eq!(default_stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(default_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            routed_last_model
+                .lock()
+                .expect("routed_last_model lock should be valid")
+                .as_str(),
+            "routed-model"
+        );
+    }
+
     #[test]
     fn looks_like_unverified_action_completion_without_tool_call_detects_claimed_side_effects() {
         assert!(looks_like_unverified_action_completion_without_tool_call(
@@ -3306,6 +4268,34 @@ mod tests {
         ));
         assert!(!looks_like_unverified_action_completion_without_tool_call(
             "I have a suggestion for the plan if you want me to proceed."
+        ));
+        assert!(!looks_like_unverified_action_completion_without_tool_call(
+            "We were previously discussing gmail integration. Goal 1 is done. Our next task is Goal 2 — Gmail API via OAuth."
+        ));
+    }
+
+    #[test]
+    fn looks_like_tool_unavailability_claim_detects_false_missing_tool_replies() {
+        let tools = vec![
+            crate::tools::ToolSpec {
+                name: "file_write".to_string(),
+                description: "Write file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            crate::tools::ToolSpec {
+                name: "file_edit".to_string(),
+                description: "Edit file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+
+        assert!(looks_like_tool_unavailability_claim(
+            "I don't have access to a file creation tool in my current set of available functions.",
+            &tools
+        ));
+        assert!(!looks_like_tool_unavailability_claim(
+            "I can create that file now.",
+            &tools
         ));
     }
 

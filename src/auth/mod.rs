@@ -27,7 +27,7 @@ static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 
 #[derive(Clone)]
 pub struct AuthService {
-    store: AuthProfilesStore,
+    pub(crate) store: AuthProfilesStore,
     client: reqwest::Client,
 }
 
@@ -299,20 +299,37 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        // Extract client credentials for refresh: try id_token `aud` claim
+        // first, then fall back to env var. For client_secret, use the
+        // well-known public Gemini CLI secret as the final fallback.
+        let id_token_client_id = latest_tokens
+            .id_token
+            .as_deref()
+            .and_then(gemini_oauth::extract_client_id_from_id_token);
+        let refresh_client_id = gemini_oauth::gemini_oauth_client_id().or(id_token_client_id);
+        let refresh_client_secret = gemini_oauth::gemini_oauth_client_secret()
+            .or_else(|| Some(gemini_oauth::GEMINI_CLI_DEFAULT_CLIENT_SECRET.to_string()));
+
+        let mut refreshed = match refresh_gemini_access_token_with_retries(
+            &self.client,
+            &refresh_token,
+            refresh_client_id.as_deref(),
+            refresh_client_secret.as_deref(),
+        )
+        .await
+        {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -441,11 +458,25 @@ async fn refresh_openai_access_token_with_retries(
 async fn refresh_gemini_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
 ) -> Result<TokenSet> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
-        match gemini_oauth::refresh_access_token(client, refresh_token).await {
+        let result = match (client_id, client_secret) {
+            (Some(id), Some(secret)) => {
+                gemini_oauth::refresh_access_token_with_credentials(
+                    client,
+                    refresh_token,
+                    id,
+                    secret,
+                )
+                .await
+            }
+            _ => gemini_oauth::refresh_access_token(client, refresh_token).await,
+        };
+        match result {
             Ok(tokens) => return Ok(tokens),
             Err(err) => {
                 let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;

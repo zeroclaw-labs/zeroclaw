@@ -1,0 +1,106 @@
+name: Test Coverage
+
+on:
+    push:
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "tests/**"
+            - ".github/workflows/test-coverage.yml"
+    pull_request:
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "tests/**"
+            - ".github/workflows/test-coverage.yml"
+    workflow_dispatch:
+
+concurrency:
+    group: test-coverage-${{ github.event.pull_request.number || github.ref || github.run_id }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+    CARGO_TERM_COLOR: always
+
+jobs:
+    coverage:
+        name: Coverage (non-blocking)
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
+        timeout-minutes: 90
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: llvm-tools-preview
+
+            - id: rust-cache
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: test-coverage
+                  cache-bin: false
+
+            - name: Install cargo-llvm-cov
+              shell: bash
+              run: cargo install cargo-llvm-cov --locked --version 0.6.16
+
+            - name: Run coverage (non-blocking)
+              id: cov
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  set +e
+                  cargo llvm-cov --workspace --all-features --lcov --output-path artifacts/lcov.info
+                  status=$?
+                  set -e
+
+                  if [ "$status" -eq 0 ]; then
+                    echo "coverage_ok=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "coverage_ok=false" >> "$GITHUB_OUTPUT"
+                    echo "::warning::Coverage generation failed (non-blocking)."
+                  fi
+
+            - name: Publish coverage summary
+              if: always()
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  {
+                    echo "### Coverage Lane (non-blocking)"
+                    echo "- Coverage generation success: \`${{ steps.cov.outputs.coverage_ok || 'false' }}\`"
+                    echo "- rust-cache hit: \`${{ steps.rust-cache.outputs.cache-hit || 'unknown' }}\`"
+                    echo "- Artifact: \`artifacts/lcov.info\` (when available)"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload coverage artifact
+              if: always()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: coverage-lcov
+                  path: artifacts/lcov.info
+                  if-no-files-found: ignore
+                  retention-days: 14

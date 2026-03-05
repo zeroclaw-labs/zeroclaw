@@ -12,7 +12,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `.github/workflows/ci-run.yml` (`CI`)
     - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate on changed Rust lines, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
-    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `lint` + `test` + `build` (no PR build-only bypass)
+    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `lint` + `test` + `restricted-hermetic` + `build` (no PR build-only bypass)
+    - Additional behavior: includes `Restricted Hermetic Validation` lane (`./scripts/ci/restricted_profile.sh`) that runs a capability-aware subset with isolated `HOME`/workspace/config roots and no external provider credentials
+    - Additional behavior: PRs with Rust changes run a binary-size regression guard versus base commit (`check_binary_size_regression.sh`, default max increase 10%)
     - Additional behavior: rust-cache is partitioned per job role via `prefix-key` to reduce cache churn across lint/test/build/flake-probe lanes
     - Additional behavior: emits `test-flake-probe` artifact from single-retry probe when tests fail; optional blocking can be enabled with repository variable `CI_BLOCK_ON_FLAKE_SUSPECTED=true`
     - Additional behavior: PRs that change `.github/workflows/**` require at least one approving review from a login in `WORKFLOW_OWNER_LOGINS` (repository variable fallback: `theonlyhennygod,willsarg`)
@@ -41,10 +43,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: owner routing + escalation policy is documented in `docs/operations/nightly-all-features-runbook.md`
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA), policy/license checks (`cargo deny`), gitleaks-based secrets governance (allowlist policy metadata + expiry guard), and SBOM snapshot artifacts (`CycloneDX` + `SPDX`)
+- `.github/workflows/test-coverage.yml` (`Test Coverage`)
+    - Purpose: non-blocking coverage lane using `cargo-llvm-cov` with `lcov` artifact upload for trend tracking before hard-gating coverage
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
     - Purpose: static analysis for security findings on PR/push (Rust/codeql paths) plus scheduled/manual runs
 - `.github/workflows/ci-change-audit.yml` (`CI/CD Change Audit`)
-    - Purpose: machine-auditable diff report for CI/security workflow changes (line churn, new `uses:` references, unpinned action-policy violations, pipe-to-shell policy violations, broad `permissions: write-all` grants, new `pull_request_target` trigger introductions, new secret references)
+    - Purpose: machine-auditable diff report for CI/security workflow changes (line churn, new `uses:` references, unpinned action-policy violations, pipe-to-shell policy violations, broad `permissions: write-all` grants, unsafe workflow-script JS execution patterns, new `pull_request_target` trigger introductions, new secret references)
 - `.github/workflows/ci-provider-connectivity.yml` (`CI Provider Connectivity`)
     - Purpose: scheduled/manual/provider-list probe matrix with downloadable JSON/Markdown artifacts for provider endpoint reachability
 - `.github/workflows/ci-reproducible-build.yml` (`CI Reproducible Build`)
@@ -96,6 +100,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
 - `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
+- `Test Coverage`: push/PR on Rust paths to `dev` and `main`, manual dispatch
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `Dependabot`: all update PRs target `main` (not `dev`)
@@ -117,7 +122,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs. If intake policy changed recently, trigger a fresh `pull_request_target` event (for example close/reopen PR) because `Re-run jobs` can reuse the original workflow snapshot.
 7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
 8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+9. Strict delta lint failures in CI: inspect the `lint` job logs (`Run strict lint delta gate` step) and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
@@ -137,6 +142,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep required check naming stable and documented in `docs/operations/required-check-mapping.md` before changing branch protection settings.
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
+- Reproduce restricted/hermetic CI behavior locally with `./scripts/ci/restricted_profile.sh` before changing workspace/home-sensitive runtime code.
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
