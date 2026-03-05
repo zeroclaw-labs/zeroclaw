@@ -1,4 +1,4 @@
-name: Test Self-Hosted Runner
+name: Test Runner Health
 
 on:
   workflow_dispatch:
@@ -10,8 +10,8 @@ permissions:
 
 jobs:
   runner-health:
-    name: Runner Health / self-hosted aws-india
-    runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+    name: Runner Health / blacksmith
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Check runner info
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v docker >/dev/null 2>&1; then
-            echo "::notice::Docker is not installed on this self-hosted runner. Skipping docker smoke test."
+            echo "::notice::Docker is not installed on this runner. Skipping docker smoke test."
             exit 0
           fi
 
