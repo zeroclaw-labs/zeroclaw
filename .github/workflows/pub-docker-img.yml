@@ -33,6 +33,7 @@ env:
     GIT_CONFIG_VALUE_0: /dev/null
     REGISTRY: ghcr.io
     IMAGE_NAME: ${{ github.repository }}
+    TRIVY_IMAGE: aquasec/trivy:0.58.2
 
 jobs:
     pr-smoke:
@@ -83,8 +84,8 @@ jobs:
                   tags: zeroclaw-pr-smoke:latest
                   labels: ${{ steps.meta.outputs.labels || '' }}
                   platforms: linux/amd64
-                  cache-from: type=gha
-                  cache-to: type=gha,mode=max
+                  cache-from: type=gha,scope=pub-docker-pr-${{ github.event.pull_request.number || 'dispatch' }}
+                  cache-to: type=gha,scope=pub-docker-pr-${{ github.event.pull_request.number || 'dispatch' }},mode=max
 
             - name: Verify image
               run: docker run --rm zeroclaw-pr-smoke:latest --version
@@ -174,6 +175,107 @@ jobs:
                     echo "latest_tag=${LATEST_SUFFIX}"
                   } >> "$GITHUB_OUTPUT"
 
+            - name: Build release candidate image (pre-push scan)
+              uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+              with:
+                  context: .
+                  push: false
+                  load: true
+                  tags: zeroclaw-release-candidate:${{ steps.meta.outputs.release_tag }}
+                  platforms: linux/amd64
+                  cache-from: type=gha,scope=pub-docker-release-${{ steps.meta.outputs.release_tag }}
+                  cache-to: type=gha,scope=pub-docker-release-${{ steps.meta.outputs.release_tag }},mode=max
+
+            - name: Pre-push Trivy gate (CRITICAL blocks, HIGH warns)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+
+                  LOCAL_SCAN_IMAGE="zeroclaw-release-candidate:${{ steps.meta.outputs.release_tag }}"
+
+                  docker run --rm \
+                    -v "$PWD/artifacts:/work" \
+                    "${TRIVY_IMAGE}" image \
+                    --quiet \
+                    --ignore-unfixed \
+                    --severity CRITICAL \
+                    --format json \
+                    --output /work/trivy-prepush-critical.json \
+                    "${LOCAL_SCAN_IMAGE}"
+
+                  critical_count="$(python3 - <<'PY'
+                  import json
+                  from pathlib import Path
+
+                  report = Path("artifacts/trivy-prepush-critical.json")
+                  if not report.exists():
+                      print(0)
+                      raise SystemExit(0)
+
+                  data = json.loads(report.read_text(encoding="utf-8"))
+                  count = 0
+                  for result in data.get("Results", []):
+                      vulns = result.get("Vulnerabilities") or []
+                      count += len(vulns)
+                  print(count)
+                  PY
+                  )"
+
+                  docker run --rm \
+                    -v "$PWD/artifacts:/work" \
+                    "${TRIVY_IMAGE}" image \
+                    --quiet \
+                    --ignore-unfixed \
+                    --severity HIGH \
+                    --format json \
+                    --output /work/trivy-prepush-high.json \
+                    "${LOCAL_SCAN_IMAGE}"
+
+                  docker run --rm \
+                    -v "$PWD/artifacts:/work" \
+                    "${TRIVY_IMAGE}" image \
+                    --quiet \
+                    --ignore-unfixed \
+                    --severity HIGH \
+                    --format table \
+                    --output /work/trivy-prepush-high.txt \
+                    "${LOCAL_SCAN_IMAGE}"
+
+                  high_count="$(python3 - <<'PY'
+                  import json
+                  from pathlib import Path
+
+                  report = Path("artifacts/trivy-prepush-high.json")
+                  if not report.exists():
+                      print(0)
+                      raise SystemExit(0)
+
+                  data = json.loads(report.read_text(encoding="utf-8"))
+                  count = 0
+                  for result in data.get("Results", []):
+                      vulns = result.get("Vulnerabilities") or []
+                      count += len(vulns)
+                  print(count)
+                  PY
+                  )"
+
+                  {
+                    echo "### Pre-push Trivy Gate"
+                    echo "- Candidate image: \`${LOCAL_SCAN_IMAGE}\`"
+                    echo "- CRITICAL findings: \`${critical_count}\` (blocking)"
+                    echo "- HIGH findings: \`${high_count}\` (advisory)"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+                  if [ "${high_count}" -gt 0 ]; then
+                    echo "::warning::Pre-push Trivy found ${high_count} HIGH vulnerabilities (advisory only)."
+                  fi
+
+                  if [ "${critical_count}" -gt 0 ]; then
+                    echo "::error::Pre-push Trivy found ${critical_count} CRITICAL vulnerabilities."
+                    exit 1
+                  fi
+
             - name: Build and push Docker image
               uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
               with:
@@ -183,8 +285,8 @@ jobs:
                       ZEROCLAW_CARGO_ALL_FEATURES=true
                   tags: ${{ steps.meta.outputs.tags }}
                   platforms: linux/amd64,linux/arm64
-                  cache-from: type=gha
-                  cache-to: type=gha,mode=max
+                  cache-from: type=gha,scope=pub-docker-release-${{ steps.meta.outputs.release_tag }}
+                  cache-to: type=gha,scope=pub-docker-release-${{ steps.meta.outputs.release_tag }},mode=max
 
             - name: Set GHCR package visibility to public
               shell: bash
@@ -271,7 +373,7 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 21
 
-            - name: Scan published image for vulnerabilities (Trivy)
+            - name: Scan published image for policy evidence (Trivy)
               shell: bash
               run: |
                   set -euo pipefail
@@ -298,7 +400,7 @@ jobs:
 
                     docker run --rm \
                       -v "$PWD/artifacts:/work" \
-                      aquasec/trivy:0.58.2 image \
+                      "${TRIVY_IMAGE}" image \
                       --quiet \
                       --ignore-unfixed \
                       --severity HIGH,CRITICAL \
@@ -308,7 +410,7 @@ jobs:
 
                     docker run --rm \
                       -v "$PWD/artifacts:/work" \
-                      aquasec/trivy:0.58.2 image \
+                      "${TRIVY_IMAGE}" image \
                       --quiet \
                       --ignore-unfixed \
                       --severity HIGH,CRITICAL \
@@ -319,7 +421,7 @@ jobs:
 
                   docker run --rm \
                     -v "$PWD/artifacts:/work" \
-                    aquasec/trivy:0.58.2 image \
+                    "${TRIVY_IMAGE}" image \
                     --quiet \
                     --ignore-unfixed \
                     --severity HIGH,CRITICAL \
@@ -419,5 +521,8 @@ jobs:
                       artifacts/trivy-sha-*.json
                       artifacts/trivy-latest.txt
                       artifacts/trivy-latest.json
+                      artifacts/trivy-prepush-critical.json
+                      artifacts/trivy-prepush-high.json
+                      artifacts/trivy-prepush-high.txt
                   if-no-files-found: ignore
                   retention-days: 14
