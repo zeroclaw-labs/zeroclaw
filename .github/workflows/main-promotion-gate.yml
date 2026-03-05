@@ -20,19 +20,23 @@ env:
 jobs:
     enforce-dev-source:
         name: Enforce Dev -> Main Promotion
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
         timeout-minutes: 5
         steps:
             - name: Enforce dev-only source branch for main
               shell: bash
+              env:
+                  REPO_FULL_NAME: ${{ github.repository }}
+                  BASE_REF: ${{ github.event.pull_request.base.ref }}
+                  HEAD_REF: ${{ github.event.pull_request.head.ref }}
+                  HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
               run: |
                   set -euo pipefail
 
-                  repo_full_name="${{ github.repository }}"
-
-                  base_ref="${{ github.event.pull_request.base.ref }}"
-                  head_ref="${{ github.event.pull_request.head.ref }}"
-                  head_repo_full_name="${{ github.event.pull_request.head.repo.full_name }}"
+                  repo_full_name="${REPO_FULL_NAME}"
+                  base_ref="${BASE_REF}"
+                  head_ref="${HEAD_REF}"
+                  head_repo_full_name="${HEAD_REPO_FULL_NAME}"
 
                   echo "base_ref=${base_ref}"
                   echo "head_ref=${head_ref}"
