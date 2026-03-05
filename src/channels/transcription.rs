@@ -211,10 +211,15 @@ async fn transcribe_with_whisper_cpp(
     }
 
     let txt_path = out_dir.join(format!("{stem}.txt"));
-    let txt = tokio::fs::read_to_string(&txt_path).await.map_err(|e| {
-        let _ = std::fs::remove_dir_all(&out_dir);
-        anyhow::anyhow!("Failed to read whisper-cli transcript output: {e}")
-    })?;
+    let txt = match tokio::fs::read_to_string(&txt_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&out_dir).await;
+            return Err(anyhow::anyhow!(
+                "Failed to read whisper-cli transcript output: {e}"
+            ));
+        }
+    };
     let _ = tokio::fs::remove_dir_all(&out_dir).await;
 
     let text = txt.trim().to_string();
