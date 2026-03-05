@@ -132,6 +132,7 @@ const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "
 const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
 const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
 const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply implied a follow-up action or claimed action completion, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
+const TOOL_UNAVAILABLE_RETRY_PROMPT_PREFIX: &str = "Internal correction: your prior reply claimed required tools were unavailable. Use only the runtime-allowed tools listed below. If file changes are requested and `file_write`/`file_edit` are listed, call them directly.";
 
 /// Detect completion claims that imply state-changing work already happened
 /// without an accompanying tool call.
@@ -154,6 +155,26 @@ static SIDE_EFFECT_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 static SIDE_EFFECT_ACTION_OBJECT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?ix)\b(file|files|folder|folders|directory|directories|workspace|cwd|current\s+working\s+directory|command|commands|script|scripts|path|paths)\b",
+    )
+    .unwrap()
+});
+
+/// Detect responses that incorrectly claim file tooling is unavailable even
+/// when runtime policy allows file tools in this turn.
+static TOOL_UNAVAILABLE_CLAIM_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(
+            i\s+(?:do\s+not|don't)\s+have\s+access|
+            i\s+(?:cannot|can't)\s+(?:access|use|perform|create|edit|write)|
+            i\s+am\s+unable\s+to|
+            no\s+(?:tool|tools|function|functions)\s+(?:available|access)
+        )\b
+        [^.!?\n]{0,220}
+        \b(
+            tool|tools|function|functions|file|file_write|file_edit|
+            create|write|edit|delete
+        )\b",
     )
     .unwrap()
 });
@@ -430,6 +451,31 @@ fn looks_like_unverified_action_completion_without_tool_call(text: &str) -> bool
     ACTION_COMPLETION_CUE_REGEX.is_match(trimmed)
         && SIDE_EFFECT_ACTION_VERB_REGEX.is_match(trimmed)
         && SIDE_EFFECT_ACTION_OBJECT_REGEX.is_match(trimmed)
+}
+
+fn looks_like_tool_unavailability_claim(text: &str, tool_specs: &[crate::tools::ToolSpec]) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !TOOL_UNAVAILABLE_CLAIM_REGEX.is_match(trimmed) {
+        return false;
+    }
+
+    tool_specs
+        .iter()
+        .any(|spec| matches!(spec.name.as_str(), "file_write" | "file_edit"))
+}
+
+fn build_tool_unavailable_retry_prompt(tool_specs: &[crate::tools::ToolSpec]) -> String {
+    const MAX_TOOLS_IN_PROMPT: usize = 24;
+    let tool_list = tool_specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .take(MAX_TOOLS_IN_PROMPT)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "{TOOL_UNAVAILABLE_RETRY_PROMPT_PREFIX}\nRuntime tools: {tool_list}\nEmit the correct tool call now if tool use is required. Otherwise provide the final answer without claiming missing tools."
+    )
 }
 
 #[derive(Debug)]
@@ -921,7 +967,10 @@ pub(crate) async fn run_tool_call_loop(
         if tool_calls.is_empty() {
             let completion_claim_signal =
                 looks_like_unverified_action_completion_without_tool_call(&display_text);
-            let missing_tool_call_signal = parse_issue_detected || completion_claim_signal;
+            let tool_unavailable_signal =
+                looks_like_tool_unavailability_claim(&display_text, &tool_specs);
+            let missing_tool_call_signal =
+                parse_issue_detected || completion_claim_signal || tool_unavailable_signal;
             let missing_tool_call_followthrough = !missing_tool_call_retry_used
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
@@ -929,9 +978,15 @@ pub(crate) async fn run_tool_call_loop(
 
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
-                missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
+                missing_tool_call_retry_prompt = Some(if tool_unavailable_signal {
+                    build_tool_unavailable_retry_prompt(&tool_specs)
+                } else {
+                    MISSING_TOOL_CALL_RETRY_PROMPT.to_string()
+                });
                 let retry_reason = if parse_issue_detected {
                     "parse_issue_detected"
+                } else if tool_unavailable_signal {
+                    "tool_unavailable_claim_detected"
                 } else {
                     "completion_claim_text_detected"
                 };
@@ -978,7 +1033,13 @@ pub(crate) async fn run_tool_call_loop(
                         ),
                     }),
                 );
-                anyhow::bail!("Model repeatedly deferred action without emitting a tool call");
+                if tool_unavailable_signal && !parse_issue_detected && !completion_claim_signal {
+                    tracing::warn!(
+                        "Model still claims missing tools after corrective retry; returning text response."
+                    );
+                } else {
+                    anyhow::bail!("Model repeatedly deferred action without emitting a tool call");
+                }
             }
 
             runtime_trace::record_event(
@@ -1519,6 +1580,23 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
     instructions
 }
 
+fn build_runtime_tool_availability_notice(tools_registry: &[Box<dyn Tool>]) -> String {
+    const MAX_LISTED_TOOLS: usize = 40;
+    let names = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .take(MAX_LISTED_TOOLS)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "\n## Runtime Tool Availability (Authoritative)\n\n\
+         Use only these runtime-available tools for this turn.\n\
+         Tools: {names}\n\
+         Do not claim tools are unavailable when they are listed here.\n"
+    )
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG, peripherals) and enters either single-shot or
@@ -1784,6 +1862,7 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+    system_prompt.push_str(&build_runtime_tool_availability_notice(&tools_registry));
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
@@ -2180,6 +2259,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+    system_prompt.push_str(&build_runtime_tool_availability_notice(&tools_registry));
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3233,6 +3313,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_retries_when_model_claims_missing_file_tools() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I don't have access to a file creation tool in my current set of available functions.",
+            r#"<tool_call>
+{"name":"file_write","arguments":{"value":"retry"}}
+</tool_call>"#,
+            "done after file tool",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("create a test file"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should retry once when model wrongly claims file tools are unavailable");
+
+        assert_eq!(result, "done after file tool");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_text_only_planning_without_tool_call() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "We were previously discussing gmail integration. Goal 1 is done. Our next task is Goal 2 — Gmail API via OAuth. Here is the implementation plan before any tool actions.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("we finished goal one, what is next"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("planning-only text should be returned without forced tool-call rejection");
+
+        assert!(result.contains("implementation plan"));
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
@@ -3306,6 +3474,34 @@ mod tests {
         ));
         assert!(!looks_like_unverified_action_completion_without_tool_call(
             "I have a suggestion for the plan if you want me to proceed."
+        ));
+        assert!(!looks_like_unverified_action_completion_without_tool_call(
+            "We were previously discussing gmail integration. Goal 1 is done. Our next task is Goal 2 — Gmail API via OAuth."
+        ));
+    }
+
+    #[test]
+    fn looks_like_tool_unavailability_claim_detects_false_missing_tool_replies() {
+        let tools = vec![
+            crate::tools::ToolSpec {
+                name: "file_write".to_string(),
+                description: "Write file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            crate::tools::ToolSpec {
+                name: "file_edit".to_string(),
+                description: "Edit file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+
+        assert!(looks_like_tool_unavailability_claim(
+            "I don't have access to a file creation tool in my current set of available functions.",
+            &tools
+        ));
+        assert!(!looks_like_tool_unavailability_claim(
+            "I can create that file now.",
+            &tools
         ));
     }
 

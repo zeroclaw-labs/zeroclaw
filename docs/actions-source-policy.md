@@ -57,6 +57,27 @@ Because this repository has high agent-authored change volume:
 - Expand allowlist only for verified missing actions; avoid broad wildcard exceptions.
 - Keep rollback instructions in the PR description for Actions policy changes.
 
+## `pull_request_target` Safety Contract
+
+The repository intentionally uses `pull_request_target` for PR intake/label automation.
+Those workflows run with base-repo token scope, so script-level safety rules are strict.
+
+Required controls:
+
+- Keep `pull_request_target` limited to trusted automation workflows (`pr-intake-checks.yml`, `pr-labeler.yml`, `pr-auto-response.yml`).
+- Run only repository-owned helper scripts from `.github/workflows/scripts/`.
+- Treat PR-controlled strings as data only; never execute or evaluate them.
+- Block dynamic execution primitives in workflow helper scripts:
+  - `eval(...)`
+  - `Function(...)`
+  - `vm.runInContext(...)`, `vm.runInNewContext(...)`, `vm.runInThisContext(...)`, `new vm.Script(...)`
+  - `child_process.exec(...)`, `execSync(...)`, `spawn(...)`, `spawnSync(...)`, `execFile(...)`, `execFileSync(...)`, `fork(...)`
+
+Enforcement:
+
+- `.github/workflows/ci-change-audit.yml` runs `scripts/ci/ci_change_audit.py` with policy-fail mode.
+- The audit policy blocks new unsafe workflow-script JS patterns and new `pull_request_target` triggers in CI/security workflow changes.
+
 ## Validation Checklist
 
 After allowlist changes, validate:

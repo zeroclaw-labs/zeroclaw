@@ -34,6 +34,7 @@ Feature matrix lane check names (informational, non-required):
 2. Enumerate check/job names and compare to this mapping:
    - `gh run view <run_id> --repo zeroclaw-labs/zeroclaw --json jobs --jq '.jobs[].name'`
 3. If any merge-critical check name changed, update this file before changing branch protection policy.
+4. Export and commit branch/ruleset snapshots as documented in `docs/operations/branch-protection.md`.
 
 ## Notes
 
