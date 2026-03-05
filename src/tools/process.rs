@@ -215,7 +215,15 @@ impl ProcessTool {
         let mut processes = self.processes.write().unwrap();
         if processes.len() >= MAX_PROCESSES {
             drop(processes);
-            let _ = child.start_kill();
+            if let Err(error) = child.start_kill() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Maximum concurrent processes ({MAX_PROCESSES}) reached; failed to terminate overflow child (pid {pid}): {error}"
+                    )),
+                });
+            }
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -375,7 +383,19 @@ impl ProcessTool {
         let id = parse_id(args, "kill")?;
 
         let entry = {
-            let mut processes = self.processes.write().unwrap();
+            let mut processes = match self.processes.write() {
+                Ok(processes) => processes,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Failed to access process table for kill action: poisoned state"
+                                .to_string(),
+                        ),
+                    });
+                }
+            };
             match processes.remove(&id) {
                 Some(entry) => entry,
                 None => {
@@ -951,5 +971,32 @@ mod tests {
             second_lines, first_lines,
             "incremental offsets should prevent duplicate detector emissions for unchanged output"
         );
+    }
+
+    #[tokio::test]
+    async fn kill_returns_structured_error_when_process_table_is_poisoned() {
+        let tool = make_tool();
+        let processes = Arc::clone(&tool.processes);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = processes.write().expect("process table write lock should be acquired");
+            panic!("poison process lock");
+        })
+        .join();
+
+        let result = tool
+            .execute(json!({
+                "action": "kill",
+                "id": 0
+            }))
+            .await
+            .expect("kill action should return ToolResult even on lock poison");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("poisoned state"));
     }
 }
