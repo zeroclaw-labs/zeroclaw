@@ -1,5 +1,7 @@
 name: Sec CodeQL
 
+# Moved off PR path per CI/CD optimization PRD.
+# Runs on push-to-main/dev + weekly schedule to catch vulnerabilities within 1 merge.
 on:
     push:
         branches: [dev, main]
@@ -14,27 +16,12 @@ on:
             - "scripts/ci/self_heal_rust_toolchain.sh"
             - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-codeql.yml"
-    pull_request:
-        branches: [dev, main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
-            - "crates/**"
-            - "scripts/ci/ensure_c_toolchain.sh"
-            - "scripts/ci/ensure_cargo_component.sh"
-            - ".github/codeql/**"
-            - "scripts/ci/self_heal_rust_toolchain.sh"
-            - "scripts/ci/ensure_cc.sh"
-            - ".github/workflows/sec-codeql.yml"
-    merge_group:
-        branches: [dev, main]
     schedule:
         - cron: "0 6 * * 1" # Weekly Monday 6am UTC
     workflow_dispatch:
 
 concurrency:
-    group: codeql-${{ github.event.pull_request.number || github.ref || github.run_id }}
+    group: codeql-${{ github.ref || github.run_id }}
     cancel-in-progress: true
 
 permissions:
@@ -47,34 +34,11 @@ env:
     GIT_CONFIG_KEY_0: core.hooksPath
     GIT_CONFIG_VALUE_0: /dev/null
 
-
 jobs:
-    select-runner:
-        name: Select CodeQL Runner Lane
-        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
-        outputs:
-            labels: ${{ steps.lane.outputs.labels }}
-            lane: ${{ steps.lane.outputs.lane }}
-        steps:
-            - name: Resolve branch lane
-              id: lane
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-                  if [[ "$branch" == release/* ]]; then
-                    echo 'labels=["self-hosted","Linux","X64","hetzner","codeql"]' >> "$GITHUB_OUTPUT"
-                    echo 'lane=release' >> "$GITHUB_OUTPUT"
-                  else
-                    echo 'labels=["self-hosted","Linux","X64","hetzner","codeql","codeql-general"]' >> "$GITHUB_OUTPUT"
-                    echo 'lane=general' >> "$GITHUB_OUTPUT"
-                  fi
-
     codeql:
         name: CodeQL Analysis
-        needs: [select-runner]
-        runs-on: ${{ fromJSON(needs.select-runner.outputs.labels) }}
-        timeout-minutes: 120
+        runs-on: blacksmith-8vcpu-ubuntu-2404
+        timeout-minutes: 45
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
             RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
@@ -113,7 +77,8 @@ jobs:
 
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
               with:
-                  prefix-key: sec-codeql-build
+                  prefix-key: zeroclaw-ci-v1
+                  shared-key: ${{ runner.os }}-rust
                   cache-targets: true
                   cache-bin: false
 
@@ -125,13 +90,12 @@ jobs:
               with:
                   category: "/language:rust"
 
-            - name: Summarize lane
+            - name: Summarize runner
               if: always()
               shell: bash
               run: |
                   {
-                    echo "### CodeQL Runner Lane"
+                    echo "### CodeQL Runner"
                     echo "- Branch: \`${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}\`"
-                    echo "- Lane: \`${{ needs.select-runner.outputs.lane }}\`"
-                    echo "- Labels: \`${{ needs.select-runner.outputs.labels }}\`"
+                    echo "- Runner: \`blacksmith-8vcpu-ubuntu-2404\`"
                   } >> "$GITHUB_STEP_SUMMARY"
