@@ -148,6 +148,10 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Multi-workspace routing and registry settings (`[workspaces]`).
+    #[serde(default)]
+    pub workspaces: WorkspacesConfig,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -296,6 +300,50 @@ pub struct ProviderConfig {
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]
     pub reasoning_level: Option<String>,
+}
+
+/// Multi-workspace registry configuration (`[workspaces]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspacesConfig {
+    /// Enables in-process workspace registry behavior.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional workspace registry root override.
+    /// If omitted, defaults to `<config_dir>/workspaces`.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+impl WorkspacesConfig {
+    /// Resolve the workspace registry root from config and runtime context.
+    pub fn resolve_root(&self, config_dir: &Path) -> PathBuf {
+        match self
+            .root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => {
+                let expanded = shellexpand::tilde(value).into_owned();
+                let path = PathBuf::from(expanded);
+                if path.is_absolute() {
+                    path
+                } else {
+                    config_dir.join(path)
+                }
+            }
+            None => config_dir.join("workspaces"),
+        }
+    }
+}
+
+impl Default for WorkspacesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: None,
+        }
+    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -2838,6 +2886,16 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
+    /// Optional per-fallback provider API keys keyed by fallback entry name.
+    /// This allows distinct credentials for multiple `custom:<url>` endpoints.
+    ///
+    /// Contract:
+    /// - Default/omitted (`{}` via `#[serde(default)]`): no per-entry override is used.
+    /// - Compatibility: additive and non-breaking for existing configs that omit this field.
+    /// - Rollback/migration: remove this map (or specific entries) to revert to provider/env-based
+    ///   credential resolution.
+    #[serde(default)]
+    pub fallback_api_keys: std::collections::HashMap<String, String>,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
@@ -2893,6 +2951,7 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
@@ -4677,6 +4736,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            workspaces: WorkspacesConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -4730,8 +4790,8 @@ fn default_config_dir() -> Result<PathBuf> {
     Ok(home.join(".zeroclaw"))
 }
 
-fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
-    default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
+fn active_workspace_state_path(marker_root: &Path) -> PathBuf {
+    marker_root.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
 /// Returns `true` if `path` lives under the OS temp directory.
@@ -4791,9 +4851,65 @@ async fn load_persisted_workspace_dirs(
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
+async fn remove_active_workspace_marker(marker_root: &Path) -> Result<()> {
+    let state_path = active_workspace_state_path(marker_root);
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    fs::remove_file(&state_path).await.with_context(|| {
+        format!(
+            "Failed to clear active workspace marker: {}",
+            state_path.display()
+        )
+    })?;
+
+    if marker_root.exists() {
+        sync_directory(marker_root).await?;
+    }
+    Ok(())
+}
+
+async fn write_active_workspace_marker(marker_root: &Path, config_dir: &Path) -> Result<()> {
+    fs::create_dir_all(marker_root).await.with_context(|| {
+        format!(
+            "Failed to create active workspace marker root: {}",
+            marker_root.display()
+        )
+    })?;
+
+    let state = ActiveWorkspaceState {
+        config_dir: config_dir.to_string_lossy().into_owned(),
+    };
+    let serialized =
+        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
+
+    let temp_path = marker_root.join(format!(
+        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temp_path, serialized).await.with_context(|| {
+        format!(
+            "Failed to write temporary active workspace marker: {}",
+            temp_path.display()
+        )
+    })?;
+
+    let state_path = active_workspace_state_path(marker_root);
+    if let Err(error) = fs::rename(&temp_path, &state_path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        anyhow::bail!(
+            "Failed to atomically persist active workspace marker {}: {error}",
+            state_path.display()
+        );
+    }
+
+    sync_directory(marker_root).await?;
+    Ok(())
+}
+
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
     let default_config_dir = default_config_dir()?;
-    let state_path = active_workspace_state_path(&default_config_dir);
 
     // Guard: never persist a temp-directory path as the active workspace.
     // This prevents transient test runs or one-off invocations from hijacking
@@ -4808,52 +4924,24 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     }
 
     if config_dir == default_config_dir {
-        if state_path.exists() {
-            fs::remove_file(&state_path).await.with_context(|| {
-                format!(
-                    "Failed to clear active workspace marker: {}",
-                    state_path.display()
-                )
-            })?;
-        }
+        remove_active_workspace_marker(&default_config_dir).await?;
         return Ok(());
     }
 
-    fs::create_dir_all(&default_config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create default config directory: {}",
-                default_config_dir.display()
-            )
-        })?;
+    // Primary marker lives with the selected config root to keep custom-home
+    // layouts self-contained and writable in restricted environments.
+    write_active_workspace_marker(config_dir, config_dir).await?;
 
-    let state = ActiveWorkspaceState {
-        config_dir: config_dir.to_string_lossy().into_owned(),
-    };
-    let serialized =
-        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
-
-    let temp_path = default_config_dir.join(format!(
-        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temp_path, serialized).await.with_context(|| {
-        format!(
-            "Failed to write temporary active workspace marker: {}",
-            temp_path.display()
-        )
-    })?;
-
-    if let Err(error) = fs::rename(&temp_path, &state_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        anyhow::bail!(
-            "Failed to atomically persist active workspace marker {}: {error}",
-            state_path.display()
+    // Mirror into the default HOME-scoped root as a best-effort pointer for
+    // later auto-discovery. Failure here must not break onboarding/update flows.
+    if let Err(error) = write_active_workspace_marker(&default_config_dir, config_dir).await {
+        tracing::warn!(
+            selected_config_dir = %config_dir.display(),
+            default_config_dir = %default_config_dir.display(),
+            "Failed to mirror active workspace marker to default HOME config root; continuing with selected-root marker only: {error}"
         );
     }
 
-    sync_directory(&default_config_dir).await?;
     Ok(())
 }
 
@@ -5008,6 +5096,21 @@ fn decrypt_vec_secrets(
     Ok(())
 }
 
+fn decrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .decrypt(value)
+                .with_context(|| format!("Failed to decrypt {field_name}.{key}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -5048,6 +5151,21 @@ fn encrypt_vec_secrets(
             *value = store
                 .encrypt(value)
                 .with_context(|| format!("Failed to encrypt {field_name}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if !crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .encrypt(value)
+                .with_context(|| format!("Failed to encrypt {field_name}.{key}"))?;
         }
     }
     Ok(())
@@ -5526,6 +5644,22 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn normalize_top_level_table_aliases(raw_toml: &mut toml::Value) {
+    let Some(root) = raw_toml.as_table_mut() else {
+        return;
+    };
+
+    if root.contains_key("Gateway") {
+        if root.contains_key("gateway") {
+            let _ = root.remove("Gateway");
+            tracing::warn!("Legacy table [Gateway] ignored because [gateway] is already present.");
+        } else if let Some(value) = root.remove("Gateway") {
+            root.insert("gateway".to_string(), value);
+            tracing::warn!("Legacy table [Gateway] mapped to [gateway].");
+        }
+    }
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -5563,12 +5697,18 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
+            let mut raw_toml: toml::Value =
+                toml::from_str(&contents).context("Failed to parse config file")?;
+            normalize_top_level_table_aliases(&mut raw_toml);
+            let normalized_contents =
+                toml::to_string(&raw_toml).context("Failed to normalize config file")?;
 
             // Track ignored/unknown config keys to warn users about silent misconfigurations
             // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
             let mut ignored_paths: Vec<String> = Vec::new();
             let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
+                toml::de::Deserializer::parse(&normalized_contents)
+                    .context("Failed to parse config file")?,
                 |path| {
                     ignored_paths.push(path.to_string());
                 },
@@ -5629,6 +5769,11 @@ impl Config {
                 &store,
                 &mut config.reliability.api_keys,
                 "config.reliability.api_keys",
+            )?;
+            decrypt_map_secrets(
+                &store,
+                &mut config.reliability.fallback_api_keys,
+                "config.reliability.fallback_api_keys",
             )?;
             decrypt_vec_secrets(
                 &store,
@@ -5833,6 +5978,29 @@ impl Config {
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
+        }
+
+        // Reliability
+        let configured_fallbacks = self
+            .reliability
+            .fallback_providers
+            .iter()
+            .map(|provider| provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        for (entry, api_key) in &self.reliability.fallback_api_keys {
+            let normalized_entry = entry.trim();
+            if normalized_entry.is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys contains an empty key");
+            }
+            if api_key.trim().is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys.{normalized_entry} must not be empty");
+            }
+            if !configured_fallbacks.contains(normalized_entry) {
+                anyhow::bail!(
+                    "reliability.fallback_api_keys.{normalized_entry} has no matching entry in reliability.fallback_providers"
+                );
+            }
         }
 
         // Autonomy
@@ -6471,6 +6639,11 @@ impl Config {
             &mut config_to_save.reliability.api_keys,
             "config.reliability.api_keys",
         )?;
+        encrypt_map_secrets(
+            &store,
+            &mut config_to_save.reliability.fallback_api_keys,
+            "config.reliability.fallback_api_keys",
+        )?;
         encrypt_vec_secrets(
             &store,
             &mut config_to_save.gateway.paired_tokens,
@@ -6994,6 +7167,7 @@ default_temperature = 0.7
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            workspaces: WorkspacesConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -7400,6 +7574,7 @@ tool_dispatcher = "xml"
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            workspaces: WorkspacesConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -7469,6 +7644,10 @@ tool_dispatcher = "xml"
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
+        config.reliability.fallback_api_keys.insert(
+            "custom:https://api-a.example.com/v1".into(),
+            "fallback-a-credential".into(),
+        );
         config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
         config.channels_config.telegram = Some(TelegramConfig {
             bot_token: "telegram-credential".into(),
@@ -7575,6 +7754,16 @@ tool_dispatcher = "xml"
         let reliability_key = &stored.reliability.api_keys[0];
         assert!(crate::security::SecretStore::is_encrypted(reliability_key));
         assert_eq!(store.decrypt(reliability_key).unwrap(), "backup-credential");
+        let fallback_key = stored
+            .reliability
+            .fallback_api_keys
+            .get("custom:https://api-a.example.com/v1")
+            .expect("fallback key should exist");
+        assert!(crate::security::SecretStore::is_encrypted(fallback_key));
+        assert_eq!(
+            store.decrypt(fallback_key).unwrap(),
+            "fallback-a-credential"
+        );
 
         let paired_token = &stored.gateway.paired_tokens[0];
         assert!(crate::security::SecretStore::is_encrypted(paired_token));
@@ -8432,6 +8621,25 @@ default_temperature = 0.7
         assert!(
             !parsed.gateway.allow_public_bind,
             "Missing [gateway] must default to allow_public_bind=false"
+        );
+    }
+
+    #[test]
+    async fn checklist_gateway_backward_compat_accepts_legacy_gateway_table_alias() {
+        let mut raw: toml::Value = toml::from_str(
+            r#"
+default_temperature = 0.7
+[Gateway]
+require_pairing = false
+"#,
+        )
+        .unwrap();
+
+        normalize_top_level_table_aliases(&mut raw);
+        let parsed: Config = raw.try_into().unwrap();
+        assert!(
+            !parsed.gateway.require_pairing,
+            "Legacy [Gateway] alias should map to [gateway]"
         );
     }
 
@@ -9339,6 +9547,74 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn persist_active_workspace_marker_is_written_to_selected_config_root() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let default_config_dir = temp_home.join(".zeroclaw");
+        let custom_config_dir = temp_home.join("profiles").join("custom-profile");
+        let default_marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+        let custom_marker_path = custom_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+
+        persist_active_workspace_config_dir(&custom_config_dir)
+            .await
+            .unwrap();
+
+        assert!(custom_marker_path.exists());
+        assert!(default_marker_path.exists());
+
+        let custom_state: ActiveWorkspaceState =
+            toml::from_str(&fs::read_to_string(&custom_marker_path).await.unwrap()).unwrap();
+        assert_eq!(PathBuf::from(custom_state.config_dir), custom_config_dir);
+
+        let default_state: ActiveWorkspaceState =
+            toml::from_str(&fs::read_to_string(&default_marker_path).await.unwrap()).unwrap();
+        assert_eq!(PathBuf::from(default_state.config_dir), custom_config_dir);
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn persist_active_workspace_marker_tolerates_restricted_default_home_root() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let default_config_root_blocker = temp_home.join(".zeroclaw");
+        let custom_config_dir = temp_home.join("profiles").join("restricted-home-profile");
+        let custom_marker_path = custom_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        fs::create_dir_all(&custom_config_dir).await.unwrap();
+        fs::write(&default_config_root_blocker, "blocked-as-file")
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+
+        persist_active_workspace_config_dir(&custom_config_dir)
+            .await
+            .unwrap();
+
+        assert!(custom_marker_path.exists());
+        assert!(default_config_root_blocker.is_file());
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -9346,6 +9622,7 @@ default_model = "legacy-model"
         let default_config_dir = temp_home.join(".zeroclaw");
         let custom_config_dir = temp_home.join("profiles").join("custom-profile");
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+        let custom_marker_path = custom_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
@@ -9354,11 +9631,13 @@ default_model = "legacy-model"
             .await
             .unwrap();
         assert!(marker_path.exists());
+        assert!(custom_marker_path.exists());
 
         persist_active_workspace_config_dir(&default_config_dir)
             .await
             .unwrap();
         assert!(!marker_path.exists());
+        assert!(custom_marker_path.exists());
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -10256,6 +10535,40 @@ baseline_syscalls = ["read", "write", "openat", "close"]
     }
 
     #[test]
+    async fn reliability_validation_rejects_empty_fallback_api_key_value() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("openrouter".to_string(), "   ".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys empty value validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.openrouter must not be empty"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_unmapped_fallback_api_key_entry() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("anthropic".to_string(), "sk-ant-test".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys mapping validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.anthropic has no matching entry"));
+    }
+
+    #[test]
     async fn security_validation_rejects_unknown_domain_category() {
         let mut config = Config::default();
         config.security.otp.gated_domain_categories = vec!["not_real".into()];
@@ -10443,5 +10756,31 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         config
             .validate()
             .expect("disabled coordination should allow empty lead agent");
+    }
+
+    #[test]
+    async fn workspaces_config_defaults_disabled() {
+        let config = Config::default();
+        assert!(!config.workspaces.enabled);
+        assert!(config.workspaces.root.is_none());
+    }
+
+    #[test]
+    async fn workspaces_config_resolve_root_default_and_relative_override() {
+        let config_dir = std::path::PathBuf::from("/tmp/zeroclaw-config-root");
+        let default_cfg = WorkspacesConfig::default();
+        assert_eq!(
+            default_cfg.resolve_root(&config_dir),
+            config_dir.join("workspaces")
+        );
+
+        let relative_cfg = WorkspacesConfig {
+            enabled: true,
+            root: Some("profiles".into()),
+        };
+        assert_eq!(
+            relative_cfg.resolve_root(&config_dir),
+            config_dir.join("profiles")
+        );
     }
 }

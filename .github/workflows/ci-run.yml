@@ -225,6 +225,32 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 14
 
+    restricted-hermetic:
+        name: Restricted Hermetic Validation
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 45
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: ci-run-restricted-hermetic
+                  cache-bin: false
+            - name: Run restricted-profile hermetic subset
+              shell: bash
+              run: ./scripts/ci/restricted_profile.sh
+
     build:
         name: Build (Smoke)
         needs: [changes]
@@ -501,7 +527,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, workspace-check, package-check, test, build, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
+        needs: [changes, lint, workspace-check, package-check, test, restricted-hermetic, build, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
         runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         steps:
             - name: Enforce required status
@@ -558,6 +584,7 @@ jobs:
                   workspace_check_result="${{ needs.workspace-check.result }}"
                   package_check_result="${{ needs.package-check.result }}"
                   test_result="${{ needs.test.result }}"
+                  restricted_hermetic_result="${{ needs.restricted-hermetic.result }}"
                   build_result="${{ needs.build.result }}"
                   cross_platform_vm_result="${{ needs.cross-platform-vm.result }}"
                   linux_distro_container_result="${{ needs.linux-distro-container.result }}"
@@ -567,6 +594,7 @@ jobs:
                   echo "workspace-check=${workspace_check_result}"
                   echo "package-check=${package_check_result}"
                   echo "test=${test_result}"
+                  echo "restricted-hermetic=${restricted_hermetic_result}"
                   echo "build=${build_result}"
                   echo "cross-platform-vm=${cross_platform_vm_result}"
                   echo "linux-distro-container=${linux_distro_container_result}"
@@ -576,8 +604,8 @@ jobs:
 
                   check_pr_governance
 
-                  if [ "$lint_result" != "success" ] || [ "$workspace_check_result" != "success" ] || [ "$package_check_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$cross_platform_vm_result" != "success" ] || [ "$linux_distro_container_result" != "success" ] || [ "$docker_smoke_result" != "success" ]; then
-                    echo "Required CI jobs did not pass: lint=${lint_result} workspace-check=${workspace_check_result} package-check=${package_check_result} test=${test_result} build=${build_result} cross-platform-vm=${cross_platform_vm_result} linux-distro-container=${linux_distro_container_result} docker-smoke=${docker_smoke_result}"
+                  if [ "$lint_result" != "success" ] || [ "$workspace_check_result" != "success" ] || [ "$package_check_result" != "success" ] || [ "$test_result" != "success" ] || [ "$restricted_hermetic_result" != "success" ] || [ "$build_result" != "success" ] || [ "$cross_platform_vm_result" != "success" ] || [ "$linux_distro_container_result" != "success" ] || [ "$docker_smoke_result" != "success" ]; then
+                    echo "Required CI jobs did not pass: lint=${lint_result} workspace-check=${workspace_check_result} package-check=${package_check_result} test=${test_result} restricted-hermetic=${restricted_hermetic_result} build=${build_result} cross-platform-vm=${cross_platform_vm_result} linux-distro-container=${linux_distro_container_result} docker-smoke=${docker_smoke_result}"
                     exit 1
                   fi
 

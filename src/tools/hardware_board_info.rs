@@ -6,6 +6,7 @@
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write as _;
 
 /// Static board info (datasheets). Used when probe-rs is unavailable.
 const BOARD_INFO: &[(&str, &str, &str)] = &[
@@ -173,27 +174,22 @@ fn probe_board_info(chip: &str) -> anyhow::Result<String> {
         match region {
             MemoryRegion::Ram(ram) => {
                 let (start, end) = (ram.range.start, ram.range.end);
-                out.push_str(&format!(
-                    "RAM: 0x{:08X} - 0x{:08X} ({} KB)\n",
-                    start,
-                    end,
-                    (end - start) / 1024
-                ));
+                append_memory_region_line(&mut out, "RAM", start, end);
             }
             MemoryRegion::Nvm(flash) => {
                 let (start, end) = (flash.range.start, flash.range.end);
-                out.push_str(&format!(
-                    "Flash: 0x{:08X} - 0x{:08X} ({} KB)\n",
-                    start,
-                    end,
-                    (end - start) / 1024
-                ));
+                append_memory_region_line(&mut out, "Flash", start, end);
             }
             _ => {}
         }
     }
     out.push_str("\n(Info read via USB/SWD — no firmware on target needed.)");
     Ok(out)
+}
+
+fn append_memory_region_line(out: &mut String, label: &str, start: u64, end: u64) {
+    let size_kb = (end - start) / 1024;
+    let _ = writeln!(out, "{label}: 0x{start:08X} - 0x{end:08X} ({size_kb} KB)");
 }
 
 fn memory_map_static(board: &str) -> Option<&'static str> {
@@ -204,5 +200,23 @@ fn memory_map_static(board: &str) -> Option<&'static str> {
         "arduino-uno" => Some("Flash: 16 KB, SRAM: 2 KB, EEPROM: 1 KB"),
         "esp32" => Some("Flash: 4 MB, IRAM/DRAM per ESP-IDF layout"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_memory_region_line;
+
+    #[test]
+    fn append_memory_region_line_matches_legacy_format() {
+        let mut actual = String::new();
+        append_memory_region_line(&mut actual, "Flash", 0x0800_0000, 0x0808_0000);
+        let expected = format!(
+            "Flash: 0x{:08X} - 0x{:08X} ({} KB)\n",
+            0x0800_0000_u64,
+            0x0808_0000_u64,
+            (0x0808_0000_u64 - 0x0800_0000_u64) / 1024
+        );
+        assert_eq!(actual, expected);
     }
 }
