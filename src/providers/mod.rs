@@ -1442,7 +1442,7 @@ pub fn create_resilient_provider_with_options(
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
-                    fallback_provider = fallback,
+                    fallback_provider = provider_name,
                     "Ignoring invalid fallback provider during initialization"
                 );
             }
