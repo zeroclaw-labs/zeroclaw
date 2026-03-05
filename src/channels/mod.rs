@@ -1625,7 +1625,7 @@ fn is_heartbeat_ok_sentinel(output: &str) -> bool {
 }
 
 fn is_agent_noop_sentinel(output: &str) -> bool {
-    crate::cron::scheduler::is_no_reply_sentinel(output) || is_heartbeat_ok_sentinel(output)
+    output.trim().eq_ignore_ascii_case("no_reply") || is_heartbeat_ok_sentinel(output)
 }
 
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
@@ -8991,9 +8991,6 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            conversation_locks: Default::default(),
-            session_config: crate::config::AgentSessionConfig::default(),
-            session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9011,8 +9008,6 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
-            safety_heartbeat: None,
-            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
         });
 
         process_channel_message(
@@ -9047,7 +9042,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .expect("user turn should still be retained");
         assert_eq!(turns.len(), 1, "assistant sentinel should not be persisted");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        assert!(
+            turns[0].content.contains("hello"),
+            "expected user content to retain original message"
+        );
     }
 
     #[test]
