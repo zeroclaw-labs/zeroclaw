@@ -108,7 +108,7 @@ impl OpenClawMigrationTool {
             dry_run,
         };
 
-        let report = migrate_openclaw(self.config.as_ref(), options).await?;
+        let report = Box::pin(migrate_openclaw(self.config.as_ref(), options)).await?;
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
@@ -162,7 +162,7 @@ impl Tool for OpenClawMigrationTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        match self.execute_action(&args).await {
+        match Box::pin(self.execute_action(&args)).await {
             Ok(result) => Ok(result),
             Err(error) => Ok(ToolResult {
                 success: false,

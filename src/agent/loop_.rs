@@ -431,7 +431,7 @@ where
 }
 
 fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
-    interval > 0 && counter > 0 && counter % interval == 0
+    interval > 0 && counter > 0 && counter.is_multiple_of(interval)
 }
 
 fn should_emit_verbose_progress(mode: ProgressMode) -> bool {
@@ -464,9 +464,18 @@ fn estimate_prompt_tokens(
         })
         .unwrap_or(0);
     let total_chars = message_chars.saturating_add(tool_chars);
-    let char_estimate = (total_chars as f64 / 4.0).ceil() as u64;
-    let framing_overhead = (messages.len() as u64).saturating_mul(6).saturating_add(64);
+    let char_estimate = u64::try_from(total_chars.div_ceil(4)).unwrap_or(u64::MAX);
+    let framing_overhead = u64::try_from(messages.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(6)
+        .saturating_add(64);
     char_estimate.saturating_add(framing_overhead)
+}
+
+fn apply_reserve_percent(tokens: u64, reserve_percent: u8) -> u64 {
+    let multiplier = 100_u128 + u128::from(reserve_percent);
+    let adjusted = (u128::from(tokens) * multiplier + 99) / 100;
+    u64::try_from(adjusted).unwrap_or(u64::MAX)
 }
 
 fn lookup_model_pricing(
@@ -503,11 +512,10 @@ fn estimate_request_cost_usd(
     messages: &[ChatMessage],
     tools: Option<&[crate::tools::ToolSpec]>,
 ) -> f64 {
-    let reserve_multiplier = 1.0 + (f64::from(context.reserve_percent) / 100.0);
     let input_tokens = estimate_prompt_tokens(messages, tools);
     let output_tokens = (input_tokens / 4).max(256);
-    let input_tokens = ((input_tokens as f64) * reserve_multiplier).ceil() as u64;
-    let output_tokens = ((output_tokens as f64) * reserve_multiplier).ceil() as u64;
+    let input_tokens = apply_reserve_percent(input_tokens, context.reserve_percent);
+    let output_tokens = apply_reserve_percent(output_tokens, context.reserve_percent);
 
     let (input_price, output_price) = lookup_model_pricing(&context.prices, provider, model);
     let input_cost = (input_tokens as f64 / 1_000_000.0) * input_price.max(0.0);
@@ -3368,7 +3376,7 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    process_message_with_session(config, message, None).await
+    Box::pin(process_message_with_session(config, message, None)).await
 }
 
 pub async fn process_message_with_session(
@@ -3785,6 +3793,16 @@ mod tests {
         );
 
         assert_eq!(args["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn apply_reserve_percent_rounds_up_for_regular_values() {
+        assert_eq!(apply_reserve_percent(101, 10), 112);
+    }
+
+    #[test]
+    fn apply_reserve_percent_clamps_large_overflowing_values() {
+        assert_eq!(apply_reserve_percent(u64::MAX, 100), u64::MAX);
     }
 
     #[test]

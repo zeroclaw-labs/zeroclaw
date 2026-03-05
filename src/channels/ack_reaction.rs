@@ -66,7 +66,7 @@ fn matches_chat_type(rule: &AckReactionRuleConfig, chat_type: AckReactionContext
         AckReactionContextChatType::Direct => AckReactionChatType::Direct,
         AckReactionContextChatType::Group => AckReactionChatType::Group,
     };
-    rule.chat_types.iter().any(|candidate| *candidate == wanted)
+    rule.chat_types.contains(&wanted)
 }
 
 fn matches_sender(rule: &AckReactionRuleConfig, sender_id: Option<&str>) -> bool {

@@ -130,8 +130,10 @@ impl ChannelAckConfigTool {
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
-            None | Some("") | Some("direct") => Ok(AckReactionContextChatType::Direct),
+            None => Ok(AckReactionContextChatType::Direct),
+            Some("") => anyhow::bail!("'chat_type' cannot be empty. Use direct|group"),
             Some("group") => Ok(AckReactionContextChatType::Group),
+            Some("direct") => Ok(AckReactionContextChatType::Direct),
             Some(other) => anyhow::bail!("Invalid chat_type '{other}'. Use direct|group"),
         }
     }
@@ -215,10 +217,10 @@ impl ChannelAckConfigTool {
         Ok(parsed)
     }
 
-    fn channel_config_ref<'a>(
-        channels: &'a AckReactionChannelsConfig,
+    fn channel_config_ref(
+        channels: &AckReactionChannelsConfig,
         channel: AckChannel,
-    ) -> Option<&'a AckReactionConfig> {
+    ) -> Option<&AckReactionConfig> {
         match channel {
             AckChannel::Telegram => channels.telegram.as_ref(),
             AckChannel::Discord => channels.discord.as_ref(),
@@ -227,10 +229,10 @@ impl ChannelAckConfigTool {
         }
     }
 
-    fn channel_config_mut<'a>(
-        channels: &'a mut AckReactionChannelsConfig,
+    fn channel_config_mut(
+        channels: &mut AckReactionChannelsConfig,
         channel: AckChannel,
-    ) -> &'a mut Option<AckReactionConfig> {
+    ) -> &mut Option<AckReactionConfig> {
         match channel {
             AckChannel::Telegram => &mut channels.telegram,
             AckChannel::Discord => &mut channels.discord,
@@ -649,31 +651,31 @@ impl Tool for ChannelAckConfigTool {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
-                self.handle_set(&args).await
+                Box::pin(self.handle_set(&args)).await
             }
             "add_rule" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
-                self.handle_add_rule(&args).await
+                Box::pin(self.handle_add_rule(&args)).await
             }
             "remove_rule" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
-                self.handle_remove_rule(&args).await
+                Box::pin(self.handle_remove_rule(&args)).await
             }
             "clear_rules" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
-                self.handle_clear_rules(&args).await
+                Box::pin(self.handle_clear_rules(&args)).await
             }
             "unset" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
-                self.handle_unset(&args).await
+                Box::pin(self.handle_unset(&args)).await
             }
             "simulate" => self.handle_simulate(&args),
             other => anyhow::bail!(
@@ -889,5 +891,23 @@ mod tests {
             output["aggregate"]["source_counts"]["channel_pool"],
             json!(5)
         );
+    }
+
+    #[tokio::test]
+    async fn simulate_rejects_empty_chat_type() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ChannelAckConfigTool::new(test_config(&tmp).await, test_security());
+
+        let err = tool
+            .execute(json!({
+                "action": "simulate",
+                "channel": "telegram",
+                "text": "hello world",
+                "chat_type": ""
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("'chat_type' cannot be empty"));
     }
 }

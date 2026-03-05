@@ -6,6 +6,7 @@ use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::convert::Infallible;
 use std::sync::Arc;
 
 /// Browser selection for the browser_open tool.
@@ -27,9 +28,8 @@ pub enum BrowserChoice {
 
 impl BrowserChoice {
     /// Parse from config string
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_config_value(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "disable" => Self::Disable,
             "brave" => Self::Brave,
             "chrome" => Self::Chrome,
             "firefox" => Self::Firefox,
@@ -49,6 +49,14 @@ impl BrowserChoice {
             Self::Edge => "Microsoft Edge",
             Self::Default => "default browser",
         }
+    }
+}
+
+impl std::str::FromStr for BrowserChoice {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_config_value(s))
     }
 }
 
@@ -703,17 +711,47 @@ mod tests {
 
     #[test]
     fn browser_choice_from_str() {
-        assert_eq!(BrowserChoice::from_str("disable"), BrowserChoice::Disable);
-        assert_eq!(BrowserChoice::from_str("Disable"), BrowserChoice::Disable);
-        assert_eq!(BrowserChoice::from_str("DISABLE"), BrowserChoice::Disable);
-        assert_eq!(BrowserChoice::from_str("brave"), BrowserChoice::Brave);
-        assert_eq!(BrowserChoice::from_str("chrome"), BrowserChoice::Chrome);
-        assert_eq!(BrowserChoice::from_str("firefox"), BrowserChoice::Firefox);
-        assert_eq!(BrowserChoice::from_str("edge"), BrowserChoice::Edge);
-        assert_eq!(BrowserChoice::from_str("msedge"), BrowserChoice::Edge);
-        assert_eq!(BrowserChoice::from_str("default"), BrowserChoice::Default);
-        assert_eq!(BrowserChoice::from_str(""), BrowserChoice::Default);
-        assert_eq!(BrowserChoice::from_str("unknown"), BrowserChoice::Disable);
+        assert_eq!(
+            BrowserChoice::from_config_value("disable"),
+            BrowserChoice::Disable
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("Disable"),
+            BrowserChoice::Disable
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("DISABLE"),
+            BrowserChoice::Disable
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("brave"),
+            BrowserChoice::Brave
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("chrome"),
+            BrowserChoice::Chrome
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("firefox"),
+            BrowserChoice::Firefox
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("edge"),
+            BrowserChoice::Edge
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("msedge"),
+            BrowserChoice::Edge
+        );
+        assert_eq!(
+            BrowserChoice::from_config_value("default"),
+            BrowserChoice::Default
+        );
+        assert_eq!(BrowserChoice::from_config_value(""), BrowserChoice::Default);
+        assert_eq!(
+            BrowserChoice::from_config_value("unknown"),
+            BrowserChoice::Disable
+        );
     }
 
     #[test]

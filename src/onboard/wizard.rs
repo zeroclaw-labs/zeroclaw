@@ -34,7 +34,7 @@ use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -81,6 +81,7 @@ const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 const STEP_PROGRESS_BAR_WIDTH: usize = 24;
+const STEP_PROGRESS_BAR_WIDTH_U8: u8 = 24;
 const STEP_DIVIDER_WIDTH: usize = 62;
 const FULL_ONBOARDING_STEPS: [&str; 11] = [
     "Workspace Setup",
@@ -192,8 +193,13 @@ pub async fn run_wizard_with_migration(
             })?;
             existing_config.workspace_dir = workspace_dir.to_path_buf();
             existing_config.config_path = config_path.to_path_buf();
-            maybe_run_openclaw_migration(&mut existing_config, &migration_options, true).await?;
-            let config = run_provider_update_wizard(&workspace_dir, &config_path).await?;
+            Box::pin(maybe_run_openclaw_migration(
+                &mut existing_config,
+                &migration_options,
+                true,
+            ))
+            .await?;
+            let config = Box::pin(run_provider_update_wizard(&workspace_dir, &config_path)).await?;
             return Ok(config);
         }
     }
@@ -310,7 +316,12 @@ pub async fn run_wizard_with_migration(
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
-    maybe_run_openclaw_migration(&mut config, &migration_options, true).await?;
+    Box::pin(maybe_run_openclaw_migration(
+        &mut config,
+        &migration_options,
+        true,
+    ))
+    .await?;
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -354,7 +365,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     );
     println!();
 
-    let mut config = Config::load_or_init().await?;
+    let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
@@ -557,7 +568,7 @@ pub async fn run_quick_setup_with_migration(
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    let mut config = run_quick_setup_with_home(
+    let mut config = Box::pin(run_quick_setup_with_home(
         credential_override,
         provider,
         model_override,
@@ -565,10 +576,15 @@ pub async fn run_quick_setup_with_migration(
         force,
         no_totp,
         &home,
-    )
+    ))
     .await?;
 
-    maybe_run_openclaw_migration(&mut config, &migration_options, false).await?;
+    Box::pin(maybe_run_openclaw_migration(
+        &mut config,
+        &migration_options,
+        false,
+    ))
+    .await?;
 
     if migration_requested {
         println!();
@@ -617,7 +633,7 @@ async fn maybe_run_openclaw_migration(
         style("↻").cyan().bold()
     );
 
-    let report = migrate_openclaw(
+    let report = Box::pin(migrate_openclaw(
         config,
         OpenClawMigrationOptions {
             source_workspace: if options.source_workspace.is_some() || resolved_workspace.exists() {
@@ -634,7 +650,7 @@ async fn maybe_run_openclaw_migration(
             include_config: true,
             dry_run: false,
         },
-    )
+    ))
     .await?;
 
     *config = load_config_without_env(config)?;
@@ -2432,12 +2448,9 @@ pub async fn run_models_refresh_all(config: &Config, force: bool) -> Result<()> 
 
 fn print_step(current: u8, total: u8, title: &str) {
     let total = total.max(1);
-    let completed = current
-        .saturating_sub(1)
-        .min(total)
-        .saturating_mul(STEP_PROGRESS_BAR_WIDTH as u8)
-        / total;
-    let completed = usize::from(completed);
+    let completed = usize::from(current.saturating_sub(1).min(total))
+        .saturating_mul(usize::from(STEP_PROGRESS_BAR_WIDTH_U8))
+        / usize::from(total);
     let remaining = STEP_PROGRESS_BAR_WIDTH.saturating_sub(completed);
     let progress = format!("[{}{}]", "=".repeat(completed), ".".repeat(remaining));
 
@@ -2543,12 +2556,28 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
         .context("Config path must have a parent directory")?;
     if let Err(error) = crate::config::schema::persist_active_workspace_config_dir(config_dir).await
     {
-        tracing::warn!(
-            config_dir = %config_dir.display(),
-            "Could not persist active workspace marker; continuing without marker: {error}"
-        );
+        if is_permission_denied_error(&error) {
+            tracing::warn!(
+                config_dir = %config_dir.display(),
+                error = %error,
+                "workspace selection marker persistence blocked by filesystem permissions; continuing without marker update"
+            );
+            return Ok(());
+        }
+        return Err(error.context(format!(
+            "Failed to persist workspace selection marker for {}",
+            config_dir.display()
+        )));
     }
     Ok(())
+}
+
+fn is_permission_denied_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::PermissionDenied)
+    })
 }
 
 // ── Step 1: Workspace ────────────────────────────────────────────
@@ -7140,6 +7169,18 @@ mod tests {
         );
         assert!(config.api_key.is_none());
         assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn permission_denied_detection_checks_error_chain() {
+        let permission_error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert!(is_permission_denied_error(&permission_error));
+
+        let other_error = anyhow::Error::new(std::io::Error::other("other"));
+        assert!(!is_permission_denied_error(&other_error));
     }
 
     #[tokio::test]
