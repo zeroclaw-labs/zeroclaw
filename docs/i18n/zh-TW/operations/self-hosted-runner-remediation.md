@@ -72,7 +72,7 @@ scripts/ci/runner_disk_cleanup.sh \
 
 安全行為：
 
-- `--apply` 在偵測到 runner worker/listener 程序時會中止，除非提供 `--force`。
+- `--apply` 在偵測到 runner worker/listener 行程時會中止，除非提供 `--force`。
 - 預設模式為非破壞性。
 
 ## 3) 復原流程

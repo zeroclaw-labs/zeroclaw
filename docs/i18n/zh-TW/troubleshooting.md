@@ -180,7 +180,7 @@ zeroclaw doctor
 修正方式：
 
 - 確保該 token 只有一個執行中的 runtime
-- 停止多餘的 `zeroclaw daemon` / `zeroclaw channel start` 程序
+- 停止多餘的 `zeroclaw daemon` / `zeroclaw channel start` 行程
 
 ### `channel doctor` 顯示頻道不健康
 

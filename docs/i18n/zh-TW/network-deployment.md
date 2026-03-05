@@ -148,7 +148,7 @@ zeroclaw channel bind-telegram <IDENTITY>
 Telegram Bot API `getUpdates` 每個 bot token 同時只支援一個輪詢器。
 
 - 同一 token 僅保持一個執行中的實例（建議：`zeroclaw daemon` 服務）。
-- 不要同時執行 `cargo run -- channel start` 或其他 bot 程序。
+- 不要同時執行 `cargo run -- channel start` 或其他 bot 行程。
 
 若遇到此錯誤：
 

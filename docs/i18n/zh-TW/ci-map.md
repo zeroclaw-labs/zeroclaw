@@ -2,7 +2,7 @@
 
 本文件說明每個 GitHub 工作流程的功能、執行時機，以及是否應阻擋合併。
 
-關於 PR、合併、推送及發布的逐事件交付行為，請參閱 [`.github/workflows/main-branch-flow.md`](../../.github/workflows/main-branch-flow.md)。
+關於 PR、合併、推送及發布的逐事件交付行為，請參閱 [`.github/workflows/main-branch-flow.md`](../../../.github/workflows/main-branch-flow.md)。
 
 ## 阻擋合併 vs 選用
 

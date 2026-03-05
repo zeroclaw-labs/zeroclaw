@@ -4,8 +4,8 @@
 
 ## 目前快照
 
-- [../../../project-triage-snapshot-2026-02-18.md](../../../project-triage-snapshot-2026-02-18.md)
-- [../../../docs-audit-2026-02-24.md](../../../docs-audit-2026-02-24.md)
+- [../project-triage-snapshot-2026-02-18.md](../project-triage-snapshot-2026-02-18.md)
+- [../docs-audit-2026-02-24.md](../docs-audit-2026-02-24.md)
 
 ## 範圍
 
@@ -15,4 +15,4 @@
 - 將文件維護與程式碼變更一同排定優先順序
 - 追蹤 PR／Issue 壓力隨時間的變化
 
-若需要穩定的文件分類（非時效性），請使用 [docs-inventory.md](../../../docs-inventory.md)。
+若需要穩定的文件分類（非時效性），請使用 [docs-inventory.md](../docs-inventory.md)。

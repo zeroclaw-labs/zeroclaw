@@ -3,7 +3,7 @@
 > ⚠️ **狀態：提案 / 規劃路線**
 >
 > 本文件描述提案中的方法，可能包含假設性的指令或設定。
-> 有關目前的執行期行為，請參閱 [config-reference.md](../../config-reference.md)、[operations-runbook.md](../../operations-runbook.md) 及 [troubleshooting.md](../../troubleshooting.md)。
+> 有關目前的執行期行為，請參閱 [config-reference.md](config-reference.md)、[operations-runbook.md](operations-runbook.md) 及 [troubleshooting.md](troubleshooting.md)。
 
 ## 核心問題：安全功能會破壞以下特性嗎...
 

@@ -5,10 +5,10 @@
 ## 入門路徑
 
 1. 主要概覽與快速啟動：[../../../../README.md](../../../../README.md)
-2. 一鍵安裝與雙模式引導：[../../../one-click-bootstrap.md](../../../one-click-bootstrap.md)
-3. 在 macOS 上更新或移除：[../../../getting-started/macos-update-uninstall.md](../../../getting-started/macos-update-uninstall.md)
-4. 在 Android 上設定（Termux/ADB）：[../../../android-setup.md](../../../android-setup.md)
-5. 依任務查詢指令：[../../../commands-reference.md](../../../commands-reference.md)
+2. 一鍵安裝與雙模式引導：[../one-click-bootstrap.md](../one-click-bootstrap.md)
+3. 在 macOS 上更新或移除：[macos-update-uninstall.md](macos-update-uninstall.md)
+4. 在 Android 上設定（Termux/ADB）：[../android-setup.md](../android-setup.md)
+5. 依任務查詢指令：[../commands-reference.md](../commands-reference.md)
 
 ## 選擇您的路徑
 
@@ -30,7 +30,7 @@
 
 ## 下一步
 
-- 執行時運維：[../../../operations/README.md](../../../operations/README.md)
-- 參照手冊：[../../../reference/README.md](../../../reference/README.md)
-- macOS 生命週期任務：[../../../getting-started/macos-update-uninstall.md](../../../getting-started/macos-update-uninstall.md)
-- Android 設定路徑：[../../../android-setup.md](../../../android-setup.md)
+- 執行時運維：[../operations/README.md](../operations/README.md)
+- 參照手冊：[../reference/README.md](../reference/README.md)
+- macOS 生命週期任務：[macos-update-uninstall.md](macos-update-uninstall.md)
+- Android 設定路徑：[../android-setup.md](../android-setup.md)

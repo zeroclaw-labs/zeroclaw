@@ -427,7 +427,7 @@ show_progress = true
 - `reasoning_enabled = true` 明確要求支援供應商的推理（`ollama` 上的 `think: true`）。
 - 未設定時保持供應商預設。
 - 已棄用的相容別名：`runtime.reasoning_level` 仍被接受，但應遷移至 `provider.reasoning_level`。
-- `runtime.kind = "wasm"` 啟用受能力約束的模組執行，並停用 Shell / 程序風格的執行。
+- `runtime.kind = "wasm"` 啟用受能力約束的模組執行，並停用 Shell / 程式風格的執行。
 
 ### `[runtime.wasm]`
 
@@ -611,7 +611,7 @@ clawhub_token = "your-token-here"
 | `api_key` | 未設定 | 可選的 computer-use Sidecar Bearer Token（加密儲存） |
 | `timeout_ms` | `15000` | 每個動作請求的逾時時間（毫秒） |
 | `allow_remote_endpoint` | `false` | 允許 computer-use Sidecar 使用遠端 / 公開端點 |
-| `window_allowlist` | `[]` | 可選的視窗標題 / 程序允許清單，轉發給 Sidecar 政策 |
+| `window_allowlist` | `[]` | 可選的視窗標題 / 程式允許清單，轉發給 Sidecar 政策 |
 | `max_coordinate_x` | 未設定 | 可選的座標動作 X 軸邊界 |
 | `max_coordinate_y` | 未設定 | 可選的座標動作 Y 軸邊界 |
 

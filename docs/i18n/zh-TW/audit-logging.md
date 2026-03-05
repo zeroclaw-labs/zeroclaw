@@ -3,7 +3,7 @@
 > ⚠️ **狀態：提案 / 規劃路線**
 >
 > 本文件描述提案中的方法，可能包含假設性的指令或設定。
-> 有關目前的執行期行為，請參閱 [config-reference.md](../../config-reference.md)、[operations-runbook.md](../../operations-runbook.md) 及 [troubleshooting.md](../../troubleshooting.md)。
+> 有關目前的執行期行為，請參閱 [config-reference.md](config-reference.md)、[operations-runbook.md](operations-runbook.md) 及 [troubleshooting.md](troubleshooting.md)。
 
 ## 問題
 
@@ -25,7 +25,7 @@ ZeroClaw 會記錄動作，但缺乏防篡改的稽核軌跡來追蹤：
   "actor": {
     "channel": "telegram",
     "user_id": "123456789",
-    "username": "@alice"
+    "username": "@user_a"
   },
   "action": {
     "command": "ls -la",
@@ -136,8 +136,8 @@ log_policy_violations = true
 ## 稽核查詢 CLI
 
 ```bash
-# 顯示 @alice 執行的所有指令
-zeroclaw audit --user @alice
+# 顯示 @user_a 執行的所有指令
+zeroclaw audit --user @user_a
 
 # 顯示所有高風險指令
 zeroclaw audit --risk high

@@ -173,7 +173,7 @@
 - 可選政策閘門：`[autonomy].non_cli_approval_approvers` 可限制誰能執行核准管理指令。
 
 多頻道啟動行為：
-- `zeroclaw channel start` 在單一程序中啟動所有已設定的頻道。
+- `zeroclaw channel start` 在單一行程中啟動所有已設定的頻道。
 - 若某個頻道初始化失敗，其他頻道仍會繼續啟動。
 - 若所有已設定的頻道都初始化失敗，啟動時會回傳錯誤並結束。
 

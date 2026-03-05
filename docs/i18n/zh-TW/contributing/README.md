@@ -4,11 +4,11 @@
 
 ## 核心政策
 
-- 貢獻指南：[../../../../CONTRIBUTING.md](../../../../CONTRIBUTING.md)
-- PR 工作流程規則：[../../../pr-workflow.md](../../../pr-workflow.md)
-- 審查者手冊：[../../../reviewer-playbook.md](../../../reviewer-playbook.md)
-- CI 地圖與負責人：[../../../ci-map.md](../../../ci-map.md)
-- Actions 來源政策：[../../../actions-source-policy.md](../../../actions-source-policy.md)
+- 貢獻指南：[../../CONTRIBUTING.md](../../CONTRIBUTING.md)
+- PR 工作流程規則：[../pr-workflow.md](../pr-workflow.md)
+- 審查者手冊：[../reviewer-playbook.md](../reviewer-playbook.md)
+- CI 地圖與負責人：[../ci-map.md](../ci-map.md)
+- Actions 來源政策：[../actions-source-policy.md](../actions-source-policy.md)
 
 ## 建議閱讀順序
 
