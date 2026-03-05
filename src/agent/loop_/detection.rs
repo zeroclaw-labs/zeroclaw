@@ -9,11 +9,91 @@
 //! self-correct.  If the pattern persists the next check returns `HardStop`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Maximum bytes of tool output considered when hashing results.
 /// Keeps hashing fast and bounded for large outputs.
 const OUTPUT_HASH_PREFIX_BYTES: usize = 4096;
+
+// ─── Failure Classification ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureCategory {
+    MissingBinary,
+    PermissionDenied,
+    Timeout,
+    RateLimit,
+    NetworkError,
+    InvalidArguments,
+    EnvironmentMissing,
+    Unknown,
+}
+
+impl fmt::Display for FailureCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::MissingBinary => "missing_binary",
+            Self::PermissionDenied => "permission_denied",
+            Self::Timeout => "timeout",
+            Self::RateLimit => "rate_limit",
+            Self::NetworkError => "network_error",
+            Self::InvalidArguments => "invalid_arguments",
+            Self::EnvironmentMissing => "environment_missing",
+            Self::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
+}
+
+pub(crate) fn classify_error(output: &str) -> FailureCategory {
+    let lower = output.to_ascii_lowercase();
+    let lower = if lower.len() > 512 { &lower[..512] } else { &lower };
+    if lower.contains("command not found")
+        || lower.contains("unknown command")
+        || lower.contains("not recognized as")
+        || lower.contains("no such file or directory")
+    {
+        FailureCategory::MissingBinary
+    } else if lower.contains("permission denied")
+        || lower.contains("not permitted")
+        || lower.contains("not allowed")
+        || lower.contains("access denied")
+    {
+        FailureCategory::PermissionDenied
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        FailureCategory::Timeout
+    } else if lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("budget exhausted")
+    {
+        FailureCategory::RateLimit
+    } else if lower.contains("connection refused")
+        || lower.contains("could not resolve")
+        || lower.contains("network unreachable")
+        || lower.contains("dns resolution")
+    {
+        FailureCategory::NetworkError
+    } else if lower.contains("missing required")
+        || lower.contains("invalid argument")
+        || lower.contains("expected ")
+    {
+        FailureCategory::InvalidArguments
+    } else if lower.contains("env var") || lower.contains("environment variable") {
+        FailureCategory::EnvironmentMissing
+    } else {
+        FailureCategory::Unknown
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoopDiagnostics {
+    pub tool: String,
+    pub category: Option<FailureCategory>,
+    pub consecutive_failures: usize,
+    pub last_errors: Vec<String>,
+    pub strategy: &'static str,
+}
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -61,6 +141,7 @@ struct CallRecord {
     args_sig: String,
     result_hash: u64,
     success: bool,
+    error_output: Option<String>,
 }
 
 // ─── Detector ────────────────────────────────────────────────────────────────
@@ -70,6 +151,7 @@ pub(crate) struct LoopDetector {
     history: Vec<CallRecord>,
     consecutive_failures: HashMap<String, usize>,
     warning_injected: bool,
+    last_diagnostics: Option<LoopDiagnostics>,
 }
 
 impl LoopDetector {
@@ -79,7 +161,13 @@ impl LoopDetector {
             history: Vec::new(),
             consecutive_failures: HashMap::new(),
             warning_injected: false,
+            last_diagnostics: None,
         }
+    }
+
+    /// Return the diagnostics from the most recent detection event.
+    pub fn diagnostics(&self) -> Option<&LoopDiagnostics> {
+        self.last_diagnostics.as_ref()
     }
 
     /// Record a completed tool invocation.
@@ -90,11 +178,23 @@ impl LoopDetector {
     /// * `success`   — whether the tool reported success.
     pub fn record_call(&mut self, tool_name: &str, args_sig: &str, output: &str, success: bool) {
         let result_hash = hash_output(output);
+        let error_output = if !success {
+            let trunc = if output.len() > 512 {
+                let boundary = crate::util::floor_utf8_char_boundary(output, 512);
+                &output[..boundary]
+            } else {
+                output
+            };
+            Some(trunc.to_owned())
+        } else {
+            None
+        };
         self.history.push(CallRecord {
             tool_name: tool_name.to_owned(),
             args_sig: args_sig.to_owned(),
             result_hash,
             success,
+            error_output,
         });
 
         if success {
@@ -109,19 +209,25 @@ impl LoopDetector {
 
     /// Evaluate the current history and return a verdict.
     pub fn check(&mut self) -> DetectionVerdict {
-        let reason = self
+        // Try each strategy, collecting diagnostics
+        let detection = self
             .check_no_progress_repeat()
             .or_else(|| self.check_ping_pong())
             .or_else(|| self.check_failure_streak());
 
-        match reason {
-            None => DetectionVerdict::Continue,
-            Some(msg) => {
+        match detection {
+            None => {
+                self.last_diagnostics = None;
+                DetectionVerdict::Continue
+            }
+            Some((msg, diag)) => {
+                let category = diag.category;
+                self.last_diagnostics = Some(diag);
                 if self.warning_injected {
                     DetectionVerdict::HardStop(msg)
                 } else {
                     self.warning_injected = true;
-                    DetectionVerdict::InjectWarning(format_warning(&msg))
+                    DetectionVerdict::InjectWarning(format_warning(&msg, category))
                 }
             }
         }
@@ -129,7 +235,7 @@ impl LoopDetector {
 
     // ── Strategy 1: no-progress repeat ───────────────────────────────────
 
-    fn check_no_progress_repeat(&self) -> Option<String> {
+    fn check_no_progress_repeat(&self) -> Option<(String, LoopDiagnostics)> {
         let threshold = self.config.no_progress_threshold;
         if threshold == 0 || self.history.is_empty() {
             return None;
@@ -146,11 +252,19 @@ impl LoopDetector {
             })
             .count();
         if streak >= threshold {
-            Some(format!(
+            let msg = format!(
                 "Tool '{}' called {} times with identical arguments and identical results \
                  — no progress detected",
                 last.tool_name, streak
-            ))
+            );
+            let diag = LoopDiagnostics {
+                tool: last.tool_name.clone(),
+                category: None,
+                consecutive_failures: 0,
+                last_errors: Vec::new(),
+                strategy: "no_progress_repeat",
+            };
+            Some((msg, diag))
         } else {
             None
         }
@@ -158,7 +272,7 @@ impl LoopDetector {
 
     // ── Strategy 2: ping-pong ────────────────────────────────────────────
 
-    fn check_ping_pong(&self) -> Option<String> {
+    fn check_ping_pong(&self) -> Option<(String, LoopDiagnostics)> {
         let cycles = self.config.ping_pong_cycles;
         if cycles == 0 || self.history.len() < 4 {
             return None;
@@ -167,7 +281,6 @@ impl LoopDetector {
         let a = &self.history[len - 2];
         let b = &self.history[len - 1];
 
-        // The two sides of the ping-pong must differ.
         if a.tool_name == b.tool_name && a.args_sig == b.args_sig {
             return None;
         }
@@ -188,10 +301,18 @@ impl LoopDetector {
         });
 
         if is_ping_pong {
-            Some(format!(
+            let msg = format!(
                 "Ping-pong loop detected: '{}' and '{}' alternating {} times with no progress",
                 a.tool_name, b.tool_name, cycles
-            ))
+            );
+            let diag = LoopDiagnostics {
+                tool: format!("{},{}", a.tool_name, b.tool_name),
+                category: None,
+                consecutive_failures: 0,
+                last_errors: Vec::new(),
+                strategy: "ping_pong",
+            };
+            Some((msg, diag))
         } else {
             None
         }
@@ -199,17 +320,37 @@ impl LoopDetector {
 
     // ── Strategy 3: consecutive failure streak ───────────────────────────
 
-    fn check_failure_streak(&self) -> Option<String> {
+    fn check_failure_streak(&self) -> Option<(String, LoopDiagnostics)> {
         let threshold = self.config.failure_streak_threshold;
         if threshold == 0 {
             return None;
         }
         for (tool, count) in &self.consecutive_failures {
             if *count >= threshold {
-                return Some(format!(
+                let last_errors: Vec<String> = self
+                    .history
+                    .iter()
+                    .rev()
+                    .filter(|r| &r.tool_name == tool && !r.success)
+                    .take(3)
+                    .filter_map(|r| r.error_output.clone())
+                    .collect();
+                let category = last_errors
+                    .first()
+                    .map(|e| classify_error(e))
+                    .unwrap_or(FailureCategory::Unknown);
+                let msg = format!(
                     "Tool '{}' failed {} consecutive times",
                     tool, count
-                ));
+                );
+                let diag = LoopDiagnostics {
+                    tool: tool.clone(),
+                    category: Some(category),
+                    consecutive_failures: *count,
+                    last_errors,
+                    strategy: "failure_streak",
+                };
+                return Some((msg, diag));
             }
         }
         None
@@ -231,13 +372,40 @@ fn hash_output(output: &str) -> u64 {
     hasher.finish()
 }
 
-fn format_warning(reason: &str) -> String {
+fn format_warning(reason: &str, category: Option<FailureCategory>) -> String {
+    let recovery_hint = match category {
+        Some(FailureCategory::MissingBinary) =>
+            "The command/binary is NOT available in this environment. \
+             Do NOT retry it. Instead: check what IS available (e.g. `which`, `ls /usr/bin`), \
+             or use a completely different approach that does not require this binary.",
+        Some(FailureCategory::PermissionDenied) =>
+            "This action is blocked by security policy or filesystem permissions. \
+             Do NOT retry the same path/command. Work within the allowed workspace \
+             and use only approved commands.",
+        Some(FailureCategory::Timeout) =>
+            "The command timed out — it may be hanging or waiting for interactive input. \
+             Try: add --no-input or --non-interactive flags, pipe from /dev/null, \
+             or break into smaller steps.",
+        Some(FailureCategory::RateLimit) =>
+            "You have hit a rate limit or action budget. Stop calling this tool \
+             and complete the task with what you have, or wait and retry later.",
+        Some(FailureCategory::NetworkError) =>
+            "Network connectivity failed. Do NOT retry network-dependent commands. \
+             Use local alternatives or inform the user that network access is needed.",
+        Some(FailureCategory::InvalidArguments) =>
+            "The tool arguments are missing or malformed. Review the tool schema \
+             and provide all required parameters with correct types.",
+        Some(FailureCategory::EnvironmentMissing) =>
+            "A required environment variable or runtime dependency is missing. \
+             Do NOT retry. Check what environment is available and adapt your approach.",
+        Some(FailureCategory::Unknown) | None =>
+            "Try a different tool or different arguments. \
+             If polling a process, increase wait time or check if it's stuck. \
+             If the task cannot be completed, explain why and stop.",
+    };
     format!(
         "IMPORTANT: A loop pattern has been detected in your tool usage. {reason}. \
-         You must change your approach: \
-         (1) Try a different tool or different arguments, \
-         (2) If polling a process, increase wait time or check if it's stuck, \
-         (3) If the task cannot be completed, explain why and stop. \
+         You MUST change your approach — {recovery_hint} \
          Do NOT repeat the same tool call with the same arguments."
     )
 }
@@ -409,5 +577,30 @@ mod tests {
         let mixed = "a".repeat(4094) + "文文"; // 4094 + 6 = 4100 bytes, boundary at 4096
         let hash3 = super::hash_output(&mixed);
         assert!(hash3 != 0); // Just verify it runs
+    }
+
+    #[test]
+    fn classify_error_categories() {
+        assert_eq!(classify_error("command not found"), FailureCategory::MissingBinary);
+        assert_eq!(classify_error("permission denied"), FailureCategory::PermissionDenied);
+        assert_eq!(classify_error("timed out"), FailureCategory::Timeout);
+        assert_eq!(classify_error("rate limit"), FailureCategory::RateLimit);
+        assert_eq!(classify_error("connection refused"), FailureCategory::NetworkError);
+        assert_eq!(classify_error("missing required"), FailureCategory::InvalidArguments);
+        assert_eq!(classify_error("env var X"), FailureCategory::EnvironmentMissing);
+        assert_eq!(classify_error("weird"), FailureCategory::Unknown);
+    }
+
+    #[test]
+    fn diagnostics_on_failure_streak() {
+        let mut det = LoopDetector::new(default_config());
+        for i in 0..3 {
+            det.record_call("sh", &format!("{{\"c\":\"{i}\"}}"), "command not found", false);
+        }
+        assert!(matches!(det.check(), DetectionVerdict::InjectWarning(_)));
+        let d = det.diagnostics().unwrap();
+        assert_eq!(d.strategy, "failure_streak");
+        assert_eq!(d.category, Some(FailureCategory::MissingBinary));
+        assert_eq!(d.consecutive_failures, 3);
     }
 }

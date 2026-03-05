@@ -3204,6 +3204,10 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// Webhook alerting for critical events (`[observability.alerting]`).
+    #[serde(default)]
+    pub alerting: AlertingConfig,
 }
 
 impl Default for ObservabilityConfig {
@@ -3215,8 +3219,39 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            alerting: AlertingConfig::default(),
         }
     }
+}
+
+/// Webhook alerting configuration for critical runtime events.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AlertingConfig {
+    /// Webhook URL to POST alerts to. Leave empty to disable.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+
+    /// Event types that trigger alerts: `"loop_hard_stop"`, `"loop_warning"`, `"provider_error"`.
+    #[serde(default)]
+    pub alert_on: Vec<String>,
+
+    /// Minimum seconds between duplicate alerts. Default: 300.
+    #[serde(default = "default_alerting_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for AlertingConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: None,
+            alert_on: Vec::new(),
+            cooldown_secs: default_alerting_cooldown_secs(),
+        }
+    }
+}
+
+fn default_alerting_cooldown_secs() -> u64 {
+    300
 }
 
 fn default_runtime_trace_mode() -> String {

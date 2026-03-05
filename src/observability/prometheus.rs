@@ -18,6 +18,7 @@ pub struct PrometheusObserver {
     webhook_auth_failures: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
+    loop_detected: IntCounterVec,
 
     // Histograms
     agent_duration: HistogramVec,
@@ -91,6 +92,15 @@ impl PrometheusObserver {
             &["component"],
         )
         .context("failed to create zeroclaw_errors_total counter")?;
+
+        let loop_detected = IntCounterVec::new(
+            prometheus::Opts::new(
+                "zeroclaw_loop_detected_total",
+                "Total loop detection events by tool, strategy, category, warning",
+            ),
+            &["tool", "strategy", "category", "warning"],
+        )
+        .context("failed to create zeroclaw_loop_detected_total counter")?;
 
         let agent_duration = HistogramVec::new(
             HistogramOpts::new(
@@ -168,6 +178,9 @@ impl PrometheusObserver {
             .register(Box::new(errors.clone()))
             .context("failed to register zeroclaw_errors_total counter")?;
         registry
+            .register(Box::new(loop_detected.clone()))
+            .context("failed to register zeroclaw_loop_detected_total counter")?;
+        registry
             .register(Box::new(agent_duration.clone()))
             .context("failed to register zeroclaw_agent_duration_seconds histogram")?;
         registry
@@ -197,6 +210,7 @@ impl PrometheusObserver {
             webhook_auth_failures,
             heartbeat_ticks,
             errors,
+            loop_detected,
             agent_duration,
             tool_duration,
             request_latency,
@@ -300,6 +314,14 @@ impl Observer for PrometheusObserver {
                 message: _,
             } => {
                 self.errors.with_label_values(&[component]).inc();
+            }
+            ObserverEvent::LoopDetected {
+                tool, strategy, category, consecutive_failures: _, warning,
+            } => {
+                let w = if *warning { "true" } else { "false" };
+                self.loop_detected
+                    .with_label_values(&[tool.as_str(), strategy.as_str(), category.as_str(), w])
+                    .inc();
             }
         }
     }

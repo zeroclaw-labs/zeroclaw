@@ -7,7 +7,7 @@ pub use schema::{
     build_runtime_proxy_client_with_timeouts, default_model_fallback_for_provider,
     resolve_default_model_id, runtime_proxy_config, set_runtime_proxy_config,
     AckReactionChannelsConfig, AckReactionChatType, AckReactionConfig, AckReactionRuleAction,
-    AckReactionRuleConfig, AckReactionStrategy, AgentConfig, AgentLoadBalanceStrategy,
+    AckReactionRuleConfig, AckReactionStrategy, AgentConfig, AgentLoadBalanceStrategy, AlertingConfig,
     AgentSessionBackend, AgentSessionConfig, AgentSessionStrategy, AgentTeamsConfig,
     AgentsIpcConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     BuiltinHooksConfig, ChannelsConfig, ClassificationRule, CommandContextRuleAction,
