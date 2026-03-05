@@ -165,6 +165,30 @@ impl StreamChunk {
     }
 }
 
+/// Structured events emitted by provider streaming APIs.
+///
+/// This extends plain text chunk streaming with explicit tool-call signals so
+/// agent loops can preserve native tool semantics without parsing payload text.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Text delta from the assistant.
+    TextDelta(StreamChunk),
+    /// Structured tool call emitted during streaming.
+    ToolCall(ToolCall),
+    /// Stream has completed.
+    Final,
+}
+
+impl StreamEvent {
+    pub(crate) fn from_chunk(chunk: StreamChunk) -> Self {
+        if chunk.is_final {
+            Self::Final
+        } else {
+            Self::TextDelta(chunk)
+        }
+    }
+}
+
 /// Options for streaming chat requests.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamOptions {
@@ -425,6 +449,14 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether provider can emit structured tool-call stream events.
+    ///
+    /// Providers should return true only when `stream_chat(...)` can produce
+    /// `StreamEvent::ToolCall` for native tool-calling requests.
+    fn supports_streaming_tool_events(&self) -> bool {
+        false
+    }
+
     /// Streaming chat with optional system prompt.
     /// Returns an async stream of text chunks.
     /// Default implementation falls back to non-streaming chat.
@@ -456,6 +488,22 @@ pub trait Provider: Send + Sync {
         // Create a single empty chunk to indicate not supported
         let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
         stream::once(async move { Ok(chunk) }).boxed()
+    }
+
+    /// Structured streaming chat interface.
+    ///
+    /// Default implementation adapts legacy text chunks from
+    /// `stream_chat_with_history` into `StreamEvent::TextDelta` / `Final`.
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_history(request.messages, model, temperature, options)
+            .map(|chunk_result| chunk_result.map(StreamEvent::from_chunk))
+            .boxed()
     }
 }
 
@@ -495,6 +543,7 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     struct CapabilityMockProvider;
 
@@ -958,5 +1007,62 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("non-prompt-guided"));
+    }
+
+    struct StreamingChunkOnlyProvider;
+
+    #[async_trait]
+    impl Provider for StreamingChunkOnlyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            stream::iter(vec![
+                Ok(StreamChunk::delta("hello")),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_chat_default_maps_legacy_chunks_to_events() {
+        let provider = StreamingChunkOnlyProvider;
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "hello"),
+            other => panic!("expected text delta event, got {other:?}"),
+        }
+        assert!(matches!(second, StreamEvent::Final));
     }
 }
