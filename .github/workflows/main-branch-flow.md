@@ -12,7 +12,7 @@ Use this with:
 
 | Event | Main workflows |
 | --- | --- |
-| PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-auto-response.yml` |
+| PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-auto-response.yml`, `main-promotion-gate.yml` (base `main` only) |
 | PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
 | Push to `dev`/`main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
 | Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job |
@@ -25,6 +25,7 @@ Observed averages below are from recent completed runs (sampled from GitHub Acti
 | Workflow | Typical trigger in main flow | Avg runtime | Docker build? | Docker run? | Docker push? |
 | --- | --- | ---:| --- | --- | --- |
 | `pr-intake-checks.yml` | PR open/update (`pull_request_target`) | 14.5s | No | No | No |
+| `main-promotion-gate.yml` | PR open/update to `main` (`pull_request_target`) | N/A (new gate) | No | No | No |
 | `pr-labeler.yml` | PR open/update (`pull_request_target`) | 53.7s | No | No | No |
 | `pr-auto-response.yml` | PR/issue automation | 24.3s | No | No | No |
 | `ci-run.yml` | PR + push to `dev`/`main` | 74.7s | No | No | No |
@@ -120,12 +121,13 @@ Notes:
    - repeated `pull_request_target` reruns from label churn causing noisy signals.
 9. After merge, normal `push` workflows on `dev` execute (scenario 4).
 
-### 3) PR to `main` (direct or from `dev`)
+### 3) PR to `main` (`dev` source only)
 
 1. Contributor or maintainer opens PR with base `main`.
-2. `ci-run.yml` and `sec-audit.yml` run on the PR, plus any path-scoped workflows.
-3. Maintainer merges PR once checks and review policy pass.
-4. Merge emits a `push` event on `main`.
+2. `main-promotion-gate.yml` enforces source policy: only internal branch `dev` may target `main`.
+3. `ci-run.yml` and `sec-audit.yml` run on the PR, plus any path-scoped workflows.
+4. Maintainer merges PR once checks and review policy pass.
+5. Merge emits a `push` event on `main`.
 
 ### 4) Push/Merge Queue to `dev` or `main` (including after merge)
 

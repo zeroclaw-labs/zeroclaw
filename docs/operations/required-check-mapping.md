@@ -2,14 +2,20 @@
 
 This document maps merge-critical workflows to expected check names.
 
-## Merge to `dev` / `main`
+## Merge to `dev`
 
 | Required check name | Source workflow | Scope |
 | --- | --- | --- |
 | `CI Required Gate` | `.github/workflows/ci-run.yml` | core Rust/doc merge gate |
-| `Security Audit` | `.github/workflows/sec-audit.yml` | dependencies, secrets, governance |
-| `Feature Matrix Summary` | `.github/workflows/feature-matrix.yml` | feature-combination compile matrix |
-| `Workflow Sanity` | `.github/workflows/workflow-sanity.yml` | workflow syntax and lint |
+| `Security Required Gate` | `.github/workflows/sec-audit.yml` | dependencies, secrets, governance |
+
+## Merge to `main`
+
+| Required check name | Source workflow | Scope |
+| --- | --- | --- |
+| `CI Required Gate` | `.github/workflows/ci-run.yml` | core Rust/doc merge gate |
+| `Security Required Gate` | `.github/workflows/sec-audit.yml` | dependencies, secrets, governance |
+| `Enforce Dev -> Main Promotion` | `.github/workflows/main-promotion-gate.yml` | block non-`dev` source branches to `main` |
 
 Feature matrix lane check names (informational, non-required):
 

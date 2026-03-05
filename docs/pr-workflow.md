@@ -97,14 +97,15 @@ Maintain these branch protection rules on `dev` and `main`:
 
 - Require status checks before merge.
 - Require check `CI Required Gate`.
+- Require check `Enforce Dev -> Main Promotion` on `main`.
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths.
 - For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
 - Default workflow-owner allowlist includes `theonlyhennygod`, `willsarg`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
-- Route normal contributor PRs to `main` by default (`dev` is optional for dedicated integration batching).
-- Allow direct merges to `main` once required checks and review policy pass.
+- Route normal contributor PRs to `dev`.
+- Allow `main` merges only through promotion PRs from branch `dev`.
 
 ---
 
@@ -113,7 +114,7 @@ Maintain these branch protection rules on `dev` and `main`:
 ### 4.1 Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
-- Normal contributor PR base is `main` by default; use `dev` only when maintainers explicitly request integration batching.
+- Normal contributor PR base is `dev`.
 - If an issue already has open community PRs, reviewers/maintainers must acknowledge overlap and either continue that thread or document supersede rationale.
 - `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
 - For all module prefixes, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label `prefix`.

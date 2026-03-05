@@ -1,0 +1,65 @@
+name: Enforce Dev -> Main Promotion
+
+on:
+    pull_request_target:
+        branches: [main]
+        types: [opened, reopened, synchronize, ready_for_review, edited]
+    merge_group:
+        branches: [main]
+
+concurrency:
+    group: main-promotion-gate-${{ github.event.pull_request.number || github.run_id }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+
+jobs:
+    enforce-dev-source:
+        name: Enforce Dev -> Main Promotion
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        timeout-minutes: 5
+        steps:
+            - name: Enforce dev-only source branch for main
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  event_name="${{ github.event_name }}"
+                  repo_full_name="${{ github.repository }}"
+
+                  if [ "${event_name}" = "merge_group" ]; then
+                    echo "merge_group validation for main detected."
+                    echo "Source-branch policy is enforced at PR stage."
+                    exit 0
+                  fi
+
+                  base_ref="${{ github.event.pull_request.base.ref }}"
+                  head_ref="${{ github.event.pull_request.head.ref }}"
+                  head_repo_full_name="${{ github.event.pull_request.head.repo.full_name }}"
+
+                  echo "base_ref=${base_ref}"
+                  echo "head_ref=${head_ref}"
+                  echo "head_repo=${head_repo_full_name}"
+
+                  if [ "${base_ref}" != "main" ]; then
+                    echo "Base branch is not main; nothing to enforce."
+                    exit 0
+                  fi
+
+                  if [ "${head_repo_full_name}" != "${repo_full_name}" ]; then
+                    echo "::error title=Promotion blocked::Only internal branch 'dev' from ${repo_full_name} can merge into 'main'."
+                    exit 1
+                  fi
+
+                  if [ "${head_ref}" != "dev" ]; then
+                    echo "::error title=Promotion blocked::Only branch 'dev' can merge into 'main'. Current source branch: '${head_ref}'."
+                    exit 1
+                  fi
+
+                  echo "Promotion gate passed: dev -> main."
