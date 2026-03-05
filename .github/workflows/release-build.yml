@@ -22,7 +22,7 @@ env:
 jobs:
     build-and-test:
         name: Build and Test (Linux x86_64)
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 120
 
         steps:

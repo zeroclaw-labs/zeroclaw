@@ -10,7 +10,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import manifestRaw from "./generated/docs-manifest.json";
 
-type Locale = "en" | "zh";
+type Locale = "en" | "zh" | "es" | "pt" | "it";
 type ThemeMode = "system" | "dark" | "light";
 type ResolvedTheme = "dark" | "light";
 type ReaderScale = "compact" | "comfortable" | "relaxed";
@@ -70,7 +70,13 @@ type HeadingItem = {
   text: string;
 };
 
-type Localized = Record<Locale, string>;
+type Localized = {
+  en: string;
+  zh: string;
+  es?: string;
+  pt?: string;
+  it?: string;
+};
 
 type PaletteEntry = {
   id: string;
@@ -81,15 +87,48 @@ type PaletteEntry = {
 
 const repoBase = "https://github.com/zeroclaw-labs/zeroclaw/blob/main";
 const rawBase = "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main";
+const localeOrder: Locale[] = ["en", "zh", "es", "pt", "it"];
+const localeLabels: Record<Locale, string> = {
+  en: "EN",
+  zh: "中文",
+  es: "ES",
+  pt: "PT",
+  it: "IT",
+};
+
+function normalizeLocale(value: string | null): Locale {
+  const candidate = (value ?? "").toLowerCase();
+  if (candidate === "en" || candidate === "zh" || candidate === "es" || candidate === "pt" || candidate === "it") {
+    return candidate;
+  }
+  return "en";
+}
+
+function nextLocale(current: Locale): Locale {
+  const index = localeOrder.indexOf(current);
+  if (index === -1 || index === localeOrder.length - 1) {
+    return localeOrder[0];
+  }
+  return localeOrder[index + 1] ?? localeOrder[0];
+}
 
 const languageNames: Record<string, Localized> = {
-  en: { en: "English", zh: "英文" },
-  "zh-CN": { en: "Chinese (Simplified)", zh: "简体中文" },
-  ja: { en: "Japanese", zh: "日文" },
-  ru: { en: "Russian", zh: "俄文" },
-  fr: { en: "French", zh: "法文" },
-  vi: { en: "Vietnamese", zh: "越南文" },
-  el: { en: "Greek", zh: "希腊文" },
+  en: { en: "English", zh: "英文", es: "Inglés", pt: "Inglês", it: "Inglese" },
+  "zh-CN": {
+    en: "Chinese (Simplified)",
+    zh: "简体中文",
+    es: "Chino (simplificado)",
+    pt: "Chinês (simplificado)",
+    it: "Cinese (semplificato)",
+  },
+  ja: { en: "Japanese", zh: "日文", es: "Japonés", pt: "Japonês", it: "Giapponese" },
+  ru: { en: "Russian", zh: "俄文", es: "Ruso", pt: "Russo", it: "Russo" },
+  fr: { en: "French", zh: "法文", es: "Francés", pt: "Francês", it: "Francese" },
+  vi: { en: "Vietnamese", zh: "越南文", es: "Vietnamita", pt: "Vietnamita", it: "Vietnamita" },
+  el: { en: "Greek", zh: "希腊文", es: "Griego", pt: "Grego", it: "Greco" },
+  es: { en: "Spanish", zh: "西班牙文", es: "Español", pt: "Espanhol", it: "Spagnolo" },
+  pt: { en: "Portuguese", zh: "葡萄牙文", es: "Portugués", pt: "Português", it: "Portoghese" },
+  it: { en: "Italian", zh: "意大利文", es: "Italiano", pt: "Italiano", it: "Italiano" },
 };
 
 const journeyOrder: Journey[] = [
@@ -118,35 +157,35 @@ const audienceOrder: Audience[] = [
 const kindOrder: DocKind[] = ["guide", "reference", "runbook", "policy", "template", "report"];
 
 const journeyNames: Record<Journey, Localized> = {
-  start: { en: "Start", zh: "起步" },
-  build: { en: "Build", zh: "构建" },
-  integrate: { en: "Integrate", zh: "集成" },
-  operate: { en: "Operate", zh: "运维" },
-  secure: { en: "Secure", zh: "安全" },
-  contribute: { en: "Contribute", zh: "贡献" },
-  reference: { en: "Reference", zh: "参考" },
-  hardware: { en: "Hardware", zh: "硬件" },
-  localize: { en: "Localization", zh: "多语言" },
-  troubleshoot: { en: "Troubleshoot", zh: "排障" },
+  start: { en: "Start", zh: "起步", es: "Inicio", pt: "Início", it: "Avvio" },
+  build: { en: "Build", zh: "构建", es: "Construir", pt: "Construir", it: "Build" },
+  integrate: { en: "Integrate", zh: "集成", es: "Integrar", pt: "Integrar", it: "Integrare" },
+  operate: { en: "Operate", zh: "运维", es: "Operar", pt: "Operar", it: "Operare" },
+  secure: { en: "Secure", zh: "安全", es: "Seguridad", pt: "Segurança", it: "Sicurezza" },
+  contribute: { en: "Contribute", zh: "贡献", es: "Contribuir", pt: "Contribuir", it: "Contribuire" },
+  reference: { en: "Reference", zh: "参考", es: "Referencia", pt: "Referência", it: "Riferimento" },
+  hardware: { en: "Hardware", zh: "硬件", es: "Hardware", pt: "Hardware", it: "Hardware" },
+  localize: { en: "Localization", zh: "多语言", es: "Localización", pt: "Localização", it: "Localizzazione" },
+  troubleshoot: { en: "Troubleshoot", zh: "排障", es: "Diagnóstico", pt: "Diagnóstico", it: "Risoluzione problemi" },
 };
 
 const audienceNames: Record<Audience, Localized> = {
-  newcomer: { en: "Newcomer", zh: "新手" },
-  builder: { en: "Builder", zh: "开发者" },
-  integrator: { en: "Integrator", zh: "集成者" },
-  operator: { en: "Operator", zh: "运维" },
-  security: { en: "Security", zh: "安全" },
-  contributor: { en: "Contributor", zh: "贡献者" },
-  hardware: { en: "Hardware", zh: "硬件工程师" },
+  newcomer: { en: "Newcomer", zh: "新手", es: "Principiante", pt: "Iniciante", it: "Nuovo utente" },
+  builder: { en: "Builder", zh: "开发者", es: "Desarrollador", pt: "Desenvolvedor", it: "Builder" },
+  integrator: { en: "Integrator", zh: "集成者", es: "Integrador", pt: "Integrador", it: "Integratore" },
+  operator: { en: "Operator", zh: "运维", es: "Operador", pt: "Operador", it: "Operatore" },
+  security: { en: "Security", zh: "安全", es: "Seguridad", pt: "Segurança", it: "Sicurezza" },
+  contributor: { en: "Contributor", zh: "贡献者", es: "Colaborador", pt: "Colaborador", it: "Contributore" },
+  hardware: { en: "Hardware", zh: "硬件工程师", es: "Hardware", pt: "Hardware", it: "Hardware" },
 };
 
 const kindNames: Record<DocKind, Localized> = {
-  guide: { en: "Guide", zh: "指南" },
-  reference: { en: "Reference", zh: "参考" },
-  runbook: { en: "Runbook", zh: "运行手册" },
-  policy: { en: "Policy", zh: "策略规范" },
-  template: { en: "Template", zh: "模板" },
-  report: { en: "Report", zh: "报告" },
+  guide: { en: "Guide", zh: "指南", es: "Guía", pt: "Guia", it: "Guida" },
+  reference: { en: "Reference", zh: "参考", es: "Referencia", pt: "Referência", it: "Riferimento" },
+  runbook: { en: "Runbook", zh: "运行手册", es: "Runbook", pt: "Runbook", it: "Runbook" },
+  policy: { en: "Policy", zh: "策略规范", es: "Política", pt: "Política", it: "Policy" },
+  template: { en: "Template", zh: "模板", es: "Plantilla", pt: "Template", it: "Template" },
+  report: { en: "Report", zh: "报告", es: "Informe", pt: "Relatório", it: "Report" },
 };
 
 const readingPaths: Array<{
@@ -162,55 +201,109 @@ const readingPaths: Array<{
 }> = [
   {
     id: "newcomer",
-    label: { en: "New to ZeroClaw", zh: "初次了解 ZeroClaw" },
+    label: {
+      en: "New to ZeroClaw",
+      zh: "初次了解 ZeroClaw",
+      es: "Nuevo en ZeroClaw",
+      pt: "Novo no ZeroClaw",
+      it: "Nuovo in ZeroClaw",
+    },
     detail: {
       en: "Onboarding and first successful run in the shortest path.",
       zh: "最短路径完成安装、配置和首个可运行实例。",
+      es: "Onboarding y primera ejecución exitosa por la ruta más corta.",
+      pt: "Onboarding e primeira execução bem-sucedida pelo caminho mais curto.",
+      it: "Onboarding e prima esecuzione riuscita nel percorso più rapido.",
     },
     filters: { journey: "start", audience: "newcomer" },
   },
   {
     id: "builder",
-    label: { en: "Build & Extend", zh: "开发与扩展" },
+    label: {
+      en: "Build & Extend",
+      zh: "开发与扩展",
+      es: "Construir y extender",
+      pt: "Construir e expandir",
+      it: "Build ed estensione",
+    },
     detail: {
       en: "Commands, config, providers, channels, and architecture references.",
       zh: "命令、配置、Provider、Channel 与架构参考。",
+      es: "Comandos, configuración, providers, canales y referencias de arquitectura.",
+      pt: "Comandos, configuração, providers, canais e referências de arquitetura.",
+      it: "Comandi, configurazione, provider, canali e riferimenti architetturali.",
     },
     filters: { journey: "build", audience: "builder" },
   },
   {
     id: "operate",
-    label: { en: "Operate in Production", zh: "生产运维" },
+    label: {
+      en: "Operate in Production",
+      zh: "生产运维",
+      es: "Operar en producción",
+      pt: "Operar em produção",
+      it: "Operare in produzione",
+    },
     detail: {
       en: "Runbooks, CI/CD gates, release flow, and observability checks.",
       zh: "运行手册、CI/CD 门禁、发布流程与可观测性校验。",
+      es: "Runbooks, puertas CI/CD, flujo de release y validaciones de observabilidad.",
+      pt: "Runbooks, gates de CI/CD, fluxo de release e verificações de observabilidade.",
+      it: "Runbook, gate CI/CD, flusso di rilascio e controlli di osservabilità.",
     },
     filters: { journey: "operate", audience: "operator" },
   },
   {
     id: "secure",
-    label: { en: "Security Hardening", zh: "安全强化" },
+    label: {
+      en: "Security Hardening",
+      zh: "安全强化",
+      es: "Hardening de seguridad",
+      pt: "Hardening de segurança",
+      it: "Hardening di sicurezza",
+    },
     detail: {
       en: "Sandboxing, advisories, and secure runtime baseline.",
       zh: "沙箱、安全公告与安全运行时基线。",
+      es: "Sandboxing, avisos y baseline de runtime seguro.",
+      pt: "Sandboxing, advisories e baseline de runtime seguro.",
+      it: "Sandboxing, advisory e baseline runtime sicura.",
     },
     filters: { journey: "secure", audience: "security" },
   },
   {
     id: "integrate",
-    label: { en: "Integrations", zh: "外部集成" },
+    label: {
+      en: "Integrations",
+      zh: "外部集成",
+      es: "Integraciones",
+      pt: "Integrações",
+      it: "Integrazioni",
+    },
     detail: {
       en: "Connect ZeroClaw with chat platforms and external providers.",
       zh: "将 ZeroClaw 接入聊天平台与外部模型能力。",
+      es: "Conecta ZeroClaw con plataformas de chat y providers externos.",
+      pt: "Conecte o ZeroClaw com plataformas de chat e providers externos.",
+      it: "Collega ZeroClaw a piattaforme chat e provider esterni.",
     },
     filters: { journey: "integrate", audience: "integrator" },
   },
   {
     id: "contribute",
-    label: { en: "Contribute", zh: "贡献流程" },
+    label: {
+      en: "Contribute",
+      zh: "贡献流程",
+      es: "Contribuir",
+      pt: "Contribuir",
+      it: "Contribuire",
+    },
     detail: {
       en: "Contributor workflow, reviews, and collaboration playbooks.",
       zh: "贡献者流程、评审规范与协作手册。",
+      es: "Flujo de contribución, revisiones y playbooks de colaboración.",
+      pt: "Fluxo de contribuição, reviews e playbooks de colaboração.",
+      it: "Flusso contributivo, review e playbook di collaborazione.",
     },
     filters: { journey: "contribute", audience: "contributor" },
   },
@@ -259,211 +352,503 @@ const docs = [...(manifestRaw as ManifestDocRaw[])]
   .map((doc) => normalizeManifestDoc(doc))
   .sort((a, b) => a.path.localeCompare(b.path));
 
-const copy = {
-  en: {
-    navDocs: "Docs",
-    navGitHub: "GitHub",
-    navWebsite: "zeroclawlabs.ai",
-    badge: "PRIVATE AGENT INTELLIGENCE.",
-    title: "Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.",
-    summary:
-      "Fast, small, and fully autonomous AI assistant infrastructure.",
-    summary2: "Deploy anywhere. Swap anything.",
-    notice:
-      "Official source channels: use this repository as the source of truth and zeroclawlabs.ai as the official website.",
-    ctaDocs: "Read docs now",
-    ctaBootstrap: "One-click bootstrap",
-    commandLaneTitle: "Runtime command lane",
-    commandLaneHint: "From official setup and operations flow",
-    engineeringTitle: "Engineering foundations",
-    docsWorkspace: "Documentation Workspace",
-    docsLead:
-      "All repository docs are indexed and readable directly on this GitHub Pages site with engineering-first layout and typography.",
-    docsIndexed: "Indexed",
-    docsFiltered: "Filtered",
-    docsActive: "Active",
-    readingPathsTitle: "Reading paths",
-    readingPathsLead:
-      "Choose a task-oriented route first, then drill down with taxonomy filters.",
-    startHereTitle: "Start here",
-    startHereLead:
-      "Core docs for first-time users who want the fastest reliable onboarding.",
-    noStartHere: "No starter docs matched the current language/filter context.",
-    startBadge: "Starter",
-    sectionFilter: "Section",
-    languageFilter: "Language",
-    journeyFilter: "Journey",
-    audienceFilter: "Audience",
-    kindFilter: "Doc type",
-    groupBy: "Group by",
-    allJourneys: "All journeys",
-    allAudiences: "All audiences",
-    allKinds: "All doc types",
-    groupJourney: "Journey",
-    groupSection: "Section",
-    groupKind: "Doc type",
-    groupLanguage: "Language",
-    resetFilters: "Reset filters",
-    search: "Search docs by title, path, summary, or keyword",
-    commandPalette: "Command palette",
-    sourceLabel: "Source",
-    docJourney: "Journey",
-    docAudience: "Audience",
-    docKind: "Type",
-    docReadTime: "Read time",
-    docTags: "Tags",
-    minuteUnit: "min",
-    relatedDocs: "Related docs",
-    noRelated: "No strongly related docs found yet.",
-    openOnGithub: "Open on GitHub",
-    openRaw: "Open raw",
-    loading: "Loading document...",
-    fallback:
-      "Document preview is unavailable right now. You can still open the source directly:",
-    empty: "No docs matched your current filters.",
-    allSections: "All sections",
-    allLanguages: "All languages",
-    outline: "Outline",
-    noOutline: "No headings found in this document.",
-    reading: "Reading mode",
-    scaleLabel: "Scale",
-    widthLabel: "Width",
-    compact: "Compact",
-    comfortable: "Comfortable",
-    relaxed: "Relaxed",
-    normalWidth: "Normal",
-    wideWidth: "Wide",
-    previousDoc: "Previous",
-    nextDoc: "Next",
-    paletteHint: "Type a command or document name",
-    actionFocus: "Focus docs search",
-    actionTop: "Back to top",
-    actionTheme: "Cycle theme",
-    actionLocale: "Toggle language",
-    status: "Current Theme",
-  },
-  zh: {
-    navDocs: "文档",
-    navGitHub: "GitHub",
-    navWebsite: "zeroclawlabs.ai",
-    badge: "PRIVATE AGENT INTELLIGENCE.",
-    title: "Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.",
-    summary: "Fast, small, and fully autonomous AI assistant infrastructure.",
-    summary2: "Deploy anywhere. Swap anything.",
-    notice:
-      "官方信息渠道：请以本仓库为事实来源，以 zeroclawlabs.ai 为官方网站。",
-    ctaDocs: "立即阅读文档",
-    ctaBootstrap: "一键安装",
-    commandLaneTitle: "运行命令通道",
-    commandLaneHint: "来自官方安装与运维流程",
-    engineeringTitle: "工程基础",
-    docsWorkspace: "文档工作区",
-    docsLead:
-      "仓库全量文档已建立索引并支持在 GitHub Pages 页面内直接阅读，采用工程化排版与阅读体验。",
-    docsIndexed: "总文档",
-    docsFiltered: "筛选后",
-    docsActive: "当前文档",
-    readingPathsTitle: "阅读路径",
-    readingPathsLead: "先按任务路径进入，再用分类筛选做深入浏览。",
-    startHereTitle: "新手起步",
-    startHereLead: "面向首次接触 ZeroClaw 的核心文档，快速完成有效上手。",
-    noStartHere: "当前语言/筛选条件下暂无起步文档。",
-    startBadge: "起步",
-    sectionFilter: "分组",
-    languageFilter: "语言",
-    journeyFilter: "阶段路径",
-    audienceFilter: "适用角色",
-    kindFilter: "文档类型",
-    groupBy: "分组方式",
-    allJourneys: "全部路径",
-    allAudiences: "全部角色",
-    allKinds: "全部类型",
-    groupJourney: "按路径",
-    groupSection: "按目录",
-    groupKind: "按类型",
-    groupLanguage: "按语言",
-    resetFilters: "重置筛选",
-    search: "按标题、路径、摘要或关键字搜索",
-    commandPalette: "命令面板",
-    sourceLabel: "来源",
-    docJourney: "阶段",
-    docAudience: "角色",
-    docKind: "类型",
-    docReadTime: "阅读时长",
-    docTags: "标签",
-    minuteUnit: "分钟",
-    relatedDocs: "相关推荐",
-    noRelated: "暂未找到高相关文档。",
-    openOnGithub: "在 GitHub 打开",
-    openRaw: "打开原文",
-    loading: "文档加载中...",
-    fallback: "当前无法预览文档，你仍可直接打开源文件：",
-    empty: "当前筛选下没有匹配文档。",
-    allSections: "全部分组",
-    allLanguages: "全部语言",
-    outline: "目录",
-    noOutline: "当前文档没有可提取的标题。",
-    reading: "阅读模式",
-    scaleLabel: "字号",
-    widthLabel: "宽度",
-    compact: "紧凑",
-    comfortable: "舒适",
-    relaxed: "宽松",
-    normalWidth: "标准",
-    wideWidth: "加宽",
-    previousDoc: "上一篇",
-    nextDoc: "下一篇",
-    paletteHint: "输入命令或文档名称",
-    actionFocus: "聚焦文档搜索",
-    actionTop: "回到顶部",
-    actionTheme: "切换主题",
-    actionLocale: "切换语言",
-    status: "当前主题",
-  },
-} as const;
+const copyEn = {
+  navDocs: "Docs",
+  navGitHub: "GitHub",
+  navWebsite: "zeroclawlabs.ai",
+  badge: "PRIVATE AGENT INTELLIGENCE.",
+  title: "Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.",
+  summary:
+    "Fast, small, and fully autonomous AI assistant infrastructure.",
+  summary2: "Deploy anywhere. Swap anything.",
+  notice:
+    "Official source channels: use this repository as the source of truth and zeroclawlabs.ai as the official website.",
+  ctaDocs: "Read docs now",
+  ctaBootstrap: "One-click bootstrap",
+  commandLaneTitle: "Runtime command lane",
+  commandLaneHint: "From official setup and operations flow",
+  engineeringTitle: "Engineering foundations",
+  docsWorkspace: "Documentation Workspace",
+  docsLead:
+    "All repository docs are indexed and readable directly on this GitHub Pages site with engineering-first layout and typography.",
+  docsIndexed: "Indexed",
+  docsFiltered: "Filtered",
+  docsActive: "Active",
+  readingPathsTitle: "Reading paths",
+  readingPathsLead:
+    "Choose a task-oriented route first, then drill down with taxonomy filters.",
+  startHereTitle: "Start here",
+  startHereLead:
+    "Core docs for first-time users who want the fastest reliable onboarding.",
+  noStartHere: "No starter docs matched the current language/filter context.",
+  startBadge: "Starter",
+  sectionFilter: "Section",
+  languageFilter: "Language",
+  journeyFilter: "Journey",
+  audienceFilter: "Audience",
+  kindFilter: "Doc type",
+  groupBy: "Group by",
+  allJourneys: "All journeys",
+  allAudiences: "All audiences",
+  allKinds: "All doc types",
+  groupJourney: "Journey",
+  groupSection: "Section",
+  groupKind: "Doc type",
+  groupLanguage: "Language",
+  resetFilters: "Reset filters",
+  search: "Search docs by title, path, summary, or keyword",
+  commandPalette: "Command palette",
+  sourceLabel: "Source",
+  docJourney: "Journey",
+  docAudience: "Audience",
+  docKind: "Type",
+  docReadTime: "Read time",
+  docTags: "Tags",
+  minuteUnit: "min",
+  relatedDocs: "Related docs",
+  noRelated: "No strongly related docs found yet.",
+  openOnGithub: "Open on GitHub",
+  openRaw: "Open raw",
+  loading: "Loading document...",
+  fallback:
+    "Document preview is unavailable right now. You can still open the source directly:",
+  empty: "No docs matched your current filters.",
+  allSections: "All sections",
+  allLanguages: "All languages",
+  outline: "Outline",
+  noOutline: "No headings found in this document.",
+  reading: "Reading mode",
+  scaleLabel: "Scale",
+  widthLabel: "Width",
+  compact: "Compact",
+  comfortable: "Comfortable",
+  relaxed: "Relaxed",
+  normalWidth: "Normal",
+  wideWidth: "Wide",
+  previousDoc: "Previous",
+  nextDoc: "Next",
+  paletteHint: "Type a command or document name",
+  actionFocus: "Focus docs search",
+  actionTop: "Back to top",
+  actionTheme: "Cycle theme",
+  actionLocale: "Toggle language",
+  status: "Current Theme",
+};
+
+const copyZh: typeof copyEn = {
+  navDocs: "文档",
+  navGitHub: "GitHub",
+  navWebsite: "zeroclawlabs.ai",
+  badge: "PRIVATE AGENT INTELLIGENCE.",
+  title: "Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.",
+  summary: "Fast, small, and fully autonomous AI assistant infrastructure.",
+  summary2: "Deploy anywhere. Swap anything.",
+  notice:
+    "官方信息渠道：请以本仓库为事实来源，以 zeroclawlabs.ai 为官方网站。",
+  ctaDocs: "立即阅读文档",
+  ctaBootstrap: "一键安装",
+  commandLaneTitle: "运行命令通道",
+  commandLaneHint: "来自官方安装与运维流程",
+  engineeringTitle: "工程基础",
+  docsWorkspace: "文档工作区",
+  docsLead:
+    "仓库全量文档已建立索引并支持在 GitHub Pages 页面内直接阅读，采用工程化排版与阅读体验。",
+  docsIndexed: "总文档",
+  docsFiltered: "筛选后",
+  docsActive: "当前文档",
+  readingPathsTitle: "阅读路径",
+  readingPathsLead: "先按任务路径进入，再用分类筛选做深入浏览。",
+  startHereTitle: "新手起步",
+  startHereLead: "面向首次接触 ZeroClaw 的核心文档，快速完成有效上手。",
+  noStartHere: "当前语言/筛选条件下暂无起步文档。",
+  startBadge: "起步",
+  sectionFilter: "分组",
+  languageFilter: "语言",
+  journeyFilter: "阶段路径",
+  audienceFilter: "适用角色",
+  kindFilter: "文档类型",
+  groupBy: "分组方式",
+  allJourneys: "全部路径",
+  allAudiences: "全部角色",
+  allKinds: "全部类型",
+  groupJourney: "按路径",
+  groupSection: "按目录",
+  groupKind: "按类型",
+  groupLanguage: "按语言",
+  resetFilters: "重置筛选",
+  search: "按标题、路径、摘要或关键字搜索",
+  commandPalette: "命令面板",
+  sourceLabel: "来源",
+  docJourney: "阶段",
+  docAudience: "角色",
+  docKind: "类型",
+  docReadTime: "阅读时长",
+  docTags: "标签",
+  minuteUnit: "分钟",
+  relatedDocs: "相关推荐",
+  noRelated: "暂未找到高相关文档。",
+  openOnGithub: "在 GitHub 打开",
+  openRaw: "打开原文",
+  loading: "文档加载中...",
+  fallback: "当前无法预览文档，你仍可直接打开源文件：",
+  empty: "当前筛选下没有匹配文档。",
+  allSections: "全部分组",
+  allLanguages: "全部语言",
+  outline: "目录",
+  noOutline: "当前文档没有可提取的标题。",
+  reading: "阅读模式",
+  scaleLabel: "字号",
+  widthLabel: "宽度",
+  compact: "紧凑",
+  comfortable: "舒适",
+  relaxed: "宽松",
+  normalWidth: "标准",
+  wideWidth: "加宽",
+  previousDoc: "上一篇",
+  nextDoc: "下一篇",
+  paletteHint: "输入命令或文档名称",
+  actionFocus: "聚焦文档搜索",
+  actionTop: "回到顶部",
+  actionTheme: "切换主题",
+  actionLocale: "切换语言",
+  status: "当前主题",
+};
+
+const copyEs: typeof copyEn = {
+  ...copyEn,
+  navDocs: "Documentos",
+  summary:
+    "Infraestructura de asistente de IA rápida, ligera y totalmente autónoma.",
+  summary2: "Despliega en cualquier lugar. Intercambia cualquier componente.",
+  notice:
+    "Canales oficiales: usa este repositorio como fuente de verdad y zeroclawlabs.ai como sitio oficial.",
+  ctaDocs: "Leer documentación",
+  ctaBootstrap: "Bootstrap en un clic",
+  commandLaneTitle: "Canal de comandos runtime",
+  commandLaneHint: "Basado en el flujo oficial de instalación y operaciones",
+  engineeringTitle: "Fundamentos de ingeniería",
+  docsWorkspace: "Espacio de documentación",
+  docsLead:
+    "Toda la documentación del repositorio está indexada y se puede leer directamente en este sitio GitHub Pages con diseño de ingeniería.",
+  docsIndexed: "Indexados",
+  docsFiltered: "Filtrados",
+  docsActive: "Activo",
+  readingPathsTitle: "Rutas de lectura",
+  readingPathsLead:
+    "Empieza con una ruta orientada a tareas y luego profundiza con filtros taxonómicos.",
+  startHereTitle: "Empieza aquí",
+  startHereLead:
+    "Documentos base para usuarios nuevos que quieren una incorporación rápida y confiable.",
+  noStartHere: "No hay documentos iniciales para el idioma/filtros actuales.",
+  startBadge: "Inicial",
+  sectionFilter: "Sección",
+  languageFilter: "Idioma",
+  journeyFilter: "Recorrido",
+  audienceFilter: "Audiencia",
+  kindFilter: "Tipo de documento",
+  groupBy: "Agrupar por",
+  allJourneys: "Todos los recorridos",
+  allAudiences: "Todas las audiencias",
+  allKinds: "Todos los tipos",
+  groupJourney: "Recorrido",
+  groupSection: "Sección",
+  groupKind: "Tipo",
+  groupLanguage: "Idioma",
+  resetFilters: "Restablecer filtros",
+  search: "Buscar por título, ruta, resumen o palabra clave",
+  commandPalette: "Paleta de comandos",
+  sourceLabel: "Fuente",
+  docJourney: "Recorrido",
+  docAudience: "Audiencia",
+  docKind: "Tipo",
+  docReadTime: "Tiempo de lectura",
+  docTags: "Etiquetas",
+  relatedDocs: "Documentos relacionados",
+  noRelated: "Aún no se encontraron documentos fuertemente relacionados.",
+  openOnGithub: "Abrir en GitHub",
+  openRaw: "Abrir texto fuente",
+  loading: "Cargando documento...",
+  fallback:
+    "La vista previa no está disponible ahora. Aun así puedes abrir la fuente directamente:",
+  empty: "No hay documentos para los filtros actuales.",
+  allSections: "Todas las secciones",
+  allLanguages: "Todos los idiomas",
+  outline: "Esquema",
+  noOutline: "No se encontraron encabezados en este documento.",
+  reading: "Modo lectura",
+  scaleLabel: "Escala",
+  widthLabel: "Ancho",
+  compact: "Compacto",
+  comfortable: "Cómodo",
+  relaxed: "Amplio",
+  normalWidth: "Normal",
+  wideWidth: "Ancho",
+  previousDoc: "Anterior",
+  nextDoc: "Siguiente",
+  paletteHint: "Escribe un comando o nombre de documento",
+  actionFocus: "Enfocar búsqueda de documentos",
+  actionTop: "Volver arriba",
+  actionTheme: "Cambiar tema",
+  actionLocale: "Cambiar idioma",
+  status: "Tema actual",
+};
+
+const copyPt: typeof copyEn = {
+  ...copyEn,
+  navDocs: "Documentação",
+  summary:
+    "Infraestrutura de assistente de IA rápida, leve e totalmente autônoma.",
+  summary2: "Implante em qualquer lugar. Troque qualquer componente.",
+  notice:
+    "Canais oficiais: use este repositório como fonte da verdade e zeroclawlabs.ai como site oficial.",
+  ctaDocs: "Ler documentação",
+  ctaBootstrap: "Bootstrap em um clique",
+  commandLaneTitle: "Canal de comandos runtime",
+  commandLaneHint: "Com base no fluxo oficial de setup e operações",
+  engineeringTitle: "Fundamentos de engenharia",
+  docsWorkspace: "Workspace de documentação",
+  docsLead:
+    "Toda a documentação do repositório está indexada e pode ser lida diretamente neste GitHub Pages com layout orientado à engenharia.",
+  docsIndexed: "Indexados",
+  docsFiltered: "Filtrados",
+  docsActive: "Ativo",
+  readingPathsTitle: "Trilhas de leitura",
+  readingPathsLead:
+    "Escolha primeiro uma trilha orientada por tarefa e depois aprofunde com filtros taxonômicos.",
+  startHereTitle: "Comece aqui",
+  startHereLead:
+    "Documentos essenciais para quem está começando e quer onboarding rápido e confiável.",
+  noStartHere: "Nenhum documento inicial corresponde ao idioma/filtros atuais.",
+  startBadge: "Inicial",
+  sectionFilter: "Seção",
+  languageFilter: "Idioma",
+  journeyFilter: "Jornada",
+  audienceFilter: "Público",
+  kindFilter: "Tipo de documento",
+  groupBy: "Agrupar por",
+  allJourneys: "Todas as jornadas",
+  allAudiences: "Todos os públicos",
+  allKinds: "Todos os tipos",
+  groupJourney: "Jornada",
+  groupSection: "Seção",
+  groupKind: "Tipo",
+  groupLanguage: "Idioma",
+  resetFilters: "Limpar filtros",
+  search: "Buscar por título, caminho, resumo ou palavra-chave",
+  commandPalette: "Paleta de comandos",
+  sourceLabel: "Fonte",
+  docJourney: "Jornada",
+  docAudience: "Público",
+  docKind: "Tipo",
+  docReadTime: "Tempo de leitura",
+  docTags: "Tags",
+  relatedDocs: "Documentos relacionados",
+  noRelated: "Ainda não há documentos fortemente relacionados.",
+  openOnGithub: "Abrir no GitHub",
+  openRaw: "Abrir fonte bruta",
+  loading: "Carregando documento...",
+  fallback:
+    "A pré-visualização não está disponível agora. Você ainda pode abrir a fonte diretamente:",
+  empty: "Nenhum documento corresponde aos filtros atuais.",
+  allSections: "Todas as seções",
+  allLanguages: "Todos os idiomas",
+  outline: "Sumário",
+  noOutline: "Nenhum cabeçalho foi encontrado neste documento.",
+  reading: "Modo de leitura",
+  scaleLabel: "Escala",
+  widthLabel: "Largura",
+  compact: "Compacto",
+  comfortable: "Confortável",
+  relaxed: "Arejado",
+  normalWidth: "Normal",
+  wideWidth: "Amplo",
+  previousDoc: "Anterior",
+  nextDoc: "Próximo",
+  paletteHint: "Digite um comando ou nome de documento",
+  actionFocus: "Focar busca de documentos",
+  actionTop: "Voltar ao topo",
+  actionTheme: "Alternar tema",
+  actionLocale: "Alternar idioma",
+  status: "Tema atual",
+};
+
+const copyIt: typeof copyEn = {
+  ...copyEn,
+  navDocs: "Documentazione",
+  summary:
+    "Infrastruttura di assistente AI veloce, leggera e completamente autonoma.",
+  summary2: "Distribuisci ovunque. Sostituisci qualsiasi componente.",
+  notice:
+    "Canali ufficiali: usa questo repository come fonte di verità e zeroclawlabs.ai come sito ufficiale.",
+  ctaDocs: "Leggi la documentazione",
+  ctaBootstrap: "Bootstrap con un clic",
+  commandLaneTitle: "Canale comandi runtime",
+  commandLaneHint: "Dal flusso ufficiale di setup e operazioni",
+  engineeringTitle: "Fondamenta ingegneristiche",
+  docsWorkspace: "Workspace documentazione",
+  docsLead:
+    "Tutta la documentazione del repository è indicizzata e leggibile direttamente su questo GitHub Pages con layout orientato all'ingegneria.",
+  docsIndexed: "Indicizzati",
+  docsFiltered: "Filtrati",
+  docsActive: "Attivo",
+  readingPathsTitle: "Percorsi di lettura",
+  readingPathsLead:
+    "Scegli prima un percorso orientato al task, poi approfondisci con filtri tassonomici.",
+  startHereTitle: "Inizia qui",
+  startHereLead:
+    "Documenti fondamentali per nuovi utenti che vogliono onboarding rapido e affidabile.",
+  noStartHere: "Nessun documento iniziale corrisponde a lingua/filtri correnti.",
+  startBadge: "Starter",
+  sectionFilter: "Sezione",
+  languageFilter: "Lingua",
+  journeyFilter: "Percorso",
+  audienceFilter: "Audience",
+  kindFilter: "Tipo documento",
+  groupBy: "Raggruppa per",
+  allJourneys: "Tutti i percorsi",
+  allAudiences: "Tutte le audience",
+  allKinds: "Tutti i tipi",
+  groupJourney: "Percorso",
+  groupSection: "Sezione",
+  groupKind: "Tipo",
+  groupLanguage: "Lingua",
+  resetFilters: "Reimposta filtri",
+  search: "Cerca per titolo, percorso, riepilogo o parola chiave",
+  commandPalette: "Command palette",
+  sourceLabel: "Sorgente",
+  docJourney: "Percorso",
+  docAudience: "Audience",
+  docKind: "Tipo",
+  docReadTime: "Tempo di lettura",
+  docTags: "Tag",
+  relatedDocs: "Documenti correlati",
+  noRelated: "Nessun documento fortemente correlato trovato.",
+  openOnGithub: "Apri su GitHub",
+  openRaw: "Apri sorgente raw",
+  loading: "Caricamento documento...",
+  fallback:
+    "L'anteprima del documento non è disponibile ora. Puoi comunque aprire direttamente la sorgente:",
+  empty: "Nessun documento corrisponde ai filtri correnti.",
+  allSections: "Tutte le sezioni",
+  allLanguages: "Tutte le lingue",
+  outline: "Indice",
+  noOutline: "Nessuna intestazione trovata in questo documento.",
+  reading: "Modalità lettura",
+  scaleLabel: "Scala",
+  widthLabel: "Larghezza",
+  compact: "Compatto",
+  comfortable: "Confortevole",
+  relaxed: "Ampio",
+  normalWidth: "Normale",
+  wideWidth: "Larga",
+  previousDoc: "Precedente",
+  nextDoc: "Successivo",
+  paletteHint: "Digita un comando o nome documento",
+  actionFocus: "Metti a fuoco ricerca documenti",
+  actionTop: "Torna in alto",
+  actionTheme: "Cambia tema",
+  actionLocale: "Cambia lingua",
+  status: "Tema corrente",
+};
+
+const copy: Record<Locale, typeof copyEn> = {
+  en: copyEn,
+  zh: copyZh,
+  es: copyEs,
+  pt: copyPt,
+  it: copyIt,
+};
 
 const commandLane: Array<{ command: string; hint: Localized }> = [
   {
     command: "zeroclaw onboard --interactive",
-    hint: { en: "Generate config and credentials", zh: "生成配置与凭据" },
+    hint: {
+      en: "Generate config and credentials",
+      zh: "生成配置与凭据",
+      es: "Generar configuración y credenciales",
+      pt: "Gerar configuração e credenciais",
+      it: "Genera configurazione e credenziali",
+    },
   },
   {
     command: "zeroclaw agent",
-    hint: { en: "Run interactive agent mode", zh: "运行交互式 Agent 模式" },
+    hint: {
+      en: "Run interactive agent mode",
+      zh: "运行交互式 Agent 模式",
+      es: "Ejecutar modo agente interactivo",
+      pt: "Executar modo agente interativo",
+      it: "Esegui modalità agente interattiva",
+    },
   },
   {
     command: "zeroclaw gateway && zeroclaw daemon",
-    hint: { en: "Start runtime services", zh: "启动运行时服务" },
+    hint: {
+      en: "Start runtime services",
+      zh: "启动运行时服务",
+      es: "Iniciar servicios de runtime",
+      pt: "Iniciar serviços de runtime",
+      it: "Avvia servizi runtime",
+    },
   },
   {
     command: "zeroclaw doctor",
     hint: {
       en: "Validate environment and runtime health",
       zh: "校验环境与运行时健康状态",
+      es: "Validar entorno y salud del runtime",
+      pt: "Validar ambiente e saúde do runtime",
+      it: "Valida ambiente e salute del runtime",
     },
   },
 ];
 
 const engineeringPillars: Array<{ title: Localized; detail: Localized }> = [
   {
-    title: { en: "Trait-driven architecture", zh: "Trait 驱动架构" },
+    title: {
+      en: "Trait-driven architecture",
+      zh: "Trait 驱动架构",
+      es: "Arquitectura guiada por traits",
+      pt: "Arquitetura orientada a traits",
+      it: "Architettura guidata da trait",
+    },
     detail: {
       en: "Providers, channels, tools, memory, and tunnels remain swappable through interfaces.",
       zh: "Provider、Channel、Tool、Memory、Tunnel 通过接口保持可插拔。",
+      es: "Providers, canales, tools, memoria y túneles se mantienen intercambiables mediante interfaces.",
+      pt: "Providers, canais, tools, memória e túneis permanecem intercambiáveis via interfaces.",
+      it: "Provider, canali, tool, memoria e tunnel restano sostituibili tramite interfacce.",
     },
   },
   {
-    title: { en: "Secure by default runtime", zh: "默认安全运行时" },
+    title: {
+      en: "Secure by default runtime",
+      zh: "默认安全运行时",
+      es: "Runtime seguro por defecto",
+      pt: "Runtime seguro por padrão",
+      it: "Runtime sicuro per default",
+    },
     detail: {
       en: "Pairing, sandboxing, explicit allowlists, and workspace scoping are baseline controls.",
       zh: "配对、沙箱、显式白名单与工作区作用域作为基线控制。",
+      es: "Pairing, sandboxing, allowlists explícitas y scope de workspace son controles base.",
+      pt: "Pairing, sandboxing, allowlists explícitas e escopo de workspace são controles de base.",
+      it: "Pairing, sandboxing, allowlist esplicite e scope del workspace sono controlli di base.",
     },
   },
   {
-    title: { en: "Build once, run anywhere", zh: "一次构建，到处运行" },
+    title: {
+      en: "Build once, run anywhere",
+      zh: "一次构建，到处运行",
+      es: "Compila una vez, ejecuta en cualquier lugar",
+      pt: "Compile uma vez, rode em qualquer lugar",
+      it: "Build una volta, esegui ovunque",
+    },
     detail: {
       en: "Single-binary Rust workflow across ARM, x86, and RISC-V from edge to cloud.",
       zh: "单一 Rust 二进制工作流覆盖 ARM、x86、RISC-V，从边缘到云端。",
+      es: "Flujo Rust de binario único para ARM, x86 y RISC-V desde edge hasta cloud.",
+      pt: "Fluxo Rust de binário único em ARM, x86 e RISC-V do edge à nuvem.",
+      it: "Workflow Rust a binario singolo su ARM, x86 e RISC-V dall'edge al cloud.",
     },
   },
 ];
@@ -583,9 +968,13 @@ function inferSectionLabel(section: string, locale: Locale): string {
   return pretty.charAt(0).toUpperCase() + pretty.slice(1);
 }
 
+function localize(value: Localized, locale: Locale): string {
+  return value[locale] ?? value.en;
+}
+
 function formatLanguage(language: string, locale: Locale): string {
   if (languageNames[language]) {
-    return languageNames[language][locale];
+    return localize(languageNames[language], locale);
   }
 
   if (language === "en") {
@@ -596,15 +985,15 @@ function formatLanguage(language: string, locale: Locale): string {
 }
 
 function formatJourney(journey: Journey, locale: Locale): string {
-  return journeyNames[journey][locale];
+  return localize(journeyNames[journey], locale);
 }
 
 function formatAudience(audience: Audience, locale: Locale): string {
-  return audienceNames[audience][locale];
+  return localize(audienceNames[audience], locale);
 }
 
 function formatKind(kind: DocKind, locale: Locale): string {
-  return kindNames[kind][locale];
+  return localize(kindNames[kind], locale);
 }
 
 function groupLabel(groupBy: GroupMode, key: string, locale: Locale) {
@@ -697,7 +1086,7 @@ export default function App(): JSX.Element {
     if (typeof window === "undefined") {
       return "en";
     }
-    return window.localStorage.getItem("zc-locale") === "zh" ? "zh" : "en";
+    return normalizeLocale(window.localStorage.getItem("zc-locale"));
   });
 
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -769,6 +1158,49 @@ export default function App(): JSX.Element {
 
     return undefined;
   }, [themeMode]);
+
+  useEffect(() => {
+    const cardSelector = ".metric-card, .principle-card, .pathway-card, .reader-side .side-card";
+    const cards = [...document.querySelectorAll<HTMLElement>(cardSelector)];
+
+    if (!cards.length) {
+      return;
+    }
+
+    const cleanups = cards.map((card) => {
+      const onPointerMove = (event: PointerEvent): void => {
+        const bounds = card.getBoundingClientRect();
+        const x = event.clientX - bounds.left;
+        const y = event.clientY - bounds.top;
+
+        card.style.setProperty("--spotlight-x", `${x}px`);
+        card.style.setProperty("--spotlight-y", `${y}px`);
+        card.style.setProperty("--spotlight-opacity", "1");
+      };
+
+      const onPointerEnter = (): void => {
+        card.style.setProperty("--spotlight-opacity", "0.9");
+      };
+
+      const onPointerLeave = (): void => {
+        card.style.setProperty("--spotlight-opacity", "0");
+      };
+
+      card.addEventListener("pointermove", onPointerMove);
+      card.addEventListener("pointerenter", onPointerEnter);
+      card.addEventListener("pointerleave", onPointerLeave);
+
+      return () => {
+        card.removeEventListener("pointermove", onPointerMove);
+        card.removeEventListener("pointerenter", onPointerEnter);
+        card.removeEventListener("pointerleave", onPointerLeave);
+      };
+    });
+
+    return () => {
+      cleanups.forEach((cleanup) => cleanup());
+    };
+  }, []);
 
   const sectionOptions = useMemo(
     () => ["all", ...new Set(docs.map((doc) => doc.section))],
@@ -866,7 +1298,14 @@ export default function App(): JSX.Element {
   );
 
   const starterDocs = useMemo(() => {
-    const preferredLanguages = locale === "zh" ? ["zh-CN", "en"] : ["en"];
+    const preferredLanguagesByLocale: Record<Locale, string[]> = {
+      en: ["en"],
+      zh: ["zh-CN", "en"],
+      es: ["es", "en"],
+      pt: ["pt", "en"],
+      it: ["it", "en"],
+    };
+    const preferredLanguages = preferredLanguagesByLocale[locale] ?? ["en"];
 
     return docs
       .filter((doc) => doc.startHere)
@@ -1171,8 +1610,8 @@ export default function App(): JSX.Element {
       {
         id: "toggle-locale",
         label: text.actionLocale,
-        hint: locale === "en" ? "EN -> 中文" : "中文 -> EN",
-        run: () => setLocale((prev) => (prev === "en" ? "zh" : "en")),
+        hint: `${localeLabels[locale]} -> ${localeLabels[nextLocale(locale)]}`,
+        run: () => setLocale((prev) => nextLocale(prev)),
       },
     ],
     [locale, resolvedTheme, text.actionFocus, text.actionLocale, text.actionTheme, text.actionTop, text.docsWorkspace, text.status]
@@ -1280,20 +1719,17 @@ export default function App(): JSX.Element {
 
           <div className="controls">
             <div className="segmented" role="group" aria-label="Language">
-              <button
-                type="button"
-                className={locale === "en" ? "active" : ""}
-                onClick={() => setLocale("en")}
-              >
-                EN
-              </button>
-              <button
-                type="button"
-                className={locale === "zh" ? "active" : ""}
-                onClick={() => setLocale("zh")}
-              >
-                中文
-              </button>
+              {localeOrder.map((entry) => (
+                <button
+                  key={entry}
+                  type="button"
+                  className={locale === entry ? "active" : ""}
+                  onClick={() => setLocale(entry)}
+                  title={formatLanguage(entry === "zh" ? "zh-CN" : entry, locale)}
+                >
+                  {localeLabels[entry]}
+                </button>
+              ))}
             </div>
 
             <div className="segmented" role="group" aria-label="Theme">
@@ -1352,7 +1788,7 @@ export default function App(): JSX.Element {
                   {commandLane.map((item) => (
                     <li key={item.command}>
                       <code>{item.command}</code>
-                      <span>{item.hint[locale]}</span>
+                      <span>{localize(item.hint, locale)}</span>
                     </li>
                   ))}
                 </ul>
@@ -1383,8 +1819,8 @@ export default function App(): JSX.Element {
               <div className="principles-grid">
                 {engineeringPillars.map((pillar) => (
                   <article key={pillar.title.en} className="principle-card">
-                    <h3>{pillar.title[locale]}</h3>
-                    <p>{pillar.detail[locale]}</p>
+                    <h3>{localize(pillar.title, locale)}</h3>
+                    <p>{localize(pillar.detail, locale)}</p>
                   </article>
                 ))}
               </div>
@@ -1412,7 +1848,10 @@ export default function App(): JSX.Element {
               <span>
                 {text.readingPathsTitle}:{" "}
                 <strong>
-                  {readingPaths.find((entry) => entry.id === activePathway)?.label[locale] ?? "-"}
+                  {localize(
+                    readingPaths.find((entry) => entry.id === activePathway)?.label ?? { en: "-", zh: "-" },
+                    locale
+                  )}
                 </strong>
               </span>
             ) : null}
@@ -1431,8 +1870,8 @@ export default function App(): JSX.Element {
                   className={`pathway-card ${activePathway === pathway.id ? "active" : ""}`}
                   onClick={() => applyPathway(pathway.id)}
                 >
-                  <span className="pathway-title">{pathway.label[locale]}</span>
-                  <span className="pathway-detail">{pathway.detail[locale]}</span>
+                  <span className="pathway-title">{localize(pathway.label, locale)}</span>
+                  <span className="pathway-detail">{localize(pathway.detail, locale)}</span>
                   <span className="pathway-count">{pathway.total}</span>
                 </button>
               ))}

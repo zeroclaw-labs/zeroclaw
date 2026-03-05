@@ -21,6 +21,7 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
+    "types": ["vite/client", "vitest/globals"],
 
     /* Aliases */
     "baseUrl": ".",
