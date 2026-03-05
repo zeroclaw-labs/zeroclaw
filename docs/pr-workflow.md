@@ -107,6 +107,7 @@ Maintain these branch protection rules on `dev` and `main`:
 - Restrict force-push on protected branches.
 - Route normal contributor PRs to `main` by default (`dev` is optional for dedicated integration batching).
 - Allow direct merges to `main` once required checks and review policy pass.
+- Keep live export snapshots and policy baseline versioned in `docs/operations/branch-protection.md`.
 
 ---
 

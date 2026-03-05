@@ -74,6 +74,7 @@ pub mod tools;
 pub(crate) mod tunnel;
 pub mod update;
 pub(crate) mod util;
+pub mod workspace;
 
 pub use config::Config;
 
