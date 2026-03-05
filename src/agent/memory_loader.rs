@@ -1,4 +1,4 @@
-use crate::memory::{self, decay, Memory, MemoryCategory};
+use crate::memory::{self, decay, retrieval, Memory, MemoryCategory};
 use async_trait::async_trait;
 use std::fmt::Write;
 
@@ -51,7 +51,8 @@ impl MemoryLoader for DefaultMemoryLoader {
     ) -> anyhow::Result<String> {
         // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
         let fetch_limit = self.limit * RECALL_OVER_FETCH_FACTOR;
-        let mut entries = memory.recall(user_message, fetch_limit, None).await?;
+        let mut entries =
+            retrieval::enhanced_recall(memory, user_message, fetch_limit, None).await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -105,6 +106,7 @@ mod tests {
     struct MockMemoryWithEntries {
         entries: Arc<Vec<MemoryEntry>>,
     }
+    struct FailingRecallMemory;
 
     #[async_trait]
     impl Memory for MockMemory {
@@ -214,6 +216,56 @@ mod tests {
 
         fn name(&self) -> &str {
             "mock-with-entries"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for FailingRecallMemory {
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Err(anyhow::anyhow!("memory backend unavailable"))
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "failing-recall-memory"
         }
     }
 
@@ -344,5 +396,15 @@ mod tests {
             !context.contains("conv_high"),
             "Conversation should be truncated when limit=1: {context}"
         );
+    }
+
+    #[tokio::test]
+    async fn default_loader_propagates_primary_recall_errors() {
+        let loader = DefaultMemoryLoader::default();
+        let err = loader
+            .load_context(&FailingRecallMemory, "hello")
+            .await
+            .expect_err("expected memory loader to propagate primary recall failure");
+        assert!(err.to_string().contains("memory backend unavailable"));
     }
 }

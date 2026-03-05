@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::security::SecurityPolicy;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 pub mod consolidation;
 mod schedule;
@@ -15,10 +15,62 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, due_jobs, get_job, list_jobs, list_runs, record_last_run, record_run,
+    remove_job, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+
+fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    security
+        .validate_command_execution(command, approved)
+        .map(|_| ())
+        .map_err(|reason| anyhow!("Command blocked by security policy: {reason}"))
+}
+
+pub fn add_shell_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+) -> Result<CronJob> {
+    add_shell_job_with_approval(config, name, schedule, command, false)
+}
+
+pub fn add_shell_job_with_approval(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    validate_shell_command(config, command, approved)?;
+    store::add_shell_job(config, name, schedule, command)
+}
+
+pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+    let schedule = Schedule::Cron {
+        expr: expression.to_string(),
+        tz: None,
+    };
+    add_shell_job(config, None, schedule, command)
+}
+
+pub fn update_shell_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    update_shell_job_with_approval(config, job_id, patch, false)
+}
+
+pub fn update_shell_job_with_approval(
+    config: &Config,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
+    if let Some(command) = patch.command.as_deref() {
+        validate_shell_command(config, command, approved)?;
+    }
+    update_job(config, job_id, patch)
+}
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
@@ -129,13 +181,6 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 None
             };
 
-            if let Some(ref cmd) = command {
-                let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-                if !security.is_command_allowed(cmd) {
-                    bail!("Command blocked by security policy: {cmd}");
-                }
-            }
-
             let patch = CronJobPatch {
                 schedule,
                 command,
@@ -143,7 +188,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 ..CronJobPatch::default()
             };
 
-            let job = update_job(config, &id, patch)?;
+            let job = update_shell_job(config, &id, patch)?;
             println!("\u{2705} Updated cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
@@ -413,5 +458,95 @@ mod tests {
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         assert!(security.is_command_allowed("echo safe"));
+    }
+
+    #[test]
+    fn add_shell_job_requires_explicit_approval_for_medium_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+
+        let denied = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "touch cron-medium-risk",
+        );
+        assert!(denied.is_err());
+        assert!(denied
+            .unwrap_err()
+            .to_string()
+            .contains("explicit approval"));
+
+        let approved = add_shell_job_with_approval(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "touch cron-medium-risk",
+            true,
+        );
+        assert!(approved.is_ok(), "{approved:?}");
+    }
+
+    #[test]
+    fn update_requires_explicit_approval_for_medium_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        let job = make_job(&config, "*/5 * * * *", None, "echo original");
+
+        let denied = update_shell_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                command: Some("touch cron-medium-risk-update".into()),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(denied.is_err());
+        assert!(denied
+            .unwrap_err()
+            .to_string()
+            .contains("explicit approval"));
+
+        let approved = update_shell_job_with_approval(
+            &config,
+            &job.id,
+            CronJobPatch {
+                command: Some("touch cron-medium-risk-update".into()),
+                ..CronJobPatch::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(approved.command, "touch cron-medium-risk-update");
+    }
+
+    #[test]
+    fn cli_update_requires_explicit_approval_for_medium_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        let job = make_job(&config, "*/5 * * * *", None, "echo original");
+
+        let result = run_update(
+            &config,
+            &job.id,
+            None,
+            None,
+            Some("touch cron-cli-medium-risk"),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("explicit approval"));
     }
 }

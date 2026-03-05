@@ -15,7 +15,7 @@ This document describes the production binary build lane for ZeroClaw on Blacksm
 
 The workflow runs on the same Blacksmith self-hosted runner label-set used by the rest of CI:
 
-`[self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]`
+`[self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]`
 
 This keeps runner routing consistent with existing CI jobs and actionlint policy.
 

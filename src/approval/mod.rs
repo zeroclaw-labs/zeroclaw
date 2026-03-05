@@ -636,8 +636,9 @@ impl ApprovalManager {
 
     /// Prompt the user on the CLI and return their decision.
     ///
-    /// For non-CLI channels, returns `Yes` automatically (interactive
-    /// approval is only supported on CLI for now).
+    /// Only valid for the CLI channel. Non-CLI channels should not call
+    /// this method; the caller in `run_tool_call_loop` denies by default
+    /// when the channel cannot provide interactive approval.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
     }
