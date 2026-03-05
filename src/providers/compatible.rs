@@ -51,6 +51,10 @@ pub struct OpenAiCompatibleProvider {
     api_mode: CompatibleApiMode,
     /// Optional max token cap propagated to outbound requests.
     max_tokens_override: Option<u32>,
+    /// Controls the `thinking` field in outbound requests.
+    /// `Some(false)` sends `{"thinking":{"type":"disabled"}}` to suppress reasoning tokens.
+    /// `None` or `Some(true)` omits the field, letting the model use its default behavior.
+    reasoning_enabled: Option<bool>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -254,6 +258,22 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             api_mode,
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            reasoning_enabled: None,
+        }
+    }
+
+    /// Builder method to set the reasoning/thinking control.
+    /// `Some(false)` disables reasoning tokens; `None` or `Some(true)` uses model defaults.
+    pub fn with_reasoning(mut self, reasoning_enabled: Option<bool>) -> Self {
+        self.reasoning_enabled = reasoning_enabled;
+        self
+    }
+
+    /// Returns the `ThinkingConfig` to include in outbound requests based on `reasoning_enabled`.
+    fn thinking_config(&self) -> Option<ThinkingConfig> {
+        match self.reasoning_enabled {
+            Some(false) => Some(ThinkingConfig::disabled()),
+            _ => None,
         }
     }
 
@@ -390,6 +410,22 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// Thinking/reasoning control for models that support it (e.g. doubao-seed-2.0).
+/// Serializes as `{"type": "disabled"}` to suppress reasoning tokens.
+#[derive(Debug, Clone, Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl ThinkingConfig {
+    fn disabled() -> Self {
+        Self {
+            kind: "disabled".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
     model: String,
@@ -403,6 +439,8 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -600,6 +638,8 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1725,6 +1765,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            thinking: self.thinking_config(),
         };
 
         let url = self.chat_completions_url();
@@ -1856,6 +1897,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            thinking: self.thinking_config(),
         };
 
         if self.should_use_responses_mode() {
@@ -1983,6 +2025,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some("auto".to_string())
             },
+            thinking: self.thinking_config(),
         };
 
         if self.should_use_responses_mode() {
@@ -2103,6 +2146,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            thinking: self.thinking_config(),
         };
 
         if self.should_use_responses_mode() {
@@ -2257,6 +2301,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
+            thinking: self.thinking_config(),
         };
 
         let url = self.chat_completions_url();
