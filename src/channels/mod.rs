@@ -160,6 +160,10 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    ShowReasoning,
+    SetReasoning(bool),
+    InvalidReasoning(String),
+    StopInFlight,
     NewSession,
     RequestAllToolsOnce,
     RequestToolApproval(String),
@@ -311,6 +315,63 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn runtime_reasoning_overrides() -> &'static Mutex<HashMap<String, bool>> {
+    static STORE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_sender_reasoning_override(
+    _ctx: &ChannelRuntimeContext,
+    sender_history_key: &str,
+) -> Option<bool> {
+    runtime_reasoning_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_history_key)
+        .copied()
+}
+
+fn set_sender_reasoning_override(
+    _ctx: &ChannelRuntimeContext,
+    sender_history_key: &str,
+    enabled: bool,
+) {
+    runtime_reasoning_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_history_key.to_string(), enabled);
+}
+
+fn clear_sender_reasoning_override(_ctx: &ChannelRuntimeContext, sender_history_key: &str) {
+    runtime_reasoning_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_history_key);
+}
+
+fn in_flight_sender_store() -> &'static tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>
+{
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+fn effective_reasoning_enabled_for_sender(
+    ctx: &ChannelRuntimeContext,
+    sender_history_key: &str,
+) -> Option<bool> {
+    resolve_sender_reasoning_override(ctx, sender_history_key)
+        .or(ctx.provider_runtime_options.reasoning_enabled)
+}
+
+fn reasoning_mode_label(enabled: Option<bool>) -> &'static str {
+    match enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "default",
+    }
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -688,6 +749,14 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord")
 }
 
+fn parse_reasoning_toggle(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
@@ -716,6 +785,16 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
+        "/reasoning" => {
+            if tail.is_empty() {
+                Some(ChannelRuntimeCommand::ShowReasoning)
+            } else if let Some(enabled) = parse_reasoning_toggle(&tail) {
+                Some(ChannelRuntimeCommand::SetReasoning(enabled))
+            } else {
+                Some(ChannelRuntimeCommand::InvalidReasoning(tail))
+            }
+        }
+        "/stop" => Some(ChannelRuntimeCommand::StopInFlight),
         // Provider/model switching remains limited to channels with session routing.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = args.first() {
@@ -1405,6 +1484,13 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             next_defaults.default_provider.clone(),
             Arc::clone(&next_default_provider),
         );
+        cache.insert(
+            provider_cache_key(
+                &next_defaults.default_provider,
+                ctx.provider_runtime_options.reasoning_enabled,
+            ),
+            Arc::clone(&next_default_provider),
+        );
     }
 
     {
@@ -1656,21 +1742,46 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
+fn provider_cache_key(provider_name: &str, reasoning_enabled: Option<bool>) -> String {
+    match reasoning_enabled {
+        Some(true) => format!("{provider_name}::reasoning=on"),
+        Some(false) => format!("{provider_name}::reasoning=off"),
+        None => format!("{provider_name}::reasoning=default"),
+    }
+}
+
+fn provider_runtime_options_with_reasoning(
+    base: &providers::ProviderRuntimeOptions,
+    reasoning_enabled: Option<bool>,
+) -> providers::ProviderRuntimeOptions {
+    let mut runtime_options = base.clone();
+    runtime_options.reasoning_enabled = reasoning_enabled;
+    runtime_options
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    reasoning_enabled: Option<bool>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
-    if let Some(existing) = ctx
-        .provider_cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(provider_name)
-        .cloned()
-    {
+    let cache_key = provider_cache_key(provider_name, reasoning_enabled);
+
+    if let Some(existing) = {
+        let cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&cache_key).cloned().or_else(|| {
+            if reasoning_enabled == ctx.provider_runtime_options.reasoning_enabled {
+                cache.get(provider_name).cloned()
+            } else {
+                None
+            }
+        })
+    } {
         return Ok(existing);
     }
 
-    if provider_name == ctx.default_provider.as_str() {
+    if provider_name == ctx.default_provider.as_str()
+        && reasoning_enabled == ctx.provider_runtime_options.reasoning_enabled
+    {
         return Ok(Arc::clone(&ctx.provider));
     }
 
@@ -1686,7 +1797,7 @@ async fn get_or_create_provider(
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
         ctx.reliability.as_ref().clone(),
-        ctx.provider_runtime_options.clone(),
+        provider_runtime_options_with_reasoning(&ctx.provider_runtime_options, reasoning_enabled),
     )
     .await?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
@@ -1697,9 +1808,15 @@ async fn get_or_create_provider(
 
     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
     let cached = cache
-        .entry(provider_name.to_string())
-        .or_insert_with(|| Arc::clone(&provider));
-    Ok(Arc::clone(cached))
+        .entry(cache_key)
+        .or_insert_with(|| Arc::clone(&provider))
+        .clone();
+    if reasoning_enabled == ctx.provider_runtime_options.reasoning_enabled {
+        cache
+            .entry(provider_name.to_string())
+            .or_insert_with(|| Arc::clone(&cached));
+    }
+    Ok(cached)
 }
 
 async fn create_resilient_provider_nonblocking(
@@ -1764,6 +1881,8 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
     response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
     response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
     response.push_str("List approval state with `/approvals`.\n");
+    response.push_str("Show/toggle session reasoning with `/reasoning` and `/reasoning on|off`.\n");
+    response.push_str("Cancel the current in-flight task with `/stop`.\n");
     response.push_str(
         "Natural language also works (policy controlled).\n\
          - `direct` mode (default): `授权工具 shell` grants immediately.\n\
@@ -1808,6 +1927,8 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
     response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
     response.push_str("List approval state with `/approvals`.\n");
+    response.push_str("Show/toggle session reasoning with `/reasoning` and `/reasoning on|off`.\n");
+    response.push_str("Cancel the current in-flight task with `/stop`.\n");
     response.push_str(
         "Natural language also works (policy controlled).\n\
          - `direct` mode (default): `授权工具 shell` grants immediately.\n\
@@ -1959,26 +2080,30 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
-                        }
+                Some(provider_name) => {
+                    let reasoning_enabled =
+                        effective_reasoning_enabled_for_sender(ctx, &sender_key);
+                    match get_or_create_provider(ctx, &provider_name, reasoning_enabled).await {
+                        Ok(_) => {
+                            if provider_name != current.provider {
+                                current.provider = provider_name.clone();
+                                set_route_selection(ctx, &sender_key, current.clone());
+                                clear_sender_history(ctx, &sender_key);
+                            }
 
-                        format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
+                            format!(
+                                "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                                current.model
+                            )
+                        }
+                        Err(err) => {
+                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            format!(
+                                "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                            )
+                        }
                     }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
-                        )
-                    }
-                },
+                }
                 None => format!(
                     "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
                 ),
@@ -2002,8 +2127,46 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
+        ChannelRuntimeCommand::ShowReasoning => {
+            let override_mode = resolve_sender_reasoning_override(ctx, &sender_key);
+            let runtime_default = ctx.provider_runtime_options.reasoning_enabled;
+            let effective = effective_reasoning_enabled_for_sender(ctx, &sender_key);
+            format!(
+                "Reasoning status for this sender session:\n- Effective: `{}`\n- Session override: `{}`\n- Runtime default: `{}`\nUse `/reasoning on` or `/reasoning off` to change this sender session.",
+                reasoning_mode_label(effective),
+                reasoning_mode_label(override_mode),
+                reasoning_mode_label(runtime_default)
+            )
+        }
+        ChannelRuntimeCommand::SetReasoning(enabled) => {
+            set_sender_reasoning_override(ctx, &sender_key, enabled);
+            let status = if enabled { "on" } else { "off" };
+            format!(
+                "Reasoning set to `{status}` for this sender session. Use `/reasoning` to view current status."
+            )
+        }
+        ChannelRuntimeCommand::InvalidReasoning(raw) => {
+            format!(
+                "Invalid `/reasoning` value `{}`. Use `/reasoning`, `/reasoning on`, or `/reasoning off`.",
+                raw.trim()
+            )
+        }
+        ChannelRuntimeCommand::StopInFlight => {
+            let scope_key = interruption_scope_key(msg);
+            let active_task = {
+                let mut active = in_flight_sender_store().lock().await;
+                active.remove(&scope_key)
+            };
+            if let Some(task_state) = active_task {
+                task_state.cancellation.cancel();
+                "Stop signal sent for the current sender task.".to_string()
+            } else {
+                "No in-flight task found for this sender in the current chat scope.".to_string()
+            }
+        }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            clear_sender_reasoning_override(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
         ChannelRuntimeCommand::RequestAllToolsOnce => {
@@ -3060,7 +3223,14 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
     let route = classify_message_route(ctx.as_ref(), &msg.content)
         .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+    let reasoning_enabled = effective_reasoning_enabled_for_sender(ctx.as_ref(), &history_key);
+    let active_provider = match get_or_create_provider(
+        ctx.as_ref(),
+        &route.provider,
+        reasoning_enabled,
+    )
+    .await
+    {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
@@ -3786,10 +3956,6 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InFlightSenderTaskState,
-    >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
@@ -3799,20 +3965,20 @@ async fn run_message_dispatch_loop(
         };
 
         let worker_ctx = Arc::clone(&ctx);
-        let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
             let interrupt_enabled =
                 worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
+            let register_in_flight = msg.channel != "cli";
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
-            if interrupt_enabled {
+            if register_in_flight {
                 let previous = {
-                    let mut active = in_flight.lock().await;
+                    let mut active = in_flight_sender_store().lock().await;
                     active.insert(
                         sender_scope_key.clone(),
                         InFlightSenderTaskState {
@@ -3823,21 +3989,23 @@ async fn run_message_dispatch_loop(
                     )
                 };
 
-                if let Some(previous) = previous {
-                    tracing::info!(
-                        channel = %msg.channel,
-                        sender = %msg.sender,
-                        "Interrupting previous in-flight request for sender"
-                    );
-                    previous.cancellation.cancel();
-                    previous.completion.wait().await;
+                if interrupt_enabled {
+                    if let Some(previous) = previous {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "Interrupting previous in-flight request for sender"
+                        );
+                        previous.cancellation.cancel();
+                        previous.completion.wait().await;
+                    }
                 }
             }
 
             process_channel_message(worker_ctx, msg, cancellation_token).await;
 
-            if interrupt_enabled {
-                let mut active = in_flight.lock().await;
+            if register_in_flight {
+                let mut active = in_flight_sender_store().lock().await;
                 if active
                     .get(&sender_scope_key)
                     .is_some_and(|state| state.task_id == task_id)
@@ -5232,6 +5400,26 @@ mod tests {
         assert_eq!(
             parse_runtime_command("slack", "/approvals"),
             Some(ChannelRuntimeCommand::ListApprovals)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/reasoning"),
+            Some(ChannelRuntimeCommand::ShowReasoning)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/reasoning on"),
+            Some(ChannelRuntimeCommand::SetReasoning(true))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/reasoning off"),
+            Some(ChannelRuntimeCommand::SetReasoning(false))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/reasoning maybe"),
+            Some(ChannelRuntimeCommand::InvalidReasoning("maybe".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/stop"),
+            Some(ChannelRuntimeCommand::StopInFlight)
         );
         assert_eq!(parse_runtime_command("slack", "/models"), None);
     }
@@ -6636,6 +6824,205 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages[0].contains("alias-tag flow resolved"));
         assert!(!sent_messages[0].contains("<toolcall>"));
         assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_reasoning_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                reasoning_enabled: Some(false),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &autonomy_with_mock_price_auto_approve(),
+            )),
+        });
+        clear_sender_reasoning_override(runtime_ctx.as_ref(), "telegram_alice");
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-reasoning-status-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-reasoning".to_string(),
+                content: "/reasoning".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-reasoning-set-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-reasoning".to_string(),
+                content: "/reasoning on".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-reasoning-status-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-reasoning".to_string(),
+                content: "/reasoning".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 3,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 3);
+        assert!(sent[0].contains("Reasoning status for this sender session"));
+        assert!(sent[0].contains("Effective: `off`"));
+        assert!(sent[1].contains("Reasoning set to `on`"));
+        assert!(sent[2].contains("Effective: `on`"));
+        drop(sent);
+
+        assert_eq!(
+            resolve_sender_reasoning_override(runtime_ctx.as_ref(), "telegram_alice"),
+            Some(true)
+        );
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_stop_command_and_cancels_in_flight_task() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &autonomy_with_mock_price_auto_approve(),
+            )),
+        });
+
+        let in_flight_cancellation = CancellationToken::new();
+        let scope_key = interruption_scope_key(&traits::ChannelMessage {
+            id: "msg-stop-scope".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-stop".to_string(),
+            content: "pending".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        });
+        in_flight_sender_store().lock().await.insert(
+            scope_key,
+            InFlightSenderTaskState {
+                task_id: 42,
+                cancellation: in_flight_cancellation.clone(),
+                completion: Arc::new(InFlightTaskCompletion::new()),
+            },
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stop-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stop".to_string(),
+                content: "/stop".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(in_flight_cancellation.is_cancelled());
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Stop signal sent"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
