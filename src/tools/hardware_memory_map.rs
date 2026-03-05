@@ -7,6 +7,7 @@
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write as _;
 
 /// Known memory maps (from datasheets). Used when probe-rs is unavailable.
 const MEMORY_MAPS: &[(&str, &str)] = &[
@@ -104,11 +105,11 @@ impl Tool for HardwareMemoryMapTool {
                 };
                 match probe_rs_memory_map(chip) {
                     Ok(probe_msg) => {
-                        output.push_str(&format!("**{}** (via probe-rs):\n{}\n", board, probe_msg));
+                        let _ = write!(output, "**{board}** (via probe-rs):\n{probe_msg}\n");
                         true
                     }
                     Err(e) => {
-                        output.push_str(&format!("Probe-rs failed: {}. ", e));
+                        let _ = write!(output, "Probe-rs failed: {e}. ");
                         false
                     }
                 }
@@ -159,20 +160,12 @@ fn probe_rs_memory_map(chip: &str) -> anyhow::Result<String> {
             MemoryRegion::Ram(ram) => {
                 let start = ram.range.start;
                 let end = ram.range.end;
-                let size_kb = (end - start) / 1024;
-                out.push_str(&format!(
-                    "RAM: 0x{:08X} - 0x{:08X} ({} KB)\n",
-                    start, end, size_kb
-                ));
+                append_region_line(&mut out, "RAM", start, end);
             }
             MemoryRegion::Nvm(flash) => {
                 let start = flash.range.start;
                 let end = flash.range.end;
-                let size_kb = (end - start) / 1024;
-                out.push_str(&format!(
-                    "Flash: 0x{:08X} - 0x{:08X} ({} KB)\n",
-                    start, end, size_kb
-                ));
+                append_region_line(&mut out, "Flash", start, end);
             }
             _ => {}
         }
@@ -183,6 +176,11 @@ fn probe_rs_memory_map(chip: &str) -> anyhow::Result<String> {
     }
 
     Ok(out)
+}
+
+fn append_region_line(out: &mut String, label: &str, start: u64, end: u64) {
+    let size_kb = (end - start) / 1024;
+    let _ = writeln!(out, "{label}: 0x{start:08X} - 0x{end:08X} ({size_kb} KB)");
 }
 
 #[cfg(test)]
@@ -203,5 +201,18 @@ mod tests {
     fn static_map_arduino() {
         let tool = HardwareMemoryMapTool::new(vec!["arduino-uno".into()]);
         assert!(tool.static_map_for_board("arduino-uno").is_some());
+    }
+
+    #[test]
+    fn append_region_line_matches_legacy_format() {
+        let mut actual = String::new();
+        append_region_line(&mut actual, "RAM", 0x2000_0000, 0x2002_0000);
+        let expected = format!(
+            "RAM: 0x{:08X} - 0x{:08X} ({} KB)\n",
+            0x2000_0000_u64,
+            0x2002_0000_u64,
+            (0x2002_0000_u64 - 0x2000_0000_u64) / 1024
+        );
+        assert_eq!(actual, expected);
     }
 }

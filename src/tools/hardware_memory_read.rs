@@ -6,6 +6,7 @@
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write as _;
 
 /// RAM base for Nucleo-F401RE (STM32F401)
 const NUCLEO_RAM_BASE: u64 = 0x2000_0000;
@@ -157,10 +158,21 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
     core.read_8(address, &mut buf)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    Ok(format_memory_dump(address, &buf))
+}
+
+fn format_memory_dump(address: u64, bytes: &[u8]) -> String {
     // Format as hex dump: address | bytes (16 per line)
-    let mut out = format!("Memory read from 0x{:08X} ({} bytes):\n\n", address, length);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Memory read from 0x{:08X} ({} bytes):",
+        address,
+        bytes.len()
+    );
+    out.push('\n');
     const COLS: usize = 16;
-    for (i, chunk) in buf.chunks(COLS).enumerate() {
+    for (i, chunk) in bytes.chunks(COLS).enumerate() {
         let addr = address + (i * COLS) as u64;
         let hex: String = chunk
             .iter()
@@ -177,7 +189,50 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
                 }
             })
             .collect();
-        out.push_str(&format!("0x{:08X}  {:48}  {}\n", addr, hex, ascii));
+        let _ = writeln!(out, "0x{:08X}  {:48}  {}", addr, hex, ascii);
     }
-    Ok(out)
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_memory_dump;
+
+    #[allow(clippy::format_push_string)]
+    fn legacy_format_memory_dump(address: u64, bytes: &[u8]) -> String {
+        let mut out = format!(
+            "Memory read from 0x{:08X} ({} bytes):\n\n",
+            address,
+            bytes.len()
+        );
+        const COLS: usize = 16;
+        for (i, chunk) in bytes.chunks(COLS).enumerate() {
+            let addr = address + (i * COLS) as u64;
+            let hex: String = chunk
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            out.push_str(&format!("0x{:08X}  {:48}  {}\n", addr, hex, ascii));
+        }
+        out
+    }
+
+    #[test]
+    fn format_memory_dump_matches_legacy_output() {
+        let bytes: Vec<u8> = (0..37).collect();
+        let actual = format_memory_dump(0x2000_0000, &bytes);
+        let expected = legacy_format_memory_dump(0x2000_0000, &bytes);
+        assert_eq!(actual, expected);
+    }
 }
