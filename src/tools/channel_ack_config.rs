@@ -130,8 +130,10 @@ impl ChannelAckConfigTool {
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
-            None | Some("" | "direct") => Ok(AckReactionContextChatType::Direct),
+            None => Ok(AckReactionContextChatType::Direct),
+            Some("") => anyhow::bail!("'chat_type' cannot be empty. Use direct|group"),
             Some("group") => Ok(AckReactionContextChatType::Group),
+            Some("direct") => Ok(AckReactionContextChatType::Direct),
             Some(other) => anyhow::bail!("Invalid chat_type '{other}'. Use direct|group"),
         }
     }
@@ -889,5 +891,23 @@ mod tests {
             output["aggregate"]["source_counts"]["channel_pool"],
             json!(5)
         );
+    }
+
+    #[tokio::test]
+    async fn simulate_rejects_empty_chat_type() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ChannelAckConfigTool::new(test_config(&tmp).await, test_security());
+
+        let err = tool
+            .execute(json!({
+                "action": "simulate",
+                "channel": "telegram",
+                "text": "hello world",
+                "chat_type": ""
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("'chat_type' cannot be empty"));
     }
 }
