@@ -148,6 +148,10 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Multi-workspace routing and registry settings (`[workspaces]`).
+    #[serde(default)]
+    pub workspaces: WorkspacesConfig,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -296,6 +300,50 @@ pub struct ProviderConfig {
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]
     pub reasoning_level: Option<String>,
+}
+
+/// Multi-workspace registry configuration (`[workspaces]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspacesConfig {
+    /// Enables in-process workspace registry behavior.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional workspace registry root override.
+    /// If omitted, defaults to `<config_dir>/workspaces`.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+impl WorkspacesConfig {
+    /// Resolve the workspace registry root from config and runtime context.
+    pub fn resolve_root(&self, config_dir: &Path) -> PathBuf {
+        match self
+            .root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => {
+                let expanded = shellexpand::tilde(value).into_owned();
+                let path = PathBuf::from(expanded);
+                if path.is_absolute() {
+                    path
+                } else {
+                    config_dir.join(path)
+                }
+            }
+            None => config_dir.join("workspaces"),
+        }
+    }
+}
+
+impl Default for WorkspacesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: None,
+        }
+    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -4677,6 +4725,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            workspaces: WorkspacesConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -6994,6 +7043,7 @@ default_temperature = 0.7
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            workspaces: WorkspacesConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -7400,6 +7450,7 @@ tool_dispatcher = "xml"
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            workspaces: WorkspacesConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -10443,5 +10494,31 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         config
             .validate()
             .expect("disabled coordination should allow empty lead agent");
+    }
+
+    #[test]
+    async fn workspaces_config_defaults_disabled() {
+        let config = Config::default();
+        assert!(!config.workspaces.enabled);
+        assert!(config.workspaces.root.is_none());
+    }
+
+    #[test]
+    async fn workspaces_config_resolve_root_default_and_relative_override() {
+        let config_dir = std::path::PathBuf::from("/tmp/zeroclaw-config-root");
+        let default_cfg = WorkspacesConfig::default();
+        assert_eq!(
+            default_cfg.resolve_root(&config_dir),
+            config_dir.join("workspaces")
+        );
+
+        let relative_cfg = WorkspacesConfig {
+            enabled: true,
+            root: Some("profiles".into()),
+        };
+        assert_eq!(
+            relative_cfg.resolve_root(&config_dir),
+            config_dir.join("profiles")
+        );
     }
 }
