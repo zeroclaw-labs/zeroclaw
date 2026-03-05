@@ -1,16 +1,8 @@
 name: CI/CD Change Audit
 
+# Moved off PR path per CI/CD optimization PRD.
+# Audit trail runs on push-to-main/dev only.
 on:
-    pull_request:
-        branches: [dev, main]
-        paths:
-            - ".github/workflows/**"
-            - ".github/release/**"
-            - ".github/codeql/**"
-            - "scripts/ci/**"
-            - ".github/dependabot.yml"
-            - "deny.toml"
-            - ".gitleaks.toml"
     push:
         branches: [dev, main]
         paths:
@@ -35,7 +27,7 @@ on:
                 type: boolean
 
 concurrency:
-    group: ci-change-audit-${{ github.event.pull_request.number || github.sha || github.run_id }}
+    group: ci-change-audit-${{ github.sha || github.run_id }}
     cancel-in-progress: true
 
 permissions:
