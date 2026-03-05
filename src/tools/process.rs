@@ -83,14 +83,26 @@ impl ProcessTool {
 
         // Check concurrent running process count.
         {
-            let processes = self.processes.read().unwrap();
+            let processes =
+                recover_rwlock_read(&self.processes, "process registry read during spawn");
             let running = processes
                 .values()
-                .filter(|e| {
-                    e.child
-                        .lock()
-                        .map(|mut c| matches!(c.try_wait(), Ok(None)))
-                        .unwrap_or(false)
+                .filter(|entry| {
+                    let mut child = recover_mutex_lock(
+                        &entry.child,
+                        "process child state during spawn running-count",
+                    );
+                    match child.try_wait() {
+                        Ok(None) => true,
+                        Ok(Some(_)) => false,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Failed to query child status during spawn limit check; treating as running"
+                            );
+                            true
+                        }
+                    }
                 })
                 .count();
             if running >= MAX_PROCESSES {
@@ -193,7 +205,7 @@ impl ProcessTool {
         }
 
         let id = {
-            let mut next = self.next_id.lock().unwrap();
+            let mut next = recover_mutex_lock(&self.next_id, "next process id allocation");
             let id = *next;
             *next += 1;
             id
@@ -210,7 +222,7 @@ impl ProcessTool {
             analyzed_offsets: Mutex::new((0, 0)),
         };
 
-        self.processes.write().unwrap().insert(id, entry);
+        recover_rwlock_write(&self.processes, "process registry insert").insert(id, entry);
 
         Ok(ToolResult {
             success: true,
@@ -236,19 +248,19 @@ impl ProcessTool {
             });
         }
 
-        let processes = self.processes.read().unwrap();
+        let processes = recover_rwlock_read(&self.processes, "process registry list");
         let mut entries = Vec::new();
 
         for entry in processes.values() {
-            let status = match entry.child.lock() {
-                Ok(mut child) => match child.try_wait() {
+            let status = {
+                let mut child = recover_mutex_lock(&entry.child, "process child state during list");
+                match child.try_wait() {
                     Ok(Some(status)) => {
                         format!("exited ({})", status.code().unwrap_or(-1))
                     }
                     Ok(None) => "running".to_string(),
                     Err(e) => format!("error: {e}"),
-                },
-                Err(_) => "unknown".to_string(),
+                }
             };
 
             entries.push(json!({
@@ -260,11 +272,18 @@ impl ProcessTool {
             }));
         }
 
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&entries).unwrap_or_default(),
-            error: None,
-        })
+        match serde_json::to_string_pretty(&entries) {
+            Ok(output) => Ok(ToolResult {
+                success: true,
+                output,
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to serialize process list: {e}")),
+            }),
+        }
     }
 
     fn handle_output(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -281,7 +300,7 @@ impl ProcessTool {
 
         let id = parse_id(args, "output")?;
 
-        let processes = self.processes.read().unwrap();
+        let processes = recover_rwlock_read(&self.processes, "process registry output lookup");
         let entry = match processes.get(&id) {
             Some(e) => e,
             None => {
@@ -299,7 +318,7 @@ impl ProcessTool {
         let stderr = stderr_snapshot.data;
 
         if let Some(detector) = &self.syscall_detector {
-            let mut offsets = entry.analyzed_offsets.lock().unwrap();
+            let mut offsets = recover_mutex_lock(&entry.analyzed_offsets, "process output offsets");
             let stdout_delta = slice_unseen_output(
                 &stdout,
                 stdout_snapshot.dropped_prefix_bytes,
@@ -347,7 +366,7 @@ impl ProcessTool {
         let id = parse_id(args, "kill")?;
 
         let pid = {
-            let processes = self.processes.read().unwrap();
+            let processes = recover_rwlock_read(&self.processes, "process registry kill lookup");
             match processes.get(&id) {
                 Some(entry) => entry.pid,
                 None => {
@@ -396,9 +415,51 @@ fn parse_id(args: &serde_json::Value, action: &str) -> anyhow::Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for {action} action"))
 }
 
+fn recover_mutex_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    context: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(context = context, "Poisoned mutex lock recovered");
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn recover_rwlock_read<'a, T>(
+    lock: &'a RwLock<T>,
+    context: &'static str,
+) -> std::sync::RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(context = context, "Poisoned RwLock read recovered");
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn recover_rwlock_write<'a, T>(
+    lock: &'a RwLock<T>,
+    context: &'static str,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(context = context, "Poisoned RwLock write recovered");
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Append data to a bounded buffer, draining oldest bytes when over limit.
 fn append_bounded(buf: &Mutex<OutputBuffer>, new_data: &str) {
-    let mut guard = buf.lock().unwrap();
+    let mut guard = recover_mutex_lock(buf, "output buffer append");
     guard.data.push_str(new_data);
     if guard.data.len() > MAX_OUTPUT_BYTES {
         let excess = guard.data.len() - MAX_OUTPUT_BYTES;
@@ -434,7 +495,7 @@ fn spawn_reader_task<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 }
 
 fn snapshot_output_buffer(buf: &Mutex<OutputBuffer>) -> OutputBuffer {
-    buf.lock().unwrap().clone()
+    recover_mutex_lock(buf, "output buffer snapshot").clone()
 }
 
 fn slice_unseen_output<'a>(
@@ -520,12 +581,10 @@ impl Tool for ProcessTool {
 
 impl Drop for ProcessTool {
     fn drop(&mut self) {
-        if let Ok(processes) = self.processes.read() {
-            for entry in processes.values() {
-                if let Ok(mut child) = entry.child.lock() {
-                    let _ = child.start_kill();
-                }
-            }
+        let processes = recover_rwlock_read(&self.processes, "process registry drop cleanup");
+        for entry in processes.values() {
+            let mut child = recover_mutex_lock(&entry.child, "process child lock during drop");
+            let _ = child.start_kill();
         }
     }
 }
@@ -536,6 +595,7 @@ mod tests {
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::NativeRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use std::panic::AssertUnwindSafe;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -831,6 +891,166 @@ mod tests {
         let guard = buf.lock().unwrap();
         assert!(guard.data.len() <= MAX_OUTPUT_BYTES);
         assert!(guard.dropped_prefix_bytes >= 100);
+    }
+
+    #[test]
+    fn append_bounded_recovers_from_poisoned_lock() {
+        let buf = Mutex::new(OutputBuffer::default());
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = buf.lock().expect("buffer lock should be available");
+            panic!("poison output buffer mutex");
+        }));
+
+        append_bounded(&buf, "hello");
+        assert!(
+            buf.lock().is_ok(),
+            "output buffer mutex poison should be cleared"
+        );
+        let guard = buf
+            .lock()
+            .expect("output buffer lock should be available after recovery");
+        assert!(guard.data.contains("hello"));
+    }
+
+    #[test]
+    fn snapshot_output_buffer_recovers_from_poisoned_lock() {
+        let buf = Mutex::new(OutputBuffer {
+            data: "seed".to_string(),
+            dropped_prefix_bytes: 0,
+        });
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = buf.lock().expect("buffer lock should be available");
+            panic!("poison output buffer mutex");
+        }));
+
+        let snapshot = snapshot_output_buffer(&buf);
+        assert!(
+            buf.lock().is_ok(),
+            "output buffer mutex poison should be cleared"
+        );
+        assert_eq!(snapshot.data, "seed");
+    }
+
+    #[tokio::test]
+    async fn spawn_recovers_from_poisoned_next_id_lock() {
+        let tool = make_tool();
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = tool
+                .next_id
+                .lock()
+                .expect("next_id lock should be available");
+            panic!("poison next_id mutex");
+        }));
+
+        let result = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo recovered_spawn"
+            }))
+            .await
+            .expect("spawn should return ToolResult instead of panicking");
+
+        assert!(result.success, "spawn should recover: {:?}", result.error);
+        assert!(
+            tool.next_id.lock().is_ok(),
+            "next_id mutex poison should be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recovers_from_poisoned_processes_lock() {
+        let tool = make_tool();
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = tool
+                .processes
+                .write()
+                .expect("processes lock should be available");
+            panic!("poison processes lock");
+        }));
+
+        let result = tool
+            .execute(json!({"action": "list"}))
+            .await
+            .expect("list should return ToolResult instead of panicking");
+
+        assert!(result.success, "list should recover: {:?}", result.error);
+        assert!(
+            tool.processes.read().is_ok(),
+            "processes lock poison should be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_recovers_from_poisoned_offsets_lock() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+        let tool = ProcessTool::new_with_syscall_detector(
+            test_security(),
+            test_runtime(),
+            Some(test_syscall_detector(&tmp)),
+        );
+        let spawn_result = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo poison_offsets"
+            }))
+            .await
+            .expect("spawn should return result");
+        assert!(spawn_result.success);
+
+        let spawn_output: serde_json::Value =
+            serde_json::from_str(&spawn_result.output).expect("spawn output should be json");
+        let id = spawn_output["id"]
+            .as_u64()
+            .expect("process id should exist in spawn output");
+        let id = usize::try_from(id).expect("process id should fit in usize");
+
+        {
+            let processes = tool
+                .processes
+                .read()
+                .expect("processes lock should be available");
+            let entry = processes.get(&id).expect("spawned entry should exist");
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _guard = entry
+                    .analyzed_offsets
+                    .lock()
+                    .expect("offsets lock should be available");
+                panic!("poison analyzed_offsets lock");
+            }));
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut result = tool
+            .execute(json!({"action": "output", "id": id}))
+            .await
+            .expect("output should return ToolResult instead of panicking");
+        while result.success
+            && !result.output.contains("poison_offsets")
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            result = tool
+                .execute(json!({"action": "output", "id": id}))
+                .await
+                .expect("output should return ToolResult instead of panicking");
+        }
+        assert!(result.success, "output should recover: {:?}", result.error);
+        assert!(
+            result.output.contains("poison_offsets"),
+            "timed out waiting for captured output: {:?}",
+            result.error
+        );
+        let processes = tool
+            .processes
+            .read()
+            .expect("processes lock should be available after recovery");
+        let entry = processes
+            .get(&id)
+            .expect("spawned entry should still exist for poison assertion");
+        assert!(
+            entry.analyzed_offsets.lock().is_ok(),
+            "analyzed_offsets mutex poison should be cleared"
+        );
     }
 
     #[test]
