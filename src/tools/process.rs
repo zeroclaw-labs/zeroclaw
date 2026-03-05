@@ -373,10 +373,41 @@ impl ProcessTool {
             });
         };
 
-        let pid = entry.pid;
-        let mut child = match entry.child.into_inner() {
+        let ProcessEntry {
+            command,
+            pid,
+            started_at,
+            child,
+            stdout_buf,
+            stderr_buf,
+            analyzed_offsets,
+            ..
+        } = entry;
+
+        let mut child = match child.into_inner() {
             Ok(child) => child,
             Err(poisoned) => poisoned.into_inner(),
+        };
+        let analyzed_offsets = match analyzed_offsets.into_inner() {
+            Ok(offsets) => offsets,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let restore_entry = |child: tokio::process::Child| {
+            let mut processes = self.processes.write().unwrap();
+            processes.insert(
+                id,
+                ProcessEntry {
+                    id,
+                    command: command.clone(),
+                    pid,
+                    started_at,
+                    child: Mutex::new(child),
+                    stdout_buf: Arc::clone(&stdout_buf),
+                    stderr_buf: Arc::clone(&stderr_buf),
+                    analyzed_offsets: Mutex::new(analyzed_offsets),
+                },
+            );
         };
 
         if let Ok(Some(status)) = child.try_wait() {
@@ -391,6 +422,7 @@ impl ProcessTool {
         }
 
         if let Err(e) = child.start_kill() {
+            restore_entry(child);
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -409,18 +441,26 @@ impl ProcessTool {
                 ),
                 error: None,
             }),
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed waiting for process {id} (pid {pid}) to exit: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Timed out waiting for process {id} (pid {pid}) to exit after termination signal"
-                )),
-            }),
+            Ok(Err(e)) => {
+                restore_entry(child);
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Failed waiting for process {id} (pid {pid}) to exit: {e}"
+                    )),
+                })
+            }
+            Err(_) => {
+                restore_entry(child);
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Timed out waiting for process {id} (pid {pid}) to exit after termination signal"
+                    )),
+                })
+            }
         }
     }
 
