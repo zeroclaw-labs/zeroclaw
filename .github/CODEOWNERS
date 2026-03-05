@@ -1,32 +1,32 @@
 # Default owner for all files
-* @theonlyhennygod @chumyin
+* @theonlyhennygod @JordanTheJet @chumyin
 
 # Important functional modules
-/src/agent/** @theonlyhennygod
-/src/providers/** @theonlyhennygod
-/src/channels/** @theonlyhennygod
-/src/tools/** @theonlyhennygod
-/src/gateway/** @theonlyhennygod
-/src/runtime/** @theonlyhennygod
-/src/memory/** @theonlyhennygod @chumyin
-/Cargo.toml @theonlyhennygod
-/Cargo.lock @theonlyhennygod
+/src/agent/** @theonlyhennygod @JordanTheJet @chumyin
+/src/providers/** @theonlyhennygod @JordanTheJet @chumyin
+/src/channels/** @theonlyhennygod @JordanTheJet @chumyin
+/src/tools/** @theonlyhennygod @JordanTheJet @chumyin
+/src/gateway/** @theonlyhennygod @JordanTheJet @chumyin
+/src/runtime/** @theonlyhennygod @JordanTheJet @chumyin
+/src/memory/** @theonlyhennygod @JordanTheJet @chumyin
+/Cargo.toml @theonlyhennygod @JordanTheJet @chumyin
+/Cargo.lock @theonlyhennygod @JordanTheJet @chumyin
 
 # Security / tests / CI-CD ownership
-/src/security/** @chumyin
-/tests/** @chumyin
-/.github/** @chumyin
-/.github/workflows/** @chumyin
-/.github/codeql/** @chumyin
-/.github/dependabot.yml @chumyin
-/SECURITY.md @chumyin
-/docs/actions-source-policy.md @chumyin
-/docs/ci-map.md @chumyin
+/src/security/** @theonlyhennygod @JordanTheJet @chumyin
+/tests/** @theonlyhennygod @JordanTheJet @chumyin
+/.github/** @theonlyhennygod @JordanTheJet @chumyin
+/.github/workflows/** @theonlyhennygod @JordanTheJet @chumyin
+/.github/codeql/** @theonlyhennygod @JordanTheJet @chumyin
+/.github/dependabot.yml @theonlyhennygod @JordanTheJet @chumyin
+/SECURITY.md @theonlyhennygod @JordanTheJet @chumyin
+/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @chumyin
+/docs/ci-map.md @theonlyhennygod @JordanTheJet @chumyin
 
 # Docs & governance
-/docs/** @chumyin
-/AGENTS.md @chumyin
-/CLAUDE.md @chumyin
-/CONTRIBUTING.md @chumyin
-/docs/pr-workflow.md @chumyin
-/docs/reviewer-playbook.md @chumyin
+/docs/** @theonlyhennygod @JordanTheJet @chumyin
+/AGENTS.md @theonlyhennygod @JordanTheJet @chumyin
+/CLAUDE.md @theonlyhennygod @JordanTheJet @chumyin
+/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @chumyin
+/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @chumyin
+/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @chumyin

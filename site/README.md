@@ -2,6 +2,8 @@
 
 This is the standalone frontend for GitHub Pages.
 
+Languages: **English** | [Español](README.es.md) | [Português](README.pt.md) | [Italiano](README.it.md)
+
 ## Commands
 
 ```bash
@@ -43,7 +45,8 @@ Notes:
   - `Auto` / `Dark` / `Light`
   - preference persisted in `localStorage`
 - i18n is enabled:
-  - UI supports `English` and `简体中文`
+  - UI currently supports `English` and `简体中文`
+  - Additional README translations are available in `Español`, `Português`, and `Italiano`
   - language preference persisted in `localStorage`
   - URL language parameter (`?lang=en` / `?lang=zh`) is synchronized for shareable links
 - Responsive system is deepened:

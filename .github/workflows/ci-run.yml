@@ -50,7 +50,7 @@ jobs:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 75
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
@@ -90,7 +90,7 @@ jobs:
         name: Workspace Check
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -111,7 +111,7 @@ jobs:
         name: Package Check (${{ matrix.package }})
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 25
         strategy:
             fail-fast: false
@@ -136,7 +136,7 @@ jobs:
         name: Test
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 120
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
@@ -229,7 +229,7 @@ jobs:
         name: Build (Smoke)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 90
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo

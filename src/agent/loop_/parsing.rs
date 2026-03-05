@@ -1196,6 +1196,49 @@ pub(super) fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     None
 }
 
+/// Parse shorthand tag body format `tool_name{...}` used by some models
+/// inside `<tool_call>...</tool_call>` wrappers.
+///
+/// Example:
+/// `<tool_call>shell{"command":"ls -la"}</tool_call>`
+fn parse_shorthand_tag_call(body: &str) -> Option<ParsedToolCall> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let open_brace = body.find('{')?;
+    let close_brace = body.rfind('}')?;
+    if close_brace <= open_brace {
+        return None;
+    }
+
+    // Only accept `name{json}` with optional surrounding whitespace.
+    if !body[close_brace + 1..].trim().is_empty() {
+        return None;
+    }
+
+    let raw_name = body[..open_brace].trim().trim_end_matches(':').trim();
+    if raw_name.is_empty()
+        || !raw_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+
+    let args = serde_json::from_str::<serde_json::Value>(&body[open_brace..=close_brace]).ok()?;
+    if !args.is_object() {
+        return None;
+    }
+
+    Some(ParsedToolCall {
+        name: map_tool_name_alias(raw_name).to_string(),
+        arguments: args,
+        tool_call_id: None,
+    })
+}
+
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
 // LLM responses may contain tool calls in multiple formats depending on
 // the provider. Parsing follows a priority chain:
@@ -1289,8 +1332,19 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
             }
 
             if !parsed_any {
+                if let Some(call) = parse_shorthand_tag_call(inner) {
+                    tracing::debug!(
+                        tool = %call.name,
+                        "parsed shorthand tool call body inside <tool_call>"
+                    );
+                    calls.push(call);
+                    parsed_any = true;
+                }
+            }
+
+            if !parsed_any {
                 tracing::warn!(
-                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
+                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM/shorthand)"
                 );
             }
 
@@ -1326,6 +1380,13 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
                 if !parsed_any {
                     if let Some(glm_call) = parse_glm_shortened_body(inner) {
                         calls.push(glm_call);
+                        parsed_any = true;
+                    }
+                }
+
+                if !parsed_any {
+                    if let Some(call) = parse_shorthand_tag_call(inner) {
+                        calls.push(call);
                         parsed_any = true;
                     }
                 }
@@ -1719,4 +1780,25 @@ pub(super) fn parse_structured_tool_calls(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tool_calls;
+
+    #[test]
+    fn parse_tool_calls_accepts_shorthand_object_in_tag_body() {
+        let response = r#"<tool_call>shell{"command":"echo hi"}</tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "echo hi");
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_non_object_shorthand_payload() {
+        let response = r#"<tool_call>shell["echo hi"]</tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+    }
 }

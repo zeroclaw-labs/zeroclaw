@@ -368,10 +368,43 @@ main {
 }
 
 .metric-card {
+  --spotlight-opacity: 0;
+  --spotlight-x: 50%;
+  --spotlight-y: 24%;
+  position: relative;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--radius-m);
   background: color-mix(in srgb, var(--bg-soft) 84%, transparent);
   padding: 0.72rem 0.76rem;
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.metric-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--spotlight-opacity);
+  background: radial-gradient(
+    190px circle at var(--spotlight-x) var(--spotlight-y),
+    color-mix(in srgb, var(--accent) 26%, transparent) 0%,
+    color-mix(in srgb, var(--accent-soft) 54%, transparent) 34%,
+    transparent 72%
+  );
+  transition: opacity 180ms ease;
+}
+
+.metric-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.metric-card:hover,
+.metric-card:focus-within {
+  --spotlight-opacity: 1;
+  border-color: var(--line-strong);
+  box-shadow: 0 12px 28px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .metric-label {
@@ -409,10 +442,43 @@ main {
 }
 
 .principle-card {
+  --spotlight-opacity: 0;
+  --spotlight-x: 50%;
+  --spotlight-y: 24%;
+  position: relative;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--radius-m);
   background: color-mix(in srgb, var(--bg-soft) 75%, transparent);
   padding: 0.72rem;
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.principle-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--spotlight-opacity);
+  background: radial-gradient(
+    190px circle at var(--spotlight-x) var(--spotlight-y),
+    color-mix(in srgb, var(--accent) 24%, transparent) 0%,
+    color-mix(in srgb, var(--accent-soft) 50%, transparent) 36%,
+    transparent 74%
+  );
+  transition: opacity 180ms ease;
+}
+
+.principle-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.principle-card:hover,
+.principle-card:focus-within {
+  --spotlight-opacity: 1;
+  border-color: var(--line-strong);
+  box-shadow: 0 12px 28px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 .principle-card h3 {
@@ -498,6 +564,11 @@ main {
 }
 
 .pathway-card {
+  --spotlight-opacity: 0;
+  --spotlight-x: 50%;
+  --spotlight-y: 24%;
+  position: relative;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: color-mix(in srgb, var(--bg-elevated) 88%, transparent);
@@ -506,17 +577,41 @@ main {
   display: grid;
   gap: 0.24rem;
   padding: 0.56rem 0.62rem;
-  transition: border-color 150ms ease, background-color 150ms ease;
+  transition: border-color 150ms ease, background-color 150ms ease, box-shadow 180ms ease;
+}
+
+.pathway-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--spotlight-opacity);
+  background: radial-gradient(
+    180px circle at var(--spotlight-x) var(--spotlight-y),
+    color-mix(in srgb, var(--accent) 20%, transparent) 0%,
+    color-mix(in srgb, var(--accent-soft) 44%, transparent) 35%,
+    transparent 72%
+  );
+  transition: opacity 150ms ease;
+}
+
+.pathway-card > * {
+  position: relative;
+  z-index: 1;
 }
 
 .pathway-card:hover {
+  --spotlight-opacity: 1;
   border-color: var(--line-strong);
   background: color-mix(in srgb, var(--accent-soft) 54%, transparent);
+  box-shadow: 0 10px 22px color-mix(in srgb, var(--accent) 14%, transparent);
 }
 
 .pathway-card.active {
+  --spotlight-opacity: 1;
   border-color: var(--line-strong);
   background: color-mix(in srgb, var(--accent-soft) 72%, transparent);
+  box-shadow: 0 10px 22px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 .pathway-title {
@@ -651,6 +746,42 @@ main {
   border: 1px solid var(--line);
   border-radius: var(--radius-l);
   background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+}
+
+.reader-side .side-card {
+  --spotlight-opacity: 0;
+  --spotlight-x: 50%;
+  --spotlight-y: 24%;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.reader-side .side-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--spotlight-opacity);
+  background: radial-gradient(
+    190px circle at var(--spotlight-x) var(--spotlight-y),
+    color-mix(in srgb, var(--accent) 22%, transparent) 0%,
+    color-mix(in srgb, var(--accent-soft) 48%, transparent) 35%,
+    transparent 72%
+  );
+  transition: opacity 180ms ease;
+}
+
+.reader-side .side-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.reader-side .side-card:hover,
+.reader-side .side-card:focus-within {
+  --spotlight-opacity: 1;
+  border-color: var(--line-strong);
+  box-shadow: 0 10px 22px color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 .doc-list {
@@ -1315,7 +1446,13 @@ main {
 
   .controls {
     width: 100%;
-    justify-content: space-between;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 0.42rem;
+  }
+
+  .palette-trigger {
+    margin-left: auto;
   }
 }
 
@@ -1326,6 +1463,12 @@ main {
 
   main {
     padding-top: 1rem;
+  }
+
+  .segmented button {
+    padding: 0.24rem 0.46rem;
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
   }
 
   .hero-inner,

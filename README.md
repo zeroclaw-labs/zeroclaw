@@ -136,6 +136,23 @@ Use repository docs as the source of truth for install/setup instructions:
 
 Issue comments can provide context, but they are not canonical installation documentation.
 
+### Migrate from OpenClaw
+
+Already running OpenClaw? One command:
+
+```bash
+# Migrate everything - agents, memory, and configs
+zeroclaw migrate openclaw
+
+# Migrate from a specific OpenClaw path
+zeroclaw migrate openclaw --source ~/.openclaw/workspace --source-config ~/.openclaw/openclaw.json
+
+# Dry run first to see what would change
+zeroclaw migrate openclaw --dry-run
+```
+
+The migration engine imports your agents, memory entries, and configuration with merge-first semantics that preserve existing ZeroClaw data. ZeroClaw reads `SKILL.md` natively and is compatible with the ClawHub marketplace.
+
 ## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
 
 Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.

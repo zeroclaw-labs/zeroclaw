@@ -2,7 +2,7 @@
 
 Dựa trên CLI hiện tại (`zeroclaw --help`).
 
-Xác minh lần cuối: **2026-02-28**.
+Xác minh lần cuối: **2026-03-04**.
 
 ## Lệnh cấp cao nhất
 
@@ -15,6 +15,7 @@ Xác minh lần cuối: **2026-02-28**.
 | `service` | Quản lý vòng đời dịch vụ cấp hệ điều hành |
 | `doctor` | Chạy chẩn đoán và kiểm tra trạng thái |
 | `status` | Hiển thị cấu hình và tóm tắt hệ thống |
+| `security` | Chạy tác vụ bảo trì bảo mật (cập nhật corpus semantic guard) |
 | `cron` | Quản lý tác vụ định kỳ |
 | `models` | Làm mới danh mục model của provider |
 | `providers` | Liệt kê ID provider, bí danh và provider đang dùng |
@@ -61,6 +62,19 @@ Xác minh lần cuối: **2026-02-28**.
 - `zeroclaw service restart`
 - `zeroclaw service status`
 - `zeroclaw service uninstall`
+
+### `security`
+
+- `zeroclaw security update-guard-corpus`
+- `zeroclaw security update-guard-corpus --source builtin`
+- `zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl`
+- `zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>`
+
+Ghi chú:
+
+- `update-guard-corpus` sẽ upsert bản ghi corpus vào collection `security.semantic_guard_collection`.
+- `--source` chấp nhận `builtin`, đường dẫn file cục bộ, hoặc URL `http(s)`.
+- `--checksum` dùng để xác thực SHA-256 trước khi import.
 
 ### `cron`
 

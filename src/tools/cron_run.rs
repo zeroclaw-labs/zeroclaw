@@ -117,7 +117,7 @@ impl Tool for CronRunTool {
 
         let started_at = Utc::now();
         let (success, output) =
-            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
+            cron::scheduler::execute_job_now_with_approval(&self.config, &job, approved).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         let status = if success { "ok" } else { "error" };
@@ -212,10 +212,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let job = cron::add_job(&config, "*/5 * * * *", "echo run-now").unwrap();
+        config.autonomy.level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
@@ -234,8 +234,18 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "touch cron-run-approval",
+            true,
+        )
+        .unwrap();
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-approval").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
