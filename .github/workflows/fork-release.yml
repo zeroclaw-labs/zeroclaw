@@ -1,0 +1,137 @@
+name: Fork Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.8-1clawx.2)"
+        required: true
+        type: string
+      ref:
+        description: "Branch or commit to build from (default: main)"
+        required: false
+        default: "main"
+        type: string
+      draft:
+        description: "Create as draft release"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.92.0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Install cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Build
+        env:
+          USE_CROSS: ${{ matrix.cross }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$USE_CROSS" = "true" ]; then
+            cross build --profile release-fast --locked --target "$TARGET"
+          else
+            cargo build --profile release-fast --locked --target "$TARGET"
+          fi
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          cd "target/${TARGET}/release-fast"
+          tar czf "../../../zeroclaw-${TARGET}.${EXT}" "$ARTIFACT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Create tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git tag "$TAG" || echo "Tag $TAG already exists, using existing"
+          git push origin "$TAG" || echo "Tag $TAG already pushed"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -name '*.tar.gz' -exec mv {} . \;
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          draft: ${{ inputs.draft }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
