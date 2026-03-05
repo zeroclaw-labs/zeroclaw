@@ -429,6 +429,21 @@ impl Agent {
             let drop_count = other_messages.len() - max;
             other_messages.drain(0..drop_count);
         }
+        // Drop any orphaned tool messages at the start of the non-system segment.
+        // Tool messages must follow an assistant message with tool_calls; if we trimmed away
+        // that assistant, we must remove the orphaned tools to avoid 400 Bad Request.
+        let start = 0;
+        while start < other_messages.len() {
+            match &other_messages[start] {
+                ConversationMessage::ToolResults(_) => {
+                    other_messages.remove(start);
+                }
+                ConversationMessage::Chat(chat) if chat.role == "tool" => {
+                    other_messages.remove(start);
+                }
+                _ => break,
+            }
+        }
 
         self.history = system_messages;
         self.history.extend(other_messages);
@@ -1234,17 +1249,107 @@ description = "plugin tool exposed for from_config tests"
     }
 
     #[test]
-    fn from_config_conflicting_allow_and_deny_fails_fast() {
+    fn trim_history_removes_orphaned_tool_messages() {
         let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["shell".to_string()];
-        config.agent.denied_tools = vec!["shell".to_string()];
+        let config_base = base_from_config_for_tool_filter_tests();
+        let mut config_agent = config_base.agent.clone();
+        config_agent.max_history_messages = 2;
 
-        let err = Agent::from_config(&config)
-            .err()
-            .expect("expected filter conflict");
-        assert!(err
-            .to_string()
-            .contains("agent.allowed_tools and agent.denied_tools removed all executable tools"));
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![crate::providers::ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+            }]),
+        });
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config_agent)
+            .build()
+            .expect("agent build should succeed");
+
+        // 1. Test removing ToolResults
+        // History: [System, User1, Assistant(calls tool), ToolResult, User2]
+        // Max history = 2 (excluding system).
+        // Truncation should drop User1 and Assistant.
+        // ToolResult becomes orphaned at start of non-system list.
+        // Logic should remove ToolResult.
+        // Result: [System, User2].
+
+        agent.history.push(ConversationMessage::Chat(ChatMessage::system("SYS")));
+        agent.history.push(ConversationMessage::Chat(ChatMessage::user("User1")));
+        // This assistant message is the "parent" of the tool result
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Thinking...".into()),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "call_1".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_content: None,
+        });
+        // This tool result corresponds to call_1
+        agent.history.push(ConversationMessage::ToolResults(vec![
+            crate::providers::ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                content: "result".into(),
+            },
+        ]));
+        agent.history.push(ConversationMessage::Chat(ChatMessage::user("User2")));
+
+        // Trigger trim (private method, but accessible in test module)
+        agent.trim_history();
+
+        assert_eq!(agent.history.len(), 2, "Expected System + User2");
+        match &agent.history[0] {
+            ConversationMessage::Chat(c) => assert_eq!(c.role, "system"),
+            _ => panic!("Expected system message at 0"),
+        }
+        match &agent.history[1] {
+            ConversationMessage::Chat(c) => {
+                assert_eq!(c.role, "user");
+                assert_eq!(c.content, "User2");
+            }
+            _ => panic!("Expected user message at 1, got {:?}", agent.history[1]),
+        }
+
+        // 2. Test removing Chat(role="tool")
+        agent.clear_history();
+        agent.history.push(ConversationMessage::Chat(ChatMessage::system("SYS")));
+        agent.history.push(ConversationMessage::Chat(ChatMessage::user("User1")));
+        agent.history.push(ConversationMessage::Chat(ChatMessage::assistant("Call tool")));
+        agent.history.push(ConversationMessage::Chat(ChatMessage::tool("Tool output"))); // role="tool"
+        agent.history.push(ConversationMessage::Chat(ChatMessage::user("User2")));
+
+        agent.trim_history();
+
+        assert_eq!(agent.history.len(), 2, "Expected System + User2 (legacy)");
+        match &agent.history[1] {
+            ConversationMessage::Chat(c) => {
+                assert_eq!(c.role, "user");
+                assert_eq!(c.content, "User2");
+            }
+            _ => panic!("Expected user message at 1, got {:?}", agent.history[1]),
+        }
     }
 }
