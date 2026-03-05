@@ -421,6 +421,17 @@ jobs:
             - name: Skip Rust jobs for non-Rust change scope
               run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
 
+    no-linear-product-refs:
+        name: No-Linear Product Reference Guard
+        needs: [changes]
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Enforce no-Linear-product reference policy
+              shell: bash
+              run: ./scripts/ci/check_no_linear_product_refs.sh
+
     docs-quality:
         name: Docs Quality
         needs: [changes]
@@ -527,7 +538,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, workspace-check, package-check, test, restricted-hermetic, build, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
+        needs: [changes, lint, workspace-check, package-check, test, restricted-hermetic, build, cross-platform-vm, linux-distro-container, docker-smoke, docs-only, non-rust, no-linear-product-refs, docs-quality, lint-feedback, license-file-owner-guard]
         runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         steps:
             - name: Enforce required status
@@ -541,6 +552,7 @@ jobs:
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
+                  linear_guard_result="${{ needs.no-linear-product-refs.result }}"
                   license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
                   # --- Helper: enforce PR governance gates ---
@@ -563,9 +575,17 @@ jobs:
                     fi
                   }
 
+                  check_no_linear_refs_guard() {
+                    if [ "$linear_guard_result" != "success" ]; then
+                      echo "No-Linear-product reference guard did not pass."
+                      exit 1
+                    fi
+                  }
+
                   # --- Docs-only fast path ---
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     check_pr_governance
+                    check_no_linear_refs_guard
                     check_docs_quality
                     echo "Docs-only fast path passed."
                     exit 0
@@ -574,6 +594,7 @@ jobs:
                   # --- Non-rust fast path ---
                   if [ "$rust_changed" != "true" ]; then
                     check_pr_governance
+                    check_no_linear_refs_guard
                     check_docs_quality
                     echo "Non-rust fast path passed."
                     exit 0
@@ -600,9 +621,11 @@ jobs:
                   echo "linux-distro-container=${linux_distro_container_result}"
                   echo "docker-smoke=${docker_smoke_result}"
                   echo "docs=${docs_result}"
+                  echo "no-linear-product-refs=${linear_guard_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
                   check_pr_governance
+                  check_no_linear_refs_guard
 
                   if [ "$lint_result" != "success" ] || [ "$workspace_check_result" != "success" ] || [ "$package_check_result" != "success" ] || [ "$test_result" != "success" ] || [ "$restricted_hermetic_result" != "success" ] || [ "$build_result" != "success" ] || [ "$cross_platform_vm_result" != "success" ] || [ "$linux_distro_container_result" != "success" ] || [ "$docker_smoke_result" != "success" ]; then
                     echo "Required CI jobs did not pass: lint=${lint_result} workspace-check=${workspace_check_result} package-check=${package_check_result} test=${test_result} restricted-hermetic=${restricted_hermetic_result} build=${build_result} cross-platform-vm=${cross_platform_vm_result} linux-distro-container=${linux_distro_container_result} docker-smoke=${docker_smoke_result}"

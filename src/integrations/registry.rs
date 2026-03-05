@@ -542,12 +542,6 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::Productivity,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
-        IntegrationEntry {
-            name: "Linear",
-            description: "Issue tracking",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
         // ── Music & Audio ───────────────────────────────────────
         IntegrationEntry {
             name: "Spotify",
