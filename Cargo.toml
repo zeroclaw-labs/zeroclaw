@@ -21,7 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 
 # Async runtime - feature-optimized for size
-tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
 tokio-util = { version = "0.7", default-features = false }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
@@ -63,7 +63,7 @@ fast_html2md = { version = "0.0.58", optional = true }
 nanohtml2text = { version = "0.2", optional = true }
 
 # Optional Rust-native browser automation backend
-fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 
 # Optional in-process WASM runtime for sandboxed tool execution
 wasmi = { version = "1.0.9", optional = true, default-features = true }
@@ -73,7 +73,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # UUID generation
-uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 # Authenticated encryption (AEAD) for secret store
 chacha20poly1305 = "0.10"
