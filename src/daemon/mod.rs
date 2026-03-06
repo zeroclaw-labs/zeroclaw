@@ -203,6 +203,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Some(prompt),
                 None,
                 None,
+                None,
                 temp,
                 vec![],
                 false,

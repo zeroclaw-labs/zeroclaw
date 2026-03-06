@@ -179,6 +179,11 @@ Examples:
         #[arg(short, long)]
         message: Option<String>,
 
+        /// Session ID for -m mode: loads this session's history and saves messages into it.
+        /// Enables stateful multi-call workflows: zeroclaw agent -m "..." --session-id my-task
+        #[arg(long)]
+        session_id: Option<String>,
+
         /// Provider to use (openrouter, anthropic, openai, openai-codex)
         #[arg(short, long)]
         provider: Option<String>,
@@ -771,21 +776,49 @@ async fn main() -> Result<()> {
 
         Commands::Agent {
             message,
+            session_id,
             provider,
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+            autonomy_level,
+            max_actions_per_hour,
+            max_tool_iterations,
+            max_history_messages,
+            compact_context,
+            memory_backend,
+        } => {
+            if let Some(level) = autonomy_level {
+                config.autonomy.level = level;
+            }
+            if let Some(n) = max_actions_per_hour {
+                config.autonomy.max_actions_per_hour = n;
+            }
+            if let Some(n) = max_tool_iterations {
+                config.agent.max_tool_iterations = n;
+            }
+            if let Some(n) = max_history_messages {
+                config.agent.max_history_messages = n;
+            }
+            if compact_context {
+                config.agent.compact_context = true;
+            }
+            if let Some(ref backend) = memory_backend {
+                config.memory.backend = backend.clone();
+            }
+            Box::pin(agent::run(
+                config,
+                message,
+                session_id,
+                provider,
+                model,
+                temperature,
+                peripheral,
+                true,
+            ))
+            .await
+            .map(|_| ())
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);

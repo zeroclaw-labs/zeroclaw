@@ -271,6 +271,42 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
     context
 }
 
+/// Load recent conversation entries for a session from memory in chronological order.
+/// Used in single-shot (`-m`) mode with `--session-id` to provide history context
+/// across invocations of the same named session.
+/// Filters to user-message autosave entries only; skips assistant entries.
+async fn load_recent_conversation(
+    mem: &dyn Memory,
+    max_messages: usize,
+    session_id: &str,
+) -> String {
+    if max_messages == 0 {
+        return String::new();
+    }
+    let Ok(entries) = mem
+        .list(Some(&MemoryCategory::Conversation), Some(session_id))
+        .await
+    else {
+        return String::new();
+    };
+    // list() returns newest-first; filter to user_msg_* keys, take N, then reverse for chronological
+    let mut recent: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.key.starts_with("user_msg_"))
+        .take(max_messages)
+        .collect();
+    if recent.is_empty() {
+        return String::new();
+    }
+    recent.reverse();
+    let mut context = String::from("[Conversation history]\n");
+    for entry in &recent {
+        let _ = writeln!(context, "- [{}] {}", entry.timestamp, entry.content);
+    }
+    context.push('\n');
+    context
+}
+
 /// Build hardware datasheet context from RAG when peripherals are enabled.
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
@@ -2726,6 +2762,7 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 pub async fn run(
     config: Config,
     message: Option<String>,
+    session_id: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
@@ -2991,11 +3028,22 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
+        let sid = session_id.as_deref();
+
+        // When a session ID is provided, load that session's recent conversation history
+        // before auto-saving so the current message is not included.
+        // Respects max_history_messages from [agent] config.
+        let conv_history = if let Some(sid) = sid {
+            load_recent_conversation(mem.as_ref(), config.agent.max_history_messages, sid).await
+        } else {
+            String::new()
+        };
+
+        // Auto-save user message to memory, scoped to session when provided.
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
+                .store(&user_key, &msg, MemoryCategory::Conversation, sid)
                 .await;
         }
 
@@ -3007,7 +3055,7 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let context = format!("{conv_history}{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {msg}")
