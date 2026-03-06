@@ -333,6 +333,12 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
+Ghi chú:
+
+- Trả lời riêng tư mặc định dùng `POST /v1.0/robot/oToMessages/batchSend`.
+- Nếu DingTalk trả về `code = "chatbotId.notAllow.sendOTO"` và cùng cuộc chat đã có `sessionWebhook` trong cache, ZeroClaw sẽ tự động fallback và trả lời qua `sessionWebhook`.
+- Tin nhắn riêng tư chủ động (không có phiên chat đến trước đó) vẫn yêu cầu quyền OTO trên nền tảng DingTalk.
+
 ### 4.13 QQ
 
 ```toml
