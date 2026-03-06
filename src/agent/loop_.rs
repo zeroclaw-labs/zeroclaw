@@ -95,15 +95,22 @@ fn redaction_prefix(value: &str) -> String {
 pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
-            let full_match = &caps[0];
-            let val = caps
+            let full_match = caps.get(0).expect("full regex match must exist");
+            let value_match = caps
                 .get(3)
                 .or(caps.get(4))
                 .or(caps.get(5))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            let redacted_value = format!("{}*[REDACTED]", redaction_prefix(val));
-            full_match.replacen(val, &redacted_value, 1)
+                .expect("credential regex must capture a value");
+            let redacted_value = format!("{}*[REDACTED]", redaction_prefix(value_match.as_str()));
+            let matched = full_match.as_str();
+            let rel_start = value_match.start() - full_match.start();
+            let rel_end = value_match.end() - full_match.start();
+            format!(
+                "{}{}{}",
+                &matched[..rel_start],
+                redacted_value,
+                &matched[rel_end..]
+            )
         })
         .to_string()
 }
@@ -2550,6 +2557,16 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains(r#""api_key": "enc2:*[REDACTED]""#));
         assert!(!scrubbed.contains("api_key ="));
+    }
+
+    #[test]
+    fn test_scrub_credentials_replaces_only_value_span() {
+        let input = r#"password="password" credential=credential"#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains(r#"password="pass*[REDACTED]""#));
+        assert!(scrubbed.contains("credential=cred*[REDACTED]"));
+        assert!(!scrubbed.contains(r#"pass*[REDACTED]="password""#));
+        assert!(!scrubbed.contains("cred*[REDACTED]=credential"));
     }
 
     #[test]
