@@ -1025,23 +1025,23 @@ Skill installs are now gated by a built-in static security audit. `zeroclaw skil
 
 ```bash
 cargo build              # Dev build
-cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
-cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)
+cargo build --release    # Release build
 cargo test               # Run full test suite
-cargo clippy --locked --all-targets -- -D clippy::correctness
-cargo fmt                # Format
-
-# Run the SQLite vs Markdown benchmark
-cargo test --test memory_comparison -- --nocapture
 ```
 
-### Pre-push hook
+### CI / CD
 
-A git hook runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before every push. Enable it once:
+Three workflows power the entire pipeline:
 
-```bash
-git config core.hooksPath .githooks
-```
+| Workflow | Trigger | What it does |
+|----------|---------|--------------|
+| **CI** | Pull request to `main` | `cargo test` + `cargo build --release` |
+| **Beta Release** | Push (merge) to `main` | Builds multi-platform binaries, creates a GitHub prerelease tagged `vX.Y.Z-beta.<run>`, pushes Docker image to GHCR |
+| **Promote Release** | Manual `workflow_dispatch` | Validates version against `Cargo.toml`, builds release artifacts, creates a stable GitHub release, pushes Docker `:latest` |
+
+**Versioning:** Semantic versioning based on the `version` field in `Cargo.toml`. Every merge to `main` automatically produces a beta prerelease. To cut a stable release, bump `Cargo.toml`, merge, then trigger *Promote Release* with the matching version.
+
+**Release targets:** `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`.
 
 ### Build troubleshooting (Linux OpenSSL errors)
 
@@ -1054,12 +1054,6 @@ cargo install --path . --force --locked
 ```
 
 ZeroClaw is configured to use `rustls` for HTTP/TLS dependencies; `--locked` keeps the transitive graph deterministic on fresh environments.
-
-To skip the hook when you need a quick push during development:
-
-```bash
-git push --no-verify
-```
 
 ## Collaboration & Docs
 
@@ -1086,7 +1080,6 @@ Core collaboration references:
 - Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
 - PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)
 - Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
-- CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
 - Security disclosure policy: [SECURITY.md](SECURITY.md)
 
 For deployment and runtime operations:
