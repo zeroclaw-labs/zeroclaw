@@ -5821,6 +5821,58 @@ mod tests {
         assert_eq!(recorded[0].as_deref(), Some("boom"));
     }
 
+    /// Verify the loop stops early when a tool fails repeatedly.
+    ///
+    /// ScriptedProvider returns a failing_tool call on every iteration;
+    /// the global tool-error budget (MAX_TOTAL_TOOL_ERRORS) must fire
+    /// before max_iterations are exhausted.
+    #[tokio::test]
+    async fn consecutive_tool_failures_stop_the_loop() {
+        // Build 10 responses each calling failing_tool; loop should stop much earlier.
+        let tool_call_response = r#"<tool_call>
+{"name":"failing_tool","arguments":{}}
+</tool_call>"#;
+        let responses: Vec<&str> = vec![tool_call_response; 10];
+        let provider = ScriptedProvider::from_text_responses(responses);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool)];
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("zeroclaw test system"),
+            ChatMessage::user("trigger repeated failure".to_string()),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            10,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "loop must stop early on repeated tool failures, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("tool error") || err.contains("tool errors"),
+            "error must mention tool errors, got: {err}"
+        );
+    }
+
     #[test]
     fn merge_continuation_text_deduplicates_partial_overlap() {
         let merged = merge_continuation_text("The result is wor", "world.");
