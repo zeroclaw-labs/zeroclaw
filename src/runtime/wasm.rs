@@ -655,7 +655,11 @@ impl WasmRuntime {
         })?;
         let module_sha256 = self.check_module_integrity(module_name, &wasm_bytes)?;
 
-        // Configure engine with fuel metering
+        // Configure engine with fuel metering.
+        // TODO(runtime-wasm): enforce memory_limit_mb at instantiation time via MemoryType
+        // limits once wasmi exposes per-instance memory ceilings. Currently fuel metering
+        // is the primary execution bound; memory_limit_mb is validated at config load but
+        // not enforced during module execution. Track in: wasm memory enforcement.
         let mut engine_config = wasmi::Config::default();
         engine_config.consume_fuel(true);
         let engine = Engine::new(&engine_config);
