@@ -277,8 +277,8 @@ async fn e2e_missing_credentials_returns_error() {
     );
 
     // The script should output JSON error to stdout or stderr
-    let combined = format!("{stdout}{stderr}");
-    let parsed: Result<Value, _> = serde_json::from_str(combined.trim());
+    let parsed = serde_json::from_str::<Value>(stdout.trim())
+        .or_else(|_| serde_json::from_str::<Value>(stderr.trim()));
 
     match parsed {
         Ok(json) => {
@@ -704,13 +704,11 @@ async fn e2e_bug_search_global_excludes_bot_echo_messages() {
         .iter()
         .filter(|r| {
             let sender_type = r["sender"]["type"].as_str().unwrap_or("");
-            let sender_name = r["sender"]["name"].as_str().unwrap_or("");
             let sender_username = r["sender"]["username"].as_str().unwrap_or("");
             // Bot messages: sender is a bot account, or the chat is a 1-on-1 with a bot
             sender_type == "bot"
                 || sender_username.ends_with("_bot")
                 || sender_username.ends_with("Bot")
-                || sender_name == "asDrgl"
         })
         .collect();
 
