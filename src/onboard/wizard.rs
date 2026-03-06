@@ -1846,17 +1846,40 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 }
 
 fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
-    let Some(api_key) = api_key else {
+    fetch_gemini_models_inner(api_key, false)
+}
+
+fn fetch_gemini_models_bearer(bearer_token: &str) -> Result<Vec<String>> {
+    fetch_gemini_models_inner(Some(bearer_token), true)
+}
+
+fn fetch_gemini_models_inner(credential: Option<&str>, use_bearer: bool) -> Result<Vec<String>> {
+    let Some(credential) = credential else {
         bail!("Gemini model fetch requires API key");
     };
 
     let client = build_model_fetch_client()?;
-    let payload: Value = client
+    let mut req = client
         .get("https://generativelanguage.googleapis.com/v1beta/models")
-        .query(&[("key", api_key), ("pageSize", "200")])
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .context("model fetch failed: GET Gemini models")?
+        .query(&[("pageSize", "200")]);
+
+    if use_bearer {
+        req = req.header("Authorization", format!("Bearer {credential}"));
+    } else {
+        req = req.query(&[("key", credential)]);
+    }
+
+    let response = req.send().context("model fetch failed: GET Gemini models")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!(
+            "model fetch failed: GET Gemini models (HTTP {}): {}",
+            status,
+            &body[..body.len().min(500)]
+        );
+    }
+    let payload: Value = response
         .json()
         .context("failed to parse Gemini model list response")?;
 
@@ -1955,10 +1978,78 @@ fn resolve_live_models_endpoint(
     models_endpoint_for_provider(provider_name).map(str::to_string)
 }
 
+/// Async wrapper that runs the blocking model fetch on a dedicated thread,
+/// avoiding the "cannot drop a runtime in a context where blocking is not
+/// allowed" panic when `reqwest::blocking` is used inside tokio.
+async fn fetch_live_models_async(
+    provider_name: &str,
+    api_key: &str,
+    provider_api_url: Option<&str>,
+    oauth_bearer: bool,
+) -> Result<Vec<String>> {
+    let provider_name = provider_name.to_string();
+    let api_key = api_key.to_string();
+    let provider_api_url = provider_api_url.map(String::from);
+
+    tokio::task::spawn_blocking(move || {
+        fetch_live_models_for_provider(
+            &provider_name,
+            &api_key,
+            provider_api_url.as_deref(),
+            oauth_bearer,
+        )
+    })
+    .await
+    .context("model fetch task panicked")?
+}
+
+/// Try to resolve an OAuth access token for providers that support device-flow auth.
+///
+/// Returns `None` (not an error) when no auth profile exists or refresh fails,
+/// so the caller can fall back to env-var resolution.
+async fn resolve_oauth_token_for_model_fetch(
+    config: &Config,
+    provider_name: &str,
+) -> Option<String> {
+    let auth_service = crate::auth::AuthService::from_config(config);
+    resolve_oauth_token_via_auth_service(&auth_service, provider_name).await
+}
+
+/// Workspace-only variant used in the interactive wizard where a full [`Config`]
+/// is not yet available.
+async fn resolve_oauth_token_for_model_fetch_from_workspace(
+    workspace_dir: &std::path::Path,
+    provider_name: &str,
+) -> Option<String> {
+    let state_dir = workspace_dir.to_path_buf();
+    let auth_service = crate::auth::AuthService::new(&state_dir, false);
+    resolve_oauth_token_via_auth_service(&auth_service, provider_name).await
+}
+
+async fn resolve_oauth_token_via_auth_service(
+    auth_service: &crate::auth::AuthService,
+    provider_name: &str,
+) -> Option<String> {
+    match canonical_provider_name(provider_name) {
+        "gemini" => auth_service
+            .get_valid_gemini_access_token(None)
+            .await
+            .ok()
+            .flatten(),
+        "openai-codex" => auth_service
+            .get_valid_openai_access_token(None)
+            .await
+            .ok()
+            .flatten(),
+        _ => None,
+    }
+}
+
 fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
+    oauth_bearer: bool,
 ) -> Result<Vec<String>> {
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
@@ -1976,6 +2067,7 @@ fn fetch_live_models_for_provider(
     let models = match provider_name {
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
+        "gemini" if oauth_bearer => fetch_gemini_models_bearer(api_key.as_deref().unwrap_or(""))?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => {
             if ollama_remote {
@@ -2237,9 +2329,18 @@ pub async fn run_models_refresh(
         }
     }
 
-    let api_key = config.api_key.clone().unwrap_or_default();
+    let mut api_key = config.api_key.clone().unwrap_or_default();
+    let mut oauth_bearer = false;
+    if api_key.trim().is_empty() && provider_supports_device_flow(&provider_name) {
+        if let Some(token) = resolve_oauth_token_for_model_fetch(config, &provider_name).await {
+            api_key = token;
+            oauth_bearer = true;
+        }
+    }
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    match fetch_live_models_async(&provider_name, &api_key, config.api_url.as_deref(), oauth_bearer)
+        .await
+    {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
@@ -3234,11 +3335,28 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(
+                let mut fetch_key = api_key.clone();
+                let mut oauth_bearer = false;
+                if fetch_key.trim().is_empty() && provider_supports_device_flow(provider_name) {
+                    if let Some(token) =
+                        resolve_oauth_token_for_model_fetch_from_workspace(
+                            workspace_dir,
+                            provider_name,
+                        )
+                        .await
+                    {
+                        fetch_key = token;
+                        oauth_bearer = true;
+                    }
+                }
+                match fetch_live_models_async(
                     provider_name,
-                    &api_key,
+                    &fetch_key,
                     provider_api_url.as_deref(),
-                ) {
+                    oauth_bearer,
+                )
+                .await
+                {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
@@ -9159,5 +9277,26 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_falls_back_when_no_profile() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // No auth profiles stored → returns None (not error)
+        assert!(resolve_oauth_token_for_model_fetch(&config, "gemini")
+            .await
+            .is_none());
+        assert!(resolve_oauth_token_for_model_fetch(&config, "openai-codex")
+            .await
+            .is_none());
+        // Non-device-flow provider → always None
+        assert!(resolve_oauth_token_for_model_fetch(&config, "openrouter")
+            .await
+            .is_none());
     }
 }
