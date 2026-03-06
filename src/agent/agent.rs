@@ -540,6 +540,12 @@ impl Agent {
             }
         }
 
+        let context = self
+            .memory_loader
+            .load_context(self.memory.as_ref(), user_message)
+            .await
+            .unwrap_or_default();
+
         if self.auto_save {
             let _ = self
                 .memory
@@ -551,12 +557,6 @@ impl Agent {
                 )
                 .await;
         }
-
-        let context = self
-            .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
-            .await
-            .unwrap_or_default();
 
         // ── Research Phase ──────────────────────────────────────────────
         // If enabled and triggered, run a focused research turn to gather
