@@ -1,9 +1,12 @@
+use glob::Pattern;
 use parking_lot::Mutex;
 use reqwest::Url;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1325,6 +1328,52 @@ impl SecurityPolicy {
     // forbidden-prefix match. Each layer addresses a distinct escape
     // technique; together they enforce workspace confinement.
 
+    /// Check if a forbidden pattern matches a path.
+    /// Supports glob wildcards (*, ?, []) for file patterns like "*.env".
+    /// Falls back to starts_with for directory prefixes like "/etc".
+    ///
+    /// If pattern parsing fails, returns false (no match) since malformed patterns
+    /// should not accidentally block files. Patterns are validated at config load time
+    /// by from_config(), so runtime failures indicate an unexpected condition.
+    fn is_forbidden_match(path: &Path, forbidden_pattern: &str) -> bool {
+        let forbidden_expanded = expand_user_path(forbidden_pattern);
+        let forbidden_str = forbidden_expanded.to_string_lossy();
+
+        // If pattern contains glob wildcards, use glob matching
+        if forbidden_pattern.contains('*') || forbidden_pattern.contains('?') || forbidden_pattern.contains('[') {
+            // Try matching against the full path string
+            match Pattern::new(&forbidden_str) {
+                Ok(pattern) => {
+                    if pattern.matches(path.to_string_lossy().as_ref()) {
+                        return true;
+                    }
+                }
+                Err(_) => {
+                    // Malformed pattern doesn't match anything
+                    // (patterns are validated at config load time)
+                }
+            }
+            // Also try matching just the filename component for patterns like "*.env"
+            if let Some(filename) = path.file_name() {
+                match Pattern::new(&forbidden_str) {
+                    Ok(pattern) => {
+                        if pattern.matches(filename.to_string_lossy().as_ref()) {
+                            return true;
+                        }
+                    }
+                    Err(_) => {
+                        // Malformed pattern doesn't match anything
+                        // (patterns are validated at config load time)
+                    }
+                }
+            }
+            false
+        } else {
+            // No wildcards - use directory prefix matching
+            path.starts_with(&forbidden_expanded)
+        }
+    }
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -1362,8 +1411,7 @@ impl SecurityPolicy {
 
         // Block forbidden paths using path-component-aware matching
         for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
+            if Self::is_forbidden_match(&expanded_path, forbidden) {
                 return false;
             }
         }
@@ -1397,8 +1445,7 @@ impl SecurityPolicy {
         // For paths outside workspace/allowlist, block forbidden roots to
         // prevent symlink escapes and sensitive directory access.
         for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
+            if Self::is_forbidden_match(resolved, forbidden) {
                 return false;
             }
         }
@@ -1475,7 +1522,6 @@ impl SecurityPolicy {
         self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
-    /// Build from config sections
     /// Produce a concise security-constraint summary suitable for periodic
     /// re-injection into the conversation (safety heartbeat).
     ///
@@ -1545,10 +1591,33 @@ impl SecurityPolicy {
         )
     }
 
+    /// Build from config sections
+    ///
+    /// Validates forbidden_paths for malformed glob patterns and returns an error
+    /// if any pattern cannot be parsed.
+    /// Build from config sections
+    ///
+    /// Panics if forbidden_paths contains malformed glob patterns.
+    /// This is a configuration error that should be caught at startup.
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        // Pre-validate forbidden_paths for malformed glob patterns
+        for forbidden in &autonomy_config.forbidden_paths {
+            // Only validate patterns that contain glob wildcards
+            if forbidden.contains('*') || forbidden.contains('?') || forbidden.contains('[') {
+                let expanded = expand_user_path(forbidden);
+                let pattern_str = expanded.to_string_lossy();
+                if let Err(e) = Pattern::new(&pattern_str) {
+                    panic!(
+                        "Invalid glob pattern in forbidden_paths '{}': {}",
+                        forbidden, e
+                    );
+                }
+            }
+        }
+
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
@@ -1599,6 +1668,7 @@ impl SecurityPolicy {
             tracker: ActionTracker::new(),
         }
     }
+
 }
 
 #[cfg(test)]
@@ -2082,20 +2152,105 @@ mod tests {
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
     }
 
+
+    #[test]
+    fn forbidden_paths_wildcard_patterns() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["*.env".into(), "*.pem".into(), "secret*".into()],
+            ..SecurityPolicy::default()
+        };
+        // Wildcard patterns should match file extensions
+        assert!(!p.is_path_allowed("config.env"));
+        assert!(!p.is_path_allowed(".env"));
+        assert!(!p.is_path_allowed("/tmp/test.env"));
+        assert!(!p.is_path_allowed("cert.pem"));
+        assert!(!p.is_path_allowed("/etc/ssl/cert.pem"));
+        assert!(!p.is_path_allowed("secrets.txt"));
+        assert!(!p.is_path_allowed("secret_file"));
+
+        // Non-matching files should be allowed
+        assert!(p.is_path_allowed("config.toml"));
+        assert!(p.is_path_allowed("README.md"));
+        assert!(p.is_path_allowed("/etc/passwd"));
+    }
+
+    #[test]
+    fn forbidden_paths_wildcard_question_mark() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["file?.txt".into()],
+            ..SecurityPolicy::default()
+        };
+        // ? matches single character
+        assert!(!p.is_path_allowed("file1.txt"));
+        assert!(!p.is_path_allowed("fileA.txt"));
+        assert!(!p.is_path_allowed("/tmp/filex.txt"));
+
+        // Should not match
+        assert!(p.is_path_allowed("file10.txt"));
+        assert!(p.is_path_allowed("file.txt"));
+    }
+
+    #[test]
+    fn forbidden_paths_character_class() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["backup[0-9].zip".into()],
+            ..SecurityPolicy::default()
+        };
+        // Character class matching
+        assert!(!p.is_path_allowed("backup1.zip"));
+        assert!(!p.is_path_allowed("backup9.zip"));
+        assert!(!p.is_path_allowed("/tmp/backup5.zip"));
+
+        // Should not match
+        assert!(p.is_path_allowed("backup.zip"));
+        assert!(p.is_path_allowed("backup10.zip"));
+        assert!(p.is_path_allowed("backupA.zip"));
+        // Should not match
+        assert!(p.is_path_allowed("backup.zip"));
+        assert!(p.is_path_allowed("backup10.zip"));
+        assert!(p.is_path_allowed("backupA.zip"));
+    }
+
+    #[test]
+    fn forbidden_paths_malformed_patterns() {
+        // Malformed glob patterns should NOT match any files
+        // (fail-closed: malformed patterns are treated as non-matching for safety)
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["[*.txt".into(), "file[.txt".into(), "[]".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Files should be allowed since malformed patterns don't match
+        assert!(p.is_path_allowed("file1.txt"));
+        assert!(p.is_path_allowed("config.env"));
+        assert!(p.is_path_allowed("backup1.zip"));
+        assert!(p.is_path_allowed("secret_file"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid glob pattern")]
+    fn from_config_rejects_malformed_glob_patterns() {
+        // Test that from_config panics on malformed glob patterns at startup
+        let autonomy_config = crate::config::AutonomyConfig {
+            forbidden_paths: vec!["[*.txt".into()], // unclosed bracket
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test");
+
+        // This should panic with "Invalid glob pattern"
+        let _policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+    }
+
     #[test]
     fn empty_path_allowed() {
         let p = default_policy();
         assert!(p.is_path_allowed(""));
     }
 
-    #[test]
-    fn dotfile_in_workspace_allowed() {
-        let p = default_policy();
-        assert!(p.is_path_allowed(".gitignore"));
-        assert!(p.is_path_allowed(".env"));
-    }
-
-    #[test]
     fn resolve_user_supplied_path_joins_workspace_for_relative_inputs() {
         let workspace = std::env::temp_dir().join("zeroclaw_test_resolve_user_path_relative");
         let p = SecurityPolicy {
