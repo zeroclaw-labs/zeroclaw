@@ -20,6 +20,7 @@ Selected allowlist (all actions currently used across CI, Beta Release, and Prom
 | `docker/setup-buildx-action@v3` | release, promote-release | Docker Buildx setup |
 | `docker/login-action@v3` | release, promote-release | GHCR authentication |
 | `docker/build-push-action@v6` | release, promote-release | Multi-platform Docker image build and push |
+| `mozilla-actions/sccache-action@v0.0.7` | ci | Compiler caching via sccache |
 
 Equivalent allowlist patterns:
 
@@ -28,6 +29,7 @@ Equivalent allowlist patterns:
 - `Swatinem/rust-cache@*`
 - `softprops/action-gh-release@*`
 - `docker/*`
+- `mozilla-actions/sccache-action@*`
 
 ## Workflows
 
@@ -66,6 +68,8 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
     - Removed patterns no longer in use: `DavidAnson/markdownlint-cli2-action@*`, `lycheeverse/lychee-action@*`, `EmbarkStudios/cargo-deny-action@*`, `rustsec/audit-check@*`, `rhysd/actionlint@*`, `sigstore/cosign-installer@*`, `Checkmarx/vorpal-reviewdog-github-action@*`, `useblacksmith/*`
     - Added: `Swatinem/rust-cache@*` (replaces `useblacksmith/*` rust-cache fork)
     - Retained: `actions/*`, `dtolnay/rust-toolchain@*`, `softprops/action-gh-release@*`, `docker/*`
+- 2026-03-05: CI build optimization — added sccache, mold linker, cargo-nextest
+    - Added allowlist pattern: `mozilla-actions/sccache-action@*`
 
 ## Rollback
 

@@ -13,19 +13,37 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
+      - uses: mozilla-actions/sccache-action@v0.0.7
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run tests
+        run: cargo nextest run --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   build:
     name: Build ${{ matrix.target }}
@@ -46,5 +64,16 @@ jobs:
           toolchain: 1.92.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
+
       - name: Build release
+        shell: bash
         run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
