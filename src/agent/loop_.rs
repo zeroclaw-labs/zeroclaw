@@ -2057,6 +2057,10 @@ pub async fn run(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        Some(&SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        )),
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2462,6 +2466,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        Some(&SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        )),
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -5719,6 +5727,7 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
+            None, // no security policy
         );
 
         // Must contain zero XML protocol artifacts
