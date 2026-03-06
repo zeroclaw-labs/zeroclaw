@@ -787,7 +787,7 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig, WasmRuntimeConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use crate::runtime::WasmRuntime;
     use serde_json::json;
     use tempfile::TempDir;

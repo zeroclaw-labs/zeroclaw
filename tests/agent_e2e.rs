@@ -909,7 +909,7 @@ async fn e2e_agent_research_phase_integration() {
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
-        .research_config(research_config.into())
+        .research_config(research_config)
         .build()
         .unwrap();
 
@@ -959,7 +959,7 @@ async fn e2e_agent_research_always_trigger() {
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
-        .research_config(research_config.into())
+        .research_config(research_config)
         .build()
         .unwrap();
 
@@ -1088,7 +1088,7 @@ async fn e2e_agent_research_prompt_guided() {
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
-        .research_config(research_config.into())
+        .research_config(research_config)
         .build()
         .unwrap();
 
@@ -1123,7 +1123,7 @@ async fn e2e_agent_research_disabled() {
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
-        .research_config(research_config.into())
+        .research_config(research_config)
         .build()
         .unwrap();
 
