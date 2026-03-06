@@ -13,6 +13,9 @@ tests
 
 # Markdown files (README, CHANGELOG, etc.)
 *.md
+# Exception: builtin skills are include_str! at compile time
+!skills/
+!skills/**/*.md
 
 # Images (unnecessary for build)
 *.png

@@ -33,6 +33,7 @@ RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
+COPY skills/ skills/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/

@@ -1379,6 +1379,30 @@ impl LarkChannel {
     }
 }
 
+/// Prefix for sending Feishu/Lark interactive card. Content after this is sent as `msg_type: "interactive"`.
+pub const FEISHU_CARD_PREFIX: &str = "FEISHU_CARD:\n";
+
+/// Build Feishu/Lark rich-text (post) content from plain text.
+/// Each line becomes one paragraph. See: https://open.feishu.cn/document/server-docs/im-v1/message-content-description/create_json#45e3a4e0
+fn build_post_content(text: &str) -> String {
+    let lines: Vec<Vec<serde_json::Value>> = if text.is_empty() {
+        vec![vec![serde_json::json!({"tag": "text", "text": ""})]]
+    } else {
+        text.lines()
+            .map(|line| vec![serde_json::json!({"tag": "text", "text": line})])
+            .collect()
+    };
+    let post = serde_json::json!({
+        "post": {
+            "zh_cn": {
+                "title": "",
+                "content": lines
+            }
+        }
+    });
+    post.to_string()
+}
+
 #[async_trait]
 impl Channel for LarkChannel {
     fn name(&self) -> &str {
@@ -1389,10 +1413,23 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
+        // Prefer exact prefix; if model added intro text, look for prefix anywhere and use content after it.
+        let (msg_type, content) = if let Some(card_json) = message.content.strip_prefix(FEISHU_CARD_PREFIX) {
+            ("interactive", card_json.trim().to_string())
+        } else if let Some(idx) = message.content.find(FEISHU_CARD_PREFIX) {
+            let after = message.content[idx + FEISHU_CARD_PREFIX.len()..].trim();
+            if after.is_empty() {
+                ("post", build_post_content(&message.content))
+            } else {
+                ("interactive", after.to_string())
+            }
+        } else {
+            ("post", build_post_content(&message.content))
+        };
+
         let body = serde_json::json!({
             "receive_id": message.recipient,
-            "msg_type": "text",
+            "msg_type": msg_type,
             "content": content,
         });
 
