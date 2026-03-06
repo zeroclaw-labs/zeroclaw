@@ -34,7 +34,7 @@ Publish-mode guardrails:
 
 - Tag must match semver-like format `vX.Y.Z[-suffix]`.
 - Tag must already exist on origin.
-- Tag commit must be reachable from `origin/main`.
+- Tag commit must be reachable from `origin/master`.
 - Matching GHCR image tag (`ghcr.io/<owner>/<repo>:<tag>`) must be available before GitHub Release publish completes.
 - Artifacts are verified before publish.
 
@@ -61,7 +61,7 @@ Expected outcome:
 
 ### 3) Cut release tag
 
-From a clean local checkout synced to `origin/main`:
+From a clean local checkout synced to `origin/master`:
 
 ```bash
 scripts/release/cut_release_tag.sh vX.Y.Z --push
@@ -70,7 +70,7 @@ scripts/release/cut_release_tag.sh vX.Y.Z --push
 This script enforces:
 
 - clean working tree
-- `HEAD == origin/main`
+- `HEAD == origin/master`
 - non-duplicate tag
 - semver-like tag format
 
