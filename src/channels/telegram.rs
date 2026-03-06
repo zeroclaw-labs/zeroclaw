@@ -2954,7 +2954,9 @@ impl Channel for TelegramChannel {
         });
 
         if let Some(thread_id) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(thread_id);
+            if let Ok(id) = thread_id.parse::<i64>() {
+                body["reply_to_message_id"] = serde_json::json!(id);
+            }
         }
 
         let response = self
