@@ -10,7 +10,7 @@ The daemon includes the gateway and all other components, so you typically only 
 
 ```bash
 cd /Users/alaingaldemas/Documents/agentic/zeroclaw
-source .env
+set -a && source .env && set +a
 RUST_LOG=debug cargo run --bin zeroclaw -- daemon 2>&1 | tee -a logs/zeroclaw-daemon.log &
 ```
 
@@ -20,6 +20,15 @@ This starts everything:
 - ✅ Heartbeat
 - ✅ Scheduler
 - ✅ Logs redirected to `./logs/zeroclaw-daemon.log`
+
+**Important**: Use `set -a && source .env && set +a` to export all variables from `.env` to subprocesses. This is critical for transcription features that read `GEMINI_API_KEY` and other provider keys.
+
+**Why this matters:**
+- When you run `cargo run`, it spawns a subprocess to compile and execute your code
+- By default, `source .env` only exports variables to the current shell session
+- `set -a` (auto-export mode) marks all variables for export, so child processes inherit them
+- Without this, `GEMINI_API_KEY` won't be available to the transcription code running in the subprocess
+- Using `.envrc` with `direnv` is an alternative (auto-exports when entering the directory)
 
 To follow logs in real-time:
 ```bash
@@ -43,9 +52,18 @@ ZeroClaw requires environment variables for API keys. There are several ways to 
 #### Option 1: Source .env file
 
 ```bash
-source .env
+set -a && source .env && set +a
 cargo run --bin zeroclaw -- <command>
 ```
+
+**Important**: The `set -a` command exports all variables defined in `.env` to the environment, making them available to child processes (like `cargo run`). This is required for transcription features to work properly.
+
+**Why `set -a` is necessary in development/debug:**
+- The `.env` file typically contains API keys (GEMINI_API_KEY, GROQ_API_KEY, etc.)
+- When cargo runs your code, it does so in a **child process**
+- Without `set -a`, the child process won't see the variables from `.env` even if the parent shell does
+- This is especially important for transcription because it runs async HTTP requests to Google's API
+- Using `.envrc` with direnv is recommended as an alternative that handles this automatically
 
 #### Option 2: Set variables directly
 
@@ -154,7 +172,7 @@ lsof -ti :42617 | xargs kill -9
 ### 2. Start daemon in background with logs
 ```bash
 cd /Users/alaingaldemas/Documents/agentic/zeroclaw
-source .env
+set -a && source .env && set +a
 RUST_LOG=debug cargo run --bin zeroclaw -- daemon 2>&1 | tee -a logs/zeroclaw-daemon.log &
 ```
 

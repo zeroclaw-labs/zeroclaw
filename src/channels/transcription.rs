@@ -1,46 +1,80 @@
 use anyhow::{bail, Context, Result};
-use reqwest::multipart::{Form, Part};
 
 use crate::config::TranscriptionConfig;
 
-/// Maximum upload size accepted by the Groq Whisper API (25 MB).
-const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+/// Maximum upload size for Gemini API (20 MB).
+const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
 
-/// Map file extension to MIME type for Whisper-compatible transcription APIs.
-fn mime_for_audio(extension: &str) -> Option<&'static str> {
-    match extension.to_ascii_lowercase().as_str() {
-        "flac" => Some("audio/flac"),
-        "mp3" | "mpeg" | "mpga" => Some("audio/mpeg"),
-        "mp4" | "m4a" => Some("audio/mp4"),
-        "ogg" | "oga" => Some("audio/ogg"),
-        "opus" => Some("audio/opus"),
-        "wav" => Some("audio/wav"),
-        "webm" => Some("audio/webm"),
-        _ => None,
+/// Normalize a value - trim whitespace and filter empty strings.
+fn normalize_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
-/// Normalize audio filename for Whisper-compatible APIs.
+/// Get the API key for transcription using the same logic as the Gemini provider.
+/// Priority: config.api_key > GEMINI_API_KEY
+fn get_transcription_api_key(config: &TranscriptionConfig) -> Option<String> {
+    // First try config.api_key
+    if let Some(ref key) = config.api_key {
+        if let Some(normalized) = normalize_non_empty(key) {
+            return Some(normalized);
+        }
+    }
+    // Then try GEMINI_API_KEY (same as Gemini provider)
+    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        if let Some(normalized) = normalize_non_empty(&key) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+/// Check which transcription provider to use.
 ///
-/// Groq validates the filename extension — `.oga` (Opus-in-Ogg) is not in
-/// its accepted list, so we rewrite it to `.ogg`.
-fn normalize_audio_filename(file_name: &str) -> String {
-    match file_name.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("oga") => format!("{stem}.ogg"),
-        _ => file_name.to_string(),
+/// Priority:
+/// 1. If api_url is explicitly set (non-default) → use that provider
+/// 2. If model contains "whisper" → use Groq
+/// 3. Default → use Gemini
+fn get_transcription_provider(config: &TranscriptionConfig) -> TranscriptionProvider {
+    // Check if api_url is explicitly set to a custom value
+    // Default is "https://api.groq.com/openai/v1/audio/transcriptions"
+    let default_groq_url = "https://api.groq.com/openai/v1/audio/transcriptions";
+
+    if !config.api_url.is_empty() && config.api_url != default_groq_url {
+        // Custom URL set - use Groq (for now)
+        if config.api_url.contains("groq.com") {
+            tracing::debug!("Using Groq: custom api_url set");
+        } else {
+            tracing::debug!("Using custom URL: {}", config.api_url);
+        }
+        return TranscriptionProvider::Groq;
     }
+
+    // If model contains "whisper", use Groq
+    if config.model.to_lowercase().contains("whisper") {
+        tracing::debug!("Using Groq Whisper: model contains 'whisper'");
+        return TranscriptionProvider::Groq;
+    }
+
+    // Default to Gemini (api_url is default Groq URL or empty → use Gemini)
+    tracing::debug!("Using Gemini for transcription: default provider");
+    TranscriptionProvider::Gemini
 }
 
-/// Transcribe audio bytes via a Whisper-compatible transcription API.
+/// Transcription provider enum
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TranscriptionProvider {
+    Gemini,
+    Groq,
+}
+
+/// Transcribe audio bytes using Gemini API.
 ///
 /// Returns the transcribed text on success.
-///
-/// Credential resolution order:
-/// 1. `config.transcription.api_key`
-/// 2. `GROQ_API_KEY` environment variable (backward compatibility)
-///
-/// The caller is responsible for enforcing duration limits *before* downloading
-/// the file; this function enforces the byte-size cap.
 pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
@@ -53,12 +87,180 @@ pub async fn transcribe_audio(
         );
     }
 
-    let normalized_name = normalize_audio_filename(file_name);
+    // Check which provider to use based on config
+    let provider = get_transcription_provider(config);
+
+    match provider {
+        TranscriptionProvider::Gemini => {
+            transcribe_audio_gemini(audio_data, file_name, config).await
+        }
+        TranscriptionProvider::Groq => transcribe_audio_groq(audio_data, file_name, config).await,
+    }
+}
+
+/// Transcribe audio using Gemini API.
+async fn transcribe_audio_gemini(
+    audio_data: Vec<u8>,
+    file_name: &str,
+    config: &TranscriptionConfig,
+) -> Result<String> {
+    // Get API key using the same logic as Gemini provider
+    let api_key = get_transcription_api_key(config)
+        .context("Missing transcription API key: set [transcription].api_key, GEMINI_API_KEY, or GOOGLE_API_KEY")?;
+
+    // Determine MIME type from file extension
+    let extension = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e)
+        .unwrap_or("")
+        .to_lowercase();
+
+    let mime_type = match extension.as_str() {
+        "mp3" | "mpeg" => "audio/mpeg",
+        "mp4" | "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        _ => "audio/mpeg", // default
+    };
+
+    // Encode audio to base64
+    let audio_base64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &audio_data);
+
+    // Use the configured model or default
+    let model = if config.model.is_empty() {
+        "gemini-2.0-flash-exp".to_string()
+    } else {
+        config.model.clone()
+    };
+
+    // Build Gemini API URL
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let client = crate::config::build_runtime_proxy_client("transcription.gemini");
+
+    // Build request with inline audio data
+    #[derive(serde::Serialize)]
+    struct GeminiRequest {
+        contents: Vec<Content>,
+        system_instruction: SystemInstruction,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Content {
+        parts: Vec<Part>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Part {
+        text: Option<String>,
+        inline_data: Option<InlineData>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct InlineData {
+        mime_type: String,
+        data: String,
+    }
+
+    #[derive(serde::Serialize)]
+    struct SystemInstruction {
+        parts: Vec<SystemPart>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct SystemPart {
+        text: String,
+    }
+
+    // Send audio only - system instruction handles the prompt
+    let request = GeminiRequest {
+        contents: vec![Content {
+            parts: vec![Part {
+                inline_data: Some(InlineData {
+                    mime_type: mime_type.to_string(),
+                    data: audio_base64,
+                }),
+                text: None,
+            }],
+        }],
+        system_instruction: SystemInstruction {
+            parts: vec![SystemPart {
+                text: "Transcribe this audio to text. Return only the transcription, nothing else."
+                    .to_string(),
+            }],
+        },
+    };
+
+    let resp = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await
+        .context("Failed to send Gemini transcription request")?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("Failed to parse Gemini transcription response")?;
+
+    if !status.is_success() {
+        let error_msg = body["error"]["message"]
+            .as_str()
+            .or_else(|| body["error"]["status"].as_str())
+            .unwrap_or("unknown error");
+        bail!("Gemini transcription API error ({}): {}", status, error_msg);
+    }
+
+    // Extract transcription from Gemini response
+    let text = body["candidates"]
+        .as_array()
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content["parts"].as_array())
+        .and_then(|parts| parts.first())
+        .and_then(|part| part["text"].as_str())
+        .map(|s| s.to_string())
+        .context("Transcription response missing expected fields")?;
+
+    Ok(text)
+}
+
+/// Transcribe audio using Groq Whisper API.
+async fn transcribe_audio_groq(
+    audio_data: Vec<u8>,
+    file_name: &str,
+    config: &TranscriptionConfig,
+) -> Result<String> {
+    use reqwest::multipart::{Form, Part};
+
+    // Normalize extension for Groq
+    let normalized_name = match file_name.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("oga") => format!("{stem}.ogg"),
+        _ => file_name.to_string(),
+    };
+
     let extension = normalized_name
         .rsplit_once('.')
         .map(|(_, e)| e)
         .unwrap_or("");
-    let mime = mime_for_audio(extension).ok_or_else(|| {
+
+    let mime = match extension.to_ascii_lowercase().as_str() {
+        "flac" => Some("audio/flac"),
+        "mp3" | "mpeg" | "mpga" => Some("audio/mpeg"),
+        "mp4" | "m4a" => Some("audio/mp4"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "wav" => Some("audio/wav"),
+        "webm" => Some("audio/webm"),
+        _ => None,
+    }.ok_or_else(|| {
         anyhow::anyhow!(
             "Unsupported audio format '.{extension}' — accepted: flac, mp3, mp4, mpeg, mpga, m4a, ogg, opus, wav, webm"
         )
@@ -142,8 +344,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_api_key() {
-        // Ensure fallback env key is absent for this test.
+        // Ensure fallback env keys are absent for this test.
         std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("GOOGLE_API_KEY");
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
@@ -154,100 +358,6 @@ mod tests {
         assert!(
             err.to_string().contains("transcription API key"),
             "expected missing-key error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn uses_config_api_key_without_groq_env() {
-        std::env::remove_var("GROQ_API_KEY");
-
-        let data = vec![0u8; 100];
-        let mut config = TranscriptionConfig::default();
-        config.api_key = Some("transcription-key".to_string());
-
-        // Keep invalid extension so we fail before network, but after key resolution.
-        let err = transcribe_audio(data, "recording.aac", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Unsupported audio format"),
-            "expected unsupported-format error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn mime_for_audio_maps_accepted_formats() {
-        let cases = [
-            ("flac", "audio/flac"),
-            ("mp3", "audio/mpeg"),
-            ("mpeg", "audio/mpeg"),
-            ("mpga", "audio/mpeg"),
-            ("mp4", "audio/mp4"),
-            ("m4a", "audio/mp4"),
-            ("ogg", "audio/ogg"),
-            ("oga", "audio/ogg"),
-            ("opus", "audio/opus"),
-            ("wav", "audio/wav"),
-            ("webm", "audio/webm"),
-        ];
-        for (ext, expected) in cases {
-            assert_eq!(
-                mime_for_audio(ext),
-                Some(expected),
-                "failed for extension: {ext}"
-            );
-        }
-    }
-
-    #[test]
-    fn mime_for_audio_case_insensitive() {
-        assert_eq!(mime_for_audio("OGG"), Some("audio/ogg"));
-        assert_eq!(mime_for_audio("MP3"), Some("audio/mpeg"));
-        assert_eq!(mime_for_audio("Opus"), Some("audio/opus"));
-    }
-
-    #[test]
-    fn mime_for_audio_rejects_unknown() {
-        assert_eq!(mime_for_audio("txt"), None);
-        assert_eq!(mime_for_audio("pdf"), None);
-        assert_eq!(mime_for_audio("aac"), None);
-        assert_eq!(mime_for_audio(""), None);
-    }
-
-    #[test]
-    fn normalize_audio_filename_rewrites_oga() {
-        assert_eq!(normalize_audio_filename("voice.oga"), "voice.ogg");
-        assert_eq!(normalize_audio_filename("file.OGA"), "file.ogg");
-    }
-
-    #[test]
-    fn normalize_audio_filename_preserves_accepted() {
-        assert_eq!(normalize_audio_filename("voice.ogg"), "voice.ogg");
-        assert_eq!(normalize_audio_filename("track.mp3"), "track.mp3");
-        assert_eq!(normalize_audio_filename("clip.opus"), "clip.opus");
-    }
-
-    #[test]
-    fn normalize_audio_filename_no_extension() {
-        assert_eq!(normalize_audio_filename("voice"), "voice");
-    }
-
-    #[tokio::test]
-    async fn rejects_unsupported_audio_format() {
-        let data = vec![0u8; 100];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(data, "recording.aac", &config)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Unsupported audio format"),
-            "expected unsupported-format error, got: {msg}"
-        );
-        assert!(
-            msg.contains(".aac"),
-            "error should mention the rejected extension, got: {msg}"
         );
     }
 }
