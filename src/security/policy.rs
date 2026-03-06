@@ -1403,9 +1403,10 @@ impl SecurityPolicy {
             }
         }
 
-        // When workspace_only is disabled the user explicitly opted out of
-        // workspace confinement after forbidden-path checks are applied.
-        if !self.workspace_only {
+        // When workspace_only is disabled, allow unrestricted access ONLY if no
+        // allowed_roots were explicitly configured. Otherwise, respect allowed_roots
+        // even when workspace_only=false - the user explicitly set an allowlist.
+        if !self.workspace_only && self.allowed_roots.is_empty() {
             return true;
         }
 
@@ -2800,6 +2801,65 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn workspace_only_false_with_allowed_roots_respects_allowlist() {
+        // When workspace_only=false but allowed_roots is explicitly set,
+        // paths must still be confined to workspace OR allowed_roots.
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false_roots");
+        let allowed_dir = std::env::temp_dir().join("zeroclaw_test_allowed");
+        let _ = std::fs::create_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(&allowed_dir);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+        let canonical_allowed = allowed_dir
+            .canonicalize()
+            .unwrap_or_else(|_| allowed_dir.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: false,
+            allowed_roots: vec![canonical_allowed.clone()],
+            forbidden_paths: vec!["/etc".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Path inside workspace — should be allowed
+        let inside_ws = canonical_workspace.join("subdir");
+        assert!(
+            p.is_resolved_path_allowed(&inside_ws),
+            "path inside workspace must be allowed even with allowed_roots set"
+        );
+
+        // Path inside allowed_roots — should be allowed
+        let inside_allowed = canonical_allowed.join("file.txt");
+        assert!(
+            p.is_resolved_path_allowed(&inside_allowed),
+            "path inside allowed_roots must be allowed when workspace_only=false"
+        );
+
+        // Path outside both workspace and allowed_roots — should be BLOCKED
+        let outside = std::env::temp_dir().join("zeroclaw_test_outside");
+        // Ensure the path is not inside workspace or allowed_dir
+        assert!(
+            !outside.starts_with(&canonical_workspace) && !outside.starts_with(&canonical_allowed),
+            "test setup: outside path should not be in workspace or allowed_roots"
+        );
+        assert!(
+            !p.is_resolved_path_allowed(&outside),
+            "workspace_only=false with allowed_roots must block paths outside allowlist"
+        );
+
+        // Forbidden paths must still be blocked even with allowed_roots
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "forbidden paths must be blocked even with allowed_roots"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&allowed_dir);
     }
 
     #[test]
