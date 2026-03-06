@@ -165,13 +165,18 @@ OpenClaw stores state in `~/.openclaw/`. ZeroClaw uses configurable backends:
 
 ```toml
 [memory]
-backend = "sqlite"              # sqlite | postgres | qdrant | markdown | none
+backend = "sqlite"              # sqlite | sqlite_qdrant_hybrid | postgres_qdrant_hybrid | postgres | qdrant | markdown | none
 auto_save = true
 embedding_provider = "openai"   # openai | custom:URL | none
 embedding_model = "text-embedding-3-small"
 vector_weight = 0.7             # weight for semantic search
 keyword_weight = 0.3            # weight for BM25 keyword search
 ```
+
+Rollout guidance: keep `backend = "sqlite"` as default, then opt into
+`postgres_qdrant_hybrid` only after both `[storage.provider.config].db_url` and
+`[memory.qdrant].url` are configured. Rollback is config-only: switch back to
+`postgres` or `sqlite` and restart ZeroClaw (no silent migration required).
 
 ### Channels
 

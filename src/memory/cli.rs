@@ -45,38 +45,44 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
             bail!("Memory backend is 'none' (disabled). No entries to manage.");
         }
         #[cfg(feature = "memory-postgres")]
-        MemoryBackendKind::Postgres => {
-            #[cfg(feature = "memory-postgres")]
-            {
-                let sp = &config.storage.provider.config;
-                let db_url = sp
-                    .db_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .context(
-                        "memory backend 'postgres' requires db_url in [storage.provider.config]",
-                    )?;
-                let mem = super::PostgresMemory::new(
-                    db_url,
-                    &sp.schema,
-                    &sp.table,
-                    sp.connect_timeout_secs,
-                    sp.tls,
-                )?;
-                Ok(Box::new(mem))
-            }
-            #[cfg(not(feature = "memory-postgres"))]
-            {
-                bail!("Memory backend 'postgres' requires the 'memory-postgres' feature to be enabled at compile time.");
-            }
+        MemoryBackendKind::Postgres => create_postgres_crud_memory(config, "postgres"),
+        #[cfg(feature = "memory-postgres")]
+        MemoryBackendKind::PostgresQdrantHybrid => {
+            create_postgres_crud_memory(config, "postgres_qdrant_hybrid")
         }
         #[cfg(not(feature = "memory-postgres"))]
         MemoryBackendKind::Postgres => {
             bail!("memory backend 'postgres' requires the 'memory-postgres' feature to be enabled");
         }
+        #[cfg(not(feature = "memory-postgres"))]
+        MemoryBackendKind::PostgresQdrantHybrid => {
+            bail!(
+                "memory backend 'postgres_qdrant_hybrid' requires the 'memory-postgres' feature to be enabled"
+            );
+        }
         _ => create_memory_for_migration(&backend, &config.workspace_dir),
     }
+}
+
+#[cfg(feature = "memory-postgres")]
+fn create_postgres_crud_memory(config: &Config, backend_name: &str) -> Result<Box<dyn Memory>> {
+    let sp = &config.storage.provider.config;
+    let db_url = sp
+        .db_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .with_context(|| {
+            format!("memory backend '{backend_name}' requires db_url in [storage.provider.config]")
+        })?;
+    let mem = super::PostgresMemory::new(
+        db_url,
+        &sp.schema,
+        &sp.table,
+        sp.connect_timeout_secs,
+        sp.tls,
+    )?;
+    Ok(Box::new(mem))
 }
 
 async fn handle_list(
@@ -307,7 +313,13 @@ async fn handle_reindex(config: &Config, yes: bool, progress: bool) -> Result<()
     use std::sync::Arc;
 
     // Reindex requires full memory backend with embeddings
-    let mem = super::create_memory(&config.memory, &config.workspace_dir, None)?;
+    let mem = super::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?;
 
     // Get total count for confirmation
     let total = mem.count().await?;

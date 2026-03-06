@@ -3000,10 +3000,13 @@ impl Default for QdrantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "sqlite_qdrant_hybrid" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "sqlite_qdrant_hybrid" | "postgres_qdrant_hybrid" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
-    /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
+    /// Default is `sqlite` for compatibility with existing installs.
+    /// `postgres` and `postgres_qdrant_hybrid` require `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     /// `qdrant` and `sqlite_qdrant_hybrid` use `[memory.qdrant]` config or `QDRANT_URL` env var.
+    /// `postgres_qdrant_hybrid` keeps Postgres as source-of-truth and uses Qdrant for semantic ranking.
+    /// Rollback is config-only: switch backend back to `postgres` or `sqlite`, then restart.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,

@@ -11,6 +11,8 @@ pub mod markdown;
 pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+#[cfg(feature = "memory-postgres")]
+pub mod postgres_qdrant_hybrid;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
@@ -31,6 +33,8 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
+#[cfg(feature = "memory-postgres")]
+pub use postgres_qdrant_hybrid::PostgresQdrantHybridMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
@@ -66,7 +70,7 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(CortexMemMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Postgres => postgres_builder(),
+        MemoryBackendKind::Postgres | MemoryBackendKind::PostgresQdrantHybrid => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
@@ -84,6 +88,11 @@ pub fn effective_memory_backend_name(
     memory_backend: &str,
     storage_provider: Option<&StorageProviderConfig>,
 ) -> String {
+    let backend = memory_backend.trim().to_ascii_lowercase();
+    if backend == "postgres_qdrant_hybrid" {
+        return backend;
+    }
+
     if let Some(override_provider) = storage_provider
         .map(|cfg| cfg.provider.trim())
         .filter(|provider| !provider.is_empty())
@@ -91,7 +100,7 @@ pub fn effective_memory_backend_name(
         return override_provider.to_ascii_lowercase();
     }
 
-    memory_backend.trim().to_ascii_lowercase()
+    backend
 }
 
 /// Legacy auto-save key used for model-authored assistant summaries.
@@ -309,12 +318,52 @@ pub fn create_memory_with_storage_and_routes(
         Ok(Box::new(memory))
     }
 
+    #[cfg(feature = "memory-postgres")]
+    fn build_postgres_qdrant_hybrid_memory(
+        config: &MemoryConfig,
+        storage_provider: Option<&StorageProviderConfig>,
+        resolved_embedding: &ResolvedEmbeddingConfig,
+    ) -> anyhow::Result<Box<dyn Memory>> {
+        let storage_provider = storage_provider.context(
+            "memory backend 'postgres_qdrant_hybrid' requires [storage.provider.config] settings",
+        )?;
+        let db_url = storage_provider
+            .db_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context(
+                "memory backend 'postgres_qdrant_hybrid' requires [storage.provider.config].db_url (or dbURL)",
+            )?;
+        let qdrant = build_qdrant_memory(config, resolved_embedding)?;
+        let memory = PostgresQdrantHybridMemory::new(
+            db_url,
+            &storage_provider.schema,
+            &storage_provider.table,
+            storage_provider.connect_timeout_secs,
+            storage_provider.tls,
+            qdrant,
+        )?;
+        Ok(Box::new(memory))
+    }
+
     #[cfg(not(feature = "memory-postgres"))]
     fn build_postgres_memory(
         _storage_provider: Option<&StorageProviderConfig>,
     ) -> anyhow::Result<Box<dyn Memory>> {
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
+        );
+    }
+
+    #[cfg(not(feature = "memory-postgres"))]
+    fn build_postgres_qdrant_hybrid_memory(
+        _config: &MemoryConfig,
+        _storage_provider: Option<&StorageProviderConfig>,
+        _resolved_embedding: &ResolvedEmbeddingConfig,
+    ) -> anyhow::Result<Box<dyn Memory>> {
+        anyhow::bail!(
+            "memory backend 'postgres_qdrant_hybrid' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
         );
     }
 
@@ -376,6 +425,10 @@ pub fn create_memory_with_storage_and_routes(
         return Ok(Box::new(SqliteQdrantHybridMemory::new(sqlite, qdrant)));
     }
 
+    if matches!(backend_kind, MemoryBackendKind::PostgresQdrantHybrid) {
+        return build_postgres_qdrant_hybrid_memory(config, storage_provider, &resolved_embedding);
+    }
+
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
@@ -397,10 +450,10 @@ pub fn create_memory_for_migration(
 
     if matches!(
         classify_memory_backend(backend),
-        MemoryBackendKind::Postgres
+        MemoryBackendKind::Postgres | MemoryBackendKind::PostgresQdrantHybrid
     ) {
         anyhow::bail!(
-            "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
+            "memory migration for backend 'postgres'/'postgres_qdrant_hybrid' is unsupported; migrate with sqlite or markdown first"
         );
     }
 
@@ -568,6 +621,19 @@ mod tests {
         assert_eq!(
             effective_memory_backend_name("sqlite", Some(&storage)),
             "postgres"
+        );
+    }
+
+    #[test]
+    fn effective_backend_name_keeps_postgres_qdrant_hybrid() {
+        let storage = StorageProviderConfig {
+            provider: "postgres".into(),
+            ..StorageProviderConfig::default()
+        };
+
+        assert_eq!(
+            effective_memory_backend_name("postgres_qdrant_hybrid", Some(&storage)),
+            "postgres_qdrant_hybrid"
         );
     }
 

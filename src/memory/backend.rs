@@ -2,6 +2,7 @@
 pub enum MemoryBackendKind {
     Sqlite,
     SqliteQdrantHybrid,
+    PostgresQdrantHybrid,
     Lucid,
     CortexMem,
     Postgres,
@@ -85,6 +86,15 @@ const SQLITE_QDRANT_HYBRID_PROFILE: MemoryBackendProfile = MemoryBackendProfile 
     optional_dependency: false,
 };
 
+const POSTGRES_QDRANT_HYBRID_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "postgres_qdrant_hybrid",
+    label: "PostgreSQL + Qdrant hybrid — Postgres source-of-truth with Qdrant semantic ranking",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -103,9 +113,10 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
-const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 6] = [
+const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 7] = [
     SQLITE_PROFILE,
     SQLITE_QDRANT_HYBRID_PROFILE,
+    POSTGRES_QDRANT_HYBRID_PROFILE,
     LUCID_PROFILE,
     CORTEX_MEM_PROFILE,
     MARKDOWN_PROFILE,
@@ -124,6 +135,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
         "sqlite_qdrant_hybrid" | "hybrid" => MemoryBackendKind::SqliteQdrantHybrid,
+        "postgres_qdrant_hybrid" => MemoryBackendKind::PostgresQdrantHybrid,
         "lucid" => MemoryBackendKind::Lucid,
         "cortex-mem" | "cortex_mem" | "cortexmem" | "cortex" => MemoryBackendKind::CortexMem,
         "postgres" => MemoryBackendKind::Postgres,
@@ -138,6 +150,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::SqliteQdrantHybrid => SQLITE_QDRANT_HYBRID_PROFILE,
+        MemoryBackendKind::PostgresQdrantHybrid => POSTGRES_QDRANT_HYBRID_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::CortexMem => CORTEX_MEM_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
@@ -158,6 +171,10 @@ mod tests {
         assert_eq!(
             classify_memory_backend("sqlite_qdrant_hybrid"),
             MemoryBackendKind::SqliteQdrantHybrid
+        );
+        assert_eq!(
+            classify_memory_backend("postgres_qdrant_hybrid"),
+            MemoryBackendKind::PostgresQdrantHybrid
         );
         assert_eq!(classify_memory_backend("lucid"), MemoryBackendKind::Lucid);
         assert_eq!(
@@ -188,6 +205,14 @@ mod tests {
     }
 
     #[test]
+    fn postgres_qdrant_hybrid_profile_uses_remote_storage() {
+        let profile = memory_backend_profile("postgres_qdrant_hybrid");
+        assert_eq!(profile.key, "postgres_qdrant_hybrid");
+        assert!(!profile.sqlite_based);
+        assert!(profile.optional_dependency);
+    }
+
+    #[test]
     fn classify_unknown_backend() {
         assert_eq!(classify_memory_backend("redis"), MemoryBackendKind::Unknown);
     }
@@ -195,13 +220,14 @@ mod tests {
     #[test]
     fn selectable_backends_are_ordered_for_onboarding() {
         let backends = selectable_memory_backends();
-        assert_eq!(backends.len(), 6);
+        assert_eq!(backends.len(), 7);
         assert_eq!(backends[0].key, "sqlite");
         assert_eq!(backends[1].key, "sqlite_qdrant_hybrid");
-        assert_eq!(backends[2].key, "lucid");
-        assert_eq!(backends[3].key, "cortex-mem");
-        assert_eq!(backends[4].key, "markdown");
-        assert_eq!(backends[5].key, "none");
+        assert_eq!(backends[2].key, "postgres_qdrant_hybrid");
+        assert_eq!(backends[3].key, "lucid");
+        assert_eq!(backends[4].key, "cortex-mem");
+        assert_eq!(backends[5].key, "markdown");
+        assert_eq!(backends[6].key, "none");
     }
 
     #[test]
