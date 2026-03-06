@@ -155,6 +155,316 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
     }
 }
 
+// ── Inbound media support ─────────────────────────────────────────────
+
+/// Maximum file size for inbound WhatsApp media downloads (20 MiB).
+#[cfg(feature = "whatsapp-web")]
+const WA_WEB_MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Sanitize a user-provided filename for embedding inside `[Document: ...]` markers.
+/// Strips characters that could break marker parsing (`[`, `]`, newlines, control chars).
+#[cfg(feature = "whatsapp-web")]
+fn sanitize_marker_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '[' | ']' | '\n' | '\r') && !c.is_control())
+        .collect()
+}
+
+/// Check whether a file path has a recognized image extension.
+#[cfg(feature = "whatsapp-web")]
+fn is_wa_image_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Derive a file extension from a MIME type for incoming media.
+#[cfg(feature = "whatsapp-web")]
+fn mime_to_wa_extension(mime: &str) -> &str {
+    let base = mime.split(';').next().unwrap_or("").trim();
+    match base.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/3gpp" => "3gp",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+/// Try to download an incoming media message (image, document, video, sticker)
+/// from WhatsApp Web and return the formatted content string with `[IMAGE:]`
+/// or `[Document:]` markers matching the multimodal pipeline convention.
+///
+/// Returns `None` if the message contains no downloadable media or if the
+/// download fails.
+#[cfg(feature = "whatsapp-web")]
+async fn try_download_wa_web_media(
+    msg: &wa_rs_proto::whatsapp::Message,
+    client: &wa_rs::Client,
+    workspace: &std::path::Path,
+    sender_id: &str,
+) -> Option<String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let safe_sender: String = sender_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let sender_component = if safe_sender.is_empty() {
+        "unknown"
+    } else {
+        &safe_sender
+    };
+    let save_dir = workspace.join("whatsapp_files");
+
+    // ── Image ──────────────────────────────────────────────────────────
+    if let Some(ref image_msg) = msg.image_message {
+        let declared_len = match image_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: image missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::info!("WhatsApp Web: image too large, skipping");
+            return None;
+        }
+        let bytes = match client.download(image_msg.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download image: {e}");
+                return None;
+            }
+        };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded image exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
+        let ext = image_msg
+            .mimetype
+            .as_deref()
+            .map(mime_to_wa_extension)
+            .unwrap_or("jpg");
+        let filename = format!("wa_image_{sender_component}_{ts}_{nonce}.{ext}");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
+        }
+        let path = save_dir.join(&filename);
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::warn!("WhatsApp Web: failed to save image: {e}");
+            return None;
+        }
+        tracing::info!(
+            "WhatsApp Web: saved inbound image to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+        let mut content = format!("[IMAGE:{}]", path.display());
+        if let Some(ref caption) = image_msg.caption {
+            if !caption.trim().is_empty() {
+                content = format!("{}\n\n{content}", caption.trim());
+            }
+        }
+        return Some(content);
+    }
+
+    // ── Document ───────────────────────────────────────────────────────
+    if let Some(ref doc_msg) = msg.document_message {
+        let declared_len = match doc_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: document missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::info!("WhatsApp Web: document too large, skipping");
+            return None;
+        }
+        let bytes = match client.download(doc_msg.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download document: {e}");
+                return None;
+            }
+        };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded document exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
+        let original_name = doc_msg.file_name.as_deref().unwrap_or("document");
+        let ext = std::path::Path::new(original_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_else(|| {
+                doc_msg
+                    .mimetype
+                    .as_deref()
+                    .map(mime_to_wa_extension)
+                    .unwrap_or("bin")
+            });
+        let filename = format!("wa_doc_{sender_component}_{ts}_{nonce}.{ext}");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
+        }
+        let path = save_dir.join(&filename);
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::warn!("WhatsApp Web: failed to save document: {e}");
+            return None;
+        }
+        tracing::info!(
+            "WhatsApp Web: saved inbound document to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+        let safe_name = sanitize_marker_text(original_name);
+        let mut content = if is_wa_image_extension(&path) {
+            format!("[IMAGE:{}]", path.display())
+        } else {
+            format!("[Document: {}] {}", safe_name, path.display())
+        };
+        if let Some(ref caption) = doc_msg.caption {
+            if !caption.trim().is_empty() {
+                content = format!("{}\n\n{content}", caption.trim());
+            }
+        }
+        return Some(content);
+    }
+
+    // ── Video ──────────────────────────────────────────────────────────
+    if let Some(ref video_msg) = msg.video_message {
+        let declared_len = match video_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: video missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::info!("WhatsApp Web: video too large, skipping");
+            return None;
+        }
+        let bytes = match client.download(video_msg.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download video: {e}");
+                return None;
+            }
+        };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded video exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
+        let ext = video_msg
+            .mimetype
+            .as_deref()
+            .map(mime_to_wa_extension)
+            .unwrap_or("mp4");
+        let filename = format!("wa_video_{sender_component}_{ts}_{nonce}.{ext}");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
+        }
+        let path = save_dir.join(&filename);
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::warn!("WhatsApp Web: failed to save video: {e}");
+            return None;
+        }
+        tracing::info!(
+            "WhatsApp Web: saved inbound video to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+        let mut content = format!("[Document: {}] {}", filename, path.display());
+        if let Some(ref caption) = video_msg.caption {
+            if !caption.trim().is_empty() {
+                content = format!("{}\n\n{content}", caption.trim());
+            }
+        }
+        return Some(content);
+    }
+
+    // ── Sticker ────────────────────────────────────────────────────────
+    if let Some(ref sticker_msg) = msg.sticker_message {
+        let declared_len = match sticker_msg.file_length {
+            Some(v) => v,
+            None => {
+                tracing::warn!("WhatsApp Web: sticker missing file_length, skipping");
+                return None;
+            }
+        };
+        if declared_len > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::info!("WhatsApp Web: sticker too large, skipping");
+            return None;
+        }
+        let bytes = match client.download(sticker_msg.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download sticker: {e}");
+                return None;
+            }
+        };
+        if bytes.len() as u64 > WA_WEB_MAX_MEDIA_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: downloaded sticker exceeds limit ({} > {}), skipping",
+                bytes.len(),
+                WA_WEB_MAX_MEDIA_BYTES
+            );
+            return None;
+        }
+        let ext = sticker_msg
+            .mimetype
+            .as_deref()
+            .map(mime_to_wa_extension)
+            .unwrap_or("webp");
+        let filename = format!("wa_sticker_{sender_component}_{ts}_{nonce}.{ext}");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp Web: failed to create save dir: {e}");
+            return None;
+        }
+        let path = save_dir.join(&filename);
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::warn!("WhatsApp Web: failed to save sticker: {e}");
+            return None;
+        }
+        tracing::info!(
+            "WhatsApp Web: saved inbound sticker to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+        return Some(format!("[IMAGE:{}]", path.display()));
+    }
+
+    None
+}
+
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
@@ -187,6 +497,8 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription configuration (Groq Whisper)
     transcription: Option<crate::config::TranscriptionConfig>,
+    /// Workspace directory for saving downloaded media attachments.
+    workspace_dir: Option<std::path::PathBuf>,
 }
 
 impl WhatsAppWebChannel {
@@ -214,7 +526,15 @@ impl WhatsAppWebChannel {
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
+            workspace_dir: None,
         }
+    }
+
+    /// Configure workspace directory for saving downloaded media attachments.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Configure voice transcription via Groq Whisper.
@@ -559,6 +879,7 @@ impl Channel for WhatsAppWebChannel {
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
         let transcription = self.transcription.clone();
+        let workspace_dir = self.workspace_dir.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
@@ -568,6 +889,7 @@ impl Channel for WhatsAppWebChannel {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
                 let transcription = transcription.clone();
+                let workspace_dir = workspace_dir.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -592,7 +914,22 @@ impl Channel for WhatsAppWebChannel {
 
                             if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
                                 let trimmed = text.trim();
-                                let content = if !trimmed.is_empty() {
+
+                                // Try inbound media download (image/doc/video/sticker)
+                                let media_content = if let Some(ref ws) = workspace_dir {
+                                    try_download_wa_web_media(&msg, &_client, ws, &sender).await
+                                } else {
+                                    None
+                                };
+
+                                let content = if let Some(media) = media_content {
+                                    // Media downloaded; prepend any text/caption
+                                    if !trimmed.is_empty() {
+                                        format!("{trimmed}\n\n{media}")
+                                    } else {
+                                        media
+                                    }
+                                } else if !trimmed.is_empty() {
                                     trimmed.to_string()
                                 } else if let Some(ref tc) = transcription {
                                     // Attempt to transcribe audio/voice messages
@@ -612,7 +949,7 @@ impl Channel for WhatsAppWebChannel {
                                             .as_deref()
                                             .unwrap_or("audio/ogg");
                                         let file_name =
-                                            Self::audio_mime_to_filename(mime);
+                                            WhatsAppWebChannel::audio_mime_to_filename(mime);
                                         // download() decrypts the media in one step.
                                         // audio_msg is Box<AudioMessage>; .as_ref() yields
                                         // &AudioMessage which implements Downloadable.
@@ -661,11 +998,23 @@ impl Channel for WhatsAppWebChannel {
                                         return;
                                     }
                                 } else {
-                                    tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message \
-                                         from {}",
-                                        normalized
-                                    );
+                                    let has_media = msg.image_message.is_some()
+                                        || msg.document_message.is_some()
+                                        || msg.video_message.is_some()
+                                        || msg.sticker_message.is_some();
+                                    if has_media && workspace_dir.is_none() {
+                                        tracing::debug!(
+                                            "WhatsApp Web: workspace_dir not configured, \
+                                             cannot save media from {}",
+                                            normalized
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring empty or non-text message \
+                                             from {}",
+                                            normalized
+                                        );
+                                    }
                                     return;
                                 };
 
@@ -1090,5 +1439,68 @@ mod tests {
             WhatsAppWebChannel::audio_mime_to_filename("application/octet-stream"),
             "voice.ogg"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // INBOUND MEDIA — Helper function tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_to_wa_extension_known_types() {
+        assert_eq!(mime_to_wa_extension("image/jpeg"), "jpg");
+        assert_eq!(mime_to_wa_extension("image/png"), "png");
+        assert_eq!(mime_to_wa_extension("image/webp"), "webp");
+        assert_eq!(mime_to_wa_extension("image/gif"), "gif");
+        assert_eq!(mime_to_wa_extension("video/mp4"), "mp4");
+        assert_eq!(mime_to_wa_extension("video/3gpp"), "3gp");
+        assert_eq!(mime_to_wa_extension("application/pdf"), "pdf");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_to_wa_extension_unknown_fallback() {
+        assert_eq!(mime_to_wa_extension("application/octet-stream"), "bin");
+        assert_eq!(mime_to_wa_extension("text/plain"), "bin");
+        assert_eq!(mime_to_wa_extension(""), "bin");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_to_wa_extension_with_params() {
+        assert_eq!(mime_to_wa_extension("image/jpeg; charset=utf-8"), "jpg");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn is_wa_image_extension_recognizes_images() {
+        assert!(is_wa_image_extension(std::path::Path::new("photo.png")));
+        assert!(is_wa_image_extension(std::path::Path::new("photo.jpg")));
+        assert!(is_wa_image_extension(std::path::Path::new("photo.jpeg")));
+        assert!(is_wa_image_extension(std::path::Path::new("photo.gif")));
+        assert!(is_wa_image_extension(std::path::Path::new("photo.webp")));
+        assert!(is_wa_image_extension(std::path::Path::new("PHOTO.PNG")));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn is_wa_image_extension_rejects_non_images() {
+        assert!(!is_wa_image_extension(std::path::Path::new("file.pdf")));
+        assert!(!is_wa_image_extension(std::path::Path::new("file.mp4")));
+        assert!(!is_wa_image_extension(std::path::Path::new("file")));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_workspace_dir_sets_field() {
+        let ch = make_channel().with_workspace_dir(std::path::PathBuf::from("/tmp/ws"));
+        assert_eq!(ch.workspace_dir, Some(std::path::PathBuf::from("/tmp/ws")));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_workspace_dir_default_is_none() {
+        let ch = make_channel();
+        assert!(ch.workspace_dir.is_none());
     }
 }
