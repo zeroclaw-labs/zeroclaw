@@ -1220,6 +1220,7 @@ Examples:
 - `[channels_config.whatsapp]`
 - `[channels_config.linq]`
 - `[channels_config.nextcloud_talk]`
+- `[channels_config.synobotchat]`
 - `[channels_config.email]`
 - `[channels_config.nostr]`
 

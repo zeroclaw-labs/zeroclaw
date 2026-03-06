@@ -92,8 +92,8 @@ impl Tool for CronAddTool {
                     "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "napcat", "lark", "feishu", "email"], "description": "Channel type to deliver to" },
-                        "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
+                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "qq", "napcat", "lark", "feishu", "email", "synobotchat"], "description": "Channel type to deliver to" },
+                        "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, SynoChat user ID, etc." },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }
                 },

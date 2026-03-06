@@ -4,7 +4,7 @@ use crate::channels::LarkChannel;
 use crate::channels::MatrixChannel;
 use crate::channels::{
     Channel, DingTalkChannel, DiscordChannel, EmailChannel, MattermostChannel, NapcatChannel,
-    QQChannel, SendMessage, SlackChannel, TelegramChannel, WhatsAppChannel,
+    QQChannel, SendMessage, SlackChannel, SynoBotChatChannel, TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -537,6 +537,19 @@ pub(crate) async fn deliver_announcement(
             {
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
             }
+        }
+        "synobotchat" => {
+            let syno = config
+                .channels_config
+                .synobotchat
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("synobotchat channel not configured"))?;
+            let channel = SynoBotChatChannel::new(
+                syno.base_url.clone(),
+                syno.token.clone(),
+                syno.allowed_user_ids.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

@@ -37,6 +37,7 @@ pub mod nostr;
 pub mod qq;
 pub mod signal;
 pub mod slack;
+pub mod synobotchat;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
@@ -69,6 +70,7 @@ pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
+pub use synobotchat::SynoBotChatChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use wati::WatiChannel;
@@ -5467,6 +5469,17 @@ fn collect_configured_channels(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
                 nc.allowed_users.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref syno) = config.channels_config.synobotchat {
+        channels.push(ConfiguredChannel {
+            display_name: "SynoBotChat",
+            channel: Arc::new(SynoBotChatChannel::new(
+                syno.base_url.clone(),
+                syno.token.clone(),
+                syno.allowed_user_ids.clone(),
             )),
         });
     }

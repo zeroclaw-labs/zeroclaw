@@ -393,6 +393,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
                 }
             },
         },
+        IntegrationEntry {
+            name: "SynoBotChat",
+            description: "Synology Chat bot webhook",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.synobotchat.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
         // ── AI Models ───────────────────────────────────────────
         IntegrationEntry {
             name: "OpenRouter",

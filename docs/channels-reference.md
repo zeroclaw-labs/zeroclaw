@@ -149,6 +149,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | Napcat | websocket receive + HTTP send (OneBot) | No (typically local/LAN) |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
 | WATI | webhook (`/wati`) | Yes (public HTTPS callback) |
+| SynoBotChat | webhook (`/synobotchat`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
 | ACP | stdio (JSON-RPC 2.0) | No |
 | Nostr | relay websocket (NIP-04 / NIP-17) | No |
@@ -166,6 +167,7 @@ For channels with inbound sender allowlists:
 Field names differ by channel:
 
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Napcat/Nextcloud Talk/ACP)
+- `allowed_user_ids` (SynoBotChat)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp/WATI)
 - `allowed_senders` (Email/Linq)
@@ -568,7 +570,37 @@ Notes:
   - `Authorization: Bearer <webhook_secret>` fallback
 - `ZEROCLAW_WATI_WEBHOOK_SECRET` overrides `webhook_secret` when set.
 
-### 4.21 ACP
+### 4.21 SynoBotChat
+
+```toml
+[channels_config.synobotchat]
+base_url = "https://chat.example.com"
+token = "synology-chat-bot-token"
+allowed_user_ids = ["*"] # empty = deny all, "*" = allow all
+```
+
+Notes:
+
+- Inbound webhook endpoint: `POST /synobotchat`.
+- Required config keys:
+  - `base_url` (no default)
+  - `token` (no default)
+- Webhook auth is enforced via a shared secret:
+  - Provide `token=<...>` as either a URL query parameter or a form field.
+  - Requests with missing/mismatched tokens are rejected with `401`.
+- Sender allowlist is fail-closed:
+  - If `allowed_user_ids = []` (the default), all inbound messages are ignored.
+  - If the sender is not allowlisted, the webhook still returns `200 {"status":"ok"}` but does no agent work.
+- `base_url` is normalized by trimming a trailing `/`.
+- Outbound sends use Synology Chat External API and include `token` in the request URL; treat it as a secret and rotate it if it leaks.
+- Outbound recipients:
+  - Use the Synology Chat `user_id` as the recipient/target (the same value the webhook provides in `user_id`).
+- Rollout/rollback guidance:
+  - Token changes are not backwards-compatible (only one token is accepted). Update Synology bot settings and ZeroClaw config together.
+  - Removing `[channels_config.synobotchat]` disables the channel cleanly.
+  - Downgrading ZeroClaw to a version without SynoBotChat support should be safe: unknown channel tables are ignored by the config loader.
+
+### 4.22 ACP
 
 ACP (Agent Client Protocol) enables ZeroClaw to act as a client for OpenCode ACP server,
 allowing remote control of OpenCode behavior through JSON-RPC 2.0 communication over stdio.
