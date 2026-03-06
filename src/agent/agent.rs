@@ -5,8 +5,8 @@ use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, Loop
 use crate::agent::loop_::history::{extract_facts_from_turns, TurnBuffer};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::agent::research;
-use crate::config::{Config, ResearchPhaseConfig};
+use crate::agent::research::{self, ResearchPhaseConfig};
+use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -301,7 +301,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -316,6 +316,18 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+
+        // Register skill tools as native function-calling tools
+        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
+        let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security));
+        if !skill_tools.is_empty() {
+            tracing::info!("Registered {} native skill tool(s)", skill_tools.len());
+            tools.extend(skill_tools);
+        }
+
+        let (tools, _bg_job_store) = tools::add_bg_tools(tools);
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        tracing::info!(count = tools.len(), "Agent tools after add_bg_tools: {:?}", tool_names);
         let (tools, tool_filter_report) = tools::filter_primary_agent_tools(
             tools,
             &config.agent.allowed_tools,
@@ -403,7 +415,7 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
-            .research_config(config.research.clone())
+            .research_config(config.research.clone().into())
             .build()
     }
 

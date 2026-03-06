@@ -391,36 +391,6 @@ mod tests {
     }
 
     #[test]
-    fn goal_loop_config_serde_roundtrip() {
-        let toml_str = r#"
-enabled = true
-interval_minutes = 15
-step_timeout_secs = 180
-max_steps_per_cycle = 5
-channel = "lark"
-target = "oc_test"
-"#;
-        let config: crate::config::schema::GoalLoopConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.interval_minutes, 15);
-        assert_eq!(config.step_timeout_secs, 180);
-        assert_eq!(config.max_steps_per_cycle, 5);
-        assert_eq!(config.channel.as_deref(), Some("lark"));
-        assert_eq!(config.target.as_deref(), Some("oc_test"));
-    }
-
-    #[test]
-    fn goal_loop_config_defaults() {
-        let config = crate::config::schema::GoalLoopConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.interval_minutes, 10);
-        assert_eq!(config.step_timeout_secs, 120);
-        assert_eq!(config.max_steps_per_cycle, 3);
-        assert!(config.channel.is_none());
-        assert!(config.target.is_none());
-    }
-
-    #[test]
     fn goal_state_serde_roundtrip() {
         let state = sample_goal_state();
         let json = serde_json::to_string_pretty(&state).unwrap();

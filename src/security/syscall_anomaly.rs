@@ -4,7 +4,7 @@
 //! syscall-related telemetry hints (seccomp/audit lines), and raises alerts
 //! when the observed pattern deviates from the configured baseline.
 
-use crate::config::{AuditConfig, SyscallAnomalyConfig};
+use crate::config::AuditConfig;
 use crate::security::audit::{AuditEvent, AuditEventType, AuditLogger};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -16,6 +16,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Configuration for the syscall anomaly detector.
+/// Re-export from config::schema to avoid duplicate definitions.
+pub use crate::config::schema::SyscallAnomalyConfig;
 
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_ALERT_SAMPLE_CHARS: usize = 240;

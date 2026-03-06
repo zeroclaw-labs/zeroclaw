@@ -191,9 +191,7 @@ impl SemanticGuard {
             }
         };
 
-        let Some(entry) = entries.into_iter().next() else {
-            return None;
-        };
+        let entry = entries.into_iter().next()?;
 
         let score = entry.score.unwrap_or(0.0);
         if score < self.threshold {
