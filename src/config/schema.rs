@@ -3500,12 +3500,28 @@ pub enum GroupReplyMode {
     MentionOnly,
     /// Reply to every message in group chats.
     AllMessages,
+    /// Reply when the bot is @-mentioned OR when a user replies directly to
+    /// one of the bot's own messages in a group chat.
+    ///
+    /// **Default:** Not set by default; opt-in by setting `group_reply.mode = "mention_or_reply"`
+    /// in `config.toml`.
+    ///
+    /// **Compatibility:** This value is only active when explicitly configured via
+    /// `group_reply.mode = "mention_or_reply"`. Older ZeroClaw versions that do not
+    /// recognise this variant will **fail config deserialization** with an error on
+    /// startup — they will not silently fall back. Downgrading requires removing or
+    /// changing this value first.
+    ///
+    /// **Rollback:** Change `group_reply.mode` back to `"mention_only"` or `"all_messages"`
+    /// (or remove the key entirely to restore default behaviour) and restart the daemon.
+    /// No data migration is required.
+    MentionOrReply,
 }
 
 impl GroupReplyMode {
     #[must_use]
     pub fn requires_mention(self) -> bool {
-        matches!(self, Self::MentionOnly)
+        matches!(self, Self::MentionOnly | Self::MentionOrReply)
     }
 }
 
