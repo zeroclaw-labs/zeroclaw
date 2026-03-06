@@ -186,6 +186,11 @@ Examples:
         #[arg(short, long)]
         message: Option<String>,
 
+        /// Session ID for -m mode: loads this session's history and saves messages into it.
+        /// Enables stateful multi-call workflows: zeroclaw agent -m "..." --session-id my-task
+        #[arg(long)]
+        session_id: Option<String>,
+
         /// Provider to use (openrouter, anthropic, openai, openai-codex)
         #[arg(short, long)]
         provider: Option<String>,
@@ -915,6 +920,7 @@ async fn main() -> Result<()> {
 
         Commands::Agent {
             message,
+            session_id,
             provider,
             model,
             temperature,
@@ -947,6 +953,7 @@ async fn main() -> Result<()> {
             Box::pin(agent::run(
                 config,
                 message,
+                session_id,
                 provider,
                 model,
                 temperature,
