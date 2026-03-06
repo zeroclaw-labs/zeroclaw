@@ -97,7 +97,14 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
             };
 
             // Preserve first 4 chars for context, then redact.
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Use char_indices to find the correct byte boundary for char-safe slicing,
+            // avoiding panics on multi-byte (e.g. CJK) characters.
+            let prefix = if val.chars().count() > 4 {
+                let end = val.char_indices().nth(4).map(|(i, _)| i).unwrap_or(val.len());
+                &val[..end]
+            } else {
+                ""
+            };
 
             format!("{key}{delimiter}{quote}{prefix}*[REDACTED]{quote}")
         })
@@ -5650,6 +5657,15 @@ Let me check the result."#;
         let input = r#"api_key="short""#;
         let result = scrub_credentials(input);
         assert_eq!(result, input, "short values should not be redacted");
+    }
+
+    #[test]
+    fn scrub_credentials_multibyte_cjk_no_panic() {
+        // CJK characters are 3 bytes each; byte-slicing at index 4 would panic.
+        // This test verifies we get a safe 4-char prefix without panicking.
+        let input = r#"token="令牌测试密钥凭证八九""#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains(r#"token="令牌测试*[REDACTED]""#));
     }
 
     // ─────────────────────────────────────────────────────────────────────

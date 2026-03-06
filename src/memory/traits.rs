@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 /// A single memory entry
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,26 +50,55 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
-impl Serialize for MemoryCategory {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
+impl serde::Serialize for MemoryCategory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Core => serializer.serialize_str("core"),
+            Self::Daily => serializer.serialize_str("daily"),
+            Self::Conversation => serializer.serialize_str("conversation"),
+            Self::Custom(name) => {
+                // Prefix reserved names and values already starting with "custom:" to prevent
+                // round-trip ambiguity:
+                //   Custom("core")       → "custom:core"       (avoids colliding with Core)
+                //   Custom("custom:foo") → "custom:custom:foo" (avoids stripping the prefix on
+                //                                               deserialization)
+                let needs_prefix = matches!(name.as_str(), "core" | "daily" | "conversation")
+                    || name.starts_with("custom:");
+                let encoded = if needs_prefix {
+                    format!("custom:{name}")
+                } else {
+                    name.clone()
+                };
+                serializer.serialize_str(&encoded)
+            }
+        }
     }
 }
 
-impl<'de> Deserialize<'de> for MemoryCategory {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "core" => Self::Core,
-            "daily" => Self::Daily,
-            "conversation" => Self::Conversation,
-            other => Self::Custom(other.to_string()),
+// Wire type for MemoryCategory deserialization.
+// Accepts two forms:
+//   plain string → built-in variants or Custom
+//   {"custom": "value"} → Custom (legacy format produced by the old serde derive)
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum MemoryCategoryWire {
+    Name(String),
+    LegacyCustom { custom: String },
+}
+
+impl<'de> serde::Deserialize<'de> for MemoryCategory {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match MemoryCategoryWire::deserialize(deserializer)? {
+            MemoryCategoryWire::Name(s) => match s.as_str() {
+                "core" => Self::Core,
+                "daily" => Self::Daily,
+                "conversation" => Self::Conversation,
+                other if other.starts_with("custom:") => {
+                    Self::Custom(other["custom:".len()..].to_string())
+                }
+                other => Self::Custom(other.to_string()),
+            },
+            MemoryCategoryWire::LegacyCustom { custom } => Self::Custom(custom),
         })
     }
 }
@@ -160,6 +189,34 @@ mod tests {
             serde_json::from_str::<MemoryCategory>("\"travel\"").unwrap(),
             MemoryCategory::Custom("travel".into())
         );
+    }
+
+    #[test]
+    fn memory_category_custom_reserved_name_roundtrips() {
+        // Custom("core") must not deserialize into Core
+        let v = MemoryCategory::Custom("core".into());
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, "\"custom:core\"");
+        let parsed: MemoryCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, MemoryCategory::Custom("core".into()));
+    }
+
+    #[test]
+    fn memory_category_custom_prefixed_name_roundtrips() {
+        // Custom("custom:foo") must not lose the prefix during round-trip
+        let v = MemoryCategory::Custom("custom:foo".into());
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, "\"custom:custom:foo\"");
+        let parsed: MemoryCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, MemoryCategory::Custom("custom:foo".into()));
+    }
+
+    #[test]
+    fn memory_category_legacy_object_format_deserializes() {
+        // Legacy {"custom": "value"} produced by old serde derive
+        let legacy_json = r#"{"custom": "project_notes"}"#;
+        let parsed: MemoryCategory = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed, MemoryCategory::Custom("project_notes".into()));
     }
 
     #[test]
