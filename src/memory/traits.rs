@@ -50,6 +50,8 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
+const CUSTOM_CATEGORY_PREFIX: &str = "custom:";
+
 impl serde::Serialize for MemoryCategory {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -57,15 +59,15 @@ impl serde::Serialize for MemoryCategory {
             Self::Daily => serializer.serialize_str("daily"),
             Self::Conversation => serializer.serialize_str("conversation"),
             Self::Custom(name) => {
-                // Prefix reserved names and values already starting with "custom:" to prevent
-                // round-trip ambiguity:
+                // Prefix reserved names and values already starting with CUSTOM_CATEGORY_PREFIX
+                // to prevent round-trip ambiguity:
                 //   Custom("core")       → "custom:core"       (avoids colliding with Core)
                 //   Custom("custom:foo") → "custom:custom:foo" (avoids stripping the prefix on
                 //                                               deserialization)
                 let needs_prefix = matches!(name.as_str(), "core" | "daily" | "conversation")
-                    || name.starts_with("custom:");
+                    || name.starts_with(CUSTOM_CATEGORY_PREFIX);
                 let encoded = if needs_prefix {
-                    format!("custom:{name}")
+                    format!("{CUSTOM_CATEGORY_PREFIX}{name}")
                 } else {
                     name.clone()
                 };
@@ -93,8 +95,8 @@ impl<'de> serde::Deserialize<'de> for MemoryCategory {
                 "core" => Self::Core,
                 "daily" => Self::Daily,
                 "conversation" => Self::Conversation,
-                other if other.starts_with("custom:") => {
-                    Self::Custom(other["custom:".len()..].to_string())
+                other if other.starts_with(CUSTOM_CATEGORY_PREFIX) => {
+                    Self::Custom(other[CUSTOM_CATEGORY_PREFIX.len()..].to_string())
                 }
                 other => Self::Custom(other.to_string()),
             },
