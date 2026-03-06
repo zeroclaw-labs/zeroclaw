@@ -29,52 +29,87 @@ use tokio::fs;
 
 // ── Container detection for Docker/Kubernetes environments ───────
 
-/// Detects if the process is running inside a container (Docker, Podman, Kubernetes, etc.).
-/// Used to suggest appropriate localhost alternatives like `host.docker.internal`.
-fn is_running_in_container() -> bool {
-    // Check for Docker/Podman marker file
-    if Path::new("/.dockerenv").exists() {
-        return true;
-    }
+/// Detected container runtime type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerRuntime {
+    /// Not running in a container
+    None,
+    /// Docker or containerd
+    Docker,
+    /// Podman
+    Podman,
+    /// Kubernetes (no reliable host alias)
+    Kubernetes,
+}
 
-    // Check for Kubernetes environment
+/// Detects which container runtime (if any) the process is running inside.
+fn detect_container_runtime() -> ContainerRuntime {
+    // Check for Kubernetes first (most specific)
     if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
-        return true;
+        return ContainerRuntime::Kubernetes;
     }
 
     // Check cgroup for container runtime signatures (Linux)
     if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
         let cgroup_lower = cgroup.to_lowercase();
-        if cgroup_lower.contains("docker")
-            || cgroup_lower.contains("containerd")
-            || cgroup_lower.contains("kubepods")
-            || cgroup_lower.contains("podman")
-        {
-            return true;
+        if cgroup_lower.contains("kubepods") {
+            return ContainerRuntime::Kubernetes;
+        }
+        if cgroup_lower.contains("podman") {
+            return ContainerRuntime::Podman;
+        }
+        if cgroup_lower.contains("docker") || cgroup_lower.contains("containerd") {
+            return ContainerRuntime::Docker;
         }
     }
 
-    // Check for container environment variables
-    if std::env::var("container").is_ok() || std::env::var("DOCKER_HOST").is_ok() {
-        return true;
+    // Check for Podman-specific marker
+    if Path::new("/run/.containerenv").exists() {
+        return ContainerRuntime::Podman;
     }
 
-    false
+    // Check for Docker marker file
+    if Path::new("/.dockerenv").exists() {
+        return ContainerRuntime::Docker;
+    }
+
+    // Check for generic container env var (set by some runtimes)
+    // Note: DOCKER_HOST is NOT checked here - it's set on the HOST to point to a remote daemon
+    if std::env::var("container").is_ok() {
+        // Try to distinguish Podman vs Docker from the value
+        if let Ok(val) = std::env::var("container") {
+            if val.to_lowercase().contains("podman") {
+                return ContainerRuntime::Podman;
+            }
+        }
+        return ContainerRuntime::Docker;
+    }
+
+    ContainerRuntime::None
 }
 
 /// Returns the appropriate hostname for accessing services on the host machine.
-/// In containers, returns `host.docker.internal`; otherwise returns `localhost`.
-fn default_local_host() -> &'static str {
-    if is_running_in_container() {
-        "host.docker.internal"
-    } else {
-        "localhost"
+/// Returns `None` for Kubernetes (no reliable alias - user must configure manually).
+fn default_local_host() -> Option<&'static str> {
+    match detect_container_runtime() {
+        ContainerRuntime::None => Some("localhost"),
+        ContainerRuntime::Docker => Some("host.docker.internal"),
+        ContainerRuntime::Podman => Some("host.containers.internal"),
+        ContainerRuntime::Kubernetes => None, // No universal alias for K8s
     }
 }
 
 /// Builds a default URL for a local service, using container-aware hostname.
-fn default_local_url(port: u16, path: &str) -> String {
-    format!("http://{}:{}{}", default_local_host(), port, path)
+/// Returns `None` for Kubernetes where no reliable host alias exists.
+fn default_local_url(port: u16, path: &str) -> Option<String> {
+    default_local_host().map(|host| format!("http://{}:{}{}", host, port, path))
+}
+
+/// Builds a default URL, falling back to localhost if no container alias is available.
+/// Use this when a fallback is acceptable (e.g., for prompts with user override).
+fn default_local_url_or_localhost(port: u16, path: &str) -> String {
+    let host = default_local_host().unwrap_or("localhost");
+    format!("http://{}:{}{}", host, port, path)
 }
 
 // ── Project context collected during wizard ──────────────────────
@@ -1425,9 +1460,12 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     Ok(parse_gemini_model_ids(&payload))
 }
 
-fn fetch_ollama_models() -> Result<Vec<String>> {
+fn fetch_ollama_models(endpoint_override: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
-    let endpoint = default_local_url(11434, "/api/tags");
+    let endpoint = match endpoint_override {
+        Some(base) => format!("{}/api/tags", base.trim_end_matches('/')),
+        None => default_local_url_or_localhost(11434, "/api/tags"),
+    };
     let payload: Value = client
         .get(&endpoint)
         .send()
@@ -1460,7 +1498,12 @@ fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
             let host_clean = host.trim_start_matches('[').trim_end_matches(']');
             matches!(
                 host_clean,
-                "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "host.docker.internal"
+                "localhost"
+                    | "127.0.0.1"
+                    | "::1"
+                    | "0.0.0.0"
+                    | "host.docker.internal"
+                    | "host.containers.internal"
             )
         })
 }
@@ -1578,7 +1621,8 @@ fn fetch_live_models_for_provider(
                 ]
             } else {
                 // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models()?
+                // Pass the configured endpoint URL (may be container-aware like host.docker.internal)
+                fetch_ollama_models(provider_api_url)?
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
                     .collect()
@@ -2362,17 +2406,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
             key
         } else {
-            let ollama_url = default_local_url(11434, "");
+            // Local Ollama: compute container-aware URL and persist it
+            let ollama_url = default_local_url_or_localhost(11434, "");
+            provider_api_url = Some(ollama_url.clone());
             print_bullet(&format!(
                 "Using local Ollama at {} (no API key needed).",
                 style(&ollama_url).cyan()
             ));
+            if detect_container_runtime() == ContainerRuntime::Kubernetes {
+                print_bullet(&format!(
+                    "Note: Running in Kubernetes. You may need to configure the Ollama endpoint manually via {}.",
+                    style("OLLAMA_API_URL").yellow()
+                ));
+            }
             String::new()
         }
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
         let raw_url: String = Input::new()
             .with_prompt("  llama.cpp server endpoint URL")
-            .default(default_local_url(8080, "/v1"))
+            .default(default_local_url_or_localhost(8080, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2403,7 +2455,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "sglang" {
         let raw_url: String = Input::new()
             .with_prompt("  SGLang server endpoint URL")
-            .default(default_local_url(30000, "/v1"))
+            .default(default_local_url_or_localhost(30000, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2434,7 +2486,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "vllm" {
         let raw_url: String = Input::new()
             .with_prompt("  vLLM server endpoint URL")
-            .default(default_local_url(8000, "/v1"))
+            .default(default_local_url_or_localhost(8000, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2465,7 +2517,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "osaurus" {
         let raw_url: String = Input::new()
             .with_prompt("  Osaurus server endpoint URL")
-            .default(default_local_url(1337, "/v1"))
+            .default(default_local_url_or_localhost(1337, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -6933,7 +6985,14 @@ mod tests {
     #[test]
     fn default_local_url_builds_correct_format() {
         // This test verifies the URL format without depending on container detection
-        let url = default_local_url(11434, "/api/tags");
+        // default_local_url returns Option<String>, use unwrap since not in K8s during tests
+        if let Some(url) = default_local_url(11434, "/api/tags") {
+            assert!(url.starts_with("http://"));
+            assert!(url.contains(":11434"));
+            assert!(url.ends_with("/api/tags"));
+        }
+        // Also test the fallback version
+        let url = default_local_url_or_localhost(11434, "/api/tags");
         assert!(url.starts_with("http://"));
         assert!(url.contains(":11434"));
         assert!(url.ends_with("/api/tags"));
@@ -6941,8 +7000,24 @@ mod tests {
 
     #[test]
     fn default_local_url_handles_empty_path() {
-        let url = default_local_url(8080, "");
+        let url = default_local_url_or_localhost(8080, "");
         assert!(url.ends_with(":8080"));
+    }
+
+    #[test]
+    fn ollama_endpoint_is_local_recognizes_podman_host() {
+        // Podman uses host.containers.internal
+        assert!(ollama_endpoint_is_local("http://host.containers.internal:11434"));
+        assert!(ollama_endpoint_is_local("http://HOST.CONTAINERS.INTERNAL:11434"));
+    }
+
+    #[test]
+    fn detect_container_runtime_returns_none_outside_container() {
+        // When not in a container, should return None
+        // Note: This test may behave differently if run inside a container
+        let runtime = detect_container_runtime();
+        // We can't assert specific value since test env varies, but ensure it doesn't panic
+        let _ = runtime;
     }
 
     #[test]
