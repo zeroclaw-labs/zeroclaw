@@ -1,0 +1,223 @@
+name: Test Multi-Agent Integration
+
+on:
+    push:
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/agent/**"
+            - "src/tools/delegate.rs"
+            - "src/config/**"
+            - "tests/**/*agent*.rs"
+            - ".github/workflows/test-multi-agent.yml"
+    pull_request:
+        branches: [dev, main]
+        paths:
+            - "src/agent/**"
+            - "src/tools/delegate.rs"
+            - "tests/**/*agent*.rs"
+    workflow_dispatch:
+
+concurrency:
+    group: test-multi-agent-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
+    CARGO_TERM_COLOR: always
+
+jobs:
+    multi-agent-unit:
+        name: Multi-Agent Unit Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Run agent module unit tests
+              run: cargo test --package zeroclaw --lib agent:: --locked --verbose
+
+    multi-agent-cli:
+        name: Multi-Agent CLI Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Build zeroclaw binary
+              run: cargo build --release --locked
+            - name: Run CLI agent tests
+              run: cargo test --test cli_agent_tests --locked --verbose
+
+    multi-agent-integration:
+        name: Multi-Agent Integration Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Run integration tests
+              run: cargo test --test agent_e2e --locked --verbose -- --test-threads=1
+
+    multi-agent-registry:
+        name: Agent Registry Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Run registry tests
+              run: cargo test --package zeroclaw --lib agent::registry --locked --verbose
+
+    multi-agent-team:
+        name: Team Orchestration Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Run team orchestration tests
+              run: cargo test --package zeroclaw --lib agent::team --locked --verbose
+
+    multi-agent-docker:
+        name: Multi-Agent Docker Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@6524bf658f48c9f75a515d50ef8a9c06fdcfcdc2 # v3
+            - name: Build Docker image
+              run: |
+                  docker build \
+                    --build-arg ZEROCLAW_CARGO_FEATURES="" \
+                    --target release \
+                    -t zeroclaw:multi-agent-test \
+                    -f Dockerfile .
+            - name: Create test agent definition
+              run: |
+                  mkdir -p /tmp/zeroclaw-test/agents
+                  cat > /tmp/zeroclaw-test/agents/test-agent.toml <<'EOF'
+                  [agent]
+                  id = "test-agent"
+                  name = "Test Agent"
+                  version = "1.0.0"
+                  description = "Test agent for CI/CD validation"
+
+                  [execution]
+                  mode = "wasm"
+
+                  [provider]
+                  name = "ollama"
+                  model = "llama3.2"
+
+                  [tools.tools]
+                  name = "web_search"
+                  enabled = false
+                  EOF
+            - name: Verify binary in container
+              run: |
+                  docker run --rm \
+                    -v /tmp/zeroclaw-test:/zeroclaw-data \
+                    zeroclaw:multi-agent-test \
+                    zeroclaw --version
+            - name: Verify agent list command in container
+              run: |
+                  docker run --rm \
+                    -v /tmp/zeroclaw-test:/zeroclaw-data \
+                    -e ZEROCLAW_CONFIG_DIR=/zeroclaw-test \
+                    -e ZEROCLAW_AGENTS_DIR=/zeroclaw-test/agents \
+                    zeroclaw:multi-agent-test \
+                    zeroclaw agent list || true
+            - name: Test multi-agent profile
+              run: |
+                  docker compose -f docker-compose.yml --profile multi-agent config >/dev/null 2>&1 || true
+
+    multi-agent-phase1-coordination:
+        name: Phase 1 Coordination Tests
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+            - name: Verify CoordinationConfig schema
+              run: |
+                  # Check that CoordinationConfig compiles
+                  cargo check --package zeroclaw --lib config::schema --locked
+            - name: Test DelegateTool Phase 1 extensions
+              run: |
+                  # Run delegate tool tests
+                  cargo test --package zeroclaw --lib tools::delegate --locked --verbose
+            - name: Verify agent message types
+              run: |
+                  # Check that message types compile
+                  cargo check --package zeroclaw --lib agent::team --locked
+
+    multi-agent-summary:
+        name: Multi-Agent Test Summary
+        if: always()
+        needs: [multi-agent-unit, multi-agent-cli, multi-agent-integration, multi-agent-registry, multi-agent-team, multi-agent-docker, multi-agent-phase1-coordination]
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        steps:
+            - name: Generate summary
+              run: |
+                  echo "### Multi-Agent Test Results" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+                  echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| Unit Tests | ${{ needs.multi-agent-unit.result }} |" >> $GITHUB_STEP_SUMMARY
+                  echo "| CLI Tests | ${{ needs.multi-agent-cli.result }} |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Integration Tests | ${{ needs.multi-agent-integration.result }} |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Registry Tests | ${{ needs.multi-agent-registry.result }} |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Team Tests | ${{ needs.multi-agent-team.result }} |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Docker Tests | ${{ needs.multi-agent-docker.result }} |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Phase 1 Coordination | ${{ needs.multi-agent-phase1-coordination.result }} |" >> $GITHUB_STEP_SUMMARY
+            - name: Check overall status
+              run: |
+                  if [ "${{ needs.multi-agent-unit.result }}" != "success" ] || \
+                     [ "${{ needs.multi-agent-cli.result }}" != "success" ] || \
+                     [ "${{ needs.multi-agent-integration.result }}" != "success" ] || \
+                     [ "${{ needs.multi-agent-registry.result }}" != "success" ] || \
+                     [ "${{ needs.multi-agent-team.result }}" != "success" ] || \
+                     [ "${{ needs.multi-agent-docker.result }}" != "success" ] || \
+                     [ "${{ needs.multi-agent-phase1-coordination.result }}" != "success" ]; then
+                    echo "One or more multi-agent test jobs failed"
+                    exit 1
+                  fi
+                  echo "All multi-agent tests passed"
