@@ -2490,6 +2490,7 @@ async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    excluded_key: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
@@ -2506,6 +2507,10 @@ async fn build_memory_context(
             }
 
             if should_skip_memory_context_entry(&entry.key, &entry.content) {
+                continue;
+            }
+
+            if excluded_key.is_some_and(|key| entry.key == key) {
                 continue;
             }
 
@@ -3079,18 +3084,22 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-        let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                None,
-            )
-            .await;
-    }
+    let autosave_key =
+        if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            let autosave_key = conversation_memory_key(&msg);
+            let _ = ctx
+                .memory
+                .store(
+                    &autosave_key,
+                    &msg.content,
+                    crate::memory::MemoryCategory::Conversation,
+                    None,
+                )
+                .await;
+            Some(autosave_key)
+        } else {
+            None
+        };
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
@@ -3127,8 +3136,13 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            autosave_key.as_deref(),
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{timestamped_content}");
@@ -9515,9 +9529,36 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_excludes_current_autosave_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let current_key = "telegram_alice_msg-1";
+        let image_input = "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nDescribe this image";
+
+        mem.store(current_key, image_input, MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        let context = build_memory_context(&mem, image_input, 0.0, Some(current_key)).await;
+        assert!(
+            context.trim().is_empty(),
+            "current autosave key should be excluded from immediate recall"
+        );
+
+        let merged_user_content = format!("{context}{image_input}");
+        let marker_count =
+            crate::multimodal::count_image_markers(&[ChatMessage::user(&merged_user_content)]);
+        assert_eq!(
+            marker_count, 1,
+            "first turn should keep a single image marker without duplication"
+        );
     }
 
     #[tokio::test]
