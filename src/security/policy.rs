@@ -1401,6 +1401,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create temp workspace");
         let workspace_path = workspace.path().to_path_buf();
         let _ = std::fs::create_dir_all(workspace_path.join("images"));
+        // Canonicalize the tempdir root so the absolute child path and workspace_dir
+        // share the same normalized prefix across macOS and Linux CI.
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.clone());
@@ -1416,8 +1418,6 @@ mod tests {
                 .to_string_lossy()
                 .as_ref()
         ));
-
-        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
