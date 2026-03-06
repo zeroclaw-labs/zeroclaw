@@ -7201,6 +7201,23 @@ fn decrypt_channel_secrets(
             "config.channels_config.lark.verification_token",
         )?;
     }
+    if let Some(ref mut feishu) = channels.feishu {
+        decrypt_secret(
+            store,
+            &mut feishu.app_secret,
+            "config.channels_config.feishu.app_secret",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut feishu.encrypt_key,
+            "config.channels_config.feishu.encrypt_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut feishu.verification_token,
+            "config.channels_config.feishu.verification_token",
+        )?;
+    }
     if let Some(ref mut dingtalk) = channels.dingtalk {
         decrypt_secret(
             store,
