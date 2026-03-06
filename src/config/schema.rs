@@ -1234,6 +1234,8 @@ pub struct SkillsConfig {
     /// Optional allowlist of canonical directory roots for workspace skill symlink targets.
     /// Symlinked workspace skills are rejected unless their resolved targets are under one
     /// of these roots. Accepts absolute paths and `~/` home-relative paths.
+    /// When empty (default), the workspace directory is used as the only trusted root so that
+    /// all skills under the workspace (including symlinks pointing under workspace) are allowed.
     #[serde(default)]
     pub trusted_skill_roots: Vec<String>,
     /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).

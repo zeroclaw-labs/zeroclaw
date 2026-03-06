@@ -1377,6 +1377,29 @@ pub async fn run_tool_call_loop(
             hooks.fire_llm_input(history, active_model.as_str()).await;
         }
 
+        // Debug: request to model (prompt); sensitive; only when RUST_LOG includes debug/trace.
+        const DEBUG_MAX_CONTENT_LEN: usize = 2000;
+        let tools_count = request_tools.map(|t| t.len()).unwrap_or(0);
+        tracing::debug!(
+            target: "zeroclaw::debug",
+            model = %active_model,
+            temperature,
+            iteration = iteration + 1,
+            message_count = request_messages.len(),
+            tools_count,
+            "request to model (prompt)"
+        );
+        for (i, msg) in request_messages.iter().enumerate() {
+            let content_preview = truncate_with_ellipsis(&msg.content, DEBUG_MAX_CONTENT_LEN);
+            tracing::debug!(
+                target: "zeroclaw::debug",
+                index = i,
+                role = %msg.role,
+                content = %content_preview,
+                "prompt message"
+            );
+        }
+
         let chat_future = provider.chat(
             ChatRequest {
                 messages: &request_messages,
@@ -1404,6 +1427,25 @@ pub async fn run_tool_call_loop(
             parse_issue_detected,
         ) = match chat_result {
             Ok(resp) => {
+                // Debug: model response; sensitive; only when RUST_LOG includes debug/trace.
+                let response_text_preview = truncate_with_ellipsis(
+                    &resp.text_or_empty(),
+                    DEBUG_MAX_CONTENT_LEN,
+                );
+                tracing::debug!(
+                    target: "zeroclaw::debug",
+                    text_preview = %response_text_preview,
+                    tool_calls_count = resp.tool_calls.len(),
+                    "model response"
+                );
+                if let Some(rc) = &resp.reasoning_content {
+                    tracing::debug!(
+                        target: "zeroclaw::debug",
+                        reasoning_preview = %truncate_with_ellipsis(rc, DEBUG_MAX_CONTENT_LEN),
+                        "model reasoning"
+                    );
+                }
+
                 let mut response_text = resp.text_or_empty().to_string();
                 let mut native_calls = resp.tool_calls;
                 let mut reasoning_content = resp.reasoning_content.clone();
@@ -3086,6 +3128,12 @@ pub async fn process_message_with_session(
     message: &str,
     session_id: Option<&str>,
 ) -> Result<String> {
+    // Debug: user raw request from client (sensitive; only when RUST_LOG includes debug/trace).
+    tracing::debug!(
+        target: "zeroclaw::debug",
+        user_message = %message,
+        "user raw request"
+    );
     if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
         tracing::warn!("plugin registry initialization skipped: {error}");
     }

@@ -133,6 +133,16 @@ fn resolve_trusted_skill_roots(workspace_dir: &Path, raw_roots: &[String]) -> Ve
     let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     let mut resolved = Vec::new();
 
+    // When no roots are configured, default to the workspace directory so that all skills
+    // under the workspace (including symlinks whose targets are under workspace) are allowed.
+    if raw_roots.is_empty() {
+        if let Ok(canonical) = workspace_dir.canonicalize() {
+            if canonical.is_dir() {
+                resolved.push(canonical);
+            }
+        }
+    }
+
     for raw in raw_roots {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
