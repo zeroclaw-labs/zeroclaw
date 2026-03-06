@@ -4645,6 +4645,10 @@ fn collect_configured_channels(
                 dt.client_id.clone(),
                 dt.client_secret.clone(),
                 dt.allowed_users.clone(),
+                dt.message_type,
+                dt.card_template_id.clone(),
+                dt.robot_code.clone(),
+                dt.card_template_key.clone(),
             )),
         });
     }

@@ -331,7 +331,18 @@ Hành vi token runtime:
 client_id = "ding-app-key"
 client_secret = "ding-app-secret"
 allowed_users = ["*"]
+
+# Tùy chọn: bật phản hồi streaming bằng template card
+message_type = "card"                  # "markdown" (mặc định) hoặc "card"
+card_template_id = "tpl_xxxxx"         # bắt buộc khi message_type = "card"
+card_template_key = "content"          # tùy chọn; mặc định "content" nếu bỏ qua
+robot_code = "ding-robot-code"         # tùy chọn, mặc định dùng client_id
 ```
+
+Ghi chú:
+
+- Chế độ card streaming chỉ bật khi `message_type = "card"` và có `card_template_id`.
+- Nếu finalize card thất bại, ZeroClaw sẽ thử fallback về markdown qua webhook trong cùng phiên.
 
 ### 4.13 QQ
 

@@ -449,7 +449,18 @@ Runtime token behavior:
 client_id = "ding-app-key"
 client_secret = "ding-app-secret"
 allowed_users = ["*"]
+
+# Optional: enable template-card streaming replies
+message_type = "card"                  # "markdown" (default) or "card"
+card_template_id = "tpl_xxxxx"         # required when message_type = "card"
+card_template_key = "content"          # optional; defaults to "content" when omitted
+robot_code = "ding-robot-code"         # optional, falls back to client_id when omitted
 ```
+
+Notes:
+
+- Card streaming is enabled only when `message_type = "card"` and `card_template_id` is set.
+- If card streaming fails at finalize, ZeroClaw attempts markdown webhook fallback for the same session.
 
 ### 4.15 QQ
 
