@@ -1497,12 +1497,15 @@ async fn handle_whatsapp_message(
             Ok(response) => {
                 let safe_response =
                     sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-                // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(safe_response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send WhatsApp reply: {e}");
+                // Skip delivery for suppressed responses (e.g., HEARTBEAT_OK sentinel)
+                if !safe_response.trim().is_empty() {
+                    // Send reply via WhatsApp
+                    if let Err(e) = wa
+                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send WhatsApp reply: {e}");
+                    }
                 }
             }
             Err(e) => {
@@ -1616,12 +1619,15 @@ async fn handle_linq_webhook(
             Ok(response) => {
                 let safe_response =
                     sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-                // Send reply via Linq
-                if let Err(e) = linq
-                    .send(&SendMessage::new(safe_response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Linq reply: {e}");
+                // Skip delivery for suppressed responses (e.g., HEARTBEAT_OK sentinel)
+                if !safe_response.trim().is_empty() {
+                    // Send reply via Linq
+                    if let Err(e) = linq
+                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Linq reply: {e}");
+                    }
                 }
             }
             Err(e) => {
@@ -1710,12 +1716,15 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             Ok(response) => {
                 let safe_response =
                     sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-                // Send reply via WATI
-                if let Err(e) = wati
-                    .send(&SendMessage::new(safe_response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send WATI reply: {e}");
+                // Skip delivery for suppressed responses (e.g., HEARTBEAT_OK sentinel)
+                if !safe_response.trim().is_empty() {
+                    // Send reply via WATI
+                    if let Err(e) = wati
+                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send WATI reply: {e}");
+                    }
                 }
             }
             Err(e) => {
@@ -1816,11 +1825,14 @@ async fn handle_nextcloud_talk_webhook(
             Ok(response) => {
                 let safe_response =
                     sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(safe_response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                // Skip delivery for suppressed responses (e.g., HEARTBEAT_OK sentinel)
+                if !safe_response.trim().is_empty() {
+                    if let Err(e) = nextcloud_talk
+                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                    }
                 }
             }
             Err(e) => {
@@ -1907,14 +1919,17 @@ async fn handle_qq_webhook(
             Ok(response) => {
                 let safe_response =
                     sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-                if let Err(e) = qq
-                    .send(
-                        &SendMessage::new(safe_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
-                {
-                    tracing::error!("Failed to send QQ reply: {e}");
+                // Skip delivery for suppressed responses (e.g., HEARTBEAT_OK sentinel)
+                if !safe_response.trim().is_empty() {
+                    if let Err(e) = qq
+                        .send(
+                            &SendMessage::new(safe_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        tracing::error!("Failed to send QQ reply: {e}");
+                    }
                 }
             }
             Err(e) => {
