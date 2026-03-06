@@ -594,6 +594,36 @@ impl Tool for ChannelAckConfigTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let rule_schema = json!({
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "contains_any": {"type": "array", "items": {"type": "string"}},
+                "contains_all": {"type": "array", "items": {"type": "string"}},
+                "contains_none": {"type": "array", "items": {"type": "string"}},
+                "regex_any": {"type": "array", "items": {"type": "string"}},
+                "regex_all": {"type": "array", "items": {"type": "string"}},
+                "regex_none": {"type": "array", "items": {"type": "string"}},
+                "sender_ids": {"type": "array", "items": {"type": "string"}},
+                "chat_ids": {"type": "array", "items": {"type": "string"}},
+                "chat_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["direct", "group"]
+                    }
+                },
+                "locale_any": {"type": "array", "items": {"type": "string"}},
+                "action": {"type": "string", "enum": ["react", "suppress"]},
+                "sample_rate": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
+                "strategy": {
+                    "type": ["string", "null"],
+                    "enum": ["random", "first", null]
+                },
+                "emojis": {"type": "array", "items": {"type": "string"}}
+            }
+        });
+
         json!({
             "type": "object",
             "properties": {
@@ -616,8 +646,16 @@ impl Tool for ChannelAckConfigTool {
                         {"type": "null"}
                     ]
                 },
-                "rules": {"type": ["array", "null"]},
-                "rule": {"type": "object"},
+                "rules": {
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": rule_schema.clone()
+                        },
+                        {"type": "null"}
+                    ]
+                },
+                "rule": rule_schema,
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},
                 "sender_id": {"type": ["string", "null"]},
@@ -888,6 +926,50 @@ mod tests {
         assert_eq!(
             output["aggregate"]["source_counts"]["channel_pool"],
             json!(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn parameters_schema_rules_array_has_items_schema() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ChannelAckConfigTool::new(test_config(&tmp).await, test_security());
+
+        let schema = tool.parameters_schema();
+        let rules_variants = schema["properties"]["rules"]["anyOf"]
+            .as_array()
+            .expect("rules.anyOf should be an array");
+        let array_variant = rules_variants
+            .iter()
+            .find(|variant| variant.get("type").and_then(Value::as_str) == Some("array"))
+            .expect("rules schema should include an array variant");
+
+        assert!(
+            array_variant.get("items").is_some(),
+            "rules array variant must declare items schema"
+        );
+        assert_eq!(
+            array_variant["items"]["properties"]["chat_types"]["items"]["enum"],
+            json!(["direct", "group"])
+        );
+    }
+
+    #[tokio::test]
+    async fn parameters_schema_rule_matches_rules_item_schema() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ChannelAckConfigTool::new(test_config(&tmp).await, test_security());
+
+        let schema = tool.parameters_schema();
+        let rules_variants = schema["properties"]["rules"]["anyOf"]
+            .as_array()
+            .expect("rules.anyOf should be an array");
+        let array_variant = rules_variants
+            .iter()
+            .find(|variant| variant.get("type").and_then(Value::as_str) == Some("array"))
+            .expect("rules schema should include an array variant");
+
+        assert_eq!(
+            schema["properties"]["rule"], array_variant["items"],
+            "'rule' and 'rules.items' should stay in sync"
         );
     }
 }
