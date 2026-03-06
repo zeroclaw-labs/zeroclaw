@@ -22,7 +22,7 @@ Build với `--features hardware` (hoặc features mặc định) để bao gồ
 ## Yêu cầu trước khi bắt đầu
 
 - Arduino Uno Q đã cấu hình WiFi
-- Arduino App Lab đã cài trên Mac (để thiết lập và triển khai lần đầu)
+- Arduino App Lab đã cài trên máy tính (để thiết lập và triển khai lần đầu)
 - API key cho LLM (OpenRouter, v.v.)
 
 ---
@@ -31,7 +31,7 @@ Build với `--features hardware` (hoặc features mặc định) để bao gồ
 
 ### 1.1 Cấu hình Uno Q qua App Lab
 
-1. Tải [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (AppImage trên Linux).
+1. Tải [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (tar.gz trên Linux).
 2. Kết nối Uno Q qua USB, bật nguồn.
 3. Mở App Lab, kết nối với board.
 4. Làm theo hướng dẫn cài đặt:
@@ -70,7 +70,7 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
 # Build (~15–30 phút trên Uno Q)
-cargo build --release
+cargo build --release --features hardware
 
 # Cài đặt
 sudo cp target/release/zeroclaw /usr/local/bin/
@@ -87,7 +87,7 @@ brew tap messense/macos-cross-toolchains
 brew install aarch64-unknown-linux-gnu
 
 # Build
-CC_aarch64_unknown_linux_gnu=aarch64-unknown-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu
+CC_aarch64_unknown_linux_gnu=aarch64-unknown-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu --features hardware
 
 # Copy sang Uno Q
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw arduino@<UNO_Q_IP>:~/
@@ -130,7 +130,7 @@ allowed_users = ["*"]
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 allow_public_bind = false
 
 [agent]
@@ -145,7 +145,7 @@ compact_context = true
 ssh arduino@<UNO_Q_IP>
 
 # Chạy daemon (Telegram polling hoạt động qua WiFi)
-zeroclaw daemon --host 127.0.0.1 --port 3000
+zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 **Tại bước này:** Telegram chat hoạt động. Gửi tin nhắn tới bot — ZeroClaw phản hồi. Chưa có GPIO.
@@ -184,7 +184,7 @@ transport = "bridge"
 ### 5.3 Chạy ZeroClaw
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 3000
+zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 Giờ khi bạn nhắn tin cho Telegram bot *"Turn on the LED"* hoặc *"Set pin 13 high"*, ZeroClaw dùng `gpio_write` qua Bridge.
@@ -200,10 +200,10 @@ Giờ khi bạn nhắn tin cho Telegram bot *"Turn on the LED"* hoặc *"Set pin
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
-| 6 | `cargo build --release --no-default-features` |
+| 6 | `cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
 | 8 | Chỉnh sửa `~/.zeroclaw/config.toml` (thêm Telegram bot_token) |
-| 9 | `zeroclaw daemon --host 127.0.0.1 --port 3000` |
+| 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Nhắn tin cho Telegram bot — nó phản hồi |
 
 ---
