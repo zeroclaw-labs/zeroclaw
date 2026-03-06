@@ -1623,7 +1623,6 @@ async fn clear_non_cli_exclusion_after_approval(
     }
 }
 
-#[allow(dead_code)]
 async fn describe_non_cli_approvals(
     ctx: &ChannelRuntimeContext,
     sender: &str,
@@ -2265,10 +2264,16 @@ fn build_models_help_response(current: &ChannelRouteSelection) -> String {
         "Provider: `{}` | Model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\n`/model <model-id or index>` — switch model\nExample: `/model 1` or `/model gpt-5.4`\n");
+    response.push_str(
+        "\n`/model <model-id or index>` — switch model\nExample: `/model 1` or `/model gpt-5.4`\n",
+    );
 
     // For profiles like "gemini:gemini-1", look up curated models by base name "gemini"
-    let provider_base = current.provider.split(':').next().unwrap_or(&current.provider);
+    let provider_base = current
+        .provider
+        .split(':')
+        .next()
+        .unwrap_or(&current.provider);
     let curated = onboard::curated_models_for_provider(provider_base);
     if curated.is_empty() {
         let _ = writeln!(
@@ -2343,8 +2348,7 @@ fn build_approvals_help_response() -> String {
     response.push_str("`/approve-pending`         — list pending requests\n");
     response.push_str("\nNatural language (policy controlled):\n");
     response.push_str("- direct mode: \"allow shell\" grants immediately\n");
-    response
-        .push_str("- request_confirm mode: \"allow shell\" then \"confirm apr-xxxxxx\"\n");
+    response.push_str("- request_confirm mode: \"allow shell\" then \"confirm apr-xxxxxx\"\n");
     response
 }
 
@@ -2600,7 +2604,11 @@ async fn handle_runtime_command_if_needed(
             // Resolve numeric index (e.g. "3") to model id from curated list.
             // Index 0 and out-of-range are treated as literal model names.
             let raw_model = if let Ok(idx) = raw_model.trim().parse::<usize>() {
-                let provider_base = current.provider.split(':').next().unwrap_or(&current.provider);
+                let provider_base = current
+                    .provider
+                    .split(':')
+                    .next()
+                    .unwrap_or(&current.provider);
                 let curated = onboard::curated_models_for_provider(provider_base);
                 if idx > 0 && idx <= curated.len() {
                     curated[idx - 1].0.clone()
@@ -3020,7 +3028,12 @@ async fn handle_runtime_command_if_needed(
                 }
             }
         }
-        ChannelRuntimeCommand::ListApprovals => build_approvals_help_response(),
+        ChannelRuntimeCommand::ListApprovals => {
+            match describe_non_cli_approvals(ctx, sender, source_channel, reply_target).await {
+                Ok(details) => details,
+                Err(err) => format!("Failed to load approvals: {err}"),
+            }
+        }
         ChannelRuntimeCommand::ApprovePendingRequest(request_id) => {
             let request_id = request_id.trim().to_string();
             if request_id.is_empty() {
@@ -8745,13 +8758,11 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Tool approval commands:"));
-        assert!(sent[0].contains("/approve "));
-        assert!(sent[0].contains("/unapprove "));
-        assert!(sent[0].contains("/approve-request "));
-        assert!(sent[0].contains("/approve-all-once"));
-        assert!(sent[0].contains("/approve-confirm "));
-        assert!(sent[0].contains("/approve-deny "));
+        assert!(
+            sent[0].contains("Supervised non-CLI tool approvals:"),
+            "Expected approval state in response, got: {}",
+            sent[0]
+        );
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
@@ -13052,36 +13063,62 @@ BTC is currently around $65,000 based on latest tool output."#;
     fn build_configured_providers_includes_default_and_fallbacks() {
         let config = make_config_with_providers(
             "openai-codex",
-            vec!["gemini:gemini-1", "gemini:gemini-2", "openai-codex:codex-1", "openai-codex:codex-2"],
+            vec![
+                "gemini:gemini-1",
+                "gemini:gemini-2",
+                "openai-codex:codex-1",
+                "openai-codex:codex-2",
+            ],
         );
         let list = build_configured_providers(&config);
 
         // default_provider (bare type) must NOT appear — only real configured profiles
-        assert!(!list.contains(&"openai-codex".to_string()), "bare default_provider must not appear in list");
-        assert!(list.contains(&"gemini:gemini-1".to_string()), "must include gemini:gemini-1");
-        assert!(list.contains(&"gemini:gemini-2".to_string()), "must include gemini:gemini-2");
-        assert!(list.contains(&"openai-codex:codex-1".to_string()), "must include openai-codex:codex-1");
-        assert!(list.contains(&"openai-codex:codex-2".to_string()), "must include openai-codex:codex-2");
+        assert!(
+            !list.contains(&"openai-codex".to_string()),
+            "bare default_provider must not appear in list"
+        );
+        assert!(
+            list.contains(&"gemini:gemini-1".to_string()),
+            "must include gemini:gemini-1"
+        );
+        assert!(
+            list.contains(&"gemini:gemini-2".to_string()),
+            "must include gemini:gemini-2"
+        );
+        assert!(
+            list.contains(&"openai-codex:codex-1".to_string()),
+            "must include openai-codex:codex-1"
+        );
+        assert!(
+            list.contains(&"openai-codex:codex-2".to_string()),
+            "must include openai-codex:codex-2"
+        );
         assert_eq!(list.len(), 4, "exactly 4 configured profiles");
     }
 
     #[test]
     fn build_configured_providers_no_duplicates() {
         // default_provider appears in fallback_providers too — must not duplicate
-        let config = make_config_with_providers(
-            "openai-codex",
-            vec!["openai-codex", "gemini:gemini-1"],
-        );
+        let config =
+            make_config_with_providers("openai-codex", vec!["openai-codex", "gemini:gemini-1"]);
         let list = build_configured_providers(&config);
         let count = list.iter().filter(|s| s.as_str() == "openai-codex").count();
-        assert_eq!(count, 1, "openai-codex must appear exactly once, got: {list:?}");
+        assert_eq!(
+            count, 1,
+            "openai-codex must appear exactly once, got: {list:?}"
+        );
     }
 
     #[test]
     fn build_configured_providers_is_sorted() {
         let config = make_config_with_providers(
             "openai-codex",
-            vec!["gemini:gemini-2", "gemini:gemini-1", "openai-codex:codex-2", "openai-codex:codex-1"],
+            vec![
+                "gemini:gemini-2",
+                "gemini:gemini-1",
+                "openai-codex:codex-2",
+                "openai-codex:codex-1",
+            ],
         );
         let list = build_configured_providers(&config);
         let mut sorted = list.clone();
@@ -13102,9 +13139,18 @@ BTC is currently around $65,000 based on latest tool output."#;
         ];
         let response = build_providers_help_response(&current, &[], &configured);
 
-        assert!(response.contains("* 1. gemini:gemini-1"), "active provider must be marked with *; got:\n{response}");
-        assert!(response.contains("  2. gemini:gemini-2"), "inactive must have space; got:\n{response}");
-        assert!(response.contains("  3. openai-codex"), "inactive must have space; got:\n{response}");
+        assert!(
+            response.contains("* 1. gemini:gemini-1"),
+            "active provider must be marked with *; got:\n{response}"
+        );
+        assert!(
+            response.contains("  2. gemini:gemini-2"),
+            "inactive must have space; got:\n{response}"
+        );
+        assert!(
+            response.contains("  3. openai-codex"),
+            "inactive must have space; got:\n{response}"
+        );
     }
 
     #[test]
@@ -13113,15 +13159,18 @@ BTC is currently around $65,000 based on latest tool output."#;
             provider: "openai-codex".to_string(),
             model: "gpt-5.2".to_string(),
         };
-        let configured = vec![
-            "gemini:gemini-1".to_string(),
-            "openai-codex".to_string(),
-        ];
+        let configured = vec!["gemini:gemini-1".to_string(), "openai-codex".to_string()];
         let opened = vec!["gemini:gemini-1".to_string()];
         let response = build_providers_help_response(&current, &opened, &configured);
 
-        assert!(response.contains("~ 1. gemini:gemini-1"), "opened provider must be marked with ~; got:\n{response}");
-        assert!(response.contains("* 2. openai-codex"), "active must be marked with *; got:\n{response}");
+        assert!(
+            response.contains("~ 1. gemini:gemini-1"),
+            "opened provider must be marked with ~; got:\n{response}"
+        );
+        assert!(
+            response.contains("* 2. openai-codex"),
+            "active must be marked with *; got:\n{response}"
+        );
     }
 
     #[test]
@@ -13140,7 +13189,10 @@ BTC is currently around $65,000 based on latest tool output."#;
         let response = build_providers_help_response(&current, &[], &configured);
 
         for name in &configured {
-            assert!(response.contains(name.as_str()), "response must contain {name}; got:\n{response}");
+            assert!(
+                response.contains(name.as_str()),
+                "response must contain {name}; got:\n{response}"
+            );
         }
     }
 
