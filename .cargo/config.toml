@@ -17,3 +17,12 @@ rustflags = ["-C", "link-args=/STACK:8388608"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "link-args=/STACK:8388608"]
+
+# riscv64gc-unknown-linux-musl target, produces a static binary with musl, but requires a custom linker and flags
+[target.riscv64gc-unknown-linux-musl]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=-no-pie",
+]
+linker = "riscv64-linux-musl-gcc"
