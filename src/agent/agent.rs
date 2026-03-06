@@ -379,6 +379,22 @@ impl Agent {
             other_messages.drain(0..drop_count);
         }
 
+        // Drop any orphaned tool messages at the start of the non-system segment.
+        // Tool messages must follow an assistant message with tool_calls; if we trimmed away
+        // that assistant, we must remove the orphaned tools to avoid 400 Bad Request.
+        let start = 0;
+        while start < other_messages.len() {
+            match &other_messages[start] {
+                ConversationMessage::ToolResults(_) => {
+                    other_messages.remove(start);
+                }
+                ConversationMessage::Chat(chat) if chat.role == "tool" => {
+                    other_messages.remove(start);
+                }
+                _ => break,
+            }
+        }
+
         self.history = system_messages;
         self.history.extend(other_messages);
     }
@@ -951,5 +967,105 @@ mod tests {
         assert_eq!(response, "classified");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn trim_history_removes_orphaned_tool_messages() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        // Agent with max_history_messages = 2
+        let config = crate::config::AgentConfig {
+            max_history_messages: 2,
+            ..Default::default()
+        };
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(config)
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        // Case 1: Orphaned ToolResults
+        // History: [User1, Assistant1, ToolResults, User2] (Len 4)
+        // Max: 2
+        // Drop count: 2 (User1, Assistant1)
+        // Remaining start: ToolResults (Orphan!) -> Should be removed
+        // Expected: [User2]
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("u1")),
+            ConversationMessage::Chat(ChatMessage::assistant("a1")),
+            ConversationMessage::ToolResults(vec![crate::providers::ToolResultMessage {
+                tool_call_id: "id".into(),
+                content: "res".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::user("u2")),
+        ];
+
+        agent.trim_history();
+
+        assert_eq!(agent.history.len(), 1);
+        match &agent.history[0] {
+            ConversationMessage::Chat(chat) => assert_eq!(chat.content, "u2"),
+            _ => panic!("Expected User message, found {:?}", agent.history[0]),
+        }
+
+        // Case 2: Orphaned Chat(role="tool")
+        // History: [User1, Assistant1, ToolChat, User2]
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("u1")),
+            ConversationMessage::Chat(ChatMessage::assistant("a1")),
+            ConversationMessage::Chat(ChatMessage::tool("tool_out")),
+            ConversationMessage::Chat(ChatMessage::user("u2")),
+        ];
+
+        agent.trim_history();
+
+        assert_eq!(agent.history.len(), 1);
+        match &agent.history[0] {
+            ConversationMessage::Chat(chat) => assert_eq!(chat.content, "u2"),
+            _ => panic!("Expected User message, found {:?}", agent.history[0]),
+        }
+
+        // Case 3: No orphan
+        // History: [User1, Assistant1, User2, Assistant2]
+        // Max: 2
+        // Drop count: 2 (User1, Assistant1)
+        // Remaining: [User2, Assistant2] -> No orphans
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("u1")),
+            ConversationMessage::Chat(ChatMessage::assistant("a1")),
+            ConversationMessage::Chat(ChatMessage::user("u2")),
+            ConversationMessage::Chat(ChatMessage::assistant("a2")),
+        ];
+
+        agent.trim_history();
+
+        assert_eq!(agent.history.len(), 2);
+        match &agent.history[0] {
+            ConversationMessage::Chat(chat) => assert_eq!(chat.content, "u2"),
+            _ => panic!("Expected User2, found {:?}", agent.history[0]),
+        }
+        match &agent.history[1] {
+            ConversationMessage::Chat(chat) => assert_eq!(chat.content, "a2"),
+            _ => panic!("Expected Assistant2, found {:?}", agent.history[1]),
+        }
     }
 }
