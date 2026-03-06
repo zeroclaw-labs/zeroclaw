@@ -1,38 +1,43 @@
-# Actions Source Policy (Phase 1)
+# Actions Source Policy
 
 This document defines the current GitHub Actions source-control policy for this repository.
-
-Phase 1 objective: lock down action sources with minimal disruption, before full SHA pinning.
 
 ## Current Policy
 
 - Repository Actions permissions: enabled
 - Allowed actions mode: selected
-- SHA pinning required: false (deferred to Phase 2)
 
-Selected allowlist patterns:
+Selected allowlist (all actions currently used across CI, Beta Release, and Promote Release workflows):
 
-- `actions/*` (covers `actions/cache`, `actions/checkout`, `actions/upload-artifact`, `actions/download-artifact`, and other first-party actions)
-- `docker/*`
+| Action | Used In | Purpose |
+|--------|---------|---------|
+| `actions/checkout@v4` | All workflows | Repository checkout |
+| `actions/upload-artifact@v4` | release, promote-release | Upload build artifacts |
+| `actions/download-artifact@v4` | release, promote-release | Download build artifacts for packaging |
+| `dtolnay/rust-toolchain@stable` | All workflows | Install Rust toolchain (1.92.0) |
+| `Swatinem/rust-cache@v2` | All workflows | Cargo build/dependency caching |
+| `softprops/action-gh-release@v2` | release, promote-release | Create GitHub Releases |
+| `docker/setup-buildx-action@v3` | release, promote-release | Docker Buildx setup |
+| `docker/login-action@v3` | release, promote-release | GHCR authentication |
+| `docker/build-push-action@v6` | release, promote-release | Multi-platform Docker image build and push |
+
+Equivalent allowlist patterns:
+
+- `actions/*`
 - `dtolnay/rust-toolchain@*`
-- `DavidAnson/markdownlint-cli2-action@*`
-- `lycheeverse/lychee-action@*`
-- `EmbarkStudios/cargo-deny-action@*`
-- `rustsec/audit-check@*`
-- `rhysd/actionlint@*`
+- `Swatinem/rust-cache@*`
 - `softprops/action-gh-release@*`
-- `sigstore/cosign-installer@*`
-- `Checkmarx/vorpal-reviewdog-github-action@*`
-- `useblacksmith/*` (Blacksmith self-hosted runner infrastructure)
+- `docker/*`
 
-## Change Control Export
+## Workflows
 
-Use these commands to export the current effective policy for audit/change control:
+| Workflow | File | Trigger |
+|----------|------|---------|
+| CI | `.github/workflows/ci.yml` | Pull requests to `main` |
+| Beta Release | `.github/workflows/release.yml` | Push to `main` |
+| Promote Release | `.github/workflows/promote-release.yml` | Manual `workflow_dispatch` |
 
-```bash
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
-```
+## Change Control
 
 Record each policy change with:
 
@@ -42,53 +47,25 @@ Record each policy change with:
 - allowlist delta (added/removed patterns)
 - rollback note
 
-## Why This Phase
+Use these commands to export the current effective policy:
 
-- Reduces supply-chain risk from unreviewed marketplace actions.
-- Preserves current CI/CD functionality with low migration overhead.
-- Prepares for Phase 2 full SHA pinning without blocking active development.
+```bash
+gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
+gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
+```
 
-## Agentic Workflow Guardrails
-
-Because this repository has high agent-authored change volume:
+## Guardrails
 
 - Any PR that adds or changes `uses:` action sources must include an allowlist impact note.
 - New third-party actions require explicit maintainer review before allowlisting.
 - Expand allowlist only for verified missing actions; avoid broad wildcard exceptions.
-- Keep rollback instructions in the PR description for Actions policy changes.
 
-## Validation Checklist
+## Change Log
 
-After allowlist changes, validate:
-
-1. `CI`
-2. `Docker`
-3. `Security Audit`
-4. `Workflow Sanity`
-5. `Release` (when safe to run)
-
-Failure mode to watch for:
-
-- `action is not allowed by policy`
-
-If encountered, add only the specific trusted missing action, rerun, and document why.
-
-Latest sweep notes:
-
-- 2026-02-21: Added manual Vorpal reviewdog workflow for targeted secure-coding checks on supported file types
-    - Added allowlist pattern: `Checkmarx/vorpal-reviewdog-github-action@*`
-    - Workflow uses pinned source: `Checkmarx/vorpal-reviewdog-github-action@8cc292f337a2f1dea581b4f4bd73852e7becb50d` (v1.2.0)
-- 2026-02-17: Rust dependency cache migrated from `Swatinem/rust-cache` to `useblacksmith/rust-cache`
-    - No new allowlist pattern required (`useblacksmith/*` already allowlisted)
-- 2026-02-16: Hidden dependency discovered in `release.yml`: `sigstore/cosign-installer@...`
-    - Added allowlist pattern: `sigstore/cosign-installer@*`
-- 2026-02-16: Blacksmith migration blocked workflow execution
-    - Added allowlist pattern: `useblacksmith/*` for self-hosted runner infrastructure
-    - Actions: `useblacksmith/setup-docker-builder@v1`, `useblacksmith/build-push-action@v2`
-- 2026-02-17: Security audit reproducibility/freshness balance update
-    - Added allowlist pattern: `rustsec/audit-check@*`
-    - Replaced inline `cargo install cargo-audit` execution with pinned `rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998` in `security.yml`
-    - Supersedes floating-version proposal in #588 while keeping action source policy explicit
+- 2026-03-05: Complete workflow overhaul — replaced 22 workflows with 3 (CI, Beta Release, Promote Release)
+    - Removed patterns no longer in use: `DavidAnson/markdownlint-cli2-action@*`, `lycheeverse/lychee-action@*`, `EmbarkStudios/cargo-deny-action@*`, `rustsec/audit-check@*`, `rhysd/actionlint@*`, `sigstore/cosign-installer@*`, `Checkmarx/vorpal-reviewdog-github-action@*`, `useblacksmith/*`
+    - Added: `Swatinem/rust-cache@*` (replaces `useblacksmith/*` rust-cache fork)
+    - Retained: `actions/*`, `dtolnay/rust-toolchain@*`, `softprops/action-gh-release@*`, `docker/*`
 
 ## Rollback
 
