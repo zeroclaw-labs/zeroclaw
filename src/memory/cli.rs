@@ -306,8 +306,14 @@ async fn handle_reindex(config: &Config, yes: bool, progress: bool) -> Result<()
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    // Reindex requires full memory backend with embeddings
-    let mem = super::create_memory(&config.memory, &config.workspace_dir, None)?;
+    // Reindex requires full memory backend with embeddings and route-aware resolution.
+    let mem = super::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?;
 
     // Get total count for confirmation
     let total = mem.count().await?;
