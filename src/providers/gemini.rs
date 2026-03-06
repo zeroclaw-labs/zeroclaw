@@ -7,8 +7,10 @@
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatResponse, NormalizedStopReason, Provider, TokenUsage,
+    ChatMessage, ChatResponse, NormalizedStopReason, Provider, ProviderCapabilities, TokenUsage,
+    ToolCall,
 };
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -16,6 +18,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::{debug, info};
 
 /// Gemini provider supporting multiple authentication methods.
 pub struct GeminiProvider {
@@ -82,6 +85,94 @@ impl GeminiAuth {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// SCHEMA CONVERSION FOR GEMINI API
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Convert JSON Schema format to Gemini API format.
+///
+/// Gemini API requirements (based on official gemini-cli source):
+/// 1. Lowercase type names (string, object, number, boolean, array) — standard JSON Schema.
+/// 2. MUST include `"type": "object"` at parameters root level.
+/// 3. Remove unsupported JSON Schema fields: additionalProperties, default, minimum, maximum, etc.
+/// 4. No union types (`["string", "null"]`) — take first non-null type.
+/// 5. No `oneOf`/`anyOf` — flatten to most appropriate alternative.
+fn convert_schema_to_gemini_format(schema: &serde_json::Value) -> serde_json::Value {
+    match schema {
+        serde_json::Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+
+            // Fields that Gemini API doesn't support (from JSON Schema).
+            // NOTE: "pattern" is NOT included because it is also a common property name
+            // (e.g., content_search, glob_search tools have a "pattern" parameter).
+            let unsupported_fields = [
+                "additionalProperties",
+                "default",
+                "minimum",
+                "maximum",
+                "minLength",
+                "maxLength",
+                "format",
+            ];
+
+            // Handle oneOf/anyOf by flattening to the most appropriate alternative.
+            if map.contains_key("oneOf") || map.contains_key("anyOf") {
+                let alternatives_key = if map.contains_key("oneOf") { "oneOf" } else { "anyOf" };
+                if let Some(serde_json::Value::Array(alternatives)) = map.get(alternatives_key) {
+                    let mut chosen_alt: Option<&serde_json::Value> = None;
+                    for alt in alternatives {
+                        if let Some(alt_map) = alt.as_object() {
+                            if let Some(serde_json::Value::String(type_str)) = alt_map.get("type") {
+                                match type_str.as_str() {
+                                    "array" => { chosen_alt = Some(alt); break; }
+                                    "object" if chosen_alt.is_none() => { chosen_alt = Some(alt); }
+                                    "string" if chosen_alt.is_none() => { chosen_alt = Some(alt); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(alt) = chosen_alt {
+                        return convert_schema_to_gemini_format(alt);
+                    } else {
+                        return serde_json::Value::Object(serde_json::Map::new());
+                    }
+                }
+            }
+
+            for (key, value) in map {
+                if unsupported_fields.contains(&key.as_str()) || key == "oneOf" || key == "anyOf" {
+                    continue;
+                }
+                if key == "type" {
+                    match value {
+                        serde_json::Value::Array(arr) => {
+                            // Union type: ["string", "null"] → take first non-null.
+                            let first_type = arr
+                                .iter()
+                                .find(|v| v.as_str().map(|s| s != "null").unwrap_or(false))
+                                .or_else(|| arr.first());
+                            if let Some(t) = first_type {
+                                new_map.insert(key.clone(), t.clone());
+                            }
+                        }
+                        _ => {
+                            new_map.insert(key.clone(), value.clone());
+                        }
+                    }
+                } else {
+                    new_map.insert(key.clone(), convert_schema_to_gemini_format(value));
+                }
+            }
+            serde_json::Value::Object(new_map)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter().map(|v| convert_schema_to_gemini_format(v)).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // API REQUEST/RESPONSE TYPES
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -92,6 +183,14 @@ struct GenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiToolDeclaration>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct GeminiToolDeclaration {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<serde_json::Value>,
 }
 
 /// Request envelope for the internal cloudcode-pa API.
@@ -128,6 +227,8 @@ struct InternalGenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiToolDeclaration>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -208,6 +309,15 @@ struct ResponsePart {
     /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
+    /// Function call requested by the model (native tool calling).
+    #[serde(default, rename = "functionCall")]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GeminiFunctionCall {
+    name: String,
+    args: serde_json::Value,
 }
 
 impl CandidateContent {
@@ -919,6 +1029,7 @@ impl GeminiProvider {
                         } else {
                             None
                         },
+                        tools: request.tools.clone(),
                     },
                 };
                 self.http_client()
@@ -1009,11 +1120,13 @@ impl GeminiProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
+        tools: Option<Vec<GeminiToolDeclaration>>,
     ) -> anyhow::Result<(
         Option<String>,
         Option<TokenUsage>,
         Option<NormalizedStopReason>,
         Option<String>,
+        Vec<ToolCall>,
     )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1064,6 +1177,7 @@ impl GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
             },
+            tools,
         };
 
         let url = Self::build_generate_content_url(model, auth);
@@ -1216,14 +1330,83 @@ impl GeminiProvider {
             .as_deref()
             .map(NormalizedStopReason::from_gemini_finish_reason);
 
-        let text = candidate.content.and_then(|c| c.effective_text());
+        // Extract function calls and text from content parts
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let text = if let Some(content) = candidate.content {
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut first_thinking: Option<String> = None;
+            for (idx, part) in content.parts.into_iter().enumerate() {
+                if let Some(fc) = part.function_call {
+                    tool_calls.push(ToolCall {
+                        id: format!("call_{}", idx),
+                        name: fc.name,
+                        arguments: serde_json::to_string(&fc.args)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    });
+                }
+                if let Some(text) = part.text {
+                    if !text.is_empty() {
+                        if !part.thought {
+                            text_parts.push(text);
+                        } else if first_thinking.is_none() {
+                            first_thinking = Some(text);
+                        }
+                    }
+                }
+            }
+            if text_parts.is_empty() {
+                first_thinking
+            } else {
+                Some(text_parts.join(""))
+            }
+        } else {
+            None
+        };
 
-        Ok((text, usage, stop_reason, raw_stop_reason))
+        Ok((text, usage, stop_reason, raw_stop_reason, tool_calls))
+    }
+
+    /// Convert ToolSpec slice to Gemini functionDeclarations format.
+    fn convert_tool_specs_to_gemini(tools: &[ToolSpec]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .enumerate()
+            .map(|(idx, tool)| {
+                debug!("   Tool[{}]: {}", idx, tool.name);
+                let gemini_params = convert_schema_to_gemini_format(&tool.parameters);
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": gemini_params
+                })
+            })
+            .collect()
     }
 }
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> crate::providers::traits::ToolsPayload {
+        if tools.is_empty() {
+            return crate::providers::traits::ToolsPayload::Gemini {
+                function_declarations: Vec::new(),
+            };
+        }
+        info!("🔧 Converting {} tools for Gemini API", tools.len());
+        let function_declarations = Self::convert_tool_specs_to_gemini(tools);
+        info!("✅ Converted {} function declarations", function_declarations.len());
+        crate::providers::traits::ToolsPayload::Gemini {
+            function_declarations,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1243,8 +1426,8 @@ impl Provider for GeminiProvider {
             parts: Self::build_user_parts(message),
         }];
 
-        let (text_opt, _usage, _stop_reason, _raw_stop_reason) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+        let (text_opt, _usage, _stop_reason, _raw_stop_reason, _tool_calls) = self
+            .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
         Ok(text)
@@ -1294,8 +1477,8 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text_opt, _usage, _stop_reason, _raw_stop_reason) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+        let (text_opt, _usage, _stop_reason, _raw_stop_reason, _tool_calls) = self
+            .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
         Ok(text)
@@ -1338,13 +1521,27 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text, usage, stop_reason, raw_stop_reason) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+        // Convert tools to Gemini functionDeclarations format if provided
+        let gemini_tools = if let Some(tools) = request.tools {
+            if !tools.is_empty() {
+                let function_declarations = Self::convert_tool_specs_to_gemini(tools);
+                Some(vec![GeminiToolDeclaration {
+                    function_declarations,
+                }])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (text, usage, stop_reason, raw_stop_reason, tool_calls) = self
+            .send_generate_content(contents, system_instruction, model, temperature, gemini_tools)
             .await?;
 
         Ok(ChatResponse {
             text,
-            tool_calls: Vec::new(),
+            tool_calls,
             usage,
             reasoning_content: None,
             quota_metadata: None,
@@ -1631,6 +1828,7 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let request = provider
@@ -1672,6 +1870,7 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let request = provider
@@ -1716,6 +1915,7 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let request = provider
@@ -1753,6 +1953,7 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1850,6 +2051,7 @@ mod tests {
                     temperature: 0.7,
                     max_output_tokens: 8192,
                 }),
+                tools: None,
             },
         };
 
@@ -1879,6 +2081,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: None,
+                tools: None,
             },
         };
 
@@ -1902,6 +2105,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: None,
+                tools: None,
             },
         };
 
