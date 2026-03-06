@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-mod audit;
+pub mod audit;
 mod templates;
 mod tool_handler;
 

@@ -20,6 +20,7 @@ use crate::channels::{
     SendMessage, WatiChannel, WhatsAppChannel,
 };
 use crate::config::Config;
+use serde::Deserialize;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};

@@ -24,6 +24,9 @@ pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod channel_ack_config;
+pub mod clawhub_install;
+pub mod clawhub_search;
+pub mod clawhub_uninstall;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -96,6 +99,9 @@ pub use bg_run::{
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use channel_ack_config::ChannelAckConfigTool;
+pub use clawhub_install::ClawhubInstallTool;
+pub use clawhub_search::ClawhubSearchTool;
+pub use clawhub_uninstall::ClawhubUninstallTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -608,6 +614,16 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // ClawHub tools
+    tool_arcs.push(Arc::new(ClawhubSearchTool::new()));
+    tool_arcs.push(Arc::new(
+        ClawhubInstallTool::new(workspace_dir.to_path_buf())
+            .with_config(root_config.clawhub.clone()),
+    ));
+    tool_arcs.push(Arc::new(ClawhubUninstallTool::new(
+        workspace_dir.to_path_buf(),
+    )));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
