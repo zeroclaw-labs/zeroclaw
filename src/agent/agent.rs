@@ -21,6 +21,18 @@ use std::time::Instant;
 
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Max characters per message when logging prompt/response in debug (avoids huge logs).
+const DEBUG_MAX_CONTENT_LEN: usize = 2000;
+
+fn debug_truncate(s: &str, max_len: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_len {
+        s.to_string()
+    } else {
+        chars.into_iter().take(max_len).collect::<String>() + "... (truncated)"
+    }
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -528,6 +540,12 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // Debug: user raw request (sensitive; only when RUST_LOG includes debug/trace).
+        tracing::debug!(
+            target: "zeroclaw::debug",
+            user_message = %user_message,
+            "user raw request"
+        );
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -626,6 +644,31 @@ impl Agent {
 
         for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let tools_count = if self.tool_dispatcher.should_send_tool_specs() {
+                self.tool_specs.len()
+            } else {
+                0
+            };
+            // Debug: request to model (prompt); sensitive; only when RUST_LOG includes debug/trace.
+            tracing::debug!(
+                target: "zeroclaw::debug",
+                model = %effective_model,
+                temperature = self.temperature,
+                iteration,
+                message_count = messages.len(),
+                tools_count,
+                "request to model (prompt)"
+            );
+            for (i, msg) in messages.iter().enumerate() {
+                let content_preview = debug_truncate(&msg.content, DEBUG_MAX_CONTENT_LEN);
+                tracing::debug!(
+                    target: "zeroclaw::debug",
+                    index = i,
+                    role = %msg.role,
+                    content = %content_preview,
+                    "prompt message"
+                );
+            }
             let response = match self
                 .provider
                 .chat(
@@ -645,6 +688,26 @@ impl Agent {
                 Ok(resp) => resp,
                 Err(err) => return Err(err),
             };
+
+            // Debug: model response; sensitive; only when RUST_LOG includes debug/trace.
+            let response_text_preview = response
+                .text
+                .as_deref()
+                .map(|s| debug_truncate(s, DEBUG_MAX_CONTENT_LEN))
+                .unwrap_or_else(|| "<empty>".to_string());
+            tracing::debug!(
+                target: "zeroclaw::debug",
+                text_preview = %response_text_preview,
+                tool_calls_count = response.tool_calls.len(),
+                "model response"
+            );
+            if let Some(rc) = &response.reasoning_content {
+                tracing::debug!(
+                    target: "zeroclaw::debug",
+                    reasoning_preview = %debug_truncate(rc, DEBUG_MAX_CONTENT_LEN),
+                    "model reasoning"
+                );
+            }
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
