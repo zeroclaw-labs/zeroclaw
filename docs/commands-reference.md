@@ -99,13 +99,70 @@ Notes:
 
 ### `security`
 
+- `zeroclaw security audit` -- run a static security configuration audit
+- `zeroclaw security audit --json` -- output results as JSON (for CI pipelines)
+- `zeroclaw security audit --memory` -- include memory content scanning
+- `zeroclaw security audit --memory --json` -- memory scan with JSON output
+- `zeroclaw security audit --fail-on warn` -- exit 1 if any warnings or errors exist (CI gate)
+- `zeroclaw security audit --fail-on error` -- exit 1 if any errors exist (CI gate)
+- `zeroclaw security audit --json --fail-on error` -- JSON output + CI gate
 - `zeroclaw security update-guard-corpus`
 - `zeroclaw security update-guard-corpus --source builtin`
 - `zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl`
 - `zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>`
 
+Performs a read-only posture assessment of the current configuration against security best practices. Each of the 27 configuration checks is graded as `ok`, `WARN`, or `ERR`, grouped into 8 categories:
+
+1. **autonomy-policy** -- autonomy level, workspace isolation, command allowlist, sensitive file access
+2. **sandbox-isolation** -- sandbox backend, resource limits (memory, CPU, subprocesses)
+3. **authentication** -- gateway pairing, public bind, OTP gating
+4. **secrets** -- encryption status, API key presence
+5. **audit-logging** -- audit log enabled, event signing, log rotation
+6. **emergency-stop** -- estop enabled, OTP-protected resume
+7. **resource-limits** -- action rate, cost cap, memory monitoring
+8. **input-validation** -- outbound leak guard, adversarial suffix filter
+
+When `--memory` is specified, 5 additional **memory-content** checks are appended (total: 32):
+
+| Check | Severity | Description |
+|-------|----------|-------------|
+| `scan_coverage` | Ok/Warn | Reports how many memory entries were scanned vs total. Warns on partial coverage or unknown total. |
+| `credential_leak` | Error | Detects API keys, private keys, JWTs, database URLs, and high-entropy tokens in memory entries. |
+| `injection_patterns` | Warn | Detects prompt injection patterns (normalized score >= 0.5) in memory entries. |
+| `adversarial_content` | Warn | Detects GCG-like adversarial suffixes. N/A when perplexity filter is disabled. |
+| `dangerous_commands` | Warn | Defense-in-depth: flags memory entries containing high-risk shell commands (e.g. `rm`, `sudo`, `kill`). Stored commands may be re-injected via future code paths. |
+
+Edge cases:
+- Memory backend `"none"`: all 5 checks emit Ok with "N/A (memory backend is none)".
+- Backend initialization failure: all 5 checks emit Warn with a fixed message ("memory scan unavailable"). Raw error details are not exposed; use `RUST_LOG=warn` to see the failure phase in logs.
+- `--memory` triggers an on-demand scan that may connect to the configured memory backend (e.g. database, remote vector store). Scan covers entries returned by the backend's list operation. Check the `scan_coverage` finding for actual scan scope. Per-entry content is capped at 16 KiB for scanning.
+
+An overall risk grade (A--F) is computed from error and warning counts:
+
+| Grade | Meaning |
+|-------|---------|
+| A | 0 errors, 0 warnings |
+| B | 0 errors, 1--3 warnings |
+| C | 0 errors, 4+ warnings |
+| D | 1--2 errors |
+| F | 3+ errors |
+
+**Grade semantics note:** `zeroclaw security audit` (27 checks) reflects configuration posture only. `zeroclaw security audit --memory` (32 checks) reflects both configuration and memory content. Grades from the two modes are not directly comparable because more checks means more potential errors/warnings.
+
+**CI gate (`--fail-on`):** Use `--fail-on warn` or `--fail-on error` to make the audit exit with code 1 when findings reach the specified severity threshold. The full report (human-readable or JSON) is always printed to stdout before the exit code is determined. Aliases `--fail-on warning` and `--fail-on err` are also accepted.
+
+CI pipeline example:
+
+```bash
+zeroclaw security audit --json --fail-on error > audit.json
+```
+
 Notes:
 
+- `--json` outputs a structured `AuditReport` with `grade`, `findings[]`, and `summary` fields.
+- `--fail-on` outputs the full report first, then exits non-zero if the threshold is exceeded. The error message goes to stderr.
+- High-risk command names in findings are redacted to base name only (e.g. `curl`, not the full command string).
+- The default configuration produces grade B (0 errors, 3 warnings from opt-in features).
 - `update-guard-corpus` upserts semantic guard seed records into `security.semantic_guard_collection`.
 - `--source` accepts `builtin`, a local file path, or an `http(s)` URL.
 - `--checksum` enforces SHA-256 integrity verification before import.

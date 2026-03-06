@@ -21,3 +21,4 @@
 
 - `zeroclaw gateway` は `--new-pairing` をサポートし、既存のペアリングトークンを消去して新しいペアリングコードを生成できます。
 - OpenClaw 移行関連の英語原文が更新されました: `zeroclaw onboard --migrate-openclaw`、`zeroclaw migrate openclaw`、およびエージェントツール `openclaw_migration`（ローカライズ追従は継続中）。
+- `zeroclaw security audit --fail-on <warn|error>` CI ゲート用パラメータ追加。閾値超過時に exit 1。詳細は英語原文を参照。
