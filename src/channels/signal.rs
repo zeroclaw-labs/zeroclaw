@@ -48,6 +48,8 @@ struct Envelope {
     data_message: Option<DataMessage>,
     #[serde(rename = "storyMessage", default)]
     story_message: Option<serde_json::Value>,
+    #[serde(rename = "receiptMessage", default)]
+    receipt_message: Option<ReceiptMessage>,
     #[serde(default)]
     timestamp: Option<u64>,
 }
@@ -68,6 +70,14 @@ struct DataMessage {
 struct GroupInfo {
     #[serde(rename = "groupId", default)]
     group_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptMessage {
+    #[serde(rename = "type")]
+    receipt_type: Option<String>,
+    #[serde(default)]
+    timestamps: Option<Vec<u64>>,
 }
 
 impl SignalChannel {
@@ -232,7 +242,38 @@ impl SignalChannel {
             }
         }
 
-        let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
+        // Build content: start with text (may be empty for image-only messages).
+        let mut content = data_msg
+            .message
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or("")
+            .to_string();
+
+        // Append [IMAGE:data:<mime>;base64,<data>] markers for enriched image
+        // attachments so the multimodal pipeline can send them to vision-capable
+        // LLMs.  Non-image attachments and attachments without inline data are
+        // silently skipped (consistent with ignore_attachments=false semantics).
+        if !self.ignore_attachments {
+            if let Some(attachments) = &data_msg.attachments {
+                for att in attachments {
+                    let ct = att.get("contentType").and_then(|v| v.as_str()).unwrap_or("");
+                    let data = att.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                    if ct.starts_with("image/") && !data.is_empty() {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&format!("[IMAGE:data:{ct};base64,{data}]"));
+                    }
+                }
+            }
+        }
+
+        // Nothing usable (no text and no image attachments).
+        if content.is_empty() {
+            return None;
+        }
+
         let sender = Self::sender(envelope)?;
 
         if !self.is_sender_allowed(&sender) {
@@ -262,11 +303,40 @@ impl SignalChannel {
             id: format!("sig_{timestamp}"),
             sender: sender.clone(),
             reply_target: target,
-            content: text.to_string(),
+            content,
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
         })
+    }
+
+    /// Format a receipt envelope as a human-readable status line for buffering.
+    /// Instead of sending receipts as independent messages (which trigger LLM turns),
+    /// they are buffered and prepended to the next real message.
+    fn format_receipt(envelope: &Envelope) -> Option<String> {
+        let receipt = envelope.receipt_message.as_ref()?;
+        let receipt_type = receipt.receipt_type.as_deref().unwrap_or("UNKNOWN");
+        let timestamps = receipt.timestamps.as_deref().unwrap_or(&[]);
+
+        let sender = envelope.source_number.as_deref()
+            .or(envelope.source.as_deref())?;
+
+        let ts_display: Vec<String> = timestamps.iter().map(|ts| {
+            let secs = ts / 1000;
+            format!("{secs}")
+        }).collect();
+
+        let verb = match receipt_type {
+            "DELIVERY" => "delivered to",
+            "READ" => "read by",
+            "VIEWED" => "viewed by",
+            _ => "acknowledged by",
+        };
+
+        Some(format!(
+            "[SIGNAL:{receipt_type}_RECEIPT] Message {verb} {sender} (original timestamps: {})",
+            ts_display.join(", ")
+        ))
     }
 }
 
@@ -335,6 +405,7 @@ impl Channel for SignalChannel {
             let mut bytes_stream = resp.bytes_stream();
             let mut buffer = String::new();
             let mut current_data = String::new();
+            let mut pending_receipts: Vec<String> = Vec::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = match chunk {
@@ -370,10 +441,21 @@ impl Channel for SignalChannel {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
-                                        if let Some(msg) = self.process_envelope(envelope) {
+                                        if let Some(mut msg) = self.process_envelope(envelope) {
+                                            // Prepend any buffered receipts to this real message
+                                            if !pending_receipts.is_empty() {
+                                                let receipt_block = format!(
+                                                    "[Message delivery status since your last message:\n{}]\n\n",
+                                                    pending_receipts.join("\n")
+                                                );
+                                                msg.content = format!("{receipt_block}{}", msg.content);
+                                                pending_receipts.clear();
+                                            }
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
+                                        } else if let Some(receipt_line) = Self::format_receipt(envelope) {
+                                            pending_receipts.push(receipt_line);
                                         }
                                     }
                                 }
@@ -397,8 +479,18 @@ impl Channel for SignalChannel {
                 match serde_json::from_str::<SseEnvelope>(&current_data) {
                     Ok(sse) => {
                         if let Some(ref envelope) = sse.envelope {
-                            if let Some(msg) = self.process_envelope(envelope) {
+                            if let Some(mut msg) = self.process_envelope(envelope) {
+                                if !pending_receipts.is_empty() {
+                                    let receipt_block = format!(
+                                        "[Message delivery status since your last message:\n{}]\n\n",
+                                        pending_receipts.join("\n")
+                                    );
+                                    msg.content = format!("{receipt_block}{}", msg.content);
+                                    pending_receipts.clear();
+                                }
                                 let _ = tx.send(msg).await;
+                            } else if let Some(receipt_line) = Self::format_receipt(envelope) {
+                                pending_receipts.push(receipt_line);
                             }
                         }
                     }
@@ -486,6 +578,7 @@ mod tests {
                 attachments: None,
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -703,6 +796,7 @@ mod tests {
             source_number: Some("+1111111111".to_string()),
             data_message: None,
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1000),
         };
         assert_eq!(SignalChannel::sender(&env), Some("+1111111111".to_string()));
@@ -715,6 +809,7 @@ mod tests {
             source_number: None,
             data_message: None,
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1000),
         };
         assert_eq!(SignalChannel::sender(&env), Some("uuid-123".to_string()));
@@ -741,6 +836,7 @@ mod tests {
                 attachments: None,
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let msg = ch.process_envelope(&env).unwrap();
@@ -776,6 +872,7 @@ mod tests {
                 attachments: None,
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let msg = ch.process_envelope(&env).unwrap();
@@ -794,6 +891,7 @@ mod tests {
             source_number: None,
             data_message: None,
             story_message: None,
+            receipt_message: None,
             timestamp: None,
         };
         assert_eq!(SignalChannel::sender(&env), None);
@@ -851,6 +949,7 @@ mod tests {
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         assert!(ch.process_envelope(&env).is_none());

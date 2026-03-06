@@ -4,6 +4,7 @@ pub mod classifier;
 pub mod dispatcher;
 pub mod loop_;
 pub mod memory_loader;
+pub mod recovery;
 pub mod prompt;
 pub mod quota_aware;
 pub mod research;

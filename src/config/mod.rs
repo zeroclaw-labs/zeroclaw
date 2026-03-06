@@ -22,7 +22,7 @@ pub use schema::{
     PeripheralsConfig, PerplexityFilterConfig, PluginEntryConfig, PluginsConfig, ProgressMode,
     ProactiveMessagingConfig, ProactiveMessagingQueueConfig, ProactiveMessagingRateLimits,
     ProviderConfig, ProxyConfig, ProxyScope, QdrantConfig, QuietHoursWindow,
-    QueryClassificationConfig,
+    QueryClassificationConfig, RecoveryConfig,
     ReliabilityConfig, ResearchPhaseConfig, ResearchTrigger, ResourceLimitsConfig, RuntimeConfig,
     SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
     SecurityRoleConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,

@@ -199,11 +199,55 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     );
     let delivery = heartbeat_delivery_target(&config)?;
 
+    // Component 3: stale turn probe — initialize the global followup store
+    let followup_enabled = config.recovery.stale_followup_enabled;
+    if followup_enabled {
+        match crate::heartbeat::pending_followups::init_global_store(&config.workspace_dir).await {
+            Ok(()) => tracing::info!("Stale followup probe enabled"),
+            Err(e) => tracing::warn!("Failed to load followup store: {e}; stale probe disabled"),
+        }
+    }
+
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
     loop {
         interval.tick().await;
+
+        // Component 3: check for stale follow-ups and send nudges
+        if followup_enabled {
+            if let Some(store) = crate::heartbeat::pending_followups::global_store() {
+                let expired = store.collect_expired().await;
+                for followup in expired {
+                    let nudge_msg = format!(
+                        "Checking in \u{2014} I was working on something for you but it may have \
+                         stalled. Context: {}. Want me to continue?",
+                        followup.context_summary
+                    );
+                    if let Err(e) = crate::cron::scheduler::deliver_announcement(
+                        &config,
+                        &followup.channel,
+                        &followup.reply_target,
+                        &nudge_msg,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            history_key = %followup.history_key,
+                            "Stale followup nudge delivery failed: {e}"
+                        );
+                    } else {
+                        tracing::info!(
+                            history_key = %followup.history_key,
+                            nudge_count = followup.nudge_count + 1,
+                            "Sent stale followup nudge"
+                        );
+                    }
+                    store.increment_nudge(&followup.history_key).await;
+                }
+                store.gc().await;
+            }
+        }
 
         let file_tasks = engine.collect_tasks().await?;
         let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());

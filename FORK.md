@@ -24,8 +24,11 @@ git diff HEAD...upstream/main -- src/config/schema.rs  # check for breaking conf
 
 ## Local Changes (relative to upstream)
 - `src/config/schema.rs`: Added `ZEROCLAW_GATEWAY_PAIRED_TOKENS` env var override
+- `src/gateway/mod.rs`: Increased `REQUEST_TIMEOUT_SECS` from 30s to 300s (gateway tool loop needs time)
+- `src/tools/mcp_transport.rs`: Added `Mcp-Session-Id` tracking to `HttpTransport` for streamable-http compatibility
 - `Dockerfile.sam`: Narrowed chown scope to `/opt/sam-tools/home/.serena`
 - `src/channels/`, `src/heartbeat/`: Proactive messaging feature
 
 ## Image Tags
+- `citizendaniel/zeroclaw-sam:v1.3.0` — gateway timeout fix, TOOLS.md cleanup
 - `citizendaniel/zeroclaw-sam:v1.2.0` — built from `sam-v1.2.0` tag

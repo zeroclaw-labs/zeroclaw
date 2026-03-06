@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod pending_followups;
 
 #[cfg(test)]
 mod tests {
