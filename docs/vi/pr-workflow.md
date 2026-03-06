@@ -37,7 +37,7 @@ Xem tiếp:
 
 - [Mục 5.1](#51-definition-of-ready-dor-trước-khi-yêu-cầu-review)
 
-### 1.2 `CI Required Gate` đang thất bại
+### 1.2 CI check đang thất bại
 
 1. Phân tuyến lỗi qua CI map và ưu tiên sửa các gate mang tính quyết định trước.
 2. Chỉ đánh giá lại rủi ro sau khi CI trả về tín hiệu rõ ràng.
@@ -93,15 +93,14 @@ Tự động hóa hỗ trợ việc triage và bảo vệ, nhưng trách nhiệm
 
 ## 3. Cài đặt repository bắt buộc
 
-Duy trì các quy tắc branch protection sau trên `main`:
+Duy trì các quy tắc branch protection sau trên `master`:
 
-- Yêu cầu status check trước khi merge.
-- Yêu cầu check `CI Required Gate`.
+- Yêu cầu status check trước khi merge (`test` và `build` từ `ci.yml`).
 - Yêu cầu review pull request trước khi merge.
 - Yêu cầu review CODEOWNERS cho các đường dẫn được bảo vệ.
-- Với `.github/workflows/**`, yêu cầu phê duyệt từ owner qua `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) và giới hạn quyền bypass branch/ruleset cho org owner.
 - Hủy bỏ approval cũ khi có commit mới được đẩy lên.
 - Hạn chế force-push trên các branch được bảo vệ.
+- Tất cả PR contributor hướng trực tiếp đến `master`.
 
 ---
 
@@ -110,19 +109,12 @@ Duy trì các quy tắc branch protection sau trên `main`:
 ### 4.1 Bước A: Intake
 
 - Contributor mở PR với `.github/pull_request_template.md` đầy đủ.
-- `PR Labeler` áp dụng nhãn phạm vi/đường dẫn + nhãn kích thước + nhãn rủi ro + nhãn module (ví dụ `channel:telegram`, `provider:kimi`, `tool:shell`) và bậc contributor theo số PR đã merge (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), đồng thời loại bỏ trùng lặp nhãn phạm vi ít cụ thể hơn khi đã có nhãn module cụ thể hơn.
-- Đối với tất cả các tiền tố module, nhãn module được nén gọn để giảm nhiễu: một module cụ thể giữ `prefix:component`, nhưng nhiều module cụ thể thu gọn thành nhãn phạm vi cơ sở `prefix`.
-- Thứ tự nhãn ưu tiên đầu tiên: `risk:*` -> `size:*` -> bậc contributor -> nhãn module/đường dẫn.
-- Maintainer có thể chạy `PR Labeler` thủ công (`workflow_dispatch`) ở chế độ `audit` để kiểm tra drift hoặc chế độ `repair` để chuẩn hóa metadata nhãn được quản lý trên toàn repository.
-- Di chuột qua nhãn trên GitHub hiển thị mô tả được quản lý tự động (tóm tắt quy tắc/ngưỡng).
-- Màu nhãn được quản lý được sắp xếp theo thứ tự hiển thị để tạo gradient mượt mà trên các hàng nhãn dài.
-- `PR Auto Responder` đăng hướng dẫn lần đầu, xử lý phân tuyến dựa trên nhãn cho các mục tín hiệu thấp và tự động áp dụng bậc contributor cho issue với cùng ngưỡng như `PR Labeler` (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50).
+- Maintainer áp dụng nhãn phạm vi, kích thước và rủi ro theo nhu cầu.
 
 ### 4.2 Bước B: Validation
 
-- `CI Required Gate` là merge gate.
-- PR chỉ thay đổi tài liệu sử dụng fast-path và bỏ qua các Rust job nặng.
-- PR không phải tài liệu phải vượt qua lint, test và kiểm tra smoke release build.
+- CI check (`test` + `build` từ `ci.yml`) là merge gate.
+- Tất cả PR chạy test suite đầy đủ và kiểm tra release build.
 
 ### 4.3 Bước C: Review
 
@@ -151,7 +143,7 @@ Duy trì các quy tắc branch protection sau trên `main`:
 
 ### 5.2 Definition of Done (DoD) sẵn sàng merge
 
-- `CI Required Gate` đã xanh.
+- CI check đã xanh (`test` + `build`).
 - Các reviewer bắt buộc đã phê duyệt (bao gồm các đường dẫn CODEOWNERS).
 - Nhãn phân loại rủi ro khớp với các đường dẫn đã chạm.
 - Tác động migration/tương thích đã được ghi lại.
@@ -177,8 +169,7 @@ Duy trì các quy tắc branch protection sau trên `main`:
 
 ### 6.3 Hành vi tự động hóa
 
-- `PR Labeler` áp dụng nhãn `size:*` từ số dòng thay đổi thực tế.
-- PR chỉ tài liệu/nặng lockfile được chuẩn hóa để tránh thổi phồng kích thước.
+- Maintainer áp dụng nhãn `size:*` dựa trên số dòng thay đổi thực tế.
 
 ---
 
@@ -213,7 +204,7 @@ Chúng tôi **không** yêu cầu contributor định lượng quyền sở hữ
 - Mục tiêu triage maintainer đầu tiên: trong vòng 48 giờ.
 - Nếu PR bị chặn, maintainer để lại một checklist hành động được.
 - Tự động hóa `stale` được dùng để giữ hàng đợi lành mạnh; maintainer có thể áp dụng `no-stale` khi cần.
-- Tự động hóa `pr-hygiene` kiểm tra các PR mở mỗi 12 giờ và đăng nhắc nhở khi PR không có commit mới trong 48+ giờ và hoặc là đang tụt hậu so với `main` hoặc thiếu/thất bại `CI Required Gate` trên head commit.
+- Maintainer định kỳ kiểm tra các PR cũ cần rebase hoặc chạy lại CI check.
 
 ### 8.1 Kiểm soát ngân sách hàng đợi
 
@@ -229,13 +220,7 @@ Chúng tôi **không** yêu cầu contributor định lượng quyền sở hữ
 
 - `r:needs-repro` cho báo cáo lỗi chưa đầy đủ (yêu cầu repro mang tính quyết định trước khi triage sâu).
 - `r:support` cho các mục sử dụng/trợ giúp nên xử lý ngoài bug backlog.
-- Nhãn `invalid` / `duplicate` kích hoạt tự động hóa đóng **chỉ issue** kèm hướng dẫn.
-
-### 8.4 Bảo vệ tác dụng phụ của tự động hóa
-
-- `PR Auto Responder` loại bỏ trùng lặp comment dựa trên nhãn để tránh spam.
-- Các luồng đóng tự động chỉ giới hạn cho issue, không phải PR.
-- Maintainer có thể đóng băng tính toán lại rủi ro tự động bằng `risk: manual` khi ngữ cảnh yêu cầu ghi đè thủ công.
+- `duplicate` / `invalid` cho các mục không thể hành động.
 
 ---
 
@@ -270,7 +255,7 @@ Các thay đổi ở những khu vực này yêu cầu review chặt chẽ hơn 
 
 Nếu một PR đã merge gây ra hồi quy:
 
-1. Revert PR ngay lập tức trên `main`.
+1. Revert PR ngay lập tức trên `master`.
 2. Mở issue theo dõi với phân tích nguyên nhân gốc.
 3. Chỉ đưa lại bản sửa lỗi khi có test hồi quy.
 
@@ -281,8 +266,7 @@ Nếu một PR đã merge gây ra hồi quy:
 ## 11. Checklist merge của maintainer
 
 - Phạm vi tập trung và dễ hiểu.
-- CI gate đã xanh.
-- Kiểm tra chất lượng tài liệu đã xanh khi tài liệu thay đổi.
+- CI check đã xanh (`test` + `build`).
 - Các trường tác động bảo mật đã hoàn thành.
 - Các trường tính riêng tư/vệ sinh dữ liệu đã hoàn thành và bằng chứng đã được biên tập/ẩn danh.
 - Ghi chú workflow agent đủ để tái tạo (nếu tự động hóa được sử dụng).
@@ -298,7 +282,7 @@ Nếu một PR đã merge gây ra hồi quy:
 ### 12.1 Làn A: triage nhanh (thân thiện với agent)
 
 - Xác nhận độ đầy đủ của template PR.
-- Xác nhận tín hiệu CI gate (`CI Required Gate`).
+- Xác nhận CI check pass (`test` + `build`).
 - Xác nhận phân loại rủi ro qua nhãn và các đường dẫn đã chạm.
 - Xác nhận tuyên bố rollback tồn tại.
 - Xác nhận phần tính riêng tư/vệ sinh dữ liệu và các yêu cầu diễn đạt trung lập đã được thỏa mãn.

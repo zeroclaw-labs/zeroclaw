@@ -81,7 +81,7 @@ Cho mỗi PR mới:
    - nhãn phạm vi (ví dụ `provider`, `channel`, `security`)
    - nhãn có phạm vi module (`channel:*`, `provider:*`, `tool:*`)
    - nhãn bậc contributor khi áp dụng được
-3. Xác nhận trạng thái tín hiệu CI (`CI Required Gate`).
+3. Xác nhận CI check pass (`test` + `build` từ `ci.yml`).
 4. Xác nhận phạm vi là một mối quan tâm (từ chối mega-PR hỗn hợp trừ khi có lý do).
 5. Xác nhận các yêu cầu tính riêng tư/vệ sinh dữ liệu và diễn đạt test trung lập đã được thỏa mãn.
 

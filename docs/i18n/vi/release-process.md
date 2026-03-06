@@ -2,111 +2,94 @@
 
 Runbook này định nghĩa quy trình release tiêu chuẩn của maintainer.
 
-Cập nhật lần cuối: **2026-02-20**.
+Cập nhật lần cuối: **2026-03-06**.
 
-## Mục tiêu release
+## Mục tiêu Release
 
-- Đảm bảo release có thể dự đoán và lặp lại.
-- Chỉ publish từ code đã có trên `main`.
-- Xác minh các artifact đa nền tảng trước khi publish.
-- Duy trì nhịp release đều đặn ngay cả khi PR volume cao.
+- Giữ release có thể dự đoán và lặp lại.
+- Chỉ publish từ code đã có trên `master`.
+- Xác minh artifact đa target trước khi publish.
+- Giữ cadence release đều đặn ngay cả khi khối lượng PR cao.
 
-## Chu kỳ tiêu chuẩn
+## Mô hình Release
+
+ZeroClaw sử dụng mô hình release hai tầng:
+
+- **Beta release** tự động — mỗi merge vào `master` kích hoạt beta pre-release (`vX.Y.Z-beta.<run_number>`).
+- **Stable release** thủ công — maintainer chạy `Promote Release` qua workflow dispatch để cắt phiên bản non-pre-release.
+
+## Hợp đồng Workflow
+
+Tự động hóa release nằm trong:
+
+- `.github/workflows/release.yml` — beta release tự động khi push lên `master`
+- `.github/workflows/promote-release.yml` — stable release thủ công qua workflow dispatch
+
+### Beta Release (tự động)
+
+- Kích hoạt trên mỗi push lên `master`.
+- Tính version từ `Cargo.toml`: `vX.Y.Z-beta.<run_number>`.
+- Build ma trận 5 target (linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64).
+- Publish GitHub pre-release với archives + SHA256SUMS.
+- Build và push Docker image đa nền tảng lên GHCR (`beta` + version tag).
+
+### Stable Release (thủ công)
+
+- Kích hoạt qua `workflow_dispatch` với input `version` (ví dụ `0.2.0`).
+- Xác thực version khớp `Cargo.toml` và tag chưa tồn tại.
+- Build cùng ma trận 5 target như beta.
+- Publish GitHub stable release với archives + SHA256SUMS.
+- Build và push Docker image lên GHCR (`latest` + version tag).
+
+## Quy trình Maintainer
+
+### 1) Kiểm tra trước trên `master`
+
+1. Đảm bảo CI xanh trên `master` mới nhất.
+2. Xác nhận không có incident ưu tiên cao hoặc regression đã biết đang mở.
+3. Xác nhận các beta release gần đây khỏe mạnh (kiểm tra trang GitHub Releases).
+
+### 2) Tùy chọn: chạy CI Full Matrix
+
+Nếu xác minh cross-compilation trước stable release:
+
+- Chạy `CI Full Matrix` thủ công (`.github/workflows/ci-full.yml`).
+- Xác nhận build thành công trên `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` và `x86_64-pc-windows-msvc`.
+
+### 3) Tăng version trong `Cargo.toml`
+
+1. Tạo branch, cập nhật `version` trong `Cargo.toml` lên version mục tiêu.
+2. Mở PR, merge vào `master`.
+3. Merge kích hoạt beta release tự động.
+
+### 4) Promote lên stable release
+
+1. Chạy workflow `Promote Release` thủ công:
+   - `version`: version mục tiêu (ví dụ `0.2.0`) — phải khớp `Cargo.toml`
+2. Workflow xác thực version, build tất cả target và publish.
+
+### 5) Xác thực sau release
+
+1. Xác minh asset GitHub Release có thể tải.
+2. Xác minh GHCR tag cho version đã release.
+3. Xác minh đường dẫn cài đặt dựa trên release asset (ví dụ tải binary bootstrap).
+
+## Cadence Tiêu chuẩn
 
 - Release patch/minor: hàng tuần hoặc hai tuần một lần.
-- Bản vá bảo mật khẩn cấp: out-of-band.
-- Không bao giờ chờ tích lũy quá nhiều commit lớn.
+- Sửa bảo mật khẩn cấp: ngoài lịch trình.
+- Beta release ship liên tục với mỗi merge.
 
-## Hợp đồng workflow
+## Đường dẫn Khẩn cấp / Khôi phục
 
-Automation release nằm tại:
+Nếu stable release thất bại:
 
-- `.github/workflows/pub-release.yml`
+1. Sửa vấn đề trên `master`.
+2. Chạy lại `Promote Release` với cùng version (nếu tag chưa được tạo).
+3. Nếu tag đã tồn tại, tăng lên patch version tiếp theo.
 
-Các chế độ:
+## Ghi chú Vận hành
 
-- Tag push `v*`: chế độ publish.
-- Manual dispatch: chế độ chỉ xác minh hoặc publish.
-- Lịch hàng tuần: chế độ chỉ xác minh.
-
-Các guardrail ở chế độ publish:
-
-- Tag phải khớp định dạng semver-like `vX.Y.Z[-suffix]`.
-- Tag phải đã tồn tại trên origin.
-- Commit của tag phải có thể truy vết được từ `origin/main`.
-- GHCR image tag tương ứng (`ghcr.io/<owner>/<repo>:<tag>`) phải sẵn sàng trước khi GitHub Release publish hoàn tất.
-- Artifact được xác minh trước khi publish.
-
-## Quy trình maintainer
-
-### 1) Preflight trên `main`
-
-1. Đảm bảo các required check đều xanh trên `main` mới nhất.
-2. Xác nhận không có sự cố ưu tiên cao hoặc regression đã biết nào đang mở.
-3. Xác nhận các workflow installer và Docker đều khoẻ mạnh trên các commit `main` gần đây.
-
-### 2) Chạy verification build (không publish)
-
-Chạy `Pub Release` thủ công:
-
-- `publish_release`: `false`
-- `release_ref`: `main`
-
-Kết quả mong đợi:
-
-- Ma trận target đầy đủ build thành công.
-- `verify-artifacts` xác nhận tất cả archive mong đợi đều tồn tại.
-- Không có GitHub Release nào được publish.
-
-### 3) Cut release tag
-
-Từ một checkout cục bộ sạch đã sync với `origin/main`:
-
-```bash
-scripts/release/cut_release_tag.sh vX.Y.Z --push
-```
-
-Script này đảm bảo:
-
-- working tree sạch
-- `HEAD == origin/main`
-- tag không bị trùng lặp
-- định dạng tag semver-like
-
-### 4) Theo dõi publish run
-
-Sau khi push tag, theo dõi:
-
-1. Chế độ publish `Pub Release`
-2. Job publish `Pub Docker Img`
-
-Kết quả publish mong đợi:
-
-- release archive
-- `SHA256SUMS`
-- SBOM `CycloneDX` và `SPDX`
-- chữ ký/chứng chỉ cosign
-- GitHub Release notes + asset
-
-### 5) Xác minh sau release
-
-1. Xác minh GitHub Release asset có thể tải xuống.
-2. Xác minh GHCR tag cho phiên bản đã release và `latest`.
-3. Xác minh các đường dẫn cài đặt phụ thuộc vào release asset (ví dụ tải xuống binary bootstrap).
-
-## Đường dẫn khẩn cấp / khôi phục
-
-Nếu release push tag thất bại sau khi artifact đã được xác minh:
-
-1. Sửa vấn đề workflow hoặc packaging trên `main`.
-2. Chạy lại `Pub Release` thủ công ở chế độ publish với:
-   - `publish_release=true`
-   - `release_tag=<existing tag>`
-   - `release_ref` tự động được pin vào `release_tag` ở chế độ publish
-3. Xác minh lại asset đã release.
-
-## Ghi chú vận hành
-
-- Giữ các thay đổi release nhỏ và có thể đảo ngược.
-- Dùng một issue/checklist release cho mỗi phiên bản để bàn giao rõ ràng.
-- Tránh publish từ các feature branch ad-hoc.
+- Giữ thay đổi release nhỏ và có thể đảo ngược.
+- Ưu tiên một issue/checklist release cho mỗi version để handoff rõ ràng.
+- Tránh publish từ các branch tính năng tùy ý.

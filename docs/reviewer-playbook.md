@@ -81,7 +81,7 @@ For every new PR:
    - scope labels (for example `provider`, `channel`, `security`)
    - module-scoped labels (`channel:*`, `provider:*`, `tool:*`)
    - contributor tier labels when applicable
-3. Confirm CI signal status (`CI Required Gate`).
+3. Confirm CI checks pass (`test` + `build` from `ci.yml`).
 4. Confirm scope is one concern (reject mixed mega-PRs unless justified).
 5. Confirm privacy/data-hygiene and neutral test wording requirements are satisfied.
 

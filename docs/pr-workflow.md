@@ -37,7 +37,7 @@ Go to:
 
 - [Section 5.1](#51-definition-of-ready-dor-before-requesting-review)
 
-### 1.2 `CI Required Gate` failing
+### 1.2 CI checks failing
 
 1. Route failure through CI map and fix deterministic gates first.
 2. Re-evaluate risk only after CI returns coherent signal.
@@ -93,18 +93,14 @@ Automation assists with triage and guardrails, but final merge accountability re
 
 ## 3. Required Repository Settings
 
-Maintain these branch protection rules on `dev` and `main`:
+Maintain these branch protection rules on `master`:
 
-- Require status checks before merge.
-- Require check `CI Required Gate`.
+- Require status checks before merge (`test` and `build` from `ci.yml`).
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths.
-- For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
-- Default workflow-owner allowlist includes `theonlyhennygod`, `willsarg`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
-- Route normal contributor PRs to `dev`.
-- Allow `main` merges only through a promotion PR from `dev` (enforced by `Main Promotion Gate`).
+- All contributor PRs target `master` directly.
 
 ---
 
@@ -113,20 +109,12 @@ Maintain these branch protection rules on `dev` and `main`:
 ### 4.1 Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
-- `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
-- For all module prefixes, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label `prefix`.
-- Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
-- Maintainers can run `PR Labeler` manually (`workflow_dispatch`) in `audit` mode for drift visibility or `repair` mode to normalize managed label metadata repository-wide.
-- Hovering a label in GitHub shows its auto-managed description (rule/threshold summary).
-- Managed label colors are arranged by display order to create a smooth gradient across long label rows.
-- `PR Auto Responder` posts first-time guidance, handles label-driven routing for low-signal items, and auto-applies issue contributor tiers using the same thresholds as `PR Labeler` (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50).
+- Maintainers manually apply scope, size, and risk labels as needed.
 
 ### 4.2 Step B: Validation
 
-- `CI Required Gate` is the merge gate.
-- Docs-only PRs use fast-path and skip heavy Rust jobs.
-- Non-doc PRs must pass lint, tests, and release build smoke check.
-- Rust-impacting PRs use the same required gate set as `dev`/`main` pushes (no PR build-only shortcut).
+- CI checks (`test` + `build` from `ci.yml`) are the merge gate.
+- All PRs run the full test suite and release build check.
 
 ### 4.3 Step C: Review
 
@@ -155,7 +143,7 @@ Maintain these branch protection rules on `dev` and `main`:
 
 ### 5.2 Definition of Done (DoD) merge-ready
 
-- `CI Required Gate` is green.
+- CI checks are green (`test` + `build`).
 - Required reviewers approved (including CODEOWNERS paths).
 - Risk class labels match touched paths.
 - Migration/compatibility impact is documented.
@@ -217,7 +205,7 @@ We do **not** require contributors to quantify AI-vs-human line ownership.
 - First maintainer triage target: within 48 hours.
 - If PR is blocked, maintainer leaves one actionable checklist.
 - `stale` automation is used to keep queue healthy; maintainers can apply `no-stale` when needed.
-- `pr-hygiene` automation checks open PRs every 12 hours and posts a nudge when a PR has no new commits for 48+ hours and is either behind `main` or missing/failing `CI Required Gate` on the head commit.
+- Maintainers periodically check for stale PRs that need rebase or re-run of CI checks.
 
 ### 8.1 Queue budget controls
 
@@ -233,13 +221,7 @@ We do **not** require contributors to quantify AI-vs-human line ownership.
 
 - `r:needs-repro` for incomplete bug reports (request deterministic repro before deep triage).
 - `r:support` for usage/help items better handled outside bug backlog.
-- `invalid` / `duplicate` labels trigger **issue-only** closing automation with guidance.
-
-### 8.4 Automation side-effect guards
-
-- `PR Auto Responder` deduplicates label-based comments to avoid spam.
-- Automated close routes are limited to issues, not PRs.
-- Maintainers can freeze automated risk recalculation with `risk: manual` when context demands human override.
+- `duplicate` / `invalid` for non-actionable items.
 
 ---
 
@@ -274,7 +256,7 @@ For agent-assisted contributions, reviewers should also verify the author demons
 
 If a merged PR causes regressions:
 
-1. Revert PR immediately on `main`.
+1. Revert PR immediately on `master`.
 2. Open a follow-up issue with root-cause analysis.
 3. Re-introduce fix only with regression tests.
 
@@ -285,8 +267,7 @@ Prefer fast restore of service quality over delayed perfect fixes.
 ## 11. Maintainer Merge Checklist
 
 - Scope is focused and understandable.
-- CI gate is green.
-- Docs-quality checks are green when docs changed.
+- CI checks are green (`test` + `build`).
 - Security impact fields are complete.
 - Privacy/data-hygiene fields are complete and evidence is redacted/anonymized.
 - Agent workflow notes are sufficient for reproducibility (if automation was used).
@@ -302,7 +283,7 @@ To keep review quality stable under high PR volume, use a two-lane review model.
 ### 12.1 Lane A: fast triage (agent-friendly)
 
 - Confirm PR template completeness.
-- Confirm CI gate signal (`CI Required Gate`).
+- Confirm CI checks pass (`test` + `build`).
 - Confirm risk class via labels and touched paths.
 - Confirm rollback statement exists.
 - Confirm privacy/data-hygiene section and neutral wording requirements are satisfied.

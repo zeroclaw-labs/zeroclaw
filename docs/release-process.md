@@ -2,129 +2,91 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **February 21, 2026**.
+Last verified: **March 6, 2026**.
 
 ## Release Goals
 
 - Keep releases predictable and repeatable.
-- Publish only from code already in `main`.
+- Publish only from code already in `master`.
 - Verify multi-target artifacts before publish.
 - Keep release cadence regular even with high PR volume.
 
-## Standard Cadence
+## Release Model
 
-- Patch/minor releases: weekly or bi-weekly.
-- Emergency security fixes: out-of-band.
-- Never wait for very large commit batches to accumulate.
+ZeroClaw uses a two-tier release model:
+
+- **Beta releases** are automatic — every merge to `master` triggers a beta pre-release (`vX.Y.Z-beta.<run_number>`).
+- **Stable releases** are manual — a maintainer runs `Promote Release` via workflow dispatch to cut a non-pre-release version.
 
 ## Workflow Contract
 
 Release automation lives in:
 
-- `.github/workflows/pub-release.yml`
-- `.github/workflows/pub-homebrew-core.yml` (manual Homebrew formula PR, bot-owned)
+- `.github/workflows/release.yml` — automatic beta release on push to `master`
+- `.github/workflows/promote-release.yml` — manual stable release via workflow dispatch
 
-Modes:
+### Beta Release (automatic)
 
-- Tag push `v*`: publish mode.
-- Manual dispatch: verification-only or publish mode.
-- Weekly schedule: verification-only mode.
+- Triggered on every push to `master`.
+- Computes version from `Cargo.toml`: `vX.Y.Z-beta.<run_number>`.
+- Builds 5-target matrix (linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64).
+- Publishes GitHub pre-release with archives + SHA256SUMS.
+- Builds and pushes multi-platform Docker image to GHCR (`beta` + version tag).
 
-Publish-mode guardrails:
+### Stable Release (manual)
 
-- Tag must match semver-like format `vX.Y.Z[-suffix]`.
-- Tag must already exist on origin.
-- Tag commit must be reachable from `origin/main`.
-- Matching GHCR image tag (`ghcr.io/<owner>/<repo>:<tag>`) must be available before GitHub Release publish completes.
-- Artifacts are verified before publish.
+- Triggered via `workflow_dispatch` with a `version` input (e.g. `0.2.0`).
+- Validates version matches `Cargo.toml` and tag does not already exist.
+- Builds same 5-target matrix as beta.
+- Publishes GitHub stable release with archives + SHA256SUMS.
+- Builds and pushes Docker image to GHCR (`latest` + version tag).
 
 ## Maintainer Procedure
 
-### 1) Preflight on `main`
+### 1) Preflight on `master`
 
-1. Ensure required checks are green on latest `main`.
+1. Ensure CI is green on latest `master`.
 2. Confirm no high-priority incidents or known regressions are open.
-3. Confirm installer and Docker workflows are healthy on recent `main` commits.
+3. Confirm recent beta releases are healthy (check GitHub Releases page).
 
-### 2) Run verification build (no publish)
+### 2) Optional: run CI Full Matrix
 
-Run `Pub Release` manually:
+If verifying cross-compilation before a stable release:
 
-- `publish_release`: `false`
-- `release_ref`: `main`
+- Run `CI Full Matrix` manually (`.github/workflows/ci-full.yml`).
+- Confirms builds succeed on `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `x86_64-pc-windows-msvc`.
 
-Expected outcome:
+### 3) Bump version in `Cargo.toml`
 
-- Full target matrix builds successfully.
-- `verify-artifacts` confirms all expected archives exist.
-- No GitHub Release is published.
+1. Create a branch, update `version` in `Cargo.toml` to the target version.
+2. Open PR, merge to `master`.
+3. The merge triggers a beta release automatically.
 
-### 3) Cut release tag
+### 4) Promote to stable release
 
-From a clean local checkout synced to `origin/main`:
-
-```bash
-scripts/release/cut_release_tag.sh vX.Y.Z --push
-```
-
-This script enforces:
-
-- clean working tree
-- `HEAD == origin/main`
-- non-duplicate tag
-- semver-like tag format
-
-### 4) Monitor publish run
-
-After tag push, monitor:
-
-1. `Pub Release` publish mode
-2. `Pub Docker Img` publish job
-
-Expected publish outputs:
-
-- release archives
-- `SHA256SUMS`
-- `CycloneDX` and `SPDX` SBOMs
-- cosign signatures/certificates
-- GitHub Release notes + assets
+1. Run `Promote Release` workflow manually:
+   - `version`: the target version (e.g. `0.2.0`) — must match `Cargo.toml`
+2. Workflow validates version, builds all targets, and publishes.
 
 ### 5) Post-release validation
 
 1. Verify GitHub Release assets are downloadable.
-2. Verify GHCR tags for the released version (`vX.Y.Z`) and release commit SHA tag (`sha-<12>`).
+2. Verify GHCR tags for the released version.
 3. Verify install paths that rely on release assets (for example bootstrap binary download).
 
-### 6) Publish Homebrew Core formula (bot-owned)
+## Standard Cadence
 
-Run `Pub Homebrew Core` manually:
-
-- `release_tag`: `vX.Y.Z`
-- `dry_run`: `true` first, then `false`
-
-Required repository settings for non-dry-run:
-
-- secret: `HOMEBREW_CORE_BOT_TOKEN` (token from a dedicated bot account, not a personal maintainer account)
-- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `zeroclaw-release-bot/homebrew-core`)
-- optional variable: `HOMEBREW_CORE_BOT_EMAIL`
-
-Workflow guardrails:
-
-- release tag must match `Cargo.toml` version
-- formula source URL and SHA256 are updated from the tagged tarball
-- formula license is normalized to `Apache-2.0 OR MIT`
-- PR is opened from the bot fork into `Homebrew/homebrew-core:master`
+- Patch/minor releases: weekly or bi-weekly.
+- Emergency security fixes: out-of-band.
+- Beta releases ship continuously with every merge.
 
 ## Emergency / Recovery Path
 
-If tag-push release fails after artifacts are validated:
+If a stable release fails:
 
-1. Fix workflow or packaging issue on `main`.
-2. Re-run manual `Pub Release` in publish mode with:
-   - `publish_release=true`
-   - `release_tag=<existing tag>`
-   - `release_ref` is automatically pinned to `release_tag` in publish mode
-3. Re-validate released assets.
+1. Fix the issue on `master`.
+2. Re-run `Promote Release` with the same version (if the tag was not yet created).
+3. If the tag already exists, bump to the next patch version.
 
 ## Operational Notes
 
