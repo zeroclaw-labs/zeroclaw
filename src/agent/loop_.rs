@@ -284,8 +284,10 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 chars (not bytes) for context, then redact.
+            // Avoid UTF-8 slicing panic (e.g. "你的_..." where byte index 4 is mid-char).
+            let prefix_owned: String = val.chars().take(4).collect();
+            let prefix = prefix_owned.as_str();
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
