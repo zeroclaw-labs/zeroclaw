@@ -4575,9 +4575,16 @@ fn collect_configured_channels(
     }
 
     if let Some(ref email_cfg) = config.channels_config.email {
+        let email_channel: EmailChannel =
+            if email_cfg.auth_method == crate::channels::email_channel::EmailAuthMethod::Xoauth2 {
+                let auth_service = crate::auth::AuthService::from_config(config);
+                EmailChannel::with_auth_service(email_cfg.clone(), auth_service)
+            } else {
+                EmailChannel::new(email_cfg.clone())
+            };
         channels.push(ConfiguredChannel {
             display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
+            channel: Arc::new(email_channel),
         });
     }
 

@@ -15,7 +15,7 @@ use async_imap::Session;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use lettre::message::SinglePart;
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
 use rustls::{ClientConfig, RootCertStore};
@@ -34,6 +34,17 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
+
+/// Authentication method for the email channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum EmailAuthMethod {
+    /// Traditional username/password authentication (default, backwards compatible).
+    #[default]
+    Password,
+    /// XOAUTH2 SASL authentication (Gmail OAuth2).
+    Xoauth2,
+}
 
 /// Email channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -54,10 +65,23 @@ pub struct EmailConfig {
     /// Use TLS for SMTP (default: true)
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    /// Authentication method: "password" (default) or "xoauth2"
+    #[serde(default)]
+    pub auth_method: EmailAuthMethod,
     /// Email username for authentication
     pub username: String,
-    /// Email password for authentication
+    /// Email password for authentication (required for password auth, omit for xoauth2)
+    #[serde(default)]
     pub password: String,
+    /// OAuth2 client ID (required for xoauth2 auth)
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// OAuth2 client secret (required for xoauth2 auth)
+    #[serde(default)]
+    pub oauth_client_secret: Option<String>,
+    /// OAuth2 profile name for token storage (default: "default")
+    #[serde(default = "default_oauth_profile")]
+    pub oauth_profile: String,
     /// From address for outgoing emails
     pub from_address: String,
     /// IDLE timeout in seconds before re-establishing connection (default: 1740 = 29 minutes)
@@ -93,6 +117,9 @@ fn default_idle_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_oauth_profile() -> String {
+    "default".into()
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -103,8 +130,12 @@ impl Default for EmailConfig {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: true,
+            auth_method: EmailAuthMethod::default(),
             username: String::new(),
             password: String::new(),
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            oauth_profile: default_oauth_profile(),
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
@@ -112,12 +143,31 @@ impl Default for EmailConfig {
     }
 }
 
-type ImapSession = Session<TlsStream<TcpStream>>;
+type ImapSession = Session<tokio::io::BufReader<TlsStream<TcpStream>>>;
+
+/// XOAUTH2 SASL authenticator for IMAP.
+struct XOAuth2Authenticator {
+    user: String,
+    access_token: String,
+}
+
+impl async_imap::Authenticator for XOAuth2Authenticator {
+    type Response = Vec<u8>;
+
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        format!(
+            "user={}\x01auth=Bearer {}\x01\x01",
+            self.user, self.access_token
+        )
+        .into_bytes()
+    }
+}
 
 /// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound
 pub struct EmailChannel {
     pub config: EmailConfig,
     seen_messages: Arc<Mutex<HashSet<String>>>,
+    auth_service: Option<crate::auth::AuthService>,
 }
 
 impl EmailChannel {
@@ -125,7 +175,70 @@ impl EmailChannel {
         Self {
             config,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            auth_service: None,
         }
+    }
+
+    /// Create an email channel with an auth service for XOAUTH2 token management.
+    pub fn with_auth_service(config: EmailConfig, auth_service: crate::auth::AuthService) -> Self {
+        Self {
+            config,
+            seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            auth_service: Some(auth_service),
+        }
+    }
+
+    /// Get a valid OAuth2 access token via the auth service.
+    async fn get_access_token(&self) -> Result<String> {
+        let auth_service = self
+            .auth_service
+            .as_ref()
+            .ok_or_else(|| anyhow!("AuthService not configured for XOAUTH2 email channel"))?;
+
+        let client_id = self
+            .config
+            .oauth_client_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("oauth_client_id is required for XOAUTH2"))?;
+        let client_secret = self
+            .config
+            .oauth_client_secret
+            .as_deref()
+            .ok_or_else(|| anyhow!("oauth_client_secret is required for XOAUTH2"))?;
+
+        let profile_override = if self.config.oauth_profile == "default" {
+            None
+        } else {
+            Some(self.config.oauth_profile.as_str())
+        };
+
+        auth_service
+            .get_valid_email_access_token(profile_override, client_id, client_secret)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "No email OAuth profile found. Run `zeroclaw auth login --provider email` first."
+                )
+            })
+    }
+
+    /// Check if the current token is near expiry (within 5 minutes).
+    async fn is_token_near_expiry(&self) -> bool {
+        let Some(auth_service) = self.auth_service.as_ref() else {
+            return false;
+        };
+        let profile_override = if self.config.oauth_profile == "default" {
+            None
+        } else {
+            Some(self.config.oauth_profile.as_str())
+        };
+        let Ok(Some(profile)) = auth_service.get_profile("email", profile_override).await else {
+            return false;
+        };
+        let Some(token_set) = profile.token_set.as_ref() else {
+            return false;
+        };
+        token_set.is_expiring_within(Duration::from_secs(300))
     }
 
     /// Check if a sender email is in the allowlist
@@ -205,13 +318,16 @@ impl EmailChannel {
         "(no readable content)".to_string()
     }
 
-    /// Connect to IMAP server with TLS and authenticate
+    /// Connect to IMAP server with TLS and authenticate.
+    /// Uses password or XOAUTH2 depending on config.
     async fn connect_imap(&self) -> Result<ImapSession> {
         let addr = format!("{}:{}", self.config.imap_host, self.config.imap_port);
         debug!("Connecting to IMAP server at {}", addr);
 
         // Connect TCP
+        debug!("TCP connecting to {}", addr);
         let tcp = TcpStream::connect(&addr).await?;
+        debug!("TCP connected, starting TLS handshake");
 
         // Establish TLS using rustls
         let certs = RootCertStore {
@@ -223,15 +339,54 @@ impl EmailChannel {
         let tls_stream: TlsConnector = Arc::new(config).into();
         let sni: DnsName = self.config.imap_host.clone().try_into()?;
         let stream = tls_stream.connect(sni.into(), tcp).await?;
+        debug!("TLS handshake complete, reading IMAP greeting");
+
+        // Read the IMAP server greeting before creating the client.
+        // Client::new() does not consume the greeting, and authenticate()
+        // can hang if the greeting is still in the stream buffer.
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut greeting = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut stream, &mut greeting).await?;
+        debug!("IMAP greeting: {}", greeting.trim());
 
         // Create IMAP client
         let client = async_imap::Client::new(stream);
+        debug!("IMAP client created, authenticating");
 
-        // Login
-        let session = client
-            .login(&self.config.username, &self.config.password)
-            .await
-            .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
+        // Authenticate based on method
+        let session = match self.config.auth_method {
+            EmailAuthMethod::Password => client
+                .login(&self.config.username, &self.config.password)
+                .await
+                .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?,
+            EmailAuthMethod::Xoauth2 => {
+                debug!("Fetching OAuth access token");
+                let access_token = self.get_access_token().await?;
+                debug!(
+                    "Got access token (len={}), sending XOAUTH2 AUTHENTICATE command for user={}",
+                    access_token.len(),
+                    self.config.username
+                );
+                let auth = XOAuth2Authenticator {
+                    user: self.config.username.clone(),
+                    access_token,
+                };
+                match timeout(
+                    Duration::from_secs(30),
+                    client.authenticate("XOAUTH2", auth),
+                )
+                .await
+                {
+                    Ok(Ok(session)) => session,
+                    Ok(Err((e, _))) => {
+                        return Err(anyhow!("IMAP XOAUTH2 authentication failed: {}", e));
+                    }
+                    Err(_) => {
+                        return Err(anyhow!("IMAP XOAUTH2 authentication timed out after 30s"));
+                    }
+                }
+            }
+        };
 
         debug!("IMAP login successful");
         Ok(session)
@@ -405,6 +560,18 @@ impl EmailChannel {
         self.process_unseen(&mut session, tx).await?;
 
         loop {
+            // For XOAUTH2: if the token is near expiry, reconnect with a fresh token
+            // before entering IDLE (avoids mid-IDLE auth failures).
+            if self.config.auth_method == EmailAuthMethod::Xoauth2
+                && self.is_token_near_expiry().await
+            {
+                debug!("OAuth token near expiry, reconnecting IMAP with fresh token");
+                let _ = session.logout().await;
+                session = self.connect_imap().await?;
+                session.select(&self.config.imap_folder).await?;
+                self.process_unseen(&mut session, tx).await?;
+            }
+
             // Enter IDLE and wait for changes (consumes session, returns it via result)
             match self.wait_for_changes(session).await {
                 Ok((IdleWaitResult::NewMail, returned_session)) => {
@@ -486,6 +653,26 @@ impl EmailChannel {
         };
         Ok(transport)
     }
+
+    /// Create SMTP transport using XOAUTH2 authentication.
+    async fn create_smtp_transport_xoauth2(&self) -> Result<SmtpTransport> {
+        let access_token = self.get_access_token().await?;
+        let creds = Credentials::new(self.config.username.clone(), access_token);
+        let transport = if self.config.smtp_tls {
+            SmtpTransport::relay(&self.config.smtp_host)?
+                .port(self.config.smtp_port)
+                .credentials(creds)
+                .authentication(vec![Mechanism::Xoauth2])
+                .build()
+        } else {
+            SmtpTransport::builder_dangerous(&self.config.smtp_host)
+                .port(self.config.smtp_port)
+                .credentials(creds)
+                .authentication(vec![Mechanism::Xoauth2])
+                .build()
+        };
+        Ok(transport)
+    }
 }
 
 /// Internal struct for parsed email data
@@ -530,7 +717,10 @@ impl Channel for EmailChannel {
             .subject(subject)
             .singlepart(SinglePart::plain(body.to_string()))?;
 
-        let transport = self.create_smtp_transport()?;
+        let transport = match self.config.auth_method {
+            EmailAuthMethod::Password => self.create_smtp_transport()?,
+            EmailAuthMethod::Xoauth2 => self.create_smtp_transport_xoauth2().await?,
+        };
         transport.send(&email)?;
         info!("Email sent to {}", message.recipient);
         Ok(())
@@ -625,16 +815,14 @@ mod tests {
     fn email_config_custom() {
         let config = EmailConfig {
             imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
             imap_folder: "Archive".to_string(),
             smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "pass123".to_string(),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            ..Default::default()
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -645,16 +833,13 @@ mod tests {
     fn email_config_clone() {
         let config = EmailConfig {
             imap_host: "imap.test.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
             smtp_host: "smtp.test.com".to_string(),
             smtp_port: 587,
-            smtp_tls: true,
             username: "user@test.com".to_string(),
             password: "secret".to_string(),
             from_address: "bot@test.com".to_string(),
-            idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            ..Default::default()
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -890,16 +1075,13 @@ mod tests {
     fn email_config_serialize_deserialize() {
         let config = EmailConfig {
             imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
-            smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
             from_address: "bot@example.com".to_string(),
-            idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -973,5 +1155,68 @@ mod tests {
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("imap.debug.com"));
+    }
+
+    // XOAUTH2 tests
+
+    #[test]
+    fn xoauth2_authenticator_produces_correct_sasl_string() {
+        use async_imap::Authenticator;
+        let mut auth = XOAuth2Authenticator {
+            user: "user@example.com".to_string(),
+            access_token: "ya29.test-token".to_string(),
+        };
+        let response = auth.process(&[]);
+        let expected = "user=user@example.com\x01auth=Bearer ya29.test-token\x01\x01";
+        assert_eq!(response, expected.as_bytes());
+    }
+
+    #[test]
+    fn email_config_default_auth_method_is_password() {
+        let config = EmailConfig::default();
+        assert_eq!(config.auth_method, EmailAuthMethod::Password);
+    }
+
+    #[test]
+    fn email_config_xoauth2_roundtrip() {
+        let json = r#"{
+            "imap_host": "imap.gmail.com",
+            "smtp_host": "smtp.gmail.com",
+            "username": "user@gmail.com",
+            "from_address": "user@gmail.com",
+            "auth_method": "xoauth2",
+            "oauth_client_id": "123456.apps.googleusercontent.com",
+            "oauth_client_secret": "GOCSPX-test"
+        }"#;
+        let config: EmailConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.auth_method, EmailAuthMethod::Xoauth2);
+        assert_eq!(
+            config.oauth_client_id.as_deref(),
+            Some("123456.apps.googleusercontent.com")
+        );
+        assert_eq!(config.oauth_client_secret.as_deref(), Some("GOCSPX-test"));
+        assert_eq!(config.password, ""); // password defaults to empty
+
+        // Roundtrip
+        let serialized = serde_json::to_string(&config).unwrap();
+        let deserialized: EmailConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.auth_method, EmailAuthMethod::Xoauth2);
+        assert_eq!(deserialized.oauth_client_id, config.oauth_client_id);
+    }
+
+    #[test]
+    fn email_config_without_auth_method_defaults_to_password() {
+        let json = r#"{
+            "imap_host": "imap.test.com",
+            "smtp_host": "smtp.test.com",
+            "username": "user",
+            "password": "pass",
+            "from_address": "bot@test.com"
+        }"#;
+        let config: EmailConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.auth_method, EmailAuthMethod::Password);
+        assert!(config.oauth_client_id.is_none());
+        assert!(config.oauth_client_secret.is_none());
+        assert_eq!(config.oauth_profile, "default");
     }
 }
