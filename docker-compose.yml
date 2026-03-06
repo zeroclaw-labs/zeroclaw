@@ -21,9 +21,9 @@ services:
       # Or use the prefixed version:
       # - ZEROCLAW_API_KEY=${ZEROCLAW_API_KEY:-}
       
-      # Optional: LLM provider (default: openrouter)
-      # Options: openrouter, openai, anthropic, ollama
-      - PROVIDER=${PROVIDER:-openrouter}
+      # Required: LLM provider (must be set)
+      # Options: openrouter, openai, anthropic, gemini, ollama, groq, mistral, deepseek, xai
+      - PROVIDER=${PROVIDER:?PROVIDER is required - set to openrouter, openai, anthropic, gemini, ollama, etc}
       
       # Allow public bind inside Docker (required for container networking)
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true

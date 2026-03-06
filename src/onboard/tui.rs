@@ -26,7 +26,7 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const PROVIDER_OPTIONS: [&str; 5] = ["openrouter", "openai", "anthropic", "gemini", "ollama"];
+const PROVIDER_OPTIONS: [&str; 6] = ["(select provider)", "openrouter", "openai", "anthropic", "gemini", "ollama"];
 const MEMORY_OPTIONS: [&str; 4] = ["sqlite", "lucid", "markdown", "none"];
 const TUNNEL_OPTIONS: [&str; 3] = ["none", "cloudflare", "ngrok"];
 
@@ -228,13 +228,12 @@ struct TuiOnboardPlan {
 
 impl TuiOnboardPlan {
     fn new(default_workspace: PathBuf, force: bool) -> Self {
-        let provider = PROVIDER_OPTIONS[0];
         Self {
             workspace_path: default_workspace.display().to_string(),
             force_overwrite: force,
-            provider_idx: 0,
+            provider_idx: 0, // Start with placeholder - user must select
             api_key: String::new(),
-            model: provider_default_model(provider),
+            model: String::new(), // No default model until provider is selected
             memory_idx: 0,
             disable_totp: false,
             enable_telegram: false,
@@ -254,7 +253,16 @@ impl TuiOnboardPlan {
     }
 
     fn provider(&self) -> &str {
-        PROVIDER_OPTIONS[self.provider_idx]
+        let idx = self.provider_idx;
+        if idx == 0 {
+            "(select provider)"
+        } else {
+            PROVIDER_OPTIONS[idx]
+        }
+    }
+
+    fn provider_selected(&self) -> bool {
+        self.provider_idx > 0
     }
 
     fn memory_backend(&self) -> &str {
@@ -765,6 +773,9 @@ impl TuiState {
                 Ok(())
             }
             Step::Provider => {
+                if !self.plan.provider_selected() {
+                    bail!("Provider selection is required. Use arrow keys to select a provider.")
+                }
                 if self.plan.model.trim().is_empty() {
                     bail!("Default model is required")
                 }

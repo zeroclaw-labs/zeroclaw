@@ -14,16 +14,18 @@ For first-time setup and quick orientation.
 
 | Scenario | Command |
 |----------|---------|
-| I have an API key, want fastest setup | `zeroclaw onboard --api-key sk-... --provider openrouter` |
-| I want guided prompts | `zeroclaw onboard --interactive` |
+| I have an API key, want fastest setup | `zeroclaw onboard --api-key sk-... --provider <provider>` |
+| I want guided prompts (TUI wizard) | `zeroclaw onboard --interactive` |
 | Config exists, just fix channels | `zeroclaw onboard --channels-only` |
 | Config exists, I intentionally want full overwrite | `zeroclaw onboard --force` |
 | Using OpenAI Codex subscription auth | See [OpenAI Codex OAuth Quick Setup](#openai-codex-oauth-quick-setup) |
 
+**Supported providers:** openrouter, openai, anthropic, gemini, ollama, groq, mistral, deepseek, xai, together-ai, fireworks, perplexity, cohere, and more.
+
 ## Onboarding and Validation
 
-- Quick onboarding: `zeroclaw onboard --api-key "sk-..." --provider openrouter`
-- Interactive onboarding: `zeroclaw onboard --interactive`
+- Quick onboarding: `zeroclaw onboard --api-key "sk-..." --provider <provider>`
+- Interactive onboarding (recommended): `zeroclaw onboard --interactive`
 - Existing config protection: reruns require explicit confirmation (or `--force` in non-interactive flows)
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).
 - Validate environment: `zeroclaw status` + `zeroclaw doctor`

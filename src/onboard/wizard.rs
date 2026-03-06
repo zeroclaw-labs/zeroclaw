@@ -477,8 +477,8 @@ fn apply_provider_update(
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid|cortex-mem`.
-/// Use `zeroclaw onboard --interactive` for the full wizard.
+/// Use `zeroclaw onboard --api-key sk-... --provider <provider> --memory sqlite|lucid|cortex-mem`.
+/// Use `zeroclaw onboard --interactive` for the full wizard with provider selection.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
@@ -741,7 +741,12 @@ async fn run_quick_setup_with_home(
         .await
         .context("Failed to create workspace directory")?;
 
-    let provider_name = provider.unwrap_or("openrouter").to_string();
+    let provider_name = provider
+        .ok_or_else(|| anyhow::anyhow!(
+            "Provider is required. Use --provider <name> or run with --interactive for the TUI wizard.\n\
+            \nSupported providers: openrouter, openai, anthropic, gemini, ollama, groq, mistral, deepseek, xai, and more."
+        ))?
+        .to_string();
     let model = model_override
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
@@ -2200,11 +2205,15 @@ pub async fn run_models_refresh(
     provider_override: Option<&str>,
     force: bool,
 ) -> Result<()> {
-    let provider_name = provider_override
+    let provider_name = match provider_override
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter")
-        .trim()
-        .to_string();
+    {
+        Some(p) => p.trim().to_string(),
+        None => anyhow::bail!(
+            "No provider configured. Run `zeroclaw onboard --interactive` or set a provider with `--provider <name>`.\n\
+            \nSupported providers: openrouter, openai, anthropic, gemini, ollama, groq, mistral, deepseek, xai, and more."
+        ),
+    };
 
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
@@ -2284,11 +2293,17 @@ pub async fn run_models_refresh(
 }
 
 pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
-    let provider_name = provider_override
+    let provider_name = match provider_override
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+    {
+        Some(p) => p.to_string(),
+        None => anyhow::bail!(
+            "No provider configured. Run `zeroclaw onboard --interactive` or specify `--provider <name>`.\n\
+            \nSupported providers: openrouter, openai, anthropic, gemini, ollama, groq, mistral, deepseek, xai, and more."
+        ),
+    };
 
-    let cached = load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?;
+    let cached = load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?;
 
     let Some(cached) = cached else {
         println!();
@@ -2336,7 +2351,7 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
 }
 
 pub async fn run_models_status(config: &Config) -> Result<()> {
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = config.default_provider.as_deref().unwrap_or("(not set)");
     let model = config.default_model.as_deref().unwrap_or("(not set)");
 
     println!();
@@ -6794,7 +6809,7 @@ fn print_summary(config: &Config) {
     println!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        config.default_provider.as_deref().unwrap_or("openrouter")
+        config.default_provider.as_deref().unwrap_or("(not set)")
     );
     println!(
         "    {} Model:         {}",
@@ -6914,57 +6929,59 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
-    let canonical_provider = canonical_provider_name(provider);
-    if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if canonical_provider == "copilot" {
-            println!(
-                "    {} Authenticate GitHub Copilot:",
-                style(format!("{step}.")).cyan().bold()
-            );
-            println!("       {}", style("zeroclaw agent -m \"Hello!\"").yellow());
-            println!(
-                "       {}",
-                style("(device/OAuth prompt appears automatically on first run)").dim()
-            );
-        } else if canonical_provider == "openai-codex" {
-            println!(
-                "    {} Authenticate OpenAI Codex:",
-                style(format!("{step}.")).cyan().bold()
-            );
-            println!(
-                "       {}",
-                style("zeroclaw auth login --provider openai-codex --device-code").yellow()
-            );
-        } else if canonical_provider == "anthropic" {
-            println!(
-                "    {} Configure Anthropic auth:",
-                style(format!("{step}.")).cyan().bold()
-            );
-            println!(
-                "       {}",
-                style("export ANTHROPIC_API_KEY=\"sk-ant-...\"").yellow()
-            );
-            println!(
-                "       {}",
-                style(
-                    "or: zeroclaw auth paste-token --provider anthropic --auth-kind authorization"
-                )
-                .yellow()
-            );
-        } else {
-            let env_var = provider_env_var(provider);
-            println!(
-                "    {} Set your API key:",
-                style(format!("{step}.")).cyan().bold()
-            );
-            println!(
-                "       {}",
-                style(format!("export {env_var}=\"sk-...\"")).yellow()
-            );
+    let provider = config.default_provider.as_deref();
+    let canonical_provider = provider.map(canonical_provider_name);
+    if let (Some(p), Some(cp)) = (provider, canonical_provider) {
+        if config.api_key.is_none() && !provider_supports_keyless_local_usage(p) {
+            if cp == "copilot" {
+                println!(
+                    "    {} Authenticate GitHub Copilot:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!("       {}", style("zeroclaw agent -m \"Hello!\"").yellow());
+                println!(
+                    "       {}",
+                    style("(device/OAuth prompt appears automatically on first run)").dim()
+                );
+            } else if cp == "openai-codex" {
+                println!(
+                    "    {} Authenticate OpenAI Codex:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!(
+                    "       {}",
+                    style("zeroclaw auth login --provider openai-codex --device-code").yellow()
+                );
+            } else if cp == "anthropic" {
+                println!(
+                    "    {} Configure Anthropic auth:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!(
+                    "       {}",
+                    style("export ANTHROPIC_API_KEY=\"sk-ant-...\"").yellow()
+                );
+                println!(
+                    "       {}",
+                    style(
+                        "or: zeroclaw auth paste-token --provider anthropic --auth-kind authorization"
+                    )
+                    .yellow()
+                );
+            } else {
+                let env_var = provider_env_var(p);
+                println!(
+                    "    {} Set your API key:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!(
+                    "       {}",
+                    style(format!("export {env_var}=\"sk-...\"")).yellow()
+                );
+            }
+            println!();
+            step += 1;
         }
-        println!();
-        step += 1;
     }
 
     // If channels are configured, show channel start as the primary next step

@@ -39,11 +39,7 @@ export default function Layout() {
           sidebarCollapsed ? 'md:ml-[6.25rem]' : 'md:ml-[17.5rem]',
         ].join(' ')}
       >
-        <Header
-          isSidebarCollapsed={sidebarCollapsed}
-          onToggleSidebar={() => setSidebarOpen((open) => !open)}
-          onToggleSidebarCollapse={toggleSidebarCollapsed}
-        />
+        <Header onToggleSidebar={() => setSidebarOpen((open) => !open)} />
 
         <main className="flex-1 overflow-y-auto px-4 pb-8 pt-5 md:px-8 md:pt-8">
           <Outlet />
