@@ -558,7 +558,7 @@ fn default_transcription_max_duration_secs() -> u64 {
 /// to e.g. `voxtral-mini-latest`, and provide `api_key` or `MISTRAL_API_KEY`.
 /// To revert: restore `api_url`/`model` to the Groq defaults above (or
 /// remove the keys to use serde defaults).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     /// Default: `false`.
@@ -597,6 +597,26 @@ impl Default for TranscriptionConfig {
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
+    }
+}
+
+impl std::fmt::Debug for TranscriptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranscriptionConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "api_key",
+                &if self.api_key.is_some() {
+                    Some("<redacted>")
+                } else {
+                    None::<&str>
+                },
+            )
+            .field("api_url", &self.api_url)
+            .field("model", &self.model)
+            .field("language", &self.language)
+            .field("max_duration_secs", &self.max_duration_secs)
+            .finish()
     }
 }
 
@@ -7821,6 +7841,8 @@ tool_dispatcher = "xml"
             },
         );
 
+        config.transcription.api_key = Some("transcription-credential".into());
+
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(config.config_path.clone())
@@ -7927,6 +7949,10 @@ tool_dispatcher = "xml"
             store.decrypt(&telegram_token).unwrap(),
             "telegram-credential"
         );
+
+        let transcription_key = stored.transcription.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(transcription_key));
+        assert_eq!(store.decrypt(transcription_key).unwrap(), "transcription-credential");
 
         let _ = fs::remove_dir_all(&dir).await;
     }
