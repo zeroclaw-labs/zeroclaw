@@ -74,6 +74,19 @@ pub enum ObserverEvent {
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
     },
+    /// Agent loop detection triggered.
+    LoopDetected {
+        /// The tool at the centre of the loop.
+        tool: String,
+        /// Detection strategy that fired.
+        strategy: String,
+        /// Classified failure category (empty if N/A).
+        category: String,
+        /// Consecutive failures (failure-streak only, else 0).
+        consecutive_failures: usize,
+        /// True = warning injection, false = hard stop.
+        warning: bool,
+    },
 }
 
 /// Numeric metrics emitted by the agent runtime.

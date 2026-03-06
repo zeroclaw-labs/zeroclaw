@@ -2452,6 +2452,15 @@ pub async fn run_tool_call_loop(
         match loop_detector.check() {
             DetectionVerdict::Continue => {}
             DetectionVerdict::InjectWarning(warning) => {
+                if let Some(diag) = loop_detector.diagnostics() {
+                    observer.record_event(&ObserverEvent::LoopDetected {
+                        tool: diag.tool.clone(),
+                        strategy: diag.strategy.to_string(),
+                        category: diag.category.map(|c| c.to_string()).unwrap_or_default(),
+                        consecutive_failures: diag.consecutive_failures,
+                        warning: true,
+                    });
+                }
                 runtime_trace::record_event(
                     "loop_detected_warning",
                     Some(channel_name),
@@ -2474,6 +2483,15 @@ pub async fn run_tool_call_loop(
                 loop_detection_prompt = Some(warning);
             }
             DetectionVerdict::HardStop(reason) => {
+                if let Some(diag) = loop_detector.diagnostics() {
+                    observer.record_event(&ObserverEvent::LoopDetected {
+                        tool: diag.tool.clone(),
+                        strategy: diag.strategy.to_string(),
+                        category: diag.category.map(|c| c.to_string()).unwrap_or_default(),
+                        consecutive_failures: diag.consecutive_failures,
+                        warning: false,
+                    });
+                }
                 runtime_trace::record_event(
                     "loop_detected_hard_stop",
                     Some(channel_name),

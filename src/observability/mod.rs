@@ -1,3 +1,4 @@
+pub mod alerting;
 pub mod cost;
 pub mod log;
 pub mod multi;
@@ -56,7 +57,7 @@ pub fn create_observer_with_cost_tracking(
 }
 
 fn create_observer_internal(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    match config.backend.as_str() {
+    let base: Box<dyn Observer> = match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
         "prometheus" => match PrometheusObserver::new() {
             Ok(obs) => {
@@ -105,6 +106,15 @@ fn create_observer_internal(config: &ObservabilityConfig) -> Box<dyn Observer> {
             );
             Box::new(NoopObserver)
         }
+    };
+
+    // Layer webhook alerting on top when configured
+    match crate::observability::alerting::WebhookAlertingObserver::new(&config.alerting) {
+        Some(alert_obs) => {
+            tracing::info!("Webhook alerting observer enabled");
+            Box::new(MultiObserver::new(vec![base, Box::new(alert_obs)]))
+        }
+        None => base,
     }
 }
 

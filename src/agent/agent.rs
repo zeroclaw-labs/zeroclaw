@@ -725,10 +725,28 @@ impl Agent {
             match loop_detector.check() {
                 DetectionVerdict::Continue => {}
                 DetectionVerdict::InjectWarning(warning) => {
+                    if let Some(diag) = loop_detector.diagnostics() {
+                        self.observer.record_event(&ObserverEvent::LoopDetected {
+                            tool: diag.tool.clone(),
+                            strategy: diag.strategy.to_string(),
+                            category: diag.category.map(|c| c.to_string()).unwrap_or_default(),
+                            consecutive_failures: diag.consecutive_failures,
+                            warning: true,
+                        });
+                    }
                     self.history
                         .push(ConversationMessage::Chat(ChatMessage::user(warning)));
                 }
                 DetectionVerdict::HardStop(reason) => {
+                    if let Some(diag) = loop_detector.diagnostics() {
+                        self.observer.record_event(&ObserverEvent::LoopDetected {
+                            tool: diag.tool.clone(),
+                            strategy: diag.strategy.to_string(),
+                            category: diag.category.map(|c| c.to_string()).unwrap_or_default(),
+                            consecutive_failures: diag.consecutive_failures,
+                            warning: false,
+                        });
+                    }
                     anyhow::bail!(
                         "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
                         iteration + 1,

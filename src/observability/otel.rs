@@ -24,6 +24,7 @@ pub struct OtelObserver {
     webhook_auth_failures: Counter<u64>,
     heartbeat_ticks: Counter<u64>,
     errors: Counter<u64>,
+    loop_detected: Counter<u64>,
     request_latency: Histogram<f64>,
     tokens_used: Counter<u64>,
     active_sessions: Gauge<u64>,
@@ -137,6 +138,11 @@ impl OtelObserver {
             .with_description("Total errors by component")
             .build();
 
+        let loop_detected = meter
+            .u64_counter("zeroclaw.loop.detected")
+            .with_description("Total loop detection events")
+            .build();
+
         let request_latency = meter
             .f64_histogram("zeroclaw.request.latency")
             .with_description("Request latency in seconds")
@@ -171,6 +177,7 @@ impl OtelObserver {
             webhook_auth_failures,
             heartbeat_ticks,
             errors,
+            loop_detected,
             request_latency,
             tokens_used,
             active_sessions,
@@ -355,6 +362,29 @@ impl Observer for OtelObserver {
 
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
+            }
+            ObserverEvent::LoopDetected {
+                tool, strategy, category, consecutive_failures, warning,
+            } => {
+                let status_msg = if *warning { "warning" } else { "hard_stop" };
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("loop.detected")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("tool", tool.clone()),
+                            KeyValue::new("strategy", strategy.clone()),
+                            KeyValue::new("category", category.clone()),
+                            KeyValue::new("consecutive_failures", *consecutive_failures as i64),
+                            KeyValue::new("warning", *warning),
+                        ]),
+                );
+                span.set_status(Status::error(status_msg));
+                span.end();
+                self.loop_detected.add(1, &[
+                    KeyValue::new("tool", tool.clone()),
+                    KeyValue::new("strategy", strategy.clone()),
+                    KeyValue::new("category", category.clone()),
+                ]);
             }
         }
     }

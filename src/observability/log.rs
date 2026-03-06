@@ -95,6 +95,18 @@ impl Observer for LogObserver {
                     "llm.response"
                 );
             }
+            ObserverEvent::LoopDetected {
+                tool, strategy, category, consecutive_failures, warning,
+            } => {
+                info!(
+                    tool = %tool,
+                    strategy = %strategy,
+                    category = %category,
+                    consecutive_failures = consecutive_failures,
+                    warning = warning,
+                    "loop.detected"
+                );
+            }
         }
     }
 
