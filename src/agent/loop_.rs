@@ -75,31 +75,42 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
+/// Replaces known credential values with a redacted placeholder while preserving
+/// the original key/delimiter formatting and a small value prefix for context.
+fn redaction_prefix(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut prefix: String = chars.by_ref().take(4).collect();
+
+    // Preserve structural separators immediately following the short prefix,
+    // e.g. keep `enc2:` as `enc2:` instead of `enc2`.
+    if let Some(next) = chars.next() {
+        if matches!(next, ':' | '-' | '_') {
+            prefix.push(next);
+        }
+    }
+
+    prefix
+}
+
 pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
-            let key = &caps[1];
-            let delimiter = caps.get(2).map(|m| m.as_str()).unwrap_or(": ");
-            let val = caps
+            let full_match = caps.get(0).expect("full regex match must exist");
+            let value_match = caps
                 .get(3)
                 .or(caps.get(4))
                 .or(caps.get(5))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            let quote = if caps.get(3).is_some() {
-                "\""
-            } else if caps.get(4).is_some() {
-                "'"
-            } else {
-                ""
-            };
-
-            // Preserve first 4 chars for context, then redact.
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
-
-            format!("{key}{delimiter}{quote}{prefix}*[REDACTED]{quote}")
+                .expect("credential regex must capture a value");
+            let redacted_value = format!("{}*[REDACTED]", redaction_prefix(value_match.as_str()));
+            let matched = full_match.as_str();
+            let rel_start = value_match.start() - full_match.start();
+            let rel_end = value_match.end() - full_match.start();
+            format!(
+                "{}{}{}",
+                &matched[..rel_start],
+                redacted_value,
+                &matched[rel_end..]
+            )
         })
         .to_string()
 }
@@ -2533,11 +2544,29 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_credentials_toml_value_with_colon_preserves_equals_delimiter() {
-        let input = r#"api_key = "enc2:QmFzZTY0VG9rZW4=""#;
+    fn test_scrub_credentials_toml_value_with_colon_preserves_equals_format() {
+        let input = r#"api_key = "enc2:b7bce80e0c3d484a""#;
         let scrubbed = scrub_credentials(input);
-        assert!(scrubbed.contains(r#"api_key = "enc2*[REDACTED]""#));
+        assert!(scrubbed.contains(r#"api_key = "enc2:*[REDACTED]""#));
         assert!(!scrubbed.contains(r#""api_key":"#));
+    }
+
+    #[test]
+    fn test_scrub_credentials_json_value_with_colon_preserves_json_format() {
+        let input = r#"{"api_key": "enc2:b7bce80e0c3d484a"}"#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains(r#""api_key": "enc2:*[REDACTED]""#));
+        assert!(!scrubbed.contains("api_key ="));
+    }
+
+    #[test]
+    fn test_scrub_credentials_replaces_only_value_span() {
+        let input = r#"password="password" credential=credential"#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains(r#"password="pass*[REDACTED]""#));
+        assert!(scrubbed.contains("credential=cred*[REDACTED]"));
+        assert!(!scrubbed.contains(r#"pass*[REDACTED]="password""#));
+        assert!(!scrubbed.contains("cred*[REDACTED]=credential"));
     }
 
     #[test]
