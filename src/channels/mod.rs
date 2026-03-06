@@ -173,6 +173,7 @@ enum ChannelRuntimeCommand {
 }
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
+const DEFAULT_AGENT_ROUTE_KEY: &str = "default";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ModelCacheState {
@@ -204,7 +205,23 @@ struct ConfigFileStamp {
 #[derive(Debug, Clone)]
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
+    workspace_routing: RuntimeWorkspaceRouting,
     last_applied_stamp: Option<ConfigFileStamp>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeWorkspaceRouting {
+    enabled: bool,
+    bindings: Vec<RuntimeWorkspaceRoutingBinding>,
+    agent_routes: HashMap<String, ChannelRouteSelection>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeWorkspaceRoutingBinding {
+    agent_key: String,
+    channel: String,
+    account: Option<String>,
+    peer: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,11 +318,35 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+fn is_default_agent_route(agent_key: &str) -> bool {
+    agent_key
+        .trim()
+        .eq_ignore_ascii_case(DEFAULT_AGENT_ROUTE_KEY)
+}
+
+fn conversation_memory_key_for_agent(msg: &traits::ChannelMessage, agent_key: &str) -> String {
+    let base = conversation_memory_key(msg);
+    if is_default_agent_route(agent_key) {
+        base
+    } else {
+        format!("agent:{agent_key}:{base}")
+    }
+}
+
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Include thread_ts for per-topic session isolation in forum groups
     match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
         None => format!("{}_{}", msg.channel, msg.sender),
+    }
+}
+
+fn conversation_history_key_for_agent(msg: &traits::ChannelMessage, agent_key: &str) -> String {
+    let base = conversation_history_key(msg);
+    if is_default_agent_route(agent_key) {
+        base
+    } else {
+        format!("agent:{agent_key}:{base}")
     }
 }
 
@@ -930,6 +971,68 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
     }
 }
 
+fn runtime_workspace_routing_from_config(config: &Config) -> RuntimeWorkspaceRouting {
+    let mut agent_routes = HashMap::new();
+    for (agent_key, agent_cfg) in &config.agents {
+        let key = agent_key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let provider = agent_cfg.provider.trim();
+        let model = agent_cfg.model.trim();
+        if provider.is_empty() || model.is_empty() {
+            continue;
+        }
+        agent_routes.insert(
+            key,
+            ChannelRouteSelection {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+        );
+    }
+
+    let bindings = config
+        .workspaces
+        .routing
+        .bindings
+        .iter()
+        .filter_map(|binding| {
+            let agent_key = binding.agent.trim();
+            let channel = binding.channel.trim();
+            if agent_key.is_empty() || channel.is_empty() {
+                return None;
+            }
+
+            let account = binding
+                .account
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let peer = binding
+                .peer
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+
+            Some(RuntimeWorkspaceRoutingBinding {
+                agent_key: agent_key.to_string(),
+                channel: channel.to_ascii_lowercase(),
+                account,
+                peer,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    RuntimeWorkspaceRouting {
+        enabled: config.workspaces.routing.enabled,
+        bindings,
+        agent_routes,
+    }
+}
+
 fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
     ctx.provider_runtime_options
         .zeroclaw_dir
@@ -955,6 +1058,19 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
     }
+}
+
+fn runtime_workspace_routing_snapshot(ctx: &ChannelRuntimeContext) -> RuntimeWorkspaceRouting {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.workspace_routing.clone();
+        }
+    }
+
+    RuntimeWorkspaceRouting::default()
 }
 
 fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
@@ -1076,7 +1192,11 @@ fn decrypt_optional_secret_for_runtime_reload(
 
 async fn load_runtime_defaults_from_config_file(
     path: &Path,
-) -> Result<(ChannelRuntimeDefaults, RuntimeAutonomyPolicy)> {
+) -> Result<(
+    ChannelRuntimeDefaults,
+    RuntimeAutonomyPolicy,
+    RuntimeWorkspaceRouting,
+)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -1093,6 +1213,7 @@ async fn load_runtime_defaults_from_config_file(
     Ok((
         runtime_defaults_from_config(&parsed),
         runtime_autonomy_policy_from_config(&parsed),
+        runtime_workspace_routing_from_config(&parsed),
     ))
 }
 
@@ -1380,7 +1501,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let (next_defaults, next_autonomy_policy) =
+    let (next_defaults, next_autonomy_policy, next_workspace_routing) =
         load_runtime_defaults_from_config_file(&config_path).await?;
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
@@ -1415,6 +1536,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             config_path.clone(),
             RuntimeConfigState {
                 defaults: next_defaults.clone(),
+                workspace_routing: next_workspace_routing.clone(),
                 last_applied_stamp: Some(stamp),
             },
         );
@@ -1440,6 +1562,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         provider = %next_defaults.default_provider,
         model = %next_defaults.model,
         temperature = next_defaults.temperature,
+        workspace_routing_enabled = next_workspace_routing.enabled,
+        workspace_routing_bindings = next_workspace_routing.bindings.len(),
         non_cli_approval_mode = %non_cli_natural_language_mode_label(
             next_autonomy_policy.non_cli_natural_language_approval_mode
         ),
@@ -1458,13 +1582,112 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     }
 }
 
-fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
+#[derive(Debug, Clone)]
+struct InboundAgentRouteSession {
+    agent_key: String,
+    sender_key: String,
+    base_route: ChannelRouteSelection,
+}
+
+fn workspace_binding_specificity(binding: &RuntimeWorkspaceRoutingBinding) -> usize {
+    let mut score = 0usize;
+    if binding.account.is_some() {
+        score += 1;
+    }
+    if binding.peer.is_some() {
+        score += 2;
+    }
+    score
+}
+
+fn workspace_binding_matches(
+    binding: &RuntimeWorkspaceRoutingBinding,
+    msg: &traits::ChannelMessage,
+) -> bool {
+    if binding.channel != msg.channel.trim().to_ascii_lowercase() {
+        return false;
+    }
+
+    if let Some(account) = binding.account.as_deref() {
+        if account != "*" && account != msg.reply_target {
+            return false;
+        }
+    }
+
+    if let Some(peer) = binding.peer.as_deref() {
+        if peer != "*" && peer != msg.sender {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn resolve_inbound_agent_route(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+) -> InboundAgentRouteSession {
+    let default_route = default_route_selection(ctx);
+    let routing = runtime_workspace_routing_snapshot(ctx);
+    if !routing.enabled {
+        return InboundAgentRouteSession {
+            agent_key: DEFAULT_AGENT_ROUTE_KEY.to_string(),
+            sender_key: conversation_history_key_for_agent(msg, DEFAULT_AGENT_ROUTE_KEY),
+            base_route: default_route,
+        };
+    }
+
+    let mut best_match: Option<(&RuntimeWorkspaceRoutingBinding, usize)> = None;
+    for binding in &routing.bindings {
+        if !workspace_binding_matches(binding, msg) {
+            continue;
+        }
+        let specificity = workspace_binding_specificity(binding);
+        match best_match {
+            Some((_, best_specificity)) if specificity <= best_specificity => {}
+            _ => {
+                best_match = Some((binding, specificity));
+            }
+        }
+    }
+
+    if let Some((binding, _)) = best_match {
+        let normalized_agent_key = binding.agent_key.trim().to_ascii_lowercase();
+        let selected_route = routing
+            .agent_routes
+            .get(&normalized_agent_key)
+            .cloned()
+            .unwrap_or_else(|| default_route.clone());
+        let selected_agent_key = if is_default_agent_route(&binding.agent_key) {
+            DEFAULT_AGENT_ROUTE_KEY.to_string()
+        } else {
+            binding.agent_key.clone()
+        };
+        return InboundAgentRouteSession {
+            sender_key: conversation_history_key_for_agent(msg, &selected_agent_key),
+            agent_key: selected_agent_key,
+            base_route: selected_route,
+        };
+    }
+
+    InboundAgentRouteSession {
+        agent_key: DEFAULT_AGENT_ROUTE_KEY.to_string(),
+        sender_key: conversation_history_key_for_agent(msg, DEFAULT_AGENT_ROUTE_KEY),
+        base_route: default_route,
+    }
+}
+
+fn get_route_selection(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    base_route: &ChannelRouteSelection,
+) -> ChannelRouteSelection {
     ctx.route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(sender_key)
         .cloned()
-        .unwrap_or_else(|| default_route_selection(ctx))
+        .unwrap_or_else(|| base_route.clone())
 }
 
 /// Classify a user message and return the appropriate route selection with logging.
@@ -1494,13 +1717,17 @@ fn classify_message_route(
     })
 }
 
-fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
-    let default_route = default_route_selection(ctx);
+fn set_route_selection(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    next: ChannelRouteSelection,
+    base_route: &ChannelRouteSelection,
+) {
     let mut routes = ctx
         .route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if next == default_route {
+    if &next == base_route {
         routes.remove(sender_key);
     } else {
         routes.insert(sender_key.to_string(), next);
@@ -1833,6 +2060,7 @@ async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
+    route_session: &InboundAgentRouteSession,
 ) -> bool {
     let is_slash_command = msg.content.trim_start().starts_with('/');
     let Some(mut command) = parse_runtime_command(&msg.channel, &msg.content) else {
@@ -1843,8 +2071,8 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
-    let mut current = get_route_selection(ctx, &sender_key);
+    let sender_key = route_session.sender_key.as_str();
+    let mut current = get_route_selection(ctx, sender_key, &route_session.base_route);
     let sender = msg.sender.as_str();
     let source_channel = msg.channel.as_str();
     let reply_target = msg.reply_target.as_str();
@@ -1963,8 +2191,13 @@ async fn handle_runtime_command_if_needed(
                     Ok(_) => {
                         if provider_name != current.provider {
                             current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
+                            set_route_selection(
+                                ctx,
+                                sender_key,
+                                current.clone(),
+                                &route_session.base_route,
+                            );
+                            clear_sender_history(ctx, sender_key);
                         }
 
                         format!(
@@ -1993,8 +2226,8 @@ async fn handle_runtime_command_if_needed(
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
             } else {
                 current.model = model.clone();
-                set_route_selection(ctx, &sender_key, current.clone());
-                clear_sender_history(ctx, &sender_key);
+                set_route_selection(ctx, sender_key, current.clone(), &route_session.base_route);
+                clear_sender_history(ctx, sender_key);
 
                 format!(
                     "Model switched to `{model}` for provider `{}` in this sender session.",
@@ -2003,7 +2236,7 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
-            clear_sender_history(ctx, &sender_key);
+            clear_sender_history(ctx, sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
         ChannelRuntimeCommand::RequestAllToolsOnce => {
@@ -2964,7 +3197,10 @@ async fn process_channel_message(
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    let route_session = resolve_inbound_agent_route(ctx.as_ref(), &msg);
+    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref(), &route_session)
+        .await
+    {
         return;
     }
 
@@ -3055,10 +3291,16 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
         }
     }
 
-    let history_key = conversation_history_key(&msg);
-    // Try classification first, fall back to sender/default route
-    let route = classify_message_route(ctx.as_ref(), &msg.content)
-        .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
+    let history_key = route_session.sender_key.clone();
+    // Classification applies only to the default routed agent. Explicit
+    // workspaces.routing bindings should keep deterministic provider/model.
+    let route = if is_default_agent_route(&route_session.agent_key) {
+        classify_message_route(ctx.as_ref(), &msg.content).unwrap_or_else(|| {
+            get_route_selection(ctx.as_ref(), &history_key, &route_session.base_route)
+        })
+    } else {
+        get_route_selection(ctx.as_ref(), &history_key, &route_session.base_route)
+    };
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
@@ -3080,7 +3322,7 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
         }
     };
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-        let autosave_key = conversation_memory_key(&msg);
+        let autosave_key = conversation_memory_key_for_agent(&msg, &route_session.agent_key);
         let _ = ctx
             .memory
             .store(
@@ -4808,6 +5050,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.config_path.clone(),
             RuntimeConfigState {
                 defaults: runtime_defaults_from_config(&config),
+                workspace_routing: runtime_workspace_routing_from_config(&config),
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -7987,6 +8230,249 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn resolve_inbound_agent_route_prefers_most_specific_workspace_binding() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl;
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let mut provider_runtime_options = providers::ProviderRuntimeOptions::default();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        provider_runtime_options.zeroclaw_dir = Some(temp.path().to_path_buf());
+        let config_path = temp.path().join("config.toml");
+
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.insert(
+                config_path,
+                RuntimeConfigState {
+                    defaults: ChannelRuntimeDefaults {
+                        default_provider: "test-provider".to_string(),
+                        model: "default-model".to_string(),
+                        temperature: 0.7,
+                        api_key: None,
+                        api_url: None,
+                        reliability: crate::config::ReliabilityConfig::default(),
+                    },
+                    workspace_routing: RuntimeWorkspaceRouting {
+                        enabled: true,
+                        bindings: vec![
+                            RuntimeWorkspaceRoutingBinding {
+                                agent_key: "support".to_string(),
+                                channel: "telegram".to_string(),
+                                account: Some("chat-1".to_string()),
+                                peer: None,
+                            },
+                            RuntimeWorkspaceRoutingBinding {
+                                agent_key: "ops".to_string(),
+                                channel: "telegram".to_string(),
+                                account: Some("chat-1".to_string()),
+                                peer: Some("alice".to_string()),
+                            },
+                        ],
+                        agent_routes: HashMap::from([
+                            (
+                                "support".to_string(),
+                                ChannelRouteSelection {
+                                    provider: "openrouter".to_string(),
+                                    model: "support-model".to_string(),
+                                },
+                            ),
+                            (
+                                "ops".to_string(),
+                                ChannelRouteSelection {
+                                    provider: "openrouter".to_string(),
+                                    model: "ops-model".to_string(),
+                                },
+                            ),
+                        ]),
+                    },
+                    last_applied_stamp: None,
+                },
+            );
+        }
+
+        let runtime_ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ModelCaptureProvider::default()),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options,
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        };
+
+        let msg = traits::ChannelMessage {
+            id: "m1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "hello".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        let resolved = resolve_inbound_agent_route(&runtime_ctx, &msg);
+        assert_eq!(resolved.agent_key, "ops");
+        assert_eq!(resolved.sender_key, "agent:ops:telegram_alice");
+        assert_eq!(resolved.base_route.provider, "openrouter");
+        assert_eq!(resolved.base_route.model, "ops-model");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_uses_workspace_routing_agent_provider_and_session_key() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let routed_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let routed_provider: Arc<dyn Provider> = routed_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("openrouter".to_string(), routed_provider);
+
+        let mut provider_runtime_options = providers::ProviderRuntimeOptions::default();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        provider_runtime_options.zeroclaw_dir = Some(temp.path().to_path_buf());
+        let config_path = temp.path().join("config.toml");
+
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.insert(
+                config_path,
+                RuntimeConfigState {
+                    defaults: ChannelRuntimeDefaults {
+                        default_provider: "test-provider".to_string(),
+                        model: "default-model".to_string(),
+                        temperature: 0.7,
+                        api_key: None,
+                        api_url: None,
+                        reliability: crate::config::ReliabilityConfig::default(),
+                    },
+                    workspace_routing: RuntimeWorkspaceRouting {
+                        enabled: true,
+                        bindings: vec![RuntimeWorkspaceRoutingBinding {
+                            agent_key: "support".to_string(),
+                            channel: "telegram".to_string(),
+                            account: Some("chat-1".to_string()),
+                            peer: Some("alice".to_string()),
+                        }],
+                        agent_routes: HashMap::from([(
+                            "support".to_string(),
+                            ChannelRouteSelection {
+                                provider: "openrouter".to_string(),
+                                model: "agent-model".to_string(),
+                            },
+                        )]),
+                    },
+                    last_applied_stamp: None,
+                },
+            );
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options,
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &autonomy_with_mock_price_auto_approve(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-routed-agent-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "hello routed agent".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            routed_provider_impl
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["agent-model".to_string()]
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            histories.contains_key("agent:support:telegram_alice"),
+            "agent-specific conversation key should isolate sender session"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_prefers_cached_default_provider_instance() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -8085,6 +8571,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
                     },
+                    workspace_routing: RuntimeWorkspaceRouting::default(),
                     last_applied_stamp: None,
                 },
             );
@@ -8185,7 +8672,7 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         cfg.save().await.expect("save config");
 
-        let (_defaults, policy) = load_runtime_defaults_from_config_file(&config_path)
+        let (_defaults, policy, _routing) = load_runtime_defaults_from_config_file(&config_path)
             .await
             .expect("load runtime state");
 

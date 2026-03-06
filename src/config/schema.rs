@@ -312,6 +312,9 @@ pub struct WorkspacesConfig {
     /// If omitted, defaults to `<config_dir>/workspaces`.
     #[serde(default)]
     pub root: Option<String>,
+    /// Inbound channel/account/peer routing bindings to logical agents.
+    #[serde(default)]
+    pub routing: WorkspaceRoutingConfig,
 }
 
 impl WorkspacesConfig {
@@ -337,11 +340,40 @@ impl WorkspacesConfig {
     }
 }
 
+/// Multi-agent inbound routing configuration (`[workspaces.routing]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct WorkspaceRoutingConfig {
+    /// Enable inbound routing rules.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ordered routing bindings.
+    ///
+    /// First match wins when two bindings have the same specificity.
+    #[serde(default)]
+    pub bindings: Vec<WorkspaceRoutingBindingConfig>,
+}
+
+/// One inbound routing binding entry in `[[workspaces.routing.bindings]]`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceRoutingBindingConfig {
+    /// Target agent id. Use `"default"` for the primary runtime agent.
+    pub agent: String,
+    /// Channel name to match (for example `"telegram"`).
+    pub channel: String,
+    /// Optional account selector mapped to inbound `reply_target`.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Optional peer selector mapped to inbound `sender`.
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
 impl Default for WorkspacesConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             root: None,
+            routing: WorkspaceRoutingConfig::default(),
         }
     }
 }
@@ -6365,6 +6397,75 @@ impl Config {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
         }
 
+        // Workspace inbound routing
+        if self.workspaces.routing.enabled && self.workspaces.routing.bindings.is_empty() {
+            anyhow::bail!(
+                "workspaces.routing.enabled=true requires at least one [[workspaces.routing.bindings]] entry"
+            );
+        }
+        let mut seen_workspace_bindings = std::collections::HashSet::new();
+        for (i, binding) in self.workspaces.routing.bindings.iter().enumerate() {
+            let agent = binding.agent.trim();
+            if agent.is_empty() {
+                anyhow::bail!("workspaces.routing.bindings[{i}].agent must not be empty");
+            }
+            if !agent.eq_ignore_ascii_case("default")
+                && !self
+                    .agents
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(agent))
+            {
+                anyhow::bail!(
+                    "workspaces.routing.bindings[{i}].agent references unknown agent `{agent}` (expected `default` or a key from [agents])"
+                );
+            }
+
+            let channel = binding.channel.trim();
+            if channel.is_empty() {
+                anyhow::bail!("workspaces.routing.bindings[{i}].channel must not be empty");
+            }
+            if !channel
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "workspaces.routing.bindings[{i}].channel contains invalid characters: {channel}"
+                );
+            }
+
+            let account = match binding.account.as_deref() {
+                Some(raw) if raw.trim().is_empty() => {
+                    anyhow::bail!(
+                        "workspaces.routing.bindings[{i}].account must not be empty when provided"
+                    );
+                }
+                Some(raw) => Some(raw.trim().to_string()),
+                None => None,
+            };
+
+            let peer = match binding.peer.as_deref() {
+                Some(raw) if raw.trim().is_empty() => {
+                    anyhow::bail!(
+                        "workspaces.routing.bindings[{i}].peer must not be empty when provided"
+                    );
+                }
+                Some(raw) => Some(raw.trim().to_string()),
+                None => None,
+            };
+
+            let dedupe_key = (
+                agent.to_ascii_lowercase(),
+                channel.to_ascii_lowercase(),
+                account.clone(),
+                peer.clone(),
+            );
+            if !seen_workspace_bindings.insert(dedupe_key) {
+                anyhow::bail!(
+                    "workspaces.routing.bindings contains a duplicate match entry for agent `{agent}` channel `{channel}`"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -10908,6 +11009,8 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         let config = Config::default();
         assert!(!config.workspaces.enabled);
         assert!(config.workspaces.root.is_none());
+        assert!(!config.workspaces.routing.enabled);
+        assert!(config.workspaces.routing.bindings.is_empty());
     }
 
     #[test]
@@ -10922,10 +11025,96 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         let relative_cfg = WorkspacesConfig {
             enabled: true,
             root: Some("profiles".into()),
+            routing: WorkspaceRoutingConfig::default(),
         };
         assert_eq!(
             relative_cfg.resolve_root(&config_dir),
             config_dir.join("profiles")
         );
+    }
+
+    #[test]
+    async fn workspaces_routing_validation_rejects_unknown_agent_and_duplicates() {
+        let mut config = Config::default();
+        config.workspaces.routing.enabled = true;
+        config.workspaces.routing.bindings = vec![WorkspaceRoutingBindingConfig {
+            agent: "ops".into(),
+            channel: "telegram".into(),
+            account: Some("chat-1".into()),
+            peer: None,
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("unknown routed agent should be rejected");
+        assert!(err.to_string().contains("unknown agent"));
+
+        config.agents.insert(
+            "ops".into(),
+            DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "x-ai/grok-code-fast-1".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+        config
+            .workspaces
+            .routing
+            .bindings
+            .push(WorkspaceRoutingBindingConfig {
+                agent: "ops".into(),
+                channel: "telegram".into(),
+                account: Some("chat-1".into()),
+                peer: None,
+            });
+
+        let err = config
+            .validate()
+            .expect_err("duplicate routing match should be rejected");
+        assert!(err.to_string().contains("duplicate match entry"));
+    }
+
+    #[test]
+    async fn workspaces_routing_validation_accepts_default_and_configured_agents() {
+        let mut config = Config::default();
+        config.workspaces.routing.enabled = true;
+        config.agents.insert(
+            "support".into(),
+            DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "anthropic/claude-sonnet-4.6".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+        config.workspaces.routing.bindings = vec![
+            WorkspaceRoutingBindingConfig {
+                agent: "default".into(),
+                channel: "telegram".into(),
+                account: None,
+                peer: None,
+            },
+            WorkspaceRoutingBindingConfig {
+                agent: "support".into(),
+                channel: "telegram".into(),
+                account: Some("chat-42".into()),
+                peer: Some("alice".into()),
+            },
+        ];
+
+        config
+            .validate()
+            .expect("routing with known/default agents should validate");
     }
 }

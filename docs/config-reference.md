@@ -654,6 +654,56 @@ max_length = 50
 priority = 5
 ```
 
+## `[workspaces.routing]`
+
+Inbound channel routing binds `(channel, account, peer)` selectors to logical agent IDs.
+This enables isolated sender sessions per bound agent in a single running channel runtime.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable inbound routing bindings |
+| `bindings` | `[]` | Ordered routing rules evaluated by specificity |
+
+Each entry in `[[workspaces.routing.bindings]]`:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `agent` | _required_ | Target agent key (`"default"` or a key from `[agents]`) |
+| `channel` | _required_ | Channel name to match (for example `telegram`) |
+| `account` | unset | Optional `reply_target` selector (`"*"` allowed) |
+| `peer` | unset | Optional `sender` selector (`"*"` allowed) |
+
+Matching behavior:
+
+- More specific rules win: `channel+account+peer` > `channel+peer` > `channel+account` > `channel`.
+- If two rules have the same specificity, the first rule in `bindings` wins.
+- If no rule matches, routing falls back to the default runtime agent/provider/model.
+- Routed agent IDs must exist in `[agents]` unless `agent = "default"`.
+
+```toml
+[agents.support]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4.6"
+
+[agents.ops]
+provider = "openrouter"
+model = "x-ai/grok-code-fast-1"
+
+[workspaces.routing]
+enabled = true
+
+[[workspaces.routing.bindings]]
+agent = "support"
+channel = "telegram"
+account = "chat-support"
+
+[[workspaces.routing.bindings]]
+agent = "ops"
+channel = "telegram"
+account = "chat-ops"
+peer = "oncall-user-id"
+```
+
 ## `[channels_config]`
 
 Top-level channel options are configured under `channels_config`.
