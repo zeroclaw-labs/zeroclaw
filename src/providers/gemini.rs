@@ -1129,6 +1129,7 @@ impl GeminiProvider {
         Option<NormalizedStopReason>,
         Option<String>,
         Vec<ToolCall>,
+        Option<super::quota_types::QuotaMetadata>,
     )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1309,6 +1310,10 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error ({status}): {error_text}");
         }
 
+        // Extract quota metadata from response headers before consuming body.
+        let quota_extractor = super::quota_adapter::UniversalQuotaExtractor::new();
+        let quota_metadata = quota_extractor.extract("gemini", response.headers(), None);
+
         let result: GenerateContentResponse = response.json().await?;
         if let Some(err) = &result.error {
             anyhow::bail!("Gemini API error: {}", err.message);
@@ -1365,7 +1370,7 @@ impl GeminiProvider {
             None
         };
 
-        Ok((text, usage, stop_reason, raw_stop_reason, tool_calls))
+        Ok((text, usage, stop_reason, raw_stop_reason, tool_calls, quota_metadata))
     }
 
     /// Convert ToolSpec slice to Gemini functionDeclarations format.
@@ -1428,7 +1433,7 @@ impl Provider for GeminiProvider {
             parts: Self::build_user_parts(message),
         }];
 
-        let (text_opt, _usage, _stop_reason, _raw_stop_reason, _tool_calls) = self
+        let (text_opt, _usage, _stop_reason, _raw_stop_reason, _tool_calls, _quota) = self
             .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
@@ -1479,7 +1484,7 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text_opt, _usage, _stop_reason, _raw_stop_reason, _tool_calls) = self
+        let (text_opt, _usage, _stop_reason, _raw_stop_reason, _tool_calls, _quota) = self
             .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
@@ -1537,7 +1542,7 @@ impl Provider for GeminiProvider {
             None
         };
 
-        let (text, usage, stop_reason, raw_stop_reason, tool_calls) = self
+        let (text, usage, stop_reason, raw_stop_reason, tool_calls, quota_metadata) = self
             .send_generate_content(contents, system_instruction, model, temperature, gemini_tools)
             .await?;
 
@@ -1546,7 +1551,7 @@ impl Provider for GeminiProvider {
             tool_calls,
             usage,
             reasoning_content: None,
-            quota_metadata: None,
+            quota_metadata,
             stop_reason,
             raw_stop_reason,
         })
