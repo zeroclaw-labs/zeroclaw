@@ -93,7 +93,7 @@ Tự động hóa hỗ trợ việc triage và bảo vệ, nhưng trách nhiệm
 
 ## 3. Cài đặt repository bắt buộc
 
-Duy trì các quy tắc branch protection sau trên `main`:
+Duy trì các quy tắc branch protection sau trên `master`:
 
 - Yêu cầu status check trước khi merge.
 - Yêu cầu check `CI Required Gate`.
