@@ -24,14 +24,24 @@ Use these i18n paths:
 | `en` | `README.md` | `docs/README.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | Source of truth |
 | `zh-CN` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/README.md` | `docs/i18n/zh-CN/commands-reference.md` | `docs/i18n/zh-CN/config-reference.md` | `docs/i18n/zh-CN/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `ja` | `docs/i18n/ja/README.md` | `docs/i18n/ja/README.md` | `docs/i18n/ja/commands-reference.md` | `docs/i18n/ja/config-reference.md` | `docs/i18n/ja/troubleshooting.md` | Full top-level parity (bridge + localized) |
+| `ko` | `docs/i18n/ko/README.md` | `docs/i18n/ko/README.md` | — | — | — | Hub-level support (bootstrap) |
+| `tl` | `docs/i18n/tl/README.md` | `docs/i18n/tl/README.md` | — | — | — | Hub-level support (bootstrap) |
+| `es` | `docs/i18n/es/README.md` | `docs/i18n/es/README.md` | — | — | — | Hub-level support (README translation) |
+| `pt` | `docs/i18n/pt/README.md` | `docs/i18n/pt/README.md` | — | — | — | Hub-level support (README translation) |
+| `it` | `docs/i18n/it/README.md` | `docs/i18n/it/README.md` | — | — | — | Hub-level support (README translation) |
+| `de` | `docs/i18n/de/README.md` | `docs/i18n/de/README.md` | — | — | — | Hub-level support (bootstrap) |
 | `ru` | `docs/i18n/ru/README.md` | `docs/i18n/ru/README.md` | `docs/i18n/ru/commands-reference.md` | `docs/i18n/ru/config-reference.md` | `docs/i18n/ru/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `fr` | `docs/i18n/fr/README.md` | `docs/i18n/fr/README.md` | `docs/i18n/fr/commands-reference.md` | `docs/i18n/fr/config-reference.md` | `docs/i18n/fr/troubleshooting.md` | Full top-level parity (bridge + localized) |
 | `vi` | `docs/i18n/vi/README.md` | `docs/i18n/vi/README.md` | `docs/i18n/vi/commands-reference.md` | `docs/i18n/vi/config-reference.md` | `docs/i18n/vi/troubleshooting.md` | Full tree localized |
+| `ar` | `docs/i18n/ar/README.md` | `docs/i18n/ar/README.md` | — | — | — | Hub-level support (bootstrap) |
+| `hi` | `docs/i18n/hi/README.md` | `docs/i18n/hi/README.md` | — | — | — | Hub-level support (bootstrap) |
+| `bn` | `docs/i18n/bn/README.md` | `docs/i18n/bn/README.md` | — | — | — | Hub-level support (bootstrap) |
 | `el` | `docs/i18n/el/README.md` | `docs/i18n/el/README.md` | `docs/i18n/el/commands-reference.md` | `docs/i18n/el/config-reference.md` | `docs/i18n/el/troubleshooting.md` | Full tree localized |
 
-## Top-Level Parity Snapshot
+## Top-Level Parity Snapshot (Core Parity Locales)
 
 Baseline on 2026-02-24 uses 40 top-level English docs (`docs/*.md`, locale root variants excluded).
+This parity table tracks core parity locales only (`zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`).
 
 | Locale | Missing top-level parity count |
 |---|---:|
@@ -68,6 +78,15 @@ Not all localized landing pages are full translations of `README.md`:
 | `fr` | Near-complete translation | ~90% |
 | `vi` | Near-complete translation | ~90% |
 | `el` | Near-complete translation | ~90% |
+| `ko` | Hub-level bootstrap | ~10% |
+| `tl` | Hub-level bootstrap | ~10% |
+| `es` | README-focused | ~35% |
+| `pt` | README-focused | ~35% |
+| `it` | README-focused | ~35% |
+| `de` | Hub-level bootstrap | ~10% |
+| `ar` | Hub-level bootstrap | ~10% |
+| `hi` | Hub-level bootstrap | ~10% |
+| `bn` | Hub-level bootstrap | ~10% |
 
 Hub-style entry points provide quick-start orientation and language navigation but do not replicate the full English README content. This is an accurate status record, not a gap to be immediately resolved.
 
