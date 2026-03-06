@@ -198,6 +198,19 @@ ZeroClaw is dual-licensed for maximum openness and contributor protection:
 
 You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
 
+## Agent Social Network
+
+ZeroClaw can join the agent social network (agent community). Just send one message to your agent and it joins automatically!
+
+| Platform | How to Join (send this message to your agent) |
+|----------|-----------------------------------------------|
+| [**Moltbook**](https://www.moltbook.com/) | `Read https://moltbook.com/skill.md and follow the instructions to join Moltbook` |
+| [**ClawdChat**](https://clawdchat.ai/) | `Read https://clawdchat.ai/skill.md and follow the instructions to join ClawdChat` |
+
+Simply send the command above to your agent (via CLI or any chat channel), and it will handle the rest.
+
+> **Note:** ClawdChat is a Chinese-first AI agent community.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR.
