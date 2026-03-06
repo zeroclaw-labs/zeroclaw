@@ -71,8 +71,58 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 /// This backend focuses on reliable CRUD and keyword recall using SQL, without
 /// requiring extension setup (for example pgvector).
 pub struct PostgresMemory {
-    client: Arc<Mutex<Client>>,
+    client: Arc<PostgresClientHolder>,
     qualified_table: String,
+}
+
+struct PostgresClientHolder {
+    client: Mutex<Option<Client>>,
+}
+
+impl PostgresClientHolder {
+    fn new(client: Client) -> Self {
+        Self {
+            client: Mutex::new(Some(client)),
+        }
+    }
+
+    fn with_client<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce(&mut Client) -> Result<T>,
+    {
+        let mut guard = self.client.lock();
+        let client = guard
+            .as_mut()
+            .context("PostgreSQL client is not available")?;
+        operation(client)
+    }
+}
+
+impl Drop for PostgresClientHolder {
+    fn drop(&mut self) {
+        let Some(client) = self.client.get_mut().take() else {
+            return;
+        };
+
+        let drop_thread = std::thread::Builder::new()
+            .name("postgres-memory-drop".to_string())
+            .spawn(move || drop(client));
+
+        match drop_thread {
+            Ok(handle) => {
+                if handle.join().is_err() {
+                    tracing::warn!(
+                        "postgres-memory-drop thread panicked while dropping PostgreSQL client"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "failed to spawn postgres-memory-drop thread while dropping PostgreSQL client: {err}"
+                );
+            }
+        }
+    }
 }
 
 impl PostgresMemory {
@@ -99,7 +149,7 @@ impl PostgresMemory {
         )?;
 
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(PostgresClientHolder::new(client)),
             qualified_table,
         })
     }
@@ -264,7 +314,6 @@ impl Memory for PostgresMemory {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let now = Utc::now();
-            let mut client = client.lock();
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
@@ -280,7 +329,10 @@ impl Memory for PostgresMemory {
             );
 
             let id = Uuid::new_v4().to_string();
-            client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
+            client.with_client(|client| {
+                client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
+                Ok(())
+            })?;
             Ok(())
         })
         .await?
@@ -298,7 +350,6 @@ impl Memory for PostgresMemory {
         let sid = session_id.map(str::to_string);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id,
@@ -317,7 +368,8 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
+            let rows = client
+                .with_client(|client| Ok(client.query(&stmt, &[&query, &sid, &limit_i64])?))?;
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
@@ -331,7 +383,6 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id
@@ -341,7 +392,7 @@ impl Memory for PostgresMemory {
                 "
             );
 
-            let row = client.query_opt(&stmt, &[&key])?;
+            let row = client.with_client(|client| Ok(client.query_opt(&stmt, &[&key])?))?;
             row.as_ref().map(Self::row_to_entry).transpose()
         })
         .await?
@@ -358,7 +409,6 @@ impl Memory for PostgresMemory {
         let sid = session_id.map(str::to_string);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id
@@ -371,7 +421,8 @@ impl Memory for PostgresMemory {
 
             let category_ref = category.as_deref();
             let session_ref = sid.as_deref();
-            let rows = client.query(&stmt, &[&category_ref, &session_ref])?;
+            let rows = client
+                .with_client(|client| Ok(client.query(&stmt, &[&category_ref, &session_ref])?))?;
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
@@ -385,9 +436,8 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
-            let deleted = client.execute(&stmt, &[&key])?;
+            let deleted = client.with_client(|client| Ok(client.execute(&stmt, &[&key])?))?;
             Ok(deleted > 0)
         })
         .await?
@@ -398,9 +448,9 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
 
         tokio::task::spawn_blocking(move || -> Result<usize> {
-            let mut client = client.lock();
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
-            let count: i64 = client.query_one(&stmt, &[])?.get(0);
+            let count: i64 =
+                client.with_client(|client| Ok(client.query_one(&stmt, &[])?.get(0)))?;
             let count =
                 usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
             Ok(count)
@@ -410,9 +460,11 @@ impl Memory for PostgresMemory {
 
     async fn health_check(&self) -> bool {
         let client = self.client.clone();
-        tokio::task::spawn_blocking(move || client.lock().simple_query("SELECT 1").is_ok())
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            client.with_client(|client| Ok(client.simple_query("SELECT 1").is_ok()))
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
