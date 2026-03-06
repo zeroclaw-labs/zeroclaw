@@ -547,7 +547,7 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 
 | Key | Default | Purpose |
 |---|---|---|
-| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
+| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `qdrant`, `cortex`, `none` |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
@@ -558,6 +558,100 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+
+### `[memory.cortex]` — Advanced Layered Memory
+
+Cortex-Memory provides an advanced memory system with L0/L1/L2 layered architecture and semantic vector search. It **auto-derives** LLM and Embedding configuration from zeroclaw's global settings, minimizing configuration burden.
+
+**Key Features:**
+
+- **Zero Config Burden** — Auto-derives LLM and Embedding settings from global config
+- **L0/L1/L2 Layers** — Automatic memory organization and extraction
+- **Semantic Search** — Vector search via Qdrant
+- **Session Isolation** — Per-session memory scoping
+
+| Key | Default | Purpose |
+|---|---|---|
+| `qdrant_url` | `http://localhost:6334` | Qdrant vector database URL (required for cortex backend) |
+| `qdrant_collection` | `zeroclaw-memory` | Qdrant collection name |
+| `qdrant_api_key` | unset | Qdrant API key (for Qdrant Cloud or secured instances) |
+| `data_dir` | `<workspace>/cortex-data` | Cortex data directory for memory storage |
+| `tenant_id` | `zeroclaw` | Tenant identifier for multi-tenancy isolation |
+| `llm_model_override` | unset | Override LLM model for memory extraction (uses `default_model` if unset) |
+| `llm_temperature` | `0.3` | LLM temperature for extraction (lower = more deterministic) |
+| `embedding_api_key_override` | unset | Override Embedding API key (uses global `api_key` if unset) |
+| `auto_index` | `true` | Auto-index messages to vector database |
+| `auto_extract` | `true` | Auto-extract memories on session close |
+| `generate_layers_on_close` | `true` | Generate L0/L1 layer files when session closes |
+
+**Minimal Configuration (Recommended):**
+
+```toml
+api_key = "${OPENAI_API_KEY}"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+
+[memory]
+backend = "cortex"
+embedding_provider = "openai"
+embedding_model = "text-embedding-3-small"
+
+[memory.cortex]
+qdrant_url = "http://localhost:6334"
+```
+
+**With Embedding Route (Advanced):**
+
+```toml
+[memory]
+backend = "cortex"
+embedding_model = "hint:semantic"
+
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-large"
+dimensions = 3072
+
+[memory.cortex]
+qdrant_url = "http://localhost:6334"
+```
+
+**Custom Provider (Ollama):**
+
+```toml
+api_key = "ollama"  # Placeholder for Ollama
+default_provider = "ollama"
+default_model = "llama3"
+
+[memory]
+backend = "cortex"
+embedding_provider = "custom:http://localhost:11434/v1"
+embedding_model = "nomic-embed-text"
+embedding_dimensions = 768
+
+[memory.cortex]
+qdrant_url = "http://localhost:6334"
+```
+
+**Auto-Derivation Rules:**
+
+| Setting | Derivation Priority |
+|---|---|
+| LLM API Key | `api_key` (global) |
+| LLM Base URL | `api_url` → provider default (openai/anthropic/ollama) |
+| LLM Model | `llm_model_override` → `default_model` |
+| Embedding API Key | `embedding_api_key_override` → route key → global `api_key` |
+| Embedding Base URL | `embedding_provider` (custom:URL or provider default) |
+| Embedding Model | `embedding_model` (direct or hint:routed) |
+
+**Build Requirement:**
+
+Cortex backend requires the `memory-cortex` feature flag:
+
+```bash
+cargo build --features memory-cortex
+```
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 

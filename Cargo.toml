@@ -98,6 +98,11 @@ async-trait = "0.1"
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
 
+# Cortex-Memory integration (local path for development, will use crates.io later)
+cortex-mem-tools = { path = "集成cortex-mem源码参考/cortex-mem-tools", optional = true }
+cortex-mem-core = { path = "集成cortex-mem源码参考/cortex-mem-core", optional = true }
+cortex-mem-config = { path = "集成cortex-mem源码参考/cortex-mem-config", optional = true }
+
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
@@ -197,6 +202,7 @@ channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
 memory-mariadb = ["dep:mysql"]
+memory-cortex = ["dep:cortex-mem-tools", "dep:cortex-mem-core", "dep:cortex-mem-config"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 web-fetch-html2md = ["dep:fast_html2md"]
 web-fetch-plaintext = ["dep:nanohtml2text"]

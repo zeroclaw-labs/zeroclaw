@@ -5,6 +5,7 @@ pub enum MemoryBackendKind {
     Postgres,
     Mariadb,
     Qdrant,
+    Cortex,
     Markdown,
     None,
     Unknown,
@@ -75,6 +76,15 @@ const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const CORTEX_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "cortex",
+    label: "Cortex-Memory — advanced L0/L1/L2 layered memory with semantic search via [memory.cortex]",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -115,6 +125,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "postgres" => MemoryBackendKind::Postgres,
         "mariadb" | "mysql" => MemoryBackendKind::Mariadb,
         "qdrant" => MemoryBackendKind::Qdrant,
+        "cortex" => MemoryBackendKind::Cortex,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -128,6 +139,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Mariadb => MARIADB_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
+        MemoryBackendKind::Cortex => CORTEX_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
@@ -151,6 +163,8 @@ mod tests {
             MemoryBackendKind::Mariadb
         );
         assert_eq!(classify_memory_backend("mysql"), MemoryBackendKind::Mariadb);
+        assert_eq!(classify_memory_backend("qdrant"), MemoryBackendKind::Qdrant);
+        assert_eq!(classify_memory_backend("cortex"), MemoryBackendKind::Cortex);
         assert_eq!(
             classify_memory_backend("markdown"),
             MemoryBackendKind::Markdown

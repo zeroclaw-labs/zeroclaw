@@ -651,6 +651,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         });
 
         let tools = all_tools(
