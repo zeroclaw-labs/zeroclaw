@@ -397,6 +397,11 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EmbeddingRouteConfig;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn parse_category_known_variants() {
@@ -435,5 +440,70 @@ mod tests {
     #[test]
     fn truncate_content_empty_string() {
         assert_eq!(truncate_content("", 10), "");
+    }
+
+    #[tokio::test]
+    async fn reindex_uses_embedding_routes_when_memory_model_is_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{"embedding": [0.1, 0.2, 0.3]}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        // Deliberately broken fallback target. If routes are not passed through,
+        // reindex will fail by trying this endpoint.
+        config.memory.embedding_provider = "custom:http://127.0.0.1:9".into();
+        config.memory.embedding_model = "hint:semantic".into();
+        config.memory.embedding_dimensions = 3;
+        config.embedding_routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: format!("custom:{}", server.uri()),
+            model: "mock-embedding".into(),
+            dimensions: Some(3),
+            api_key: None,
+        }];
+
+        let mem = crate::memory::create_memory_with_storage_and_routes(
+            &config.memory,
+            &config.embedding_routes,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )
+        .expect("route-aware memory constructor should succeed");
+        mem.store(
+            "reindex_route_guard",
+            "This memory entry ensures reindex triggers embedding generation.",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .expect("seed memory save should succeed via routed embedding provider");
+
+        handle_reindex(&config, true, false)
+            .await
+            .expect("reindex should succeed when embedding routes are provided");
+
+        let mut without_routes = config.clone();
+        without_routes.embedding_routes.clear();
+        let err = handle_reindex(&without_routes, true, false)
+            .await
+            .expect_err("without routes, fallback provider should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error sending request")
+                || msg.contains("Connection refused")
+                || msg.contains("failed to connect"),
+            "unexpected error when routes are missing: {msg}"
+        );
     }
 }
