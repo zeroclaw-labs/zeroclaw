@@ -1403,6 +1403,7 @@ mod tests {
         let _ = std::fs::create_dir_all(workspace_path.join("images"));
         // Canonicalize the tempdir root so the absolute child path and workspace_dir
         // share the same normalized prefix across macOS and Linux CI.
+        // This keeps the test focused on "absolute path inside workspace" behavior.
         let canonical_workspace = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.clone());
