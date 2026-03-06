@@ -128,6 +128,36 @@ zeroclaw chat "Hello!"
 
 For detailed setup options, see [docs/one-click-bootstrap.md](docs/one-click-bootstrap.md).
 
+### Developer Build
+
+When you run ZeroClaw from source, the dashboard assets served by the Rust binary come from the embedded `web/dist/` bundle.
+If you changed anything under `web/src/`, rebuild the frontend before rebuilding Rust.
+
+```bash
+# Rebuild frontend assets, then rebuild Rust
+./build.sh
+
+# Frontend only (refreshes web/dist)
+./build.sh --frontend-only
+
+# Rust only, if web/dist is already current
+./build.sh --no-frontend
+
+# Release build
+./build.sh --release
+```
+
+Manual equivalent:
+
+```bash
+cd web
+npm install
+npm run build
+
+cd ..
+cargo build
+```
+
 ### Installation Docs (Canonical Source)
 
 Use repository docs as the source of truth for install/setup instructions:
