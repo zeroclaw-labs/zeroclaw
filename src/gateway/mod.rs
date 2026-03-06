@@ -959,12 +959,13 @@ async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow:
 }
 
 fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
-    let sanitized = crate::channels::sanitize_channel_response(response, tools);
-    if sanitized.is_empty() && !response.trim().is_empty() {
-        "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
-            .to_string()
-    } else {
-        sanitized
+    match crate::channels::sanitize_channel_response(response, tools) {
+        None => String::new(),
+        Some(text) if text.is_empty() && !response.trim().is_empty() => {
+            "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                .to_string()
+        }
+        Some(text) => text,
     }
 }
 

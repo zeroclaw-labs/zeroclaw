@@ -3319,7 +3319,7 @@ async fn process_channel_message(
 
             // Skip delivery entirely for suppressed responses (e.g., HEARTBEAT_OK sentinel)
             let delivered_response = match sanitized_response {
-                None => return Ok(()), // Suppress - don't send any message
+                None => return, // Suppress - don't send any message
                 Some(text) if text.is_empty() && !outbound_response.trim().is_empty() => {
                     // Malformed tool-call output
                     "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
