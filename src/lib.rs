@@ -115,6 +115,9 @@ pub(crate) mod tunnel;
 pub mod update;
 pub(crate) mod util;
 
+/// MCP hot reload module for zero-downtime configuration reloading
+pub mod mcp_reload;
+
 pub use config::Config;
 
 /// Service management subcommands
