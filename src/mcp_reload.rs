@@ -229,40 +229,12 @@ pub async fn reload_mcps(
         changes.unchanged.len()
     );
 
-    // 4. Apply changes — abort on first failure to avoid config/runtime divergence
-    let mut manager = mcp_manager.write().await;
-
-    // Stop removed MCPs
-    for name in &changes.removed {
-        info!("Stopping removed MCP: {}", name);
-        manager.stop_server(name).await.map_err(|e| {
-            error!("Error stopping MCP {}: {}", name, e);
-            e
-        })?;
-    }
-
-    // Restart modified MCPs
-    for name in &changes.modified {
-        info!("Restarting modified MCP: {}", name);
-        let config = new_servers.iter().find(|s| &s.name == name).unwrap();
-        manager.restart_server(name, config).await.map_err(|e| {
-            error!("Error restarting MCP {}: {}", name, e);
-            e
-        })?;
-    }
-
-    // Start new MCPs
-    for name in &changes.added {
-        info!("Starting new MCP: {}", name);
-        let config = new_servers.iter().find(|s| &s.name == name).unwrap();
-        manager.start_server(config).await.map_err(|e| {
-            error!("Error starting MCP {}: {}", name, e);
-            e
-        })?;
-    }
-
-    // 5. Rebuild registry only after all operations succeed
+    // 4. Rebuild registry with new configuration set.
+    //    connect_all handles starting all new/modified servers;
+    //    old servers are dropped when the registry is replaced.
     let registry = McpRegistry::connect_all(&new_servers).await?;
+
+    let mut manager = mcp_manager.write().await;
     manager.set_registry(registry);
     manager.update_configs(new_servers).await;
     info!("MCP reload complete - registry rebuilt");
