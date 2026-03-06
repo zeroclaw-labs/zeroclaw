@@ -922,9 +922,21 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
+        // When workspace_only is set, absolute paths are only allowed if they
+        // already point inside the workspace or an explicit allowed root.
         if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+            let workspace_root = self
+                .workspace_dir
+                .canonicalize()
+                .unwrap_or_else(|_| self.workspace_dir.clone());
+            if !expanded_path.starts_with(&workspace_root)
+                && !self.allowed_roots.iter().any(|root| {
+                    let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    expanded_path.starts_with(&canonical)
+                })
+            {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
@@ -1377,11 +1389,34 @@ mod tests {
     }
 
     #[test]
-    fn absolute_paths_blocked_when_workspace_only() {
+    fn absolute_paths_outside_workspace_blocked_when_workspace_only() {
         let p = default_policy();
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_paths_inside_workspace_allowed_when_workspace_only() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_absolute_workspace");
+        let _ = std::fs::create_dir_all(workspace.join("images"));
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_path_allowed(
+            canonical_workspace
+                .join("images/example.png")
+                .to_string_lossy()
+                .as_ref()
+        ));
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
@@ -1754,6 +1789,28 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_path_argument_allows_absolute_path_inside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_forbidden_abs_workspace");
+        let _ = std::fs::create_dir_all(workspace.join("images"));
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let allowed_path = canonical_workspace.join("images/example.png");
+
+        assert_eq!(
+            p.forbidden_path_argument(&format!("cat {}", allowed_path.display())),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     fn forbidden_path_argument_detects_parent_dir_reference() {
         let p = default_policy();
         assert_eq!(
@@ -2122,13 +2179,27 @@ mod tests {
     }
 
     #[test]
-    fn checklist_workspace_only_blocks_all_absolute() {
+    fn checklist_workspace_only_blocks_absolute_paths_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_checklist_workspace");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
         let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
             workspace_only: true,
             ..SecurityPolicy::default()
         };
         assert!(!p.is_path_allowed("/any/absolute/path"));
+        assert!(p.is_path_allowed(
+            canonical_workspace
+                .join("relative/path.txt")
+                .to_string_lossy()
+                .as_ref()
+        ));
         assert!(p.is_path_allowed("relative/path.txt"));
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
