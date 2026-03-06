@@ -1427,7 +1427,8 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key), "brave", "firecrawl", or "tavily"
+    /// Search provider: "duckduckgo" (free, no API key), "bing" (free), "brave", "tavily", or
+    /// "firecrawl" (requires Cargo feature `firecrawl`).
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Generic provider API key (used by firecrawl, tavily, and as fallback for brave).
