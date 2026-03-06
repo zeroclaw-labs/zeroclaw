@@ -186,6 +186,15 @@ cargo test -- tools::file_read
 cargo test -- tools::file_write
 ```
 
+## Dependency Supply-Chain Controls
+
+ZeroClaw enforces dependency policy with:
+
+- `cargo-deny` policy gates (`deny.toml`)
+- `cargo-vet` attestations/exemptions (`supply-chain/`)
+
+See [`docs/supply-chain.md`](docs/supply-chain.md) for policy scope, CI integration, and local workflows.
+
 ## Container Security
 
 ZeroClaw images follow CIS Docker Benchmark-oriented hardening.
