@@ -924,17 +924,18 @@ impl SecurityPolicy {
 
         // When workspace_only is set, absolute paths are only allowed if they
         // already point inside the workspace or an explicit allowed root.
+        let mut confined_absolute = false;
         if self.workspace_only && expanded_path.is_absolute() {
             let workspace_root = self
                 .workspace_dir
                 .canonicalize()
                 .unwrap_or_else(|_| self.workspace_dir.clone());
-            if !expanded_path.starts_with(&workspace_root)
-                && !self.allowed_roots.iter().any(|root| {
+            confined_absolute = expanded_path.starts_with(&workspace_root)
+                || self.allowed_roots.iter().any(|root| {
                     let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
                     expanded_path.starts_with(&canonical)
-                })
-            {
+                });
+            if !confined_absolute {
                 return false;
             }
         }
@@ -942,7 +943,7 @@ impl SecurityPolicy {
         // Block forbidden paths using path-component-aware matching
         for forbidden in &self.forbidden_paths {
             let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
+            if expanded_path.starts_with(forbidden_path) && !confined_absolute {
                 return false;
             }
         }
