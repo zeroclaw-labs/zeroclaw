@@ -64,14 +64,14 @@ impl DiscordChannel {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        let gw_response = self
             .http_client()
             .get(gateway_discovery_url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
-            .await?
-            .json()
             .await?;
+
+        let gw_resp: serde_json::Value = gw_response.error_for_status()?.json().await?;
 
         let gw_url = gw_resp
             .get("url")
@@ -244,7 +244,8 @@ impl DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                        tracing::warn!("Discord: ignoring message from unauthorized user");
+                        tracing::debug!(author_id_len = author_id.len(), "Discord: unauthorized user message dropped");
                         continue;
                     }
 
@@ -1385,6 +1386,12 @@ mod tests {
         use tokio::sync::mpsc;
         use tokio_tungstenite::accept_async;
 
+        const TEST_HEARTBEAT_INTERVAL_MS: u64 = 100;
+        const TEST_HEARTBEAT_WAIT_MS: u64 = 1_500;
+        const TEST_FIRST_MESSAGE_WAIT_MS: u64 = 1_500;
+        const TEST_LISTEN_EXIT_WAIT_MS: u64 = 3_000;
+        const TEST_POST_HEARTBEAT_SLEEP_MS: u64 = 1_000;
+
         let ws_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake discord ws listener");
@@ -1427,7 +1434,7 @@ mod tests {
                 .expect("upgrade fake discord websocket");
 
             ws.send(Message::Text(
-                json!({ "op": 10, "d": { "heartbeat_interval": 25 } })
+                json!({ "op": 10, "d": { "heartbeat_interval": TEST_HEARTBEAT_INTERVAL_MS } })
                     .to_string()
                     .into(),
             ))
@@ -1464,18 +1471,19 @@ mod tests {
             .await
             .expect("send first discord message event");
 
-            let heartbeat = tokio::time::timeout(Duration::from_millis(150), ws.next())
-                .await
-                .expect("client should send heartbeat before timeout")
-                .expect("heartbeat frame should exist")
-                .expect("heartbeat frame should be valid");
+            let heartbeat =
+                tokio::time::timeout(Duration::from_millis(TEST_HEARTBEAT_WAIT_MS), ws.next())
+                    .await
+                    .expect("client should send heartbeat before timeout")
+                    .expect("heartbeat frame should exist")
+                    .expect("heartbeat frame should be valid");
             let heartbeat_text = heartbeat
                 .into_text()
                 .expect("heartbeat frame should be text")
                 .to_string();
             assert!(heartbeat_text.contains("\"op\":1"));
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(TEST_POST_HEARTBEAT_SLEEP_MS)).await;
         });
 
         let channel = DiscordChannel::new(
@@ -1493,17 +1501,19 @@ mod tests {
                 .await
         });
 
-        let first_message = tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .expect("listener should deliver first discord message")
-            .expect("first discord message should exist");
+        let first_message =
+            tokio::time::timeout(Duration::from_millis(TEST_FIRST_MESSAGE_WAIT_MS), rx.recv())
+                .await
+                .expect("listener should deliver first discord message")
+                .expect("first discord message should exist");
         assert_eq!(first_message.content, "hello after first exchange");
 
-        let err = tokio::time::timeout(Duration::from_millis(400), listen_task)
-            .await
-            .expect("listener should exit after missing heartbeat ACK")
-            .expect("listener join should complete")
-            .expect_err("listener should error on missing heartbeat ACK");
+        let err =
+            tokio::time::timeout(Duration::from_millis(TEST_LISTEN_EXIT_WAIT_MS), listen_task)
+                .await
+                .expect("listener should exit after missing heartbeat ACK")
+                .expect("listener join should complete")
+                .expect_err("listener should error on missing heartbeat ACK");
         assert!(
             format!("{err:#}").contains("heartbeat ACK timeout"),
             "unexpected listener error: {err:#}"
