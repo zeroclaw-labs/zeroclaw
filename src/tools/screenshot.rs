@@ -2,7 +2,6 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::fmt::Write;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -280,7 +279,9 @@ impl ScreenshotTool {
                     Some("webp") => "image/webp",
                     _ => "image/png",
                 };
-                let _ = write!(output_msg, "\ndata:{mime};base64,{encoded}");
+                use std::fmt::Write as _;
+                write!(&mut output_msg, "\ndata:{mime};base64,{encoded}")
+                    .expect("writing to String should not fail");
 
                 Ok(ToolResult {
                     success: true,

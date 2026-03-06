@@ -2430,6 +2430,24 @@ pub async fn run_models_refresh_all(config: &Config, force: bool) -> Result<()> 
 
 // ── Step helpers ─────────────────────────────────────────────────
 
+fn env_flag_enabled(key: &str) -> bool {
+    let Ok(raw) = std::env::var(key) else {
+        return false;
+    };
+
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+fn is_non_interactive() -> bool {
+    env_flag_enabled("ZEROCLAW_NON_INTERACTIVE")
+        || env_flag_enabled("CI")
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+}
+
 fn print_step(current: u8, total: u8, title: &str) {
     let total = total.max(1);
     let completed = current
@@ -2472,7 +2490,7 @@ fn resolve_interactive_onboarding_mode(
         return Ok(InteractiveOnboardingMode::FullOnboarding);
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if is_non_interactive() {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -2515,7 +2533,7 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if is_non_interactive() {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -7065,6 +7083,7 @@ mod tests {
         home: &Path,
     ) -> Result<Config> {
         let _env_guard = env_lock().lock().await;
+        let _home_env = EnvVarGuard::set("HOME", home.to_string_lossy().as_ref());
         let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
@@ -7228,6 +7247,10 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_requires_force_when_non_interactive() {
+        let _env_guard = env_lock().lock().await;
+        let _non_interactive = EnvVarGuard::set("ZEROCLAW_NON_INTERACTIVE", "1");
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
         let zeroclaw_dir = tmp.path().join(".zeroclaw");
         let config_path = zeroclaw_dir.join("config.toml");
@@ -7237,7 +7260,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_clean_env(
+        let err = run_quick_setup_with_home(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
@@ -7293,6 +7316,7 @@ mod tests {
     async fn quick_setup_respects_zero_claw_workspace_env_layout() {
         let _env_guard = env_lock().lock().await;
         let tmp = TempDir::new().unwrap();
+        let _home_env = EnvVarGuard::set("HOME", tmp.path().to_string_lossy().as_ref());
         let workspace_root = tmp.path().join("zeroclaw-data");
         let workspace_dir = workspace_root.join("workspace");
         let expected_config_path = workspace_root.join(".zeroclaw").join("config.toml");

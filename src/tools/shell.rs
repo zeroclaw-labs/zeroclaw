@@ -136,6 +136,14 @@ fn extract_command_argument(args: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn floor_char_boundary_compat(text: &str, index: usize) -> usize {
+    let mut end = index.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {

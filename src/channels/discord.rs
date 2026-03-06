@@ -658,7 +658,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
-            return (value % upper) as usize;
+            return usize::try_from(value % upper).expect("index must fit in usize");
         }
     }
 }
@@ -1924,8 +1924,13 @@ mod tests {
     #[test]
     #[allow(clippy::format_collect)]
     fn split_message_many_short_lines() {
+        use std::fmt::Write as _;
+
         // Many short lines should be batched into chunks under the limit
-        let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let mut msg = String::new();
+        for i in 0..500 {
+            writeln!(&mut msg, "line {i}").expect("writing to String should not fail");
+        }
         let parts = split_message_for_discord(&msg);
         for part in &parts {
             assert!(
