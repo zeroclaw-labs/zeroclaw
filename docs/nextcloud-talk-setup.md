@@ -60,9 +60,29 @@ If verification fails, the gateway returns `401 Unauthorized`.
 
 ## 5. Message routing behavior
 
-- ZeroClaw ignores bot-originated webhook events (`actorType = bots`).
+- ZeroClaw accepts both payload variants:
+  - legacy Talk webhook payloads (`type = "message"`)
+  - Activity Streams 2.0 payloads (`type = "Create"` + `object.type = "Note"`)
+- ZeroClaw ignores bot-originated webhook events (`actorType = bots` or `actor.type = "Application"`).
 - ZeroClaw ignores non-message/system events.
-- Reply routing uses the Talk room token from the webhook payload.
+- Reply routing uses the Talk room token from `object.token` (legacy) or `target.id` (AS2).
+- For actor allowlists, both full (`users/alice`) and short (`alice`) IDs are accepted.
+
+Example Activity Streams 2.0 webhook payload:
+
+```json
+{
+  "type": "Create",
+  "actor": { "type": "Person", "id": "users/test", "name": "test" },
+  "object": {
+    "type": "Note",
+    "id": "177",
+    "content": "{\"message\":\"hello\",\"parameters\":[]}",
+    "mediaType": "text/markdown"
+  },
+  "target": { "type": "Collection", "id": "yyrubgfp", "name": "TESTCHAT" }
+}
+```
 
 ## 6. Quick validation checklist
 

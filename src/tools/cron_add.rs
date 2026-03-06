@@ -78,7 +78,10 @@ impl Tool for CronAddTool {
                 "command": { "type": "string" },
                 "prompt": { "type": "string" },
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
-                "model": { "type": "string" },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for this job. Omit unless the user explicitly requests a different model; defaults to the active model/context."
+                },
                 "recurring_confirmed": {
                     "type": "boolean",
                     "description": "Required for agent recurring schedules (schedule.kind='cron' or 'every'). Set true only when recurring behavior is intentional.",
@@ -181,19 +184,11 @@ impl Tool for CronAddTool {
                     }
                 };
 
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(reason),
-                    });
-                }
-
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job_with_approval(&self.config, name, schedule, command, approved)
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {

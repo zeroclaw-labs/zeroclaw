@@ -39,6 +39,8 @@ fn canonical_provider_for_model_defaults(provider_name: &str) -> String {
         "kimi_coding" | "kimi_for_coding" => "kimi-code".to_string(),
         "nvidia-nim" | "build.nvidia.com" => "nvidia".to_string(),
         "aws-bedrock" => "bedrock".to_string(),
+        "samba-nova" => "sambanova".to_string(),
+        "hf" => "huggingface".to_string(),
         "llama.cpp" => "llamacpp".to_string(),
         _ => provider_name.to_string(),
     }
@@ -76,6 +78,11 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "novita" => "minimax/minimax-m2.5",
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "cohere" => "command-a-03-2025",
+        "ai21" => "jamba-1.5-large",
+        "cerebras" => "llama3.1-70b",
+        "sambanova" => "Meta-Llama-3.3-70B-Instruct",
+        "huggingface" => "meta-llama/Llama-3.3-70B-Instruct",
+        "replicate" => "meta/meta-llama-3-70b-instruct",
         "moonshot" => "kimi-k2.5",
         "stepfun" => "step-3.5-flash",
         "hunyuan" => "hunyuan-t1-latest",
@@ -403,6 +410,17 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional custom authentication header for `custom:` providers
+    /// (for example `api-key` for Azure OpenAI).
+    ///
+    /// Contract:
+    /// - Default/omitted (`None`): uses the standard `Authorization: Bearer <token>` header.
+    /// - Compatibility: this key is additive and optional; older runtimes that do not support it
+    ///   ignore the field while continuing to use Bearer auth behavior.
+    /// - Rollback/migration: remove `auth_header` to return to Bearer-only auth if operators
+    ///   need to downgrade or revert custom-header behavior.
+    #[serde(default)]
+    pub auth_header: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
@@ -439,7 +457,6 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub transport: Option<String>,
 }
-
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
@@ -1044,6 +1061,14 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Optional allowlist for primary-agent tool visibility.
+    /// When non-empty, only listed tools are exposed to the primary agent.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Optional denylist for primary-agent tool visibility.
+    /// Applied after `allowed_tools`.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
     /// Agent-team runtime controls for synchronous delegation.
     #[serde(default)]
     pub teams: AgentTeamsConfig,
@@ -1179,6 +1204,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
             teams: AgentTeamsConfig::default(),
             subagents: SubAgentsConfig::default(),
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
@@ -1205,11 +1232,11 @@ impl Default for AgentSessionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions and tool metadata into the system prompt.
-    #[default]
-    Full,
     /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    #[default]
     Compact,
+    /// Inline full skill instructions and tool metadata into the system prompt.
+    Full,
 }
 
 fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjectionMode> {
@@ -1241,7 +1268,8 @@ pub struct SkillsConfig {
     #[serde(default)]
     pub allow_scripts: bool,
     /// Controls how skills are injected into the system prompt.
-    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    /// `compact` (default) keeps context small and loads skills on demand.
+    /// `full` preserves legacy behavior as an opt-in.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Optional ClawhHub API token for authenticated skill downloads.
@@ -3348,9 +3376,13 @@ pub enum CommandContextRuleAction {
     Allow,
     /// Matching context is explicitly denied.
     Deny,
+    /// Matching context requires interactive approval in supervised mode.
+    ///
+    /// This does not allow a command by itself; allowlist and deny checks still apply.
+    RequireApproval,
 }
 
-/// Context-aware allow/deny rule for shell commands.
+/// Context-aware command rule for shell commands.
 ///
 /// Rules are evaluated per command segment. Command matching accepts command
 /// names (`curl`), explicit paths (`/usr/bin/curl`), and wildcard (`*`).
@@ -3359,6 +3391,8 @@ pub enum CommandContextRuleAction {
 /// - `action = "deny"`: if all constraints match, the segment is rejected.
 /// - `action = "allow"`: if at least one allow rule exists for a command,
 ///   segments must match at least one of those allow rules.
+/// - `action = "require_approval"`: matching segments require explicit
+///   `approved=true` in supervised mode, even when `shell` is auto-approved.
 ///
 /// Constraints are optional:
 /// - `allowed_domains`: require URL arguments to match these hosts/patterns.
@@ -3371,7 +3405,7 @@ pub struct CommandContextRuleConfig {
     /// Command name/path pattern (`git`, `/usr/bin/curl`, or `*`).
     pub command: String,
 
-    /// Rule action (`allow` | `deny`). Defaults to `allow`.
+    /// Rule action (`allow` | `deny` | `require_approval`). Defaults to `allow`.
     #[serde(default)]
     pub action: CommandContextRuleAction,
 
@@ -3994,6 +4028,16 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
+    /// Optional per-fallback provider API keys keyed by fallback entry name.
+    /// This allows distinct credentials for multiple `custom:<url>` endpoints.
+    ///
+    /// Contract:
+    /// - Default/omitted (`{}` via `#[serde(default)]`): no per-entry override is used.
+    /// - Compatibility: additive and non-breaking for existing configs that omit this field.
+    /// - Rollback/migration: remove this map (or specific entries) to revert to provider/env-based
+    ///   credential resolution.
+    #[serde(default)]
+    pub fallback_api_keys: std::collections::HashMap<String, String>,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
@@ -4049,6 +4093,7 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
+            fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
@@ -4214,6 +4259,12 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Maximum heartbeat tasks to execute per tick. Default: `3`.
+    #[serde(default = "default_heartbeat_max_tasks_per_tick")]
+    pub max_tasks_per_tick: usize,
+    /// Skip duplicate task text within this cooldown window (minutes). Default: `0` (disabled).
+    #[serde(default = "default_heartbeat_dedupe_window_minutes")]
+    pub dedupe_window_minutes: u32,
     /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
     #[serde(default)]
     pub message: Option<String>,
@@ -4225,11 +4276,21 @@ pub struct HeartbeatConfig {
     pub to: Option<String>,
 }
 
+fn default_heartbeat_max_tasks_per_tick() -> usize {
+    3
+}
+
+fn default_heartbeat_dedupe_window_minutes() -> u32 {
+    0
+}
+
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             interval_minutes: 30,
+            max_tasks_per_tick: default_heartbeat_max_tasks_per_tick(),
+            dedupe_window_minutes: default_heartbeat_dedupe_window_minutes(),
             message: None,
             target: None,
             to: None,
@@ -4620,6 +4681,8 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+    /// Native streaming for channels that support draft updates directly.
+    On,
 }
 
 /// Progress verbosity for channels that support draft streaming.
@@ -5636,7 +5699,7 @@ impl FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecurityConfig {
     /// Sandbox configuration
     #[serde(default)]
@@ -5674,9 +5737,57 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub outbound_leak_guard: OutboundLeakGuardConfig,
 
+    /// Enable per-turn canary tokens to detect system-context exfiltration.
+    #[serde(default = "default_true")]
+    pub canary_tokens: bool,
+
+    /// Enable semantic prompt-injection guard backed by vector similarity.
+    ///
+    /// This guard is additive to lexical prompt detection and only runs when
+    /// `PromptGuard` does not already block the input.
+    #[serde(default)]
+    pub semantic_guard: bool,
+
+    /// Qdrant collection used by the semantic guard.
+    #[serde(default = "default_semantic_guard_collection")]
+    pub semantic_guard_collection: String,
+
+    /// Cosine similarity threshold for semantic-guard detections.
+    #[serde(default = "default_semantic_guard_threshold")]
+    pub semantic_guard_threshold: f64,
+
     /// Shared URL access policy for network-enabled tools.
     #[serde(default)]
     pub url_access: UrlAccessConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+            otp: OtpConfig::default(),
+            roles: Vec::default(),
+            estop: EstopConfig::default(),
+            syscall_anomaly: SyscallAnomalyConfig::default(),
+            perplexity_filter: PerplexityFilterConfig::default(),
+            outbound_leak_guard: OutboundLeakGuardConfig::default(),
+            canary_tokens: true,
+            semantic_guard: false,
+            semantic_guard_collection: default_semantic_guard_collection(),
+            semantic_guard_threshold: default_semantic_guard_threshold(),
+            url_access: UrlAccessConfig::default(),
+        }
+    }
+}
+
+fn default_semantic_guard_collection() -> String {
+    "semantic_guard".into()
+}
+
+fn default_semantic_guard_threshold() -> f64 {
+    0.82
 }
 
 /// Outbound leak handling mode for channel responses.
@@ -6500,8 +6611,8 @@ fn default_config_dir() -> Result<PathBuf> {
     Ok(home.join(".zeroclaw"))
 }
 
-fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
-    default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
+fn active_workspace_state_path(marker_root: &Path) -> PathBuf {
+    marker_root.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
 /// Returns `true` if `path` lives under the OS temp directory.
@@ -6616,9 +6727,65 @@ async fn load_persisted_workspace_dirs(
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
+async fn remove_active_workspace_marker(marker_root: &Path) -> Result<()> {
+    let state_path = active_workspace_state_path(marker_root);
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    fs::remove_file(&state_path).await.with_context(|| {
+        format!(
+            "Failed to clear active workspace marker: {}",
+            state_path.display()
+        )
+    })?;
+
+    if marker_root.exists() {
+        sync_directory(marker_root).await?;
+    }
+    Ok(())
+}
+
+async fn write_active_workspace_marker(marker_root: &Path, config_dir: &Path) -> Result<()> {
+    fs::create_dir_all(marker_root).await.with_context(|| {
+        format!(
+            "Failed to create active workspace marker root: {}",
+            marker_root.display()
+        )
+    })?;
+
+    let state = ActiveWorkspaceState {
+        config_dir: config_dir.to_string_lossy().into_owned(),
+    };
+    let serialized =
+        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
+
+    let temp_path = marker_root.join(format!(
+        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temp_path, serialized).await.with_context(|| {
+        format!(
+            "Failed to write temporary active workspace marker: {}",
+            temp_path.display()
+        )
+    })?;
+
+    let state_path = active_workspace_state_path(marker_root);
+    if let Err(error) = fs::rename(&temp_path, &state_path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        anyhow::bail!(
+            "Failed to atomically persist active workspace marker {}: {error}",
+            state_path.display()
+        );
+    }
+
+    sync_directory(marker_root).await?;
+    Ok(())
+}
+
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
     let default_config_dir = default_config_dir()?;
-    let state_path = active_workspace_state_path(&default_config_dir);
 
     // Guard: never persist a temp-directory path as the active workspace.
     // This prevents transient test runs or one-off invocations from hijacking
@@ -6633,48 +6800,21 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     }
 
     if config_dir == default_config_dir {
-        if state_path.exists() {
-            fs::remove_file(&state_path).await.with_context(|| {
-                format!(
-                    "Failed to clear active workspace marker: {}",
-                    state_path.display()
-                )
-            })?;
-        }
+        remove_active_workspace_marker(&default_config_dir).await?;
         return Ok(());
     }
 
-    fs::create_dir_all(&default_config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create default config directory: {}",
-                default_config_dir.display()
-            )
-        })?;
+    // Primary marker lives with the selected config root to keep custom-home
+    // layouts self-contained and writable in restricted environments.
+    write_active_workspace_marker(config_dir, config_dir).await?;
 
-    let state = ActiveWorkspaceState {
-        config_dir: config_dir.to_string_lossy().into_owned(),
-    };
-    let serialized =
-        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
-
-    let temp_path = default_config_dir.join(format!(
-        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temp_path, serialized).await.with_context(|| {
-        format!(
-            "Failed to write temporary active workspace marker: {}",
-            temp_path.display()
-        )
-    })?;
-
-    if let Err(error) = fs::rename(&temp_path, &state_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        anyhow::bail!(
-            "Failed to atomically persist active workspace marker {}: {error}",
-            state_path.display()
+    // Mirror into the default HOME-scoped root as a best-effort pointer for
+    // later auto-discovery. Failure here must not break onboarding/update flows.
+    if let Err(error) = write_active_workspace_marker(&default_config_dir, config_dir).await {
+        tracing::warn!(
+            selected_config_dir = %config_dir.display(),
+            default_config_dir = %default_config_dir.display(),
+            "Failed to mirror active workspace marker to default HOME config root; continuing with selected-root marker only: {error}"
         );
     }
 
@@ -6836,6 +6976,21 @@ fn decrypt_vec_secrets(
     Ok(())
 }
 
+fn decrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .decrypt(value)
+                .with_context(|| format!("Failed to decrypt {field_name}.{key}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -6876,6 +7031,21 @@ fn encrypt_vec_secrets(
             *value = store
                 .encrypt(value)
                 .with_context(|| format!("Failed to encrypt {field_name}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_map_secrets(
+    store: &crate::security::SecretStore,
+    values: &mut std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<()> {
+    for (key, value) in values.iter_mut() {
+        if !crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .encrypt(value)
+                .with_context(|| format!("Failed to encrypt {field_name}.{key}"))?;
         }
     }
     Ok(())
@@ -7606,6 +7776,11 @@ impl Config {
                 &mut config.reliability.api_keys,
                 "config.reliability.api_keys",
             )?;
+            decrypt_map_secrets(
+                &store,
+                &mut config.reliability.fallback_api_keys,
+                "config.reliability.fallback_api_keys",
+            )?;
             decrypt_vec_secrets(
                 &store,
                 &mut config.gateway.paired_tokens,
@@ -7624,7 +7799,8 @@ impl Config {
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
                 source = resolution_source.as_str(),
-                initialized = false,
+                initialized = true,
+                created = false,
                 "Config loaded"
             );
             Ok(config)
@@ -7648,6 +7824,7 @@ impl Config {
                 workspace = %config.workspace_dir.display(),
                 source = resolution_source.as_str(),
                 initialized = true,
+                created = true,
                 "Config loaded"
             );
             Ok(config)
@@ -7693,6 +7870,23 @@ impl Config {
                 None
             }
         }
+    }
+
+    fn normalize_url_for_profile_match(raw: &str) -> (String, Option<String>) {
+        let trimmed = raw.trim();
+        let (path, query) = match trimmed.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (trimmed, None),
+        };
+
+        (
+            path.trim_end_matches('/').to_string(),
+            query.map(|value| value.to_string()),
+        )
+    }
+
+    fn urls_match_ignoring_trailing_slash(lhs: &str, rhs: &str) -> bool {
+        Self::normalize_url_for_profile_match(lhs) == Self::normalize_url_for_profile_match(rhs)
     }
 
     /// Resolve provider reasoning level with backward-compatible runtime alias.
@@ -7746,6 +7940,53 @@ impl Config {
     /// - `sse`
     pub fn effective_provider_transport(&self) -> Option<String> {
         Self::normalize_provider_transport(self.provider.transport.as_deref(), "provider.transport")
+    }
+
+    /// Resolve custom provider auth header from a matching `[model_providers.*]` profile.
+    ///
+    /// This is used when `default_provider = "custom:<url>"` and a profile with the
+    /// same `base_url` declares `auth_header` (for example `api-key` for Azure OpenAI).
+    pub fn effective_custom_provider_auth_header(&self) -> Option<String> {
+        let custom_provider_url = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .and_then(|provider| provider.strip_prefix("custom:"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        let mut profile_keys = self.model_providers.keys().collect::<Vec<_>>();
+        profile_keys.sort_unstable();
+
+        for profile_key in profile_keys {
+            let Some(profile) = self.model_providers.get(profile_key) else {
+                continue;
+            };
+
+            let Some(header) = profile
+                .auth_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            let Some(base_url) = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            if Self::urls_match_ignoring_trailing_slash(custom_provider_url, base_url) {
+                return Some(header.to_string());
+            }
+        }
+
+        None
     }
 
     fn lookup_model_provider_profile(
@@ -7880,6 +8121,29 @@ impl Config {
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
+        }
+
+        // Reliability
+        let configured_fallbacks = self
+            .reliability
+            .fallback_providers
+            .iter()
+            .map(|provider| provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        for (entry, api_key) in &self.reliability.fallback_api_keys {
+            let normalized_entry = entry.trim();
+            if normalized_entry.is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys contains an empty key");
+            }
+            if api_key.trim().is_empty() {
+                anyhow::bail!("reliability.fallback_api_keys.{normalized_entry} must not be empty");
+            }
+            if !configured_fallbacks.contains(normalized_entry) {
+                anyhow::bail!(
+                    "reliability.fallback_api_keys.{normalized_entry} has no matching entry in reliability.fallback_providers"
+                );
+            }
         }
 
         // Autonomy
@@ -8102,6 +8366,30 @@ impl Config {
                 );
             }
         }
+        for (i, tool_name) in self.agent.allowed_tools.iter().enumerate() {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("agent.allowed_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+            {
+                anyhow::bail!("agent.allowed_tools[{i}] contains invalid characters: {normalized}");
+            }
+        }
+        for (i, tool_name) in self.agent.denied_tools.iter().enumerate() {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("agent.denied_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+            {
+                anyhow::bail!("agent.denied_tools[{i}] contains invalid characters: {normalized}");
+            }
+        }
         let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
         let mut custom_role_names = std::collections::HashSet::new();
         for (i, role) in self.security.roles.iter().enumerate() {
@@ -8266,6 +8554,12 @@ impl Config {
         if !(0.0..=1.0).contains(&self.security.outbound_leak_guard.sensitivity) {
             anyhow::bail!("security.outbound_leak_guard.sensitivity must be between 0.0 and 1.0");
         }
+        if self.security.semantic_guard_collection.trim().is_empty() {
+            anyhow::bail!("security.semantic_guard_collection must not be empty");
+        }
+        if !(0.0..=1.0).contains(&self.security.semantic_guard_threshold) {
+            anyhow::bail!("security.semantic_guard_threshold must be between 0.0 and 1.0");
+        }
 
         // Browser
         if normalize_browser_open_choice(&self.browser.browser_open).is_none() {
@@ -8363,6 +8657,12 @@ impl Config {
         }
 
         // Scheduler
+        if self.heartbeat.interval_minutes == 0 {
+            anyhow::bail!("heartbeat.interval_minutes must be greater than 0");
+        }
+        if self.heartbeat.max_tasks_per_tick == 0 {
+            anyhow::bail!("heartbeat.max_tasks_per_tick must be greater than 0");
+        }
         if self.scheduler.max_concurrent == 0 {
             anyhow::bail!("scheduler.max_concurrent must be greater than 0");
         }
@@ -8454,22 +8754,26 @@ impl Config {
             }
         }
 
+        let mut custom_auth_headers_by_base_url: Vec<(String, String, String)> = Vec::new();
         for (profile_key, profile) in &self.model_providers {
             let profile_name = profile_key.trim();
             if profile_name.is_empty() {
                 anyhow::bail!("model_providers contains an empty profile name");
             }
 
+            let normalized_base_url = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+
             let has_name = profile
                 .name
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
-            let has_base_url = profile
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
+            let has_base_url = normalized_base_url.is_some();
 
             if !has_name && !has_base_url {
                 anyhow::bail!(
@@ -8477,16 +8781,12 @@ impl Config {
                 );
             }
 
-            if let Some(base_url) = profile.base_url.as_deref().map(str::trim) {
-                if !base_url.is_empty() {
-                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                        format!("model_providers.{profile_name}.base_url is not a valid URL")
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") {
-                        anyhow::bail!(
-                            "model_providers.{profile_name}.base_url must use http/https"
-                        );
-                    }
+            if let Some(base_url) = normalized_base_url.as_deref() {
+                let parsed = reqwest::Url::parse(base_url).with_context(|| {
+                    format!("model_providers.{profile_name}.base_url is not a valid URL")
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("model_providers.{profile_name}.base_url must use http/https");
                 }
             }
 
@@ -8494,6 +8794,42 @@ impl Config {
                 if !wire_api.is_empty() && normalize_wire_api(wire_api).is_none() {
                     anyhow::bail!(
                         "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                    );
+                }
+            }
+
+            if let Some(auth_header) = profile.auth_header.as_deref().map(str::trim) {
+                if !auth_header.is_empty() {
+                    reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).with_context(
+                        || {
+                            format!(
+                                "model_providers.{profile_name}.auth_header is invalid; expected a valid HTTP header name"
+                            )
+                        },
+                    )?;
+
+                    if let Some(base_url) = normalized_base_url.as_deref() {
+                        custom_auth_headers_by_base_url.push((
+                            profile_name.to_string(),
+                            base_url.to_string(),
+                            auth_header.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for left_index in 0..custom_auth_headers_by_base_url.len() {
+            let (left_profile, left_url, left_header) =
+                &custom_auth_headers_by_base_url[left_index];
+            for right_index in (left_index + 1)..custom_auth_headers_by_base_url.len() {
+                let (right_profile, right_url, right_header) =
+                    &custom_auth_headers_by_base_url[right_index];
+                if Self::urls_match_ignoring_trailing_slash(left_url, right_url)
+                    && !left_header.eq_ignore_ascii_case(right_header)
+                {
+                    anyhow::bail!(
+                        "model_providers.{left_profile} and model_providers.{right_profile} define conflicting auth_header values for equivalent base_url {left_url}"
                     );
                 }
             }
@@ -9305,6 +9641,11 @@ impl Config {
             &mut config_to_save.reliability.api_keys,
             "config.reliability.api_keys",
         )?;
+        encrypt_map_secrets(
+            &store,
+            &mut config_to_save.reliability.fallback_api_keys,
+            "config.reliability.fallback_api_keys",
+        )?;
         encrypt_vec_secrets(
             &store,
             &mut config_to_save.gateway.paired_tokens,
@@ -9526,7 +9867,7 @@ mod tests {
         assert!(!c.skills.allow_scripts);
         assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
@@ -9833,6 +10174,34 @@ allowed_roots = []
     }
 
     #[test]
+    async fn autonomy_command_context_rule_supports_require_approval_action() {
+        let raw = r#"
+level = "supervised"
+workspace_only = true
+allowed_commands = ["ls", "rm"]
+forbidden_paths = ["/etc"]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = []
+auto_approve = ["shell"]
+always_ask = []
+allowed_roots = []
+
+[[command_context_rules]]
+command = "rm"
+action = "require_approval"
+"#;
+        let parsed: AutonomyConfig = toml::from_str(raw).expect("autonomy config should parse");
+        assert_eq!(parsed.command_context_rules.len(), 1);
+        assert_eq!(
+            parsed.command_context_rules[0].action,
+            CommandContextRuleAction::RequireApproval
+        );
+    }
+
+    #[test]
     async fn config_validate_rejects_duplicate_non_cli_excluded_tools() {
         let mut cfg = Config::default();
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".into(), "shell".into()];
@@ -9879,6 +10248,8 @@ allowed_roots = []
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
+        assert_eq!(h.max_tasks_per_tick, 3);
+        assert_eq!(h.dedupe_window_minutes, 0);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
@@ -9889,6 +10260,8 @@ allowed_roots = []
         let raw = r#"
 enabled = true
 interval_minutes = 10
+max_tasks_per_tick = 5
+dedupe_window_minutes = 30
 message = "Ping"
 channel = "telegram"
 recipient = "42"
@@ -9896,6 +10269,8 @@ recipient = "42"
         let parsed: HeartbeatConfig = toml::from_str(raw).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.interval_minutes, 10);
+        assert_eq!(parsed.max_tasks_per_tick, 5);
+        assert_eq!(parsed.dedupe_window_minutes, 30);
         assert_eq!(parsed.message.as_deref(), Some("Ping"));
         assert_eq!(parsed.target.as_deref(), Some("telegram"));
         assert_eq!(parsed.to.as_deref(), Some("42"));
@@ -10062,6 +10437,8 @@ ws_url = "ws://127.0.0.1:3002"
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                max_tasks_per_tick: 4,
+                dedupe_window_minutes: 10,
                 message: Some("Check London time".into()),
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
@@ -10149,6 +10526,8 @@ ws_url = "ws://127.0.0.1:3002"
         assert_eq!(parsed.runtime.kind, "docker");
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
+        assert_eq!(parsed.heartbeat.max_tasks_per_tick, 4);
+        assert_eq!(parsed.heartbeat.dedupe_window_minutes, 10);
         assert_eq!(
             parsed.heartbeat.message.as_deref(),
             Some("Check London time")
@@ -10177,6 +10556,8 @@ default_temperature = 0.7
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);
+        assert_eq!(parsed.heartbeat.max_tasks_per_tick, 3);
+        assert_eq!(parsed.heartbeat.dedupe_window_minutes, 0);
         assert!(parsed.channels_config.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
@@ -10411,6 +10792,8 @@ reasoning_level = "high"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(cfg.allowed_tools.is_empty());
+        assert!(cfg.denied_tools.is_empty());
     }
 
     #[test]
@@ -10423,6 +10806,8 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+allowed_tools = ["delegate", "task_plan"]
+denied_tools = ["shell"]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -10430,6 +10815,11 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        assert_eq!(
+            parsed.agent.allowed_tools,
+            vec!["delegate".to_string(), "task_plan".to_string()]
+        );
+        assert_eq!(parsed.agent.denied_tools, vec!["shell".to_string()]);
     }
 
     #[tokio::test]
@@ -10552,6 +10942,10 @@ tool_dispatcher = "xml"
         config.web_search.jina_api_key = Some("jina-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
+        config.reliability.fallback_api_keys.insert(
+            "custom:https://api-a.example.com/v1".into(),
+            "fallback-a-credential".into(),
+        );
         config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
         config.channels_config.telegram = Some(TelegramConfig {
             bot_token: "telegram-credential".into(),
@@ -10686,6 +11080,16 @@ tool_dispatcher = "xml"
         let reliability_key = &stored.reliability.api_keys[0];
         assert!(crate::security::SecretStore::is_encrypted(reliability_key));
         assert_eq!(store.decrypt(reliability_key).unwrap(), "backup-credential");
+        let fallback_key = stored
+            .reliability
+            .fallback_api_keys
+            .get("custom:https://api-a.example.com/v1")
+            .expect("fallback key should exist");
+        assert!(crate::security::SecretStore::is_encrypted(fallback_key));
+        assert_eq!(
+            store.decrypt(fallback_key).unwrap(),
+            "fallback-a-credential"
+        );
 
         let paired_token = &stored.gateway.paired_tokens[0];
         assert!(crate::security::SecretStore::is_encrypted(paired_token));
@@ -10776,6 +11180,13 @@ tool_dispatcher = "xml"
             GroupReplyMode::AllMessages
         );
         assert!(parsed.group_reply_allowed_sender_ids().is_empty());
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_stream_mode_on() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"stream_mode":"on"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stream_mode, StreamMode::On);
     }
 
     #[test]
@@ -11232,6 +11643,33 @@ channel_id = "C123"
         assert_eq!(
             parsed.group_reply_allowed_sender_ids(),
             vec!["U111".to_string()]
+        );
+    }
+
+    #[test]
+    async fn channels_slack_group_reply_toml_nested_table_deserializes() {
+        let toml_str = r#"
+cli = true
+
+[slack]
+bot_token = "xoxb-tok"
+app_token = "xapp-tok"
+channel_id = "C123"
+allowed_users = ["*"]
+
+[slack.group_reply]
+mode = "mention_only"
+allowed_sender_ids = ["U111", "U222"]
+"#;
+        let parsed: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        let slack = parsed.slack.expect("slack config should exist");
+        assert_eq!(
+            slack.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            slack.group_reply_allowed_sender_ids(),
+            vec!["U111".to_string(), "U222".to_string()]
         );
     }
 
@@ -12047,7 +12485,7 @@ requires_openai_auth = true
         assert!(config.skills.open_skills_dir.is_none());
         assert_eq!(
             config.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
@@ -12391,6 +12829,12 @@ provider_api = "not-a-real-mode"
 
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
+
+        let ai21 = resolve_default_model_id(None, Some("ai21"));
+        assert_eq!(ai21, "jamba-1.5-large");
+
+        let huggingface = resolve_default_model_id(None, Some("huggingface"));
+        assert_eq!(huggingface, "meta-llama/Llama-3.3-70B-Instruct");
     }
 
     #[test]
@@ -12406,6 +12850,12 @@ provider_api = "not-a-real-mode"
 
         let step_ai_alias = resolve_default_model_id(None, Some("step-ai"));
         assert_eq!(step_ai_alias, "step-3.5-flash");
+
+        let samba_nova_alias = resolve_default_model_id(None, Some("samba-nova"));
+        assert_eq!(samba_nova_alias, "Meta-Llama-3.3-70B-Instruct");
+
+        let hf_alias = resolve_default_model_id(None, Some("hf"));
+        assert_eq!(hf_alias, "meta-llama/Llama-3.3-70B-Instruct");
     }
 
     #[test]
@@ -12418,6 +12868,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: None,
                     api_key: None,
@@ -12439,6 +12890,105 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn model_provider_profile_surfaces_custom_auth_header_for_matching_custom_provider() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("azure".to_string()),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+            )
+        );
+        assert_eq!(
+            config.effective_custom_provider_auth_header().as_deref(),
+            Some("api-key")
+        );
+    }
+
+    #[test]
+    async fn model_provider_profile_custom_auth_header_requires_url_match() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config {
+            default_provider: Some("azure".to_string()),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/other-model/chat/completions?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        config.apply_env_overrides();
+        config.default_provider = Some(
+            "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                .to_string(),
+        );
+        assert!(config.effective_custom_provider_auth_header().is_none());
+    }
+
+    #[test]
+    async fn model_provider_profile_custom_auth_header_matches_slash_before_query() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                    .to_string(),
+            ),
+            model_providers: HashMap::from([(
+                "azure".to_string(),
+                ModelProviderConfig {
+                    name: Some("azure".to_string()),
+                    base_url: Some(
+                        "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions/?api-version=2024-02-01"
+                            .to_string(),
+                    ),
+                    auth_header: Some("api-key".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.effective_custom_provider_auth_header().as_deref(),
+            Some("api-key")
+        );
+    }
+
+    #[test]
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12448,6 +12998,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue".to_string()),
+                    auth_header: None,
                     wire_api: Some("responses".to_string()),
                     default_model: None,
                     api_key: None,
@@ -12512,6 +13063,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: Some("ws".to_string()),
                     default_model: None,
                     api_key: None,
@@ -12528,6 +13080,77 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn validate_rejects_invalid_model_provider_auth_header() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: Some("not a header".to_string()),
+                    wire_api: None,
+                    default_model: None,
+                    api_key: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("auth_header is invalid"));
+    }
+
+    #[test]
+    async fn validate_rejects_conflicting_model_provider_auth_headers_for_same_base_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some(
+                "custom:https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                    .to_string(),
+            ),
+            model_providers: HashMap::from([
+                (
+                    "azure_a".to_string(),
+                    ModelProviderConfig {
+                        name: Some("openai".to_string()),
+                        base_url: Some(
+                            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
+                                .to_string(),
+                        ),
+                        auth_header: Some("api-key".to_string()),
+                        wire_api: None,
+                        default_model: None,
+                        api_key: None,
+                        requires_openai_auth: false,
+                    },
+                ),
+                (
+                    "azure_b".to_string(),
+                    ModelProviderConfig {
+                        name: Some("openai".to_string()),
+                        base_url: Some(
+                            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions/?api-version=2024-02-01"
+                                .to_string(),
+                        ),
+                        auth_header: Some("x-api-key".to_string()),
+                        wire_api: None,
+                        default_model: None,
+                        api_key: None,
+                        requires_openai_auth: false,
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("conflicting auth_header values"));
+    }
+
+    #[test]
     async fn model_provider_profile_uses_profile_api_key_when_global_is_missing() {
         let _env_guard = env_override_lock().await;
         let mut config = Config {
@@ -12538,6 +13161,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: None,
                     api_key: Some("profile-api-key".to_string()),
@@ -12562,6 +13186,7 @@ provider_api = "not-a-real-mode"
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    auth_header: None,
                     wire_api: None,
                     default_model: Some("qwen-max".to_string()),
                     api_key: None,
@@ -12989,6 +13614,74 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn persist_active_workspace_marker_is_written_to_selected_config_root() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let default_config_dir = temp_home.join(".zeroclaw");
+        let custom_config_dir = temp_home.join("profiles").join("custom-profile");
+        let default_marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+        let custom_marker_path = custom_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+
+        persist_active_workspace_config_dir(&custom_config_dir)
+            .await
+            .unwrap();
+
+        assert!(custom_marker_path.exists());
+        assert!(default_marker_path.exists());
+
+        let custom_state: ActiveWorkspaceState =
+            toml::from_str(&fs::read_to_string(&custom_marker_path).await.unwrap()).unwrap();
+        assert_eq!(PathBuf::from(custom_state.config_dir), custom_config_dir);
+
+        let default_state: ActiveWorkspaceState =
+            toml::from_str(&fs::read_to_string(&default_marker_path).await.unwrap()).unwrap();
+        assert_eq!(PathBuf::from(default_state.config_dir), custom_config_dir);
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn persist_active_workspace_marker_tolerates_restricted_default_home_root() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let default_config_root_blocker = temp_home.join(".zeroclaw");
+        let custom_config_dir = temp_home.join("profiles").join("restricted-home-profile");
+        let custom_marker_path = custom_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        fs::create_dir_all(&custom_config_dir).await.unwrap();
+        fs::write(&default_config_root_blocker, "blocked-as-file")
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+
+        persist_active_workspace_config_dir(&custom_config_dir)
+            .await
+            .unwrap();
+
+        assert!(custom_marker_path.exists());
+        assert!(default_config_root_blocker.is_file());
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -12996,6 +13689,7 @@ default_model = "legacy-model"
         let default_config_dir = temp_home.join(".zeroclaw");
         let custom_config_dir = temp_home.join("profiles").join("custom-profile");
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+        let custom_marker_path = custom_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
@@ -13004,11 +13698,13 @@ default_model = "legacy-model"
             .await
             .unwrap();
         assert!(marker_path.exists());
+        assert!(custom_marker_path.exists());
 
         persist_active_workspace_config_dir(&default_config_dir)
             .await
             .unwrap();
         assert!(!marker_path.exists());
+        assert!(custom_marker_path.exists());
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -14129,6 +14825,10 @@ default_temperature = 0.7
             OutboundLeakGuardAction::Redact
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.7);
+        assert!(parsed.security.canary_tokens);
+        assert!(!parsed.security.semantic_guard);
+        assert_eq!(parsed.security.semantic_guard_collection, "semantic_guard");
+        assert!((parsed.security.semantic_guard_threshold - 0.82).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -14138,6 +14838,12 @@ default_temperature = 0.7
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
+
+[security]
+canary_tokens = false
+semantic_guard = true
+semantic_guard_collection = "semantic_guard_custom"
+semantic_guard_threshold = 0.91
 
 [security.otp]
 enabled = true
@@ -14220,6 +14926,13 @@ sensitivity = 0.9
             OutboundLeakGuardAction::Block
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.9);
+        assert!(!parsed.security.canary_tokens);
+        assert!(parsed.security.semantic_guard);
+        assert_eq!(
+            parsed.security.semantic_guard_collection,
+            "semantic_guard_custom"
+        );
+        assert!((parsed.security.semantic_guard_threshold - 0.91).abs() < f64::EPSILON);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         assert_eq!(
@@ -14240,6 +14953,50 @@ sensitivity = 0.9
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_empty_allowed_tool_entry() {
+        let mut config = Config::default();
+        config.agent.allowed_tools = vec!["   ".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent allowed_tools entry");
+        assert!(err.to_string().contains("agent.allowed_tools"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_invalid_allowed_tool_chars() {
+        let mut config = Config::default();
+        config.agent.allowed_tools = vec!["bad tool".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent allowed_tools chars");
+        assert!(err.to_string().contains("agent.allowed_tools"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_empty_denied_tool_entry() {
+        let mut config = Config::default();
+        config.agent.denied_tools = vec!["   ".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent denied_tools entry");
+        assert!(err.to_string().contains("agent.denied_tools"));
+    }
+
+    #[test]
+    async fn agent_validation_rejects_invalid_denied_tool_chars() {
+        let mut config = Config::default();
+        config.agent.denied_tools = vec!["bad/tool".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid agent denied_tools chars");
+        assert!(err.to_string().contains("agent.denied_tools"));
     }
 
     #[test]
@@ -14308,6 +15065,40 @@ sensitivity = 0.9
         assert!(err
             .to_string()
             .contains("security.url_access.enforce_domain_allowlist"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_empty_fallback_api_key_value() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("openrouter".to_string(), "   ".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys empty value validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.openrouter must not be empty"));
+    }
+
+    #[test]
+    async fn reliability_validation_rejects_unmapped_fallback_api_key_entry() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["openrouter".to_string()];
+        config
+            .reliability
+            .fallback_api_keys
+            .insert("anthropic".to_string(), "sk-ant-test".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("expected fallback_api_keys mapping validation failure");
+        assert!(err
+            .to_string()
+            .contains("reliability.fallback_api_keys.anthropic has no matching entry"));
     }
 
     #[test]
@@ -14474,6 +15265,19 @@ sensitivity = 0.9
     }
 
     #[test]
+    async fn heartbeat_validation_rejects_zero_max_tasks_per_tick() {
+        let mut config = Config::default();
+        config.heartbeat.max_tasks_per_tick = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected heartbeat max_tasks_per_tick validation failure");
+        assert!(err
+            .to_string()
+            .contains("heartbeat.max_tasks_per_tick must be greater than 0"));
+    }
+
+    #[test]
     async fn security_validation_rejects_denied_threshold_above_total_threshold() {
         let mut config = Config::default();
         config.security.syscall_anomaly.max_denied_events_per_minute = 10;
@@ -14520,6 +15324,32 @@ sensitivity = 0.9
         assert!(err
             .to_string()
             .contains("security.outbound_leak_guard.sensitivity"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_empty_semantic_guard_collection() {
+        let mut config = Config::default();
+        config.security.semantic_guard_collection = "   ".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("expected semantic_guard_collection validation failure");
+        assert!(err
+            .to_string()
+            .contains("security.semantic_guard_collection"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_semantic_guard_threshold() {
+        let mut config = Config::default();
+        config.security.semantic_guard_threshold = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected semantic_guard_threshold validation failure");
+        assert!(err
+            .to_string()
+            .contains("security.semantic_guard_threshold"));
     }
 
     #[test]

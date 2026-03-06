@@ -13,7 +13,7 @@ let
 in
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "zeroclaw";
-  version = "0.1.7";
+  version = "0.1.8";
 
   src =
     let

@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::config::Config;
-    use crate::skills::{handle_command, load_skills_with_config, skills_dir};
-    use crate::SkillCommands;
+    use crate::skills::skills_dir;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -105,18 +103,18 @@ mod tests {
             let result = std::os::unix::fs::symlink(&outside_dir, &dest_link);
             assert!(result.is_ok(), "symlink creation should succeed on unix");
 
-            let mut config = Config::default();
+            let mut config = crate::config::Config::default();
             config.workspace_dir = workspace_dir.clone();
             config.config_path = workspace_dir.join("config.toml");
 
-            let blocked = load_skills_with_config(&workspace_dir, &config);
+            let blocked = crate::skills::load_skills_with_config(&workspace_dir, &config);
             assert!(
                 blocked.is_empty(),
                 "symlinked skill should be rejected when trusted_skill_roots is empty"
             );
 
             config.skills.trusted_skill_roots = vec![tmp.path().display().to_string()];
-            let allowed = load_skills_with_config(&workspace_dir, &config);
+            let allowed = crate::skills::load_skills_with_config(&workspace_dir, &config);
             assert_eq!(
                 allowed.len(),
                 1,
@@ -145,12 +143,12 @@ mod tests {
             let link_path = skills_path.join("outside_skill");
             std::os::unix::fs::symlink(&outside_dir, &link_path).unwrap();
 
-            let mut config = Config::default();
+            let mut config = crate::config::Config::default();
             config.workspace_dir = workspace_dir.clone();
             config.config_path = workspace_dir.join("config.toml");
 
-            let blocked = handle_command(
-                SkillCommands::Audit {
+            let blocked = crate::skills::handle_command(
+                crate::SkillCommands::Audit {
                     source: "outside_skill".to_string(),
                 },
                 &config,
@@ -161,8 +159,8 @@ mod tests {
             );
 
             config.skills.trusted_skill_roots = vec![tmp.path().display().to_string()];
-            let allowed = handle_command(
-                SkillCommands::Audit {
+            let allowed = crate::skills::handle_command(
+                crate::SkillCommands::Audit {
                     source: "outside_skill".to_string(),
                 },
                 &config,

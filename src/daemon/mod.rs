@@ -1,12 +1,62 @@
 use crate::config::Config;
 use anyhow::{bail, Result};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+const SHUTDOWN_GRACE_SECONDS: u64 = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownSignal {
+    CtrlC,
+    SigTerm,
+}
+
+fn shutdown_reason(signal: ShutdownSignal) -> &'static str {
+    match signal {
+        ShutdownSignal::CtrlC => "shutdown requested (SIGINT)",
+        ShutdownSignal::SigTerm => "shutdown requested (SIGTERM)",
+    }
+}
+
+#[cfg(unix)]
+fn shutdown_hint() -> &'static str {
+    "Ctrl+C or SIGTERM to stop"
+}
+
+#[cfg(not(unix))]
+fn shutdown_hint() -> &'static str {
+    "Ctrl+C to stop"
+}
+
+async fn wait_for_shutdown_signal() -> Result<ShutdownSignal> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            ctrl_c = tokio::signal::ctrl_c() => {
+                ctrl_c?;
+                Ok(ShutdownSignal::CtrlC)
+            }
+            sigterm_result = sigterm.recv() => match sigterm_result {
+                Some(()) => Ok(ShutdownSignal::SigTerm),
+                None => bail!("SIGTERM signal stream unexpectedly closed"),
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(ShutdownSignal::CtrlC)
+    }
+}
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // Pre-flight: check if port is already in use by another zeroclaw daemon
@@ -106,19 +156,40 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
-    println!("   Ctrl+C to stop");
+    println!("   {}", shutdown_hint());
 
-    tokio::signal::ctrl_c().await?;
-    crate::health::mark_component_error("daemon", "shutdown requested");
+    let signal = wait_for_shutdown_signal().await?;
+    crate::health::mark_component_error("daemon", shutdown_reason(signal));
+    let aborted =
+        shutdown_handles_with_grace(handles, Duration::from_secs(SHUTDOWN_GRACE_SECONDS)).await;
+    if aborted > 0 {
+        tracing::warn!(
+            aborted,
+            grace_seconds = SHUTDOWN_GRACE_SECONDS,
+            "Forced shutdown for daemon tasks that exceeded graceful drain window"
+        );
+    }
 
+    Ok(())
+}
+
+async fn shutdown_handles_with_grace(handles: Vec<JoinHandle<()>>, grace: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + grace;
+    while !handles.iter().all(JoinHandle::is_finished) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut aborted = 0usize;
     for handle in &handles {
-        handle.abort();
+        if !handle.is_finished() {
+            handle.abort();
+            aborted += 1;
+        }
     }
     for handle in handles {
         let _ = handle.await;
     }
-
-    Ok(())
+    aborted
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -200,15 +271,40 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let delivery = heartbeat_delivery_target(&config)?;
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
+    let dedupe_window = Duration::from_secs(u64::from(config.heartbeat.dedupe_window_minutes) * 60);
+    let mut recently_executed_tasks: HashMap<String, Instant> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
     loop {
         interval.tick().await;
 
         let file_tasks = engine.collect_tasks().await?;
-        let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
+        let candidate_tasks =
+            heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
+        let candidate_count = candidate_tasks.len();
+        let tasks = apply_heartbeat_runtime_policy(
+            candidate_tasks,
+            config.heartbeat.max_tasks_per_tick,
+            dedupe_window,
+            &mut recently_executed_tasks,
+            Instant::now(),
+        );
         if tasks.is_empty() {
+            if candidate_count > 0 {
+                tracing::debug!(
+                    "Heartbeat runtime policy skipped all candidate tasks (dedupe/cap active)"
+                );
+            }
             continue;
+        }
+        if tasks.len() < candidate_count {
+            tracing::info!(
+                selected = tasks.len(),
+                candidates = candidate_count,
+                max_tasks_per_tick = config.heartbeat.max_tasks_per_tick,
+                dedupe_window_minutes = config.heartbeat.dedupe_window_minutes,
+                "Heartbeat runtime policy filtered candidate tasks"
+            );
         }
 
         for task in tasks {
@@ -292,6 +388,53 @@ fn heartbeat_tasks_for_tick(
         .filter(|message| !message.is_empty())
         .map(|message| vec![message.to_string()])
         .unwrap_or_default()
+}
+
+fn apply_heartbeat_runtime_policy(
+    tasks: Vec<String>,
+    max_tasks_per_tick: usize,
+    dedupe_window: Duration,
+    recently_executed_tasks: &mut HashMap<String, Instant>,
+    now: Instant,
+) -> Vec<String> {
+    if max_tasks_per_tick == 0 {
+        return Vec::new();
+    }
+
+    if dedupe_window.is_zero() {
+        return tasks.into_iter().take(max_tasks_per_tick).collect();
+    }
+
+    recently_executed_tasks.retain(|_, seen_at| {
+        now.checked_duration_since(*seen_at)
+            .unwrap_or_default()
+            .lt(&dedupe_window)
+    });
+
+    let mut selected = Vec::new();
+    for task in tasks {
+        let dedupe_key = task.trim().to_ascii_lowercase();
+        if dedupe_key.is_empty() {
+            continue;
+        }
+        let seen_recently = recently_executed_tasks
+            .get(&dedupe_key)
+            .is_some_and(|seen_at| {
+                now.checked_duration_since(*seen_at)
+                    .unwrap_or_default()
+                    .lt(&dedupe_window)
+            });
+        if seen_recently {
+            continue;
+        }
+
+        recently_executed_tasks.insert(dedupe_key, now);
+        selected.push(task);
+        if selected.len() >= max_tasks_per_tick {
+            break;
+        }
+    }
+    selected
 }
 
 fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>> {
@@ -444,6 +587,54 @@ mod tests {
         assert_eq!(path, tmp.path().join("daemon_state.json"));
     }
 
+    #[test]
+    fn shutdown_reason_for_ctrl_c_mentions_sigint() {
+        assert_eq!(
+            shutdown_reason(ShutdownSignal::CtrlC),
+            "shutdown requested (SIGINT)"
+        );
+    }
+
+    #[test]
+    fn shutdown_reason_for_sigterm_mentions_sigterm() {
+        assert_eq!(
+            shutdown_reason(ShutdownSignal::SigTerm),
+            "shutdown requested (SIGTERM)"
+        );
+    }
+
+    #[test]
+    fn shutdown_hint_matches_platform_signal_support() {
+        #[cfg(unix)]
+        assert_eq!(shutdown_hint(), "Ctrl+C or SIGTERM to stop");
+
+        #[cfg(not(unix))]
+        assert_eq!(shutdown_hint(), "Ctrl+C to stop");
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_completed_handles_without_abort() {
+        let finished = tokio::spawn(async {});
+        let aborted = shutdown_handles_with_grace(vec![finished], Duration::from_millis(20)).await;
+        assert_eq!(aborted, 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_aborts_stuck_handles_after_timeout() {
+        let never_finishes = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let started = tokio::time::Instant::now();
+        let aborted =
+            shutdown_handles_with_grace(vec![never_finishes], Duration::from_millis(20)).await;
+
+        assert_eq!(aborted, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown should not block indefinitely"
+        );
+    }
+
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
         let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
@@ -574,6 +765,69 @@ mod tests {
     fn heartbeat_tasks_ignore_empty_fallback_message() {
         let tasks = heartbeat_tasks_for_tick(vec![], Some("   "));
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_runtime_policy_limits_tasks_per_tick() {
+        let now = Instant::now();
+        let mut recent = HashMap::new();
+        let tasks = apply_heartbeat_runtime_policy(
+            vec![
+                "task-a".to_string(),
+                "task-b".to_string(),
+                "task-c".to_string(),
+            ],
+            2,
+            Duration::ZERO,
+            &mut recent,
+            now,
+        );
+        assert_eq!(tasks, vec!["task-a".to_string(), "task-b".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_runtime_policy_dedupes_recent_tasks_case_insensitive() {
+        let now = Instant::now();
+        let mut recent = HashMap::new();
+        let window = Duration::from_secs(300);
+
+        let first = apply_heartbeat_runtime_policy(
+            vec!["Task-A".to_string(), "Task-B".to_string()],
+            5,
+            window,
+            &mut recent,
+            now,
+        );
+        assert_eq!(first.len(), 2);
+
+        let second = apply_heartbeat_runtime_policy(
+            vec!["task-a".to_string(), "task-c".to_string()],
+            5,
+            window,
+            &mut recent,
+            now + Duration::from_secs(60),
+        );
+        assert_eq!(second, vec!["task-c".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_runtime_policy_allows_task_after_dedupe_window() {
+        let now = Instant::now();
+        let mut recent = HashMap::new();
+        let window = Duration::from_secs(60);
+
+        let first =
+            apply_heartbeat_runtime_policy(vec!["task-a".to_string()], 5, window, &mut recent, now);
+        assert_eq!(first, vec!["task-a".to_string()]);
+
+        let second = apply_heartbeat_runtime_policy(
+            vec!["task-a".to_string()],
+            5,
+            window,
+            &mut recent,
+            now + Duration::from_secs(61),
+        );
+        assert_eq!(second, vec!["task-a".to_string()]);
     }
 
     #[test]

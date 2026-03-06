@@ -76,6 +76,22 @@ credential is not reused for fallback providers.
 - This provider spawns a subprocess per request and is best suited for batch/script usage rather than high-throughput inference.
 - **Limitations**: Only the system prompt (if any) and the last user message are forwarded per request. Full multi-turn conversation history is not preserved because the headless CLI accepts a single prompt per invocation. Temperature control is not supported; non-default values return an explicit error.
 
+### LM Studio Notes
+
+- Provider ID: `lmstudio` (alias: `lm-studio`)
+- Default local endpoint: `http://localhost:1234/v1`
+- Override endpoint with `api_url` for remote server mode:
+
+```toml
+default_provider = "lmstudio"
+api_url = "http://10.0.0.20:1234/v1"
+default_model = "qwen2.5-coder:7b"
+```
+
+- Authentication:
+  - Optional. If your LM Studio server enforces auth, set `api_key` (or `API_KEY`/`ZEROCLAW_API_KEY`).
+  - If no key is set, ZeroClaw uses an internal placeholder token for compatibility with OpenAI-style auth headers.
+
 ### Vercel AI Gateway Notes
 
 - Provider ID: `vercel` (alias: `vercel-ai`)

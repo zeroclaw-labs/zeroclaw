@@ -243,7 +243,6 @@ mod tests {
     use crate::config::PluginsConfig;
     use crate::plugins::manifest::PluginManifest;
     use crate::plugins::traits::{Plugin, PluginApi};
-    use async_trait::async_trait;
 
     struct OkPlugin {
         manifest: PluginManifest,

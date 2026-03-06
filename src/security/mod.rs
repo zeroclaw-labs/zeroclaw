@@ -21,6 +21,7 @@
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod canary_guard;
 pub mod detect;
 pub mod docker;
 pub mod file_link_guard;
@@ -40,12 +41,14 @@ pub mod policy;
 pub mod prompt_guard;
 pub mod roles;
 pub mod secrets;
+pub mod semantic_guard;
 pub mod sensitive_paths;
 pub mod syscall_anomaly;
 pub mod traits;
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
+pub use canary_guard::CanaryGuard;
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
@@ -62,6 +65,8 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use roles::{RoleRegistry, ToolAccess};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
+#[allow(unused_imports)]
+pub use semantic_guard::{GuardCorpusUpdateReport, SemanticGuard, SemanticGuardStartupStatus};
 #[allow(unused_imports)]
 pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};
 #[allow(unused_imports)]

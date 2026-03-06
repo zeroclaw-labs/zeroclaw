@@ -1,4 +1,4 @@
-use crate::memory::{self, decay, Memory, MemoryCategory};
+use crate::memory::{self, decay, retrieval, Memory, MemoryCategory};
 use std::fmt::Write;
 
 /// Default half-life (days) for time decay in context building.
@@ -16,6 +16,7 @@ const CONTEXT_ENTRY_LIMIT: usize = 5;
 const RECALL_OVER_FETCH_FACTOR: usize = 2;
 
 /// Build context preamble by searching memory for relevant entries.
+/// Uses enhanced retrieval (multi-query + Core boosting) for better coverage.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 ///
@@ -34,7 +35,13 @@ pub(super) async fn build_context(
 
     // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
     let fetch_limit = CONTEXT_ENTRY_LIMIT * RECALL_OVER_FETCH_FACTOR;
-    if let Ok(mut entries) = mem.recall(user_msg, fetch_limit, session_id).await {
+    if let Ok(mut entries) =
+        retrieval::enhanced_recall(mem, user_msg, fetch_limit, session_id).await
+    {
+        if entries.is_empty() {
+            return context;
+        }
+
         // Apply time decay: older non-Core memories score lower.
         decay::apply_time_decay(&mut entries, CONTEXT_DECAY_HALF_LIFE_DAYS);
 

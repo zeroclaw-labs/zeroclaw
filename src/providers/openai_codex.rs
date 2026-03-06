@@ -74,6 +74,25 @@ impl std::fmt::Display for WebsocketRequestError {
 
 impl std::error::Error for WebsocketRequestError {}
 
+fn websocket_idle_timeout_error(has_partial_output: bool) -> WebsocketRequestError {
+    if has_partial_output {
+        WebsocketRequestError::stream(anyhow::anyhow!(
+            "No response from OpenAI Codex websocket stream before timeout"
+        ))
+    } else {
+        WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+            "OpenAI Codex websocket stream timed out after {}s waiting for events",
+            CODEX_WS_READ_TIMEOUT.as_secs()
+        ))
+    }
+}
+
+fn websocket_no_response_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "No response from OpenAI Codex websocket stream"
+    ))
+}
+
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
@@ -795,10 +814,7 @@ impl OpenAiCodexProvider {
                         timed_out = true;
                         break;
                     }
-                    return Err(WebsocketRequestError::stream(anyhow::anyhow!(
-                        "OpenAI Codex websocket stream timed out after {}s waiting for events",
-                        CODEX_WS_READ_TIMEOUT.as_secs()
-                    )));
+                    return Err(websocket_idle_timeout_error(false));
                 }
             };
 
@@ -881,14 +897,10 @@ impl OpenAiCodexProvider {
             return Ok(text);
         }
         if timed_out {
-            return Err(WebsocketRequestError::stream(anyhow::anyhow!(
-                "No response from OpenAI Codex websocket stream before timeout"
-            )));
+            return Err(websocket_idle_timeout_error(true));
         }
 
-        Err(WebsocketRequestError::stream(anyhow::anyhow!(
-            "No response from OpenAI Codex websocket stream"
-        )))
+        Err(websocket_no_response_error())
     }
 
     async fn send_responses_sse_request(
@@ -1601,6 +1613,7 @@ data: [DONE]
             reasoning_enabled: None,
             reasoning_level: None,
             custom_provider_api_mode: None,
+            custom_provider_auth_header: None,
             max_tokens_override: None,
             model_support_vision: None,
         };
@@ -1610,5 +1623,45 @@ data: [DONE]
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn websocket_idle_timeout_without_partial_output_is_transport_unavailable() {
+        let error = websocket_idle_timeout_error(false);
+        assert!(matches!(
+            error,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("timed out after 60s waiting for events"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn websocket_idle_timeout_with_partial_output_is_stream_error() {
+        let error = websocket_idle_timeout_error(true);
+        assert!(matches!(error, WebsocketRequestError::Stream(_)));
+        assert!(
+            error.to_string().contains("before timeout"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn websocket_no_response_maps_to_transport_unavailable() {
+        let error = websocket_no_response_error();
+        assert!(matches!(
+            error,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("No response from OpenAI Codex websocket stream"),
+            "unexpected error message: {error}"
+        );
     }
 }

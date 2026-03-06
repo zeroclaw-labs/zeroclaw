@@ -82,7 +82,12 @@ fi
 ensure_bash
 
 if [ "$#" -eq 0 ]; then
-  exec bash "$BOOTSTRAP_SCRIPT" --guided
+  if [ -t 0 ] && [ -t 1 ]; then
+    # Default one-click interactive path: guided install + full-screen TUI onboarding.
+    exec bash "$BOOTSTRAP_SCRIPT" --guided --interactive-onboard
+  fi
+  # Non-interactive no-arg path remains install-only.
+  exec bash "$BOOTSTRAP_SCRIPT"
 fi
 
 exec bash "$BOOTSTRAP_SCRIPT" "$@"

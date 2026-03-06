@@ -1,5 +1,7 @@
 name: Feature Matrix
 
+# Non-default feature lanes moved to nightly/weekly only per CI/CD optimization PRD.
+# PR path only runs default lane via ci:full/ci:feature-matrix labels.
 on:
     push:
         branches: [dev]
@@ -51,7 +53,7 @@ env:
 jobs:
     resolve-profile:
         name: Resolve Matrix Profile
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: ubuntu-latest
         outputs:
             profile: ${{ steps.resolve.outputs.profile }}
             lane_job_prefix: ${{ steps.resolve.outputs.lane_job_prefix }}
@@ -127,41 +129,55 @@ jobs:
             github.event_name != 'pull_request' ||
             contains(github.event.pull_request.labels.*.name, 'ci:full') ||
             contains(github.event.pull_request.labels.*.name, 'ci:feature-matrix')
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: blacksmith-8vcpu-ubuntu-2404
         timeout-minutes: ${{ fromJSON(needs.resolve-profile.outputs.lane_timeout_minutes) }}
         strategy:
             fail-fast: false
             matrix:
                 include:
+                    # Default lane: always runs (PR compile + nightly)
                     - name: default
                       compile_command: cargo check --locked
                       nightly_command: cargo test --locked --test agent_e2e --verbose
                       install_libudev: false
+                      nightly_only: false
+                    # Non-default lanes: nightly/weekly/dispatch only (skipped on PR compile profile)
                     - name: whatsapp-web
                       compile_command: cargo check --locked --no-default-features --features whatsapp-web
                       nightly_command: cargo check --locked --no-default-features --features whatsapp-web --verbose
                       install_libudev: false
+                      nightly_only: true
                     - name: browser-native
                       compile_command: cargo check --locked --no-default-features --features browser-native
                       nightly_command: cargo check --locked --no-default-features --features browser-native --verbose
                       install_libudev: false
+                      nightly_only: true
                     - name: nightly-all-features
                       compile_command: cargo check --locked --all-features
                       nightly_command: cargo test --locked --all-features --test agent_e2e --verbose
                       install_libudev: true
+                      nightly_only: true
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+            - name: Ensure cargo component
+              shell: bash
+              env:
+                  ENSURE_CARGO_COMPONENT_STRICT: "true"
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
 
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              if: "!matrix.nightly_only || needs.resolve-profile.outputs.profile == 'nightly'"
               with:
-                  prefix-key: feature-matrix-${{ matrix.name }}
+                  prefix-key: zeroclaw-ci-v1
+                  shared-key: ${{ runner.os }}-rust
+                  cache-targets: true
 
             - name: Ensure Linux deps for all-features lane
-              if: matrix.install_libudev
+              if: matrix.install_libudev && (!matrix.nightly_only || needs.resolve-profile.outputs.profile == 'nightly')
               shell: bash
               run: |
                   set -euo pipefail
@@ -186,7 +202,12 @@ jobs:
                     sleep 10
                   done
 
+            - name: Skip non-default lane on compile profile
+              if: matrix.nightly_only && needs.resolve-profile.outputs.profile != 'nightly'
+              run: echo "Skipping non-default lane '${{ matrix.name }}' on compile profile."
+
             - name: Run matrix lane command
+              if: "!matrix.nightly_only || needs.resolve-profile.outputs.profile == 'nightly'"
               id: lane
               shell: bash
               run: |
@@ -253,7 +274,7 @@ jobs:
                   echo "lane_exit_code=${status}" >> "$GITHUB_OUTPUT"
 
             - name: Upload lane report
-              if: always()
+              if: always() && steps.lane.outcome != 'skipped'
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
                   name: ${{ needs.resolve-profile.outputs.lane_artifact_prefix }}-${{ matrix.name }}
@@ -262,7 +283,7 @@ jobs:
                   retention-days: ${{ fromJSON(needs.resolve-profile.outputs.lane_retention_days) }}
 
             - name: Enforce lane success
-              if: steps.lane.outputs.lane_status != 'success'
+              if: steps.lane.outcome == 'success' && steps.lane.outputs.lane_status != 'success'
               shell: bash
               run: |
                   set -euo pipefail
@@ -278,7 +299,7 @@ jobs:
         name: ${{ needs.resolve-profile.outputs.summary_job_name }}
         needs: [resolve-profile, feature-check]
         if: always()
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

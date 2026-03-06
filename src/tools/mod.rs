@@ -201,6 +201,90 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrimaryAgentToolFilterReport {
+    /// `agent.allowed_tools` entries that did not match any registered tool name.
+    pub unmatched_allowed_tools: Vec<String>,
+    /// Number of tools kept after applying `agent.allowed_tools` and before denylist removal.
+    pub allowlist_match_count: usize,
+}
+
+fn matches_tool_rule(rule: &str, tool_name: &str) -> bool {
+    rule == "*" || rule.eq_ignore_ascii_case(tool_name)
+}
+
+/// Filter the primary-agent tool registry based on `[agent]` allow/deny settings.
+///
+/// Filtering is done at startup so excluded tools never enter model context.
+pub fn filter_primary_agent_tools(
+    tools: Vec<Box<dyn Tool>>,
+    allowed_tools: &[String],
+    denied_tools: &[String],
+) -> (Vec<Box<dyn Tool>>, PrimaryAgentToolFilterReport) {
+    let normalized_allowed: Vec<String> = allowed_tools
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let normalized_denied: Vec<String> = denied_tools
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let use_allowlist = !normalized_allowed.is_empty();
+    let tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
+
+    let unmatched_allowed_tools = if use_allowlist {
+        normalized_allowed
+            .iter()
+            .filter(|allowed| {
+                !tool_names
+                    .iter()
+                    .any(|tool_name| matches_tool_rule(allowed.as_str(), tool_name))
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut allowlist_match_count = 0usize;
+    let mut filtered = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let tool_name = tool.name();
+
+        if use_allowlist
+            && !normalized_allowed
+                .iter()
+                .any(|rule| matches_tool_rule(rule.as_str(), tool_name))
+        {
+            continue;
+        }
+        if use_allowlist {
+            allowlist_match_count += 1;
+        }
+
+        if normalized_denied
+            .iter()
+            .any(|rule| matches_tool_rule(rule.as_str(), tool_name))
+        {
+            continue;
+        }
+        filtered.push(tool);
+    }
+
+    (
+        filtered,
+        PrimaryAgentToolFilterReport {
+            unmatched_allowed_tools,
+            allowlist_match_count,
+        },
+    )
+}
+
 /// Add background tool execution capabilities to a tool registry
 pub fn add_bg_tools(tools: Vec<Box<dyn Tool>>) -> (Vec<Box<dyn Tool>>, BgJobStore) {
     let bg_job_store = BgJobStore::new();
@@ -560,6 +644,7 @@ pub fn all_tools_with_runtime(
             custom_provider_api_mode: root_config
                 .provider_api
                 .map(|mode| mode.as_compatible_mode()),
+            custom_provider_auth_header: root_config.effective_custom_provider_auth_header(),
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };
@@ -709,6 +794,7 @@ mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig, WasmRuntimeConfig};
     use crate::runtime::WasmRuntime;
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -717,6 +803,96 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         }
+    }
+
+    struct DummyTool {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "dummy"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn sample_tools() -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(DummyTool { name: "shell" }),
+            Box::new(DummyTool { name: "file_read" }),
+            Box::new(DummyTool {
+                name: "browser_open",
+            }),
+        ]
+    }
+
+    fn names(tools: &[Box<dyn Tool>]) -> Vec<String> {
+        tools.iter().map(|tool| tool.name().to_string()).collect()
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_keeps_full_registry_when_allowlist_empty() {
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &[], &[]);
+        assert_eq!(names(&filtered), vec!["shell", "file_read", "browser_open"]);
+        assert_eq!(report.allowlist_match_count, 0);
+        assert!(report.unmatched_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_applies_allowlist() {
+        let allow = vec!["file_read".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &[]);
+        assert_eq!(names(&filtered), vec!["file_read"]);
+        assert_eq!(report.allowlist_match_count, 1);
+        assert!(report.unmatched_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_reports_unmatched_allow_entries() {
+        let allow = vec!["missing_tool".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &[]);
+        assert!(filtered.is_empty());
+        assert_eq!(report.allowlist_match_count, 0);
+        assert_eq!(report.unmatched_allowed_tools, vec!["missing_tool"]);
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_applies_denylist_after_allowlist() {
+        let allow = vec!["shell".to_string(), "file_read".to_string()];
+        let deny = vec!["shell".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &deny);
+        assert_eq!(names(&filtered), vec!["file_read"]);
+        assert_eq!(report.allowlist_match_count, 2);
+        assert!(report.unmatched_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn filter_primary_agent_tools_supports_star_rule() {
+        let allow = vec!["*".to_string()];
+        let deny = vec!["browser_open".to_string()];
+        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &deny);
+        assert_eq!(names(&filtered), vec!["shell", "file_read"]);
+        assert_eq!(report.allowlist_match_count, 3);
+        assert!(report.unmatched_allowed_tools.is_empty());
     }
 
     #[test]

@@ -26,6 +26,40 @@
     clippy::uninlined_format_args,
     clippy::unused_self,
     clippy::cast_precision_loss,
+    clippy::assertions_on_constants,
+    clippy::await_holding_lock,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::default_trait_access,
+    clippy::doc_lazy_continuation,
+    clippy::explicit_iter_loop,
+    clippy::fn_params_excessive_bools,
+    clippy::format_push_string,
+    clippy::if_not_else,
+    clippy::large_enum_variant,
+    clippy::large_futures,
+    clippy::manual_clamp,
+    clippy::manual_contains,
+    clippy::manual_is_multiple_of,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::missing_fields_in_debug,
+    clippy::needless_borrow,
+    clippy::needless_lifetimes,
+    clippy::redundant_else,
+    clippy::semicolon_if_nothing_returned,
+    clippy::should_implement_trait,
+    clippy::stable_sort_primitive,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::unchecked_time_subtraction,
+    clippy::unnecessary_debug_formatting,
+    clippy::unnested_or_patterns,
+    clippy::unreadable_literal,
+    clippy::unused_async,
+    clippy::wildcard_imports,
     clippy::unnecessary_cast,
     clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_literal_bound,
@@ -57,6 +91,54 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
         return Err("temperature must be between 0.0 and 2.0".to_string());
     }
     Ok(t)
+}
+
+fn dashboard_open_url(host: &str, port: u16) -> String {
+    let bind_host = host.trim();
+    let browser_host = match bind_host {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        _ => bind_host,
+    };
+    format!("http://{browser_host}:{port}/")
+}
+
+async fn open_url_in_default_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+        bail!("automatic dashboard open is unsupported on this platform");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let status = command.status().await?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("browser launcher exited with status {status}");
+        }
+    }
 }
 
 mod agent;
@@ -91,6 +173,8 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+#[cfg(test)]
+mod test_locks;
 mod tools;
 mod tunnel;
 mod update;
@@ -152,6 +236,10 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
 
+        /// Run the full-screen TUI onboarding flow (ratatui)
+        #[arg(long)]
+        interactive_ui: bool,
+
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -160,7 +248,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive)
+        /// API key (used in quick mode, ignored with --interactive or --interactive-ui)
         #[arg(long)]
         api_key: Option<String>,
 
@@ -263,6 +351,7 @@ Examples:
   zeroclaw gateway                  # use config defaults
   zeroclaw gateway -p 8080          # listen on port 8080
   zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
+  zeroclaw gateway --open-dashboard # open web dashboard automatically
   zeroclaw gateway -p 0             # random available port
   zeroclaw gateway --new-pairing    # clear tokens and generate fresh pairing code")]
     Gateway {
@@ -277,6 +366,10 @@ Examples:
         /// Clear all paired tokens and generate a fresh pairing code
         #[arg(long)]
         new_pairing: bool,
+
+        /// Open the web dashboard URL in the default browser on startup
+        #[arg(long)]
+        open_dashboard: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -379,6 +472,22 @@ Examples:
         tools: Vec<String>,
     },
 
+    /// Manage security maintenance tasks
+    #[command(long_about = "\
+Manage security maintenance tasks.
+
+Commands in this group maintain security-related data stores used at runtime.
+
+Examples:
+  zeroclaw security update-guard-corpus
+  zeroclaw security update-guard-corpus --source builtin
+  zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl
+  zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>")]
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
+    },
+
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
 Configure and manage scheduled tasks.
@@ -437,13 +546,14 @@ Examples:
         #[arg(long, value_enum, default_value_t = QuotaFormat::Text)]
         format: QuotaFormat,
     },
-    /// Manage channels (telegram, discord, slack, github)
+    /// Manage channels (telegram, discord, slack, qq, napcat, and more)
     #[command(long_about = "\
 Manage communication channels.
 
 Add, remove, list, and health-check channels that connect ZeroClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
-slack, whatsapp, github, matrix, imessage, email.
+slack, mattermost, whatsapp, matrix, signal, qq, napcat, \
+lark, feishu, dingtalk, github, nextcloud, irc, imessage, email.
 
 Examples:
   zeroclaw channel list
@@ -607,6 +717,19 @@ enum EstopSubcommands {
         /// OTP code. If omitted and OTP is required, a prompt is shown.
         #[arg(long)]
         otp: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Upsert semantic prompt-injection corpus records into the configured vector collection
+    UpdateGuardCorpus {
+        /// Corpus source: `builtin`, filesystem path, or HTTP(S) URL
+        #[arg(long)]
+        source: Option<String>,
+        /// Expected SHA-256 checksum (hex) for source payload verification
+        #[arg(long)]
+        checksum: Option<String>,
     },
 }
 
@@ -829,12 +952,14 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
+    // Onboard runs quick setup by default, interactive wizard with --interactive,
+    // or full-screen TUI with --interactive-ui.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
         interactive,
+        interactive_ui,
         force,
         channels_only,
         api_key,
@@ -848,6 +973,7 @@ async fn main() -> Result<()> {
     } = &cli.command
     {
         let interactive = *interactive;
+        let interactive_ui = *interactive_ui;
         let force = *force;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
@@ -861,8 +987,25 @@ async fn main() -> Result<()> {
         let openclaw_migration_enabled =
             migrate_openclaw || openclaw_source.is_some() || openclaw_config.is_some();
 
+        if interactive && interactive_ui {
+            bail!("Use either --interactive or --interactive-ui, not both");
+        }
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
+        }
+        if interactive_ui && channels_only {
+            bail!("Use either --interactive-ui or --channels-only, not both");
+        }
+        if interactive_ui
+            && (api_key.is_some()
+                || provider.is_some()
+                || model.is_some()
+                || memory.is_some()
+                || no_totp)
+        {
+            bail!(
+                "--interactive-ui does not accept --api-key, --provider, --model, --memory, or --no-totp"
+            );
         }
         if channels_only
             && (api_key.is_some()
@@ -883,6 +1026,16 @@ async fn main() -> Result<()> {
         }
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if interactive_ui {
+            Box::pin(onboard::run_wizard_tui_with_migration(
+                force,
+                onboard::OpenClawOnboardMigrationOptions {
+                    enabled: openclaw_migration_enabled,
+                    source_workspace: openclaw_source,
+                    source_config: openclaw_config,
+                },
+            ))
+            .await
         } else if interactive {
             Box::pin(onboard::run_wizard_with_migration(
                 force,
@@ -990,6 +1143,7 @@ async fn main() -> Result<()> {
             port,
             host,
             new_pairing,
+            open_dashboard,
         } => {
             if new_pairing {
                 // Persist token reset from raw config so env-derived overrides are not written to disk.
@@ -1005,6 +1159,25 @@ async fn main() -> Result<()> {
                 info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
             } else {
                 info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+            }
+            if open_dashboard {
+                if port == 0 {
+                    warn!(
+                        "--open-dashboard requires a fixed port; skipping auto-open because --port 0 uses a random port"
+                    );
+                } else {
+                    let dashboard_url = dashboard_open_url(&host, port);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                        if let Err(err) = open_url_in_default_browser(&dashboard_url).await {
+                            warn!(
+                                "Could not open dashboard automatically ({err}). Open manually: {dashboard_url}"
+                            );
+                        } else {
+                            info!("🌐 Opened dashboard in browser: {dashboard_url}");
+                        }
+                    });
+                }
             }
             gateway::run_gateway(&host, port, config).await
         }
@@ -1134,6 +1307,10 @@ async fn main() -> Result<()> {
             domains,
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
+
+        Commands::Security { security_command } => {
+            handle_security_command(&config, security_command).await
+        }
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
@@ -1586,6 +1763,30 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
 
     writer.flush()?;
     Ok(())
+}
+
+async fn handle_security_command(
+    config: &Config,
+    security_command: SecurityCommands,
+) -> Result<()> {
+    match security_command {
+        SecurityCommands::UpdateGuardCorpus { source, checksum } => {
+            let report = security::semantic_guard::update_guard_corpus(
+                config,
+                source.as_deref(),
+                checksum.as_deref(),
+            )
+            .await?;
+
+            println!("Semantic guard corpus update completed.");
+            println!("  Source:           {}", report.source);
+            println!("  SHA-256:          {}", report.sha256);
+            println!("  Parsed records:   {}", report.parsed_records);
+            println!("  Upserted records: {}", report.upserted_records);
+            println!("  Collection:       {}", report.collection);
+            Ok(())
+        }
+    }
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────
@@ -2407,6 +2608,24 @@ mod tests {
     }
 
     #[test]
+    fn gateway_help_includes_open_dashboard_flag() {
+        let cmd = Cli::command();
+        let gateway = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "gateway")
+            .expect("gateway subcommand must exist");
+
+        let has_open_dashboard_flag = gateway.get_arguments().any(|arg| {
+            arg.get_id().as_str() == "open_dashboard" && arg.get_long() == Some("open-dashboard")
+        });
+
+        assert!(
+            has_open_dashboard_flag,
+            "gateway help should include --open-dashboard"
+        );
+    }
+
+    #[test]
     fn gateway_cli_accepts_new_pairing_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--new-pairing"])
             .expect("gateway --new-pairing should parse");
@@ -2418,13 +2637,45 @@ mod tests {
     }
 
     #[test]
-    fn gateway_cli_defaults_new_pairing_to_false() {
+    fn gateway_cli_accepts_open_dashboard_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--open-dashboard"])
+            .expect("gateway --open-dashboard should parse");
+
+        match cli.command {
+            Commands::Gateway { open_dashboard, .. } => assert!(open_dashboard),
+            other => panic!("expected gateway command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_cli_defaults_flags_to_false() {
         let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
 
         match cli.command {
-            Commands::Gateway { new_pairing, .. } => assert!(!new_pairing),
+            Commands::Gateway {
+                new_pairing,
+                open_dashboard,
+                ..
+            } => {
+                assert!(!new_pairing);
+                assert!(!open_dashboard);
+            }
             other => panic!("expected gateway command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dashboard_open_url_prefers_loopback_for_wildcard_bind_hosts() {
+        assert_eq!(
+            dashboard_open_url("0.0.0.0", 42617),
+            "http://127.0.0.1:42617/"
+        );
+        assert_eq!(dashboard_open_url("::", 42617), "http://127.0.0.1:42617/");
+        assert_eq!(dashboard_open_url("[::]", 42617), "http://127.0.0.1:42617/");
+        assert_eq!(
+            dashboard_open_url("127.0.0.1", 42617),
+            "http://127.0.0.1:42617/"
+        );
     }
 
     #[test]
@@ -2446,6 +2697,24 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_interactive_ui_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive-ui"])
+            .expect("onboard --interactive-ui should parse");
+
+        match cli.command {
+            Commands::Onboard {
+                interactive,
+                interactive_ui,
+                ..
+            } => {
+                assert!(!interactive);
+                assert!(interactive_ui);
+            }
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
