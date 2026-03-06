@@ -99,9 +99,9 @@ async-trait = "0.1"
 ring = "0.17"
 
 # Cortex-Memory integration (local path for development, will use crates.io later)
-cortex-mem-tools = { path = "集成cortex-mem源码参考/cortex-mem-tools", optional = true }
-cortex-mem-core = { path = "集成cortex-mem源码参考/cortex-mem-core", optional = true }
-cortex-mem-config = { path = "集成cortex-mem源码参考/cortex-mem-config", optional = true }
+cortex-mem-tools = { version="2.5", optional = true }
+cortex-mem-core = { version="2.5", optional = true }
+cortex-mem-config = { version="2.5", optional = true }
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
