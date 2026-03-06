@@ -84,9 +84,7 @@ impl NextcloudTalkChannel {
     }
 
     fn extract_content_from_as2_object(payload: &serde_json::Value) -> Option<String> {
-        let Some(content_value) = payload.get("object").and_then(|obj| obj.get("content")) else {
-            return None;
-        };
+        let content_value = payload.get("object").and_then(|obj| obj.get("content"))?;
 
         let content = match content_value {
             serde_json::Value::String(raw) => {

@@ -172,12 +172,10 @@ mod tests {
                 } else {
                     Ok(self.primary.clone())
                 }
+            } else if self.fail_keyword {
+                Err(anyhow::anyhow!("keyword recall failed"))
             } else {
-                if self.fail_keyword {
-                    Err(anyhow::anyhow!("keyword recall failed"))
-                } else {
-                    Ok(self.keyword.clone())
-                }
+                Ok(self.keyword.clone())
             }
         }
         async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {

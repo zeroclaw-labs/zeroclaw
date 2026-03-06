@@ -49,11 +49,20 @@ pub fn add_shell_job_with_approval(
 }
 
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+    add_job_approved(config, expression, command, false)
+}
+
+pub fn add_job_approved(
+    config: &Config,
+    expression: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job_with_approval(config, None, schedule, command, approved)
 }
 
 pub fn update_shell_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
@@ -210,9 +219,18 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 }
 
 pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
+    add_once_approved(config, delay, command, false)
+}
+
+pub fn add_once_approved(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at(config, at, command)
+    add_once_at_approved(config, at, command, approved)
 }
 
 pub fn add_once_at(
@@ -220,8 +238,17 @@ pub fn add_once_at(
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
+    add_once_at_approved(config, at, command, false)
+}
+
+pub fn add_once_at_approved(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job_with_approval(config, None, schedule, command, approved)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {

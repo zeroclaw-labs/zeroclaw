@@ -288,9 +288,11 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuditConfig, SyscallAnomalyConfig};
+    use crate::config::AuditConfig;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use crate::security::{
+        AutonomyLevel, SecurityPolicy, SyscallAnomalyConfig, SyscallAnomalyDetector,
+    };
     use tempfile::TempDir;
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {

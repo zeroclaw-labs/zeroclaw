@@ -738,7 +738,7 @@ async fn e2e_live_openai_codex_multi_turn() {
 async fn e2e_live_research_phase() {
     use std::sync::Arc;
     use zeroclaw::agent::research::{run_research_phase, should_trigger};
-    use zeroclaw::config::{ResearchPhaseConfig, ResearchTrigger};
+    use zeroclaw::agent::research::{ResearchPhaseConfig, ResearchTrigger};
     use zeroclaw::observability::NoopObserver;
     use zeroclaw::providers::openai_codex::OpenAiCodexProvider;
     use zeroclaw::tools::{Tool, ToolResult};
@@ -883,7 +883,7 @@ async fn e2e_live_research_phase() {
 /// This test uses mocks to verify the integration without external dependencies.
 #[tokio::test]
 async fn e2e_agent_research_phase_integration() {
-    use zeroclaw::config::{ResearchPhaseConfig, ResearchTrigger};
+    use zeroclaw::agent::research::{ResearchPhaseConfig, ResearchTrigger};
 
     // Create a recording provider to capture what the agent sends
     let (provider, recorded) = RecordingProvider::new(vec![
@@ -933,7 +933,7 @@ async fn e2e_agent_research_phase_integration() {
 /// Validates that Always trigger activates research on every message.
 #[tokio::test]
 async fn e2e_agent_research_always_trigger() {
-    use zeroclaw::config::{ResearchPhaseConfig, ResearchTrigger};
+    use zeroclaw::agent::research::{ResearchPhaseConfig, ResearchTrigger};
 
     let (provider, recorded) = RecordingProvider::new(vec![
         // Research phase response
@@ -979,7 +979,7 @@ async fn e2e_agent_research_always_trigger() {
 /// The provider returns XML tool calls in text, which should be parsed and executed.
 #[tokio::test]
 async fn e2e_agent_research_prompt_guided() {
-    use zeroclaw::config::{ResearchPhaseConfig, ResearchTrigger};
+    use zeroclaw::agent::research::{ResearchPhaseConfig, ResearchTrigger};
     use zeroclaw::providers::traits::ProviderCapabilities;
 
     /// Mock provider that does NOT support native tools (like Gemini).
@@ -1102,7 +1102,7 @@ async fn e2e_agent_research_prompt_guided() {
 /// Validates that disabled research phase skips research entirely.
 #[tokio::test]
 async fn e2e_agent_research_disabled() {
-    use zeroclaw::config::{ResearchPhaseConfig, ResearchTrigger};
+    use zeroclaw::agent::research::{ResearchPhaseConfig, ResearchTrigger};
 
     let (provider, recorded) = RecordingProvider::new(vec![text_response("Direct response")]);
 
