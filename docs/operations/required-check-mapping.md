@@ -9,19 +9,30 @@ This document maps merge-critical workflows to expected check names.
 | `CI Required Gate` | `.github/workflows/ci-run.yml` | core Rust/doc merge gate |
 | `Security Required Gate` | `.github/workflows/sec-audit.yml` | aggregated security merge gate |
 
+### CI Run consolidated job names (referenced by CI Required Gate)
+
+- `Quality Gate (Fmt + Clippy + Workspace + Package Checks)` — replaces `Lint Gate`, `Workspace Check`, `Package Check`
+- `Test + Build` — replaces `Test`, `Build (Smoke)`
+
+### Security audit consolidated job names (referenced by Security Required Gate)
+
+- `Rust Security (Audit + Deny + Regressions)` — replaces `Security Audit`, `License & Supply Chain`, `Security Regression Tests`
+- `Secrets Governance (Gitleaks)` — unchanged
+- `Compliance (SBOM + Unsafe Debt)` — replaces `SBOM Snapshot`, `Unsafe Debt Audit`
+
 Supplemental monitors (non-blocking unless added to branch protection contexts):
 
-- `CI Change Audit` (`.github/workflows/ci-change-audit.yml`)
-- `CodeQL Analysis` (`.github/workflows/sec-codeql.yml`)
+- `CI Change Audit` (`.github/workflows/ci-change-audit.yml`) — push-to-main only (removed from PR path)
+- `CodeQL Analysis` (`.github/workflows/sec-codeql.yml`) — push-to-main + weekly only (removed from PR path)
 - `Workflow Sanity` (`.github/workflows/workflow-sanity.yml`)
 - `Feature Matrix Summary` (`.github/workflows/feature-matrix.yml`)
 
 Feature matrix lane check names (informational, non-required):
 
-- `Matrix Lane (default)`
-- `Matrix Lane (whatsapp-web)`
-- `Matrix Lane (browser-native)`
-- `Matrix Lane (nightly-all-features)`
+- `Matrix Lane (default)` — runs on all profiles
+- `Matrix Lane (whatsapp-web)` — nightly/weekly only
+- `Matrix Lane (browser-native)` — nightly/weekly only
+- `Matrix Lane (nightly-all-features)` — nightly/weekly only
 
 ## Release / Pre-release
 

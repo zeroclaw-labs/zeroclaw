@@ -4,8 +4,8 @@
 // Required environment variables:
 //   RUST_CHANGED      — "true" if Rust files changed
 //   DOCS_CHANGED      — "true" if docs files changed
-//   LINT_RESULT       — result of the lint job
-//   LINT_DELTA_RESULT — result of the strict delta lint job
+//   LINT_RESULT       — result of the quality-gate job (fmt + clippy)
+//   LINT_DELTA_RESULT — result of the quality-gate job (strict delta)
 //   DOCS_RESULT       — result of the docs-quality job
 
 module.exports = async ({ github, context, core }) => {
@@ -23,10 +23,10 @@ module.exports = async ({ github, context, core }) => {
 
   const failures = [];
   if (rustChanged && !["success", "skipped"].includes(lintResult)) {
-    failures.push("`Lint Gate (Format + Clippy)` failed.");
+    failures.push("`Quality Gate (Format + Clippy)` failed.");
   }
   if (rustChanged && !["success", "skipped"].includes(lintDeltaResult)) {
-    failures.push("`Lint Gate (Strict Delta)` failed.");
+    failures.push("`Quality Gate (Strict Delta)` failed.");
   }
   if (docsChanged && !["success", "skipped"].includes(docsResult)) {
     failures.push("`Docs Quality` failed.");
