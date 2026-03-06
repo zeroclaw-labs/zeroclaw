@@ -586,10 +586,34 @@ async fn maybe_run_openclaw_migration(
     options: &OpenClawOnboardMigrationOptions,
     allow_interactive_prompt: bool,
 ) -> Result<()> {
-    let resolved_workspace = resolve_openclaw_workspace(options.source_workspace.clone())?;
-    let resolved_config = resolve_openclaw_config(options.source_config.clone())?;
+    let migration_requested =
+        options.enabled || options.source_workspace.is_some() || options.source_config.is_some();
 
-    let auto_detected = resolved_workspace.exists() || resolved_config.exists();
+    if !migration_requested && !allow_interactive_prompt {
+        return Ok(());
+    }
+
+    let resolved_workspace = match resolve_openclaw_workspace(options.source_workspace.clone()) {
+        Ok(path) => Some(path),
+        Err(error) if options.source_workspace.is_none() => {
+            tracing::debug!("Skipping OpenClaw workspace auto-detection: {error}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let resolved_config = match resolve_openclaw_config(options.source_config.clone()) {
+        Ok(path) => Some(path),
+        Err(error) if options.source_config.is_none() => {
+            tracing::debug!("Skipping OpenClaw config auto-detection: {error}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+
+    let auto_detected = resolved_workspace
+        .as_ref()
+        .is_some_and(|path| path.exists())
+        || resolved_config.as_ref().is_some_and(|path| path.exists());
     let should_run = if options.enabled {
         true
     } else if allow_interactive_prompt && auto_detected {
@@ -620,16 +644,10 @@ async fn maybe_run_openclaw_migration(
     let report = migrate_openclaw(
         config,
         OpenClawMigrationOptions {
-            source_workspace: if options.source_workspace.is_some() || resolved_workspace.exists() {
-                Some(resolved_workspace.clone())
-            } else {
-                None
-            },
-            source_config: if options.source_config.is_some() || resolved_config.exists() {
-                Some(resolved_config.clone())
-            } else {
-                None
-            },
+            source_workspace: resolved_workspace
+                .filter(|path| options.source_workspace.is_some() || path.exists()),
+            source_config: resolved_config
+                .filter(|path| options.source_config.is_some() || path.exists()),
             include_memory: true,
             include_config: true,
             dry_run: false,
@@ -815,7 +833,7 @@ async fn run_quick_setup_with_home(
     }
 
     config.save().await?;
-    persist_workspace_selection(&config.config_path).await?;
+    persist_workspace_selection_with_default_root(&config.config_path, Some(&zeroclaw_dir)).await?;
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -2538,14 +2556,35 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
 }
 
 async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
+    let default_root = std::env::var("ZEROCLAW_CONFIG_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    persist_workspace_selection_with_default_root(config_path, default_root.as_deref()).await
+}
+
+async fn persist_workspace_selection_with_default_root(
+    config_path: &Path,
+    default_root: Option<&Path>,
+) -> Result<()> {
     let config_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    if let Err(error) = crate::config::schema::persist_active_workspace_config_dir(config_dir).await
-    {
+    let result = if let Some(default_root) = default_root {
+        crate::config::schema::persist_active_workspace_config_dir_with_default_root(
+            config_dir,
+            default_root,
+        )
+        .await
+    } else {
+        crate::config::schema::persist_active_workspace_config_dir(config_dir).await
+    };
+
+    if let Err(error) = result {
         tracing::warn!(
-            config_dir = %config_dir.display(),
-            "Could not persist active workspace marker; continuing without marker: {error}"
+            "Failed to persist active workspace selection for {}: {error}",
+            config_dir.display()
         );
     }
     Ok(())
@@ -7016,15 +7055,9 @@ fn print_summary(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::home_env_lock_for_tests;
     use serde_json::json;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -7064,7 +7097,7 @@ mod tests {
         no_totp: bool,
         home: &Path,
     ) -> Result<Config> {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
@@ -7291,7 +7324,7 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_respects_zero_claw_workspace_env_layout() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let tmp = TempDir::new().unwrap();
         let workspace_root = tmp.path().join("zeroclaw-data");
         let workspace_dir = workspace_root.join("workspace");
@@ -7317,6 +7350,87 @@ mod tests {
 
         assert_eq!(config.workspace_dir, workspace_dir);
         assert_eq!(config.config_path, expected_config_path);
+    }
+
+    #[tokio::test]
+    async fn quick_setup_avoids_writing_workspace_marker_to_ambient_home() {
+        let _env_guard = home_env_lock_for_tests().lock().await;
+        let selected_home = TempDir::new().unwrap();
+        let ambient_home = TempDir::new().unwrap();
+
+        let custom_workspace = selected_home
+            .path()
+            .join("profiles")
+            .join("alpha")
+            .join("workspace");
+        let expected_config_dir = selected_home
+            .path()
+            .join("profiles")
+            .join("alpha")
+            .join(".zeroclaw");
+        let marker_path = selected_home
+            .path()
+            .join(".zeroclaw")
+            .join("active_workspace.toml");
+        let ambient_marker_path = ambient_home
+            .path()
+            .join(".zeroclaw")
+            .join("active_workspace.toml");
+
+        let _home_env = EnvVarGuard::set("HOME", ambient_home.path().to_string_lossy().as_ref());
+        let _workspace_env = EnvVarGuard::set(
+            "ZEROCLAW_WORKSPACE",
+            custom_workspace.to_string_lossy().as_ref(),
+        );
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+
+        let config = run_quick_setup_with_home(
+            Some("sk-home-safe"),
+            Some("openrouter"),
+            Some("model-home-safe"),
+            Some("sqlite"),
+            false,
+            false,
+            selected_home.path(),
+        )
+        .await
+        .expect("quick setup should succeed for selected home");
+
+        assert_eq!(config.config_path, expected_config_dir.join("config.toml"));
+        assert!(
+            !ambient_marker_path.exists(),
+            "ambient HOME marker should remain untouched"
+        );
+
+        if marker_path.exists() {
+            let marker_raw = tokio::fs::read_to_string(marker_path).await.unwrap();
+            assert!(marker_raw.contains(expected_config_dir.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_workspace_selection_is_non_fatal_when_marker_root_is_invalid() {
+        let _env_guard = home_env_lock_for_tests().lock().await;
+        let tmp = TempDir::new().unwrap();
+        let marker_root_file = tmp.path().join("marker-root-file");
+        tokio::fs::write(&marker_root_file, "not-a-directory")
+            .await
+            .unwrap();
+
+        let _config_env = EnvVarGuard::set(
+            "ZEROCLAW_CONFIG_DIR",
+            marker_root_file.to_string_lossy().as_ref(),
+        );
+        let config_path = tmp.path().join("profile").join("config.toml");
+        tokio::fs::create_dir_all(config_path.parent().unwrap())
+            .await
+            .unwrap();
+
+        let result = persist_workspace_selection(&config_path).await;
+        assert!(
+            result.is_ok(),
+            "workspace selection persistence should not fail onboarding"
+        );
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────
@@ -8933,7 +9047,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_api_key_from_env_prefers_primary_over_fallback() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let _primary = EnvVarGuard::set("STEP_API_KEY", "primary-step-key");
         let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
 
@@ -8945,7 +9059,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_api_key_from_env_uses_stepfun_fallback_key() {
-        let _env_guard = env_lock().lock().await;
+        let _env_guard = home_env_lock_for_tests().lock().await;
         let _unset_primary = EnvVarGuard::unset("STEP_API_KEY");
         let _fallback = EnvVarGuard::set("STEPFUN_API_KEY", "fallback-step-key");
 

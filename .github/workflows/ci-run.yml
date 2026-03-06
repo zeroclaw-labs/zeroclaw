@@ -215,6 +215,41 @@ jobs:
                   BINARY_SIZE_TARGET_MB: 5
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
+    restricted-profile:
+        name: Restricted Capability Profile
+        needs: [changes, quality-gate]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.quality-gate.result == 'success'
+        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
+        timeout-minutes: 45
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
+            - name: Ensure cargo component
+              shell: bash
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: zeroclaw-ci-v1
+                  shared-key: ${{ runner.os }}-rust
+                  cache-targets: true
+                  cache-bin: false
+            - name: Run restricted capability profile
+              run: bash ./scripts/ci/restricted_profile.sh
+
     docs-only:
         name: Docs-Only Fast Path
         needs: [changes]
@@ -340,7 +375,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, quality-gate, test-and-build, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
+        needs: [changes, quality-gate, test-and-build, restricted-profile, docs-only, non-rust, docs-quality, lint-feedback, license-file-owner-guard]
         runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         steps:
             - name: Enforce required status
@@ -389,16 +424,18 @@ jobs:
                   # --- Rust change path ---
                   quality_gate_result="${{ needs.quality-gate.result }}"
                   test_and_build_result="${{ needs.test-and-build.result }}"
+                  restricted_profile_result="${{ needs.restricted-profile.result }}"
 
                   echo "quality-gate=${quality_gate_result}"
                   echo "test-and-build=${test_and_build_result}"
+                  echo "restricted-profile=${restricted_profile_result}"
                   echo "docs=${docs_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
 
                   check_pr_governance
 
-                  if [ "$quality_gate_result" != "success" ] || [ "$test_and_build_result" != "success" ]; then
-                    echo "Required CI jobs did not pass: quality-gate=${quality_gate_result} test-and-build=${test_and_build_result}"
+                  if [ "$quality_gate_result" != "success" ] || [ "$test_and_build_result" != "success" ] || [ "$restricted_profile_result" != "success" ]; then
+                    echo "Required CI jobs did not pass: quality-gate=${quality_gate_result} test-and-build=${test_and_build_result} restricted-profile=${restricted_profile_result}"
                     exit 1
                   fi
 
