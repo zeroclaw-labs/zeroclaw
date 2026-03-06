@@ -5553,11 +5553,14 @@ fn collect_configured_channels(
     if let Some(ref dt) = config.channels_config.dingtalk {
         channels.push(ConfiguredChannel {
             display_name: "DingTalk",
-            channel: Arc::new(DingTalkChannel::new(
-                dt.client_id.clone(),
-                dt.client_secret.clone(),
-                dt.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                DingTalkChannel::new(
+                    dt.client_id.clone(),
+                    dt.client_secret.clone(),
+                    dt.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
