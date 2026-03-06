@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 
-use crate::config::schema::McpServerConfig;
+use crate::config::schema::{McpServerConfig, McpTransport};
 use crate::tools::mcp_client::{McpRegistry, McpServer};
 
 /// Manager for MCP servers with hot-reload capability
@@ -115,33 +115,25 @@ impl SignalHandler {
         Self { mcp_manager, config_path }
     }
 
-    /// Start listening for SIGHUP signals
-    pub fn start(self) -> std::thread::JoinHandle<()> {
-        use signal_hook::{consts::SIGHUP, iterator::Signals};
+    /// Start listening for SIGHUP signals as an async task
+    pub fn start(self) -> tokio::task::JoinHandle<()> {
+        use tokio::signal::unix::{signal, SignalKind};
 
-        std::thread::spawn(move || {
-            let mut signals = Signals::new(&[SIGHUP]).expect("Failed to create signal handler");
+        tokio::spawn(async move {
+            let mut sig = signal(SignalKind::hangup())
+                .expect("Failed to create SIGHUP signal handler");
 
-            for sig in signals.forever() {
-                match sig {
-                    SIGHUP => {
-                        info!("Received SIGHUP, reloading MCP configuration...");
+            while sig.recv().await.is_some() {
+                info!("Received SIGHUP, reloading MCP configuration...");
 
-                        // Spawn async task to handle reload
-                        let _manager = self.mcp_manager.clone();
-                        let config_path = self.config_path.clone();
-
-                        // Note: We can't easily spawn into the tokio runtime from here
-                        // In practice, this should be integrated with the daemon's main loop
-                        // For now, log that we received the signal
-                        info!("SIGHUP received - would reload MCP config from {:?}", config_path);
-
-                        // The actual reload should be done by the daemon's main loop
-                        // which has access to the tokio runtime
-                    }
-                    _ => {}
+                if let Err(e) = reload_mcps(
+                    self.mcp_manager.clone(),
+                    self.config_path.clone(),
+                ).await {
+                    error!("Failed to reload MCPs: {}", e);
                 }
             }
+            warn!("SIGHUP stream closed; stopping MCP reload listener task.");
         })
     }
 }
@@ -237,47 +229,43 @@ pub async fn reload_mcps(
         changes.unchanged.len()
     );
 
-    // 4. Apply changes
+    // 4. Apply changes — abort on first failure to avoid config/runtime divergence
     let mut manager = mcp_manager.write().await;
 
     // Stop removed MCPs
     for name in &changes.removed {
         info!("Stopping removed MCP: {}", name);
-        if let Err(e) = manager.stop_server(name).await {
-            warn!("Error stopping MCP {}: {}", name, e);
-        }
+        manager.stop_server(name).await.map_err(|e| {
+            error!("Error stopping MCP {}: {}", name, e);
+            e
+        })?;
     }
 
     // Restart modified MCPs
     for name in &changes.modified {
         info!("Restarting modified MCP: {}", name);
         let config = new_servers.iter().find(|s| &s.name == name).unwrap();
-        if let Err(e) = manager.restart_server(name, config).await {
+        manager.restart_server(name, config).await.map_err(|e| {
             error!("Error restarting MCP {}: {}", name, e);
-        }
+            e
+        })?;
     }
 
     // Start new MCPs
     for name in &changes.added {
         info!("Starting new MCP: {}", name);
         let config = new_servers.iter().find(|s| &s.name == name).unwrap();
-        if let Err(e) = manager.start_server(config).await {
+        manager.start_server(config).await.map_err(|e| {
             error!("Error starting MCP {}: {}", name, e);
-        }
+            e
+        })?;
     }
 
-    // 5. Rebuild registry with new configurations
-    match McpRegistry::connect_all(&new_servers).await {
-        Ok(registry) => {
-            manager.set_registry(registry);
-            manager.update_configs(new_servers).await;
-            info!("MCP reload complete - registry rebuilt");
-        }
-        Err(e) => {
-            error!("Failed to rebuild MCP registry: {}", e);
-            return Err(e);
-        }
-    }
+    // 5. Rebuild registry only after all operations succeed
+    let registry = McpRegistry::connect_all(&new_servers).await?;
+    manager.set_registry(registry);
+    manager.update_configs(new_servers).await;
+    info!("MCP reload complete - registry rebuilt");
 
     Ok(())
 }

@@ -31,9 +31,6 @@ tokio = { version = "1.42", default-features = false, features = ["rt-multi-thre
 tokio-util = { version = "0.7", default-features = false }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
-# Signal handling for MCP hot reload
-signal-hook = "0.3"
-
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 

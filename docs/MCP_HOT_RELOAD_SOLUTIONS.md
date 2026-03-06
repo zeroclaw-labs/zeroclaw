@@ -21,7 +21,7 @@ We've created three layers of solutions:
 |----------|-----------|-------------|--------|
 | **Helper Scripts** (Now) | Low | Manual trigger | ✅ Ready |
 | **File Watcher** (Now) | Low | One-time setup | ✅ Ready |
-| **SIGHUP Support** (Future) | Medium | Signal trigger | 📋 RFC Complete |
+| **SIGHUP Support** (Now) | Medium | Signal trigger | ✅ Ready |
 | **Native Hot Reload** (Future) | High | Automatic | 📋 RFC Complete |
 
 ---
@@ -82,22 +82,17 @@ python3 mcp_file_watcher.py --once
 
 ## Architecture Roadmap
 
-### Phase 1: SIGHUP Signal Handler
+### Phase 1: SIGHUP Signal Handler (Implemented)
 
-**Implementation:** Add signal handling to ZeroClaw
-
-```rust
-// ZeroClaw would catch SIGHUP
-signal_hook::consts::SIGHUP => {
-    reload_mcp_config().await;
-}
-```
+SIGHUP-based hot reload is available now in this PR. The implementation uses
+`tokio::signal::unix` to listen for SIGHUP and triggers config diffing and
+selective MCP lifecycle management.
 
 **User Experience:**
 ```bash
 kill -HUP $(pgrep zeroclaw)
 # or
-systemctl reload zeroclaw
+systemctl --user reload zeroclaw
 ```
 
 **Benefits:**
@@ -106,7 +101,7 @@ systemctl reload zeroclaw
 - Standard Unix practice
 - Context preserved
 
-**See:** `MCP_HOT_RELOAD_RFC.md` for full implementation details
+**See:** `MCP_HOT_RELOAD_RFC.md` for full architecture details
 
 ### Phase 2: File Watch with Debouncing
 
@@ -232,8 +227,6 @@ echo '{"cmd":"reload_mcps"}' | \
 | File | Purpose | Lines |
 |------|---------|-------|
 | `MCP_HOT_RELOAD_RFC.md` | Detailed architecture RFC | 350+ |
-| `mcp-hot-reload.sh` | Bash helper script | 250+ |
-| `mcp_file_watcher.py` | Python file watcher daemon | 400+ |
 | `MCP_HOT_RELOAD_SOLUTIONS.md` | This summary document | - |
 
 ---

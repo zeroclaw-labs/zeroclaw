@@ -16,47 +16,43 @@ This is disruptive because:
 
 ### Layer 1: SIGHUP Signal Handler (Immediate Implementation)
 
-**Unix Standard Approach**
+#### Unix Standard Approach
+
 ```rust
 // In ZeroClaw daemon
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use signal_hook::consts::SIGHUP;
-use signal_hook_tokio::Signals;
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{info, error};
 
 async fn handle_reload_signal(
     mcp_manager: Arc<RwLock<McpManager>>,
     config_path: PathBuf,
 ) {
-    let mut signals = Signals::new(&[SIGHUP]).unwrap();
-    
-    for sig in signals.recv() {
-        match sig {
-            SIGHUP => {
-                log::info!("Received SIGHUP, reloading MCP configuration...");
-                
-                // 1. Parse new config
-                let new_config = match load_mcp_config(&config_path).await {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        log::error!("Failed to parse MCP config: {}", e);
-                        continue;
-                    }
-                };
-                
-                // 2. Diff with current config
-                let mut manager = mcp_manager.write().await;
-                let changes = manager.diff_config(&new_config);
-                
-                // 3. Apply changes granularly
-                if let Err(e) = manager.apply_changes(changes).await {
-                    log::error!("Failed to apply MCP changes: {}", e);
-                }
-                
-                log::info!("MCP reload complete");
+    let mut sig = signal(SignalKind::hangup()).unwrap();
+
+    while sig.recv().await.is_some() {
+        info!("Received SIGHUP, reloading MCP configuration...");
+
+        // 1. Parse new config
+        let new_config = match load_mcp_config(&config_path).await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                error!("Failed to parse MCP config: {}", e);
+                continue;
             }
-            _ => {}
+        };
+
+        // 2. Diff with current config
+        let mut manager = mcp_manager.write().await;
+        let changes = manager.diff_config(&new_config);
+
+        // 3. Apply changes granularly
+        if let Err(e) = manager.apply_changes(changes).await {
+            error!("Failed to apply MCP changes: {}", e);
         }
+
+        info!("MCP reload complete");
     }
 }
 ```
@@ -66,7 +62,7 @@ async fn handle_reload_signal(
 # Instead of restart
 kill -HUP $(pgrep zeroclaw)
 # or
-systemctl reload zeroclaw
+systemctl --user reload zeroclaw
 ```
 
 ### Layer 2: File Watch with Debouncing
@@ -95,11 +91,11 @@ async fn watch_config_changes(
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 
                 if let Err(e) = reload_tx.send(()).await {
-                    log::error!("Failed to trigger reload: {}", e);
+                    error!("Failed to trigger reload: {}", e);
                 }
             }
             Ok(_) => {}
-            Err(e) => log::error!("Watch error: {}", e),
+            Err(e) => error!("Watch error: {}", e),
         }
     }
 }
@@ -173,7 +169,7 @@ impl McpManager {
         for name in &changes.removed {
             if let Some(server) = self.servers.remove(name) {
                 server.shutdown().await;
-                log::info!("Shutdown MCP server: {}", name);
+                info!("Shutdown MCP server: {}", name);
             }
         }
         
@@ -184,14 +180,14 @@ impl McpManager {
             }
             let new_server = McpServer::start(server_config.clone()).await?;
             self.servers.insert(server_config.name.clone(), new_server);
-            log::info!("Restarted MCP server: {}", server_config.name);
+            info!("Restarted MCP server: {}", server_config.name);
         }
         
         // 4. Start new servers
         for server_config in &changes.added {
             let server = McpServer::start(server_config.clone()).await?;
             self.servers.insert(server_config.name.clone(), server);
-            log::info!("Started new MCP server: {}", server_config.name);
+            info!("Started new MCP server: {}", server_config.name);
         }
         
         Ok(())
@@ -322,3 +318,9 @@ zeroclawctl reload-mcps
 - [ ] Failed MCP config doesn't crash daemon
 - [ ] 99.9% reload success rate
 - [ ] User never needs full restart for MCP changes
+
+---
+
+> **i18n note:** This RFC introduces new shared documentation. Localization for
+> supported locales (`zh-CN`, `ja`, `ru`, `fr`, `vi`, `el`) is deferred to a
+> follow-up PR.
