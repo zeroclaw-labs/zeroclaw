@@ -2,14 +2,14 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: zeroclaw-vault-sa
-  namespace: zeroclaw-test
+  namespace: ai-agents
 
 ---
 apiVersion: secrets.hashicorp.com/v1beta1
 kind: VaultAuth
 metadata:
   name: zeroclaw-static-auth
-  namespace: zeroclaw-test
+  namespace: ai-agents
 spec:
   method: kubernetes
   mount: scrapyard
@@ -24,7 +24,7 @@ apiVersion: secrets.hashicorp.com/v1beta1
 kind: VaultStaticSecret
 metadata:
   name: zeroclaw-config-secret
-  namespace: zeroclaw-test
+  namespace: ai-agents
 spec:
   vaultAuthRef: zeroclaw-static-auth
   mount: kvv2

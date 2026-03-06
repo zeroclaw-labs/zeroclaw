@@ -4,7 +4,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: signal-cli-daemon
-  namespace: zeroclaw-test
+  namespace: ai-agents
   labels:
     app: signal-cli-daemon
 spec:

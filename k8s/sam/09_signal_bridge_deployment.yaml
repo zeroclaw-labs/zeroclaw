@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: signal-bridge
-  namespace: zeroclaw-test
+  namespace: ai-agents
   labels:
     app: signal-bridge
 spec:

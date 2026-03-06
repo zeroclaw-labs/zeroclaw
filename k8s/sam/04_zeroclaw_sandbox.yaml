@@ -4,7 +4,7 @@ apiVersion: agents.x-k8s.io/v1alpha1
 kind: Sandbox
 metadata:
   name: zeroclaw
-  namespace: zeroclaw-test
+  namespace: ai-agents
 spec:
   replicas: 1
   podTemplate:
@@ -102,7 +102,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: zeroclaw-config-secrets
-                  key: api-key
+                  key: api_key
             - name: ZEROCLAW_GATEWAY_PAIRED_TOKENS
               valueFrom:
                 secretKeyRef:
@@ -180,7 +180,7 @@ spec:
               protocol: TCP
           env:
             - name: BRIDGE_BASE_URL
-              value: http://signal-cli-daemon.zeroclaw-test.svc.cluster.local:8686
+              value: http://signal-cli-daemon.ai-agents.svc.cluster.local:8686
             - name: LISTEN_ADDR
               value: :8686
             - name: POLL_TIMEOUT_SECONDS

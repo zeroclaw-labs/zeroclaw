@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: signal-bridge-allow-from-zeroclaw
-  namespace: zeroclaw-test
+  namespace: ai-agents
 spec:
   podSelector:
     matchLabels:
@@ -14,7 +14,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: zeroclaw-test
+              kubernetes.io/metadata.name: ai-agents
     - from:
         - podSelector:
             matchLabels:
@@ -25,7 +25,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: zeroclaw-allow-to-signal-bridge
-  namespace: zeroclaw-test
+  namespace: ai-agents
 spec:
   podSelector:
     matchLabels:
@@ -37,7 +37,7 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: zeroclaw-test
+              kubernetes.io/metadata.name: ai-agents
     - to:
         - podSelector:
             matchLabels:
