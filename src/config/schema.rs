@@ -7201,6 +7201,23 @@ fn decrypt_channel_secrets(
             "config.channels_config.lark.verification_token",
         )?;
     }
+    if let Some(ref mut feishu) = channels.feishu {
+        decrypt_secret(
+            store,
+            &mut feishu.app_secret,
+            "config.channels_config.feishu.app_secret",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut feishu.encrypt_key,
+            "config.channels_config.feishu.encrypt_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut feishu.verification_token,
+            "config.channels_config.feishu.verification_token",
+        )?;
+    }
     if let Some(ref mut dingtalk) = channels.dingtalk {
         decrypt_secret(
             store,
@@ -7404,6 +7421,23 @@ fn encrypt_channel_secrets(
             store,
             &mut lark.verification_token,
             "config.channels_config.lark.verification_token",
+        )?;
+    }
+    if let Some(ref mut feishu) = channels.feishu {
+        encrypt_secret(
+            store,
+            &mut feishu.app_secret,
+            "config.channels_config.feishu.app_secret",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut feishu.encrypt_key,
+            "config.channels_config.feishu.encrypt_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut feishu.verification_token,
+            "config.channels_config.feishu.verification_token",
         )?;
     }
     if let Some(ref mut dingtalk) = channels.dingtalk {
@@ -10959,6 +10993,18 @@ denied_tools = ["shell"]
             group_reply: None,
             base_url: None,
         });
+        config.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_test_feishu".into(),
+            app_secret: "feishu-app-secret".into(),
+            encrypt_key: Some("feishu-encrypt-key".into()),
+            verification_token: Some("feishu-verify-token".into()),
+            allowed_users: vec!["user-1".into()],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
+        });
 
         config.agents.insert(
             "worker".into(),
@@ -11106,6 +11152,32 @@ denied_tools = ["shell"]
         assert_eq!(
             store.decrypt(&telegram_token).unwrap(),
             "telegram-credential"
+        );
+
+        let feishu = stored.channels_config.feishu.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            &feishu.app_secret
+        ));
+        assert!(feishu
+            .encrypt_key
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert!(feishu
+            .verification_token
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+
+        let mut decrypted_channels = stored.channels_config.clone();
+        decrypt_channel_secrets(&store, &mut decrypted_channels).unwrap();
+        let decrypted_feishu = decrypted_channels.feishu.as_ref().unwrap();
+        assert_eq!(decrypted_feishu.app_secret, "feishu-app-secret");
+        assert_eq!(
+            decrypted_feishu.encrypt_key.as_deref(),
+            Some("feishu-encrypt-key")
+        );
+        assert_eq!(
+            decrypted_feishu.verification_token.as_deref(),
+            Some("feishu-verify-token")
         );
 
         let _ = fs::remove_dir_all(&dir).await;
