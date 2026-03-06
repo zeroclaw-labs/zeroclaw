@@ -206,6 +206,7 @@ impl DiscordChannel {
                         11 => {
                             tracing::debug!("Discord: heartbeat ACK received");
                             awaiting_heartbeat_ack = false;
+                            last_heartbeat_sent_at = None;
                             continue;
                         }
                         // Op 7: Reconnect
@@ -1530,6 +1531,12 @@ mod tests {
         use tokio::sync::mpsc;
         use tokio_tungstenite::accept_async;
 
+        const TEST_HEARTBEAT_INTERVAL_MS: u64 = 100;
+        const TEST_HEARTBEAT_WAIT_MS: u64 = 1_500;
+        const TEST_FIRST_MESSAGE_WAIT_MS: u64 = 1_500;
+        const TEST_POST_RECONNECT_SLEEP_MS: u64 = 200;
+        const TEST_MISSED_ACK_SLEEP_MS: u64 = 1_000;
+
         let ws_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake discord ws listener");
@@ -1576,7 +1583,7 @@ mod tests {
                     .expect("upgrade fake discord websocket");
 
                 ws.send(Message::Text(
-                    json!({ "op": 10, "d": { "heartbeat_interval": 25 } })
+                    json!({ "op": 10, "d": { "heartbeat_interval": TEST_HEARTBEAT_INTERVAL_MS } })
                         .to_string()
                         .into(),
                 ))
@@ -1613,11 +1620,12 @@ mod tests {
                 .await
                 .expect("send discord message event");
 
-                let heartbeat = tokio::time::timeout(Duration::from_millis(150), ws.next())
-                    .await
-                    .expect("client should send heartbeat before timeout")
-                    .expect("heartbeat frame should exist")
-                    .expect("heartbeat frame should be valid");
+                let heartbeat =
+                    tokio::time::timeout(Duration::from_millis(TEST_HEARTBEAT_WAIT_MS), ws.next())
+                        .await
+                        .expect("client should send heartbeat before timeout")
+                        .expect("heartbeat frame should exist")
+                        .expect("heartbeat frame should be valid");
                 let heartbeat_text = heartbeat
                     .into_text()
                     .expect("heartbeat frame should be text")
@@ -1625,14 +1633,14 @@ mod tests {
                 assert!(heartbeat_text.contains("\"op\":1"));
 
                 if attempt == 0 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(TEST_MISSED_ACK_SLEEP_MS)).await;
                 } else {
                     ws.send(Message::Text(
                         json!({ "op": 11, "d": null }).to_string().into(),
                     ))
                     .await
                     .expect("send heartbeat ack after reconnect");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(TEST_POST_RECONNECT_SLEEP_MS)).await;
                 }
             }
         });
@@ -1659,10 +1667,11 @@ mod tests {
             Duration::from_millis(20),
         );
 
-        let first_message = tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .expect("should receive first discord dispatch")
-            .expect("first dispatch should exist");
+        let first_message =
+            tokio::time::timeout(Duration::from_millis(TEST_FIRST_MESSAGE_WAIT_MS), rx.recv())
+                .await
+                .expect("should receive first discord dispatch")
+                .expect("first dispatch should exist");
         assert_eq!(first_message.content, "first dispatch");
 
         let second_message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -1671,7 +1680,7 @@ mod tests {
             .expect("second dispatch should exist");
         assert_eq!(second_message.content, "second dispatch after reconnect");
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(TEST_POST_RECONNECT_SLEEP_MS)).await;
         let snapshot = crate::health::snapshot_json();
         let component = &snapshot["components"][&component_name];
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
