@@ -277,7 +277,6 @@ tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
-tokio = { version = "1.42", features = ["test-util"] }
 
 [[bench]]
 name = "agent_benchmarks"

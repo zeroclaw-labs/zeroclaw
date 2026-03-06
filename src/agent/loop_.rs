@@ -62,14 +62,6 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 
-/// Maximum time to wait for a single provider.chat() call inside the tool loop.
-///
-/// Caps the blast radius of a stalled HTTP connection: without this limit every
-/// iteration could block for the reqwest default (120 s), and with 20 iterations
-/// the loop could silently hang for up to 40 minutes before the channel budget
-/// fires. At 90 s the first stall surfaces an error within the same minute.
-const TOOL_LOOP_LLM_CALL_TIMEOUT_SECS: u64 = 90;
-
 /// Maximum continuation retries when a provider reports max-token truncation.
 const MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS: usize = 3;
 /// Absolute safety cap for merged continuation output.
@@ -1523,15 +1515,13 @@ pub async fn run_tool_call_loop(
             temperature,
         );
 
-        let chat_timeout =
-            tokio::time::timeout(std::time::Duration::from_secs(TOOL_LOOP_LLM_CALL_TIMEOUT_SECS), chat_future);
         let chat_result = if let Some(token) = cancellation_token.as_ref() {
             tokio::select! {
                 () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_timeout => result.map_err(|_| anyhow::anyhow!("LLM call timed out after {}s", TOOL_LOOP_LLM_CALL_TIMEOUT_SECS))?,
+                result = chat_future => result,
             }
         } else {
-            chat_timeout.await.map_err(|_| anyhow::anyhow!("LLM call timed out after {}s", TOOL_LOOP_LLM_CALL_TIMEOUT_SECS))?
+            chat_future.await
         };
 
         let (
@@ -1612,17 +1602,13 @@ pub async fn run_tool_call_loop(
                         active_model.as_str(),
                         temperature,
                     );
-                    let continuation_timeout = tokio::time::timeout(
-                        std::time::Duration::from_secs(TOOL_LOOP_LLM_CALL_TIMEOUT_SECS),
-                        continuation_future,
-                    );
                     let continuation_result = if let Some(token) = cancellation_token.as_ref() {
                         tokio::select! {
                             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = continuation_timeout => result.map_err(|_| anyhow::anyhow!("LLM call timed out after {}s", TOOL_LOOP_LLM_CALL_TIMEOUT_SECS))?,
+                            result = continuation_future => result,
                         }
                     } else {
-                        continuation_timeout.await.map_err(|_| anyhow::anyhow!("LLM call timed out after {}s", TOOL_LOOP_LLM_CALL_TIMEOUT_SECS))?
+                        continuation_future.await
                     };
 
                     let continuation_resp = match continuation_result {
@@ -7617,90 +7603,6 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
-    }
-
-    /// Provider that never returns from chat() — simulates a stalled HTTP connection.
-    struct StallingProvider;
-
-    #[async_trait]
-    impl Provider for StallingProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            tokio::time::sleep(Duration::MAX).await;
-            anyhow::bail!("unreachable")
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
-            tokio::time::sleep(Duration::MAX).await;
-            anyhow::bail!("unreachable")
-        }
-    }
-
-    /// Verify that a stalled provider.chat() does not block the loop indefinitely.
-    ///
-    /// The per-LLM-call timeout (TOOL_LOOP_LLM_CALL_TIMEOUT_SECS) must fire and
-    /// return an error. Uses paused tokio time so the test completes instantly.
-    #[tokio::test(start_paused = true)]
-    async fn llm_call_timeout_fires_within_budget() {
-        let provider = StallingProvider;
-        let mut history = vec![
-            ChatMessage::system("zeroclaw test system"),
-            ChatMessage::user("trigger stall".to_string()),
-        ];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = crate::observability::NoopObserver;
-
-        // Wrap in a timeout that fires just after TOOL_LOOP_LLM_CALL_TIMEOUT_SECS.
-        // With paused time this only advances when the loop polls a sleep future.
-        let result = tokio::time::timeout(
-            Duration::from_secs(TOOL_LOOP_LLM_CALL_TIMEOUT_SECS + 5),
-            run_tool_call_loop(
-                &provider,
-                &mut history,
-                &tools_registry,
-                &observer,
-                "stalling-provider",
-                "stalling-model",
-                0.0,
-                true,
-                None,
-                "cli",
-                &crate::config::MultimodalConfig::default(),
-                1,
-                None,
-                None,
-                None,
-                &[],
-            ),
-        )
-        .await;
-
-        // The inner per-call timeout must fire before the outer guard.
-        assert!(
-            result.is_ok(),
-            "outer guard fired — inner LLM-call timeout did not fire within budget"
-        );
-        let inner = result.unwrap();
-        assert!(
-            inner.is_err(),
-            "stalled LLM call must produce an Err, got: {:?}",
-            inner
-        );
-        let err_msg = inner.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("timed out") || err_msg.contains("LLM call"),
-            "expected timeout error message, got: {err_msg}"
-        );
     }
 
     #[test]
