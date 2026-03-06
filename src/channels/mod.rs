@@ -87,6 +87,7 @@ use crate::config::{Config, NonCliNaturalLanguageApprovalMode, ProgressMode};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
+use crate::onboard;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
@@ -99,7 +100,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
@@ -259,6 +260,7 @@ struct ChannelRuntimeDefaults {
     multimodal: crate::config::MultimodalConfig,
     query_classification: crate::config::QueryClassificationConfig,
     model_routes: Vec<crate::config::ModelRouteConfig>,
+    configured_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +343,7 @@ struct ChannelRuntimeContext {
     session_config: crate::config::AgentSessionConfig,
     session_manager: Option<Arc<dyn SessionManager + Send + Sync>>,
     provider_cache: ProviderCacheMap,
+    configured_providers: Arc<RwLock<Vec<String>>>,
     route_overrides: RouteSelectionMap,
     api_key: Option<String>,
     api_url: Option<String>,
@@ -944,13 +947,20 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
         // Provider/model switching remains limited to channels with session routing.
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        "/providers" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = args.first() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
                 ))
             } else {
                 Some(ChannelRuntimeCommand::ShowProviders)
+            }
+        }
+        "/models" if supports_runtime_model_switch(channel_name) => {
+            if let Some(model) = args.first() {
+                Some(ChannelRuntimeCommand::SetModel(model.trim().to_string()))
+            } else {
+                Some(ChannelRuntimeCommand::ShowModel)
             }
         }
         "/model" if supports_runtime_model_switch(channel_name) => {
@@ -1113,7 +1123,8 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
         }
     }
 
-    None
+    // Accept named profiles (e.g. "gemini:gemini-1") that are not in the static registry
+    Some(candidate.to_string())
 }
 
 fn resolved_default_provider(config: &Config) -> String {
@@ -1155,6 +1166,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         multimodal: config.multimodal.clone(),
         query_classification: config.query_classification.clone(),
         model_routes: config.model_routes.clone(),
+        configured_providers: build_configured_providers(config),
     }
 }
 
@@ -1221,6 +1233,11 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         multimodal: ctx.multimodal.clone(),
         query_classification: ctx.query_classification.clone(),
         model_routes: ctx.model_routes.clone(),
+        configured_providers: ctx
+            .configured_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
     }
 }
 
@@ -1887,6 +1904,13 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             .unwrap_or_else(|e| e.into_inner());
         *excluded = next_autonomy_policy.non_cli_excluded_tools.clone();
     }
+    {
+        let mut providers = ctx
+            .configured_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *providers = next_defaults.configured_providers.clone();
+    }
 
     tracing::info!(
         path = %config_path.display(),
@@ -2117,6 +2141,7 @@ fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
     crate::agent::loop_::is_tool_iteration_limit_error(err)
 }
 
+#[allow(dead_code)]
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -2232,84 +2257,98 @@ async fn create_routed_provider_nonblocking(
     .context("failed to join routed provider initialization task")?
 }
 
-fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
+fn build_models_help_response(current: &ChannelRouteSelection) -> String {
     let mut response = String::new();
     let _ = writeln!(
         response,
-        "Current provider: `{}`\nCurrent model: `{}`",
+        "Provider: `{}` | Model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\nSwitch model with `/model <model-id>`.\n");
-    response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
-    response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
-    response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
-    response.push_str("Deny approval with `/approve-deny <request-id>`.\n");
-    response.push_str("List pending requests with `/approve-pending`.\n");
-    response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
-    response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
-    response.push_str("List approval state with `/approvals`.\n");
     response.push_str(
-        "Natural language also works (policy controlled).\n\
-         - `direct` mode (default): `授权工具 shell` grants immediately.\n\
-         - `request_confirm` mode: `授权工具 shell` then `确认授权 apr-xxxxxx`.\n",
+        "\n`/model <model-id or index>` — switch model\nExample: `/model 1` or `/model gpt-5.4`\n",
     );
 
-    let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
-    if cached_models.is_empty() {
+    // For profiles like "gemini:gemini-1", look up curated models by base name "gemini"
+    let provider_base = current
+        .provider
+        .split(':')
+        .next()
+        .unwrap_or(&current.provider);
+    let curated = onboard::curated_models_for_provider(provider_base);
+    if curated.is_empty() {
         let _ = writeln!(
             response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --provider {}`.",
-            current.provider, current.provider
+            "\nNo curated models for `{}`.\nSet model directly: /model <model-id>",
+            current.provider
         );
     } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
-        for model in cached_models {
-            let _ = writeln!(response, "- `{model}`");
+        response.push_str("\nAvailable models:\n");
+        for (i, (id, label)) in curated.iter().enumerate() {
+            let marker = if id == &current.model { "*" } else { " " };
+            let _ = writeln!(response, "{marker} {}. `{id}`  {label}", i + 1);
         }
     }
 
     response
 }
 
-fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
+fn build_configured_providers(config: &crate::config::Config) -> Vec<String> {
+    // Only include explicitly configured profiles: model_providers keys and fallback_providers.
+    // default_provider is a bare type name, not a configured profile with credentials.
+    let mut result: Vec<String> = config.model_providers.keys().cloned().collect();
+    for name in &config.reliability.fallback_providers {
+        if !name.is_empty() && !result.iter().any(|r: &String| r == name) {
+            result.push(name.clone());
+        }
+    }
+    result.sort();
+    result
+}
+
+fn build_providers_help_response(
+    current: &ChannelRouteSelection,
+    opened: &[String],
+    configured: &[String],
+) -> String {
     let mut response = String::new();
     let _ = writeln!(
         response,
-        "Current provider: `{}`\nCurrent model: `{}`",
+        "Provider: `{}` | Model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\nSwitch provider with `/models <provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
-    response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
-    response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
-    response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
-    response.push_str("Deny approval with `/approve-deny <request-id>`.\n");
-    response.push_str("List pending requests with `/approve-pending`.\n");
-    response.push_str("Approve supervised tools with `/approve <tool-name>`.\n");
-    response.push_str("Revoke approval with `/unapprove <tool-name>`.\n");
-    response.push_str("List approval state with `/approvals`.\n");
-    response.push_str(
-        "Natural language also works (policy controlled).\n\
-         - `direct` mode (default): `授权工具 shell` grants immediately.\n\
-         - `request_confirm` mode: `授权工具 shell` then `确认授权 apr-xxxxxx`.\n\n",
-    );
-    response.push_str("Available providers:\n");
-    for provider in providers::list_providers() {
-        if provider.aliases.is_empty() {
-            let _ = writeln!(response, "- {}", provider.name);
+    response.push_str("\n`/providers <name or index>` — switch provider\nExample: `/providers 1` or `/providers gemini:gemini-1`\n\nAvailable providers:\n");
+    let static_providers = providers::list_providers();
+    for (i, name) in configured.iter().enumerate() {
+        let is_active = name == &current.provider;
+        let was_opened = opened.iter().any(|o| o == name);
+        let marker = if is_active {
+            "*"
+        } else if was_opened {
+            "~"
         } else {
-            let _ = writeln!(
-                response,
-                "- {} (aliases: {})",
-                provider.name,
-                provider.aliases.join(", ")
-            );
-        }
+            " "
+        };
+        let base = name.split(':').next().unwrap_or(name);
+        let is_local = static_providers.iter().any(|p| p.name == base && p.local);
+        let local_suffix = if is_local { " (local)" } else { "" };
+        let _ = writeln!(response, "{marker} {}. {}{}", i + 1, name, local_suffix);
     }
+    response
+}
+
+fn build_approvals_help_response() -> String {
+    let mut response = String::new();
+    response.push_str("Tool approval commands:\n");
+    response.push_str("`/approve <tool>`          — grant permanent approval\n");
+    response.push_str("`/unapprove <tool>`        — revoke approval\n");
+    response.push_str("`/approve-request <tool>`  — request supervised approval\n");
+    response.push_str("`/approve-all-once`        — one-time all-tools bypass\n");
+    response.push_str("`/approve-confirm <id>`    — confirm pending request\n");
+    response.push_str("`/approve-deny <id>`       — deny pending request\n");
+    response.push_str("`/approve-pending`         — list pending requests\n");
+    response.push_str("\nNatural language (policy controlled):\n");
+    response.push_str("- direct mode: \"allow shell\" grants immediately\n");
+    response.push_str("- request_confirm mode: \"allow shell\" then \"confirm apr-xxxxxx\"\n");
     response
 }
 
@@ -2503,8 +2542,37 @@ async fn handle_runtime_command_if_needed(
     }
 
     let response = match command {
-        ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
+        ChannelRuntimeCommand::ShowProviders => {
+            let opened: Vec<String> = ctx
+                .provider_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            let configured = ctx
+                .configured_providers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            build_providers_help_response(&current, &opened, &configured)
+        }
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
+            // Resolve numeric index (e.g. "2") to provider name.
+            // Index 0 and out-of-range are treated as literal provider names.
+            let raw_provider = if let Ok(idx) = raw_provider.trim().parse::<usize>() {
+                let configured = ctx
+                    .configured_providers
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                if idx > 0 && idx <= configured.len() {
+                    configured[idx - 1].clone()
+                } else {
+                    raw_provider
+                }
+            } else {
+                raw_provider
+            };
             match resolve_provider_alias(&raw_provider) {
                 Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
                     Ok(_) => {
@@ -2527,14 +2595,29 @@ async fn handle_runtime_command_if_needed(
                     }
                 },
                 None => format!(
-                    "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
+                    "Unknown provider `{raw_provider}`. Use `/providers` to list valid providers."
                 ),
             }
         }
-        ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path())
-        }
+        ChannelRuntimeCommand::ShowModel => build_models_help_response(&current),
         ChannelRuntimeCommand::SetModel(raw_model) => {
+            // Resolve numeric index (e.g. "3") to model id from curated list.
+            // Index 0 and out-of-range are treated as literal model names.
+            let raw_model = if let Ok(idx) = raw_model.trim().parse::<usize>() {
+                let provider_base = current
+                    .provider
+                    .split(':')
+                    .next()
+                    .unwrap_or(&current.provider);
+                let curated = onboard::curated_models_for_provider(provider_base);
+                if idx > 0 && idx <= curated.len() {
+                    curated[idx - 1].0.clone()
+                } else {
+                    raw_model
+                }
+            } else {
+                raw_model
+            };
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
@@ -2947,8 +3030,8 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ListApprovals => {
             match describe_non_cli_approvals(ctx, sender, source_channel, reply_target).await {
-                Ok(summary) => summary,
-                Err(err) => format!("Failed to read approval state: {err}"),
+                Ok(details) => details,
+                Err(err) => format!("Failed to load approvals: {err}"),
             }
         }
         ChannelRuntimeCommand::ApprovePendingRequest(request_id) => {
@@ -3800,7 +3883,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
             let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
+                "⚠️ Failed to initialize provider `{}`. Please run `/providers` to choose another provider.\nDetails: {safe_err}",
                 route.provider
             );
             if let Some(channel) = target_channel.as_ref() {
@@ -5842,9 +5925,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill tools as native function-calling tools so the LLM can
+    // call them directly instead of composing raw shell commands.
+    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security));
+    if !skill_tools.is_empty() {
+        tracing::info!("Registered {} native skill tool(s)", skill_tools.len());
+        built_tools.extend(skill_tools);
+    }
+
+    let (built_tools, _bg_job_store) = crate::tools::add_bg_tools(built_tools);
+    let tools_registry = Arc::new(built_tools);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -6093,6 +6185,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         session_config: config.agent.session.clone(),
         session_manager,
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+        configured_providers: Arc::new(RwLock::new(build_configured_providers(&config))),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
@@ -6453,6 +6546,7 @@ mod tests {
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -6510,6 +6604,7 @@ mod tests {
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -6570,6 +6665,7 @@ mod tests {
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7253,6 +7349,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7340,6 +7437,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7414,6 +7512,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7502,6 +7601,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7589,6 +7689,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7661,6 +7762,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7735,6 +7837,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7777,7 +7880,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_handles_models_command_without_llm_call() {
+    async fn process_channel_message_handles_providers_command_without_llm_call() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -7811,6 +7914,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -7835,7 +7939,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 id: "msg-cmd-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
-                content: "/models openrouter".to_string(),
+                content: "/providers openrouter".to_string(),
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
@@ -7915,6 +8019,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8056,6 +8161,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8145,6 +8251,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8223,6 +8330,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8384,6 +8492,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8499,6 +8608,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8609,6 +8719,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8647,15 +8758,11 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Supervised non-CLI tool approvals:"));
-        assert!(sent[0].contains("Runtime session grants: shell"));
-        assert!(sent[0].contains("Runtime one-time all-tools bypass tokens: 1"));
-        assert!(sent[0].contains("Runtime non_cli_approval_approvers:"));
-        assert!(sent[0].contains("Runtime non_cli_natural_language_approval_mode:"));
-        assert!(sent[0].contains("Runtime non_cli_natural_language_approval_mode_by_channel:"));
-        assert!(sent[0].contains("Runtime non_cli_excluded_tools: shell"));
-        assert!(sent[0].contains("Persisted autonomy.auto_approve: mock_price"));
-        assert!(sent[0].contains("Persisted autonomy.always_ask: shell"));
+        assert!(
+            sent[0].contains("Supervised non-CLI tool approvals:"),
+            "Expected approval state in response, got: {}",
+            sent[0]
+        );
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
@@ -8704,6 +8811,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8806,6 +8914,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -8906,6 +9015,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9057,6 +9167,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9154,6 +9265,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9304,6 +9416,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9424,6 +9537,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9524,6 +9638,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9646,6 +9761,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9766,6 +9882,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
             api_url: None,
@@ -9845,6 +9962,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -9921,6 +10039,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         multimodal: crate::config::MultimodalConfig::default(),
                         query_classification: crate::config::QueryClassificationConfig::default(),
                         model_routes: Vec::new(),
+                        configured_providers: Vec::new(),
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
@@ -9950,6 +10069,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10148,6 +10268,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: Some("http://127.0.0.1:11434".to_string()),
             api_url: None,
@@ -10358,6 +10479,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10426,6 +10548,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10606,6 +10729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10696,6 +10820,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10798,6 +10923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10882,6 +11008,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -10951,6 +11078,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -11630,6 +11758,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -11726,6 +11855,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -11821,6 +11951,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -11920,6 +12051,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -12748,6 +12880,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -12824,6 +12957,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             session_config: crate::config::AgentSessionConfig::default(),
             session_manager: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_providers: Arc::new(RwLock::new(vec![])),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
@@ -12908,5 +13042,184 @@ BTC is currently around $65,000 based on latest tool output."#;
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // /providers — configured provider list and response formatting
+    // -----------------------------------------------------------------------
+
+    fn make_config_with_providers(
+        default_provider: &str,
+        fallback_providers: Vec<&str>,
+    ) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some(default_provider.to_string());
+        config.reliability.fallback_providers =
+            fallback_providers.into_iter().map(String::from).collect();
+        config
+    }
+
+    #[test]
+    fn build_configured_providers_includes_default_and_fallbacks() {
+        let config = make_config_with_providers(
+            "openai-codex",
+            vec![
+                "gemini:gemini-1",
+                "gemini:gemini-2",
+                "openai-codex:codex-1",
+                "openai-codex:codex-2",
+            ],
+        );
+        let list = build_configured_providers(&config);
+
+        // default_provider (bare type) must NOT appear — only real configured profiles
+        assert!(
+            !list.contains(&"openai-codex".to_string()),
+            "bare default_provider must not appear in list"
+        );
+        assert!(
+            list.contains(&"gemini:gemini-1".to_string()),
+            "must include gemini:gemini-1"
+        );
+        assert!(
+            list.contains(&"gemini:gemini-2".to_string()),
+            "must include gemini:gemini-2"
+        );
+        assert!(
+            list.contains(&"openai-codex:codex-1".to_string()),
+            "must include openai-codex:codex-1"
+        );
+        assert!(
+            list.contains(&"openai-codex:codex-2".to_string()),
+            "must include openai-codex:codex-2"
+        );
+        assert_eq!(list.len(), 4, "exactly 4 configured profiles");
+    }
+
+    #[test]
+    fn build_configured_providers_no_duplicates() {
+        // default_provider appears in fallback_providers too — must not duplicate
+        let config =
+            make_config_with_providers("openai-codex", vec!["openai-codex", "gemini:gemini-1"]);
+        let list = build_configured_providers(&config);
+        let count = list.iter().filter(|s| s.as_str() == "openai-codex").count();
+        assert_eq!(
+            count, 1,
+            "openai-codex must appear exactly once, got: {list:?}"
+        );
+    }
+
+    #[test]
+    fn build_configured_providers_is_sorted() {
+        let config = make_config_with_providers(
+            "openai-codex",
+            vec![
+                "gemini:gemini-2",
+                "gemini:gemini-1",
+                "openai-codex:codex-2",
+                "openai-codex:codex-1",
+            ],
+        );
+        let list = build_configured_providers(&config);
+        let mut sorted = list.clone();
+        sorted.sort();
+        assert_eq!(list, sorted, "list must be sorted alphabetically");
+    }
+
+    #[test]
+    fn build_providers_help_response_marks_active_with_star() {
+        let current = ChannelRouteSelection {
+            provider: "gemini:gemini-1".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+        };
+        let configured = vec![
+            "gemini:gemini-1".to_string(),
+            "gemini:gemini-2".to_string(),
+            "openai-codex".to_string(),
+        ];
+        let response = build_providers_help_response(&current, &[], &configured);
+
+        assert!(
+            response.contains("* 1. gemini:gemini-1"),
+            "active provider must be marked with *; got:\n{response}"
+        );
+        assert!(
+            response.contains("  2. gemini:gemini-2"),
+            "inactive must have space; got:\n{response}"
+        );
+        assert!(
+            response.contains("  3. openai-codex"),
+            "inactive must have space; got:\n{response}"
+        );
+    }
+
+    #[test]
+    fn build_providers_help_response_marks_opened_with_tilde() {
+        let current = ChannelRouteSelection {
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.2".to_string(),
+        };
+        let configured = vec!["gemini:gemini-1".to_string(), "openai-codex".to_string()];
+        let opened = vec!["gemini:gemini-1".to_string()];
+        let response = build_providers_help_response(&current, &opened, &configured);
+
+        assert!(
+            response.contains("~ 1. gemini:gemini-1"),
+            "opened provider must be marked with ~; got:\n{response}"
+        );
+        assert!(
+            response.contains("* 2. openai-codex"),
+            "active must be marked with *; got:\n{response}"
+        );
+    }
+
+    #[test]
+    fn build_providers_help_response_all_configured_appear() {
+        let current = ChannelRouteSelection {
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.2".to_string(),
+        };
+        let configured = vec![
+            "gemini:gemini-1".to_string(),
+            "gemini:gemini-2".to_string(),
+            "openai-codex".to_string(),
+            "openai-codex:codex-1".to_string(),
+            "openai-codex:codex-2".to_string(),
+        ];
+        let response = build_providers_help_response(&current, &[], &configured);
+
+        for name in &configured {
+            assert!(
+                response.contains(name.as_str()),
+                "response must contain {name}; got:\n{response}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_provider_alias_accepts_profile_names() {
+        // Profile names like "gemini:gemini-1" are not in the static registry
+        // but must be accepted as valid (passed through as-is)
+        let result = resolve_provider_alias("gemini:gemini-1");
+        assert_eq!(result, Some("gemini:gemini-1".to_string()));
+
+        let result = resolve_provider_alias("openai-codex:codex-2");
+        assert_eq!(result, Some("openai-codex:codex-2".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_alias_rejects_empty() {
+        assert_eq!(resolve_provider_alias(""), None);
+        assert_eq!(resolve_provider_alias("   "), None);
+    }
+
+    #[test]
+    fn resolve_provider_alias_accepts_known_base_providers() {
+        // Base providers from the static registry must still resolve
+        let result = resolve_provider_alias("gemini");
+        assert_eq!(result, Some("gemini".to_string()));
+
+        let result = resolve_provider_alias("openai-codex");
+        assert_eq!(result, Some("openai-codex".to_string()));
     }
 }

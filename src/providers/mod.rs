@@ -22,6 +22,7 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod cursor;
+pub mod error_parser;
 pub mod gemini;
 pub mod health;
 pub mod ollama;
@@ -1613,7 +1614,7 @@ fn create_provider_with_url_and_options(
 /// delimited profile, or `(original_str, None)` otherwise.  Entries starting
 /// with `custom:` or `anthropic-custom:` are left untouched because the colon
 /// is part of the URL scheme.
-fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
+pub(crate) fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
     if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
         return (s, None);
     }

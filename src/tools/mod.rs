@@ -781,18 +781,13 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Attach background execution wrappers to the finalized registry.
-    // This ensures `bg_run` / `bg_status` are available anywhere the
-    // runtime tool graph is used.
-    let built_tools = boxed_registry_from_arcs(tool_arcs);
-    let (extended_tools, _bg_job_store) = add_bg_tools(built_tools);
-    extended_tools
+    boxed_registry_from_arcs(tool_arcs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig, WasmRuntimeConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use crate::runtime::WasmRuntime;
     use serde_json::json;
     use tempfile::TempDir;
@@ -906,8 +901,9 @@ mod tests {
     #[test]
     fn default_tools_with_runtime_includes_wasm_module_for_wasm_runtime() {
         let security = Arc::new(SecurityPolicy::default());
-        let runtime: Arc<dyn RuntimeAdapter> =
-            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(WasmRuntime::new(
+            crate::runtime::WasmRuntimeConfig::default(),
+        ));
         let tools = default_tools_with_runtime(security, runtime);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"wasm_module"));
@@ -916,8 +912,9 @@ mod tests {
     #[test]
     fn default_tools_with_runtime_excludes_shell_and_fs_for_wasm_runtime() {
         let security = Arc::new(SecurityPolicy::default());
-        let runtime: Arc<dyn RuntimeAdapter> =
-            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(WasmRuntime::new(
+            crate::runtime::WasmRuntimeConfig::default(),
+        ));
         let tools = default_tools_with_runtime(security, runtime);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"shell"));
@@ -1066,8 +1063,9 @@ mod tests {
         };
         let mem: Arc<dyn Memory> =
             Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let runtime: Arc<dyn RuntimeAdapter> =
-            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(WasmRuntime::new(
+            crate::runtime::WasmRuntimeConfig::default(),
+        ));
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
@@ -1130,6 +1128,14 @@ mod tests {
             &cfg,
         );
 
+        // bg_run/bg_status are now added by callers (after skill tools),
+        // so all_tools_with_runtime no longer includes them directly.
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"bg_run"));
+        assert!(!names.contains(&"bg_status"));
+
+        // After add_bg_tools, they should be present.
+        let (tools, _store) = add_bg_tools(tools);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"bg_run"));
         assert!(names.contains(&"bg_status"));

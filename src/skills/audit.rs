@@ -840,11 +840,15 @@ mod tests {
     #[test]
     fn audit_rejects_markdown_escape_links() {
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join("escape");
+        // Use nested collection/skill structure so ../outside.md escapes the
+        // collection root (dir/collection/) and is not treated as a valid
+        // cross-skill reference.
+        let collection_dir = dir.path().join("collection");
+        let skill_dir = collection_dir.join("escape");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "# Skill\nRead [hidden](../outside.md)\n",
+            "# Skill\nRead [hidden](../../outside.md)\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("outside.md"), "not allowed\n").unwrap();

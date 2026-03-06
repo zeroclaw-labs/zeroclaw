@@ -617,7 +617,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
-    match crate::providers::create_provider(name, None) {
+    // Parse OAuth multi-profile syntax before validation
+    let (provider_name, _profile) = crate::providers::parse_provider_profile(name);
+
+    match crate::providers::create_provider(provider_name, None) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -1271,6 +1274,18 @@ mod tests {
             .find(|i| i.message.contains("fallback provider"));
         assert!(fb_item.is_some());
         assert_eq!(fb_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_accepts_oauth_profiles() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["gemini:profile-1".into()];
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        // Should NOT warn about valid provider with profile syntax
+        assert!(!items
+            .iter()
+            .any(|i| { i.severity == Severity::Warn && i.message.contains("gemini") }));
     }
 
     #[test]
