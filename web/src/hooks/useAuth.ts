@@ -44,8 +44,8 @@ export interface AuthProviderProps {
 }
 
 export function AuthProvider({ children }: AuthProviderProps) {
-  const [token, setTokenState] = useState<string | null>(readToken);
-  const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
+  const [token, setTokenState] = useState<string | null>(readToken());
+  const [authenticated, setAuthenticated] = useState<boolean>(checkAuth());
   const [loading, setLoading] = useState<boolean>(!checkAuth());
 
   // On mount: check if server requires pairing at all
