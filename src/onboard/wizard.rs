@@ -1138,18 +1138,25 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "openai-codex" => vec![
             (
-                "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (latest codex generation)".to_string(),
+                "gpt-5.4".to_string(),
+                "GPT-5.4 (flagship, default)".to_string(),
             ),
             (
-                "gpt-5-codex".to_string(),
-                "GPT-5 Codex (recommended)".to_string(),
+                "gpt-5.3-codex".to_string(),
+                "GPT-5.3 Codex (latest codex generation)".to_string(),
             ),
             (
                 "gpt-5.2-codex".to_string(),
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
-            ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+            (
+                "gpt-5.1-codex-max".to_string(),
+                "GPT-5.1 Codex Max (long-running tasks)".to_string(),
+            ),
+            (
+                "gpt-5.1-codex-mini".to_string(),
+                "GPT-5.1 Codex Mini (cost-effective)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -1574,8 +1581,16 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "gemini" => vec![
             (
+                "gemini-3.1-pro-preview".to_string(),
+                "Gemini 3.1 Pro Preview (latest frontier reasoning)".to_string(),
+            ),
+            (
+                "gemini-3-flash-preview".to_string(),
+                "Gemini 3 Flash Preview (fast Gemini 3)".to_string(),
+            ),
+            (
                 "gemini-3-pro-preview".to_string(),
-                "Gemini 3 Pro Preview (latest frontier reasoning)".to_string(),
+                "Gemini 3 Pro Preview (frontier reasoning)".to_string(),
             ),
             (
                 "gemini-2.5-pro".to_string(),
@@ -8214,9 +8229,11 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
+        assert!(ids.contains(&"gpt-5.4".to_string()));
         assert!(ids.contains(&"gpt-5.3-codex".to_string()));
-        assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+        assert!(ids.contains(&"gpt-5.1-codex-max".to_string()));
+        assert!(ids.contains(&"gpt-5.1-codex-mini".to_string()));
     }
 
     #[test]
