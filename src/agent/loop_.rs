@@ -128,18 +128,22 @@ fn retain_visible_tool_descriptions<'a>(
     tool_descs.retain(|(name, _)| visible_tools.contains(*name));
 }
 
-fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
-    if provider.supports_vision() {
-        return true;
-    }
-
-    // Guardrail for issue #2107: some anthropic setups have reported false
-    // negatives from provider capability probing even though Claude models
-    // accept image inputs. Keep the preflight permissive for anthropic routes
-    // and rely on upstream API validation if a specific model cannot handle
-    // vision.
-    let normalized = provider_name.trim().to_ascii_lowercase();
-    normalized == "anthropic" || normalized.starts_with("anthropic-custom:")
+/// Determine whether the current provider + config supports vision input.
+///
+/// Vision capability is resolved entirely through the provider contract:
+///
+/// 1. **Config override** (`model_support_vision = true/false` in TOML or
+///    `ZEROCLAW_MODEL_SUPPORT_VISION` env var) has final authority and is
+///    applied inside `ReliableProvider::supports_vision()`.
+/// 2. **Provider capability** — each `Provider` impl declares vision support
+///    via `capabilities().vision`. OpenAI and Gemini return `true`; providers
+///    for text-only backends return `false`.
+///
+/// No hardcoded model lists: models change faster than code ships.
+/// Users running non-standard models behind an OpenAI-compatible proxy
+/// should set `model_support_vision` in their config.
+fn should_treat_provider_as_vision_capable(provider: &dyn Provider) -> bool {
+    provider.supports_vision()
 }
 
 /// Slash-command definitions for interactive-mode completion.
@@ -1262,8 +1266,7 @@ pub async fn run_tool_call_loop(
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
-        let provider_supports_vision =
-            should_treat_provider_as_vision_capable(provider_name, provider);
+        let provider_supports_vision = should_treat_provider_as_vision_capable(provider);
         if image_marker_count > 0 && !provider_supports_vision {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
@@ -3926,6 +3929,11 @@ mod tests {
             self.capabilities.native_tool_calling = true;
             self
         }
+
+        fn with_vision_support(mut self) -> Self {
+            self.capabilities.vision = true;
+            self
+        }
     }
 
     #[async_trait]
@@ -4268,8 +4276,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_allows_anthropic_route_on_vision_probe_false_negative() {
-        let provider = ScriptedProvider::from_text_responses(vec!["vision-ok"]);
+    async fn run_tool_call_loop_allows_vision_when_provider_declares_support() {
+        let provider =
+            ScriptedProvider::from_text_responses(vec!["vision-ok"]).with_vision_support();
         let mut history = vec![ChatMessage::user(
             "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
@@ -4282,7 +4291,7 @@ mod tests {
             &tools_registry,
             &observer,
             "anthropic",
-            "opus-4-6",
+            "claude-opus-4-6",
             0.0,
             true,
             None,
@@ -4295,7 +4304,7 @@ mod tests {
             &[],
         )
         .await
-        .expect("anthropic route should not fail on a false-negative vision capability probe");
+        .expect("provider declaring vision support should process image input");
 
         assert_eq!(result, "vision-ok");
     }
