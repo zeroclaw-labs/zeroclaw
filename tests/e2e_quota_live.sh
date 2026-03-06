@@ -10,7 +10,7 @@
 #   bash tests/e2e_quota_live.sh --cli-only    # run only CLI tests (no agent)
 #
 # Environment:
-#   ZEROCLAW_CONFIG_DIR — override config dir (default: /home/spex/.zeroclaw)
+#   ZEROCLAW_CONFIG_DIR — override config dir (default: ~/.zeroclaw)
 #   ZEROCLAW_BIN        — override binary path (default: ./target/release/zeroclaw)
 #   TIMEOUT             — per-test timeout in seconds (default: 120)
 
@@ -31,6 +31,13 @@ for arg in "$@"; do
     --cli-only)   CLI_ONLY=true ;;
   esac
 done
+
+# Guard: this script mutates persistent config (auth-profiles.json, active_workspace.toml).
+# Require opt-in to prevent accidental state changes.
+if [ "${ZEROCLAW_TEST_ALLOW_CONFIG_MUTATION:-}" != "1" ]; then
+  echo "WARN: This test mutates persistent config. Set ZEROCLAW_TEST_ALLOW_CONFIG_MUTATION=1 to proceed."
+  exit 1
+fi
 
 # ── Colors ─────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -178,7 +185,11 @@ if [ -f "$AWF" ]; then
   current_dir=$(grep -oP 'config_dir\s*=\s*"\K[^"]+' "$AWF" 2>/dev/null || true)
   if [ -n "$current_dir" ] && [[ "$current_dir" == /tmp/* ]]; then
     log "Fixing active_workspace.toml: ${current_dir} -> ${ZEROCLAW_CONFIG_DIR}"
-    echo "config_dir = \"${ZEROCLAW_CONFIG_DIR}\"" > "$AWF"
+    if grep -qE '^\s*config_dir\s*=' "$AWF" 2>/dev/null; then
+      sed -i.bak -E "s|^(\s*config_dir\s*=\s*).*|\1\"${ZEROCLAW_CONFIG_DIR}\"|" "$AWF"
+    else
+      echo "config_dir = \"${ZEROCLAW_CONFIG_DIR}\"" >> "$AWF"
+    fi
   fi
 fi
 
@@ -331,6 +342,19 @@ if [ -f "$AP_FILE" ]; then
   log "Original active codex:  ${ORIG_ACTIVE_CODEX:-<none>}"
 fi
 
+restore_profiles() {
+  if [ -f "$AP_FILE" ]; then
+    if [ -n "$ORIG_ACTIVE_GEMINI" ]; then
+      switch_active_profile "gemini" "$(echo "$ORIG_ACTIVE_GEMINI" | sed 's/^gemini://')"
+    fi
+    if [ -n "$ORIG_ACTIVE_CODEX" ]; then
+      switch_active_profile "openai-codex" "$(echo "$ORIG_ACTIVE_CODEX" | sed 's/^openai-codex://')"
+    fi
+    log "Active profiles restored."
+  fi
+}
+trap restore_profiles EXIT
+
 if [ "$CLI_ONLY" = false ]; then
 
 # gemini-1 quota
@@ -366,19 +390,6 @@ run_agent_test \
   "quota|limit|available|provider|codex|rate"
 
 fi  # CLI_ONLY
-
-# Restore original active profiles
-log ""
-log "Restoring original active profiles..."
-if [ -f "$AP_FILE" ]; then
-  if [ -n "$ORIG_ACTIVE_GEMINI" ]; then
-    switch_active_profile "gemini" "$(echo "$ORIG_ACTIVE_GEMINI" | sed 's/^gemini://')"
-  fi
-  if [ -n "$ORIG_ACTIVE_CODEX" ]; then
-    switch_active_profile "openai-codex" "$(echo "$ORIG_ACTIVE_CODEX" | sed 's/^openai-codex://')"
-  fi
-  log "Active profiles restored."
-fi
 
 # ======================================================================
 #  Summary
