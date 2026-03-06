@@ -27,6 +27,56 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
 
+// ── Container detection for Docker/Kubernetes environments ───────
+
+/// Detects if the process is running inside a container (Docker, Podman, Kubernetes, etc.).
+/// Used to suggest appropriate localhost alternatives like `host.docker.internal`.
+fn is_running_in_container() -> bool {
+    // Check for Docker/Podman marker file
+    if Path::new("/.dockerenv").exists() {
+        return true;
+    }
+
+    // Check for Kubernetes environment
+    if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
+        return true;
+    }
+
+    // Check cgroup for container runtime signatures (Linux)
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+        let cgroup_lower = cgroup.to_lowercase();
+        if cgroup_lower.contains("docker")
+            || cgroup_lower.contains("containerd")
+            || cgroup_lower.contains("kubepods")
+            || cgroup_lower.contains("podman")
+        {
+            return true;
+        }
+    }
+
+    // Check for container environment variables
+    if std::env::var("container").is_ok() || std::env::var("DOCKER_HOST").is_ok() {
+        return true;
+    }
+
+    false
+}
+
+/// Returns the appropriate hostname for accessing services on the host machine.
+/// In containers, returns `host.docker.internal`; otherwise returns `localhost`.
+fn default_local_host() -> &'static str {
+    if is_running_in_container() {
+        "host.docker.internal"
+    } else {
+        "localhost"
+    }
+}
+
+/// Builds a default URL for a local service, using container-aware hostname.
+fn default_local_url(port: u16, path: &str) -> String {
+    format!("http://{}:{}{}", default_local_host(), port, path)
+}
+
 // ── Project context collected during wizard ──────────────────────
 
 /// User-provided personalization baked into workspace MD files.
@@ -1377,11 +1427,12 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
 fn fetch_ollama_models() -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
+    let endpoint = default_local_url(11434, "/api/tags");
     let payload: Value = client
-        .get("http://localhost:11434/api/tags")
+        .get(&endpoint)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .context("model fetch failed: GET http://localhost:11434/api/tags")?
+        .with_context(|| format!("model fetch failed: GET {endpoint}"))?
         .json()
         .context("failed to parse Ollama model list response")?;
 
@@ -1404,7 +1455,14 @@ fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
     reqwest::Url::parse(endpoint_url)
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+        .is_some_and(|host| {
+            // Strip brackets from IPv6 addresses for comparison
+            let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+            matches!(
+                host_clean,
+                "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "host.docker.internal"
+            )
+        })
 }
 
 fn ollama_uses_remote_endpoint(provider_api_url: Option<&str>) -> bool {
@@ -2304,13 +2362,17 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
             key
         } else {
-            print_bullet("Using local Ollama at http://localhost:11434 (no API key needed).");
+            let ollama_url = default_local_url(11434, "");
+            print_bullet(&format!(
+                "Using local Ollama at {} (no API key needed).",
+                style(&ollama_url).cyan()
+            ));
             String::new()
         }
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
         let raw_url: String = Input::new()
             .with_prompt("  llama.cpp server endpoint URL")
-            .default("http://localhost:8080/v1".into())
+            .default(default_local_url(8080, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2341,7 +2403,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "sglang" {
         let raw_url: String = Input::new()
             .with_prompt("  SGLang server endpoint URL")
-            .default("http://localhost:30000/v1".into())
+            .default(default_local_url(30000, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2372,7 +2434,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "vllm" {
         let raw_url: String = Input::new()
             .with_prompt("  vLLM server endpoint URL")
-            .default("http://localhost:8000/v1".into())
+            .default(default_local_url(8000, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2403,7 +2465,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "osaurus" {
         let raw_url: String = Input::new()
             .with_prompt("  Osaurus server endpoint URL")
-            .default("http://localhost:1337/v1".into())
+            .default(default_local_url(1337, "/v1"))
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -6839,6 +6901,48 @@ mod tests {
         )));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com")));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com/api")));
+    }
+
+    #[test]
+    fn ollama_endpoint_is_local_recognizes_docker_internal_host() {
+        // Standard localhost variants
+        assert!(ollama_endpoint_is_local("http://localhost:11434"));
+        assert!(ollama_endpoint_is_local("http://127.0.0.1:11434"));
+        assert!(ollama_endpoint_is_local("http://0.0.0.0:11434"));
+        assert!(ollama_endpoint_is_local("http://[::1]:11434"));
+
+        // Docker internal hostname (container-to-host communication)
+        assert!(ollama_endpoint_is_local("http://host.docker.internal:11434"));
+        assert!(ollama_endpoint_is_local("http://HOST.DOCKER.INTERNAL:11434"));
+
+        // Remote endpoints should not be considered local
+        assert!(!ollama_endpoint_is_local("https://ollama.example.com"));
+        assert!(!ollama_endpoint_is_local("http://192.168.1.100:11434"));
+    }
+
+    #[test]
+    fn ollama_uses_remote_endpoint_treats_docker_internal_as_local() {
+        assert!(!ollama_uses_remote_endpoint(Some(
+            "http://host.docker.internal:11434"
+        )));
+        assert!(!ollama_uses_remote_endpoint(Some(
+            "http://host.docker.internal:11434/api"
+        )));
+    }
+
+    #[test]
+    fn default_local_url_builds_correct_format() {
+        // This test verifies the URL format without depending on container detection
+        let url = default_local_url(11434, "/api/tags");
+        assert!(url.starts_with("http://"));
+        assert!(url.contains(":11434"));
+        assert!(url.ends_with("/api/tags"));
+    }
+
+    #[test]
+    fn default_local_url_handles_empty_path() {
+        let url = default_local_url(8080, "");
+        assert!(url.ends_with(":8080"));
     }
 
     #[test]
