@@ -882,6 +882,26 @@ pub enum AgentLoadBalanceStrategy {
     LeastLoaded,
 }
 
+/// Backend type for Phase 1 multi-agent coordination.
+///
+/// Determines how agent messages and shared state are stored and routed.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationBackend {
+    /// In-memory only (default, single-process).
+    Memory,
+    /// SQLite-based (persistent, single-process).
+    Sqlite,
+    /// Redis-based (distributed, multi-process).
+    Redis,
+}
+
+impl Default for CoordinationBackend {
+    fn default() -> Self {
+        Self::Memory
+    }
+}
+
 /// Delegate coordination runtime configuration (`[coordination]` section).
 ///
 /// Controls typed delegate message-bus integration used by `delegate` and
@@ -906,6 +926,33 @@ pub struct CoordinationConfig {
     /// Maximum retained dedupe window size for processed message IDs.
     #[serde(default = "default_coordination_max_seen_message_ids")]
     pub max_seen_message_ids: usize,
+
+    // Phase 1 multi-agent communication fields
+    /// Message channel backend for Phase 1 inter-agent communication.
+    #[serde(default)]
+    pub channel_backend: CoordinationBackend,
+    /// Shared state backend for Phase 1 multi-agent coordination.
+    #[serde(default)]
+    pub state_backend: CoordinationBackend,
+    /// This agent's ID for Phase 1 communication (None = auto-generate).
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Message TTL in seconds for Phase 1 messages.
+    #[serde(default = "default_message_ttl")]
+    pub message_ttl_seconds: u64,
+    /// State TTL in seconds for Phase 1 shared state entries.
+    #[serde(default = "default_state_ttl")]
+    pub state_ttl_seconds: u64,
+}
+
+/// Default message TTL: 1 hour.
+fn default_message_ttl() -> u64 {
+    3600
+}
+
+/// Default state TTL: 24 hours.
+fn default_state_ttl() -> u64 {
+    86400
 }
 
 impl Default for CoordinationConfig {
@@ -917,6 +964,11 @@ impl Default for CoordinationConfig {
             max_dead_letters: default_coordination_max_dead_letters(),
             max_context_entries: default_coordination_max_context_entries(),
             max_seen_message_ids: default_coordination_max_seen_message_ids(),
+            channel_backend: CoordinationBackend::default(),
+            state_backend: CoordinationBackend::default(),
+            agent_id: None,
+            message_ttl_seconds: default_message_ttl(),
+            state_ttl_seconds: default_state_ttl(),
         }
     }
 }
@@ -7865,6 +7917,51 @@ impl Config {
 
         if let Some(base_url) = base_url {
             self.default_provider = Some(format!("custom:{base_url}"));
+        }
+    }
+
+    /// Load agent definitions from the agents directory and merge with config agents.
+    ///
+    /// This method discovers YAML agent definition files in the workspace's `agents/`
+    /// directory and adds them to the `config.agents` HashMap. Agents defined in the
+    /// config file take precedence over file-based agents with the same ID.
+    pub async fn load_agents_from_registry(&mut self) -> Result<usize> {
+        use crate::agent::AgentRegistry;
+        use crate::security::SecurityPolicy;
+        use std::sync::Arc;
+
+        let agents_dir = self.workspace_dir.join("agents");
+        let security = Arc::new(SecurityPolicy::default());
+        let registry = AgentRegistry::new(agents_dir, security)?;
+
+        match registry.discover() {
+            Ok(count) => {
+                if count > 0 {
+                    let file_agents = registry.all_as_delegate_configs();
+                    let mut merged_count = 0;
+
+                    for (id, agent_config) in file_agents {
+                        // Config-defined agents take precedence
+                        if !self.agents.contains_key(&id) {
+                            self.agents.insert(id, agent_config);
+                            merged_count += 1;
+                        }
+                    }
+
+                    tracing::info!(
+                        total = count,
+                        merged = merged_count,
+                        "Loaded agent definitions from registry"
+                    );
+                    Ok(merged_count)
+                } else {
+                    Ok(0)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to discover agent definitions: {}", e);
+                Ok(0)
+            }
         }
     }
 

@@ -40,6 +40,7 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+serde_yaml = "0.9"
 
 # Config
 directories = "6.0"
@@ -128,6 +129,9 @@ console = "0.16"
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
+
+# File system watcher for agent hot-reload
+notify = "7"
 
 # Binary discovery (init system detection)
 which = "8.0"

@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 28, 2026**.
+Last verified: **March 6, 2026**.
 
 Config path resolution at startup:
 
@@ -140,6 +140,36 @@ Notes:
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 - **Loop detection** intervenes before `max_tool_iterations` is exhausted. On first detection the agent receives a self-correction prompt; if the loop persists the agent is stopped early. Detection is result-aware: repeated calls with *different* outputs (genuine progress) do not trigger. Set any threshold to `0` to disable that detector.
+
+## `[coordination]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable delegate coordination tracing/runtime bus integration |
+| `lead_agent` | `"delegate-lead"` | Designated lead agent ID for coordination |
+| `max_inbox_messages_per_agent` | `256` | Maximum inbox messages per agent |
+| `max_dead_letters` | `256` | Maximum dead letter messages |
+| `max_context_entries` | `512` | Maximum context entries per coordination session |
+| `max_seen_message_ids` | `4096` | Maximum seen message IDs for deduplication |
+
+Notes:
+
+- Coordination enables synchronous delegation (`delegate`) and team-wide coordination.
+- When `enabled = true`, `lead_agent` must not be empty.
+- All limit values must be greater than zero when coordination is enabled.
+- These settings govern the `delegate_coordination_status` tool.
+
+Example:
+
+```toml
+[coordination]
+enabled = true
+lead_agent = "runtime-lead"
+max_inbox_messages_per_agent = 256
+max_dead_letters = 256
+max_context_entries = 512
+max_seen_message_ids = 4096
+```
 
 ## `[security.otp]`
 

@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agent_load_tracker;
+pub mod agent_message;
 pub mod agent_selection;
 pub mod agents_ipc;
 pub mod apply_patch;
@@ -34,7 +35,9 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
-pub mod delegate_coordination_status;
+
+#[cfg(test)]
+pub mod delegate_tests;
 pub mod docx_read;
 #[cfg(feature = "channel-lark")]
 pub mod feishu_doc;
@@ -71,6 +74,7 @@ pub mod quota_tools;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod shared_state;
 pub mod shell;
 pub mod subagent_list;
 pub mod subagent_manage;
@@ -88,6 +92,7 @@ pub mod web_search_tool;
 pub mod xlsx_read;
 
 pub use agent_load_tracker::AgentLoadTracker;
+pub use agent_message::InterAgentMessageTool;
 pub use apply_patch::ApplyPatchTool;
 #[allow(unused_imports)]
 pub use bg_run::{
@@ -105,7 +110,6 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
-pub use delegate_coordination_status::DelegateCoordinationStatusTool;
 pub use docx_read::DocxReadTool;
 #[cfg(feature = "channel-lark")]
 pub use feishu_doc::FeishuDocTool;
@@ -139,6 +143,7 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use shared_state::SharedStateTool;
 pub use shell::ShellTool;
 pub use subagent_list::SubAgentListTool;
 pub use subagent_manage::SubAgentManageTool;
@@ -566,65 +571,53 @@ pub fn all_tools_with_runtime(
         let runtime_config_path = Some(root_config.config_path.clone());
         let parent_tools = Arc::new(tool_arcs.clone());
         let load_tracker = AgentLoadTracker::new();
-        let mut delegate_tool = DelegateTool::new_with_options(
-            delegate_agents.clone(),
-            delegate_fallback_credential.clone(),
-            security.clone(),
-            provider_runtime_options.clone(),
-        )
-        .with_parent_tools(parent_tools.clone())
-        .with_multimodal_config(root_config.multimodal.clone())
-        .with_load_tracker(load_tracker.clone())
-        .with_runtime_team_settings(
-            root_config.agent.teams.enabled,
-            root_config.agent.teams.auto_activate,
-            root_config.agent.teams.max_agents,
-            runtime_config_path.clone(),
-        );
 
-        if root_config.coordination.enabled {
-            let coordination_lead_agent = {
-                let value = root_config.coordination.lead_agent.trim();
-                if value.is_empty() {
-                    "delegate-lead".to_string()
+        // Create agent registry for file-based agent definitions
+        let agents_dir = root_config
+            .config_path
+            .parent()
+            .map(|p| p.join("agents"));
+        let agent_registry = agents_dir
+            .and_then(|dir| {
+                if dir.is_dir() {
+                    let dir_display = dir.display().to_string();
+                    match crate::agent::AgentRegistry::new(dir, security.clone()) {
+                        Ok(registry) => {
+                            tracing::info!("Loaded agent registry from {}", dir_display);
+                            Some(Arc::new(registry))
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to load agent registry from {}: {e}", dir_display);
+                            None
+                        }
+                    }
                 } else {
-                    value.to_string()
+                    tracing::debug!("Agent directory does not exist: {}", dir.display());
+                    None
                 }
-            };
-            let coordination_bus = crate::coordination::InMemoryMessageBus::with_limits(
-                crate::coordination::InMemoryMessageBusLimits {
-                    max_inbox_messages_per_agent: root_config
-                        .coordination
-                        .max_inbox_messages_per_agent,
-                    max_dead_letters: root_config.coordination.max_dead_letters,
-                    max_context_entries: root_config.coordination.max_context_entries,
-                    max_seen_message_ids: root_config.coordination.max_seen_message_ids,
-                },
-            );
-            if let Err(error) = coordination_bus.register_agent(coordination_lead_agent.clone()) {
-                tracing::warn!(
-                    "delegate coordination: failed to register lead agent '{coordination_lead_agent}': {error}"
-                );
-            }
-            for agent_name in delegate_agents.keys() {
-                if let Err(error) = coordination_bus.register_agent(agent_name.clone()) {
-                    tracing::warn!(
-                        "delegate coordination: failed to register agent '{agent_name}': {error}"
-                    );
-                }
-            }
+            });
 
-            delegate_tool = delegate_tool
-                .with_coordination_bus(coordination_bus.clone(), coordination_lead_agent);
-            tool_arcs.push(Arc::new(delegate_tool));
-            tool_arcs.push(Arc::new(DelegateCoordinationStatusTool::new(
-                coordination_bus,
+        // Create delegate tool with registry support
+        let delegate_tool = if let Some(registry) = agent_registry {
+            DelegateTool::with_registry_and_fallback_and_options(
+                registry.clone(),
+                delegate_agents.clone(),
+                delegate_fallback_credential.clone(),
                 security.clone(),
-            )));
+                provider_runtime_options.clone(),
+            )
         } else {
-            delegate_tool = delegate_tool.with_coordination_disabled();
-            tool_arcs.push(Arc::new(delegate_tool));
+            DelegateTool::new_with_options(
+                delegate_agents.clone(),
+                delegate_fallback_credential.clone(),
+                security.clone(),
+                provider_runtime_options.clone(),
+            )
         }
+        .with_parent_tools(parent_tools.clone())
+        .with_multimodal_config(root_config.multimodal.clone());
+
+        tool_arcs.push(Arc::new(delegate_tool));
 
         let subagent_registry = Arc::new(SubAgentRegistry::new());
         tool_arcs.push(Arc::new(
@@ -699,6 +692,329 @@ pub fn all_tools_with_runtime(
     // Attach background execution wrappers to the finalized registry.
     // This ensures `bg_run` / `bg_status` are available anywhere the
     // runtime tool graph is used.
+    let built_tools = boxed_registry_from_arcs(tool_arcs);
+    let (extended_tools, _bg_job_store) = add_bg_tools(built_tools);
+    extended_tools
+}
+
+/// Create full tool registry with external agent registry support.
+///
+/// This is a variant of `all_tools_with_runtime` that accepts an external
+/// `AgentRegistry` parameter for file-based agent definitions.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn all_tools_with_runtime_and_registry(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
+    web_fetch_config: &crate::config::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, DelegateAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &crate::config::Config,
+    agent_registry: Option<&std::sync::Arc<crate::agent::AgentRegistry>>,
+) -> Vec<Box<dyn Tool>> {
+    let has_shell_access = runtime.has_shell_access();
+    let has_filesystem_access = runtime.has_filesystem_access();
+    let zeroclaw_dir = root_config
+        .config_path
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| runtime.storage_path());
+    let syscall_detector = Arc::new(crate::security::SyscallAnomalyDetector::new(
+        root_config.security.syscall_anomaly.clone(),
+        &zeroclaw_dir,
+        root_config.security.audit.clone(),
+    ));
+
+    let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(CronListTool::new(config.clone())),
+        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryObserveTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(TaskPlanTool::new(security.clone())),
+        Arc::new(ModelRoutingConfigTool::new(
+            config.clone(),
+            security.clone(),
+        )),
+        Arc::new(ChannelAckConfigTool::new(config.clone(), security.clone())),
+        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
+        Arc::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
+        Arc::new(PushoverTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
+        Arc::new(OpenClawMigrationTool::new(
+            config.clone(),
+            security.clone(),
+        )),
+        Arc::new(ProcessTool::new_with_syscall_detector(
+            security.clone(),
+            runtime.clone(),
+            Some(syscall_detector.clone()),
+        )),
+        Arc::new(ScreenshotTool::new(security.clone())),
+        Arc::new(ImageInfoTool::new(security.clone())),
+    ];
+
+    // Add shell and file tools based on runtime capabilities
+    if has_shell_access {
+        tool_arcs.push(Arc::new(ShellTool::new(
+            security.clone(),
+            runtime.clone(),
+        )));
+    }
+    if has_filesystem_access {
+        tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
+        tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
+        tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
+        tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
+        tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
+    }
+
+    if browser_config.enabled {
+        let browser_choice = browser_open::BrowserChoice::from_str(&browser_config.browser_open);
+        if browser_choice != browser_open::BrowserChoice::Disable {
+            tool_arcs.push(Arc::new(BrowserOpenTool::new(
+                security.clone(),
+                browser_config.allowed_domains.clone(),
+                root_config.security.url_access.clone(),
+                browser_choice,
+            )));
+        }
+        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.session_name.clone(),
+            browser_config.backend.clone(),
+            browser_config.auto_backend_priority.clone(),
+            browser_config.agent_browser_command.clone(),
+            browser_config.agent_browser_extra_args.clone(),
+            browser_config.agent_browser_timeout_ms,
+            browser_config.native_headless,
+            browser_config.native_webdriver_url.clone(),
+            browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
+        )));
+    }
+
+    if http_config.enabled {
+        tool_arcs.push(Arc::new(HttpRequestTool::new(
+            security.clone(),
+            http_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
+            http_config.max_response_size,
+            http_config.timeout_secs,
+            http_config.user_agent.clone(),
+            http_config.credential_profiles.clone(),
+        )));
+    }
+
+    if web_fetch_config.enabled {
+        tool_arcs.push(Arc::new(WebFetchTool::new(
+            security.clone(),
+            web_fetch_config.provider.clone(),
+            web_fetch_config.api_key.clone(),
+            web_fetch_config.api_url.clone(),
+            web_fetch_config.allowed_domains.clone(),
+            web_fetch_config.blocked_domains.clone(),
+            root_config.security.url_access.clone(),
+            web_fetch_config.max_response_size,
+            web_fetch_config.timeout_secs,
+            web_fetch_config.user_agent.clone(),
+        )));
+    }
+
+    if root_config.web_search.enabled {
+        tool_arcs.push(Arc::new(WebSearchTool::new_with_options(
+            security.clone(),
+            root_config.web_search.provider.clone(),
+            root_config.web_search.api_key.clone(),
+            root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.perplexity_api_key.clone(),
+            root_config.web_search.exa_api_key.clone(),
+            root_config.web_search.jina_api_key.clone(),
+            root_config.web_search.api_url.clone(),
+            root_config.web_search.max_results,
+            root_config.web_search.timeout_secs,
+            root_config.web_search.user_agent.clone(),
+            root_config.web_search.fallback_providers.clone(),
+            root_config.web_search.retries_per_provider,
+            root_config.web_search.retry_backoff_ms,
+            root_config.web_search.domain_filter.clone(),
+            root_config.web_search.language_filter.clone(),
+            root_config.web_search.country.clone(),
+            root_config.web_search.recency_filter.clone(),
+            root_config.web_search.max_tokens,
+            root_config.web_search.max_tokens_per_page,
+            root_config.web_search.exa_search_type.clone(),
+            root_config.web_search.exa_include_text,
+            root_config.web_search.jina_site_filters.clone(),
+        )));
+    }
+
+    tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+
+    if let Some(key) = composio_key {
+        if !key.is_empty() {
+            tool_arcs.push(Arc::new(ComposioTool::new(
+                key,
+                composio_entity_id,
+                security.clone(),
+            )));
+        }
+    }
+
+    // Build delegate tool with external registry support
+    let has_agents = !agents.is_empty() || agent_registry.is_some_and(|r| r.count() > 0);
+
+    if has_agents {
+        let all_agents: HashMap<String, DelegateAgentConfig> = agents
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        let delegate_agents = all_agents.clone();
+        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+            let trimmed_value = value.trim();
+            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+        });
+        let parent_tools = Arc::new(tool_arcs.clone());
+        let load_tracker = AgentLoadTracker::new();
+
+        let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: root_config.api_url.clone(),
+            provider_transport: root_config.effective_provider_transport(),
+            zeroclaw_dir: root_config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from),
+            secrets_encrypt: root_config.secrets.encrypt,
+            reasoning_enabled: root_config.runtime.reasoning_enabled,
+            reasoning_level: root_config.effective_provider_reasoning_level(),
+            custom_provider_api_mode: root_config
+                .provider_api
+                .map(|mode| mode.as_compatible_mode()),
+            max_tokens_override: None,
+            model_support_vision: root_config.model_support_vision,
+        };
+        let runtime_config_path = Some(root_config.config_path.clone());
+
+        // Create delegate tool with registry support
+        let delegate_tool = if let Some(registry) = agent_registry {
+            DelegateTool::with_registry_and_fallback_and_options(
+                registry.clone(),
+                delegate_agents.clone(),
+                delegate_fallback_credential.clone(),
+                security.clone(),
+                provider_runtime_options.clone(),
+            )
+        } else {
+            DelegateTool::new_with_options(
+                delegate_agents.clone(),
+                delegate_fallback_credential.clone(),
+                security.clone(),
+                provider_runtime_options.clone(),
+            )
+        }
+        .with_parent_tools(parent_tools.clone())
+        .with_multimodal_config(root_config.multimodal.clone());
+
+        tool_arcs.push(Arc::new(delegate_tool));
+
+        let subagent_registry = Arc::new(SubAgentRegistry::new());
+        tool_arcs.push(Arc::new(
+            SubAgentSpawnTool::new(
+                all_agents,
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+                subagent_registry.clone(),
+                parent_tools,
+                root_config.multimodal.clone(),
+                root_config.agent.subagents.enabled,
+                root_config.agent.subagents.max_concurrent,
+                root_config.agent.subagents.auto_activate,
+                runtime_config_path,
+            )
+            .with_load_tracker(load_tracker),
+        ));
+        tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
+        tool_arcs.push(Arc::new(SubAgentManageTool::new(
+            subagent_registry,
+            security.clone(),
+        )));
+    }
+
+    // Feishu document tools (enabled when channel-lark feature is active)
+    #[cfg(feature = "channel-lark")]
+    {
+        let feishu_creds = root_config
+            .channels_config
+            .feishu
+            .as_ref()
+            .map(|fs| (fs.app_id.clone(), fs.app_secret.clone(), true))
+            .or_else(|| {
+                root_config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .map(|lk| (lk.app_id.clone(), lk.app_secret.clone(), lk.use_feishu))
+            });
+
+        if let Some((app_id, app_secret, use_feishu)) = feishu_creds {
+            let app_id = app_id.trim().to_string();
+            let app_secret = app_secret.trim().to_string();
+            if app_id.is_empty() || app_secret.is_empty() {
+                tracing::warn!(
+                    "feishu_doc: skipped registration because app credentials are empty"
+                );
+            } else {
+                tool_arcs.push(Arc::new(FeishuDocTool::new(
+                    app_id,
+                    app_secret,
+                    use_feishu,
+                    security.clone(),
+                )));
+            }
+        }
+    }
+
+    // Add declared plugin tools from the active plugin registry.
+    if config.plugins.enabled {
+        let registry = plugins::runtime::current_registry();
+        for tool in registry.tools() {
+            tool_arcs.push(Arc::new(PluginManifestTool::new(ToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })));
+        }
+    }
+
+    // Attach background execution wrappers to the finalized registry.
     let built_tools = boxed_registry_from_arcs(tool_arcs);
     let (extended_tools, _bg_job_store) = add_bg_tools(built_tools);
     extended_tools
@@ -1106,7 +1422,6 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
-        assert!(names.contains(&"delegate_coordination_status"));
     }
 
     #[test]
@@ -1194,11 +1509,10 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
-        assert!(!names.contains(&"delegate_coordination_status"));
     }
 
     #[test]
-    fn all_tools_keeps_delegate_registered_when_team_toggle_is_off() {
+    fn all_tools_keeps_delegate_registered_with_agents_configured() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {

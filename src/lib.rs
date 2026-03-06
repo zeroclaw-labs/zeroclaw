@@ -67,7 +67,7 @@ pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
 #[allow(unused_imports)]
-pub(crate) mod plugins;
+pub mod plugins;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
@@ -497,4 +497,116 @@ Examples:
     },
     /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
     FlashNucleo,
+}
+
+/// Agent management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentCommands {
+    /// List all registered agents
+    #[command(long_about = "\
+List all registered agent definitions.
+
+Displays all available agents discovered from the agents directory \
+with their IDs, names, versions, and descriptions.
+
+Examples:
+  zeroclaw agent list")]
+    List,
+    /// Show detailed information about a specific agent
+    #[command(long_about = "\
+Show detailed information about a specific agent.
+
+Displays full configuration details for the specified agent including \
+execution settings, provider configuration, tools, and system prompt.
+
+Examples:
+  zeroclaw agent show researcher
+  zeroclaw agent show worker")]
+    Show {
+        /// Agent ID or name
+        name: String,
+    },
+    /// Reload agent definitions from disk
+    #[command(long_about = "\
+Reload agent definitions from disk.
+
+Rediscover and reload all agent definition files from the agents \
+directory. Useful for picking up new or modified agent definitions \
+without restarting the daemon.
+
+Examples:
+  zeroclaw agent reload")]
+    Reload,
+    /// Run an agent with a prompt
+    #[command(long_about = "\
+Run an agent with the specified prompt.
+
+Executes the named agent with the given prompt input. The agent \
+will use its configured provider, tools, and system prompt.
+
+Examples:
+  zeroclaw agent run researcher \"What is the latest in quantum computing?\"
+  zeroclaw agent run coder \"Fix the bug in main.rs\"")]
+    Run {
+        /// Agent ID or name to run
+        name: String,
+        /// Prompt to send to the agent
+        prompt: String,
+    },
+}
+
+/// Team management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TeamCommands {
+    /// List all registered teams
+    #[command(long_about = "\
+List all registered team definitions.
+
+Displays all available teams discovered from the teams directory \
+with their IDs, names, topologies, and member counts.
+
+Examples:
+  zeroclaw teams list")]
+    List,
+    /// Show detailed information about a specific team
+    #[command(long_about = "\
+Show detailed information about a specific team.
+
+Displays full configuration details for the specified team including \
+topology, coordination settings, budget, and member roles.
+
+Examples:
+  zeroclaw teams show research-team
+  zeroclaw teams show dev-team")]
+    Show {
+        /// Team ID or name
+        name: String,
+    },
+    /// Reload team definitions from disk
+    #[command(long_about = "\
+Reload team definitions from disk.
+
+Rediscover and reload all team definition files from the teams \
+directory. Useful for picking up new or modified team definitions \
+without restarting the daemon.
+
+Examples:
+  zeroclaw teams reload")]
+    Reload,
+    /// Run a team with a task/prompt
+    #[command(long_about = "\
+Run a team with the specified prompt.
+
+Executes the named team with the given prompt input. The team \
+will coordinate work among its members based on the configured topology.
+
+Examples:
+  zeroclaw teams run research-team \"Analyze the latest AI trends\"
+  zeroclaw teams run dev-team \"Implement the new feature\"")]
+    Run {
+        /// Team ID or name to run
+        name: String,
+        /// Prompt/task to send to the team
+        prompt: String,
+    },
 }

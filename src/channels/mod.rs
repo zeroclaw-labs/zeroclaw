@@ -6967,7 +6967,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7041,7 +7041,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7129,7 +7129,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7216,7 +7216,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7362,7 +7362,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),

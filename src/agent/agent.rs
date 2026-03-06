@@ -277,6 +277,28 @@ impl Agent {
             config.api_key.as_deref(),
         )?);
 
+        // ── Agent Registry (file-based agent definitions) ───────────────
+        let agent_registry = match crate::agent::AgentRegistry::from_workspace_dir(&config.workspace_dir) {
+            Ok(registry) => {
+                let registry = Arc::new(registry);
+                match registry.discover() {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(count, "Loaded agent definitions from registry");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to discover agent definitions");
+                    }
+                }
+                Some(registry)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create agent registry");
+                None
+            }
+        };
+
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()
         } else {
@@ -288,7 +310,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let tools = tools::all_tools_with_runtime_and_registry(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -302,6 +324,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            agent_registry.as_ref(),
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");

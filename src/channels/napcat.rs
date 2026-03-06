@@ -480,7 +480,7 @@ mod tests {
             "message_type": "private",
             "message_id": 99,
             "user_id": 10001,
-            "time": 1700000000,
+            "time": 1_700_000_000,
             "message": [{"type":"text","data":{"text":"hi"}}]
         });
 

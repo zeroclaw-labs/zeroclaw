@@ -21,6 +21,19 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    // Multi-agent coordination events
+    AgentRegistered,
+    AgentUnregistered,
+    AgentHotReload,
+    AgentDiscovery,
+    DelegationStart,
+    DelegationEnd,
+    DelegationDenied,
+    TeamCreated,
+    TeamModified,
+    TeamDeleted,
+    TeamTopologyChange,
+    RateLimitExceeded,
 }
 
 /// Actor information (who performed the action)
@@ -231,6 +244,147 @@ impl AuditLogger {
             success,
             duration_ms,
         })
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Multi-Agent Coordination Audit Helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Log agent registration event
+    pub fn log_agent_registered(
+        &self,
+        agent_id: &str,
+        source: &str,
+        success: bool,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::AgentRegistered)
+            .with_actor("agent_registry".to_string(), None, Some(agent_id.to_string()))
+            .with_result(success, None, 0, None);
+        self.log(&event)
+    }
+
+    /// Log agent unregistration event
+    pub fn log_agent_unregistered(
+        &self,
+        agent_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::AgentUnregistered)
+            .with_actor("agent_registry".to_string(), None, Some(agent_id.to_string()))
+            .with_result(true, None, 0, Some(reason.to_string()));
+        self.log(&event)
+    }
+
+    /// Log agent discovery/hot reload event
+    pub fn log_agent_discovery(
+        &self,
+        agents_found: usize,
+        _source: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::AgentDiscovery)
+            .with_actor("agent_registry".to_string(), None, None)
+            .with_result(true, None, 0, Some(format!("{} agents found", agents_found)));
+        self.log(&event)
+    }
+
+    /// Log delegation start event
+    pub fn log_delegation_start(
+        &self,
+        delegating_agent: &str,
+        target_agent: &str,
+        depth: u32,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::DelegationStart)
+            .with_actor(delegating_agent.to_string(), None, Some(target_agent.to_string()))
+            .with_result(true, None, 0, Some(format!("depth: {}", depth)));
+        self.log(&event)
+    }
+
+    /// Log delegation end event
+    pub fn log_delegation_end(
+        &self,
+        delegating_agent: &str,
+        target_agent: &str,
+        success: bool,
+        duration_ms: u64,
+        error: Option<String>,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::DelegationEnd)
+            .with_actor(delegating_agent.to_string(), None, Some(target_agent.to_string()))
+            .with_result(success, None, duration_ms, error);
+        self.log(&event)
+    }
+
+    /// Log delegation denied event (rate limit, auth, etc.)
+    pub fn log_delegation_denied(
+        &self,
+        delegating_agent: &str,
+        target_agent: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::DelegationDenied)
+            .with_actor(delegating_agent.to_string(), None, Some(target_agent.to_string()))
+            .with_result(false, None, 0, Some(reason.to_string()));
+        self.log(&event)
+    }
+
+    /// Log team creation event
+    pub fn log_team_created(
+        &self,
+        team_id: &str,
+        member_count: usize,
+        topology: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::TeamCreated)
+            .with_actor("team_registry".to_string(), None, Some(team_id.to_string()))
+            .with_result(
+                true,
+                None,
+                0,
+                Some(format!(
+                    "members: {}, topology: {}",
+                    member_count, topology
+                )),
+            );
+        self.log(&event)
+    }
+
+    /// Log team modification event
+    pub fn log_team_modified(
+        &self,
+        team_id: &str,
+        change_type: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::TeamModified)
+            .with_actor("team_registry".to_string(), None, Some(team_id.to_string()))
+            .with_result(true, None, 0, Some(change_type.to_string()));
+        self.log(&event)
+    }
+
+    /// Log team deletion event
+    pub fn log_team_deleted(
+        &self,
+        team_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::TeamDeleted)
+            .with_actor("team_registry".to_string(), None, Some(team_id.to_string()))
+            .with_result(true, None, 0, Some(reason.to_string()));
+        self.log(&event)
+    }
+
+    /// Log rate limit exceeded event
+    pub fn log_rate_limit_exceeded(
+        &self,
+        agent_id: &str,
+        operation: &str,
+        retry_after_ms: u64,
+    ) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::RateLimitExceeded)
+            .with_actor(agent_id.to_string(), None, Some(operation.to_string()))
+            .with_security(Some(format!("retry_after: {}ms", retry_after_ms)))
+            .with_result(false, None, 0, Some("Rate limit exceeded".to_string()));
+        self.log(&event)
     }
 
     /// Rotate log if it exceeds max size

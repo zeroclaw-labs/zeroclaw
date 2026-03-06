@@ -21,9 +21,12 @@
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod delegation;
 pub mod detect;
 pub mod docker;
 pub mod file_link_guard;
+#[cfg(target_os = "linux")]
+pub mod firejail;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
@@ -33,6 +36,7 @@ pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
 pub mod leak_detector;
+pub mod rate_limit;
 pub mod otp;
 pub mod pairing;
 pub mod perplexity;
@@ -47,8 +51,12 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
+pub use delegation::{DelegationToken, DelegationStore, MAX_DELEGATION_DEPTH};
+#[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
+#[allow(unused_imports)]
+pub use rate_limit::{AgentRateLimiter, RateLimitConfig, RateLimitError};
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 #[allow(unused_imports)]

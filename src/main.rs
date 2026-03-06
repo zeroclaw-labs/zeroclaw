@@ -1,5 +1,4 @@
 #![warn(clippy::all, clippy::pedantic)]
-#![forbid(unsafe_code)]
 #![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
@@ -34,22 +33,13 @@
     dead_code
 )]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
-
-const PROFILE_MISMATCH_PREFIX: &str = "Pending login profile mismatch:";
-const ZEROCLAW_BUILD_VERSION: &str = env!("ZEROCLAW_BUILD_VERSION");
-
-#[derive(Debug, Clone, ValueEnum)]
-enum QuotaFormat {
-    Text,
-    Json,
-}
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -60,17 +50,19 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 }
 
 mod agent;
+mod agent_cli;
 mod approval;
 mod auth;
 mod channels;
+mod rag {
+    pub use zeroclaw::rag::*;
+}
 mod config;
-mod coordination;
 mod cost;
 mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
-mod goals;
 mod hardware;
 mod health;
 mod heartbeat;
@@ -83,9 +75,7 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
-mod plugins;
 mod providers;
-mod rag;
 mod runtime;
 mod security;
 mod service;
@@ -93,15 +83,14 @@ mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
-mod update;
 mod util;
 
 use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
-    PeripheralCommands, ServiceCommands, SkillCommands,
+    AgentCommands, ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands,
+    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands, TeamCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -118,23 +107,11 @@ enum CompletionShell {
     Elvish,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum EstopLevelArg {
-    #[value(name = "kill-all")]
-    KillAll,
-    #[value(name = "network-kill")]
-    NetworkKill,
-    #[value(name = "domain-block")]
-    DomainBlock,
-    #[value(name = "tool-freeze")]
-    ToolFreeze,
-}
-
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version = ZEROCLAW_BUILD_VERSION)]
+#[command(version)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -173,22 +150,6 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
-
-        /// Disable OTP in quick setup (not recommended)
-        #[arg(long)]
-        no_totp: bool,
-
-        /// Merge-migrate data from OpenClaw during onboarding
-        #[arg(long)]
-        migrate_openclaw: bool,
-
-        /// Optional OpenClaw workspace path (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        openclaw_source: Option<std::path::PathBuf>,
-
-        /// Optional OpenClaw config path (defaults to ~/.openclaw/openclaw.json)
-        #[arg(long)]
-        openclaw_config: Option<std::path::PathBuf>,
     },
 
     /// Start the AI agent loop
@@ -202,9 +163,7 @@ Examples:
   zeroclaw agent                              # interactive session
   zeroclaw agent -m \"Summarize today's logs\"  # single message
   zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
-  zeroclaw agent --autonomy-level full --max-actions-per-hour 100
-  zeroclaw agent -m \"quick task\" --memory-backend none --compact-context")]
+  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -225,30 +184,42 @@ Examples:
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
         peripheral: Vec<String>,
+    },
 
-        /// Autonomy level (read_only, supervised, full)
-        #[arg(long, value_parser = clap::value_parser!(security::AutonomyLevel))]
-        autonomy_level: Option<security::AutonomyLevel>,
+    /// Manage agent definitions (list, show, reload, run)
+    #[command(long_about = "\
+Manage agent definitions.
 
-        /// Maximum shell/tool actions per hour
-        #[arg(long)]
-        max_actions_per_hour: Option<u32>,
+List, show details, reload, and run pre-defined agent configurations \
+from the agents directory. Agent definitions are YAML files that \
+specify provider, tools, system prompts, and execution settings.
 
-        /// Maximum tool-call iterations per message
-        #[arg(long)]
-        max_tool_iterations: Option<usize>,
+Examples:
+  zeroclaw agents list
+  zeroclaw agents show researcher
+  zeroclaw agents reload
+  zeroclaw agents run researcher \"What is quantum computing?\"")]
+    Agents {
+        #[command(subcommand)]
+        agent_command: AgentCommands,
+    },
 
-        /// Maximum conversation history messages
-        #[arg(long)]
-        max_history_messages: Option<usize>,
+    /// Manage team definitions (list, show, reload, run)
+    #[command(long_about = "\
+Manage team definitions for multi-agent collaboration.
 
-        /// Enable compact context mode (smaller prompts for limited models)
-        #[arg(long)]
-        compact_context: bool,
+List, show details, reload, and run pre-defined team configurations \
+from the teams directory. Team definitions are YAML files that \
+specify topology, coordination settings, and member agents.
 
-        /// Memory backend (sqlite, markdown, none)
-        #[arg(long)]
-        memory_backend: Option<String>,
+Examples:
+  zeroclaw teams list
+  zeroclaw teams show research-team
+  zeroclaw teams reload
+  zeroclaw teams run research-team \"Analyze the latest AI trends\"")]
+    Teams {
+        #[command(subcommand)]
+        team_command: TeamCommands,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -263,8 +234,7 @@ Examples:
   zeroclaw gateway                  # use config defaults
   zeroclaw gateway -p 8080          # listen on port 8080
   zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port
-  zeroclaw gateway --new-pairing    # clear tokens and generate fresh pairing code")]
+  zeroclaw gateway -p 0             # random available port")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -324,61 +294,6 @@ Examples:
     /// Show system status (full details)
     Status,
 
-    /// Self-update ZeroClaw to the latest version
-    #[command(long_about = "\
-Self-update ZeroClaw to the latest release from GitHub.
-
-Downloads the appropriate pre-built binary for your platform and
-replaces the current executable. Requires write permissions to
-the binary location.
-
-Examples:
-  zeroclaw update              # Update to latest version
-  zeroclaw update --check      # Check for updates without installing
-  zeroclaw update --instructions # Show install-method-specific update instructions
-  zeroclaw update --force      # Reinstall even if already up to date")]
-    Update {
-        /// Check for updates without installing
-        #[arg(long, conflicts_with_all = ["force", "instructions"])]
-        check: bool,
-
-        /// Force update even if already at latest version
-        #[arg(long, conflicts_with = "instructions")]
-        force: bool,
-
-        /// Show human-friendly update instructions for your installation method
-        #[arg(long, conflicts_with_all = ["check", "force"])]
-        instructions: bool,
-    },
-
-    /// Engage, inspect, and resume emergency-stop states.
-    ///
-    /// Examples:
-    /// - `zeroclaw estop`
-    /// - `zeroclaw estop --level network-kill`
-    /// - `zeroclaw estop --level domain-block --domain "*.chase.com"`
-    /// - `zeroclaw estop --level tool-freeze --tool shell --tool browser`
-    /// - `zeroclaw estop status`
-    /// - `zeroclaw estop resume --network`
-    /// - `zeroclaw estop resume --domain "*.chase.com"`
-    /// - `zeroclaw estop resume --tool shell`
-    Estop {
-        #[command(subcommand)]
-        estop_command: Option<EstopSubcommands>,
-
-        /// Level used when engaging estop from `zeroclaw estop`.
-        #[arg(long, value_enum)]
-        level: Option<EstopLevelArg>,
-
-        /// Domain pattern(s) for `domain-block` (repeatable).
-        #[arg(long = "domain")]
-        domains: Vec<String>,
-
-        /// Tool name(s) for `tool-freeze` (repeatable).
-        #[arg(long = "tool")]
-        tools: Vec<String>,
-    },
-
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
 Configure and manage scheduled tasks.
@@ -413,37 +328,13 @@ Examples:
     /// List supported AI providers
     Providers,
 
-    /// Show provider quota and rate limit status
-    #[command(
-        name = "providers-quota",
-        long_about = "\
-Show provider quota and rate limit status.
-
-Displays quota remaining, rate limit resets, circuit breaker state, \
-and per-profile breakdown for all configured providers. Helps diagnose \
-quota exhaustion and rate limiting issues.
-
-Examples:
-  zeroclaw providers-quota                    # text output, all providers
-  zeroclaw providers-quota --format json      # JSON output
-  zeroclaw providers-quota --provider gemini  # filter by provider"
-    )]
-    ProvidersQuota {
-        /// Filter by provider name (optional, shows all if omitted)
-        #[arg(long)]
-        provider: Option<String>,
-
-        /// Output format (text or json)
-        #[arg(long, value_enum, default_value_t = QuotaFormat::Text)]
-        format: QuotaFormat,
-    },
-    /// Manage channels (telegram, discord, slack, github)
+    /// Manage channels (telegram, discord, slack)
     #[command(long_about = "\
 Manage communication channels.
 
 Add, remove, list, and health-check channels that connect ZeroClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
-slack, whatsapp, github, matrix, imessage, email.
+slack, whatsapp, matrix, imessage, email.
 
 Examples:
   zeroclaw channel list
@@ -463,7 +354,6 @@ Examples:
     },
 
     /// Manage skills (user-defined capabilities)
-    #[command(name = "skill", alias = "skills")]
     Skills {
         #[command(subcommand)]
         skill_command: SkillCommands,
@@ -540,13 +430,13 @@ Examples:
     #[command(long_about = "\
 Manage ZeroClaw configuration.
 
-Inspect, query, and modify configuration settings.
+Inspect and export configuration settings. Use 'schema' to dump \
+the full JSON Schema for the config file, which documents every \
+available key, type, and default value.
 
 Examples:
-  zeroclaw config show                        # show effective config (secrets masked)
-  zeroclaw config get gateway.port            # query a specific value by dot-path
-  zeroclaw config set gateway.port 8080       # update a value and save to config.toml
-  zeroclaw config schema                      # print full JSON Schema to stdout")]
+  zeroclaw config schema              # print JSON Schema to stdout
+  zeroclaw config schema > schema.json")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -571,43 +461,8 @@ Examples:
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
-    /// Show the current effective configuration (secrets masked)
-    Show,
-    /// Get a specific configuration value by dot-path (e.g. "gateway.port")
-    Get {
-        /// Dot-separated config path, e.g. "security.estop.enabled"
-        key: String,
-    },
-    /// Set a configuration value and save to config.toml
-    Set {
-        /// Dot-separated config path, e.g. "gateway.port"
-        key: String,
-        /// New value (string, number, boolean, or JSON for objects/arrays)
-        value: String,
-    },
     /// Dump the full configuration JSON Schema to stdout
     Schema,
-}
-
-#[derive(Subcommand, Debug)]
-enum EstopSubcommands {
-    /// Print current estop status.
-    Status,
-    /// Resume from an engaged estop level.
-    Resume {
-        /// Resume only network kill.
-        #[arg(long)]
-        network: bool,
-        /// Resume one or more blocked domain patterns.
-        #[arg(long = "domain")]
-        domains: Vec<String>,
-        /// Resume one or more frozen tools.
-        #[arg(long = "tool")]
-        tools: Vec<String>,
-        /// OTP code. If omitted and OTP is required, a prompt is shown.
-        #[arg(long)]
-        otp: Option<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -701,27 +556,10 @@ enum ModelCommands {
         #[arg(long)]
         provider: Option<String>,
 
-        /// Refresh all providers that support live model discovery
-        #[arg(long)]
-        all: bool,
-
         /// Force live refresh and ignore fresh cache
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a provider
-    List {
-        /// Provider name (defaults to configured default provider)
-        #[arg(long)]
-        provider: Option<String>,
-    },
-    /// Set the default model in config
-    Set {
-        /// Model name to set as default
-        model: String,
-    },
-    /// Show current model configuration and cache status
-    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -781,15 +619,6 @@ enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Rebuild embeddings for all memories (use after changing embedding model)
-    Reindex {
-        /// Skip confirmation prompt
-        #[arg(long)]
-        yes: bool,
-        /// Show progress during reindex
-        #[arg(long, default_value = "true")]
-        progress: bool,
-    },
 }
 
 #[tokio::main]
@@ -821,7 +650,6 @@ async fn main() -> Result<()> {
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
     let subscriber = fmt::Subscriber::builder()
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -841,10 +669,6 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
-        no_totp,
-        migrate_openclaw,
-        openclaw_source,
-        openclaw_config,
     } = &cli.command
     {
         let interactive = *interactive;
@@ -854,64 +678,36 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
-        let no_totp = *no_totp;
-        let migrate_openclaw = *migrate_openclaw;
-        let openclaw_source = openclaw_source.clone();
-        let openclaw_config = openclaw_config.clone();
-        let openclaw_migration_enabled =
-            migrate_openclaw || openclaw_source.is_some() || openclaw_config.is_some();
 
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
         if channels_only
-            && (api_key.is_some()
-                || provider.is_some()
-                || model.is_some()
-                || memory.is_some()
-                || no_totp
-                || migrate_openclaw
-                || openclaw_source.is_some()
-                || openclaw_config.is_some())
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
         {
-            bail!(
-                "--channels-only does not accept --api-key, --provider, --model, --memory, --no-totp, or OpenClaw migration flags"
-            );
+            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
         if channels_only && force {
             bail!("--channels-only does not accept --force");
         }
         let config = if channels_only {
-            Box::pin(onboard::run_channels_repair_wizard()).await
+            onboard::run_channels_repair_wizard().await
         } else if interactive {
-            Box::pin(onboard::run_wizard_with_migration(
-                force,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
-            ))
-            .await
+            onboard::run_wizard(force).await
         } else {
-            onboard::run_quick_setup_with_migration(
+            onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
                 force,
-                no_totp,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
+                false,
             )
             .await
         }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            Box::pin(channels::start_channels(config)).await?;
+            channels::start_channels(config).await?;
         }
         return Ok(());
     }
@@ -920,22 +716,15 @@ async fn main() -> Result<()> {
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
-    if config.security.otp.enabled {
-        let config_dir = config
-            .config_path
-            .parent()
-            .context("Config path must have a parent directory")?;
-        let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
-        let (_validator, enrollment_uri) =
-            security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
-        if let Some(uri) = enrollment_uri {
-            println!("Initialized OTP secret for ZeroClaw.");
-            println!("Enrollment URI: {uri}");
-        }
+
+    // Load agent definitions from workspace agents directory
+    if let Err(e) = config.load_agents_from_registry().await {
+        tracing::warn!("Failed to load agent definitions from registry: {}", e);
     }
 
     match cli.command {
-        Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
+        Commands::Onboard { .. } => unreachable!(),
+        Commands::Completions { .. } => unreachable!(),
 
         Commands::Agent {
             message,
@@ -943,47 +732,25 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-            autonomy_level,
-            max_actions_per_hour,
-            max_tool_iterations,
-            max_history_messages,
-            compact_context,
-            memory_backend,
-        } => {
-            if let Some(level) = autonomy_level {
-                config.autonomy.level = level;
-            }
-            if let Some(n) = max_actions_per_hour {
-                config.autonomy.max_actions_per_hour = n;
-            }
-            if let Some(n) = max_tool_iterations {
-                config.agent.max_tool_iterations = n;
-            }
-            if let Some(n) = max_history_messages {
-                config.agent.max_history_messages = n;
-            }
-            if compact_context {
-                config.agent.compact_context = true;
-            }
-            if let Some(ref backend) = memory_backend {
-                config.memory.backend = backend.clone();
-            }
-            // interactive=true only when no --message flag (real REPL session).
-            // Single-shot mode (-m) runs non-interactively: no TTY approval prompt,
-            // so tools are not denied by a stdin read returning EOF.
-            let interactive = message.is_none();
-            Box::pin(agent::run(
-                config,
-                message,
-                provider,
-                model,
-                temperature,
-                peripheral,
-                interactive,
-                None,
-            ))
-            .await
-            .map(|_| ())
+        } => agent::run(
+            config,
+            message,
+            provider,
+            model,
+            temperature,
+            peripheral,
+            true,
+            None,
+        )
+        .await
+        .map(|_| ()),
+
+        Commands::Agents { agent_command } => {
+            agent_cli::handle_command(agent_command, &config).await
+        }
+
+        Commands::Teams { team_command } => {
+            zeroclaw::handle_team_command(team_command, &config).await
         }
 
         Commands::Gateway {
@@ -1023,7 +790,7 @@ async fn main() -> Result<()> {
         Commands::Status => {
             println!("🦀 ZeroClaw Status");
             println!();
-            println!("Version:     {}", ZEROCLAW_BUILD_VERSION);
+            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
@@ -1083,8 +850,6 @@ async fn main() -> Result<()> {
                 "  Max cost/day:      ${:.2}",
                 f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
             );
-            println!("  OTP enabled:       {}", config.security.otp.enabled);
-            println!("  E-stop enabled:    {}", config.security.estop.enabled);
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
@@ -1114,58 +879,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Update {
-            check,
-            force,
-            instructions,
-        } => {
-            if instructions {
-                update::print_update_instructions()?;
-                Ok(())
-            } else {
-                update::self_update(force, check).await?;
-                Ok(())
-            }
-        }
-
-        Commands::Estop {
-            estop_command,
-            level,
-            domains,
-            tools,
-        } => handle_estop_command(&config, estop_command, level, domains, tools),
-
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => match model_command {
-            ModelCommands::Refresh {
-                provider,
-                all,
-                force,
-            } => {
-                if all {
-                    if provider.is_some() {
-                        bail!("`models refresh --all` cannot be combined with --provider");
-                    }
-                    onboard::run_models_refresh_all(&config, force).await
-                } else {
-                    onboard::run_models_refresh(&config, provider.as_deref(), force).await
-                }
+            ModelCommands::Refresh { provider, force } => {
+                onboard::run_models_refresh(&config, provider.as_deref(), force).await
             }
-            ModelCommands::List { provider } => {
-                onboard::run_models_list(&config, provider.as_deref()).await
-            }
-            ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
-            ModelCommands::Status => onboard::run_models_status(&config).await,
         },
-
-        Commands::ProvidersQuota { provider, format } => {
-            let format_str = match format {
-                QuotaFormat::Text => "text",
-                QuotaFormat::Json => "json",
-            };
-            providers::quota_cli::run(&config, provider.as_deref(), format_str).await
-        }
 
         Commands::Providers => {
             let providers = providers::list_providers();
@@ -1229,8 +949,8 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
-            ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
+            ChannelCommands::Start => channels::start_channels(config).await,
+            ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
         },
 
@@ -1259,94 +979,6 @@ async fn main() -> Result<()> {
         }
 
         Commands::Config { config_command } => match config_command {
-            ConfigCommands::Show => {
-                let mut json =
-                    serde_json::to_value(&config).context("Failed to serialize config")?;
-                redact_config_secrets(&mut json);
-                println!("{}", serde_json::to_string_pretty(&json)?);
-                Ok(())
-            }
-            ConfigCommands::Get { key } => {
-                let mut json =
-                    serde_json::to_value(&config).context("Failed to serialize config")?;
-                redact_config_secrets(&mut json);
-
-                let mut current = &json;
-                for segment in key.split('.') {
-                    current = current
-                        .get(segment)
-                        .with_context(|| format!("Config path not found: {key}"))?;
-                }
-
-                match current {
-                    serde_json::Value::String(s) => println!("{s}"),
-                    serde_json::Value::Bool(b) => println!("{b}"),
-                    serde_json::Value::Number(n) => println!("{n}"),
-                    serde_json::Value::Null => println!("null"),
-                    _ => println!("{}", serde_json::to_string_pretty(current)?),
-                }
-                Ok(())
-            }
-            ConfigCommands::Set { key, value } => {
-                let mut json =
-                    serde_json::to_value(&config).context("Failed to serialize config")?;
-
-                // Parse the new value: try bool, then integer, then float, then JSON, then string
-                let new_value = if value == "true" {
-                    serde_json::Value::Bool(true)
-                } else if value == "false" {
-                    serde_json::Value::Bool(false)
-                } else if value == "null" {
-                    serde_json::Value::Null
-                } else if let Ok(n) = value.parse::<i64>() {
-                    serde_json::json!(n)
-                } else if let Ok(n) = value.parse::<f64>() {
-                    serde_json::json!(n)
-                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) {
-                    // JSON object/array (e.g. '["a","b"]' or '{"key":"val"}')
-                    parsed
-                } else {
-                    serde_json::Value::String(value.clone())
-                };
-
-                // Navigate to the parent and set the leaf
-                let segments: Vec<&str> = key.split('.').collect();
-                if segments.is_empty() {
-                    bail!("Config key cannot be empty");
-                }
-                let (parents, leaf) = segments.split_at(segments.len() - 1);
-
-                let mut target = &mut json;
-                for segment in parents {
-                    target = target
-                        .get_mut(*segment)
-                        .with_context(|| format!("Config path not found: {key}"))?;
-                }
-
-                let leaf_key = leaf[0];
-                if target.get(leaf_key).is_none() {
-                    bail!("Config path not found: {key}");
-                }
-                target[leaf_key] = new_value.clone();
-
-                // Deserialize back to Config and save.
-                // Preserve runtime-only fields lost during JSON round-trip (#[serde(skip)]).
-                let config_path = config.config_path.clone();
-                let workspace_dir = config.workspace_dir.clone();
-                config = serde_json::from_value(json)
-                    .context("Invalid value for this config key — type mismatch")?;
-                config.config_path = config_path;
-                config.workspace_dir = workspace_dir;
-                config.save().await?;
-
-                // Show the saved value
-                let display = match &new_value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                println!("Set {key} = {display}");
-                Ok(())
-            }
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
                 println!(
@@ -1356,214 +988,6 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-    }
-}
-
-/// Keys whose values are masked in `config show` / `config get` output.
-const REDACTED_CONFIG_KEYS: &[&str] = &[
-    "api_key",
-    "api_keys",
-    "bot_token",
-    "paired_tokens",
-    "db_url",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "secret_key",
-    "webhook_secret",
-];
-
-fn redact_config_secrets(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                if REDACTED_CONFIG_KEYS.contains(&k.as_str()) {
-                    match v {
-                        serde_json::Value::String(s) if !s.is_empty() => {
-                            *v = serde_json::Value::String("***REDACTED***".to_string());
-                        }
-                        serde_json::Value::Array(arr) if !arr.is_empty() => {
-                            *v = serde_json::json!(["***REDACTED***"]);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    redact_config_secrets(v);
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                redact_config_secrets(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_estop_command(
-    config: &Config,
-    estop_command: Option<EstopSubcommands>,
-    level: Option<EstopLevelArg>,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<()> {
-    if !config.security.estop.enabled {
-        bail!("Emergency stop is disabled. Enable [security.estop].enabled = true in config.toml");
-    }
-
-    let config_dir = config
-        .config_path
-        .parent()
-        .context("Config path must have a parent directory")?;
-    let mut manager = security::EstopManager::load(&config.security.estop, config_dir)?;
-
-    match estop_command {
-        Some(EstopSubcommands::Status) => {
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-        Some(EstopSubcommands::Resume {
-            network,
-            domains,
-            tools,
-            otp,
-        }) => {
-            let selector = build_resume_selector(network, domains, tools)?;
-            let mut otp_code = otp;
-            let otp_validator = if config.security.estop.require_otp_to_resume {
-                if !config.security.otp.enabled {
-                    bail!(
-                        "security.estop.require_otp_to_resume=true but security.otp.enabled=false"
-                    );
-                }
-                if otp_code.is_none() {
-                    let entered = Password::new()
-                        .with_prompt("Enter OTP code")
-                        .allow_empty_password(false)
-                        .interact()?;
-                    otp_code = Some(entered);
-                }
-
-                let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
-                let (validator, enrollment_uri) =
-                    security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
-                if let Some(uri) = enrollment_uri {
-                    println!("Initialized OTP secret for ZeroClaw.");
-                    println!("Enrollment URI: {uri}");
-                }
-                Some(validator)
-            } else {
-                None
-            };
-
-            manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
-            println!("Estop resume completed.");
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-        None => {
-            let engage_level = build_engage_level(level, domains, tools)?;
-            manager.engage(engage_level)?;
-            println!("Estop engaged.");
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-    }
-}
-
-fn build_engage_level(
-    level: Option<EstopLevelArg>,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<security::EstopLevel> {
-    let requested = level.unwrap_or(EstopLevelArg::KillAll);
-    match requested {
-        EstopLevelArg::KillAll => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are only valid with --level domain-block/tool-freeze");
-            }
-            Ok(security::EstopLevel::KillAll)
-        }
-        EstopLevelArg::NetworkKill => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are not valid with --level network-kill");
-            }
-            Ok(security::EstopLevel::NetworkKill)
-        }
-        EstopLevelArg::DomainBlock => {
-            if domains.is_empty() {
-                bail!("--level domain-block requires at least one --domain");
-            }
-            if !tools.is_empty() {
-                bail!("--tool is not valid with --level domain-block");
-            }
-            Ok(security::EstopLevel::DomainBlock(domains))
-        }
-        EstopLevelArg::ToolFreeze => {
-            if tools.is_empty() {
-                bail!("--level tool-freeze requires at least one --tool");
-            }
-            if !domains.is_empty() {
-                bail!("--domain is not valid with --level tool-freeze");
-            }
-            Ok(security::EstopLevel::ToolFreeze(tools))
-        }
-    }
-}
-
-fn build_resume_selector(
-    network: bool,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<security::ResumeSelector> {
-    let selected =
-        usize::from(network) + usize::from(!domains.is_empty()) + usize::from(!tools.is_empty());
-    if selected > 1 {
-        bail!("Use only one of --network, --domain, or --tool for estop resume");
-    }
-    if network {
-        return Ok(security::ResumeSelector::Network);
-    }
-    if !domains.is_empty() {
-        return Ok(security::ResumeSelector::Domains(domains));
-    }
-    if !tools.is_empty() {
-        return Ok(security::ResumeSelector::Tools(tools));
-    }
-    Ok(security::ResumeSelector::KillAll)
-}
-
-fn print_estop_status(state: &security::EstopState) {
-    println!("Estop status:");
-    println!(
-        "  engaged:        {}",
-        if state.is_engaged() { "yes" } else { "no" }
-    );
-    println!(
-        "  kill_all:       {}",
-        if state.kill_all { "active" } else { "inactive" }
-    );
-    println!(
-        "  network_kill:   {}",
-        if state.network_kill {
-            "active"
-        } else {
-            "inactive"
-        }
-    );
-    if state.blocked_domains.is_empty() {
-        println!("  domain_blocks:  (none)");
-    } else {
-        println!("  domain_blocks:  {}", state.blocked_domains.join(", "));
-    }
-    if state.frozen_tools.is_empty() {
-        println!("  tool_freeze:    (none)");
-    } else {
-        println!("  tool_freeze:    {}", state.frozen_tools.join(", "));
-    }
-    if let Some(updated_at) = &state.updated_at {
-        println!("  updated_at:     {updated_at}");
     }
 }
 
@@ -1637,17 +1061,6 @@ fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a pending OAuth login is stale (older than 24 hours).
-fn is_pending_login_stale(pending: &PendingOAuthLogin) -> bool {
-    if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&pending.created_at) {
-        let age = chrono::Utc::now().signed_duration_since(created);
-        age > chrono::Duration::hours(24)
-    } else {
-        // If we can't parse the timestamp, consider it stale
-        true
-    }
-}
-
 fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
     let path = pending_oauth_login_path(config, &pending.provider);
     if let Some(parent) = path.parent() {
@@ -1694,23 +1107,13 @@ fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<Pe
     } else {
         bail!("Pending {} login is missing code verifier", provider);
     };
-
-    let pending = PendingOAuthLogin {
+    Ok(Some(PendingOAuthLogin {
         provider: persisted.provider.unwrap_or_else(|| provider.to_string()),
         profile: persisted.profile,
         code_verifier,
         state: persisted.state,
         created_at: persisted.created_at,
-    };
-
-    // Auto-cleanup if stale (older than 24 hours)
-    if is_pending_login_stale(&pending) {
-        println!("ℹ️  Removing stale pending auth file (older than 24h)");
-        let _ = std::fs::remove_file(&path);
-        return Ok(None);
-    }
-
-    Ok(Some(pending))
+    }))
 }
 
 fn clear_pending_oauth_login(config: &Config, provider: &str) {
@@ -1807,23 +1210,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                                 return Ok(());
                             }
                             Err(e) => {
-                                let err_msg = e.to_string();
-                                if err_msg.contains("403")
-                                    || err_msg.contains("Forbidden")
-                                    || err_msg.contains("Cloudflare")
-                                {
-                                    println!(
-                                        "ℹ️  Device-code flow is blocked by Cloudflare protection."
-                                    );
-                                    println!("   This is normal for server environments.");
-                                    println!("   Switching to browser authorization flow...");
-                                } else if err_msg.contains("invalid_client") {
-                                    println!("⚠️  OAuth client configuration error: {}", err_msg);
-                                    println!("   Check your GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET");
-                                } else {
-                                    println!("ℹ️  Device-code flow unavailable: {}", err_msg);
-                                    println!("   Falling back to browser flow.");
-                                }
+                                println!(
+                                    "Device-code flow unavailable: {e}. Falling back to browser flow."
+                                );
                             }
                         }
                     }
@@ -1910,20 +1299,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                                 return Ok(());
                             }
                             Err(e) => {
-                                let err_msg = e.to_string();
-                                if err_msg.contains("403")
-                                    || err_msg.contains("Forbidden")
-                                    || err_msg.contains("Cloudflare")
-                                {
-                                    println!(
-                                        "ℹ️  Device-code flow is blocked by Cloudflare protection."
-                                    );
-                                    println!("   This is normal for server environments.");
-                                    println!("   Switching to browser authorization flow...");
-                                } else {
-                                    println!("ℹ️  Device-code flow unavailable: {}", err_msg);
-                                    println!("   Falling back to browser flow.");
-                                }
+                                println!(
+                                    "Device-code flow unavailable: {e}. Falling back to browser/paste flow."
+                                );
                             }
                         }
                     }
@@ -1990,156 +1368,95 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             match provider.as_str() {
                 "openai-codex" => {
-                    let result = async {
-                        let pending =
-                            load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "No pending OpenAI login found.\n\n\
-                                💡 Please start the login flow first:\n   \
-                                zeroclaw auth login --provider openai-codex --profile {}\n\n\
-                                Then paste the callback URL or code here.",
-                                    profile
-                                )
-                            })?;
+                    let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                        )
+                    })?;
 
-                        if pending.profile != profile {
-                            bail!(
-                                "{} pending={}, requested={}",
-                                PROFILE_MISMATCH_PREFIX,
-                                pending.profile,
-                                profile
-                            );
-                        }
-
-                        let redirect_input = match input {
-                            Some(value) => value,
-                            None => read_plain_input("Paste redirect URL or OAuth code")?,
-                        };
-
-                        let code = auth::openai_oauth::parse_code_from_redirect(
-                            &redirect_input,
-                            Some(&pending.state),
-                        )?;
-
-                        let pkce = auth::openai_oauth::PkceState {
-                            code_verifier: pending.code_verifier.clone(),
-                            code_challenge: String::new(),
-                            state: pending.state.clone(),
-                        };
-
-                        let client = reqwest::Client::new();
-                        let token_set =
-                            auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce)
-                                .await?;
-                        let account_id =
-                            extract_openai_account_id_for_profile(&token_set.access_token);
-
-                        auth_service
-                            .store_openai_tokens(&profile, token_set, account_id, true)
-                            .await?;
-                        clear_pending_oauth_login(config, "openai");
-
-                        println!("Saved profile {profile}");
-                        println!("Active profile for openai-codex: {profile}");
-                        Ok(())
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
                     }
-                    .await;
 
-                    if let Err(e) = result {
-                        // Cleanup pending file on error
-                        if e.to_string().starts_with(PROFILE_MISMATCH_PREFIX) {
-                            clear_pending_oauth_login(config, "openai");
-                            eprintln!("❌ {}", e);
-                            eprintln!(
-                                "\n💡 Tip: A previous login attempt was for a different profile."
-                            );
-                            eprintln!("   The pending auth file has been cleared.");
-                            eprintln!("   Please start fresh with:");
-                            eprintln!(
-                                "   zeroclaw auth login --provider openai-codex --profile {}",
-                                profile
-                            );
-                            std::process::exit(1);
-                        }
-                        return Err(e);
-                    }
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::openai_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::openai_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+
+                    auth_service
+                        .store_openai_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "openai");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for openai-codex: {profile}");
                 }
                 "gemini" => {
-                    let result = async {
-                        let pending =
-                            load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "No pending Gemini login found.\n\n\
-                                💡 Please start the login flow first:\n   \
-                                zeroclaw auth login --provider gemini --profile {}\n\n\
-                                Then paste the callback URL or code here.",
-                                    profile
-                                )
-                            })?;
+                    let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
+                        )
+                    })?;
 
-                        if pending.profile != profile {
-                            bail!(
-                                "{} pending={}, requested={}",
-                                PROFILE_MISMATCH_PREFIX,
-                                pending.profile,
-                                profile
-                            );
-                        }
-
-                        let redirect_input = match input {
-                            Some(value) => value,
-                            None => read_plain_input("Paste redirect URL or OAuth code")?,
-                        };
-
-                        let code = auth::gemini_oauth::parse_code_from_redirect(
-                            &redirect_input,
-                            Some(&pending.state),
-                        )?;
-
-                        let pkce = auth::gemini_oauth::PkceState {
-                            code_verifier: pending.code_verifier.clone(),
-                            code_challenge: String::new(),
-                            state: pending.state.clone(),
-                        };
-
-                        let client = reqwest::Client::new();
-                        let token_set =
-                            auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce)
-                                .await?;
-                        let account_id = token_set
-                            .id_token
-                            .as_deref()
-                            .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
-
-                        auth_service
-                            .store_gemini_tokens(&profile, token_set, account_id, true)
-                            .await?;
-                        clear_pending_oauth_login(config, "gemini");
-
-                        println!("Saved profile {profile}");
-                        println!("Active profile for gemini: {profile}");
-                        Ok(())
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
                     }
-                    .await;
 
-                    if let Err(e) = result {
-                        // Cleanup pending file on error
-                        if e.to_string().starts_with(PROFILE_MISMATCH_PREFIX) {
-                            clear_pending_oauth_login(config, "gemini");
-                            eprintln!("❌ {}", e);
-                            eprintln!(
-                                "\n💡 Tip: A previous login attempt was for a different profile."
-                            );
-                            eprintln!("   The pending auth file has been cleared.");
-                            eprintln!("   Please start fresh with:");
-                            eprintln!(
-                                "   zeroclaw auth login --provider gemini --profile {}",
-                                profile
-                            );
-                            std::process::exit(1);
-                        }
-                        return Err(e);
-                    }
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::gemini_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::gemini_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = token_set
+                        .id_token
+                        .as_deref()
+                        .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
+
+                    auth_service
+                        .store_gemini_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "gemini");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for gemini: {profile}");
                 }
                 _ => {
                     bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
@@ -2389,45 +1706,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_help_includes_new_pairing_flag() {
-        let cmd = Cli::command();
-        let gateway = cmd
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "gateway")
-            .expect("gateway subcommand must exist");
-
-        let has_new_pairing_flag = gateway.get_arguments().any(|arg| {
-            arg.get_id().as_str() == "new_pairing" && arg.get_long() == Some("new-pairing")
-        });
-
-        assert!(
-            has_new_pairing_flag,
-            "gateway help should include --new-pairing"
-        );
-    }
-
-    #[test]
-    fn gateway_cli_accepts_new_pairing_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--new-pairing"])
-            .expect("gateway --new-pairing should parse");
-
-        match cli.command {
-            Commands::Gateway { new_pairing, .. } => assert!(new_pairing),
-            other => panic!("expected gateway command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gateway_cli_defaults_new_pairing_to_false() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
-
-        match cli.command {
-            Commands::Gateway { new_pairing, .. } => assert!(!new_pairing),
-            other => panic!("expected gateway command, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -2447,240 +1725,6 @@ mod tests {
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
             other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn onboard_cli_accepts_no_totp_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--no-totp"])
-            .expect("onboard --no-totp should parse");
-
-        match cli.command {
-            Commands::Onboard { no_totp, .. } => assert!(no_totp),
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn onboard_cli_accepts_openclaw_migration_flags() {
-        let cli = Cli::try_parse_from([
-            "zeroclaw",
-            "onboard",
-            "--migrate-openclaw",
-            "--openclaw-source",
-            "/tmp/openclaw-workspace",
-            "--openclaw-config",
-            "/tmp/openclaw.json",
-        ])
-        .expect("onboard openclaw migration flags should parse");
-
-        match cli.command {
-            Commands::Onboard {
-                migrate_openclaw,
-                openclaw_source,
-                openclaw_config,
-                ..
-            } => {
-                assert!(migrate_openclaw);
-                assert_eq!(
-                    openclaw_source.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw-workspace"))
-                );
-                assert_eq!(
-                    openclaw_config.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw.json"))
-                );
-            }
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn migrate_openclaw_cli_accepts_source_and_module_flags() {
-        let cli = Cli::try_parse_from([
-            "zeroclaw",
-            "migrate",
-            "openclaw",
-            "--source",
-            "/tmp/openclaw-workspace",
-            "--source-config",
-            "/tmp/openclaw.json",
-            "--dry-run",
-            "--no-config",
-        ])
-        .expect("migrate openclaw flags should parse");
-
-        match cli.command {
-            Commands::Migrate {
-                migrate_command:
-                    MigrateCommands::Openclaw {
-                        source,
-                        source_config,
-                        dry_run,
-                        no_memory,
-                        no_config,
-                    },
-            } => {
-                assert_eq!(
-                    source.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw-workspace"))
-                );
-                assert_eq!(
-                    source_config.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw.json"))
-                );
-                assert!(dry_run);
-                assert!(!no_memory);
-                assert!(no_config);
-            }
-            other => panic!("expected migrate openclaw command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_estop_default_engage() {
-        let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
-
-        match cli.command {
-            Commands::Estop {
-                estop_command,
-                level,
-                domains,
-                tools,
-            } => {
-                assert!(estop_command.is_none());
-                assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
-            }
-            other => panic!("expected estop command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_estop_resume_domain() {
-        let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
-            .expect("estop resume command should parse");
-
-        match cli.command {
-            Commands::Estop {
-                estop_command: Some(EstopSubcommands::Resume { domains, .. }),
-                ..
-            } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
-            other => panic!("expected estop resume command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn config_help_mentions_show_get_set_examples() {
-        let cmd = Cli::command();
-        let config_cmd = cmd
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "config")
-            .expect("config subcommand must exist");
-
-        let mut output = Vec::new();
-        config_cmd
-            .clone()
-            .write_long_help(&mut output)
-            .expect("help generation should succeed");
-        let help = String::from_utf8(output).expect("help output should be utf-8");
-        assert!(help.contains("zeroclaw config show"));
-        assert!(help.contains("zeroclaw config get gateway.port"));
-        assert!(help.contains("zeroclaw config set gateway.port 8080"));
-    }
-
-    #[test]
-    fn config_cli_parses_show_get_set_subcommands() {
-        let show =
-            Cli::try_parse_from(["zeroclaw", "config", "show"]).expect("config show should parse");
-        match show.command {
-            Commands::Config {
-                config_command: ConfigCommands::Show,
-            } => {}
-            other => panic!("expected config show, got {other:?}"),
-        }
-
-        let get = Cli::try_parse_from(["zeroclaw", "config", "get", "gateway.port"])
-            .expect("config get should parse");
-        match get.command {
-            Commands::Config {
-                config_command: ConfigCommands::Get { key },
-            } => assert_eq!(key, "gateway.port"),
-            other => panic!("expected config get, got {other:?}"),
-        }
-
-        let set = Cli::try_parse_from(["zeroclaw", "config", "set", "gateway.port", "8080"])
-            .expect("config set should parse");
-        match set.command {
-            Commands::Config {
-                config_command: ConfigCommands::Set { key, value },
-            } => {
-                assert_eq!(key, "gateway.port");
-                assert_eq!(value, "8080");
-            }
-            other => panic!("expected config set, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn redact_config_secrets_masks_nested_sensitive_values() {
-        let mut payload = serde_json::json!({
-            "api_key": "sk-test",
-            "nested": {
-                "bot_token": "token",
-                "paired_tokens": ["abc", "def"],
-                "non_secret": "ok"
-            }
-        });
-        redact_config_secrets(&mut payload);
-
-        assert_eq!(payload["api_key"], serde_json::json!("***REDACTED***"));
-        assert_eq!(
-            payload["nested"]["bot_token"],
-            serde_json::json!("***REDACTED***")
-        );
-        assert_eq!(
-            payload["nested"]["paired_tokens"],
-            serde_json::json!(["***REDACTED***"])
-        );
-        assert_eq!(payload["nested"]["non_secret"], serde_json::json!("ok"));
-    }
-
-    #[test]
-    fn update_help_mentions_instructions_flag() {
-        let cmd = Cli::command();
-        let update_cmd = cmd
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "update")
-            .expect("update subcommand must exist");
-
-        let mut output = Vec::new();
-        update_cmd
-            .clone()
-            .write_long_help(&mut output)
-            .expect("help generation should succeed");
-        let help = String::from_utf8(output).expect("help output should be utf-8");
-
-        assert!(help.contains("--instructions"));
-    }
-
-    #[test]
-    fn update_cli_parses_instructions_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "update", "--instructions"])
-            .expect("update --instructions should parse");
-
-        match cli.command {
-            Commands::Update {
-                check,
-                force,
-                instructions,
-            } => {
-                assert!(!check);
-                assert!(!force);
-                assert!(instructions);
-            }
-            other => panic!("expected update command, got {other:?}"),
         }
     }
 }

@@ -1,9 +1,19 @@
+//! Coordination module for multi-agent communication.
+//!
+//! This module provides both the existing coordination envelope system
+//! and the Phase 1 multi-agent communication traits.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 use uuid::Uuid;
+
+// Phase 1 multi-agent communication modules
+pub mod message;
+pub mod channel;
+pub mod state;
 
 /// Delivery mode for a coordination envelope.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

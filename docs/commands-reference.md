@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 28, 2026**.
+Last verified: **March 6, 2026**.
 
 ## Top-Level Commands
 
@@ -56,10 +56,59 @@ Last verified: **February 28, 2026**.
 
 ### `agent`
 
+**Interactive Chat:**
 - `zeroclaw agent`
 - `zeroclaw agent -m "Hello"`
 - `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
 - `zeroclaw agent --peripheral <board:path>`
+
+**Agent Management (Multi-Agent Support):**
+- `zeroclaw agent list` — List all registered agent definitions
+- `zeroclaw agent show <name>` — Show detailed information about an agent
+- `zeroclaw agent reload` — Reload agent definitions from disk
+- `zeroclaw agent run <name> --prompt "..."` — Run a specific agent with a prompt
+
+**Agent Directory:**
+
+Agent definitions are stored as YAML files in:
+- `~/.zeroclaw/agents/` (default)
+- `<workspace>/agents/` (workspace-specific)
+
+**Agent Definition Format:**
+
+```yaml
+# agents/researcher.yaml
+agent:
+  id: "researcher"
+  name: "Research Agent"
+  version: "1.0.0"
+  description: "Conducts research on given topics"
+
+execution:
+  mode: "subprocess"
+  command: "zeroclaw"
+  args: ["agent", "run", "--agent-id", "{agent_id}"]
+
+provider:
+  name: "openrouter"
+  model: "anthropic/claude-sonnet-4-6"
+  temperature: 0.3
+
+tools:
+  - name: "web_search"
+    enabled: true
+
+system:
+  prompt: "You are a Research Agent..."
+
+memory:
+  backend: "shared"
+
+reporting:
+  mode: "ipc"
+  format: "json"
+  timeout_seconds: 300
+```
 
 Tip:
 
