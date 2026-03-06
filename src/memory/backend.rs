@@ -110,7 +110,7 @@ pub fn default_memory_backend_key() -> &'static str {
 
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     match backend {
-        "sqlite" => MemoryBackendKind::Sqlite,
+        "sqlite" | "sqlite_qdrant_hybrid" | "sqlite-qdrant-hybrid" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
         "mariadb" | "mysql" => MemoryBackendKind::Mariadb,
@@ -141,6 +141,14 @@ mod tests {
     #[test]
     fn classify_known_backends() {
         assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
+        assert_eq!(
+            classify_memory_backend("sqlite_qdrant_hybrid"),
+            MemoryBackendKind::Sqlite
+        );
+        assert_eq!(
+            classify_memory_backend("sqlite-qdrant-hybrid"),
+            MemoryBackendKind::Sqlite
+        );
         assert_eq!(classify_memory_backend("lucid"), MemoryBackendKind::Lucid);
         assert_eq!(
             classify_memory_backend("postgres"),

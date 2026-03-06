@@ -20,6 +20,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         } => handle_list(config, category, session, limit, offset).await,
         crate::MemoryCommands::Get { key } => handle_get(config, &key).await,
         crate::MemoryCommands::Stats => handle_stats(config).await,
+        crate::MemoryCommands::Reindex => handle_reindex(config).await,
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
@@ -217,6 +218,25 @@ async fn handle_stats(config: &Config) -> Result<()> {
             println!("    {cat:<20} {count}");
         }
     }
+
+    Ok(())
+}
+
+async fn handle_reindex(config: &Config) -> Result<()> {
+    let mem = create_cli_memory(config)?;
+
+    println!(
+        "{} Reindexing memory backend `{}` ...",
+        style("→").cyan().bold(),
+        style(mem.name()).white().bold()
+    );
+
+    let rebuilt = mem.reindex().await?;
+    println!(
+        "{} Reindex completed. Rebuilt {} entries.",
+        style("✓").green().bold(),
+        rebuilt
+    );
 
     Ok(())
 }

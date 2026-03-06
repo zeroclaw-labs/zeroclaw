@@ -113,6 +113,11 @@ pub trait Memory: Send + Sync {
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 
+    /// Rebuild backend indices/embeddings where supported.
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        anyhow::bail!("Reindex not supported by {} backend", self.name())
+    }
+
     /// Health check
     async fn health_check(&self) -> bool;
 }

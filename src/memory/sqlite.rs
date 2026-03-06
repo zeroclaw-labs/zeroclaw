@@ -773,6 +773,10 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        SqliteMemory::reindex(self).await
+    }
+
     async fn health_check(&self) -> bool {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())

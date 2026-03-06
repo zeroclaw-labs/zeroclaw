@@ -2064,6 +2064,9 @@ impl Default for QdrantConfig {
 pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "postgres" | "mariadb" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
+    /// Backward compatibility: legacy `sqlite_qdrant_hybrid` / `sqlite-qdrant-hybrid`
+    /// are accepted and treated as `sqlite`.
+    ///
     /// `postgres` / `mariadb` require `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
