@@ -2559,45 +2559,63 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             // Resolve numeric index (e.g. "2") to provider name.
-            // Index 0 and out-of-range are treated as literal provider names.
-            let raw_provider = if let Ok(idx) = raw_provider.trim().parse::<usize>() {
+            // Index 0 is invalid (list is 1-based); out-of-range returns an
+            // explicit error rather than passing the digit as a provider name.
+            let numeric_error = if let Ok(idx) = raw_provider.trim().parse::<usize>() {
                 let configured = ctx
                     .configured_providers
                     .read()
                     .unwrap_or_else(|e| e.into_inner());
-                if idx > 0 && idx <= configured.len() {
+                if idx == 0 || idx > configured.len() {
+                    Some(format!(
+                        "Invalid index `{idx}`. Use `/providers` to list available providers."
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(err_msg) = numeric_error {
+                err_msg
+            } else {
+                let raw_provider = if let Ok(idx) = raw_provider.trim().parse::<usize>() {
+                    let configured = ctx
+                        .configured_providers
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
                     configured[idx - 1].clone()
                 } else {
                     raw_provider
-                }
-            } else {
-                raw_provider
-            };
-            match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
-                        }
+                };
+                match resolve_provider_alias(&raw_provider) {
+                    Some(provider_name) => {
+                        match get_or_create_provider(ctx, &provider_name).await {
+                            Ok(_) => {
+                                if provider_name != current.provider {
+                                    current.provider = provider_name.clone();
+                                    set_route_selection(ctx, &sender_key, current.clone());
+                                    clear_sender_history(ctx, &sender_key);
+                                }
 
-                        format!(
+                                format!(
                             "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
                             current.model
                         )
-                    }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
+                            }
+                            Err(err) => {
+                                let safe_err = providers::sanitize_api_error(&err.to_string());
+                                format!(
                             "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
                         )
+                            }
+                        }
                     }
-                },
-                None => format!(
+                    None => format!(
                     "Unknown provider `{raw_provider}`. Use `/providers` to list valid providers."
                 ),
-            }
+                }
+            } // end else (valid numeric index or named provider)
         }
         ChannelRuntimeCommand::ShowModel => build_models_help_response(&current),
         ChannelRuntimeCommand::SetModel(raw_model) => {
