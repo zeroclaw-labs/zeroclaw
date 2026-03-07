@@ -64,6 +64,9 @@ where
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
+        MemoryBackendKind::Cortex => {
+            anyhow::bail!("memory backend 'cortex' requires feature flag, rebuild with --features memory-cortex")
+        }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(

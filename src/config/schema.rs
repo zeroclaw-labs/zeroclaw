@@ -1955,6 +1955,7 @@ impl Default for MemoryConfig {
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            cortex: CortexMemConfig::default(),
         }
     }
 }
