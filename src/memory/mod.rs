@@ -223,18 +223,30 @@ pub fn create_memory_with_storage_and_routes(
             "🧠 Cortex-Memory backend selected (tenant: {})",
             config.cortex.tenant_id
         );
-        
+
         let memory_config = config.clone();
         let workspace_dir = workspace_dir.to_path_buf();
+        
+        // Build a minimal config context for Cortex-Memory initialization
+        // api_key priority: embedding route key > cortex override > passed api_key parameter
+        let api_key = embedding_routes
+            .iter()
+            .find(|r| r.hint == config.embedding_model.strip_prefix("hint:").unwrap_or(""))
+            .and_then(|r| r.api_key.clone())
+            .or_else(|| config.cortex.embedding_api_key_override.clone())
+            .or_else(|| api_key.map(|s| s.to_string()));
+        
         let config_clone = crate::config::Config {
             memory: config.clone(),
             embedding_routes: embedding_routes.to_vec(),
             storage: crate::config::StorageConfig::default(),
             workspace_dir: workspace_dir.clone(),
-            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            api_key,
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
             ..crate::config::Config::default()
         };
-        
+
         return tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 crate::memory::CortexMemory::new(&memory_config, workspace_dir, &config_clone)
