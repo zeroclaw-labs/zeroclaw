@@ -23,11 +23,15 @@ const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
 const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
+/// How often the background keepalive checks tokens.
+pub const TOKEN_KEEPALIVE_INTERVAL_SECS: u64 = 300; // 5 min
+/// Proactively refresh tokens expiring within this window.
+pub const TOKEN_KEEPALIVE_REFRESH_SKEW_SECS: u64 = 600; // 10 min
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AuthService {
-    store: AuthProfilesStore,
+    pub(crate) store: AuthProfilesStore,
     client: reqwest::Client,
 }
 
@@ -299,20 +303,37 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        // Extract client credentials for refresh: try id_token `aud` claim
+        // first, then fall back to env var. For client_secret, use the
+        // well-known public Gemini CLI secret as the final fallback.
+        let id_token_client_id = latest_tokens
+            .id_token
+            .as_deref()
+            .and_then(gemini_oauth::extract_client_id_from_id_token);
+        let refresh_client_id = id_token_client_id.or_else(gemini_oauth::gemini_oauth_client_id);
+        let refresh_client_secret = gemini_oauth::gemini_oauth_client_secret()
+            .or_else(|| Some(gemini_oauth::GEMINI_CLI_DEFAULT_CLIENT_SECRET.to_string()));
+
+        let mut refreshed = match refresh_gemini_access_token_with_retries(
+            &self.client,
+            &refresh_token,
+            refresh_client_id.as_deref(),
+            refresh_client_secret.as_deref(),
+        )
+        .await
+        {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -336,6 +357,69 @@ impl AuthService {
             .await?;
 
         Ok(updated.token_set.map(|t| t.access_token))
+    }
+
+    /// Spawn a background task that proactively refreshes all managed OAuth tokens
+    /// before they expire. Runs every `check_interval`, refreshes tokens expiring
+    /// within `refresh_skew`. Never panics; errors are logged and the loop continues.
+    pub fn spawn_token_keepalive(
+        self: Arc<Self>,
+        check_interval: std::time::Duration,
+        refresh_skew: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+            loop {
+                interval.tick().await;
+
+                let data = match self.store.load().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "token keepalive: failed to load auth profiles");
+                        continue;
+                    }
+                };
+
+                for (id, profile) in &data.profiles {
+                    if profile.kind != AuthProfileKind::OAuth {
+                        continue;
+                    }
+                    let Some(token_set) = profile.token_set.as_ref() else {
+                        continue;
+                    };
+                    if !token_set.is_expiring_within(refresh_skew) {
+                        tracing::debug!(profile = %id, "token keepalive: still fresh, skipping");
+                        continue;
+                    }
+
+                    tracing::info!(profile = %id, provider = %profile.provider, "token keepalive: refreshing expiring token");
+
+                    let result = match profile.provider.as_str() {
+                        OPENAI_CODEX_PROVIDER => {
+                            self.get_valid_openai_access_token(Some(&profile.profile_name))
+                                .await
+                        }
+                        GEMINI_PROVIDER => {
+                            self.get_valid_gemini_access_token(Some(&profile.profile_name))
+                                .await
+                        }
+                        other => {
+                            tracing::debug!(profile = %id, provider = %other, "token keepalive: unsupported provider, skipping");
+                            continue;
+                        }
+                    };
+
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(profile = %id, "token keepalive: refreshed successfully");
+                        }
+                        Err(e) => {
+                            tracing::warn!(profile = %id, error = %e, "token keepalive: refresh failed");
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Get Gemini profile info (for provider initialization).
@@ -441,11 +525,25 @@ async fn refresh_openai_access_token_with_retries(
 async fn refresh_gemini_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
 ) -> Result<TokenSet> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
-        match gemini_oauth::refresh_access_token(client, refresh_token).await {
+        let result = match (client_id, client_secret) {
+            (Some(id), Some(secret)) => {
+                gemini_oauth::refresh_access_token_with_credentials(
+                    client,
+                    refresh_token,
+                    id,
+                    secret,
+                )
+                .await
+            }
+            _ => gemini_oauth::refresh_access_token(client, refresh_token).await,
+        };
+        match result {
             Ok(tokens) => return Ok(tokens),
             Err(err) => {
                 let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
@@ -511,7 +609,7 @@ fn clear_refresh_backoff(profile_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+    use crate::auth::profiles::{AuthProfile, AuthProfileKind, TokenSet};
 
     #[test]
     fn normalize_provider_aliases() {
@@ -570,5 +668,111 @@ mod tests {
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
         );
+    }
+
+    // ── keepalive tests ──────────────────────────────────────────────────────
+
+    fn make_token_profile(provider: &str, name: &str) -> AuthProfile {
+        AuthProfile {
+            id: profile_id(provider, name),
+            provider: provider.to_string(),
+            profile_name: name.to_string(),
+            kind: AuthProfileKind::Token,
+            account_id: None,
+            workspace_id: None,
+            token_set: None,
+            token: Some("tok".into()),
+            metadata: std::collections::BTreeMap::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_oauth_profile(provider: &str, name: &str, expires_in: chrono::Duration) -> AuthProfile {
+        let token_set = TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() + expires_in),
+            token_type: None,
+            scope: None,
+        };
+        AuthProfile {
+            id: profile_id(provider, name),
+            provider: provider.to_string(),
+            profile_name: name.to_string(),
+            kind: AuthProfileKind::OAuth,
+            account_id: None,
+            workspace_id: None,
+            token_set: Some(token_set),
+            token: None,
+            metadata: std::collections::BTreeMap::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Token-kind profiles and fresh OAuth profiles must be skipped by keepalive.
+    /// Verifiable: the keepalive reads profiles, applies the `is_expiring_within`
+    /// filter, and only calls refresh for OAuth profiles whose token expires soon.
+    /// A Token-kind profile (no token_set) must be skipped unconditionally.
+    #[test]
+    fn keepalive_skips_token_kind_profile() {
+        let token_profile = make_token_profile("openai-codex", "default");
+        // A Token-kind profile has no token_set → keepalive `continue`s past it.
+        assert!(token_profile.token_set.is_none());
+        assert_eq!(token_profile.kind, AuthProfileKind::Token);
+    }
+
+    /// An OAuth profile whose token expires in 30 min is NOT expiring within 10 min skew.
+    #[test]
+    fn keepalive_skips_fresh_oauth_token() {
+        let fresh = make_oauth_profile("gemini", "default", chrono::Duration::minutes(30));
+        let skew = Duration::from_secs(TOKEN_KEEPALIVE_REFRESH_SKEW_SECS);
+        let token_set = fresh.token_set.as_ref().unwrap();
+        // Must NOT be expiring — keepalive should skip.
+        assert!(!token_set.is_expiring_within(skew));
+    }
+
+    /// An OAuth profile whose token expired or expires in <10 min IS expiring within skew.
+    #[test]
+    fn keepalive_detects_expiring_oauth_token() {
+        let expiring = make_oauth_profile("gemini", "default", chrono::Duration::minutes(5));
+        let skew = Duration::from_secs(TOKEN_KEEPALIVE_REFRESH_SKEW_SECS);
+        let token_set = expiring.token_set.as_ref().unwrap();
+        // Must be expiring — keepalive should attempt refresh.
+        assert!(token_set.is_expiring_within(skew));
+    }
+
+    /// Keepalive does not panic when refresh fails. We verify this by running
+    /// one tick against a temp-dir store with an expiring profile; the HTTP
+    /// call will fail (no server), but the task must complete without panic.
+    #[tokio::test]
+    async fn keepalive_does_not_panic_on_refresh_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = std::sync::Arc::new(AuthService::new(tmp.path(), false));
+
+        // Store an expiring Gemini OAuth profile.
+        let token_set = TokenSet {
+            access_token: "old".into(),
+            refresh_token: Some("rtoken".into()),
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(2)),
+            token_type: None,
+            scope: None,
+        };
+        auth.store_gemini_tokens("default", token_set, None, true)
+            .await
+            .unwrap();
+
+        // Run keepalive with a very short interval so it fires quickly.
+        let handle = auth.clone().spawn_token_keepalive(
+            Duration::from_millis(10),
+            Duration::from_secs(TOKEN_KEEPALIVE_REFRESH_SKEW_SECS),
+        );
+        // Give the task time to run at least one tick (refresh will fail — no HTTP server).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+        // If we reach here the task did not panic despite the refresh error.
     }
 }

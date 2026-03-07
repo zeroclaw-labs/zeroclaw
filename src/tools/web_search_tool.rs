@@ -1,3 +1,4 @@
+#![allow(unexpected_cfgs)]
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;

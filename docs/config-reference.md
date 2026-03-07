@@ -1211,7 +1211,7 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
+| `message_timeout_secs` | `120` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4×, max 480 s). A separate per-LLM-call timeout of 90 s ensures stalled model calls surface quickly within this budget. |
 
 Examples:
 

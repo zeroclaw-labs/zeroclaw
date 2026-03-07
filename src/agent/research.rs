@@ -10,7 +10,6 @@
 //! - Prompt-guided tool calling (Gemini and other providers without native support)
 
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
-use crate::config::{ResearchPhaseConfig, ResearchTrigger};
 use crate::observability::Observer;
 use crate::providers::traits::build_tool_instructions_text;
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
@@ -18,6 +17,81 @@ use crate::tools::{Tool, ToolResult, ToolSpec};
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Configuration for the research phase.
+#[derive(Debug, Clone)]
+pub struct ResearchPhaseConfig {
+    /// Whether the research phase is enabled.
+    pub enabled: bool,
+    /// What triggers the research phase.
+    pub trigger: ResearchTrigger,
+    /// Keywords that trigger research when trigger is `Keywords`.
+    pub keywords: Vec<String>,
+    /// Minimum message length to trigger research when trigger is `Length`.
+    pub min_message_length: usize,
+    /// Maximum number of research iterations.
+    pub max_iterations: usize,
+    /// Whether to show progress during research.
+    pub show_progress: bool,
+    /// Optional system prompt prefix for the research phase.
+    pub system_prompt_prefix: String,
+}
+
+impl Default for ResearchPhaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: ResearchTrigger::Never,
+            keywords: Vec::new(),
+            min_message_length: 50,
+            max_iterations: 3,
+            show_progress: false,
+            system_prompt_prefix: String::new(),
+        }
+    }
+}
+
+impl From<crate::config::schema::ResearchPhaseConfig> for ResearchPhaseConfig {
+    fn from(cfg: crate::config::schema::ResearchPhaseConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            trigger: cfg.trigger.into(),
+            keywords: cfg.keywords,
+            min_message_length: cfg.min_message_length,
+            max_iterations: cfg.max_iterations,
+            show_progress: cfg.show_progress,
+            system_prompt_prefix: cfg.system_prompt_prefix,
+        }
+    }
+}
+
+/// What triggers the research phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResearchTrigger {
+    /// Never trigger research.
+    Never,
+    /// Always trigger research.
+    Always,
+    /// Trigger when message contains configured keywords.
+    Keywords,
+    /// Trigger when message exceeds a length threshold.
+    Length,
+    /// Trigger when message contains a question mark.
+    Question,
+}
+
+impl From<crate::config::schema::ResearchTrigger> for ResearchTrigger {
+    fn from(trigger: crate::config::schema::ResearchTrigger) -> Self {
+        use crate::config::schema::ResearchTrigger as ConfigTrigger;
+        match trigger {
+            ConfigTrigger::Never => Self::Never,
+            ConfigTrigger::Always => Self::Always,
+            ConfigTrigger::Keywords => Self::Keywords,
+            ConfigTrigger::Length => Self::Length,
+            ConfigTrigger::Question => Self::Question,
+        }
+    }
+}
 
 /// Result of the research phase.
 #[derive(Debug, Clone)]

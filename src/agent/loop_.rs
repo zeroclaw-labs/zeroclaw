@@ -62,6 +62,13 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 
+/// Stop the loop after this many total tool errors (across all iterations and tool names)
+/// to prevent runaway retry spirals where the LLM keeps calling a broken tool with
+/// varying arguments.  Intentionally higher than `LoopDetector.failure_streak_threshold`
+/// (which is per-tool-name) so two different tools can each fail a couple of times
+/// before the global budget fires.
+const MAX_TOTAL_TOOL_ERRORS: usize = 5;
+
 /// Maximum continuation retries when a provider reports max-token truncation.
 const MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS: usize = 3;
 /// Absolute safety cap for merged continuation output.
@@ -1208,6 +1215,7 @@ pub async fn run_tool_call_loop(
         .unwrap_or_default();
     let mut loop_detector = LoopDetector::new(ld_config);
     let mut loop_detection_prompt: Option<String> = None;
+    let mut total_tool_errors: usize = 0;
     let heartbeat_config = SAFETY_HEARTBEAT_CONFIG
         .try_with(Clone::clone)
         .ok()
@@ -2400,6 +2408,21 @@ pub async fn run_tool_call_loop(
             {
                 let sig = tool_call_signature(&call.name, &call.arguments);
                 loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
+            }
+
+            // ── Global tool-error budget ─────────────────────────
+            // Counts only real execution failures (not dedup skips or approval
+            // denials) to avoid false positives from loop-detection side-effects.
+            if !outcome.success {
+                total_tool_errors += 1;
+                if total_tool_errors >= MAX_TOTAL_TOOL_ERRORS {
+                    anyhow::bail!(
+                        "Tool loop stopped after {} total tool errors (last tool: {}, reason: {})",
+                        total_tool_errors,
+                        call.name,
+                        outcome.error_reason.as_deref().unwrap_or("unknown")
+                    );
+                }
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -5819,6 +5842,68 @@ mod tests {
             .expect("hook error buffer lock should be valid");
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].as_deref(), Some("boom"));
+    }
+
+    /// Verify the loop stops early when a tool fails repeatedly.
+    ///
+    /// ScriptedProvider returns a failing_tool call on every iteration with a
+    /// unique arg (to bypass dedup) so each call is actually executed.
+    /// The global tool-error budget (MAX_TOTAL_TOOL_ERRORS) must fire
+    /// before max_iterations are exhausted.
+    #[tokio::test]
+    async fn consecutive_tool_failures_stop_the_loop() {
+        // Use unique arg per call so dedup doesn't suppress real executions.
+        let responses: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    "<tool_call>\n{{\"name\":\"failing_tool\",\"arguments\":{{\"attempt\":{i}}}}}\n</tool_call>"
+                )
+            })
+            .collect();
+        let responses: Vec<&str> = responses.iter().map(String::as_str).collect();
+        let provider = ScriptedProvider::from_text_responses(responses);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool)];
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("zeroclaw test system"),
+            ChatMessage::user("trigger repeated failure".to_string()),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            10,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "loop must stop early on repeated tool failures, got: {:?}",
+            result
+        );
+        // Either the global tool-error budget or the per-tool LoopDetector streak
+        // is acceptable — both represent correct early termination on repeated failures.
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("tool error")
+                || err.contains("tool errors")
+                || err.contains("loop pattern")
+                || err.contains("consecutive"),
+            "expected early-stop error, got: {err}"
+        );
     }
 
     #[test]

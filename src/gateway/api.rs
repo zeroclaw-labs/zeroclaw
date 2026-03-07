@@ -22,25 +22,32 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
-/// Verify bearer token against PairingGuard. Returns error response if unauthorized.
+/// Enforce bearer-token authentication when pairing is required.
+///
+/// When `require_pairing` is `false` (the default), all API endpoints are open
+/// to any local process. This is intentional: the gateway binds to
+/// `127.0.0.1:42617` by default and only accepts public bind addresses when
+/// `allow_public_bind = true` is explicitly set. Operators who set
+/// `require_pairing = false` accept that any process on the same machine can
+/// call the gateway without credentials.
 fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if !state.pairing.require_pairing() {
-        return Ok(());
-    }
-
-    let token = extract_bearer_token(headers).unwrap_or("");
-    if state.pairing.is_authenticated(token) {
-        Ok(())
+    if state.pairing.require_pairing() {
+        let token = extract_bearer_token(headers).unwrap_or("");
+        if state.pairing.is_authenticated(token) {
+            Ok(())
+        } else {
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            ))
+        }
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            })),
-        ))
+        Ok(())
     }
 }
 

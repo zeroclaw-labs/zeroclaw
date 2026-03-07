@@ -533,9 +533,11 @@ impl Drop for ProcessTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuditConfig, SyscallAnomalyConfig};
+    use crate::config::AuditConfig;
     use crate::runtime::NativeRuntime;
-    use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use crate::security::{
+        AutonomyLevel, SecurityPolicy, SyscallAnomalyConfig, SyscallAnomalyDetector,
+    };
     use std::path::PathBuf;
     use tempfile::TempDir;
 
