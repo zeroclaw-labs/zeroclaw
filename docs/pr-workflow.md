@@ -93,18 +93,17 @@ Automation assists with triage and guardrails, but final merge accountability re
 
 ## 3. Required Repository Settings
 
-Maintain these branch protection rules on `dev` and `main`:
+Maintain these branch protection rules on `master`:
 
 - Require status checks before merge.
 - Require check `CI Required Gate`.
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths.
 - For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
-- Default workflow-owner allowlist includes `theonlyhennygod`, `willsarg`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
+- Default workflow-owner allowlist is configured via the `WORKFLOW_OWNER_LOGINS` repository variable (see CODEOWNERS for current maintainers).
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
-- Route normal contributor PRs to `dev`.
-- Allow `main` merges only through a promotion PR from `dev` (enforced by `Main Promotion Gate`).
+- All contributor PRs target `master` directly.
 
 ---
 
@@ -126,7 +125,7 @@ Maintain these branch protection rules on `dev` and `main`:
 - `CI Required Gate` is the merge gate.
 - Docs-only PRs use fast-path and skip heavy Rust jobs.
 - Non-doc PRs must pass lint, tests, and release build smoke check.
-- Rust-impacting PRs use the same required gate set as `dev`/`main` pushes (no PR build-only shortcut).
+- Rust-impacting PRs use the same required gate set as `master` pushes (no PR build-only shortcut).
 
 ### 4.3 Step C: Review
 
@@ -217,7 +216,7 @@ We do **not** require contributors to quantify AI-vs-human line ownership.
 - First maintainer triage target: within 48 hours.
 - If PR is blocked, maintainer leaves one actionable checklist.
 - `stale` automation is used to keep queue healthy; maintainers can apply `no-stale` when needed.
-- `pr-hygiene` automation checks open PRs every 12 hours and posts a nudge when a PR has no new commits for 48+ hours and is either behind `main` or missing/failing `CI Required Gate` on the head commit.
+- `pr-hygiene` automation checks open PRs every 12 hours and posts a nudge when a PR has no new commits for 48+ hours and is either behind `master` or missing/failing `CI Required Gate` on the head commit.
 
 ### 8.1 Queue budget controls
 
@@ -274,7 +273,7 @@ For agent-assisted contributions, reviewers should also verify the author demons
 
 If a merged PR causes regressions:
 
-1. Revert PR immediately on `main`.
+1. Revert PR immediately on `master`.
 2. Open a follow-up issue with root-cause analysis.
 3. Re-introduce fix only with regression tests.
 

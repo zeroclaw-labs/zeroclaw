@@ -140,7 +140,7 @@ body:
     attributes:
       label: Pre-flight checks
       options:
-        - label: I reproduced this on the latest main branch or latest release.
+        - label: I reproduced this on the latest master branch or latest release.
           required: true
         - label: I redacted secrets/tokens from logs.
           required: true
