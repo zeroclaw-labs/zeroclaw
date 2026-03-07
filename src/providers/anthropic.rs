@@ -367,43 +367,62 @@ impl AnthropicProvider {
     }
 
     /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
+    ///
+    /// Emits content blocks in encounter order to preserve interleaving of text
+    /// and images, matching the Bedrock provider's sequential approach.
     fn parse_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
-        let (cleaned_text, image_refs) = crate::multimodal::parse_image_markers(content);
-        if image_refs.is_empty() {
-            return vec![NativeContentOut::Text {
-                text: content.to_string(),
-                cache_control: None,
-            }];
-        }
+        let mut blocks = Vec::new();
+        let mut remaining = content;
 
-        let mut blocks = Vec::with_capacity(image_refs.len() + 1);
-        let trimmed = cleaned_text.trim();
-        if !trimmed.is_empty() {
-            blocks.push(NativeContentOut::Text {
-                text: trimmed.to_string(),
-                cache_control: None,
-            });
-        }
+        while let Some(start) = remaining.find("[IMAGE:") {
+            let text_before = &remaining[..start];
+            if !text_before.trim().is_empty() {
+                blocks.push(NativeContentOut::Text {
+                    text: text_before.to_string(),
+                    cache_control: None,
+                });
+            }
 
-        for image_ref in image_refs {
-            if let Some(rest) = image_ref.strip_prefix("data:") {
-                if let Some(semi) = rest.find(';') {
-                    let mime = &rest[..semi];
-                    if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
-                        blocks.push(NativeContentOut::Image {
-                            source: NativeImageSource {
-                                source_type: "base64".to_string(),
-                                media_type: mime.to_string(),
-                                data: b64.to_string(),
-                            },
-                        });
-                        continue;
+            let after = &remaining[start + 7..]; // skip "[IMAGE:"
+            if let Some(end) = after.find(']') {
+                let src = &after[..end];
+                remaining = &after[end + 1..];
+
+                if let Some(rest) = src.strip_prefix("data:") {
+                    if let Some(semi) = rest.find(';') {
+                        let mime = &rest[..semi];
+                        if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
+                            blocks.push(NativeContentOut::Image {
+                                source: NativeImageSource {
+                                    source_type: "base64".to_string(),
+                                    media_type: mime.to_string(),
+                                    data: b64.to_string(),
+                                },
+                            });
+                            continue;
+                        }
                     }
                 }
+                // Non-data-uri image: include as text reference
+                blocks.push(NativeContentOut::Text {
+                    text: format!("[image: {}]", src),
+                    cache_control: None,
+                });
+            } else {
+                // No closing bracket, treat rest as text
+                blocks.push(NativeContentOut::Text {
+                    text: remaining.to_string(),
+                    cache_control: None,
+                });
+                remaining = "";
+                break;
             }
-            // Non-data-uri image: include as text reference
+        }
+
+        // Add any remaining text after the last marker
+        if !remaining.trim().is_empty() {
             blocks.push(NativeContentOut::Text {
-                text: format!("[image: {}]", image_ref),
+                text: remaining.to_string(),
                 cache_control: None,
             });
         }
@@ -1444,7 +1463,7 @@ mod tests {
 
         match &blocks[0] {
             NativeContentOut::Text { text, .. } => {
-                assert_eq!(text, "Describe this");
+                assert_eq!(text, "Describe this\n\n");
             }
             _ => panic!("Expected Text variant for first block"),
         }
@@ -1513,7 +1532,7 @@ mod tests {
 
         match &native_msgs[0].content[0] {
             NativeContentOut::Text { text, .. } => {
-                assert_eq!(text, "What is in this photo?");
+                assert_eq!(text, "What is in this photo?\n\n");
             }
             _ => panic!("Expected Text variant"),
         }
@@ -1525,6 +1544,36 @@ mod tests {
                 assert_eq!(source.data, "iVBOR");
             }
             _ => panic!("Expected Image variant"),
+        }
+    }
+
+    #[test]
+    fn parse_user_content_blocks_preserves_interleaved_order() {
+        let content = "before [IMAGE:data:image/png;base64,abcd] after";
+        let blocks = AnthropicProvider::parse_user_content_blocks(content);
+        assert_eq!(blocks.len(), 3);
+
+        match &blocks[0] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, "before ");
+            }
+            _ => panic!("Expected Text variant for first block"),
+        }
+
+        match &blocks[1] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.data, "abcd");
+            }
+            _ => panic!("Expected Image variant for second block"),
+        }
+
+        match &blocks[2] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, " after");
+            }
+            _ => panic!("Expected Text variant for third block"),
         }
     }
 }
