@@ -8,7 +8,6 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use crate::config::{Config, MemoryConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use cortex_mem_core::FilesystemOperations;
 use std::path::PathBuf;
 use std::sync::Arc;
 

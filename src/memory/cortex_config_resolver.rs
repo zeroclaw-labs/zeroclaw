@@ -238,6 +238,9 @@ mod tests {
     #[test]
     fn test_provider_to_base_url() {
         assert_eq!(provider_to_base_url("openai"), "https://api.openai.com/v1");
+        assert_eq!(provider_to_base_url("anthropic"), "https://api.anthropic.com/v1");
+        assert_eq!(provider_to_base_url("ollama"), "http://localhost:11434/v1");
+        assert_eq!(provider_to_base_url("openrouter"), "https://openrouter.ai/api/v1");
         assert_eq!(
             provider_to_base_url("custom:http://localhost:8080/v1"),
             "http://localhost:8080/v1"
