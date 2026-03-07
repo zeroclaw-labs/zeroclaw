@@ -52,16 +52,16 @@ Refactor the dueling agent loops into a single cohesive structure powered by a `
 Implement the eager checkpointing logic to eliminate agent amnesia.
 
 #### Acceptance Criteria
-- [ ] Agent recovers progress after a mock rate limit error.
-- [ ] Initial greeting is only shown for truly new conversations.
-- [ ] Credentials remain scrubbed in persistent storage.
+- [x] Agent recovers progress after a mock rate limit error.
+- [x] Initial greeting is only shown for truly new conversations.
+- [x] Credentials remain scrubbed in persistent storage.
 
 #### Atomic Tasks
-- **Task 2.1: Implement Eager Checkpointing [3h]**
+- **Task 2.1: Implement Eager Checkpointing [3h]** ✅ Completed
     - Objective: Add `.checkpoint()` calls to `run_tool_call_loop` after each major state change.
     - Context Boundary: `src/agent/loop_.rs`, `src/agent/conversation.rs`.
     - Validation: Verify SQLite entries are created even if the loop is aborted mid-way.
-- **Task 2.2: Conditional Greeting Logic [1h]**
+- **Task 2.2: Conditional Greeting Logic [1h]** ✅ Completed
     - Objective: Modify startup to check `ConversationManager::is_empty()` before printing the 🦀 intro.
     - Context Boundary: `src/agent/loop_.rs`, `src/agent/agent.rs`.
     - Validation: No intro shown on retry of a failed turn.
@@ -70,11 +70,11 @@ Implement the eager checkpointing logic to eliminate agent amnesia.
 Ensure long-term goals are never lost in long contexts.
 
 #### Acceptance Criteria
-- [ ] Core instructions from `AGENTS.md` are always present in the context.
-- [ ] Summary compaction preserves the user's primary objective.
+- [x] Core instructions from `AGENTS.md` are always present in the context.
+- [x] Summary compaction preserves the user's primary objective.
 
 #### Atomic Tasks
-- **Task 3.1: Guidance Anchoring in Prompt Builder [2h]**
+- **Task 3.1: Guidance Anchoring in Prompt Builder [2h]** ✅ Completed
     - Objective: Update `src/agent/prompt.rs` to ensure "Identity" files are anchored to the end of the context if needed.
     - Context Boundary: `src/agent/prompt.rs`, `src/agent/conversation.rs`.
     - Validation: Verify model adherence in long-context simulation tests.

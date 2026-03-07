@@ -33,13 +33,13 @@ impl SystemPromptBuilder {
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
-                Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
+                Box::new(IdentitySection),
             ],
         }
     }
