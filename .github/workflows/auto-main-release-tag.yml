@@ -1,0 +1,83 @@
+name: Auto Main Release Tag
+
+on:
+  workflow_run:
+    workflows: ["Production Release Build"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: auto-main-release-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: core.hooksPath
+  GIT_CONFIG_VALUE_0: /dev/null
+
+jobs:
+  tag:
+    name: Create release tag from Cargo.toml
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//' | sed 's/"//')
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::Could not determine version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: v${VERSION}"
+
+      - name: Check if tag already exists
+        id: tag_check
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.version }}"
+          if git rev-parse "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} already exists, skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} does not exist, will create."
+          fi
+
+      - name: Create and push annotated tag
+        if: steps.tag_check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed tag: ${TAG}"
+          echo "### Auto Release Tag" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Triggered by: Production Release Build (run: ${{ github.event.workflow_run.id }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag already existed (skipped)
+        if: steps.tag_check.outputs.exists == 'true'
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.version }}"
+          echo "### Auto Release Tag (skipped)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag \`${TAG}\` already exists; no new tag created." >> "$GITHUB_STEP_SUMMARY"
+          echo "- To release a new version, bump the version in Cargo.toml before merging to main."  >> "$GITHUB_STEP_SUMMARY"
