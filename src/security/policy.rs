@@ -922,15 +922,28 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
+        // When workspace_only is set, absolute paths are only allowed if they
+        // already point inside the workspace or an explicit allowed root.
+        let mut confined_absolute = false;
         if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+            let workspace_root = self
+                .workspace_dir
+                .canonicalize()
+                .unwrap_or_else(|_| self.workspace_dir.clone());
+            confined_absolute = expanded_path.starts_with(&workspace_root)
+                || self.allowed_roots.iter().any(|root| {
+                    let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    expanded_path.starts_with(&canonical)
+                });
+            if !confined_absolute {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
         for forbidden in &self.forbidden_paths {
             let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
+            if expanded_path.starts_with(forbidden_path) && !confined_absolute {
                 return false;
             }
         }
@@ -1377,11 +1390,36 @@ mod tests {
     }
 
     #[test]
-    fn absolute_paths_blocked_when_workspace_only() {
+    fn absolute_paths_outside_workspace_blocked_when_workspace_only() {
         let p = default_policy();
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_paths_inside_workspace_allowed_when_workspace_only() {
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let _ = std::fs::create_dir_all(workspace_path.join("images"));
+        // Canonicalize the tempdir root so the absolute child path and workspace_dir
+        // share the same normalized prefix across macOS and Linux CI.
+        // This keeps the test focused on "absolute path inside workspace" behavior.
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.clone());
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_path_allowed(
+            canonical_workspace
+                .join("images/example.png")
+                .to_string_lossy()
+                .as_ref()
+        ));
     }
 
     #[test]
@@ -1754,6 +1792,27 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_path_argument_allows_absolute_path_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let _ = std::fs::create_dir_all(workspace_path.join("images"));
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.clone());
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let allowed_path = canonical_workspace.join("images/example.png");
+
+        assert_eq!(
+            p.forbidden_path_argument(&format!("cat {}", allowed_path.display())),
+            None
+        );
+    }
+
+    #[test]
     fn forbidden_path_argument_detects_parent_dir_reference() {
         let p = default_policy();
         assert_eq!(
@@ -1967,11 +2026,11 @@ mod tests {
 
     #[test]
     fn workspace_only_false_allows_resolved_outside_workspace() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false");
-        let _ = std::fs::create_dir_all(&workspace);
-        let canonical_workspace = workspace
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let canonical_workspace = workspace_path
             .canonicalize()
-            .unwrap_or_else(|_| workspace.clone());
+            .unwrap_or_else(|_| workspace_path.clone());
 
         let p = SecurityPolicy {
             workspace_dir: canonical_workspace.clone(),
@@ -1999,17 +2058,15 @@ mod tests {
             !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
             "forbidden /var must be blocked even when workspace_only=false"
         );
-
-        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
     fn workspace_only_true_blocks_resolved_outside_workspace() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_true");
-        let _ = std::fs::create_dir_all(&workspace);
-        let canonical_workspace = workspace
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let canonical_workspace = workspace_path
             .canonicalize()
-            .unwrap_or_else(|_| workspace.clone());
+            .unwrap_or_else(|_| workspace_path.clone());
 
         let p = SecurityPolicy {
             workspace_dir: canonical_workspace.clone(),
@@ -2122,12 +2179,24 @@ mod tests {
     }
 
     #[test]
-    fn checklist_workspace_only_blocks_all_absolute() {
+    fn checklist_workspace_only_blocks_absolute_paths_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.clone());
         let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
             workspace_only: true,
             ..SecurityPolicy::default()
         };
         assert!(!p.is_path_allowed("/any/absolute/path"));
+        assert!(p.is_path_allowed(
+            canonical_workspace
+                .join("relative/path.txt")
+                .to_string_lossy()
+                .as_ref()
+        ));
         assert!(p.is_path_allowed("relative/path.txt"));
     }
 
@@ -2178,13 +2247,13 @@ mod tests {
 
     #[test]
     fn resolved_path_blocks_outside_workspace() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_resolved_path");
-        let _ = std::fs::create_dir_all(&workspace);
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_path = workspace.path().to_path_buf();
 
         // Use the canonicalized workspace so starts_with checks match
-        let canonical_workspace = workspace
+        let canonical_workspace = workspace_path
             .canonicalize()
-            .unwrap_or_else(|_| workspace.clone());
+            .unwrap_or_else(|_| workspace_path.clone());
 
         let policy = SecurityPolicy {
             workspace_dir: canonical_workspace.clone(),
@@ -2207,8 +2276,6 @@ mod tests {
             !policy.is_resolved_path_allowed(&outside),
             "path outside workspace must be blocked"
         );
-
-        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

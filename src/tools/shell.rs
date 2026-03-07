@@ -216,6 +216,14 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
+    fn test_security_with_workspace(workspace_dir: std::path::PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn shell_tool_name() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -317,6 +325,38 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_allows_absolute_path_argument_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let workspace_dir = workspace
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.path().to_path_buf());
+        let allowed_path = workspace_dir.join("images/example.png");
+        std::fs::create_dir_all(
+            allowed_path
+                .parent()
+                .expect("allowed path should have a parent directory"),
+        )
+        .expect("create nested workspace directories");
+        std::fs::write(&allowed_path, b"ok").expect("write fixture file");
+
+        let tool = ShellTool::new(test_security_with_workspace(workspace_dir), test_runtime());
+        let result = tool
+            .execute(json!({"command": format!("echo {}", allowed_path.display())}))
+            .await
+            .expect("workspace absolute path should be allowed");
+
+        assert!(result.success, "expected command to succeed: {result:?}");
+        assert!(result.error.is_none(), "unexpected stderr: {result:?}");
+        assert!(
+            result
+                .output
+                .contains(allowed_path.to_string_lossy().as_ref()),
+            "stdout should contain echoed workspace path: {result:?}"
+        );
     }
 
     #[tokio::test]
