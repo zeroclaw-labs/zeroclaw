@@ -296,7 +296,8 @@ in
 
   config = mkIf cfg.enable {
     systemd.tmpfiles.rules = [
-      "d ${cfg.stateDir} 0700 ${cfg.user} ${cfg.group} -"
+      "d ${cfg.stateDir}           0700 ${cfg.user} ${cfg.group} -"
+      "d ${cfg.stateDir}/workspace 0700 ${cfg.user} ${cfg.group} -"
     ];
 
     users.users.${cfg.user} = {
