@@ -315,6 +315,7 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      restartTriggers = [ configFile ];
 
       environment = {
         ZEROCLAW_CONFIG_DIR = cfg.stateDir;
