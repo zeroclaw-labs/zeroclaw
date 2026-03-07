@@ -500,10 +500,8 @@ mod tests {
             .expect_err("without routes, fallback provider should fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("error sending request")
-                || msg.contains("Connection refused")
-                || msg.contains("failed to connect"),
-            "unexpected error when routes are missing: {msg}"
+            msg.contains("127.0.0.1:9"),
+            "expected fallback-provider failure against 127.0.0.1:9, got: {msg}"
         );
     }
 }
