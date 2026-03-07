@@ -22,6 +22,8 @@ pub struct ResolvedCortexConfig {
     pub embedding_api_key: String,
     pub embedding_model: String,
     pub embedding_dimensions: usize,
+    pub auto_extract: bool,
+    pub generate_layers_on_close: bool,
 }
 
 /// Resolve cortex-mem configuration from zeroclaw config
@@ -76,6 +78,8 @@ pub fn resolve_cortex_config(
         embedding_api_key,
         embedding_model,
         embedding_dimensions,
+        auto_extract: cortex_config.auto_extract,
+        generate_layers_on_close: cortex_config.generate_layers_on_close,
     })
 }
 

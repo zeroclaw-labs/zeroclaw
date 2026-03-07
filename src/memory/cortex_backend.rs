@@ -109,26 +109,35 @@ impl Memory for CortexMemory {
         session_id: Option<&str>,
     ) -> Result<()> {
         let thread_id = session_id.unwrap_or("default");
-        
+
         // Map category to cortex-mem scope
         let role = match category {
             MemoryCategory::Core => "system",
             MemoryCategory::Daily | MemoryCategory::Conversation => "user",
             MemoryCategory::Custom(_) => "user",
         };
-        
+
+        tracing::info!(
+            "Cortex storing memory: key={}, thread={}, role={}, category={:?}, content_len={}",
+            _key,
+            thread_id,
+            role,
+            category,
+            content.len()
+        );
+
         // Use MemoryOperations to add message
         self.operations
             .add_message(thread_id, role, content)
             .await
             .context("Failed to store memory in Cortex-Memory")?;
-        
-        tracing::debug!(
-            "Cortex stored message in thread {} (category: {:?})",
-            thread_id,
-            category
+
+        tracing::info!(
+            "Cortex stored memory successfully: key={}, thread={}",
+            _key,
+            thread_id
         );
-        
+
         Ok(())
     }
     
