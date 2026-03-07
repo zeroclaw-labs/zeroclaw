@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 pub mod backend;
 pub mod chunker;
 pub mod cli;
