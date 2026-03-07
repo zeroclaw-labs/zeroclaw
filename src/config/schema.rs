@@ -11165,8 +11165,13 @@ denied_tools = ["shell"]
         );
 
         let transcription_key = stored.transcription.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(transcription_key));
-        assert_eq!(store.decrypt(transcription_key).unwrap(), "transcription-credential");
+        assert!(crate::security::SecretStore::is_encrypted(
+            transcription_key
+        ));
+        assert_eq!(
+            store.decrypt(transcription_key).unwrap(),
+            "transcription-credential"
+        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
