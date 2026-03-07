@@ -212,6 +212,12 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Resul
 
     if !status.is_success() {
         if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&body) {
+            if err.error == "invalid_grant" {
+                anyhow::bail!(
+                    "Gemini OAuth refresh token is expired or revoked (invalid_grant). \
+                     Re-run `gemini` to authenticate again."
+                );
+            }
             anyhow::bail!(
                 "Google OAuth refresh error: {} - {}",
                 err.error,
@@ -597,6 +603,12 @@ pub async fn refresh_access_token_with_credentials(
 
     if !status.is_success() {
         if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&body) {
+            if err.error == "invalid_grant" {
+                anyhow::bail!(
+                    "Gemini OAuth refresh token is expired or revoked (invalid_grant). \
+                     Re-run `gemini` to authenticate again."
+                );
+            }
             anyhow::bail!(
                 "Google OAuth refresh error: {} - {}",
                 err.error,

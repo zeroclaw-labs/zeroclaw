@@ -271,7 +271,10 @@ impl AuthService {
         }
 
         let Some(refresh_token) = token_set.refresh_token.clone() else {
-            return Ok(Some(token_set.access_token.clone()));
+            anyhow::bail!(
+                "Gemini OAuth token is expired and no refresh_token is available for profile '{profile_id}'. \
+                 Re-run `gemini` to authenticate again."
+            );
         };
 
         let refresh_lock = refresh_lock_for_profile(&profile_id);
@@ -542,7 +545,7 @@ fn clear_refresh_backoff(profile_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+    use crate::auth::profiles::{AuthProfile, AuthProfileKind, TokenSet};
 
     #[test]
     fn normalize_provider_aliases() {
@@ -600,6 +603,49 @@ mod tests {
         assert_eq!(
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_expired_token_without_refresh_token_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AuthService::new(dir.path(), false);
+
+        let expired_token_set = TokenSet {
+            access_token: "expired-access-token".into(),
+            refresh_token: None,
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
+            token_type: Some("Bearer".into()),
+            scope: None,
+        };
+
+        let profile = AuthProfile {
+            id: profile_id(GEMINI_PROVIDER, DEFAULT_PROFILE_NAME),
+            provider: GEMINI_PROVIDER.into(),
+            profile_name: DEFAULT_PROFILE_NAME.into(),
+            kind: AuthProfileKind::OAuth,
+            account_id: None,
+            workspace_id: None,
+            token_set: Some(expired_token_set),
+            token: None,
+            metadata: std::collections::BTreeMap::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        service.store.upsert_profile(profile, true).await.unwrap();
+
+        let result = service.get_valid_gemini_access_token(None).await;
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no refresh_token is available"),
+            "expected 'no refresh_token is available' in: {msg}"
+        );
+        assert!(
+            msg.contains("Re-run `gemini`"),
+            "expected 'Re-run `gemini`' in: {msg}"
         );
     }
 }
