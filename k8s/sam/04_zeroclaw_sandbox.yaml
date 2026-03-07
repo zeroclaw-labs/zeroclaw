@@ -48,12 +48,10 @@ spec:
               # This lets activate_project work without auto-detection
               # (which fails on markdown-only workspaces).
               mkdir -p /data/workspace/.serena
-              if [ ! -f /data/workspace/.serena/project.yml ]; then
-                echo "Seeding .serena/project.yml"
-                printf '%s\n' 'project_name: sam' 'languages:' '  - bash' \
-                  > /data/workspace/.serena/project.yml
-                chown 1000:1000 /data/workspace/.serena /data/workspace/.serena/project.yml
-              fi
+              echo "Syncing .serena/project.yml"
+              printf '%s\n' 'project_name: sam' 'languages:' '  - bash' '  - toml' '  - yaml' \
+                > /data/workspace/.serena/project.yml
+              chown 1000:1000 /data/workspace/.serena /data/workspace/.serena/project.yml
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -77,7 +75,7 @@ spec:
               readOnly: true
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.3.5
+          image: citizendaniel/zeroclaw-sam:v1.3.7
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -146,7 +144,7 @@ spec:
             - name: zeroclaw-data
               mountPath: /data
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.3.5
+          image: citizendaniel/zeroclaw-sam:v1.3.7
           imagePullPolicy: IfNotPresent
           command:
             - sh
