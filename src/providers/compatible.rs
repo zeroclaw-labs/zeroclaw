@@ -440,20 +440,22 @@ impl ResponseMessage {
 struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    #[serde(rename = "type")]
-    #[serde(default)]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     function: Option<Function>,
 
-    // Compatibility: Some providers (e.g., older GLM) may use 'name' directly
-    #[serde(default)]
+    // Compatibility: Some providers (e.g., older GLM) may use 'name' directly.
+    // We still deserialize it, but avoid sending `name: null` back to strict
+    // OpenAI-compatible providers (e.g., Mistral) that reject unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     arguments: Option<String>,
 
-    // Compatibility: DeepSeek sometimes wraps arguments differently
-    #[serde(rename = "parameters", default)]
+    // Compatibility: DeepSeek sometimes wraps arguments differently.
+    // Kept for deserialization only; omitted from outbound payloads when None.
+    #[serde(rename = "parameters", default, skip_serializing_if = "Option::is_none")]
     parameters: Option<serde_json::Value>,
 }
 
