@@ -231,17 +231,11 @@ impl Tool for ImageInfoTool {
         }
 
         if include_base64 {
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let mime = match format {
-                "png" => "image/png",
-                "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "webp" => "image/webp",
-                "bmp" => "image/bmp",
-                _ => "application/octet-stream",
-            };
-            let _ = write!(output, "\ndata:{mime};base64,{encoded}");
+            // Optimize the image before inlining to prevent context window blowout.
+            // Uses the same pipeline as browser screenshots: resize to 1024px max,
+            // JPEG compress, and emit an [IMAGE:] marker for the multimodal pipeline.
+            let (optimized, mime) = super::browser::optimize_screenshot(bytes.clone()).await;
+            output = super::browser::format_screenshot_result(&optimized, mime, &output);
         }
 
         Ok(ToolResult {

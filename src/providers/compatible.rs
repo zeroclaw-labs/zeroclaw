@@ -1593,7 +1593,13 @@ impl OpenAiCompatibleProvider {
         content: &str,
         allow_user_image_parts: bool,
     ) -> MessageContent {
-        if role != "user" || !allow_user_image_parts {
+        // Parse [IMAGE:] markers for user messages and tool results.
+        // Tool results can contain optimized screenshots from the browser tool;
+        // sending them as proper image_url content parts lets the vision model
+        // actually see the image instead of receiving raw base64 text tokens.
+        let allow_images =
+            allow_user_image_parts && (role == "user" || role == "tool");
+        if !allow_images {
             return MessageContent::Text(content.to_string());
         }
 
@@ -1679,9 +1685,14 @@ impl OpenAiCompatibleProvider {
 
                     if let Some(id) = tool_call_id {
                         if assistant_tool_call_ids.contains(&id) {
+                            let content = Self::to_message_content(
+                                "tool",
+                                &content_text,
+                                allow_user_image_parts,
+                            );
                             native_messages.push(NativeMessage {
                                 role: "tool".to_string(),
-                                content: Some(MessageContent::Text(content_text)),
+                                content: Some(content),
                                 tool_call_id: Some(id),
                                 tool_calls: None,
                                 reasoning_content: None,
