@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 21, 2026**.
+Last verified: **March 1, 2026**.
 
 ## How to List Providers
 
@@ -35,6 +35,7 @@ credential is not reused for fallback providers.
 | `vercel` | `vercel-ai` | No | `VERCEL_API_KEY` |
 | `cloudflare` | `cloudflare-ai` | No | `CLOUDFLARE_API_KEY` |
 | `moonshot` | `kimi` | No | `MOONSHOT_API_KEY` |
+| `stepfun` | `step`, `step-ai`, `step_ai` | No | `STEP_API_KEY`, `STEPFUN_API_KEY` |
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | No | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | No | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
@@ -44,6 +45,8 @@ credential is not reused for fallback providers.
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
 | `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
+| `siliconflow` | `silicon-cloud`, `siliconcloud` | No | `SILICONFLOW_API_KEY` |
+| `hunyuan` | `tencent` | No | `HUNYUAN_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
@@ -55,12 +58,39 @@ credential is not reused for fallback providers.
 | `perplexity` | — | No | `PERPLEXITY_API_KEY` |
 | `cohere` | — | No | `COHERE_API_KEY` |
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
+| `cursor` | — | Yes | (none; Cursor manages its own credentials) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+
+### Cursor (Headless CLI) Notes
+
+- Provider ID: `cursor`
+- Invocation: `cursor --headless [--model <model>] -` (prompt is sent via stdin)
+- The `cursor` binary must be in `PATH`, or override its location with `CURSOR_PATH` env var.
+- Authentication is managed by Cursor itself (its own credential store); no API key is required.
+- The model argument is forwarded to cursor as-is; use `"default"` (or leave model empty) to let Cursor select the model.
+- This provider spawns a subprocess per request and is best suited for batch/script usage rather than high-throughput inference.
+- **Limitations**: Only the system prompt (if any) and the last user message are forwarded per request. Full multi-turn conversation history is not preserved because the headless CLI accepts a single prompt per invocation. Temperature control is not supported; non-default values return an explicit error.
+
+### LM Studio Notes
+
+- Provider ID: `lmstudio` (alias: `lm-studio`)
+- Default local endpoint: `http://localhost:1234/v1`
+- Override endpoint with `api_url` for remote server mode:
+
+```toml
+default_provider = "lmstudio"
+api_url = "http://10.0.0.20:1234/v1"
+default_model = "qwen2.5-coder:7b"
+```
+
+- Authentication:
+  - Optional. If your LM Studio server enforces auth, set `api_key` (or `API_KEY`/`ZEROCLAW_API_KEY`).
+  - If no key is set, ZeroClaw uses an internal placeholder token for compatibility with OpenAI-style auth headers.
 
 ### Vercel AI Gateway Notes
 
@@ -78,6 +108,102 @@ credential is not reused for fallback providers.
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 - Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
 
+### Qwen (Alibaba Cloud) Notes
+
+- Provider IDs: `qwen`, `qwen-code` (OAuth), `qwen-oauth`, `dashscope`, `qwen-intl`, `qwen-us`
+- **OAuth Free Tier**: Use `qwen-code` or set `api_key = "qwen-oauth"` in config
+  - Endpoint: `portal.qwen.ai/v1`
+  - Credentials: `~/.qwen/oauth_creds.json` (use `qwen login` to authenticate)
+  - Daily quota: 1000 requests
+  - Available model: `qwen3-coder-plus` (verified 2026-02-24)
+  - Context window: ~32K tokens
+- **API Key Access**: Use `qwen` or `dashscope` provider with `DASHSCOPE_API_KEY`
+  - Endpoint: `dashscope.aliyuncs.com/compatible-mode/v1`
+  - Higher quotas and more models available with paid API key
+- **Authentication**: `QWEN_OAUTH_TOKEN` (for OAuth) or `DASHSCOPE_API_KEY` (for API key)
+- **Recommended Model**: `qwen3-coder-plus` - Optimized for coding tasks
+- **Quota Tracking**: `zeroclaw providers-quota --provider qwen-code` shows static quota info (`?/1000` - unknown remaining, 1000/day total)
+  - Qwen OAuth API does not return rate limit headers
+  - Actual request counting requires local counter (not implemented)
+  - Rate limit errors are detected and parsed for retry backoff
+- **Limitations**:
+  - OAuth free tier limited to 1 model and 1000 requests/day
+  - See test report: `docs/qwen-provider-test-report.md`
+
+### Volcengine ARK (Doubao) Notes
+
+- Runtime provider ID: `doubao` (aliases: `volcengine`, `ark`, `doubao-cn`)
+- Onboarding display/canonical name: `volcengine`
+- Base API URL: `https://ark.cn-beijing.volces.com/api/v3`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Authentication: `ARK_API_KEY` (fallback: `DOUBAO_API_KEY`)
+- Default model preset: `doubao-1-5-pro-32k-250115`
+
+Minimal setup example:
+
+```bash
+export ARK_API_KEY="your-ark-api-key"
+zeroclaw onboard --provider volcengine --api-key "$ARK_API_KEY" --model doubao-1-5-pro-32k-250115 --force
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider volcengine
+zeroclaw agent --provider volcengine --model doubao-1-5-pro-32k-250115 -m "ping"
+```
+
+### StepFun Notes
+
+- Provider ID: `stepfun` (aliases: `step`, `step-ai`, `step_ai`)
+- Base API URL: `https://api.stepfun.com/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Authentication: `STEP_API_KEY` (fallback: `STEPFUN_API_KEY`)
+- Default model preset: `step-3.5-flash`
+- Official docs:
+  - Chat Completions: <https://platform.stepfun.com/docs/zh/api-reference/chat/chat-completion-create>
+  - Models List: <https://platform.stepfun.com/docs/api-reference/models/list>
+  - OpenAI migration guide: <https://platform.stepfun.com/docs/guide/openai>
+
+Minimal setup example:
+
+```bash
+export STEP_API_KEY="your-stepfun-api-key"
+zeroclaw onboard --provider stepfun --api-key "$STEP_API_KEY" --model step-3.5-flash --force
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider stepfun
+zeroclaw agent --provider stepfun --model step-3.5-flash -m "ping"
+```
+
+### SiliconFlow Notes
+
+- Provider ID: `siliconflow` (aliases: `silicon-cloud`, `siliconcloud`)
+- Base API URL: `https://api.siliconflow.cn/v1`
+- Chat endpoint: `/chat/completions`
+- Model discovery endpoint: `/models`
+- Authentication: `SILICONFLOW_API_KEY`
+- Default model preset: `Pro/zai-org/GLM-4.7`
+
+Minimal setup example:
+
+```bash
+export SILICONFLOW_API_KEY="your-siliconflow-api-key"
+zeroclaw onboard --provider siliconflow --api-key "$SILICONFLOW_API_KEY" --model Pro/zai-org/GLM-4.7 --force
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider siliconflow
+zeroclaw agent --provider siliconflow --model Pro/zai-org/GLM-4.7 -m "ping"
+```
+
 ### Ollama Vision Notes
 
 - Provider ID: `ollama`
@@ -92,6 +218,13 @@ credential is not reused for fallback providers.
 - ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
+
+### Hunyuan Notes
+
+- Provider ID: `hunyuan` (alias: `tencent`)
+- Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
+- Authentication: `HUNYUAN_API_KEY` (obtain from [Tencent Cloud console](https://console.cloud.tencent.com/hunyuan))
+- Recommended models: `hunyuan-t1-latest` (deep reasoning), `hunyuan-turbo-latest` (fast), `hunyuan-pro` (high quality)
 
 ### llama.cpp Server Notes
 
@@ -151,6 +284,57 @@ Behavior:
 - `false`: sends `think: false` to Ollama `/api/chat` requests.
 - `true`: sends `think: true`.
 - Unset: omits `think` and keeps Ollama/model defaults.
+
+### Ollama Vision Override
+
+Some Ollama models support vision (e.g. `llava`, `llama3.2-vision`) while others do not.
+Since ZeroClaw cannot auto-detect this, you can override it in `config.toml`:
+
+```toml
+default_provider = "ollama"
+default_model = "llava"
+model_support_vision = true
+```
+
+Behavior:
+
+- `true`: enables image attachment processing in the agent loop.
+- `false`: disables vision even if the provider reports support.
+- Unset: uses the provider's built-in default.
+
+Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
+
+### OpenAI Codex Reasoning Level
+
+You can control OpenAI Codex reasoning effort from `config.toml`:
+
+```toml
+[provider]
+reasoning_level = "high"
+```
+
+Behavior:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT`.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- Legacy compatibility: `runtime.reasoning_level` is accepted but deprecated; prefer `provider.reasoning_level`.
+- If both `provider.reasoning_level` and `runtime.reasoning_level` are set, provider-level value wins.
+
+### OpenAI-Compatible Provider Timeout
+
+You can override HTTP timeout for OpenAI-compatible providers from `config.toml`:
+
+```toml
+[provider]
+compatible_timeout_secs = 1200
+```
+
+Behavior:
+
+- Applies to OpenAI-compatible providers (for example: OpenRouter-compatible/custom endpoints, Groq, Mistral, DeepSeek, Qwen-compatible endpoints).
+- Must be greater than `0` when set.
+- Unset uses default timeout `120` seconds.
 
 ### Kimi Code Notes
 
@@ -243,6 +427,7 @@ You can route model calls by hint using `[[model_routes]]`:
 hint = "reasoning"
 provider = "openrouter"
 model = "anthropic/claude-opus-4-20250514"
+max_tokens = 8192
 
 [[model_routes]]
 hint = "fast"
