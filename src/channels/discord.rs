@@ -6,6 +6,7 @@ use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -52,6 +53,298 @@ impl DiscordChannel {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn listen_with_gateway_discovery_url(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        gateway_discovery_url: &str,
+    ) -> anyhow::Result<()> {
+        let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
+
+        // Get Gateway URL
+        let gw_response = self
+            .http_client()
+            .get(gateway_discovery_url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        let gw_resp: serde_json::Value = gw_response.error_for_status()?.json().await?;
+
+        let gw_url = gw_resp
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("wss://gateway.discord.gg");
+
+        let ws_url = format!("{gw_url}/?v=10&encoding=json");
+        tracing::info!("Discord: connecting to gateway...");
+
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Read Hello (opcode 10)
+        let hello = read.next().await.ok_or(anyhow::anyhow!("No hello"))??;
+        let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
+        let heartbeat_interval = hello_data
+            .get("d")
+            .and_then(|d| d.get("heartbeat_interval"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(41250);
+
+        // Send Identify (opcode 2)
+        let identify = json!({
+            "op": 2,
+            "d": {
+                "token": self.bot_token,
+                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
+                "properties": {
+                    "os": "linux",
+                    "browser": "zeroclaw",
+                    "device": "zeroclaw"
+                }
+            }
+        });
+        write
+            .send(Message::Text(identify.to_string().into()))
+            .await?;
+
+        tracing::info!("Discord: connected and identified");
+
+        // Track the last sequence number for heartbeats and resume.
+        // Only accessed in the select! loop below, so a plain i64 suffices.
+        let mut sequence: i64 = -1;
+
+        // Spawn heartbeat timer — sends a tick signal, actual heartbeat
+        // is assembled in the select! loop where `sequence` lives.
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let hb_interval = heartbeat_interval;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(hb_interval));
+            loop {
+                interval.tick().await;
+                if hb_tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let heartbeat_ack_timeout = Duration::from_millis(heartbeat_interval.saturating_mul(2));
+        let mut awaiting_heartbeat_ack = false;
+        let mut last_heartbeat_sent_at: Option<Instant> = None;
+
+        let guild_filter = self.guild_id.clone();
+
+        loop {
+            tokio::select! {
+                _ = hb_rx.recv() => {
+                    if discord_heartbeat_ack_timed_out(
+                        awaiting_heartbeat_ack,
+                        last_heartbeat_sent_at,
+                        heartbeat_ack_timeout,
+                    ) {
+                        anyhow::bail!(
+                            "Discord heartbeat ACK timeout after {:?}; forcing reconnect",
+                            heartbeat_ack_timeout
+                        );
+                    }
+                    let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
+                    let hb = json!({"op": 1, "d": d});
+                    if write.send(Message::Text(hb.to_string().into())).await.is_err() {
+                        break;
+                    }
+                    if !awaiting_heartbeat_ack {
+                        last_heartbeat_sent_at = Some(Instant::now());
+                    }
+                    awaiting_heartbeat_ack = true;
+                }
+                msg = read.next() => {
+                    let msg = match msg {
+                        Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(Message::Close(_))) | None => break,
+                        _ => continue,
+                    };
+
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    // Track sequence number from all dispatch events
+                    if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
+                        sequence = s;
+                    }
+
+                    let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+
+                    match op {
+                        // Op 1: Server requests an immediate heartbeat
+                        1 => {
+                            if discord_heartbeat_ack_timed_out(
+                                awaiting_heartbeat_ack,
+                                last_heartbeat_sent_at,
+                                heartbeat_ack_timeout,
+                            ) {
+                                anyhow::bail!(
+                                    "Discord heartbeat ACK timeout after {:?}; forcing reconnect",
+                                    heartbeat_ack_timeout
+                                );
+                            }
+                            let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
+                            let hb = json!({"op": 1, "d": d});
+                            if write.send(Message::Text(hb.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            if !awaiting_heartbeat_ack {
+                                last_heartbeat_sent_at = Some(Instant::now());
+                            }
+                            awaiting_heartbeat_ack = true;
+                            continue;
+                        }
+                        // Op 11: Heartbeat ACK
+                        11 => {
+                            tracing::debug!("Discord: heartbeat ACK received");
+                            awaiting_heartbeat_ack = false;
+                            last_heartbeat_sent_at = None;
+                            continue;
+                        }
+                        // Op 7: Reconnect
+                        7 => {
+                            tracing::warn!("Discord: received Reconnect (op 7), closing for restart");
+                            break;
+                        }
+                        // Op 9: Invalid Session
+                        9 => {
+                            tracing::warn!("Discord: received Invalid Session (op 9), closing for restart");
+                            break;
+                        }
+                        _ => {}
+                    }
+
+                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
+                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+                    if event_type != "MESSAGE_CREATE" {
+                        continue;
+                    }
+
+                    let Some(d) = event.get("d") else {
+                        continue;
+                    };
+
+                    // Skip messages from the bot itself
+                    let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
+                    if author_id == bot_user_id {
+                        continue;
+                    }
+
+                    // Skip bot messages (unless listen_to_bots is enabled)
+                    if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                        continue;
+                    }
+
+                    // Sender validation
+                    if !self.is_user_allowed(author_id) {
+                        tracing::warn!("Discord: ignoring message from unauthorized user");
+                        tracing::debug!(author_id_len = author_id.len(), "Discord: unauthorized user message dropped");
+                        continue;
+                    }
+
+                    // Guild filter
+                    if let Some(ref gid) = guild_filter {
+                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
+                        // DMs have no guild_id — let them through; for guild messages, enforce the filter
+                        if let Some(g) = msg_guild {
+                            if g != gid {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let Some(clean_content) =
+                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                    else {
+                        continue;
+                    };
+
+                    let attachment_text = {
+                        let atts = d
+                            .get("attachments")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        process_attachments(&atts, &self.http_client()).await
+                    };
+                    let final_content = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !message_id.is_empty() && !channel_id.is_empty() {
+                        let reaction_channel = DiscordChannel::new(
+                            self.bot_token.clone(),
+                            self.guild_id.clone(),
+                            self.allowed_users.clone(),
+                            self.listen_to_bots,
+                            self.mention_only,
+                        );
+                        let reaction_channel_id = channel_id.clone();
+                        let reaction_message_id = message_id.to_string();
+                        let reaction_emoji = random_discord_ack_reaction().to_string();
+                        tokio::spawn(async move {
+                            if let Err(err) = reaction_channel
+                                .add_reaction(
+                                    &reaction_channel_id,
+                                    &reaction_message_id,
+                                    &reaction_emoji,
+                                )
+                                .await
+                            {
+                                tracing::debug!(
+                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                );
+                            }
+                        });
+                    }
+
+                    let channel_msg = ChannelMessage {
+                        id: if message_id.is_empty() {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            format!("discord_{message_id}")
+                        },
+                        sender: author_id.to_string(),
+                        reply_target: if channel_id.is_empty() {
+                            author_id.to_string()
+                        } else {
+                            channel_id.clone()
+                        },
+                        content: final_content,
+                        channel: "discord".to_string(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        thread_ts: None,
+                    };
+
+                    if tx.send(channel_msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -404,6 +697,20 @@ fn discord_reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> Stri
     )
 }
 
+/// Returns true when a previously sent gateway heartbeat is still awaiting
+/// `HEARTBEAT_ACK` past the allowed timeout window and the listener should
+/// force a reconnect through the supervised channel loop.
+fn discord_heartbeat_ack_timed_out(
+    awaiting_ack: bool,
+    last_heartbeat_sent_at: Option<Instant>,
+    timeout: Duration,
+) -> bool {
+    awaiting_ack
+        && last_heartbeat_sent_at
+            .map(|sent_at| sent_at.elapsed() >= timeout)
+            .unwrap_or(false)
+}
+
 fn mention_tags(bot_user_id: &str) -> [String; 2] {
     [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
 }
@@ -535,252 +842,9 @@ impl Channel for DiscordChannel {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
-
-        // Get Gateway URL
-        let gw_resp: serde_json::Value = self
-            .http_client()
-            .get("https://discord.com/api/v10/gateway/bot")
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        let gw_url = gw_resp
-            .get("url")
-            .and_then(|u| u.as_str())
-            .unwrap_or("wss://gateway.discord.gg");
-
-        let ws_url = format!("{gw_url}/?v=10&encoding=json");
-        tracing::info!("Discord: connecting to gateway...");
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
-        let (mut write, mut read) = ws_stream.split();
-
-        // Read Hello (opcode 10)
-        let hello = read.next().await.ok_or(anyhow::anyhow!("No hello"))??;
-        let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
-        let heartbeat_interval = hello_data
-            .get("d")
-            .and_then(|d| d.get("heartbeat_interval"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(41250);
-
-        // Send Identify (opcode 2)
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": self.bot_token,
-                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
-                "properties": {
-                    "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw"
-                }
-            }
-        });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
-
-        tracing::info!("Discord: connected and identified");
-
-        // Track the last sequence number for heartbeats and resume.
-        // Only accessed in the select! loop below, so a plain i64 suffices.
-        let mut sequence: i64 = -1;
-
-        // Spawn heartbeat timer — sends a tick signal, actual heartbeat
-        // is assembled in the select! loop where `sequence` lives.
-        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let hb_interval = heartbeat_interval;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
-            loop {
-                interval.tick().await;
-                if hb_tx.send(()).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let guild_filter = self.guild_id.clone();
-
-        loop {
-            tokio::select! {
-                _ = hb_rx.recv() => {
-                    let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
-                    let hb = json!({"op": 1, "d": d});
-                    if write.send(Message::Text(hb.to_string().into())).await.is_err() {
-                        break;
-                    }
-                }
-                msg = read.next() => {
-                    let msg = match msg {
-                        Some(Ok(Message::Text(t))) => t,
-                        Some(Ok(Message::Close(_))) | None => break,
-                        _ => continue,
-                    };
-
-                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-
-                    // Track sequence number from all dispatch events
-                    if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
-                        sequence = s;
-                    }
-
-                    let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
-
-                    match op {
-                        // Op 1: Server requests an immediate heartbeat
-                        1 => {
-                            let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
-                            let hb = json!({"op": 1, "d": d});
-                            if write.send(Message::Text(hb.to_string().into())).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        // Op 7: Reconnect
-                        7 => {
-                            tracing::warn!("Discord: received Reconnect (op 7), closing for restart");
-                            break;
-                        }
-                        // Op 9: Invalid Session
-                        9 => {
-                            tracing::warn!("Discord: received Invalid Session (op 9), closing for restart");
-                            break;
-                        }
-                        _ => {}
-                    }
-
-                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
-                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
-                    if event_type != "MESSAGE_CREATE" {
-                        continue;
-                    }
-
-                    let Some(d) = event.get("d") else {
-                        continue;
-                    };
-
-                    // Skip messages from the bot itself
-                    let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
-                    if author_id == bot_user_id {
-                        continue;
-                    }
-
-                    // Skip bot messages (unless listen_to_bots is enabled)
-                    if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
-                        continue;
-                    }
-
-                    // Sender validation
-                    if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
-                        continue;
-                    }
-
-                    // Guild filter
-                    if let Some(ref gid) = guild_filter {
-                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
-                        // DMs have no guild_id — let them through; for guild messages, enforce the filter
-                        if let Some(g) = msg_guild {
-                            if g != gid {
-                                continue;
-                            }
-                        }
-                    }
-
-                    let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
-                    else {
-                        continue;
-                    };
-
-                    let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        process_attachments(&atts, &self.http_client()).await
-                    };
-                    let final_content = if attachment_text.is_empty() {
-                        clean_content
-                    } else {
-                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
-                    };
-
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    if !message_id.is_empty() && !channel_id.is_empty() {
-                        let reaction_channel = DiscordChannel::new(
-                            self.bot_token.clone(),
-                            self.guild_id.clone(),
-                            self.allowed_users.clone(),
-                            self.listen_to_bots,
-                            self.mention_only,
-                        );
-                        let reaction_channel_id = channel_id.clone();
-                        let reaction_message_id = message_id.to_string();
-                        let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
-                            if let Err(err) = reaction_channel
-                                .add_reaction(
-                                    &reaction_channel_id,
-                                    &reaction_message_id,
-                                    &reaction_emoji,
-                                )
-                                .await
-                            {
-                                tracing::debug!(
-                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
-                                );
-                            }
-                        });
-                    }
-
-                    let channel_msg = ChannelMessage {
-                        id: if message_id.is_empty() {
-                            Uuid::new_v4().to_string()
-                        } else {
-                            format!("discord_{message_id}")
-                        },
-                        sender: author_id.to_string(),
-                        reply_target: if channel_id.is_empty() {
-                            author_id.to_string()
-                        } else {
-                            channel_id.clone()
-                        },
-                        content: final_content,
-                        channel: "discord".to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        thread_ts: None,
-                    };
-
-                    if tx.send(channel_msg).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        self.listen_with_gateway_discovery_url(tx, "https://discord.com/api/v10/gateway/bot")
+            .await
     }
 
     async fn health_check(&self) -> bool {
@@ -885,6 +949,34 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct TestDiscordChannel {
+        inner: DiscordChannel,
+        discovery_url: String,
+        name: String,
+    }
+
+    #[async_trait]
+    impl Channel for TestDiscordChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .listen_with_gateway_discovery_url(tx, &self.discovery_url)
+                .await
+        }
+    }
 
     #[test]
     fn discord_channel_name() {
@@ -1244,6 +1336,361 @@ mod tests {
             let emoji = random_discord_ack_reaction();
             assert!(DISCORD_ACK_REACTIONS.contains(&emoji));
         }
+    }
+
+    #[test]
+    fn heartbeat_ack_timeout_triggers_when_waiting_too_long() {
+        let timeout = Duration::from_millis(50);
+        let sent_at = Instant::now() - Duration::from_millis(60);
+        assert!(discord_heartbeat_ack_timed_out(
+            true,
+            Some(sent_at),
+            timeout
+        ));
+    }
+
+    #[test]
+    fn heartbeat_ack_timeout_does_not_trigger_without_pending_ack() {
+        let timeout = Duration::from_millis(50);
+        let sent_at = Instant::now() - Duration::from_millis(60);
+        assert!(!discord_heartbeat_ack_timed_out(
+            false,
+            Some(sent_at),
+            timeout
+        ));
+        assert!(!discord_heartbeat_ack_timed_out(true, None, timeout));
+    }
+
+    #[test]
+    fn heartbeat_ack_roundtrip_clears_pending_timeout_state() {
+        let timeout = Duration::from_millis(50);
+        let just_sent = Instant::now();
+        assert!(!discord_heartbeat_ack_timed_out(
+            true,
+            Some(just_sent),
+            timeout
+        ));
+
+        let awaiting_ack = false; // state after receiving op 11 ACK
+        let older_sent_at = Instant::now() - Duration::from_millis(60);
+        assert!(!discord_heartbeat_ack_timed_out(
+            awaiting_ack,
+            Some(older_sent_at),
+            timeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn discord_listener_exits_after_first_message_when_heartbeat_ack_stops() {
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::accept_async;
+
+        const TEST_HEARTBEAT_INTERVAL_MS: u64 = 100;
+        const TEST_HEARTBEAT_WAIT_MS: u64 = 1_500;
+        const TEST_FIRST_MESSAGE_WAIT_MS: u64 = 1_500;
+        const TEST_LISTEN_EXIT_WAIT_MS: u64 = 3_000;
+        const TEST_POST_HEARTBEAT_SLEEP_MS: u64 = 1_000;
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake discord ws listener");
+        let ws_addr = ws_listener
+            .local_addr()
+            .expect("get fake discord ws listener addr");
+        let ws_url = format!("ws://{ws_addr}");
+
+        let http_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake discord discovery listener");
+        let http_addr = http_listener
+            .local_addr()
+            .expect("get fake discord discovery listener addr");
+        let discovery_url = format!("http://{http_addr}/api/v10/gateway/bot");
+
+        let app = Router::new().route(
+            "/api/v10/gateway/bot",
+            get({
+                let ws_url = ws_url.clone();
+                move || {
+                    let ws_url = ws_url.clone();
+                    async move { Json(json!({ "url": ws_url })) }
+                }
+            }),
+        );
+        let http_handle = tokio::spawn(async move {
+            axum::serve(http_listener, app)
+                .await
+                .expect("serve fake discord discovery endpoint");
+        });
+
+        let ws_handle = tokio::spawn(async move {
+            let (stream, _) = ws_listener
+                .accept()
+                .await
+                .expect("accept fake ws connection");
+            let mut ws = accept_async(stream)
+                .await
+                .expect("upgrade fake discord websocket");
+
+            ws.send(Message::Text(
+                json!({ "op": 10, "d": { "heartbeat_interval": TEST_HEARTBEAT_INTERVAL_MS } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send hello");
+
+            let identify = ws
+                .next()
+                .await
+                .expect("read identify frame")
+                .expect("identify frame should be valid");
+            let identify_text = identify
+                .into_text()
+                .expect("identify frame should be text")
+                .to_string();
+            assert!(identify_text.contains("\"op\":2"));
+
+            ws.send(Message::Text(
+                json!({
+                    "op": 0,
+                    "t": "MESSAGE_CREATE",
+                    "s": 1,
+                    "d": {
+                        "id": "",
+                        "channel_id": "chan-1",
+                        "content": "hello after first exchange",
+                        "author": { "id": "user-42", "bot": false },
+                        "attachments": []
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send first discord message event");
+
+            let heartbeat =
+                tokio::time::timeout(Duration::from_millis(TEST_HEARTBEAT_WAIT_MS), ws.next())
+                    .await
+                    .expect("client should send heartbeat before timeout")
+                    .expect("heartbeat frame should exist")
+                    .expect("heartbeat frame should be valid");
+            let heartbeat_text = heartbeat
+                .into_text()
+                .expect("heartbeat frame should be text")
+                .to_string();
+            assert!(heartbeat_text.contains("\"op\":1"));
+
+            tokio::time::sleep(Duration::from_millis(TEST_POST_HEARTBEAT_SLEEP_MS)).await;
+        });
+
+        let channel = DiscordChannel::new(
+            "MTIz.fake.hmac".into(),
+            None,
+            vec!["*".into()],
+            false,
+            false,
+        );
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(4);
+
+        let listen_task = tokio::spawn(async move {
+            channel
+                .listen_with_gateway_discovery_url(tx, &discovery_url)
+                .await
+        });
+
+        let first_message =
+            tokio::time::timeout(Duration::from_millis(TEST_FIRST_MESSAGE_WAIT_MS), rx.recv())
+                .await
+                .expect("listener should deliver first discord message")
+                .expect("first discord message should exist");
+        assert_eq!(first_message.content, "hello after first exchange");
+
+        let err =
+            tokio::time::timeout(Duration::from_millis(TEST_LISTEN_EXIT_WAIT_MS), listen_task)
+                .await
+                .expect("listener should exit after missing heartbeat ACK")
+                .expect("listener join should complete")
+                .expect_err("listener should error on missing heartbeat ACK");
+        assert!(
+            format!("{err:#}").contains("heartbeat ACK timeout"),
+            "unexpected listener error: {err:#}"
+        );
+
+        http_handle.abort();
+        ws_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn discord_supervisor_reconnects_and_receives_second_dispatch_after_ack_timeout() {
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::accept_async;
+
+        const TEST_HEARTBEAT_INTERVAL_MS: u64 = 100;
+        const TEST_HEARTBEAT_WAIT_MS: u64 = 1_500;
+        const TEST_FIRST_MESSAGE_WAIT_MS: u64 = 1_500;
+        const TEST_POST_RECONNECT_SLEEP_MS: u64 = 200;
+        const TEST_MISSED_ACK_SLEEP_MS: u64 = 1_000;
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake discord ws listener");
+        let ws_addr = ws_listener
+            .local_addr()
+            .expect("get fake discord ws listener addr");
+        let ws_url = format!("ws://{ws_addr}");
+
+        let http_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake discord discovery listener");
+        let http_addr = http_listener
+            .local_addr()
+            .expect("get fake discord discovery listener addr");
+        let discovery_url = format!("http://{http_addr}/api/v10/gateway/bot");
+
+        let app = Router::new().route(
+            "/api/v10/gateway/bot",
+            get({
+                let ws_url = ws_url.clone();
+                move || {
+                    let ws_url = ws_url.clone();
+                    async move { Json(json!({ "url": ws_url })) }
+                }
+            }),
+        );
+        let http_handle = tokio::spawn(async move {
+            axum::serve(http_listener, app)
+                .await
+                .expect("serve fake discord discovery endpoint");
+        });
+
+        let ws_connections = Arc::new(AtomicUsize::new(0));
+        let ws_connections_for_task = Arc::clone(&ws_connections);
+        let ws_handle = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (stream, _) = ws_listener
+                    .accept()
+                    .await
+                    .expect("accept fake ws connection");
+                ws_connections_for_task.fetch_add(1, Ordering::SeqCst);
+                let mut ws = accept_async(stream)
+                    .await
+                    .expect("upgrade fake discord websocket");
+
+                ws.send(Message::Text(
+                    json!({ "op": 10, "d": { "heartbeat_interval": TEST_HEARTBEAT_INTERVAL_MS } })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send hello");
+
+                let identify = ws
+                    .next()
+                    .await
+                    .expect("read identify frame")
+                    .expect("identify frame should be valid");
+                let identify_text = identify
+                    .into_text()
+                    .expect("identify frame should be text")
+                    .to_string();
+                assert!(identify_text.contains("\"op\":2"));
+
+                ws.send(Message::Text(
+                    json!({
+                        "op": 0,
+                        "t": "MESSAGE_CREATE",
+                        "s": attempt + 1,
+                        "d": {
+                            "id": "",
+                            "channel_id": "chan-1",
+                            "content": if attempt == 0 { "first dispatch" } else { "second dispatch after reconnect" },
+                            "author": { "id": "user-42", "bot": false },
+                            "attachments": []
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send discord message event");
+
+                let heartbeat =
+                    tokio::time::timeout(Duration::from_millis(TEST_HEARTBEAT_WAIT_MS), ws.next())
+                        .await
+                        .expect("client should send heartbeat before timeout")
+                        .expect("heartbeat frame should exist")
+                        .expect("heartbeat frame should be valid");
+                let heartbeat_text = heartbeat
+                    .into_text()
+                    .expect("heartbeat frame should be text")
+                    .to_string();
+                assert!(heartbeat_text.contains("\"op\":1"));
+
+                if attempt == 0 {
+                    tokio::time::sleep(Duration::from_millis(TEST_MISSED_ACK_SLEEP_MS)).await;
+                } else {
+                    ws.send(Message::Text(
+                        json!({ "op": 11, "d": null }).to_string().into(),
+                    ))
+                    .await
+                    .expect("send heartbeat ack after reconnect");
+                    tokio::time::sleep(Duration::from_millis(TEST_POST_RECONNECT_SLEEP_MS)).await;
+                }
+            }
+        });
+
+        let channel_name = format!("discord-reconnect-test-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(TestDiscordChannel {
+            inner: DiscordChannel::new(
+                "MTIz.fake.hmac".into(),
+                None,
+                vec!["*".into()],
+                false,
+                false,
+            ),
+            discovery_url,
+            name: channel_name.clone(),
+        });
+        let component_name = format!("channel:{channel_name}");
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = super::super::spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+        );
+
+        let first_message =
+            tokio::time::timeout(Duration::from_millis(TEST_FIRST_MESSAGE_WAIT_MS), rx.recv())
+                .await
+                .expect("should receive first discord dispatch")
+                .expect("first dispatch should exist");
+        assert_eq!(first_message.content, "first dispatch");
+
+        let second_message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("supervisor should reconnect and receive second dispatch")
+            .expect("second dispatch should exist");
+        assert_eq!(second_message.content, "second dispatch after reconnect");
+
+        tokio::time::sleep(Duration::from_millis(TEST_POST_RECONNECT_SLEEP_MS)).await;
+        let snapshot = crate::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
+        assert!(ws_connections.load(Ordering::SeqCst) >= 2);
+
+        drop(rx);
+        handle.abort();
+        let _ = handle.await;
+        http_handle.abort();
+        ws_handle.abort();
     }
 
     #[test]
