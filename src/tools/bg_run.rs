@@ -39,7 +39,7 @@ const DELIVERED_JOB_EXPIRY_SECS: u64 = 300;
 
 /// Maximum concurrent background jobs per session.
 /// Prevents resource exhaustion from unbounded parallel tool execution.
-const MAX_CONCURRENT_JOBS: usize = 5;
+const MAX_CONCURRENT_JOBS: usize = 12;
 
 // ── Job Status ──────────────────────────────────────────────────────────────
 
@@ -284,6 +284,7 @@ impl Tool for BgRunTool {
 
         // Validate arguments is an object (matches schema declaration)
         if !arguments.is_object() {
+            tracing::warn!(tool = tool_name, "bg_run: arguments is not an object");
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -295,6 +296,7 @@ impl Tool for BgRunTool {
         let tool = match self.find_tool(tool_name) {
             Some(t) => t,
             None => {
+                tracing::warn!(tool = tool_name, "bg_run: unknown tool requested");
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -315,6 +317,12 @@ impl Tool for BgRunTool {
         // Enforce concurrent job limit to prevent resource exhaustion
         let running_count = self.job_store.running_count().await;
         if running_count >= MAX_CONCURRENT_JOBS {
+            tracing::warn!(
+                tool = tool_name,
+                running_count,
+                limit = MAX_CONCURRENT_JOBS,
+                "bg_run: concurrent job limit reached"
+            );
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -4025,7 +4025,8 @@ pub struct ReliabilityConfig {
     /// Base backoff (ms) for provider retry delay.
     #[serde(default = "default_provider_backoff_ms")]
     pub provider_backoff_ms: u64,
-    /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
+    /// Primary provider fallback chain. When the active provider fails, ZeroClaw
+    /// tries these in order. Distinct from `model_fallbacks` (per-model substitution).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
     /// Optional per-fallback provider API keys keyed by fallback entry name.
@@ -8819,12 +8820,12 @@ impl Config {
             }
         }
 
-        for left_index in 0..custom_auth_headers_by_base_url.len() {
-            let (left_profile, left_url, left_header) =
-                &custom_auth_headers_by_base_url[left_index];
-            for right_index in (left_index + 1)..custom_auth_headers_by_base_url.len() {
-                let (right_profile, right_url, right_header) =
-                    &custom_auth_headers_by_base_url[right_index];
+        for (left_index, (left_profile, left_url, left_header)) in
+            custom_auth_headers_by_base_url.iter().enumerate()
+        {
+            for (right_profile, right_url, right_header) in
+                custom_auth_headers_by_base_url[left_index + 1..].iter()
+            {
                 if Self::urls_match_ignoring_trailing_slash(left_url, right_url)
                     && !left_header.eq_ignore_ascii_case(right_header)
                 {

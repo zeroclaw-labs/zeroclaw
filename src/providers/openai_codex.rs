@@ -196,6 +196,44 @@ impl OpenAiCodexProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
+
+    /// Extract and persist quota metadata from response headers.
+    async fn extract_and_persist_quota(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+        profile_override: &str,
+    ) -> anyhow::Result<()> {
+        use crate::providers::quota_adapter::UniversalQuotaExtractor;
+
+        let extractor = UniversalQuotaExtractor::new();
+        if let Some(quota) = extractor.extract("openai-codex", headers, None) {
+            tracing::debug!(
+                provider = "openai-codex",
+                profile = profile_override,
+                remaining = ?quota.rate_limit_remaining,
+                reset_at = ?quota.rate_limit_reset_at,
+                "Extracted quota metadata from response headers"
+            );
+
+            self.auth
+                .store
+                .update_quota_metadata(
+                    profile_override,
+                    quota.rate_limit_remaining,
+                    quota.rate_limit_reset_at,
+                    quota.rate_limit_total,
+                )
+                .await?;
+
+            tracing::debug!(
+                provider = "openai-codex",
+                profile = profile_override,
+                "Persisted quota metadata to auth profiles store"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -774,6 +812,8 @@ impl OpenAiCodexProvider {
             "parallel_tool_calls": request.parallel_tool_calls,
         });
 
+        // TODO: WebSocket responses do not expose HTTP headers post-upgrade;
+        // quota metadata cannot be extracted on this transport path.
         let (mut ws_stream, _) = timeout(CODEX_WS_CONNECT_TIMEOUT, connect_async(ws_request))
             .await
             .map_err(|_| {
@@ -939,7 +979,26 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        // Capture headers for quota metadata extraction before consuming response
+        let headers = response.headers().clone();
+
+        let result = decode_responses_body(response).await?;
+
+        // Extract and persist quota metadata; fall back to sentinel key for the default profile
+        let profile_key = self
+            .auth_profile_override
+            .as_deref()
+            .unwrap_or("openai-codex:default");
+        if let Err(err) = self.extract_and_persist_quota(&headers, profile_key).await {
+            tracing::warn!(
+                error = %err,
+                provider = "openai-codex",
+                profile = profile_key,
+                "Failed to persist quota metadata"
+            );
+        }
+
+        Ok(result)
     }
 
     async fn send_responses_request(

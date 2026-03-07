@@ -68,7 +68,9 @@ pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use semantic_guard::{GuardCorpusUpdateReport, SemanticGuard, SemanticGuardStartupStatus};
 #[allow(unused_imports)]
-pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};
+pub use syscall_anomaly::{
+    SyscallAnomalyAlert, SyscallAnomalyConfig, SyscallAnomalyDetector, SyscallAnomalyKind,
+};
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Prompt injection defense exports

@@ -424,11 +424,15 @@ pub async fn self_update(force: bool, check_only: bool) -> Result<()> {
     let asset = find_asset_for_platform(&release)?;
     println!("Downloading: {}", asset.name);
 
-    // Create temp directory
-    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    // Create OS-managed unique temp directory; RAII guarantees cleanup on all exit paths.
+    let temp_dir_guard = tempfile::Builder::new()
+        .prefix("zeroclaw-update-")
+        .tempdir()
+        .context("Failed to create temp directory")?;
+    let temp_dir = temp_dir_guard.path();
 
     // Download and extract
-    let new_binary = download_binary(asset, temp_dir.path()).await?;
+    let new_binary = download_binary(asset, temp_dir).await?;
 
     println!("Installing update...");
 
@@ -436,7 +440,7 @@ pub async fn self_update(force: bool, check_only: bool) -> Result<()> {
     replace_binary(&new_binary, &current_exe)?;
 
     println!();
-    println!("✅ Successfully updated to {}!", release.tag_name);
+    println!("Successfully updated to {}!", release.tag_name);
     println!();
     println!("Restart ZeroClaw to use the new version.");
 
