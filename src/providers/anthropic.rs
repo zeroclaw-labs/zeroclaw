@@ -83,10 +83,12 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// Anthropic-native base64 image content block.
     #[serde(rename = "image")]
     Image { source: NativeImageSource },
 }
 
+/// Source payload for an Anthropic image content block.
 #[derive(Debug, Serialize)]
 struct NativeImageSource {
     #[serde(rename = "type")]
@@ -514,6 +516,12 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
+        if message.contains("[IMAGE:") {
+            anyhow::bail!(
+                "Anthropic chat_with_system does not support image content. Use the structured chat API for vision requests."
+            );
+        }
+
         let request = ChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
@@ -784,6 +792,24 @@ mod tests {
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_rejects_image_markers() {
+        let p = AnthropicProvider::new(Some("test-key"));
+        let result = p
+            .chat_with_system(
+                Some("system"),
+                "Describe [IMAGE:data:image/png;base64,abcd]",
+                "claude-3-opus",
+                0.7,
+            )
+            .await;
+        let err = result.expect_err("should reject image markers in chat_with_system");
+        assert!(
+            err.to_string().contains("does not support image content"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
