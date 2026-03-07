@@ -216,6 +216,39 @@ pub fn create_memory_with_storage_and_routes(
         tracing::warn!("memory hygiene skipped: {e}");
     }
 
+    // Cortex backend (requires memory-cortex feature)
+    #[cfg(feature = "memory-cortex")]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        tracing::info!(
+            "🧠 Cortex-Memory backend selected (tenant: {})",
+            config.cortex.tenant_id
+        );
+        
+        let memory_config = config.clone();
+        let workspace_dir = workspace_dir.to_path_buf();
+        let config_clone = crate::config::Config {
+            memory: config.clone(),
+            embedding_routes: embedding_routes.to_vec(),
+            storage: crate::config::StorageConfig::default(),
+            workspace_dir: workspace_dir.clone(),
+            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            ..crate::config::Config::default()
+        };
+        
+        return tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::memory::CortexMemory::new(&memory_config, workspace_dir, &config_clone)
+                    .await
+                    .map(|m| Box::new(m) as Box<dyn Memory>)
+            })
+        });
+    }
+
+    #[cfg(not(feature = "memory-cortex"))]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        anyhow::bail!("memory backend 'cortex' requires feature flag, rebuild with --features memory-cortex")
+    }
+
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
         && config.snapshot_on_hygiene
