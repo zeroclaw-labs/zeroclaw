@@ -1171,6 +1171,16 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
+    fn run_capture_ignores_bash_env_noise() {
+        let mut cmd = Command::new("sh");
+        cmd.env("BASH_ENV", "/definitely/missing/ci-env")
+            .args(["-lc", "echo hello"]);
+        let out = run_capture(&mut cmd).expect("stdout capture should succeed");
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
     fn run_capture_falls_back_to_stderr() {
         let out = run_capture(Command::new("/bin/sh").args(["-c", "echo warn 1>&2"]))
             .expect("stderr capture should succeed");

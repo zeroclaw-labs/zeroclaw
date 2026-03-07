@@ -1,4 +1,3 @@
-#![rustfmt::skip]
 //! Head-to-head comparison: SQLite vs Markdown memory backends
 //!
 //! Run with: cargo test --test memory_comparison -- --nocapture
@@ -83,16 +82,48 @@ async fn compare_recall_quality() {
 
     // Seed both with identical data
     let entries = vec![
-        ("lang_pref", "User prefers Rust over Python", MemoryCategory::Core),
-        ("editor", "Uses VS Code with rust-analyzer", MemoryCategory::Core),
+        (
+            "lang_pref",
+            "User prefers Rust over Python",
+            MemoryCategory::Core,
+        ),
+        (
+            "editor",
+            "Uses VS Code with rust-analyzer",
+            MemoryCategory::Core,
+        ),
         ("tz", "Timezone is EST, works 9-5", MemoryCategory::Core),
-        ("proj1", "Working on ZeroClaw AI assistant", MemoryCategory::Daily),
-        ("proj2", "Previous project was a web scraper in Python", MemoryCategory::Daily),
+        (
+            "proj1",
+            "Working on ZeroClaw AI assistant",
+            MemoryCategory::Daily,
+        ),
+        (
+            "proj2",
+            "Previous project was a web scraper in Python",
+            MemoryCategory::Daily,
+        ),
         ("deploy", "Deploys to VPS via Docker", MemoryCategory::Core),
-        ("model", "Prefers Claude Sonnet for coding tasks", MemoryCategory::Core),
-        ("style", "Likes concise responses, no fluff", MemoryCategory::Core),
-        ("rust_note", "Rust's ownership model prevents memory bugs", MemoryCategory::Daily),
-        ("perf", "Cares about binary size and startup time", MemoryCategory::Core),
+        (
+            "model",
+            "Prefers Claude Sonnet for coding tasks",
+            MemoryCategory::Core,
+        ),
+        (
+            "style",
+            "Likes concise responses, no fluff",
+            MemoryCategory::Core,
+        ),
+        (
+            "rust_note",
+            "Rust's ownership model prevents memory bugs",
+            MemoryCategory::Daily,
+        ),
+        (
+            "perf",
+            "Cares about binary size and startup time",
+            MemoryCategory::Core,
+        ),
     ];
 
     for (key, content, cat) in &entries {
@@ -112,8 +143,10 @@ async fn compare_recall_quality() {
 
     println!();
     println!("============================================================");
-    println!("RECALL QUALITY (10 entries seeded):
-");
+    println!(
+        "RECALL QUALITY (10 entries seeded):
+"
+    );
 
     for (query, desc) in &queries {
         let sq_results = sq.recall(query, 10, None).await.unwrap();
@@ -227,12 +260,16 @@ async fn compare_persistence() {
     let sq_entry = sq2.get("persist_test").await.unwrap();
     let md_entry = md2.get("persist_test").await.unwrap();
 
-let sq_status = if sq_entry.is_some() {
-                        "✅ Survived"
-        } else {
-            "❌ Lost"
-        };
-    let md_status = if md_entry.is_some() { "✅ Survived" } else { "❌ Lost" };
+    let sq_status = if sq_entry.is_some() {
+        "✅ Survived"
+    } else {
+        "❌ Lost"
+    };
+    let md_status = if md_entry.is_some() {
+        "✅ Survived"
+    } else {
+        "❌ Lost"
+    };
 
     println!();
     println!("============================================================");
@@ -315,20 +352,20 @@ async fn compare_forget() {
     let md_forgot = md.forget("secret").await.unwrap();
 
     let sq_status = if sq_forgot { "✅ Deleted" } else { "❌ Kept" };
-        let md_status = if md_forgot {
-            "✅ Deleted"
-        } else {
-            "⚠️  Cannot delete (audit trail)"
-        };
+    let md_status = if md_forgot {
+        "✅ Deleted"
+    } else {
+        "⚠️  Cannot delete (audit trail)"
+    };
 
     println!();
     println!("============================================================");
     println!("FORGET (delete sensitive data):");
-        println!(
-           " SQLite:   {} (count={})",
-            sq_status,
-            sq.count().await.unwrap()
-        );
+    println!(
+        " SQLite:   {} (count={})",
+        sq_status,
+        sq.count().await.unwrap()
+    );
     println!(" Markdown: {} (append-only by design)", md_status);
 
     // SQLite can delete
