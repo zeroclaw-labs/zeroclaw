@@ -46,6 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GNU/Linux - dynamic linking
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: zeroclaw
@@ -57,6 +58,43 @@ jobs:
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+
+          # musl/Linux - static linking (portable binaries)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: musl-tools
+            linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+            linker: musl-gcc
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+            linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+
+          # Android - Termux native (Bionic libc)
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
+          - os: ubuntu-latest
+            target: armv7-linux-androideabi
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
+
+          # macOS
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -65,6 +103,8 @@ jobs:
             target: x86_64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+
+          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
@@ -78,11 +118,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: runner.os != 'Windows'
 
-      - name: Install cross compiler
-        if: matrix.cross_compiler
+      - name: Install musl-tools (for musl targets)
+        if: contains(matrix.target, '-musl')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross compiler (GNU/Linux)
+        if: matrix.cross_compiler && !matrix.ndk
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: |
+          # Install Android NDK
+          sudo apt-get update -qq
+          sudo apt-get install -y wget unzip
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q android-ndk-r27c-linux.zip
+          echo "ANDROID_NDK_HOME=$GITHUB_WORKSPACE/android-ndk-r27c" >> $GITHUB_ENV
+          echo "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
       - name: Build release
         shell: bash
@@ -90,6 +147,12 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
+          
+          # For Android targets, set CC environment variable
+          if [ "${{ matrix.ndk }}" = "true" ]; then
+            export CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}21-clang
+          fi
+          
           cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Unix)
