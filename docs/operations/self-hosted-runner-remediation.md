@@ -85,7 +85,7 @@ Safety behavior:
 
 ## 3.1) Build Smoke Exit `143` Triage
 
-When `CI Run / Build (Smoke)` fails with `Process completed with exit code 143`:
+When `CI Run / Test + Build` fails with `Process completed with exit code 143`:
 
 1. Treat it as external termination (SIGTERM), not a compile error.
 2. Confirm the build step ended with `Terminated` and no Rust compiler diagnostic was emitted.

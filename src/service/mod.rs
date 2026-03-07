@@ -1121,15 +1121,9 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .join("zeroclaw.service"))
 }
 
-fn scrub_shell_startup_env(command: &mut Command) {
-    // CI providers may inject BASH_ENV/ENV to source transient bootstrap files.
-    // If those files disappear between steps, non-interactive shell commands emit
-    // startup errors that pollute stdout/stderr capture.
-    command.env_remove("BASH_ENV").env_remove("ENV");
-}
-
 fn run_checked(command: &mut Command) -> Result<()> {
-    scrub_shell_startup_env(command);
+    // Keep shell child behavior deterministic under CI wrappers that set ENV/BASH_ENV.
+    command.env_remove("ENV").env_remove("BASH_ENV");
     let output = command.output().context("Failed to spawn command")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1139,7 +1133,8 @@ fn run_checked(command: &mut Command) -> Result<()> {
 }
 
 fn run_capture(command: &mut Command) -> Result<String> {
-    scrub_shell_startup_env(command);
+    // Keep shell child behavior deterministic under CI wrappers that set ENV/BASH_ENV.
+    command.env_remove("ENV").env_remove("BASH_ENV");
     let output = command.output().context("Failed to spawn command")?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
@@ -1169,7 +1164,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_capture_reads_stdout() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"]))
+        let out = run_capture(Command::new("/bin/sh").args(["-c", "echo hello"]))
             .expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
@@ -1187,7 +1182,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_capture_falls_back_to_stderr() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"]))
+        let out = run_capture(Command::new("/bin/sh").args(["-c", "echo warn 1>&2"]))
             .expect("stderr capture should succeed");
         assert_eq!(out.trim(), "warn");
     }
@@ -1195,7 +1190,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_checked_errors_on_non_zero_status() {
-        let err = run_checked(Command::new("sh").args(["-lc", "exit 17"]))
+        let err = run_checked(Command::new("/bin/sh").args(["-c", "exit 17"]))
             .expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
     }

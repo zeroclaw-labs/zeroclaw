@@ -13,6 +13,7 @@ Narrative depth status: **enhanced bridge rollout completed for `zh-CN`/`ja`/`ru
 - Français (French): [fr/README.md](fr/README.md)
 - Tiếng Việt (Vietnamese): [vi/README.md](vi/README.md)
 - Ελληνικά (Greek): [el/README.md](el/README.md)
+- Español (Spanish): _coming soon_
 
 ## Structure
 

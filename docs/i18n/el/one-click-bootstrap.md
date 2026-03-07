@@ -57,7 +57,7 @@ brew install zeroclaw
 ## Επιλογή Β: Απομακρυσμένη Εκτέλεση
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://zeroclawlabs.ai/install.sh | bash
 ```
 > [!IMPORTANT]
 > Για περιβάλλοντα υψηλής ασφάλειας, συνιστάται η **Επιλογή Α**, ώστε να μπορείτε να επιθεωρήσετε το σενάριο πριν από την εκτέλεση.

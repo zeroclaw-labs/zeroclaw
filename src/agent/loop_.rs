@@ -10,7 +10,7 @@ use crate::providers::{
     ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{CanaryGuard, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -35,7 +35,7 @@ use uuid::Uuid;
 mod context;
 pub(crate) mod detection;
 mod execution;
-mod history;
+pub(crate) mod history;
 mod parsing;
 
 use context::{build_context, build_hardware_context};
@@ -46,7 +46,7 @@ use execution::{
 };
 #[cfg(test)]
 use history::{apply_compaction_summary, build_compaction_transcript};
-use history::{auto_compact_history, trim_history};
+use history::{auto_compact_history, extract_facts_from_turns, trim_history, TurnBuffer};
 #[allow(unused_imports)]
 use parsing::{
     default_param_for_tool, detect_tool_call_parse_issue, extract_json_values, map_tool_name_alias,
@@ -72,9 +72,61 @@ const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Previous response was truncated by
 const MAX_TOKENS_CONTINUATION_NOTICE: &str =
     "\n\n[Response may be truncated due to continuation limits. Reply \"continue\" to resume.]";
 
+/// Returned when canary token exfiltration is detected in model output.
+const CANARY_EXFILTRATION_BLOCK_MESSAGE: &str =
+    "I blocked that response because it attempted to reveal protected internal context.";
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+fn filter_primary_agent_tools_or_fail(
+    config: &Config,
+    tools_registry: Vec<Box<dyn Tool>>,
+) -> Result<Vec<Box<dyn Tool>>> {
+    let (filtered_tools, report) = tools::filter_primary_agent_tools(
+        tools_registry,
+        &config.agent.allowed_tools,
+        &config.agent.denied_tools,
+    );
+
+    for unmatched in report.unmatched_allowed_tools {
+        tracing::debug!(
+            tool = %unmatched,
+            "agent.allowed_tools entry did not match any registered tool"
+        );
+    }
+
+    let has_agent_allowlist = config
+        .agent
+        .allowed_tools
+        .iter()
+        .any(|entry| !entry.trim().is_empty());
+    let has_agent_denylist = config
+        .agent
+        .denied_tools
+        .iter()
+        .any(|entry| !entry.trim().is_empty());
+    if has_agent_allowlist
+        && has_agent_denylist
+        && report.allowlist_match_count > 0
+        && filtered_tools.is_empty()
+    {
+        anyhow::bail!(
+            "agent.allowed_tools and agent.denied_tools removed all executable tools; update [agent] tool filters"
+        );
+    }
+
+    Ok(filtered_tools)
+}
+
+fn retain_visible_tool_descriptions<'a>(
+    tool_descs: &mut Vec<(&'a str, &'a str)>,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    let visible_tools: HashSet<&str> = tools_registry.iter().map(|tool| tool.name()).collect();
+    tool_descs.retain(|(name, _)| visible_tools.contains(*name));
+}
 
 fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
     if provider.supports_vision() {
@@ -278,6 +330,10 @@ pub(crate) const DRAFT_PROGRESS_SECTION_END: &str = "\n<!-- progress-end -->\n";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_CANARY_TOKENS_ENABLED: bool;
 }
 
 const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
@@ -619,11 +675,18 @@ fn stop_reason_name(reason: &NormalizedStopReason) -> &'static str {
     }
 }
 
+fn is_legacy_cron_model_fallback(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "gpt-4o-mini" | "openai/gpt-4o-mini")
+}
+
 fn maybe_inject_cron_add_delivery(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
     reply_target: Option<&str>,
+    provider_name: &str,
+    active_model: &str,
 ) {
     if tool_name != "cron_add"
         || !AUTO_CRON_DELIVERY_CHANNELS
@@ -690,6 +753,44 @@ fn maybe_inject_cron_add_delivery(
         delivery_obj.insert(
             "to".to_string(),
             serde_json::Value::String(reply_target.to_string()),
+        );
+    }
+
+    let active_model = active_model.trim();
+    if active_model.is_empty() {
+        return;
+    }
+
+    let model_missing = args_obj
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if model_missing {
+        args_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(active_model.to_string()),
+        );
+        return;
+    }
+
+    let is_custom_provider = provider_name
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("custom:");
+    if !is_custom_provider {
+        return;
+    }
+
+    let should_replace_model = args_obj
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| {
+            is_legacy_cron_model_fallback(value) && !value.trim().eq_ignore_ascii_case(active_model)
+        });
+    if should_replace_model {
+        args_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(active_model.to_string()),
         );
     }
 }
@@ -895,25 +996,29 @@ pub(crate) async fn agent_turn(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
-    run_tool_call_loop(
-        provider,
-        history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        None,
-        "channel",
-        multimodal_config,
-        max_tool_iterations,
-        None,
-        None,
-        None,
-        &[],
-    )
-    .await
+    TOOL_LOOP_CANARY_TOKENS_ENABLED
+        .scope(
+            false,
+            run_tool_call_loop(
+                provider,
+                history,
+                tools_registry,
+                observer,
+                provider_name,
+                model,
+                temperature,
+                silent,
+                None,
+                "channel",
+                multimodal_config,
+                max_tool_iterations,
+                None,
+                None,
+                None,
+                &[],
+            ),
+        )
+        .await
 }
 
 /// Run the tool loop with channel reply_target context, used by channel runtimes
@@ -942,25 +1047,28 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
     TOOL_LOOP_PROGRESS_MODE
         .scope(
             progress_mode,
-            TOOL_LOOP_REPLY_TARGET.scope(
-                reply_target.map(str::to_string),
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+            TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                false,
+                TOOL_LOOP_REPLY_TARGET.scope(
+                    reply_target.map(str::to_string),
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -989,6 +1097,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     excluded_tools: &[String],
     progress_mode: ProgressMode,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
+    canary_tokens_enabled: bool,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
@@ -999,27 +1108,30 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
             progress_mode,
             SAFETY_HEARTBEAT_CONFIG.scope(
                 safety_heartbeat,
-                TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
-                    non_cli_approval_context,
-                    TOOL_LOOP_REPLY_TARGET.scope(
-                        reply_target,
-                        run_tool_call_loop(
-                            provider,
-                            history,
-                            tools_registry,
-                            observer,
-                            provider_name,
-                            model,
-                            temperature,
-                            silent,
-                            approval,
-                            channel_name,
-                            multimodal_config,
-                            max_tool_iterations,
-                            cancellation_token,
-                            on_delta,
-                            hooks,
-                            excluded_tools,
+                TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                    canary_tokens_enabled,
+                    TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                        non_cli_approval_context,
+                        TOOL_LOOP_REPLY_TARGET.scope(
+                            reply_target,
+                            run_tool_call_loop(
+                                provider,
+                                history,
+                                tools_registry,
+                                observer,
+                                provider_name,
+                                model,
+                                temperature,
+                                silent,
+                                approval,
+                                channel_name,
+                                multimodal_config,
+                                max_tool_iterations,
+                                cancellation_token,
+                                on_delta,
+                                hooks,
+                                excluded_tools,
+                            ),
                         ),
                     ),
                 ),
@@ -1109,6 +1221,23 @@ pub async fn run_tool_call_loop(
         .flatten();
     let mut progress_tracker = ProgressTracker::default();
     let mut active_model = model.to_string();
+    let canary_guard = CanaryGuard::new(
+        TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false),
+    );
+    let mut turn_canary_token: Option<String> = None;
+    if let Some(system_message) = history.first_mut() {
+        if system_message.role == "system" {
+            let (updated_prompt, token) = canary_guard.inject_turn_token(&system_message.content);
+            system_message.content = updated_prompt;
+            turn_canary_token = token;
+        }
+    }
+    let redact_trace_text = |text: &str| -> String {
+        let scrubbed = scrub_credentials(text);
+        canary_guard.redact_token_from_text(&scrubbed, turn_canary_token.as_deref())
+    };
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -1632,7 +1761,7 @@ pub async fn run_tool_call_loop(
                             "iteration": iteration + 1,
                             "invalid_native_tool_json_count": invalid_native_tool_json_count,
                             "response_excerpt": truncate_with_ellipsis(
-                                &scrub_credentials(&response_text),
+                                &redact_trace_text(&response_text),
                                 600
                             ),
                         }),
@@ -1652,7 +1781,7 @@ pub async fn run_tool_call_loop(
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                         "input_tokens": resp_input_tokens,
                         "output_tokens": resp_output_tokens,
-                        "raw_response": scrub_credentials(&response_text),
+                        "raw_response": redact_trace_text(&response_text),
                         "native_tool_calls": native_calls.len(),
                         "parsed_tool_calls": calls.len(),
                         "continuation_attempts": continuation_attempts,
@@ -1725,6 +1854,33 @@ pub async fn run_tool_call_loop(
             parsed_text
         };
 
+        let canary_exfiltration_detected = canary_guard
+            .response_contains_canary(&response_text, turn_canary_token.as_deref())
+            || canary_guard.response_contains_canary(&display_text, turn_canary_token.as_deref());
+        if canary_exfiltration_detected {
+            runtime_trace::record_event(
+                "security_canary_exfiltration_blocked",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(false),
+                Some("llm output contained turn canary token"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
+                }),
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string()).await;
+            }
+            history.push(ChatMessage::assistant(
+                CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string(),
+            ));
+            return Ok(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string());
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if should_emit_verbose_progress(progress_mode) {
             if let Some(ref tx) = on_delta {
@@ -1767,7 +1923,7 @@ pub async fn run_tool_call_loop(
                     serde_json::json!({
                         "iteration": iteration + 1,
                         "reason": retry_reason,
-                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                        "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
                     }),
                 );
 
@@ -1795,7 +1951,7 @@ pub async fn run_tool_call_loop(
                     Some("llm response still implied follow-up action but emitted no tool call after retry"),
                     serde_json::json!({
                         "iteration": iteration + 1,
-                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
+                        "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
                     }),
                 );
                 anyhow::bail!(
@@ -1813,7 +1969,7 @@ pub async fn run_tool_call_loop(
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "text": scrub_credentials(&display_text),
+                    "text": redact_trace_text(&display_text),
                 }),
             );
             // No tool calls — this is the final response.
@@ -1917,6 +2073,8 @@ pub async fn run_tool_call_loop(
                 &mut tool_args,
                 channel_name,
                 channel_reply_target.as_deref(),
+                provider_name,
+                active_model.as_str(),
             );
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
@@ -1953,34 +2111,45 @@ pub async fn run_tool_call_loop(
             if let Some(mgr) = approval {
                 let non_cli_session_granted =
                     channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
-                if bypass_non_cli_approval_for_turn || non_cli_session_granted {
+                let requires_interactive_approval =
+                    mgr.needs_approval_for_call(&tool_name, &tool_args);
+                if bypass_non_cli_approval_for_turn {
+                    // One-time bypass token: bypass ALL approvals (including interactive)
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
                         ApprovalResponse::Yes,
                         channel_name,
                     );
-                    if non_cli_session_granted {
-                        runtime_trace::record_event(
-                            "approval_bypass_non_cli_session_grant",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(active_model.as_str()),
-                            Some(&turn_id),
-                            Some(true),
-                            Some("using runtime non-cli session approval grant"),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                            }),
-                        );
-                    }
-                } else if mgr.needs_approval(&tool_name) {
+                } else if non_cli_session_granted && !requires_interactive_approval {
+                    // Session grant: bypass only non-interactive approvals
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        ApprovalResponse::Yes,
+                        channel_name,
+                    );
+                    runtime_trace::record_event(
+                        "approval_bypass_non_cli_session_grant",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(true),
+                        Some("using runtime non-cli session approval grant"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": tool_name.clone(),
+                        }),
+                    );
+                } else if requires_interactive_approval {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
                     };
 
+                    // Only prompt interactively on CLI; deny on other channels
+                    // (remote channels cannot provide interactive approval).
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
                     } else if let Some(ctx) = non_cli_approval_context.as_ref() {
@@ -2011,13 +2180,26 @@ pub async fn run_tool_call_loop(
                         )
                         .await
                     } else {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            channel = %channel_name,
+                            "Tool requires approval but channel cannot prompt — denied"
+                        );
                         ApprovalResponse::No
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
+                        let denied = if channel_name == "cli" {
+                            "Denied by user.".to_string()
+                        } else {
+                            format!(
+                                "Tool '{}' requires approval but channel '{}' cannot prompt interactively. \
+                                 Configure auto_approve or set autonomy level to Full to allow.",
+                                tool_name, channel_name
+                            )
+                        };
                         runtime_trace::record_event(
                             "tool_call_result",
                             Some(channel_name),
@@ -2043,6 +2225,24 @@ pub async fn run_tool_call_loop(
                             },
                         ));
                         continue;
+                    }
+
+                    if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                        match &mut tool_args {
+                            serde_json::Value::Object(map) => {
+                                map.insert("approved".to_string(), serde_json::Value::Bool(true));
+                            }
+                            serde_json::Value::String(command) => {
+                                let normalized_command = command.trim().to_string();
+                                if !normalized_command.is_empty() {
+                                    tool_args = serde_json::json!({
+                                        "command": normalized_command,
+                                        "approved": true
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -2509,6 +2709,7 @@ pub async fn run(
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
     }
+    let tools_registry = filter_primary_agent_tools_or_fail(&config, tools_registry)?;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -2532,6 +2733,7 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -2697,6 +2899,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2787,23 +2990,26 @@ pub async fn run(
                 hb_cfg,
                 LOOP_DETECTION_CONFIG.scope(
                     ld_cfg,
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        provider_name,
-                        &model_name,
-                        temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        effective_hooks,
-                        &[],
+                    TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                        config.security.canary_tokens,
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            provider_name,
+                            &model_name,
+                            temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            effective_hooks,
+                            &[],
+                        ),
                     ),
                 ),
             ),
@@ -2823,6 +3029,19 @@ pub async fn run(
         }
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
+
+        // ── Post-turn fact extraction (single-message mode) ────────
+        if config.memory.auto_save {
+            let turns = vec![(msg.clone(), response.clone())];
+            let _ = extract_facts_from_turns(
+                provider.as_ref(),
+                &model_name,
+                &turns,
+                mem.as_ref(),
+                None,
+            )
+            .await;
+        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -2831,6 +3050,7 @@ pub async fn run(
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
         let mut interactive_turn: usize = 0;
+        let mut turn_buffer = TurnBuffer::new();
         // Reusable readline editor for UTF-8 input support
         let mut rl = Editor::with_config(
             RlConfig::builder()
@@ -2843,6 +3063,18 @@ pub async fn run(
             let input = match rl.readline("> ") {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                    // Flush any remaining buffered turns before exit.
+                    if config.memory.auto_save && !turn_buffer.is_empty() {
+                        let turns = turn_buffer.drain_for_extraction();
+                        let _ = extract_facts_from_turns(
+                            provider.as_ref(),
+                            &model_name,
+                            &turns,
+                            mem.as_ref(),
+                            None,
+                        )
+                        .await;
+                    }
                     break;
                 }
                 Err(e) => {
@@ -2857,7 +3089,21 @@ pub async fn run(
             }
             rl.add_history_entry(&input)?;
             match user_input.as_str() {
-                "/quit" | "/exit" => break,
+                "/quit" | "/exit" => {
+                    // Flush any remaining buffered turns before exit.
+                    if config.memory.auto_save && !turn_buffer.is_empty() {
+                        let turns = turn_buffer.drain_for_extraction();
+                        let _ = extract_facts_from_turns(
+                            provider.as_ref(),
+                            &model_name,
+                            &turns,
+                            mem.as_ref(),
+                            None,
+                        )
+                        .await;
+                    }
+                    break;
+                }
                 "/help" => {
                     println!("Available commands:");
                     println!("  /help        Show this help message");
@@ -2882,6 +3128,7 @@ pub async fn run(
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
                     interactive_turn = 0;
+                    turn_buffer = TurnBuffer::new();
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2972,23 +3219,26 @@ pub async fn run(
                     hb_cfg,
                     LOOP_DETECTION_CONFIG.scope(
                         ld_cfg,
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            provider_name,
-                            &model_name,
-                            temperature,
-                            false,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            None,
-                            None,
-                            effective_hooks,
-                            &[],
+                        TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                            config.security.canary_tokens,
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                provider_name,
+                                &model_name,
+                                temperature,
+                                false,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                None,
+                                None,
+                                effective_hooks,
+                                &[],
+                            ),
                         ),
                     ),
                 ),
@@ -3042,18 +3292,58 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
+            // ── Post-turn fact extraction ────────────────────────────
+            if config.memory.auto_save {
+                turn_buffer.push(&user_input, &response);
+                if turn_buffer.should_extract() {
+                    let turns = turn_buffer.drain_for_extraction();
+                    let result = extract_facts_from_turns(
+                        provider.as_ref(),
+                        &model_name,
+                        &turns,
+                        mem.as_ref(),
+                        None,
+                    )
+                    .await;
+                    if result.stored > 0 || result.no_facts {
+                        turn_buffer.mark_extract_success();
+                    }
+                }
+            }
+
             // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
+            // post_turn_active is only true when auto_save is on AND the
+            // turn buffer confirms recent extraction succeeded; otherwise
+            // compaction must fall back to its own flush_durable_facts.
+            let post_turn_active =
+                config.memory.auto_save && !turn_buffer.needs_compaction_fallback();
+            if let Ok((compacted, flush_ok)) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
                 &model_name,
                 config.agent.max_history_messages,
                 effective_hooks,
                 Some(mem.as_ref()),
+                None,
+                post_turn_active,
             )
             .await
             {
                 if compacted {
+                    if !post_turn_active {
+                        // Compaction ran its own flush_durable_facts as
+                        // fallback. Drain any buffered turns to prevent
+                        // duplicate extraction.
+                        if !turn_buffer.is_empty() {
+                            let _ = turn_buffer.drain_for_extraction();
+                        }
+                        // Only reset the failure flag when the fallback
+                        // flush actually succeeded; otherwise keep the
+                        // flag so subsequent compactions retry.
+                        if flush_ok {
+                            turn_buffer.mark_extract_success();
+                        }
+                    }
                     println!("🧹 Auto-compaction complete");
                 }
             }
@@ -3133,6 +3423,7 @@ pub async fn process_message_with_session(
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+    let tools_registry = filter_primary_agent_tools_or_fail(&config, tools_registry)?;
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = crate::config::resolve_default_model_id(
@@ -3148,6 +3439,7 @@ pub async fn process_message_with_session(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -3234,6 +3526,7 @@ pub async fn process_message_with_session(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3290,7 +3583,7 @@ pub async fn process_message_with_session(
     } else {
         None
     };
-    scope_cost_enforcement_context(
+    let response = scope_cost_enforcement_context(
         cost_enforcement_context,
         SAFETY_HEARTBEAT_CONFIG.scope(
             hb_cfg,
@@ -3308,7 +3601,22 @@ pub async fn process_message_with_session(
             ),
         ),
     )
-    .await
+    .await?;
+
+    // ── Post-turn fact extraction (channel / single-message-with-session) ──
+    if config.memory.auto_save {
+        let turns = vec![(message.to_owned(), response.clone())];
+        let _ = extract_facts_from_turns(
+            provider.as_ref(),
+            &model_name,
+            &turns,
+            mem.as_ref(),
+            session_id,
+        )
+        .await;
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -3317,7 +3625,7 @@ mod tests {
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -3347,11 +3655,19 @@ mod tests {
             "prompt": "remind me later"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "custom:https://llm.example.com/v1",
+            "gpt-oss:20b",
+        );
 
         assert_eq!(args["delivery"]["mode"], "announce");
         assert_eq!(args["delivery"]["channel"], "telegram");
         assert_eq!(args["delivery"]["to"], "-10012345");
+        assert_eq!(args["model"], "gpt-oss:20b");
     }
 
     #[test]
@@ -3366,7 +3682,14 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert_eq!(args["delivery"]["channel"], "discord");
         assert_eq!(args["delivery"]["to"], "C123");
@@ -3379,7 +3702,14 @@ mod tests {
             "command": "echo hello"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("-10012345"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert!(args.get("delivery").is_none());
     }
@@ -3390,7 +3720,14 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut lark_args,
+            "lark",
+            Some("oc_xxx"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(lark_args["delivery"]["channel"], "lark");
         assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
 
@@ -3398,9 +3735,56 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut feishu_args,
+            "feishu",
+            Some("oc_yyy"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(feishu_args["delivery"]["channel"], "feishu");
         assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_replaces_legacy_model_on_custom_provider() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "model": "gpt-4o-mini"
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("C123"),
+            "custom:https://somecoolai.endpoint.lan/api/v1",
+            "gpt-oss:20b",
+        );
+
+        assert_eq!(args["model"], "gpt-oss:20b");
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_keeps_explicit_model_for_non_custom_provider() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "model": "gpt-4o-mini"
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("C123"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
+
+        assert_eq!(args["model"], "gpt-4o-mini");
     }
 
     #[test]
@@ -3576,6 +3960,54 @@ mod tests {
         }
     }
 
+    struct EchoCanaryProvider;
+
+    #[async_trait]
+    impl Provider for EchoCanaryProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in canary provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let canary = request
+                .messages
+                .iter()
+                .find(|msg| msg.role == "system")
+                .and_then(|msg| {
+                    msg.content.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix("Internal security canary token: ")
+                            .map(str::trim)
+                    })
+                })
+                .unwrap_or("NO_CANARY");
+            Ok(ChatResponse {
+                text: Some(format!("Leaking token for test: {canary}")),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+            })
+        }
+    }
+
     struct CountingTool {
         name: String,
         invocations: Arc<AtomicUsize>,
@@ -3631,6 +4063,16 @@ mod tests {
         delay_ms: u64,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+    }
+
+    struct ApprovalFlagTool {
+        approved_seen: Arc<AtomicBool>,
+    }
+
+    impl ApprovalFlagTool {
+        fn new(approved_seen: Arc<AtomicBool>) -> Self {
+            Self { approved_seen }
+        }
     }
 
     impl DelayTool {
@@ -3748,6 +4190,44 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Tool for ApprovalFlagTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Captures the approved flag for approval-flow tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "approved": { "type": "boolean" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let approved = args
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.approved_seen.store(approved, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: approved,
+                output: format!("approved={approved}"),
+                error: (!approved).then(|| "missing approved=true".to_string()),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3818,6 +4298,87 @@ mod tests {
         .expect("anthropic route should not fail on a false-negative vision capability probe");
 
         assert_eq!(result, "vision-ok");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_when_canary_token_is_echoed() {
+        let provider = EchoCanaryProvider;
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .scope(
+                true,
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &tools_registry,
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "cli",
+                    &crate::config::MultimodalConfig::default(),
+                    3,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+            )
+            .await
+            .expect("canary leak should return a guarded message");
+
+        assert_eq!(result, CANARY_EXFILTRATION_BLOCK_MESSAGE);
+        assert_eq!(
+            history.last().map(|msg| msg.content.as_str()),
+            Some(result.as_str())
+        );
+        assert!(history[0].content.contains("ZC_CANARY_START"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_echo_provider_when_canary_guard_disabled() {
+        let provider = EchoCanaryProvider;
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .scope(
+                false,
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &tools_registry,
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "cli",
+                    &crate::config::MultimodalConfig::default(),
+                    3,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+            )
+            .await
+            .expect("without canary guard, response should pass through");
+
+        assert!(result.contains("NO_CANARY"));
     }
 
     #[tokio::test]
@@ -3955,6 +4516,76 @@ mod tests {
         ];
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_false_when_command_rule_requires_approval() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "rm -f ./tmp.txt"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                tool_call_id: None,
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string(), "file_read".to_string()],
+            always_ask: vec![],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".to_string(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(!should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_true_when_command_rule_does_not_match() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "ls -la"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                tool_call_id: None,
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string(), "file_read".to_string()],
+            always_ask: vec![],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "rm".to_string(),
+                action: crate::config::CommandContextRuleAction::RequireApproval,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
             ..crate::config::AutonomyConfig::default()
         };
         let approval_mgr = ApprovalManager::from_config(&approval_cfg);
@@ -4124,7 +4755,10 @@ mod tests {
             Arc::clone(&max_active),
         ))];
 
-        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         approval_mgr.grant_non_cli_session("shell");
 
         let mut history = vec![
@@ -4233,6 +4867,7 @@ mod tests {
             &[],
             ProgressMode::Verbose,
             None,
+            false,
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -4243,6 +4878,85 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_approved_flag_after_non_cli_approval() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"rm -f ./tmp.txt"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let approved_seen = Arc::new(AtomicBool::new(false));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(ApprovalFlagTool::new(Arc::clone(&approved_seen)))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let approval_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            approval_mgr_for_task
+                .confirm_non_cli_pending_request(
+                    &prompt.request_id,
+                    "alice",
+                    "telegram",
+                    "chat-approved-flag",
+                )
+                .expect("pending approval should confirm");
+            approval_mgr_for_task
+                .record_non_cli_pending_resolution(&prompt.request_id, ApprovalResponse::Yes);
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approved-flag".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            ProgressMode::Verbose,
+            None,
+            false,
+        )
+        .await
+        .expect("tool loop should continue after non-cli approval");
+
+        approval_task.await.expect("approval task should complete");
+        assert_eq!(result, "done");
+        assert!(
+            approved_seen.load(Ordering::SeqCst),
+            "approved=true should be injected after prompt approval"
         );
     }
 
@@ -6901,7 +7615,6 @@ Let me check the result."#;
         assert!(should_emit_tool_progress(ProgressMode::Compact));
         assert!(!should_emit_tool_progress(ProgressMode::Off));
     }
-
     #[test]
     fn progress_tracker_renders_in_place_block() {
         let mut tracker = ProgressTracker::default();

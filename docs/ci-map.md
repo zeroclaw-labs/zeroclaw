@@ -12,9 +12,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `.github/workflows/ci-run.yml` (`CI`)
     - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate on changed Rust lines, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
-    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `lint` + `test` + `build` (no PR build-only bypass)
-    - Additional behavior: `lint`, `test`, and `build` run in parallel (all depend only on `changes` job) to minimize critical path duration
-    - Additional behavior: rust-cache is shared between `lint` and `test` via unified `prefix-key` (`ci-run-check`) to reduce redundant compilation; `build` uses a separate key for release-fast profile
+    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `quality-gate` + `test-and-build` (no PR build-only bypass)
+    - Additional behavior: `quality-gate` and `test-and-build` run in parallel (all depend only on `changes` job) to minimize critical path duration
+    - Additional behavior: rust-cache is shared across all Rust CI jobs via unified `prefix-key` (`zeroclaw-ci-v1`) and `shared-key` (`${{ runner.os }}-rust`) to reduce redundant compilation
     - Additional behavior: flake detection is integrated into the `test` job via single-retry probe; emits `test-flake-probe` artifact when flake is suspected; optional blocking can be enabled with repository variable `CI_BLOCK_ON_FLAKE_SUSPECTED=true`
     - Additional behavior: PRs that change CI/CD-governed paths require an explicit approving review from `@chumyin` (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs)
     - Additional behavior: PRs that change root license files (`LICENSE-APACHE`, `LICENSE-MIT`) must be authored by `willsarg`
@@ -61,6 +61,11 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
+- `.github/workflows/release-build.yml` (`Production Release Build`)
+    - Purpose: build reproducible Linux x86_64 production binaries on `main` pushes and `v*` tags using Blacksmith runners
+    - Canonical build command: `cargo build --release --locked`
+    - Quality gates: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked --verbose` before release build
+    - Artifact output: `zeroclaw-linux-amd64` (`target/release/zeroclaw` + `.sha256`)
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
 
@@ -98,7 +103,11 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Feature Matrix`: push on Rust + workflow paths to `dev`, merge queue, weekly schedule, manual dispatch; PRs only when `ci:full` or `ci:feature-matrix` label is applied
 - `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
-- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
+- `Production Release Build`: push to `main`, push tags matching `v*`, manual dispatch
+- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule; non-Rust PRs fast-path skip Rust compilation jobs
+- `CodeQL Analysis`: push to `dev` and `main` on Rust/CodeQL-impacting paths, weekly schedule, manual dispatch (removed from PR path)
+- `CI Change Audit`: push to `dev` and `main` on CI/security paths, manual dispatch (removed from PR path)
+- `Reproducible Build`: push to `dev` and `main` on Rust/CI paths, weekly schedule, manual dispatch (removed from PR path)
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `Dependabot`: all update PRs target `main` (not `dev`)
@@ -116,18 +125,18 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
    - For tag-publish failures, inspect `ghcr-publish-contract.json` / `audit-event-ghcr-publish-contract.json`, `ghcr-vulnerability-gate.json` / `audit-event-ghcr-vulnerability-gate.json`, and Trivy artifacts from `pub-docker-img.yml`.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs. If intake policy changed recently, trigger a fresh `pull_request_target` event (for example close/reopen PR) because `Re-run jobs` can reuse the original workflow snapshot.
-7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+4. Production release build failures (`main`/`v*`): inspect `.github/workflows/release-build.yml` quality-gate + build steps.
+5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+6. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+7. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs. If intake policy changed recently, trigger a fresh `pull_request_target` event (for example close/reopen PR) because `Re-run jobs` can reuse the original workflow snapshot.
+8. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+9. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+10. Strict delta lint failures in CI: inspect `quality-gate` job strict-delta step logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
-- Keep merge-queue compatibility explicit by supporting `merge_group` on required workflows (`ci-run`, `sec-audit`, and `sec-codeql`).
-- Keep PRs mapped to Linear issue keys (`RMN-*`/`CDV-*`/`COM-*`) when available for traceability (recommended by PR intake checks, non-blocking).
+- Keep merge-queue compatibility explicit by supporting `merge_group` on required workflows (`ci-run`, `sec-audit`).
 - Keep PR intake backfills event-driven: when intake logic changes, prefer triggering a fresh PR event over rerunning old runs so checks evaluate against the latest workflow/script snapshot.
 - Keep `deny.toml` advisory ignore entries in object form with explicit reasons (enforced by `deny_policy_guard.py`).
 - Keep deny ignore governance metadata current in `.github/security/deny-ignore-governance.json` (owner/reason/expiry/ticket enforced by `deny_policy_guard.py`).
@@ -140,6 +149,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep pre-release stage transition policy + matrix coverage + transition audit semantics current in `.github/release/prerelease-stage-gates.json`.
 - Keep required check naming stable and documented in `docs/operations/required-check-mapping.md` before changing branch protection settings.
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
+- Keep production build reproducibility anchored to `cargo build --release --locked` in `.github/workflows/release-build.yml`.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.

@@ -20,9 +20,65 @@ pub struct HttpRequestTool {
     timeout_secs: u64,
     user_agent: String,
     credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
+    credential_cache: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl HttpRequestTool {
+    fn read_non_empty_env_var(name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn cache_secret(&self, env_var: &str, secret: &str) {
+        let mut guard = self
+            .credential_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(env_var.to_string(), secret.to_string());
+    }
+
+    fn cached_secret(&self, env_var: &str) -> Option<String> {
+        let guard = self
+            .credential_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(env_var).cloned()
+    }
+
+    fn resolve_secret_for_profile(
+        &self,
+        requested_name: &str,
+        env_var: &str,
+    ) -> anyhow::Result<String> {
+        match std::env::var(env_var) {
+            Ok(secret_raw) => {
+                let secret = secret_raw.trim();
+                if secret.is_empty() {
+                    anyhow::bail!(
+                        "credential_profile '{requested_name}' uses environment variable {env_var}, but it is empty"
+                    );
+                }
+                self.cache_secret(env_var, secret);
+                Ok(secret.to_string())
+            }
+            Err(_) => {
+                if let Some(cached) = self.cached_secret(env_var) {
+                    tracing::warn!(
+                        profile = requested_name,
+                        env_var,
+                        "http_request credential env var unavailable; using cached secret"
+                    );
+                    return Ok(cached);
+                }
+                anyhow::bail!(
+                    "credential_profile '{requested_name}' requires environment variable {env_var}"
+                );
+            }
+        }
+    }
+
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
@@ -32,6 +88,22 @@ impl HttpRequestTool {
         user_agent: String,
         credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
     ) -> Self {
+        let credential_profiles: HashMap<String, HttpRequestCredentialProfile> =
+            credential_profiles
+                .into_iter()
+                .map(|(name, profile)| (name.trim().to_ascii_lowercase(), profile))
+                .collect();
+        let mut credential_cache = HashMap::new();
+        for profile in credential_profiles.values() {
+            let env_var = profile.env_var.trim();
+            if env_var.is_empty() {
+                continue;
+            }
+            if let Some(secret) = Self::read_non_empty_env_var(env_var) {
+                credential_cache.insert(env_var.to_string(), secret);
+            }
+        }
+
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
@@ -39,10 +111,8 @@ impl HttpRequestTool {
             max_response_size,
             timeout_secs,
             user_agent,
-            credential_profiles: credential_profiles
-                .into_iter()
-                .map(|(name, profile)| (name.trim().to_ascii_lowercase(), profile))
-                .collect(),
+            credential_profiles,
+            credential_cache: std::sync::Mutex::new(credential_cache),
         }
     }
 
@@ -149,17 +219,7 @@ impl HttpRequestTool {
             anyhow::bail!("credential_profile '{requested_name}' has an empty env_var in config");
         }
 
-        let secret = std::env::var(env_var).map_err(|_| {
-            anyhow::anyhow!(
-                "credential_profile '{requested_name}' requires environment variable {env_var}"
-            )
-        })?;
-        let secret = secret.trim();
-        if secret.is_empty() {
-            anyhow::bail!(
-                "credential_profile '{requested_name}' uses environment variable {env_var}, but it is empty"
-            );
-        }
+        let secret = self.resolve_secret_for_profile(requested_name, env_var)?;
 
         let header_value = format!("{}{}", profile.value_prefix, secret);
         let mut sensitive_values = vec![secret.to_string(), header_value.clone()];
@@ -881,6 +941,126 @@ mod tests {
             .expect_err("missing env var should fail")
             .to_string();
         assert!(err.contains("ZEROCLAW_TEST_MISSING_HTTP_REQUEST_TOKEN"));
+    }
+
+    #[test]
+    fn resolve_credential_profile_uses_cached_secret_when_env_temporarily_missing() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_HTTP_REQUEST_CACHE_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let test_secret = "cached-secret-value-12345";
+        std::env::set_var(&env_var, test_secret);
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "cached".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "Authorization".to_string(),
+                env_var: env_var.clone(),
+                value_prefix: "Bearer ".to_string(),
+            },
+        );
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+            profiles,
+        );
+
+        std::env::remove_var(&env_var);
+
+        let (headers, sensitive_values) = tool
+            .resolve_credential_profile("cached")
+            .expect("cached credential should resolve");
+        assert_eq!(headers[0].0, "Authorization");
+        assert_eq!(headers[0].1, format!("Bearer {test_secret}"));
+        assert!(sensitive_values.contains(&test_secret.to_string()));
+    }
+
+    #[test]
+    fn resolve_credential_profile_refreshes_cached_secret_after_rotation() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_HTTP_REQUEST_ROTATION_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        std::env::set_var(&env_var, "initial-secret");
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "rotating".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "Authorization".to_string(),
+                env_var: env_var.clone(),
+                value_prefix: "Bearer ".to_string(),
+            },
+        );
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+            profiles,
+        );
+
+        std::env::set_var(&env_var, "rotated-secret");
+        let (headers_after_rotation, _) = tool
+            .resolve_credential_profile("rotating")
+            .expect("rotated env value should resolve");
+        assert_eq!(headers_after_rotation[0].1, "Bearer rotated-secret");
+
+        std::env::remove_var(&env_var);
+        let (headers_after_removal, _) = tool
+            .resolve_credential_profile("rotating")
+            .expect("cached rotated value should be used");
+        assert_eq!(headers_after_removal[0].1, "Bearer rotated-secret");
+    }
+
+    #[test]
+    fn resolve_credential_profile_empty_env_var_does_not_fallback_to_cached_secret() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_HTTP_REQUEST_EMPTY_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        std::env::set_var(&env_var, "cached-secret");
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "empty".to_string(),
+            HttpRequestCredentialProfile {
+                header_name: "Authorization".to_string(),
+                env_var: env_var.clone(),
+                value_prefix: "Bearer ".to_string(),
+            },
+        );
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            UrlAccessConfig::default(),
+            1_000_000,
+            30,
+            "test".to_string(),
+            profiles,
+        );
+
+        // Explicitly set to empty: this should be treated as misconfiguration
+        // and must not fall back to cache.
+        std::env::set_var(&env_var, "");
+        let err = tool
+            .resolve_credential_profile("empty")
+            .expect_err("empty env var should hard-fail")
+            .to_string();
+        assert!(err.contains("but it is empty"));
+
+        std::env::remove_var(&env_var);
     }
 
     #[test]

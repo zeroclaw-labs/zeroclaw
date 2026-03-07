@@ -1,20 +1,9 @@
 name: CI Reproducible Build
 
+# Moved off PR path per CI/CD optimization PRD.
+# Reproducibility is a release concern; runs on push-to-main/dev + weekly schedule.
 on:
     push:
-        branches: [dev, main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
-            - "crates/**"
-            - "scripts/ci/ensure_c_toolchain.sh"
-            - "scripts/ci/ensure_cargo_component.sh"
-            - "scripts/ci/ensure_cc.sh"
-            - "scripts/ci/reproducible_build_check.sh"
-            - "scripts/ci/self_heal_rust_toolchain.sh"
-            - ".github/workflows/ci-reproducible-build.yml"
-    pull_request:
         branches: [dev, main]
         paths:
             - "Cargo.toml"
@@ -43,7 +32,7 @@ on:
                 type: boolean
 
 concurrency:
-    group: repro-build-${{ github.event.pull_request.number || github.ref || github.run_id }}
+    group: repro-build-${{ github.ref || github.run_id }}
     cancel-in-progress: true
 
 permissions:
@@ -58,8 +47,8 @@ env:
 jobs:
     reproducibility:
         name: Reproducible Build Probe
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
-        timeout-minutes: 75
+        runs-on: blacksmith-8vcpu-ubuntu-2404
+        timeout-minutes: 35
         env:
             CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
             RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
@@ -88,6 +77,13 @@ jobs:
               env:
                   ENSURE_CARGO_COMPONENT_STRICT: "true"
               run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: zeroclaw-ci-v1
+                  shared-key: ${{ runner.os }}-rust
+                  cache-targets: true
+                  cache-bin: false
 
             - name: Run reproducible build check
               shell: bash
