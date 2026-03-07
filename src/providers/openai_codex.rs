@@ -4,23 +4,103 @@ use crate::multimodal;
 use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::time::timeout;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{
+            header::{AUTHORIZATION, USER_AGENT},
+            HeaderValue as WsHeaderValue,
+        },
+        Message as WsMessage,
+    },
+};
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
 const CODEX_BASE_URL_ENV: &str = "ZEROCLAW_CODEX_BASE_URL";
+const CODEX_TRANSPORT_ENV: &str = "ZEROCLAW_CODEX_TRANSPORT";
+const CODEX_PROVIDER_TRANSPORT_ENV: &str = "ZEROCLAW_PROVIDER_TRANSPORT";
+const CODEX_RESPONSES_WEBSOCKET_ENV_LEGACY: &str = "ZEROCLAW_RESPONSES_WEBSOCKET";
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
+const CODEX_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const CODEX_WS_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+const CODEX_WS_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTransport {
+    Auto,
+    WebSocket,
+    Sse,
+}
+
+#[derive(Debug)]
+enum WebsocketRequestError {
+    TransportUnavailable(anyhow::Error),
+    Stream(anyhow::Error),
+}
+
+impl WebsocketRequestError {
+    fn transport_unavailable<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self::TransportUnavailable(error.into())
+    }
+
+    fn stream<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self::Stream(error.into())
+    }
+}
+
+impl std::fmt::Display for WebsocketRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransportUnavailable(error) | Self::Stream(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WebsocketRequestError {}
+
+fn websocket_idle_timeout_error(has_partial_output: bool) -> WebsocketRequestError {
+    if has_partial_output {
+        WebsocketRequestError::stream(anyhow::anyhow!(
+            "No response from OpenAI Codex websocket stream before timeout"
+        ))
+    } else {
+        WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+            "OpenAI Codex websocket stream timed out after {}s waiting for events",
+            CODEX_WS_READ_TIMEOUT.as_secs()
+        ))
+    }
+}
+
+fn websocket_no_response_error() -> WebsocketRequestError {
+    WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+        "No response from OpenAI Codex websocket stream"
+    ))
+}
 
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
     responses_url: String,
+    transport: CodexTransport,
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
+    reasoning_level: Option<String>,
     client: Client,
 }
 
@@ -103,7 +183,12 @@ impl OpenAiCodexProvider {
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
             responses_url,
+            transport: resolve_transport_mode(options)?,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
+            reasoning_level: normalize_reasoning_level(
+                options.reasoning_level.as_deref(),
+                "provider.reasoning_level",
+            ),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -199,6 +284,72 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
     })
 }
 
+fn parse_transport_override(
+    raw: Option<&str>,
+    source: &str,
+) -> anyhow::Result<Option<CodexTransport>> {
+    let Some(raw_value) = raw else {
+        return Ok(None);
+    };
+    let value = raw_value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "auto" => Ok(Some(CodexTransport::Auto)),
+        "websocket" | "ws" => Ok(Some(CodexTransport::WebSocket)),
+        "sse" | "http" => Ok(Some(CodexTransport::Sse)),
+        _ => anyhow::bail!(
+            "Invalid OpenAI Codex transport override '{value}' from {source}; expected one of: auto, websocket, sse"
+        ),
+    }
+}
+
+fn parse_legacy_websocket_flag(raw: &str) -> Option<CodexTransport> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "on" | "yes" => Some(CodexTransport::WebSocket),
+        "0" | "false" | "off" | "no" => Some(CodexTransport::Sse),
+        _ => None,
+    }
+}
+
+fn resolve_transport_mode(options: &ProviderRuntimeOptions) -> anyhow::Result<CodexTransport> {
+    if let Some(mode) = parse_transport_override(
+        options.provider_transport.as_deref(),
+        "provider.transport runtime override",
+    )? {
+        return Ok(mode);
+    }
+
+    if let Ok(value) = std::env::var(CODEX_TRANSPORT_ENV) {
+        if let Some(mode) = parse_transport_override(Some(&value), CODEX_TRANSPORT_ENV)? {
+            return Ok(mode);
+        }
+    }
+
+    if let Ok(value) = std::env::var(CODEX_PROVIDER_TRANSPORT_ENV) {
+        if let Some(mode) = parse_transport_override(Some(&value), CODEX_PROVIDER_TRANSPORT_ENV)? {
+            return Ok(mode);
+        }
+    }
+
+    if let Some(mode) = std::env::var(CODEX_RESPONSES_WEBSOCKET_ENV_LEGACY)
+        .ok()
+        .and_then(|value| parse_legacy_websocket_flag(&value))
+    {
+        tracing::warn!(
+            env = CODEX_RESPONSES_WEBSOCKET_ENV_LEGACY,
+            "Using deprecated websocket toggle env for OpenAI Codex transport"
+        );
+        return Ok(mode);
+    }
+
+    Ok(CodexTransport::Auto)
+}
+
 fn resolve_instructions(system_prompt: Option<&str>) -> String {
     first_nonempty(system_prompt).unwrap_or_else(|| DEFAULT_CODEX_INSTRUCTIONS.to_string())
 }
@@ -281,7 +432,6 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
         return match effort {
             "low" | "medium" | "high" => effort.to_string(),
             "minimal" => "low".to_string(),
-            "xhigh" => "high".to_string(),
             _ => "high".to_string(),
         };
     }
@@ -304,12 +454,35 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model_id: &str) -> String {
-    let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
+fn normalize_reasoning_level(raw: Option<&str>, source: &str) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" => Some(normalized),
+        _ => {
+            tracing::warn!(
+                reasoning_level = %value,
+                source,
+                "Ignoring invalid reasoning level override"
+            );
+            None
+        }
+    }
+}
+
+fn resolve_reasoning_effort(model_id: &str, override_level: Option<&str>) -> String {
+    let override_level = normalize_reasoning_level(override_level, "provider.reasoning_level");
+    let env_level = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
         .ok()
-        .and_then(|value| first_nonempty(Some(&value)))
-        .unwrap_or_else(|| "xhigh".to_string())
-        .to_ascii_lowercase();
+        .and_then(|value| {
+            normalize_reasoning_level(Some(&value), "ZEROCLAW_CODEX_REASONING_EFFORT")
+        });
+    let raw = override_level
+        .or(env_level)
+        .unwrap_or_else(|| "xhigh".to_string());
     clamp_reasoning_effort(model_id, &raw)
 }
 
@@ -499,6 +672,276 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
 }
 
 impl OpenAiCodexProvider {
+    fn responses_websocket_url(&self, model: &str) -> anyhow::Result<String> {
+        let mut url = reqwest::Url::parse(&self.responses_url)?;
+        let next_scheme: &'static str = match url.scheme() {
+            "https" | "wss" => "wss",
+            "http" | "ws" => "ws",
+            other => {
+                anyhow::bail!(
+                    "OpenAI Codex websocket transport does not support URL scheme: {}",
+                    other
+                );
+            }
+        };
+
+        url.set_scheme(next_scheme)
+            .map_err(|()| anyhow::anyhow!("failed to set websocket URL scheme"))?;
+
+        if !url.query_pairs().any(|(k, _)| k == "model") {
+            url.query_pairs_mut().append_pair("model", model);
+        }
+
+        Ok(url.into())
+    }
+
+    fn apply_auth_headers_ws(
+        &self,
+        request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+    ) -> anyhow::Result<()> {
+        let headers = request.headers_mut();
+        headers.insert(
+            AUTHORIZATION,
+            WsHeaderValue::from_str(&format!("Bearer {bearer_token}"))?,
+        );
+        headers.insert(
+            "OpenAI-Beta",
+            WsHeaderValue::from_static("responses=experimental"),
+        );
+        headers.insert("originator", WsHeaderValue::from_static("pi"));
+        headers.insert("accept", WsHeaderValue::from_static("text/event-stream"));
+        headers.insert(USER_AGENT, WsHeaderValue::from_static("zeroclaw"));
+
+        if let Some(account_id) = account_id {
+            headers.insert("chatgpt-account-id", WsHeaderValue::from_str(account_id)?);
+        }
+
+        if use_gateway_api_key_auth {
+            if let Some(access_token) = access_token {
+                headers.insert(
+                    "x-openai-access-token",
+                    WsHeaderValue::from_str(access_token)?,
+                );
+            }
+            if let Some(account_id) = account_id {
+                headers.insert("x-openai-account-id", WsHeaderValue::from_str(account_id)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_responses_websocket_request(
+        &self,
+        request: &ResponsesRequest,
+        model: &str,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+    ) -> Result<String, WebsocketRequestError> {
+        let ws_url = self
+            .responses_websocket_url(model)
+            .map_err(WebsocketRequestError::transport_unavailable)?;
+        let mut ws_request = ws_url.into_client_request().map_err(|error| {
+            WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+                "invalid websocket request URL: {error}"
+            ))
+        })?;
+        self.apply_auth_headers_ws(
+            &mut ws_request,
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+        )
+        .map_err(WebsocketRequestError::transport_unavailable)?;
+
+        let payload = serde_json::json!({
+            "type": "response.create",
+            "model": &request.model,
+            "input": &request.input,
+            "instructions": &request.instructions,
+            "store": request.store,
+            "text": &request.text,
+            "reasoning": &request.reasoning,
+            "include": &request.include,
+            "tool_choice": &request.tool_choice,
+            "parallel_tool_calls": request.parallel_tool_calls,
+        });
+
+        let (mut ws_stream, _) = timeout(CODEX_WS_CONNECT_TIMEOUT, connect_async(ws_request))
+            .await
+            .map_err(|_| {
+                WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+                    "OpenAI Codex websocket connect timed out after {}s",
+                    CODEX_WS_CONNECT_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(WebsocketRequestError::transport_unavailable)?;
+        timeout(
+            CODEX_WS_SEND_TIMEOUT,
+            ws_stream.send(WsMessage::Text(
+                serde_json::to_string(&payload)
+                    .map_err(WebsocketRequestError::transport_unavailable)?
+                    .into(),
+            )),
+        )
+        .await
+        .map_err(|_| {
+            WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
+                "OpenAI Codex websocket send timed out after {}s",
+                CODEX_WS_SEND_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(WebsocketRequestError::transport_unavailable)?;
+
+        let mut saw_delta = false;
+        let mut delta_accumulator = String::new();
+        let mut fallback_text: Option<String> = None;
+        let mut timed_out = false;
+
+        loop {
+            let frame = match timeout(CODEX_WS_READ_TIMEOUT, ws_stream.next()).await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    let _ = ws_stream.close(None).await;
+                    if saw_delta || fallback_text.is_some() {
+                        timed_out = true;
+                        break;
+                    }
+                    return Err(websocket_idle_timeout_error(false));
+                }
+            };
+
+            let Some(frame) = frame else {
+                break;
+            };
+            let frame = frame.map_err(WebsocketRequestError::stream)?;
+            let event: Value = match frame {
+                WsMessage::Text(text) => {
+                    serde_json::from_str(text.as_ref()).map_err(WebsocketRequestError::stream)?
+                }
+                WsMessage::Binary(binary) => {
+                    let text = String::from_utf8(binary.to_vec()).map_err(|error| {
+                        WebsocketRequestError::stream(anyhow::anyhow!(
+                            "invalid UTF-8 websocket frame from OpenAI Codex: {error}"
+                        ))
+                    })?;
+                    serde_json::from_str(&text).map_err(WebsocketRequestError::stream)?
+                }
+                WsMessage::Ping(payload) => {
+                    ws_stream
+                        .send(WsMessage::Pong(payload))
+                        .await
+                        .map_err(WebsocketRequestError::stream)?;
+                    continue;
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            };
+
+            if let Some(message) = extract_stream_error_message(&event) {
+                return Err(WebsocketRequestError::stream(anyhow::anyhow!(
+                    "OpenAI Codex websocket stream error: {message}"
+                )));
+            }
+
+            if let Some(text) = extract_stream_event_text(&event, saw_delta) {
+                let event_type = event.get("type").and_then(Value::as_str);
+                if event_type == Some("response.output_text.delta") {
+                    saw_delta = true;
+                    delta_accumulator.push_str(&text);
+                } else if fallback_text.is_none() {
+                    fallback_text = Some(text);
+                }
+            }
+
+            let event_type = event.get("type").and_then(Value::as_str);
+            if event_type == Some("response.completed") || event_type == Some("response.done") {
+                if let Some(response_value) = event.get("response").cloned() {
+                    if let Ok(parsed) = serde_json::from_value::<ResponsesResponse>(response_value)
+                    {
+                        if let Some(text) = extract_responses_text(&parsed) {
+                            let _ = ws_stream.close(None).await;
+                            return Ok(text);
+                        }
+                    }
+                }
+
+                if saw_delta {
+                    let _ = ws_stream.close(None).await;
+                    return nonempty_preserve(Some(&delta_accumulator)).ok_or_else(|| {
+                        WebsocketRequestError::stream(anyhow::anyhow!(
+                            "No response from OpenAI Codex"
+                        ))
+                    });
+                }
+                if let Some(text) = fallback_text.clone() {
+                    let _ = ws_stream.close(None).await;
+                    return Ok(text);
+                }
+            }
+        }
+
+        if saw_delta {
+            return nonempty_preserve(Some(&delta_accumulator)).ok_or_else(|| {
+                WebsocketRequestError::stream(anyhow::anyhow!("No response from OpenAI Codex"))
+            });
+        }
+        if let Some(text) = fallback_text {
+            return Ok(text);
+        }
+        if timed_out {
+            return Err(websocket_idle_timeout_error(true));
+        }
+
+        Err(websocket_no_response_error())
+    }
+
+    async fn send_responses_sse_request(
+        &self,
+        request: &ResponsesRequest,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+    ) -> anyhow::Result<String> {
+        let mut request_builder = self
+            .client
+            .post(&self.responses_url)
+            .header("Authorization", format!("Bearer {bearer_token}"))
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "pi")
+            .header("accept", "text/event-stream")
+            .header("Content-Type", "application/json");
+
+        if let Some(account_id) = account_id {
+            request_builder = request_builder.header("chatgpt-account-id", account_id);
+        }
+
+        if use_gateway_api_key_auth {
+            if let Some(access_token) = access_token {
+                request_builder = request_builder.header("x-openai-access-token", access_token);
+            }
+            if let Some(account_id) = account_id {
+                request_builder = request_builder.header("x-openai-account-id", account_id);
+            }
+        }
+
+        let response = request_builder.json(request).send().await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI Codex", response).await);
+        }
+
+        decode_responses_body(response).await
+    }
+
     async fn send_responses_request(
         &self,
         input: Vec<ResponsesInput>,
@@ -572,7 +1015,7 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
+                effort: resolve_reasoning_effort(normalized_model, self.reasoning_level.as_deref()),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -586,35 +1029,59 @@ impl OpenAiCodexProvider {
             access_token.as_deref().unwrap_or_default()
         };
 
-        let mut request_builder = self
-            .client
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {bearer_token}"))
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "pi")
-            .header("accept", "text/event-stream")
-            .header("Content-Type", "application/json");
-
-        if let Some(account_id) = account_id.as_deref() {
-            request_builder = request_builder.header("chatgpt-account-id", account_id);
-        }
-
-        if use_gateway_api_key_auth {
-            if let Some(access_token) = access_token.as_deref() {
-                request_builder = request_builder.header("x-openai-access-token", access_token);
+        match self.transport {
+            CodexTransport::WebSocket => self
+                .send_responses_websocket_request(
+                    &request,
+                    normalized_model,
+                    bearer_token,
+                    account_id.as_deref(),
+                    access_token.as_deref(),
+                    use_gateway_api_key_auth,
+                )
+                .await
+                .map_err(Into::into),
+            CodexTransport::Sse => {
+                self.send_responses_sse_request(
+                    &request,
+                    bearer_token,
+                    account_id.as_deref(),
+                    access_token.as_deref(),
+                    use_gateway_api_key_auth,
+                )
+                .await
             }
-            if let Some(account_id) = account_id.as_deref() {
-                request_builder = request_builder.header("x-openai-account-id", account_id);
+            CodexTransport::Auto => {
+                match self
+                    .send_responses_websocket_request(
+                        &request,
+                        normalized_model,
+                        bearer_token,
+                        account_id.as_deref(),
+                        access_token.as_deref(),
+                        use_gateway_api_key_auth,
+                    )
+                    .await
+                {
+                    Ok(text) => Ok(text),
+                    Err(WebsocketRequestError::TransportUnavailable(error)) => {
+                        tracing::warn!(
+                            error = %error,
+                            "OpenAI Codex websocket request failed; falling back to SSE"
+                        );
+                        self.send_responses_sse_request(
+                            &request,
+                            bearer_token,
+                            account_id.as_deref(),
+                            access_token.as_deref(),
+                            use_gateway_api_key_auth,
+                        )
+                        .await
+                    }
+                    Err(WebsocketRequestError::Stream(error)) => Err(error),
+                }
             }
         }
-
-        let response = request_builder.json(&request).send().await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenAI Codex", response).await);
-        }
-
-        decode_responses_body(response).await
     }
 }
 
@@ -643,7 +1110,12 @@ impl Provider for OpenAiCodexProvider {
 
         // Normalize images: convert file paths to data URIs
         let config = crate::config::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+        let prepared = crate::multimodal::prepare_messages_for_provider_with_provider_hint(
+            &messages,
+            &config,
+            Some("openai"),
+        )
+        .await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
@@ -658,7 +1130,12 @@ impl Provider for OpenAiCodexProvider {
     ) -> anyhow::Result<String> {
         // Normalize image markers: convert file paths to data URIs
         let config = crate::config::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared = crate::multimodal::prepare_messages_for_provider_with_provider_hint(
+            messages,
+            &config,
+            Some("openai"),
+        )
+        .await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
@@ -669,6 +1146,7 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     struct EnvGuard {
         key: &'static str,
@@ -694,6 +1172,13 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
     }
 
     #[test]
@@ -743,6 +1228,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_prefers_explicit_endpoint_env() {
+        let _env_lock = env_lock();
         let _endpoint_guard = EnvGuard::set(
             CODEX_RESPONSES_URL_ENV,
             Some("https://env.example.com/v1/responses"),
@@ -758,6 +1244,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
+        let _env_lock = env_lock();
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
@@ -769,6 +1256,85 @@ mod tests {
         assert_eq!(
             resolve_responses_url(&options).unwrap(),
             "https://proxy.example.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn resolve_transport_mode_defaults_to_auto() {
+        let _env_lock = env_lock();
+        let _transport_guard = EnvGuard::set(CODEX_TRANSPORT_ENV, None);
+        let _legacy_guard = EnvGuard::set(CODEX_RESPONSES_WEBSOCKET_ENV_LEGACY, None);
+        let _provider_guard = EnvGuard::set("ZEROCLAW_PROVIDER_TRANSPORT", None);
+
+        assert_eq!(
+            resolve_transport_mode(&ProviderRuntimeOptions::default()).unwrap(),
+            CodexTransport::Auto
+        );
+    }
+
+    #[test]
+    fn resolve_transport_mode_accepts_runtime_override() {
+        let _env_lock = env_lock();
+        let _transport_guard = EnvGuard::set(CODEX_TRANSPORT_ENV, Some("sse"));
+
+        let options = ProviderRuntimeOptions {
+            provider_transport: Some("websocket".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        assert_eq!(
+            resolve_transport_mode(&options).unwrap(),
+            CodexTransport::WebSocket
+        );
+    }
+
+    #[test]
+    fn resolve_transport_mode_legacy_bool_env_is_supported() {
+        let _env_lock = env_lock();
+        let _transport_guard = EnvGuard::set(CODEX_TRANSPORT_ENV, None);
+        let _provider_guard = EnvGuard::set("ZEROCLAW_PROVIDER_TRANSPORT", None);
+        let _legacy_guard = EnvGuard::set(CODEX_RESPONSES_WEBSOCKET_ENV_LEGACY, Some("false"));
+
+        assert_eq!(
+            resolve_transport_mode(&ProviderRuntimeOptions::default()).unwrap(),
+            CodexTransport::Sse
+        );
+    }
+
+    #[test]
+    fn resolve_transport_mode_rejects_invalid_runtime_override() {
+        let _env_lock = env_lock();
+        let _transport_guard = EnvGuard::set(CODEX_TRANSPORT_ENV, None);
+        let _provider_guard = EnvGuard::set("ZEROCLAW_PROVIDER_TRANSPORT", None);
+        let _legacy_guard = EnvGuard::set(CODEX_RESPONSES_WEBSOCKET_ENV_LEGACY, None);
+
+        let options = ProviderRuntimeOptions {
+            provider_transport: Some("udp".to_string()),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let err =
+            resolve_transport_mode(&options).expect_err("invalid runtime transport must fail");
+        assert!(err
+            .to_string()
+            .contains("Invalid OpenAI Codex transport override 'udp'"));
+    }
+
+    #[test]
+    fn websocket_url_uses_ws_scheme_and_model_query() {
+        let _env_lock = env_lock();
+        let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
+        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
+
+        let options = ProviderRuntimeOptions::default();
+        let provider = OpenAiCodexProvider::new(&options, None).expect("provider should init");
+        let ws_url = provider
+            .responses_websocket_url("gpt-5.3-codex")
+            .expect("websocket URL should be derived");
+
+        assert_eq!(
+            ws_url,
+            "wss://chatgpt.com/backend-api/codex/responses?model=gpt-5.3-codex"
         );
     }
 
@@ -785,6 +1351,10 @@ mod tests {
 
     #[test]
     fn constructor_enables_custom_endpoint_key_mode() {
+        let _env_lock = env_lock();
+        let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
+        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
+
         let options = ProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
             ..ProviderRuntimeOptions::default()
@@ -856,6 +1426,28 @@ mod tests {
         assert_eq!(
             clamp_reasoning_effort("gpt-5.3-codex", "xhigh"),
             "xhigh".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_prefers_config_override() {
+        let _env_lock = env_lock();
+        let _reasoning_guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
+
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("xhigh")),
+            "high".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_falls_back_to_env_when_override_invalid() {
+        let _env_lock = env_lock();
+        let _reasoning_guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("medium"));
+
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("banana")),
+            "medium".to_string()
         );
     }
 
@@ -1014,10 +1606,17 @@ data: [DONE]
     fn capabilities_includes_vision() {
         let options = ProviderRuntimeOptions {
             provider_api_url: None,
+            provider_transport: None,
             zeroclaw_dir: None,
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            reasoning_level: None,
+            custom_provider_api_mode: None,
+            custom_provider_auth_header: None,
+            compatible_timeout_secs: None,
+            max_tokens_override: None,
+            model_support_vision: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
@@ -1025,5 +1624,45 @@ data: [DONE]
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn websocket_idle_timeout_without_partial_output_is_transport_unavailable() {
+        let error = websocket_idle_timeout_error(false);
+        assert!(matches!(
+            error,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("timed out after 60s waiting for events"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn websocket_idle_timeout_with_partial_output_is_stream_error() {
+        let error = websocket_idle_timeout_error(true);
+        assert!(matches!(error, WebsocketRequestError::Stream(_)));
+        assert!(
+            error.to_string().contains("before timeout"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn websocket_no_response_maps_to_transport_unavailable() {
+        let error = websocket_no_response_error();
+        assert!(matches!(
+            error,
+            WebsocketRequestError::TransportUnavailable(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("No response from OpenAI Codex websocket stream"),
+            "unexpected error message: {error}"
+        );
     }
 }

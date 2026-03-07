@@ -12,7 +12,7 @@
 //! Run manually: `cargo test provider_vision -- --ignored --nocapture`
 
 use anyhow::Result;
-use zeroclaw::providers::{ChatMessage, ChatRequest, Provider, ProviderRuntimeOptions};
+use zeroclaw::providers::{ChatMessage, ChatRequest, ProviderRuntimeOptions};
 
 /// Tests that provider supports vision input.
 ///
@@ -148,9 +148,16 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     let opts = ProviderRuntimeOptions {
         auth_profile_override: Some("second".to_string()),
         provider_api_url: None,
+        provider_transport: None,
         zeroclaw_dir: None,
         secrets_encrypt: false,
         reasoning_enabled: None,
+        reasoning_level: None,
+        custom_provider_api_mode: None,
+        custom_provider_auth_header: None,
+        compatible_timeout_secs: None,
+        max_tokens_override: None,
+        model_support_vision: None,
     };
 
     let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;
