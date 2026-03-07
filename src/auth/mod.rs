@@ -310,8 +310,17 @@ impl AuthService {
             .as_deref()
             .and_then(gemini_oauth::extract_client_id_from_id_token);
         let refresh_client_id = id_token_client_id.or_else(gemini_oauth::gemini_oauth_client_id);
-        let refresh_client_secret = gemini_oauth::gemini_oauth_client_secret()
-            .or_else(|| Some(gemini_oauth::GEMINI_CLI_DEFAULT_CLIENT_SECRET.to_string()));
+        // Use the well-known Gemini CLI client secret as final fallback only when
+        // a client_id is also present. Without a client_id the secret has no
+        // counterpart, so forcing it would incorrectly credentialize a bare
+        // refresh token exchange (breaking non-CLI Gemini OAuth clients).
+        let refresh_client_secret = gemini_oauth::gemini_oauth_client_secret().or_else(|| {
+            if refresh_client_id.is_some() {
+                Some(gemini_oauth::GEMINI_CLI_DEFAULT_CLIENT_SECRET.to_string())
+            } else {
+                None
+            }
+        });
 
         let mut refreshed = match refresh_gemini_access_token_with_retries(
             &self.client,
