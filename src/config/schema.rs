@@ -4450,6 +4450,59 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
     }
 }
 
+/// Channel conversation context management settings (`[channels_config.context]`).
+///
+/// Controls how aggressively the channel runtime compacts and trims conversation
+/// history to stay within the model's context window. All fields have sensible
+/// defaults matching the previous hardcoded behaviour so existing configs remain
+/// unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChannelContextConfig {
+    /// Maximum messages to retain during history compaction. Default: 12.
+    #[serde(default = "default_compact_keep_messages")]
+    pub compact_keep_messages: usize,
+    /// Maximum characters per message after compaction truncation. Default: 600.
+    #[serde(default = "default_compact_content_chars")]
+    pub compact_content_chars: usize,
+    /// Estimated token count that triggers proactive history trimming. Default: 90 000.
+    #[serde(default = "default_context_token_limit")]
+    pub context_token_limit: usize,
+    /// Target estimated token budget after trimming. Default: 80 000.
+    #[serde(default = "default_context_token_target")]
+    pub context_token_target: usize,
+    /// Minimum non-system messages preserved during trimming. Default: 4.
+    #[serde(default = "default_min_keep_messages")]
+    pub min_keep_messages: usize,
+}
+
+impl Default for ChannelContextConfig {
+    fn default() -> Self {
+        Self {
+            compact_keep_messages: default_compact_keep_messages(),
+            compact_content_chars: default_compact_content_chars(),
+            context_token_limit: default_context_token_limit(),
+            context_token_target: default_context_token_target(),
+            min_keep_messages: default_min_keep_messages(),
+        }
+    }
+}
+
+fn default_compact_keep_messages() -> usize {
+    12
+}
+fn default_compact_content_chars() -> usize {
+    600
+}
+fn default_context_token_limit() -> usize {
+    90_000
+}
+fn default_context_token_target() -> usize {
+    80_000
+}
+fn default_min_keep_messages() -> usize {
+    4
+}
+
 /// Top-level channel configurations (`[channels_config]` section).
 ///
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
@@ -4520,6 +4573,9 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Conversation context management (compaction and trimming thresholds).
+    #[serde(default)]
+    pub context: ChannelContextConfig,
 }
 
 impl ChannelsConfig {
@@ -4668,6 +4724,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: default_channel_message_timeout_secs(),
+            context: ChannelContextConfig::default(),
         }
     }
 }
@@ -5759,6 +5816,14 @@ pub struct SecurityConfig {
     /// Shared URL access policy for network-enabled tools.
     #[serde(default)]
     pub url_access: UrlAccessConfig,
+
+    /// Sender IDs trusted to bypass the prompt-injection guard.
+    ///
+    /// Messages from these senders skip the lexical and semantic prompt guards
+    /// entirely. Use this for the bot owner's Discord/Telegram user ID so that
+    /// normal admin messages are never blocked.
+    #[serde(default)]
+    pub prompt_guard_trusted_senders: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -5778,6 +5843,7 @@ impl Default for SecurityConfig {
             semantic_guard_collection: default_semantic_guard_collection(),
             semantic_guard_threshold: default_semantic_guard_threshold(),
             url_access: UrlAccessConfig::default(),
+            prompt_guard_trusted_senders: Vec::new(),
         }
     }
 }
