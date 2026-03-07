@@ -1067,7 +1067,12 @@ impl BedrockProvider {
             request = request.header("x-amz-security-token", token);
         }
 
-        let response: reqwest::Response = request.body(payload).send().await?;
+        let response: reqwest::Response =
+            crate::observability::llm_http_trace::send_with_middleware(
+                "provider.bedrock",
+                request.body(payload),
+            )
+            .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("Bedrock", response).await);
@@ -1123,7 +1128,11 @@ impl BedrockProvider {
             request = request.header("x-amz-security-token", token);
         }
 
-        let response = request.body(payload).send().await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.bedrock",
+            request.body(payload),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("Bedrock", response).await);
@@ -1546,10 +1555,15 @@ impl Provider for BedrockProvider {
                 req = req.header("x-amz-security-token", token);
             }
 
-            let response = match req.body(payload).send().await {
+            let response = match crate::observability::llm_http_trace::send_with_middleware(
+                "provider.bedrock",
+                req.body(payload),
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::Provider(e.to_string()))).await;
                     return;
                 }
             };
@@ -1633,7 +1647,11 @@ impl Provider for BedrockProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Ok(creds) = self.get_credentials().await {
             let url = format!("https://{ENDPOINT_PREFIX}.{}.amazonaws.com/", creds.region);
-            let _ = self.http_client().get(&url).send().await;
+            let _ = crate::observability::llm_http_trace::send_with_middleware(
+                "provider.bedrock",
+                self.http_client().get(&url),
+            )
+            .await;
         }
         Ok(())
     }

@@ -1432,10 +1432,11 @@ impl OpenAiCompatibleProvider {
 
         let url = self.responses_url();
 
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.compatible",
+            self.apply_auth_header(self.http_client().post(&url).json(&request), credential),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1984,10 +1985,11 @@ impl Provider for OpenAiCompatibleProvider {
                 .await;
         }
 
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await
+        let response = match crate::observability::llm_http_trace::send_with_middleware(
+            "provider.compatible",
+            self.apply_auth_header(self.http_client().post(&url).json(&request), credential),
+        )
+        .await
         {
             Ok(response) => response,
             Err(chat_error) => {
@@ -2101,10 +2103,11 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await
+        let response = match crate::observability::llm_http_trace::send_with_middleware(
+            "provider.compatible",
+            self.apply_auth_header(self.http_client().post(&url).json(&request), credential),
+        )
+        .await
         {
             Ok(response) => response,
             Err(chat_error) => {
@@ -2232,10 +2235,11 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await
+        let response = match crate::observability::llm_http_trace::send_with_middleware(
+            "provider.compatible",
+            self.apply_auth_header(self.http_client().post(&url).json(&request), credential),
+        )
+        .await
         {
             Ok(response) => response,
             Err(error) => {
@@ -2381,13 +2385,14 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(
+        let response = match crate::observability::llm_http_trace::send_with_middleware(
+            "provider.compatible",
+            self.apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
                 credential,
-            )
-            .send()
-            .await
+            ),
+        )
+        .await
         {
             Ok(response) => response,
             Err(chat_error) => {
@@ -2543,10 +2548,19 @@ impl Provider for OpenAiCompatibleProvider {
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             // Send request
-            let response = match req_builder.send().await {
+            let response = match crate::observability::llm_http_trace::send_with_middleware(
+                "provider.compatible",
+                req_builder,
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let stream_error = match e.downcast::<reqwest::Error>() {
+                        Ok(http_err) => StreamError::Http(http_err),
+                        Err(other) => StreamError::Provider(other.to_string()),
+                    };
+                    let _ = tx.send(Err(stream_error)).await;
                     return;
                 }
             };
@@ -2586,10 +2600,11 @@ impl Provider for OpenAiCompatibleProvider {
             // The server will likely return 405 Method Not Allowed, which is fine -
             // the goal is TLS handshake and HTTP/2 negotiation.
             let url = self.chat_completions_url();
-            let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
-                .send()
-                .await?;
+            let _ = crate::observability::llm_http_trace::send_with_middleware(
+                "provider.compatible",
+                self.apply_auth_header(self.http_client().get(&url), credential),
+            )
+            .await?;
         }
         Ok(())
     }

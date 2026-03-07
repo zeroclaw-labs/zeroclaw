@@ -380,7 +380,9 @@ impl CopilotProvider {
             req = req.header(*header, *value);
         }
 
-        let response = req.send().await?;
+        let response =
+            crate::observability::llm_http_trace::send_with_middleware("provider.copilot", req)
+                .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("GitHub Copilot", response).await);
@@ -474,15 +476,17 @@ impl CopilotProvider {
 
     /// Run GitHub OAuth device code flow.
     async fn device_code_login(&self) -> anyhow::Result<String> {
-        let response: DeviceCodeResponse = self
-            .http_client()
-            .post(GITHUB_DEVICE_CODE_URL)
-            .header("Accept", "application/json")
-            .json(&serde_json::json!({
-                "client_id": GITHUB_CLIENT_ID,
-                "scope": "read:user"
-            }))
-            .send()
+        let response: DeviceCodeResponse =
+            crate::observability::llm_http_trace::send_with_middleware(
+                "provider.copilot",
+                self.http_client()
+                    .post(GITHUB_DEVICE_CODE_URL)
+                    .header("Accept", "application/json")
+                    .json(&serde_json::json!({
+                        "client_id": GITHUB_CLIENT_ID,
+                        "scope": "read:user"
+                    })),
+            )
             .await?
             .error_for_status()?
             .json()
@@ -503,16 +507,18 @@ impl CopilotProvider {
         while tokio::time::Instant::now() < expires_at {
             tokio::time::sleep(poll_interval).await;
 
-            let token_response: AccessTokenResponse = self
-                .http_client()
-                .post(GITHUB_ACCESS_TOKEN_URL)
-                .header("Accept", "application/json")
-                .json(&serde_json::json!({
-                    "client_id": GITHUB_CLIENT_ID,
-                    "device_code": response.device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
-                }))
-                .send()
+            let token_response: AccessTokenResponse =
+                crate::observability::llm_http_trace::send_with_middleware(
+                    "provider.copilot",
+                    self.http_client()
+                        .post(GITHUB_ACCESS_TOKEN_URL)
+                        .header("Accept", "application/json")
+                        .json(&serde_json::json!({
+                            "client_id": GITHUB_CLIENT_ID,
+                            "device_code": response.device_code,
+                            "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+                        })),
+                )
                 .await?
                 .json()
                 .await?;
@@ -545,7 +551,9 @@ impl CopilotProvider {
         }
         request = request.header("Authorization", format!("token {access_token}"));
 
-        let response = request.send().await?;
+        let response =
+            crate::observability::llm_http_trace::send_with_middleware("provider.copilot", request)
+                .await?;
 
         if !response.status().is_success() {
             let status = response.status();

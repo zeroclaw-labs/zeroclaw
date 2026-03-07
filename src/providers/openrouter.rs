@@ -335,12 +335,14 @@ impl Provider for OpenRouterProvider {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
-                .get("https://openrouter.ai/api/v1/auth/key")
-                .header("Authorization", format!("Bearer {credential}"))
-                .send()
-                .await?
-                .error_for_status()?;
+            crate::observability::llm_http_trace::send_with_middleware(
+                "provider.openrouter",
+                self.http_client()
+                    .get("https://openrouter.ai/api/v1/auth/key")
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
+            .await?
+            .error_for_status()?;
         }
         Ok(())
     }
@@ -376,15 +378,16 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens_override,
         };
 
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openrouter",
+            self.http_client()
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenRouter", response).await);
@@ -424,15 +427,16 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens_override,
         };
 
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openrouter",
+            self.http_client()
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenRouter", response).await);
@@ -470,15 +474,16 @@ impl Provider for OpenRouterProvider {
             tools,
         };
 
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openrouter",
+            self.http_client()
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .json(&native_request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenRouter", response).await);
@@ -561,15 +566,16 @@ impl Provider for OpenRouterProvider {
             tools: native_tools,
         };
 
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openrouter",
+            self.http_client()
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .json(&native_request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenRouter", response).await);

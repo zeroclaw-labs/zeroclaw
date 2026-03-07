@@ -933,7 +933,11 @@ impl OpenAiCodexProvider {
             }
         }
 
-        let response = request_builder.json(request).send().await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.openai_codex",
+            request_builder.json(request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI Codex", response).await);

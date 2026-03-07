@@ -837,20 +837,22 @@ impl GeminiProvider {
 
         // Call loadCodeAssist
         let client = self.http_client();
-        let response = client
-            .post(LOAD_CODE_ASSIST_ENDPOINT)
-            .bearer_auth(token)
-            .json(&serde_json::json!({
-                "cloudaicompanionProject": project_seed_for_request,
-                "metadata": {
-                    "ideType": "GEMINI_CLI",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
-                    "duetProject": duet_project_for_request,
-                }
-            }))
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.gemini",
+            client
+                .post(LOAD_CODE_ASSIST_ENDPOINT)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "cloudaicompanionProject": project_seed_for_request,
+                    "metadata": {
+                        "ideType": "GEMINI_CLI",
+                        "platform": "PLATFORM_UNSPECIFIED",
+                        "pluginType": "GEMINI",
+                        "duetProject": duet_project_for_request,
+                    }
+                })),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1068,8 +1070,9 @@ impl GeminiProvider {
 
         let url = Self::build_generate_content_url(model, auth);
 
-        let mut response = self
-            .build_generate_content_request(
+        let mut response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.gemini",
+            self.build_generate_content_request(
                 auth,
                 &url,
                 &request,
@@ -1077,9 +1080,9 @@ impl GeminiProvider {
                 true,
                 project.as_deref(),
                 oauth_token.as_deref(),
-            )
-            .send()
-            .await?;
+            ),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1123,8 +1126,9 @@ impl GeminiProvider {
                     };
                     oauth_token = Some(new_token);
                     project = Some(new_project);
-                    response = self
-                        .build_generate_content_request(
+                    response = crate::observability::llm_http_trace::send_with_middleware(
+                        "provider.gemini",
+                        self.build_generate_content_request(
                             auth,
                             &url,
                             &request,
@@ -1132,9 +1136,9 @@ impl GeminiProvider {
                             true,
                             project.as_deref(),
                             oauth_token.as_deref(),
-                        )
-                        .send()
-                        .await?;
+                        ),
+                    )
+                    .await?;
                 } else {
                     anyhow::bail!("Gemini API error ({status}): {error_text}");
                 }
@@ -1144,8 +1148,9 @@ impl GeminiProvider {
                 tracing::warn!(
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
-                response = self
-                    .build_generate_content_request(
+                response = crate::observability::llm_http_trace::send_with_middleware(
+                    "provider.gemini",
+                    self.build_generate_content_request(
                         auth,
                         &url,
                         &request,
@@ -1153,9 +1158,9 @@ impl GeminiProvider {
                         false,
                         project.as_deref(),
                         oauth_token.as_deref(),
-                    )
-                    .send()
-                    .await?;
+                    ),
+                )
+                .await?;
             } else {
                 anyhow::bail!("Gemini API error ({status}): {error_text}");
             }
@@ -1170,8 +1175,9 @@ impl GeminiProvider {
                 tracing::warn!(
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
-                response = self
-                    .build_generate_content_request(
+                response = crate::observability::llm_http_trace::send_with_middleware(
+                    "provider.gemini",
+                    self.build_generate_content_request(
                         auth,
                         &url,
                         &request,
@@ -1179,9 +1185,9 @@ impl GeminiProvider {
                         false,
                         project.as_deref(),
                         oauth_token.as_deref(),
-                    )
-                    .send()
-                    .await?;
+                    ),
+                )
+                .await?;
             } else {
                 anyhow::bail!("Gemini API error ({status}): {error_text}");
             }
@@ -1392,6 +1398,7 @@ impl Provider for GeminiProvider {
                         "https://generativelanguage.googleapis.com/v1beta/models".to_string()
                     };
 
+                    // not recording because there might be the api key in url
                     self.http_client()
                         .get(&url)
                         .send()

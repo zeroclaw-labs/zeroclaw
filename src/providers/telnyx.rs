@@ -75,12 +75,13 @@ impl TelnyxProvider {
             anyhow::anyhow!("Telnyx API key not set. Set TELNYX_API_KEY environment variable.")
         })?;
 
-        let response = self
-            .client
-            .get(format!("{}/models", Self::BASE_URL))
-            .header("Authorization", format!("Bearer {}", api_key))
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.telnyx",
+            self.client
+                .get(format!("{}/models", Self::BASE_URL))
+                .header("Authorization", format!("Bearer {}", api_key)),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let error = response.text().await?;
@@ -200,14 +201,15 @@ impl Provider for TelnyxProvider {
             temperature,
         };
 
-        let response = self
-            .client
-            .post(self.chat_url())
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.telnyx",
+            self.client
+                .post(self.chat_url())
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -252,14 +254,15 @@ impl Provider for TelnyxProvider {
             temperature,
         };
 
-        let response = self
-            .client
-            .post(self.chat_url())
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.telnyx",
+            self.client
+                .post(self.chat_url())
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&request),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -280,11 +283,11 @@ impl Provider for TelnyxProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         // Pre-warm the connection pool
-        let _ = self
-            .client
-            .get(format!("{}/models", Self::BASE_URL))
-            .send()
-            .await;
+        let _ = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.telnyx",
+            self.client.get(format!("{}/models", Self::BASE_URL)),
+        )
+        .await;
         Ok(())
     }
 }

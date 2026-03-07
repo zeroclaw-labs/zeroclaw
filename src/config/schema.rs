@@ -3204,6 +3204,10 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// Record detailed LLM HTTP request/response events into runtime trace.
+    #[serde(default)]
+    pub runtime_trace_record_http: bool,
 }
 
 impl Default for ObservabilityConfig {
@@ -3215,6 +3219,7 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            runtime_trace_record_http: false,
         }
     }
 }
@@ -10076,6 +10081,7 @@ mod tests {
         assert_eq!(o.runtime_trace_mode, "none");
         assert_eq!(o.runtime_trace_path, "state/runtime-trace.jsonl");
         assert_eq!(o.runtime_trace_max_entries, 200);
+        assert!(!o.runtime_trace_record_http);
     }
 
     #[test]

@@ -41,14 +41,29 @@ Lưu ý:
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `backend` | `none` | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry` hoặc `otlp` |
+| `backend` | `none` | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, hoặc `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | Endpoint OTLP HTTP khi backend là `otel` |
 | `otel_service_name` | `zeroclaw` | Tên dịch vụ gửi đến OTLP collector |
+| `runtime_trace_mode` | `none` | Chế độ lưu trữ runtime trace: `none`, `rolling`, hoặc `full` |
+| `runtime_trace_path` | `state/runtime-trace.jsonl` | Đường dẫn JSONL runtime trace (tương đối với workspace trừ khi là đường dẫn tuyệt đối) |
+| `runtime_trace_max_entries` | `200` | Sự kiện tối đa được giữ lại khi `runtime_trace_mode = "rolling"` |
+| `runtime_trace_record_http` | `false` | Ghi chi tiết HTTP request/response của LLM vào runtime trace (`llm_http_request` / `llm_http_response`) |
 
 Lưu ý:
 
 - `backend = "otel"` dùng OTLP HTTP export với blocking exporter client để span và metric có thể được gửi an toàn từ context ngoài Tokio.
 - Bí danh `opentelemetry` và `otlp` trỏ đến cùng backend OTel.
+- Runtime traces dùng để debug tool-call failures và malformed model tool payloads. Có thể chứa model output text, nên giữ tắt mặc định trên shared hosts.
+- `runtime_trace_record_http` chỉ có hiệu lực khi `runtime_trace_mode` là `rolling` hoặc `full`.
+  - HTTP trace payload ẩn các trường nhạy cảm phổ biến (ví dụ: tiêu đề Authorization và các trường query/body dạng token), nhưng vẫn coi tệp trace là dữ liệu vận hành nhạy cảm.
+  - Với yêu cầu streaming, để cải thiện hiệu quả, phần thân phản hồi sẽ được bỏ qua, trong khi phần thân yêu cầu vẫn được ghi lại (trong giới hạn kích thước).
+  - Request/response/giá trị header bị cắt ngắn nếu quá lớn. Tuy nhiên, lưu lượng LLM cao với các phản hồi lớn vẫn có thể làm tăng đáng kể mức sử dụng bộ nhớ và kích thước tệp trace.
+  - Cân nhắc tắt HTTP tracing trong môi trường sản xuất.
+- Truy vấn runtime trace bằng:
+  - `zeroclaw doctor traces --limit 20`
+  - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
+  - `zeroclaw doctor traces --event llm_http_response --contains \"500\"`
+  - `zeroclaw doctor traces --id <trace-id>`
 
 Ví dụ:
 
@@ -57,6 +72,10 @@ Ví dụ:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
+runtime_trace_record_http = true
 ```
 
 ## Ghi đè provider qua biến môi trường

@@ -375,7 +375,11 @@ impl OllamaProvider {
             }
         }
 
-        let response = request_builder.send().await?;
+        let response = crate::observability::llm_http_trace::send_with_middleware(
+            "provider.ollama",
+            request_builder,
+        )
+        .await?;
         let status = response.status();
         tracing::debug!("Ollama response status: {}", status);
 

@@ -1073,6 +1073,7 @@ async fn main() -> Result<()> {
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    observability::llm_http_trace::init_from_config(&config.observability);
     if config.security.otp.enabled {
         let config_dir = config
             .config_path
