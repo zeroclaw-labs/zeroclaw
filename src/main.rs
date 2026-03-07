@@ -82,6 +82,7 @@ mod skills;
 mod tools;
 mod tunnel;
 mod util;
+mod verifiable_intent;
 
 use config::Config;
 

@@ -52,6 +52,7 @@ pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
+pub mod verifiable_intent;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -94,6 +95,7 @@ pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use verifiable_intent::VerifiableIntentTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -343,6 +345,18 @@ pub fn all_tools_with_runtime(
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
+    }
+
+    // Verifiable Intent tool (opt-in via config)
+    if root_config.verifiable_intent.enabled {
+        let strictness = match root_config.verifiable_intent.strictness.as_str() {
+            "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
+            _ => crate::verifiable_intent::StrictnessMode::Strict,
+        };
+        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
+            security.clone(),
+            strictness,
+        )));
     }
 
     boxed_registry_from_arcs(tool_arcs)
