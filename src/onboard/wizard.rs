@@ -18,10 +18,11 @@ use crate::providers::{
 };
 use anyhow::{bail, Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -3898,8 +3899,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style("Matrix Setup").white().bold(),
                     style("— self-hosted, federated chat").dim()
                 );
-                print_bullet("You need a Matrix account and an access token.");
-                print_bullet("Get a token via Element → Settings → Help & About → Access Token.");
+                print_bullet("You need a Matrix homeserver and login credentials.");
+                print_bullet("The wizard will fetch an access token for you.");
                 println!();
 
                 let homeserver: String = Input::new()
@@ -3911,76 +3912,74 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
+                let user_id: String = Input::new()
+                    .with_prompt("  User ID (e.g. @user-id:matrix.org)")
+                    .interact_text()?;
 
-                if access_token.trim().is_empty() {
-                    println!("  {} Skipped — token required", style("→").dim());
+                if user_id.trim().is_empty() {
+                    println!("  {} Skipped — user ID required", style("→").dim());
                     continue;
                 }
 
-                // Test connection (run entirely in separate thread — Response must be used/dropped there)
-                let hs = homeserver.trim_end_matches('/');
-                print!("  {} Testing connection... ", style("⏳").dim());
-                let hs_owned = hs.to_string();
-                let access_token_clone = access_token.clone();
-                let thread_result = std::thread::spawn(move || {
-                    let client = reqwest::blocking::Client::new();
-                    let resp = client
-                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
-                        .header("Authorization", format!("Bearer {access_token_clone}"))
-                        .send()?;
-                    let ok = resp.status().is_success();
+                let password: String = Password::new().with_prompt("  Password").interact()?;
 
-                    if !ok {
-                        return Ok::<_, reqwest::Error>((false, None, None));
-                    }
+                if password.is_empty() {
+                    println!("  {} Skipped — password required", style("→").dim());
+                    continue;
+                }
 
-                    let payload: Value = match resp.json() {
-                        Ok(payload) => payload,
-                        Err(_) => Value::Null,
-                    };
-                    let user_id = payload
-                        .get("user_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-                    let device_id = payload
-                        .get("device_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
+                // trim whitespace that might have been accidentally entered
+                let homeserver = homeserver.trim().to_string();
+                let user_id = user_id.trim().to_string();
+                let password = password;
 
-                    Ok::<_, reqwest::Error>((true, user_id, device_id))
-                })
-                .join();
-
-                let (detected_user_id, detected_device_id) = match thread_result {
-                    Ok(Ok((true, user_id, device_id))) => {
-                        println!(
-                            "\r  {} Connection verified        ",
-                            style("✅").green().bold()
-                        );
-
-                        if device_id.is_none() {
-                            println!(
-                                "  {} Homeserver did not return device_id from whoami. If E2EE decryption fails, set channels.matrix.device_id manually in config.toml.",
-                                style("⚠️").yellow().bold()
-                            );
+                // device id prompt with history detection
+                let mut device_id: Option<String> = None;
+                if let Some(prev) = config.matrix.as_ref().and_then(|c| c.device_id.clone()) {
+                    let use_prev: bool = Confirm::new()
+                        .with_prompt("Found previous device ID, use it?")
+                        .default(true)
+                        .interact()?;
+                    if use_prev {
+                        device_id = Some(prev);
+                    } else {
+                        let input: String = Input::new()
+                            .with_prompt("  Device ID (optional)")
+                            .allow_empty(true)
+                            .interact_text()?;
+                        if !input.trim().is_empty() {
+                            device_id = Some(input);
                         }
+                    }
+                } else {
+                    let input: String = Input::new()
+                        .with_prompt("  Device ID (optional)")
+                        .allow_empty(true)
+                        .interact_text()?;
+                    if !input.trim().is_empty() {
+                        device_id = Some(input);
+                    }
+                }
 
-                        (user_id, device_id)
-                    }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check homeserver URL and token",
-                            style("❌").red().bold()
-                        );
-                        continue;
-                    }
-                };
+                let recovery_key: String = Input::new()
+                    .with_prompt("  Recovery key (optional, will be shown)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                if !recovery_key.trim().is_empty() {
+                    println!(
+                        "  {} You entered a recovery key; keep it safe if you want encrypted history.",
+                        style("⚠").yellow()
+                    );
+                }
 
                 let room_id: String = Input::new()
                     .with_prompt("  Room ID (e.g. !abc123:matrix.org)")
                     .interact_text()?;
+
+                if room_id.trim().is_empty() {
+                    println!("  {} Skipped — room ID required", style("→").dim());
+                    continue;
+                }
 
                 let users_str: String = Input::new()
                     .with_prompt("  Allowed users (comma-separated @user:server, or * for all)")
@@ -3993,11 +3992,151 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
+                // perform login request
+                let mut hs = homeserver.trim().trim_end_matches('/').to_string();
+                if !hs.starts_with("http://") && !hs.starts_with("https://") {
+                    // assume https if user omitted scheme
+                    hs = format!("https://{hs}");
+                }
+                print!("  {} Logging in... ", style("⏳").dim());
+                let hs_owned = hs.to_string();
+                let user_clone = user_id.clone();
+                let password_clone = password.clone();
+                let device_clone = device_id.clone();
+                let thread_result = std::thread::spawn(move || {
+                    // helper to perform login attempt with given builder
+                    fn attempt(
+                        builder: reqwest::blocking::ClientBuilder,
+                        hs: &str,
+                        body: &Value,
+                    ) -> Result<(reqwest::StatusCode, Value), reqwest::Error> {
+                        let client = builder.build()?;
+                        let resp = client
+                            .post(format!("{hs}/_matrix/client/v3/login"))
+                            .header("Content-Type", "application/json")
+                            .json(body)
+                            .send()?;
+                        let status = resp.status();
+                        let text = resp.text().unwrap_or_default();
+                        let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                        Ok((status, payload))
+                    }
+
+                    let mut body = serde_json::json!({
+                        "type": "m.login.password",
+                        "user": user_clone,
+                        "password": password_clone,
+                    });
+                    if let Some(dev) = device_clone {
+                        body["device_id"] = serde_json::Value::String(dev);
+                    }
+
+                    // first try with default (env) proxy settings
+                    let builder1 = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(20))
+                        .connect_timeout(Duration::from_secs(15));
+                    match attempt(builder1, &hs_owned, &body) {
+                        Ok(result) => Ok(result),
+                        Err(e) => {
+                            // if it looked like a timeout, retry once w/o proxy
+                            if e.is_request() && e.to_string().contains("TimedOut") {
+                                eprintln!("initial login timed out, retrying without proxy");
+                                let builder2 = reqwest::blocking::Client::builder()
+                                    .timeout(Duration::from_secs(20))
+                                    .connect_timeout(Duration::from_secs(15))
+                                    .no_proxy();
+                                attempt(builder2, &hs_owned, &body)
+                            } else {
+                                Err(e)
+                            }
+                        }
+                    }
+                })
+                .join();
+
+                // interpret result and optionally offer manual token fallback
+                let (access_token, detected_user_id, detected_device_id) = match thread_result {
+                    Ok(Ok((status, payload))) if status.is_success() => {
+                        // extract required fields
+                        let tok = payload
+                            .get("access_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if tok.is_empty() {
+                            println!(
+                                "\r  {} Login succeeded but no token returned",
+                                style("❌").red().bold()
+                            );
+                            continue;
+                        }
+                        let user = payload
+                            .get("user_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let dev = payload
+                            .get("device_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        println!("\r  {} Logged in        ", style("✅").green().bold());
+                        (tok, user, dev)
+                    }
+                    Ok(Ok((status, payload))) => {
+                        println!(
+                            "\r  {} Login failed (HTTP {})",
+                            style("❌").red().bold(),
+                            status
+                        );
+                        if !payload.is_null() {
+                            println!("  server response: {}", payload);
+                        }
+                        // fall through to manual-token prompt below
+                        (String::new(), None, None)
+                    }
+                    Ok(Err(err)) => {
+                        println!(
+                            "\r  {} Login request error: {:?}",
+                            style("❌").red().bold(),
+                            err
+                        );
+                        if let Some(source) = err.source() {
+                            println!("    source: {:?}", source);
+                        }
+                        (String::new(), None, None)
+                    }
+                    Err(_) => {
+                        println!("\r  {} Login thread panicked", style("❌").red().bold());
+                        (String::new(), None, None)
+                    }
+                };
+
+                // if we didn't obtain a token from the network, offer manual entry
+                let access_token = if access_token.is_empty() {
+                    let manual: bool = Confirm::new()
+                        .with_prompt(
+                            "Login failed repeatedly – enter access token manually instead?",
+                        )
+                        .default(true)
+                        .interact()?;
+                    if manual {
+                        let tok: String = Input::new()
+                            .with_prompt("  Access token")
+                            .allow_empty(false)
+                            .interact_text()?;
+                        tok
+                    } else {
+                        continue; // go back to homeserver prompt loop
+                    }
+                } else {
+                    access_token
+                };
+
                 config.matrix = Some(MatrixConfig {
                     homeserver: homeserver.trim_end_matches('/').to_string(),
                     access_token,
                     user_id: detected_user_id,
                     device_id: detected_device_id,
+                    recovery_key: recovery_key.trim().to_string().into(),
                     room_id,
                     allowed_users,
                 });

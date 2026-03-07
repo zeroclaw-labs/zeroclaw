@@ -13,6 +13,8 @@ For encrypted Matrix rooms, also read the dedicated runbook:
 - Need Nextcloud Talk bot setup: use [Nextcloud Talk Setup](./nextcloud-talk-setup.md).
 - Need deployment/network assumptions (polling vs webhook): use [Network Deployment](./network-deployment.md).
 
+> **Wizard note:** the onboarding wizard now supports password‑based login for Matrix. it will prompt for homeserver URL, user ID, and password (plus optional device ID and recovery key) and fetch an access token automatically. manual tokens are still accepted if you edit `channels_config.matrix` directly.
+
 ## FAQ: Matrix setup passes but no reply
 
 This is the most common symptom (same class as issue #499). Check these in order:
@@ -73,6 +75,22 @@ Operational notes:
 ## Channel Matrix
 
 ### Build Feature Toggles (`channel-matrix`, `channel-lark`)
+
+### Matrix login fields
+
+When using the interactive wizard, Matrix configuration no longer requires you to pre‑generate an access token. instead the wizard will ask for:
+
+1. Homeserver URL (e.g. `https://matrix.org`) – **required**
+2. User ID (`@user-id:server`) – **required**
+3. Password – **required**, hidden input
+4. Device ID – optional; if a previous device ID exists the wizard will ask whether to reuse it; leaving blank omits it from the login request.
+5. Recovery key – optional; shown on screen when entered, save it if you want to decrypt encrypted room history.
+6. Room ID – **required**
+7. Allowed users – comma-separated `@user:server` list or `*` (default `*`)
+
+These values are used to perform a `POST /_matrix/client/v3/login` request. the resulting
+access token, user_id and device_id are stored in `channels_config.matrix`.
+
 
 Matrix and Lark support are controlled at compile time.
 

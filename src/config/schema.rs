@@ -2903,6 +2903,9 @@ pub struct MatrixConfig {
     /// Optional Matrix device ID.
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Optional recovery key for end-to-end encryption (if the bot account has E2E enabled).
+    #[serde(default)]
+    pub recovery_key: Option<String>,
     /// Matrix room ID to listen in (e.g. `"!abc123:matrix.org"`).
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
@@ -5578,6 +5581,7 @@ tool_dispatcher = "xml"
             access_token: "syt_token_abc".into(),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
+            recovery_key: Some("recovery_key_abc".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
         };
@@ -5587,6 +5591,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.access_token, "syt_token_abc");
         assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
+        assert_eq!(parsed.recovery_key.as_deref(), Some("recovery_key_abc"));
         assert_eq!(parsed.room_id, "!room123:matrix.org");
         assert_eq!(parsed.allowed_users.len(), 1);
     }
@@ -5598,6 +5603,7 @@ tool_dispatcher = "xml"
             access_token: "tok".into(),
             user_id: None,
             device_id: None,
+            recovery_key: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
         };
@@ -5687,6 +5693,7 @@ allowed_users = ["@ops:matrix.org"]
                 access_token: "tok".into(),
                 user_id: None,
                 device_id: None,
+                recovery_key: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),
