@@ -14,58 +14,16 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
-pub mod clawdtalk;
 pub mod cli;
-pub mod dingtalk;
 pub mod discord;
-pub mod email_channel;
-pub mod imessage;
-pub mod irc;
-#[cfg(feature = "channel-lark")]
-pub mod lark;
-pub mod linq;
-#[cfg(feature = "channel-matrix")]
-pub mod matrix;
-pub mod mattermost;
-pub mod nextcloud_talk;
-pub mod nostr;
-pub mod qq;
-pub mod signal;
-pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
-pub mod wati;
-pub mod whatsapp;
-#[cfg(feature = "whatsapp-web")]
-pub mod whatsapp_storage;
-#[cfg(feature = "whatsapp-web")]
-pub mod whatsapp_web;
 
-pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
-pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
-pub use email_channel::EmailChannel;
-pub use imessage::IMessageChannel;
-pub use irc::IrcChannel;
-#[cfg(feature = "channel-lark")]
-pub use lark::LarkChannel;
-pub use linq::LinqChannel;
-#[cfg(feature = "channel-matrix")]
-pub use matrix::MatrixChannel;
-pub use mattermost::MattermostChannel;
-pub use nextcloud_talk::NextcloudTalkChannel;
-pub use nostr::NostrChannel;
-pub use qq::QQChannel;
-pub use signal::SignalChannel;
-pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
-pub use wati::WatiChannel;
-pub use whatsapp::WhatsAppChannel;
-#[cfg(feature = "whatsapp-web")]
-pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
@@ -438,17 +396,6 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
-        ),
-        "whatsapp" => Some(
-            "When responding on WhatsApp:\n\
-             - Use *bold* for emphasis (WhatsApp uses single asterisks).\n\
-             - Be concise. No markdown headers (## etc.) — they don't render.\n\
-             - No markdown tables — use bullet lists instead.\n\
-             - For sending images, documents, videos, or audio files use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>]\n\
-             - The path MUST be an absolute filesystem path to a local file (e.g. [IMAGE:/home/nicolas/.zeroclaw/workspace/images/chart.png]).\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - You can combine text and media in one response — text is sent first, then each attachment.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         _ => None,
@@ -4098,16 +4045,6 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
                     channel.name()
                 );
             }
-            if !cfg!(feature = "channel-matrix") {
-                println!(
-                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
-                );
-            }
-            if !cfg!(feature = "channel-lark") {
-                println!(
-                    "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
-                );
-            }
             println!("\nTo start channels: zeroclaw channel start");
             println!("To check health:    zeroclaw channel doctor");
             println!("To configure:      zeroclaw onboard");
@@ -4152,13 +4089,7 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
-fn collect_configured_channels(
-    config: &Config,
-    matrix_skip_context: &str,
-) -> Vec<ConfiguredChannel> {
-    // Keep this symbol used even when Matrix support is compiled in and
-    // `#[cfg(not(feature = "channel-matrix"))]` blocks are removed.
-    let _ = matrix_skip_context;
+fn collect_configured_channels(config: &Config) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
@@ -4200,309 +4131,14 @@ fn collect_configured_channels(
         });
     }
 
-    if let Some(ref sl) = config.channels_config.slack {
-        channels.push(ConfiguredChannel {
-            display_name: "Slack",
-            channel: Arc::new(
-                SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.channel_id.clone(),
-                    sl.allowed_users.clone(),
-                )
-                .with_group_reply_policy(
-                    sl.effective_group_reply_mode().requires_mention(),
-                    sl.group_reply_allowed_sender_ids(),
-                ),
-            ),
-        });
-    }
-
-    if let Some(ref mm) = config.channels_config.mattermost {
-        channels.push(ConfiguredChannel {
-            display_name: "Mattermost",
-            channel: Arc::new(
-                MattermostChannel::new(
-                    mm.url.clone(),
-                    mm.bot_token.clone(),
-                    mm.channel_id.clone(),
-                    mm.allowed_users.clone(),
-                    mm.thread_replies.unwrap_or(true),
-                    mm.effective_group_reply_mode().requires_mention(),
-                )
-                .with_group_reply_allowed_senders(mm.group_reply_allowed_sender_ids()),
-            ),
-        });
-    }
-
-    if let Some(ref im) = config.channels_config.imessage {
-        channels.push(ConfiguredChannel {
-            display_name: "iMessage",
-            channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
-        });
-    }
-
-    #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
-        channels.push(ConfiguredChannel {
-            display_name: "Matrix",
-            channel: Arc::new(
-                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                    mx.homeserver.clone(),
-                    mx.access_token.clone(),
-                    mx.room_id.clone(),
-                    mx.allowed_users.clone(),
-                    mx.user_id.clone(),
-                    mx.device_id.clone(),
-                    config.config_path.parent().map(|path| path.to_path_buf()),
-                )
-                .with_mention_only(mx.mention_only),
-            ),
-        });
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
-        tracing::warn!(
-            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            matrix_skip_context
-        );
-    }
-
-    if let Some(ref sig) = config.channels_config.signal {
-        channels.push(ConfiguredChannel {
-            display_name: "Signal",
-            channel: Arc::new(SignalChannel::new(
-                sig.http_url.clone(),
-                sig.account.clone(),
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-            )),
-        });
-    }
-
-    if let Some(ref wa) = config.channels_config.whatsapp {
-        if wa.is_ambiguous_config() {
-            tracing::warn!(
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
-            );
-        }
-        // Runtime negotiation: detect backend type from config
-        match wa.backend_type() {
-            "cloud" => {
-                // Cloud API mode: requires phone_number_id, access_token, verify_token
-                if wa.is_cloud_config() {
-                    channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppChannel::new(
-                            wa.access_token.clone().unwrap_or_default(),
-                            wa.phone_number_id.clone().unwrap_or_default(),
-                            wa.verify_token.clone().unwrap_or_default(),
-                            wa.allowed_numbers.clone(),
-                        )),
-                    });
-                } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
-                }
-            }
-            "web" => {
-                // Web mode: requires session_path
-                #[cfg(feature = "whatsapp-web")]
-                if wa.is_web_config() {
-                    channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppWebChannel::new(
-                            wa.session_path.clone().unwrap_or_default(),
-                            wa.pair_phone.clone(),
-                            wa.pair_code.clone(),
-                            wa.allowed_numbers.clone(),
-                        )),
-                    });
-                } else {
-                    tracing::warn!("WhatsApp Web configured but session_path not set");
-                }
-                #[cfg(not(feature = "whatsapp-web"))]
-                {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
-                }
-            }
-            _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
-            }
-        }
-    }
-
-    if let Some(ref lq) = config.channels_config.linq {
-        channels.push(ConfiguredChannel {
-            display_name: "Linq",
-            channel: Arc::new(LinqChannel::new(
-                lq.api_token.clone(),
-                lq.from_phone.clone(),
-                lq.allowed_senders.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref wati_cfg) = config.channels_config.wati {
-        channels.push(ConfiguredChannel {
-            display_name: "WATI",
-            channel: Arc::new(WatiChannel::new(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref nc) = config.channels_config.nextcloud_talk {
-        channels.push(ConfiguredChannel {
-            display_name: "Nextcloud Talk",
-            channel: Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
-        });
-    }
-
-    if let Some(ref irc) = config.channels_config.irc {
-        channels.push(ConfiguredChannel {
-            display_name: "IRC",
-            channel: Arc::new(IrcChannel::new(irc::IrcChannelConfig {
-                server: irc.server.clone(),
-                port: irc.port,
-                nickname: irc.nickname.clone(),
-                username: irc.username.clone(),
-                channels: irc.channels.clone(),
-                allowed_users: irc.allowed_users.clone(),
-                server_password: irc.server_password.clone(),
-                nickserv_password: irc.nickserv_password.clone(),
-                sasl_password: irc.sasl_password.clone(),
-                verify_tls: irc.verify_tls.unwrap_or(true),
-            })),
-        });
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels_config.lark {
-        if lk.use_feishu {
-            if config.channels_config.feishu.is_some() {
-                tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                );
-            } else {
-                tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                );
-                channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
-                    channel: Arc::new(LarkChannel::from_config(lk)),
-                });
-            }
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "Lark",
-                channel: Arc::new(LarkChannel::from_lark_config(lk)),
-            });
-        }
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref fs) = config.channels_config.feishu {
-        channels.push(ConfiguredChannel {
-            display_name: "Feishu",
-            channel: Arc::new(LarkChannel::from_feishu_config(fs)),
-        });
-    }
-
-    #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
-        tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
-        );
-    }
-
-    if let Some(ref dt) = config.channels_config.dingtalk {
-        channels.push(ConfiguredChannel {
-            display_name: "DingTalk",
-            channel: Arc::new(DingTalkChannel::new(
-                dt.client_id.clone(),
-                dt.client_secret.clone(),
-                dt.allowed_users.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref qq) = config.channels_config.qq {
-        if qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook {
-            tracing::info!(
-                "QQ channel configured with receive_mode=webhook; websocket listener startup skipped."
-            );
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "QQ",
-                channel: Arc::new(QQChannel::new(
-                    qq.app_id.clone(),
-                    qq.app_secret.clone(),
-                    qq.allowed_users.clone(),
-                )),
-            });
-        }
-    }
-
-    if let Some(ref ct) = config.channels_config.clawdtalk {
-        channels.push(ConfiguredChannel {
-            display_name: "ClawdTalk",
-            channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
-        });
-    }
-
     channels
-}
-
-async fn append_nostr_channel_if_available(
-    config: &Config,
-    channels: &mut Vec<ConfiguredChannel>,
-    startup_context: &str,
-) -> Option<String> {
-    let ns = config.channels_config.nostr.as_ref()?;
-    match NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await {
-        Ok(channel) => {
-            channels.push(ConfiguredChannel {
-                display_name: "Nostr",
-                channel: Arc::new(channel),
-            });
-            None
-        }
-        Err(err) => {
-            let reason = format!("Nostr init failed during {startup_context}: {err}");
-            tracing::warn!("{reason}");
-            Some(reason)
-        }
-    }
 }
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let mut channels = collect_configured_channels(&config, "health check");
-    let mut init_failures = Vec::new();
+    let channels = collect_configured_channels(&config);
 
-    if let Some(reason) =
-        append_nostr_channel_if_available(&config, &mut channels, "health check").await
-    {
-        init_failures.push(reason);
-    }
-
-    if channels.is_empty() && init_failures.is_empty() {
+    if channels.is_empty() {
         println!("No real-time channels configured. Run `zeroclaw onboard` first.");
         return Ok(());
     }
@@ -4511,14 +4147,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     println!();
 
     let mut healthy = 0_u32;
-    let mut unhealthy = u32::try_from(init_failures.len()).unwrap_or(u32::MAX);
+    let mut unhealthy = 0_u32;
     let mut timeout = 0_u32;
-    let has_runtime_channels = !channels.is_empty();
-
-    for failure in &init_failures {
-        println!("  ❌ {:<9} {failure}", "Nostr");
-    }
-
     for configured in channels {
         let result =
             tokio::time::timeout(Duration::from_secs(10), configured.channel.health_check()).await;
@@ -4547,11 +4177,6 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
     }
 
-    if !has_runtime_channels && !init_failures.is_empty() {
-        println!();
-        anyhow::bail!("All configured channels failed during initialization.");
-    }
-
     println!();
     println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
     Ok(())
@@ -4568,7 +4193,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
-        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -4755,32 +4379,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut configured_channels = collect_configured_channels(&config, "runtime startup");
-    let mut init_failures = Vec::new();
-    if let Some(reason) =
-        append_nostr_channel_if_available(&config, &mut configured_channels, "runtime startup")
-            .await
-    {
-        init_failures.push(reason);
-    }
+    let configured_channels = collect_configured_channels(&config);
 
-    if configured_channels.is_empty() && init_failures.is_empty() {
+    if configured_channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
-    }
-
-    if configured_channels.is_empty() && !init_failures.is_empty() {
-        for failure in &init_failures {
-            println!("  ❌ {failure}");
-        }
-        anyhow::bail!("All configured channels failed during initialization.");
-    }
-
-    if !init_failures.is_empty() {
-        for failure in &init_failures {
-            println!("  ⚠️  {failure}");
-        }
-        println!();
     }
 
     let channels: Vec<Arc<dyn Channel>> = configured_channels
@@ -4975,50 +4578,50 @@ mod tests {
     #[test]
     fn parse_runtime_command_allows_approval_commands_on_non_model_channels() {
         assert_eq!(
-            parse_runtime_command("slack", "/approve-request shell"),
+            parse_runtime_command("discord", "/approve-request shell"),
             Some(ChannelRuntimeCommand::RequestToolApproval(
                 "shell".to_string()
             ))
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approve-all-once"),
+            parse_runtime_command("discord", "/approve-all-once"),
             Some(ChannelRuntimeCommand::RequestAllToolsOnce)
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approve-confirm apr-deadbeef"),
+            parse_runtime_command("discord", "/approve-confirm apr-deadbeef"),
             Some(ChannelRuntimeCommand::ConfirmToolApproval(
                 "apr-deadbeef".to_string()
             ))
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approve-allow apr-deadbeef"),
+            parse_runtime_command("discord", "/approve-allow apr-deadbeef"),
             Some(ChannelRuntimeCommand::ApprovePendingRequest(
                 "apr-deadbeef".to_string()
             ))
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approve-deny apr-deadbeef"),
+            parse_runtime_command("discord", "/approve-deny apr-deadbeef"),
             Some(ChannelRuntimeCommand::DenyToolApproval(
                 "apr-deadbeef".to_string()
             ))
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approve-pending"),
+            parse_runtime_command("discord", "/approve-pending"),
             Some(ChannelRuntimeCommand::ListPendingApprovals)
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approve shell"),
+            parse_runtime_command("discord", "/approve shell"),
             Some(ChannelRuntimeCommand::ApproveTool("shell".to_string()))
         );
         assert_eq!(
-            parse_runtime_command("slack", "/unapprove shell"),
+            parse_runtime_command("discord", "/unapprove shell"),
             Some(ChannelRuntimeCommand::UnapproveTool("shell".to_string()))
         );
         assert_eq!(
-            parse_runtime_command("slack", "/approvals"),
+            parse_runtime_command("discord", "/approvals"),
             Some(ChannelRuntimeCommand::ListApprovals)
         );
-        assert_eq!(parse_runtime_command("slack", "/models"), None);
+        assert_eq!(parse_runtime_command("discord", "/models"), None);
     }
 
     #[test]
@@ -9060,12 +8663,12 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "hello".into(),
-            channel: "slack".into(),
+            channel: "discord".into(),
             timestamp: 1,
             thread_ts: None,
         };
 
-        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+        assert_eq!(conversation_memory_key(&msg), "discord_U123_msg_abc123");
     }
 
     #[test]
@@ -9075,7 +8678,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "first".into(),
-            channel: "slack".into(),
+            channel: "discord".into(),
             timestamp: 1,
             thread_ts: None,
         };
@@ -9084,7 +8687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "second".into(),
-            channel: "slack".into(),
+            channel: "discord".into(),
             timestamp: 2,
             thread_ts: None,
         };
@@ -9105,7 +8708,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "I'm Paul".into(),
-            channel: "slack".into(),
+            channel: "discord".into(),
             timestamp: 1,
             thread_ts: None,
         };
@@ -9114,7 +8717,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "I'm 45".into(),
-            channel: "slack".into(),
+            channel: "discord".into(),
             timestamp: 2,
             thread_ts: None,
         };
@@ -9757,28 +9360,6 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert_eq!(state, ChannelHealthState::Timeout);
     }
 
-    #[test]
-    fn collect_configured_channels_includes_mattermost_when_configured() {
-        let mut config = Config::default();
-        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
-            url: "https://mattermost.example.com".to_string(),
-            bot_token: "test-token".to_string(),
-            channel_id: Some("channel-1".to_string()),
-            allowed_users: vec![],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-            group_reply: None,
-        });
-
-        let channels = collect_configured_channels(&config, "test");
-
-        assert!(channels
-            .iter()
-            .any(|entry| entry.display_name == "Mattermost"));
-        assert!(channels
-            .iter()
-            .any(|entry| entry.channel.name() == "mattermost"));
-    }
 
     struct AlwaysFailChannel {
         name: &'static str,

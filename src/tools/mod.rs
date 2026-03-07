@@ -35,12 +35,6 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
-#[cfg(feature = "hardware")]
-pub mod hardware_board_info;
-#[cfg(feature = "hardware")]
-pub mod hardware_memory_map;
-#[cfg(feature = "hardware")]
-pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
@@ -84,12 +78,6 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
-#[cfg(feature = "hardware")]
-pub use hardware_board_info::HardwareBoardInfoTool;
-#[cfg(feature = "hardware")]
-pub use hardware_memory_map::HardwareMemoryMapTool;
-#[cfg(feature = "hardware")]
-pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
@@ -423,9 +411,6 @@ pub fn all_tools_with_runtime(
             secrets_encrypt: root_config.secrets.encrypt,
             reasoning_enabled: root_config.runtime.reasoning_enabled,
             reasoning_level: root_config.effective_provider_reasoning_level(),
-            custom_provider_api_mode: root_config
-                .provider_api
-                .map(|mode| mode.as_compatible_mode()),
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };

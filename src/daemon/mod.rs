@@ -204,7 +204,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 None,
                 None,
                 temp,
-                vec![],
                 false,
             )
             .await
@@ -295,20 +294,6 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
             if config.channels_config.discord.is_none() {
                 anyhow::bail!(
                     "heartbeat.target is set to discord but channels_config.discord is not configured"
-                );
-            }
-        }
-        "slack" => {
-            if config.channels_config.slack.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to slack but channels_config.slack is not configured"
-                );
-            }
-        }
-        "mattermost" => {
-            if config.channels_config.mattermost.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
                 );
             }
         }
@@ -416,45 +401,6 @@ mod tests {
         config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
-            allowed_users: vec!["*".into()],
-        });
-        assert!(has_supervised_channels(&config));
-    }
-
-    #[test]
-    fn detects_mattermost_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
-            url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
-            channel_id: Some("channel-id".into()),
-            allowed_users: vec!["*".into()],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-            group_reply: None,
-        });
-        assert!(has_supervised_channels(&config));
-    }
-
-    #[test]
-    fn detects_qq_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.qq = Some(crate::config::schema::QQConfig {
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            allowed_users: vec!["*".into()],
-            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
-        });
-        assert!(has_supervised_channels(&config));
-    }
-
-    #[test]
-    fn detects_nextcloud_talk_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
-            base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
-            webhook_secret: None,
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
