@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.anthropic",
+    "provider.azure_openai",
     "provider.compatible",
     "provider.copilot",
     "provider.gemini",

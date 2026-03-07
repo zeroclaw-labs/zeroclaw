@@ -10,3 +10,15 @@ default_temperature = 0.7
 port = 42617
 host = "[::]"
 allow_public_bind = true
+
+# Example provider configurations
+# [model_providers]
+# 
+# # Azure OpenAI configuration example
+# [model_providers.azure_openai_example]
+# name = "azure-openai"
+# api_url = "https://your-resource.openai.azure.com"
+# # Set AZURE_OPENAI_API_KEY environment variable for authentication
+# # Model name will be used as the deployment name (e.g. "gpt-5.2-chat", "gpt-4o")
+# 
+# # To use: set default_provider = "azure_openai_example" and default_model = "your-deployment-name" above

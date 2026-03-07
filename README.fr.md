@@ -78,7 +78,7 @@ Utilisez ce tableau pour les avis importants (changements incompatibles, avis de
 - **Léger par défaut :** petit binaire Rust, démarrage rapide, empreinte mémoire faible.
 - **Sécurisé par conception :** appairage, sandboxing strict, listes d'autorisation explicites, portée de workspace.
 - **Entièrement interchangeable :** les systèmes centraux sont des traits (fournisseurs, canaux, outils, mémoire, tunnels).
-- **Aucun verrouillage :** support de fournisseur compatible OpenAI + endpoints personnalisés pluggables.
+- **Aucun verrouillage :** support de fournisseur compatible OpenAI et Azure OpenAI + endpoints personnalisés pluggables.
 
 ## Instantané de Benchmark (ZeroClaw vs OpenClaw, Reproductible)
 

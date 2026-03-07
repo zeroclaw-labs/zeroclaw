@@ -17,6 +17,7 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
+pub mod azure_openai;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
@@ -971,6 +972,12 @@ fn create_provider_with_url_and_options(
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        "azure-openai" | "azure_openai" => {
+            let base_url = api_url.ok_or_else(|| {
+                anyhow::anyhow!("Azure OpenAI requires api_url configuration (e.g., https://your-resource.openai.azure.com)")
+            })?;
+            Ok(Box::new(azure_openai::AzureOpenAiProvider::new(base_url, key)))
+        },
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
@@ -1989,6 +1996,32 @@ mod tests {
     #[test]
     fn factory_openai() {
         assert!(create_provider("openai", Some("provider-test-credential")).is_ok());
+    }
+
+    #[test]
+    fn factory_azure_openai() {
+        // Azure OpenAI requires api_url, should fail without it
+        assert!(create_provider("azure-openai", Some("test-key")).is_err());
+        assert!(create_provider("azure_openai", Some("test-key")).is_err());
+        
+        // Should succeed with base_url
+        assert!(create_provider_with_url(
+            "azure-openai", 
+            Some("test-key"), 
+            Some("https://test.openai.azure.com")
+        ).is_ok());
+        assert!(create_provider_with_url(
+            "azure_openai", 
+            Some("test-key"), 
+            Some("https://test.openai.azure.com")
+        ).is_ok());
+        
+        // Should work without API key (will be checked at runtime)
+        assert!(create_provider_with_url(
+            "azure-openai", 
+            None, 
+            Some("https://test.openai.azure.com")
+        ).is_ok());
     }
 
     #[test]

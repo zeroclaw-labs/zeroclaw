@@ -78,7 +78,7 @@ Use this board for important notices (breaking changes, security advisories, mai
 - **Lean by default:** small Rust binary, fast startup, low memory footprint.
 - **Secure by design:** pairing, strict sandboxing, explicit allowlists, workspace scoping.
 - **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
-- **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
+- **No lock-in:** OpenAI and Azure OpenAI-compatible provider support + pluggable custom endpoints.
 
 ## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
 

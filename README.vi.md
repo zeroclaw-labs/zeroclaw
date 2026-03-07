@@ -78,7 +78,7 @@ Bảng này dành cho các thông báo quan trọng (thay đổi không tương 
 - **Mặc định tinh gọn:** binary Rust nhỏ, khởi động nhanh, tốn ít bộ nhớ.
 - **Bảo mật từ gốc:** xác thực ghép cặp, sandbox nghiêm ngặt, allowlist rõ ràng, giới hạn workspace.
 - **Hoán đổi tự do:** mọi hệ thống cốt lõi đều là trait (provider, channel, tool, memory, tunnel).
-- **Không khoá vendor:** hỗ trợ provider tương thích OpenAI + endpoint tùy chỉnh dễ dàng mở rộng.
+- **Không khoá vendor:** hỗ trợ provider tương thích OpenAI và Azure OpenAI + endpoint tùy chỉnh dễ dàng mở rộng.
 
 ## So sánh hiệu suất (ZeroClaw vs OpenClaw, có thể tái tạo)
 

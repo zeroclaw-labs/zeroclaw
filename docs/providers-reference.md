@@ -29,6 +29,7 @@ credential is not reused for fallback providers.
 | `openrouter` | — | No | `OPENROUTER_API_KEY` |
 | `anthropic` | — | No | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
 | `openai` | — | No | `OPENAI_API_KEY` |
+| `azure-openai` | `azure_openai` | No | `AZURE_OPENAI_API_KEY` |
 | `ollama` | — | Yes | `OLLAMA_API_KEY` (optional) |
 | `gemini` | `google`, `google-gemini` | No | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
 | `venice` | — | No | `VENICE_API_KEY` |
@@ -69,6 +70,36 @@ credential is not reused for fallback providers.
 - Authentication: `VERCEL_API_KEY`
 - Vercel AI Gateway usage does not require a project deployment.
 - If you see `DEPLOYMENT_NOT_FOUND`, verify the provider is targeting the gateway endpoint above instead of `https://api.vercel.ai`.
+
+### Azure OpenAI Notes
+
+- Provider ID: `azure-openai` (alias: `azure_openai`)
+- Requires configuration of api_url; model name represents the deployment name
+- Authentication: `AZURE_OPENAI_API_KEY` environment variable
+- Uses Azure OpenAI API endpoint format: `{api_url}/openai/deployments/{model}/chat/completions`
+- Uses `api-key` header instead of `Authorization: Bearer` for authentication
+- Request format uses `max_completion_tokens` instead of `max_tokens`
+- API version: `2024-02-15-preview`
+- Supports native tool calling
+- **Important**: The `model` parameter represents the Azure deployment name (e.g., "gpt-5.2-chat", "gpt-4o")
+
+Configuration example:
+
+```toml
+[model_providers.my_azure_openai]
+name = "azure-openai"
+api_url = "https://your-resource.openai.azure.com"
+
+# Then set your provider and model (deployment name):
+default_provider = "my_azure_openai"
+default_model = "gpt-5.2-chat"  # This is your Azure deployment name
+```
+
+Environment variables:
+
+```bash
+export AZURE_OPENAI_API_KEY="your-api-key"
+```
 
 ### Gemini Notes
 
