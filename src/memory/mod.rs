@@ -1,6 +1,10 @@
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_backend;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_config_resolver;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
@@ -26,6 +30,8 @@ pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
+#[cfg(feature = "memory-cortex")]
+pub use cortex_backend::CortexMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
