@@ -7,6 +7,10 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+/// MIME types supported by the Anthropic Messages API for image content blocks.
+const ANTHROPIC_SUPPORTED_IMAGE_TYPES: &[&str] =
+    &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
@@ -85,7 +89,11 @@ enum NativeContentOut {
     },
     /// Anthropic-native base64 image content block.
     #[serde(rename = "image")]
-    Image { source: NativeImageSource },
+    Image {
+        source: NativeImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 }
 
 /// Source payload for an Anthropic image content block.
@@ -219,10 +227,11 @@ impl AnthropicProvider {
             if let Some(last_content) = last_msg.content.last_mut() {
                 match last_content {
                     NativeContentOut::Text { cache_control, .. }
-                    | NativeContentOut::ToolResult { cache_control, .. } => {
+                    | NativeContentOut::ToolResult { cache_control, .. }
+                    | NativeContentOut::Image { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
+                    NativeContentOut::ToolUse { .. } => {}
                 }
             }
         }
@@ -394,14 +403,18 @@ impl AnthropicProvider {
                     if let Some(semi) = rest.find(';') {
                         let mime = &rest[..semi];
                         if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
-                            blocks.push(NativeContentOut::Image {
-                                source: NativeImageSource {
-                                    source_type: "base64".to_string(),
-                                    media_type: mime.to_string(),
-                                    data: b64.to_string(),
-                                },
-                            });
-                            continue;
+                            if ANTHROPIC_SUPPORTED_IMAGE_TYPES.contains(&mime) {
+                                blocks.push(NativeContentOut::Image {
+                                    source: NativeImageSource {
+                                        source_type: "base64".to_string(),
+                                        media_type: mime.to_string(),
+                                        data: b64.to_string(),
+                                    },
+                                    cache_control: None,
+                                });
+                                continue;
+                            }
+                            // Unsupported MIME type: fall through to text reference
                         }
                     }
                 }
@@ -1495,7 +1508,7 @@ mod tests {
         }
 
         match &blocks[1] {
-            NativeContentOut::Image { source } => {
+            NativeContentOut::Image { source, .. } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type, "image/png");
                 assert_eq!(source.data, "abcd");
@@ -1511,7 +1524,7 @@ mod tests {
         assert_eq!(blocks.len(), 2);
 
         match &blocks[0] {
-            NativeContentOut::Image { source } => {
+            NativeContentOut::Image { source, .. } => {
                 assert_eq!(source.media_type, "image/jpeg");
                 assert_eq!(source.data, "img1");
             }
@@ -1519,7 +1532,7 @@ mod tests {
         }
 
         match &blocks[1] {
-            NativeContentOut::Image { source } => {
+            NativeContentOut::Image { source, .. } => {
                 assert_eq!(source.media_type, "image/webp");
                 assert_eq!(source.data, "img2");
             }
@@ -1535,6 +1548,7 @@ mod tests {
                 media_type: "image/jpeg".to_string(),
                 data: "abc123".to_string(),
             },
+            cache_control: None,
         };
         let json = serde_json::to_string(&content).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1564,7 +1578,7 @@ mod tests {
         }
 
         match &native_msgs[0].content[1] {
-            NativeContentOut::Image { source } => {
+            NativeContentOut::Image { source, .. } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type, "image/png");
                 assert_eq!(source.data, "iVBOR");
@@ -1587,7 +1601,7 @@ mod tests {
         }
 
         match &blocks[1] {
-            NativeContentOut::Image { source } => {
+            NativeContentOut::Image { source, .. } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type, "image/png");
                 assert_eq!(source.data, "abcd");
@@ -1600,6 +1614,47 @@ mod tests {
                 assert_eq!(text, " after");
             }
             _ => panic!("Expected Text variant for third block"),
+        }
+    }
+
+    #[test]
+    fn parse_user_content_blocks_rejects_unsupported_mime() {
+        let content = "[IMAGE:data:image/tiff;base64,abcd]";
+        let blocks = AnthropicProvider::parse_user_content_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            NativeContentOut::Text { text, .. } => {
+                assert!(
+                    text.contains("[image:"),
+                    "unsupported MIME should fall back to text: {text}"
+                );
+            }
+            _ => panic!("Expected Text fallback for unsupported MIME type"),
+        }
+    }
+
+    #[test]
+    fn apply_cache_to_last_message_image() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Image {
+                source: NativeImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "abcd".to_string(),
+                },
+                cache_control: None,
+            }],
+        }];
+        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        match &messages[0].content[0] {
+            NativeContentOut::Image { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "image block should have cache_control set"
+                );
+            }
+            _ => panic!("Expected Image variant"),
         }
     }
 }
