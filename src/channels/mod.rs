@@ -27,6 +27,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod mqtt_channel;
 pub mod nextcloud_talk;
 pub mod nostr;
 pub mod qq;
@@ -55,6 +56,7 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use mqtt_channel::MqttChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use qq::QQChannel;
@@ -2961,6 +2963,17 @@ fn collect_configured_channels(
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
         });
+    }
+
+    if let Some(ref mqtt) = config.channels_config.mqtt {
+        if let Err(e) = mqtt.validate() {
+            tracing::error!("MQTT channel config invalid: {e}");
+        } else {
+            channels.push(ConfiguredChannel {
+                display_name: "MQTT",
+                channel: Arc::new(MqttChannel::new(mqtt.clone())),
+            });
+        }
     }
 
     channels

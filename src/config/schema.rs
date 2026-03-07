@@ -2587,6 +2587,8 @@ pub struct ChannelsConfig {
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     pub nostr: Option<NostrConfig>,
+    /// MQTT pub/sub channel configuration.
+    pub mqtt: Option<MqttChannelConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
@@ -2676,6 +2678,10 @@ impl ChannelsConfig {
                 self.nostr.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(&self.mqtt)),
+                self.mqtt.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(&self.clawdtalk)),
                 self.clawdtalk.is_some(),
             ),
@@ -2719,6 +2725,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             nostr: None,
+            mqtt: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
@@ -3578,6 +3585,161 @@ pub fn default_nostr_relays() -> Vec<String> {
         "wss://relay.snort.social".to_string(),
     ]
 }
+
+/// MQTT channel configuration for pub/sub messaging.
+///
+/// MQTT is a lightweight publish/subscribe protocol ideal for IoT devices,
+/// sensors, and low-bandwidth environments. This channel connects to an
+/// MQTT broker and subscribes to configured topics.
+///
+/// # Example
+///
+/// ```toml
+/// [channels_config.mqtt]
+/// broker_url = "mqtt://broker.example.com:1883"
+/// client_id = "zeroclaw_agent"
+/// topics = ["sensors/#", "commands/zeroclaw/#"]
+/// qos = 1
+/// username = "zeroclaw_user"
+/// password = "secret"
+/// use_tls = false
+/// keep_alive_secs = 30
+/// response_topic = "responses/zeroclaw/{{sender}}"
+/// allowed_senders = ["*"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MqttChannelConfig {
+    /// MQTT broker URL (mqtt://host:port or mqtts://host:port for TLS)
+    pub broker_url: String,
+    /// Unique client identifier for this connection
+    pub client_id: String,
+    /// Topics to subscribe to (supports MQTT wildcards: + and #)
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Quality of Service level (0=at most once, 1=at least once, 2=exactly once)
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Username for broker authentication (optional)
+    pub username: Option<String>,
+    /// Password for broker authentication (optional)
+    pub password: Option<String>,
+    /// Enable TLS (must be true for mqtts:// URLs, false for mqtt://)
+    #[serde(default)]
+    pub use_tls: bool,
+    /// Keep-alive interval in seconds
+    #[serde(default = "default_mqtt_keep_alive")]
+    pub keep_alive_secs: u64,
+    /// Topic template for responses (supports {{sender}} placeholder)
+    /// If not set, responses are sent to the incoming message's reply topic
+    #[serde(default)]
+    pub response_topic: Option<String>,
+    /// Allowed sender patterns (client IDs). Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+}
+
+fn default_mqtt_qos() -> u8 {
+    1
+}
+
+fn default_mqtt_keep_alive() -> u64 {
+    30
+}
+
+impl MqttChannelConfig {
+    /// Validate the MQTT configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.broker_url.starts_with("mqtt://") && !self.broker_url.starts_with("mqtts://") {
+            anyhow::bail!("broker_url must start with mqtt:// or mqtts://");
+        }
+        if self.client_id.is_empty() {
+            anyhow::bail!("client_id must not be empty");
+        }
+        if self.topics.is_empty() {
+            anyhow::bail!("at least one topic is required");
+        }
+        if self.qos > 2 {
+            anyhow::bail!("qos must be 0, 1, or 2");
+        }
+        // TLS consistency check
+        let is_tls_url = self.broker_url.starts_with("mqtts://");
+        if is_tls_url && !self.use_tls {
+            anyhow::bail!("mqtts:// URL requires use_tls = true");
+        }
+        if !is_tls_url && self.use_tls {
+            anyhow::bail!("use_tls is true but broker_url uses mqtt:// (non-TLS) scheme");
+        }
+        Ok(())
+    }
+}
+
+impl ChannelConfig for MqttChannelConfig {
+    fn name() -> &'static str {
+        "MQTT"
+    }
+    fn desc() -> &'static str {
+        "MQTT pub/sub channel"
+    }
+}
+
+/// MQTT SOP listener configuration for triggering automated procedures.
+///
+/// This is used by the SOP engine to listen for MQTT messages that trigger
+/// automated workflows. Unlike `MqttChannelConfig` which is for interactive chat,
+/// this configuration is for headless automation triggers.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MqttSopConfig {
+    /// MQTT broker URL (mqtt://host:port or mqtts://host:port for TLS)
+    pub broker_url: String,
+    /// Unique client identifier for this connection
+    pub client_id: String,
+    /// Topics to subscribe to (supports MQTT wildcards: + and #)
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Quality of Service level (0=at most once, 1=at least once, 2=exactly once)
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Username for broker authentication (optional)
+    pub username: Option<String>,
+    /// Password for broker authentication (optional)
+    pub password: Option<String>,
+    /// Enable TLS (must be true for mqtts:// URLs, false for mqtt://)
+    #[serde(default)]
+    pub use_tls: bool,
+    /// Keep-alive interval in seconds
+    #[serde(default = "default_mqtt_keep_alive")]
+    pub keep_alive_secs: u64,
+}
+
+impl MqttSopConfig {
+    /// Validate the MQTT SOP configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.broker_url.starts_with("mqtt://") && !self.broker_url.starts_with("mqtts://") {
+            anyhow::bail!("broker_url must start with mqtt:// or mqtts://");
+        }
+        if self.client_id.is_empty() {
+            anyhow::bail!("client_id must not be empty");
+        }
+        if self.topics.is_empty() {
+            anyhow::bail!("at least one topic is required");
+        }
+        if self.qos > 2 {
+            anyhow::bail!("qos must be 0, 1, or 2");
+        }
+        // TLS consistency check
+        let is_tls_url = self.broker_url.starts_with("mqtts://");
+        if is_tls_url && !self.use_tls {
+            anyhow::bail!("mqtts:// URL requires use_tls = true");
+        }
+        if !is_tls_url && self.use_tls {
+            anyhow::bail!("use_tls is true but broker_url uses mqtt:// (non-TLS) scheme");
+        }
+        Ok(())
+    }
+}
+
+// Re-export for backward compatibility with mqtt.rs SOP listener
+pub type MqttConfig = MqttSopConfig;
 
 // ── Config impl ──────────────────────────────────────────────────
 
@@ -5138,6 +5300,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 nostr: None,
+                mqtt: None,
                 clawdtalk: None,
                 message_timeout_secs: 300,
             },
@@ -5702,6 +5865,7 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             qq: None,
             nostr: None,
+            mqtt: None,
             clawdtalk: None,
             message_timeout_secs: 300,
         };
@@ -5916,6 +6080,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             nostr: None,
+            mqtt: None,
             clawdtalk: None,
             message_timeout_secs: 300,
         };
