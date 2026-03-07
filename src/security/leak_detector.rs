@@ -132,7 +132,7 @@ impl LeakDetector {
 
         for (regex, name) in regexes {
             if regex.is_match(content) {
-                patterns.push(name.to_string());
+                patterns.push((*name).to_string());
                 *redacted = regex
                     .replace_all(redacted, "[REDACTED_API_KEY]")
                     .to_string();
@@ -166,7 +166,7 @@ impl LeakDetector {
 
         for (regex, name) in regexes {
             if regex.is_match(content) {
-                patterns.push(name.to_string());
+                patterns.push((*name).to_string());
                 *redacted = regex
                     .replace_all(redacted, "[REDACTED_AWS_CREDENTIAL]")
                     .to_string();
@@ -201,7 +201,7 @@ impl LeakDetector {
 
         for (regex, name) in regexes {
             if regex.is_match(content) && self.sensitivity > GENERIC_SECRET_SENSITIVITY_THRESHOLD {
-                patterns.push(name.to_string());
+                patterns.push((*name).to_string());
                 *redacted = regex.replace_all(redacted, "[REDACTED_SECRET]").to_string();
             }
         }
@@ -235,7 +235,7 @@ impl LeakDetector {
 
         for (begin, end, name) in key_patterns {
             if content.contains(begin) && content.contains(end) {
-                patterns.push(name.to_string());
+                patterns.push((*name).to_string());
                 // Redact the entire key block
                 if let Some(start_idx) = content.find(begin) {
                     if let Some(end_idx) = content.find(end) {
@@ -292,7 +292,7 @@ impl LeakDetector {
 
         for (regex, name) in regexes {
             if regex.is_match(content) {
-                patterns.push(name.to_string());
+                patterns.push((*name).to_string());
                 *redacted = regex
                     .replace_all(redacted, "[REDACTED_DATABASE_URL]")
                     .to_string();

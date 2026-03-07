@@ -180,7 +180,7 @@ impl Completer for SlashCommandCompleter {
                     .unwrap_or(&triggers[0]);
                 Pair {
                     display: format!("  {:<14}{desc:<64}", label),
-                    replacement: replacement.to_string(),
+                    replacement: (*replacement).to_string(),
                 }
             })
             .collect();

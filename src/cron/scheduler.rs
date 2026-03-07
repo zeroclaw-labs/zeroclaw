@@ -747,7 +747,6 @@ mod tests {
         let _env_hook = EnvGuard::set("ENV", &missing_hook);
         let _bash_env_hook = EnvGuard::set("BASH_ENV", &missing_hook);
 
-
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 

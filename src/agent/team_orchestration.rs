@@ -1771,8 +1771,8 @@ mod tests {
     ) -> TaskNodeSpec {
         TaskNodeSpec {
             id: id.to_string(),
-            depends_on: depends_on.iter().map(|x| x.to_string()).collect(),
-            ownership_keys: ownership.iter().map(|x| x.to_string()).collect(),
+            depends_on: depends_on.iter().map(|x| (*x).to_string()).collect(),
+            ownership_keys: ownership.iter().map(|x| (*x).to_string()).collect(),
             estimated_execution_tokens: exec_tokens,
             estimated_coordination_tokens: coord_tokens,
         }

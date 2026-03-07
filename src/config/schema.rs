@@ -8822,9 +8822,9 @@ impl Config {
         for left_index in 0..custom_auth_headers_by_base_url.len() {
             let (left_profile, left_url, left_header) =
                 &custom_auth_headers_by_base_url[left_index];
-            for right_index in (left_index + 1)..custom_auth_headers_by_base_url.len() {
-                let (right_profile, right_url, right_header) =
-                    &custom_auth_headers_by_base_url[right_index];
+            for (right_profile, right_url, right_header) in
+                custom_auth_headers_by_base_url.iter().skip(left_index + 1)
+            {
                 if Self::urls_match_ignoring_trailing_slash(left_url, right_url)
                     && !left_header.eq_ignore_ascii_case(right_header)
                 {
