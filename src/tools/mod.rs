@@ -439,6 +439,7 @@ pub fn all_tools_with_runtime(
             custom_provider_api_mode: root_config
                 .provider_api
                 .map(|mode| mode.as_compatible_mode()),
+            compatible_timeout_secs: Some(root_config.effective_provider_compatible_timeout_secs()),
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };
@@ -651,6 +652,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         });
 
         let tools = all_tools(

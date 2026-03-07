@@ -234,6 +234,22 @@ Behavior:
 - Legacy compatibility: `runtime.reasoning_level` is accepted but deprecated; prefer `provider.reasoning_level`.
 - If both `provider.reasoning_level` and `runtime.reasoning_level` are set, provider-level value wins.
 
+### OpenAI-Compatible Request Timeout
+
+Local/self-hosted OpenAI-compatible models can take longer to produce first tokens.
+You can raise timeout for all OpenAI-compatible providers:
+
+```toml
+[provider]
+compatible_timeout_secs = 300
+```
+
+Behavior:
+
+- Effective default is `120` seconds when unset.
+- Value must be greater than `0`.
+- Applies to `OpenAiCompatibleProvider`-backed providers (including `custom:<url>`).
+
 ### Kimi Code Notes
 
 - Provider ID: `kimi-code`

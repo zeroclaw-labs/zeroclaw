@@ -22,6 +22,13 @@
 
 - `max_tool_iterations`: Πόσες φορές μπορεί η AI να χρησιμοποιήσει εργαλεία για να απαντήσει σε 1 μήνυμα (προεπιλογή: 10).
 - `max_history_messages`: Πόσα προηγούμενα μηνύματα θυμάται η AI στη συνομιλία (προεπιλογή: 50).
+- `allow_repeated_tool_calls`: Επιτρέπει επαναλαμβανόμενες ίδιες κλήσεις εργαλείων (ίδιο όνομα + args) στο ίδιο turn. Προεπιλογή: `false`.
+  Χρησιμοποιήστε `true` όταν αναμένεται polling αναμονής, π.χ. `process.output()` μετά από `process.spawn()`.
+
+## 1.1 Πάροχος (Provider)
+
+- `provider.compatible_timeout_secs`: Timeout request (σε δευτερόλεπτα) για OpenAI-compatible providers.
+  Προεπιλεγμένη ενεργή τιμή: `120`. Η τιμή `0` απορρίπτεται.
 
 ## 2. Αυτονομία και Ασφάλεια (Autonomy)
 

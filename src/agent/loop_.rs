@@ -17,6 +17,7 @@ use regex::{Regex, RegexSet};
 use rustyline::error::ReadlineError;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
+use std::future::Future;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -122,6 +123,7 @@ pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
+    static ALLOW_REPEATED_TOOL_CALLS: bool;
 }
 
 const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "mattermost"];
@@ -720,6 +722,13 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
         .await
 }
 
+pub(crate) async fn scope_allow_repeated_tool_calls<F>(allow: bool, future: F) -> F::Output
+where
+    F: Future,
+{
+    ALLOW_REPEATED_TOOL_CALLS.scope(allow, future).await
+}
+
 /// Run the tool loop with optional non-CLI approval context scoped to this task.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
@@ -740,6 +749,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    allow_repeated_tool_calls: bool,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
@@ -750,23 +760,26 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
             non_cli_approval_context,
             TOOL_LOOP_REPLY_TARGET.scope(
                 reply_target,
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+                scope_allow_repeated_tool_calls(
+                    allow_repeated_tool_calls,
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -834,6 +847,9 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let allow_repeated_tool_calls = ALLOW_REPEATED_TOOL_CALLS
+        .try_with(|allow| *allow)
+        .unwrap_or(false);
     let mut missing_tool_call_retry_used = false;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
     let bypass_non_cli_approval_for_turn =
@@ -1465,7 +1481,7 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             let signature = tool_call_signature(&tool_name, &tool_args);
-            if !seen_tool_signatures.insert(signature) {
+            if !allow_repeated_tool_calls && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -1887,6 +1903,7 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        compatible_timeout_secs: Some(config.effective_provider_compatible_timeout_secs()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -2109,23 +2126,26 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            approval_manager.as_ref(),
-            channel_name,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            None,
-            None,
-            &[],
+        let response = scope_allow_repeated_tool_calls(
+            config.agent.allow_repeated_tool_calls,
+            run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                model_name,
+                temperature,
+                false,
+                approval_manager.as_ref(),
+                channel_name,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                None,
+                None,
+                None,
+                &[],
+            ),
         )
         .await?;
         final_output = response.clone();
@@ -2229,23 +2249,26 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &[],
+            let response = match scope_allow_repeated_tool_calls(
+                config.agent.allow_repeated_tool_calls,
+                run_tool_call_loop(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    provider_name,
+                    model_name,
+                    temperature,
+                    false,
+                    approval_manager.as_ref(),
+                    channel_name,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
             )
             .await
             {
@@ -2365,6 +2388,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        compatible_timeout_secs: Some(config.effective_provider_compatible_timeout_secs()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -2488,17 +2512,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
+    scope_allow_repeated_tool_calls(
+        config.agent.allow_repeated_tool_calls,
+        agent_turn(
+            provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            provider_name,
+            &model_name,
+            config.default_temperature,
+            true,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+        ),
     )
     .await
 }
@@ -3478,6 +3505,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .await
         .expect("tool loop should continue after non-cli approval");

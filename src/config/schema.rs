@@ -300,6 +300,11 @@ pub struct ProviderConfig {
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]
     pub reasoning_level: Option<String>,
+    /// Request timeout in seconds for OpenAI-compatible providers.
+    /// Applies to providers backed by `OpenAiCompatibleProvider`.
+    /// Default fallback when unset: `120`.
+    #[serde(default)]
+    pub compatible_timeout_secs: Option<u64>,
 }
 
 /// Multi-workspace registry configuration (`[workspaces]`).
@@ -690,6 +695,12 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Allow reusing the exact same tool call signature (name + identical args)
+    /// within the same turn.
+    ///
+    /// Default: `false` (duplicate calls are skipped to prevent runaway loops).
+    #[serde(default)]
+    pub allow_repeated_tool_calls: bool,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -704,6 +715,10 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_provider_compatible_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -712,6 +727,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            allow_repeated_tool_calls: false,
         }
     }
 }
@@ -5991,6 +6007,13 @@ impl Config {
         }
     }
 
+    /// Resolve timeout for OpenAI-compatible provider HTTP requests.
+    pub fn effective_provider_compatible_timeout_secs(&self) -> u64 {
+        self.provider
+            .compatible_timeout_secs
+            .unwrap_or_else(default_provider_compatible_timeout_secs)
+    }
+
     fn lookup_model_provider_profile(
         &self,
         provider_name: &str,
@@ -6262,6 +6285,9 @@ impl Config {
             anyhow::bail!(
                 "provider_api is only valid when default_provider uses the custom:<url> format"
             );
+        }
+        if self.provider.compatible_timeout_secs == Some(0) {
+            anyhow::bail!("provider.compatible_timeout_secs must be greater than 0");
         }
 
         // Embedding routes
@@ -7612,6 +7638,22 @@ reasoning_level = "high"
     }
 
     #[test]
+    async fn provider_compatible_timeout_defaults_and_deserializes() {
+        let defaults = Config::default();
+        assert_eq!(defaults.effective_provider_compatible_timeout_secs(), 120);
+        assert_eq!(defaults.provider.compatible_timeout_secs, None);
+
+        let raw = r#"
+default_temperature = 0.7
+[provider]
+compatible_timeout_secs = 1200
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.provider.compatible_timeout_secs, Some(1200));
+        assert_eq!(parsed.effective_provider_compatible_timeout_secs(), 1200);
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -7619,6 +7661,7 @@ reasoning_level = "high"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(!cfg.allow_repeated_tool_calls);
     }
 
     #[test]
@@ -7631,6 +7674,7 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+allow_repeated_tool_calls = true
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -7638,6 +7682,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        assert!(parsed.agent.allow_repeated_tool_calls);
     }
 
     #[tokio::test]
@@ -9217,6 +9262,18 @@ provider_api = "not-a-real-mode"
             parsed.is_err(),
             "invalid provider_api should fail to deserialize"
         );
+    }
+
+    #[test]
+    async fn provider_compatible_timeout_zero_is_rejected() {
+        let mut config = Config::default();
+        config.provider.compatible_timeout_secs = Some(0);
+        let err = config
+            .validate()
+            .expect_err("provider.compatible_timeout_secs should reject zero");
+        assert!(err
+            .to_string()
+            .contains("provider.compatible_timeout_secs must be greater than 0"));
     }
 
     #[test]

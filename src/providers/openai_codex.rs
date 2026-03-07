@@ -116,7 +116,6 @@ impl OpenAiCodexProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
-
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -1084,6 +1083,7 @@ data: [DONE]
             reasoning_enabled: None,
             reasoning_level: None,
             custom_provider_api_mode: None,
+            compatible_timeout_secs: None,
             max_tokens_override: None,
             model_support_vision: None,
         };

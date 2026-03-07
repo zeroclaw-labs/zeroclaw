@@ -51,6 +51,7 @@ pub struct OpenAiCompatibleProvider {
     api_mode: CompatibleApiMode,
     /// Optional max token cap propagated to outbound requests.
     max_tokens_override: Option<u32>,
+    request_timeout_secs: u64,
 }
 
 /// How the provider expects the API key to be sent.
@@ -254,6 +255,13 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             api_mode,
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            request_timeout_secs: 120,
+        }
+    }
+
+    pub(crate) fn set_request_timeout_secs(&mut self, timeout_secs: Option<u64>) {
+        if let Some(timeout_secs) = timeout_secs.filter(|value| *value > 0) {
+            self.request_timeout_secs = timeout_secs;
         }
     }
 
@@ -296,7 +304,7 @@ impl OpenAiCompatibleProvider {
             }
 
             let builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
             let builder =
@@ -308,7 +316,11 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.compatible", 120, 10)
+        crate::config::build_runtime_proxy_client_with_timeouts(
+            "provider.compatible",
+            self.request_timeout_secs,
+            10,
+        )
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.

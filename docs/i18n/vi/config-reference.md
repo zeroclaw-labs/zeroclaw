@@ -78,6 +78,7 @@ Lưu ý cho người dùng container:
 | `max_history_messages` | `50` | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên |
 | `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
 | `tool_dispatcher` | `auto` | Chiến lược dispatch tool |
+| `allow_repeated_tool_calls` | `false` | Cho phép chạy lặp lại lời gọi tool trùng chữ ký (cùng tên + args) trong cùng một lượt |
 
 Lưu ý:
 
@@ -85,6 +86,7 @@ Lưu ý:
 - Nếu tin nhắn kênh vượt giá trị này, runtime trả về: `Agent exceeded maximum tool iterations (<value>)`.
 - Trong vòng lặp tool của CLI, gateway và channel, các lời gọi tool độc lập được thực thi đồng thời mặc định khi không cần phê duyệt; thứ tự kết quả giữ ổn định.
 - `parallel_tools` áp dụng cho API `Agent::turn()`. Không ảnh hưởng đến vòng lặp runtime của CLI, gateway hay channel.
+- Nên giữ `allow_repeated_tool_calls = false` để an toàn vòng lặp. Bật `true` khi có luồng chờ kết quả, ví dụ gọi lặp `process.output()` sau `process.spawn()`.
 
 ## `[agents.<name>]`
 
@@ -141,12 +143,14 @@ Lưu ý:
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
 | `reasoning_level` | chưa đặt (`None`) | Ghi đè mức reasoning cho provider hỗ trợ mức (hiện tại OpenAI Codex `/responses`) |
+| `compatible_timeout_secs` | chưa đặt (`None`, hiệu lực `120`) | Timeout request (giây) cho provider tương thích OpenAI |
 
 Lưu ý:
 
 - Giá trị hỗ trợ: `minimal`, `low`, `medium`, `high`, `xhigh` (không phân biệt hoa/thường).
 - Khi đặt, ghi đè `ZEROCLAW_CODEX_REASONING_EFFORT` cho OpenAI Codex.
 - Để trống sẽ dùng `ZEROCLAW_CODEX_REASONING_EFFORT` nếu có, nếu không mặc định `xhigh`.
+- `provider.compatible_timeout_secs` phải lớn hơn `0`.
 
 ## `[skills]`
 

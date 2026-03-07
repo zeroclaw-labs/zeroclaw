@@ -94,6 +94,7 @@ Operational note for container users:
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
+| `allow_repeated_tool_calls` | `false` | Allow identical tool call signatures (same name + args) to run repeatedly in one turn |
 
 Notes:
 
@@ -101,6 +102,7 @@ Notes:
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+- Keep `allow_repeated_tool_calls = false` for strict loop safety. Set it to `true` when waiting workflows are expected, such as repeated `process.output()` polling after `process.spawn()`.
 
 ## `[security.otp]`
 
@@ -327,6 +329,7 @@ WASM profile templates:
 | Key | Default | Purpose |
 |---|---|---|
 | `reasoning_level` | unset (`None`) | Reasoning effort/level override for providers that support explicit levels (currently OpenAI Codex `/responses`) |
+| `compatible_timeout_secs` | unset (`None`, effective `120`) | Request timeout (seconds) for OpenAI-compatible providers |
 
 Notes:
 
@@ -334,6 +337,7 @@ Notes:
 - When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT` for OpenAI Codex requests.
 - Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
 - If both `provider.reasoning_level` and deprecated `runtime.reasoning_level` are set, provider-level value wins.
+- `provider.compatible_timeout_secs` must be greater than `0`.
 
 ## `[skills]`
 

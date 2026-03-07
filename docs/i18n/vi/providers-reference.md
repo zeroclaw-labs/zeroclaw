@@ -128,6 +128,22 @@ Hành vi:
 - Khi đặt, ghi đè `ZEROCLAW_CODEX_REASONING_EFFORT`.
 - Không đặt sẽ dùng `ZEROCLAW_CODEX_REASONING_EFFORT` nếu có, nếu không mặc định `xhigh`.
 
+### Timeout cho provider tương thích OpenAI
+
+Model cục bộ/tự host kiểu OpenAI-compatible có thể phản hồi chậm hơn ở lượt đầu.
+Bạn có thể tăng timeout cho toàn bộ provider tương thích OpenAI:
+
+```toml
+[provider]
+compatible_timeout_secs = 300
+```
+
+Hành vi:
+
+- Mặc định hiệu lực là `120` giây khi không đặt.
+- Giá trị phải lớn hơn `0`.
+- Áp dụng cho các provider dùng `OpenAiCompatibleProvider` (bao gồm `custom:<url>`).
+
 ### Ghi chú về Kimi Code
 
 - Provider ID: `kimi-code`
