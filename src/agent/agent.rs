@@ -283,7 +283,7 @@ impl Agent {
         ));
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
-            &config.memory,
+            &config,
             &config.embedding_routes,
             Some(&config.storage.provider.config),
             &config.workspace_dir,

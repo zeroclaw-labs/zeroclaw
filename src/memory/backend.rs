@@ -4,6 +4,7 @@ pub enum MemoryBackendKind {
     SqliteQdrantHybrid,
     Lucid,
     CortexMem,
+    Cortex,
     Postgres,
     Qdrant,
     Markdown,
@@ -46,6 +47,15 @@ const CORTEX_MEM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     auto_save_default: true,
     uses_sqlite_hygiene: true,
     sqlite_based: true,
+    optional_dependency: true,
+};
+
+const CORTEX_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "cortex",
+    label: "Cortex-Memory — advanced L0/L1/L2 layered memory with semantic search via [memory.cortex]",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
     optional_dependency: true,
 };
 
@@ -125,7 +135,8 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "sqlite" => MemoryBackendKind::Sqlite,
         "sqlite_qdrant_hybrid" | "hybrid" => MemoryBackendKind::SqliteQdrantHybrid,
         "lucid" => MemoryBackendKind::Lucid,
-        "cortex-mem" | "cortex_mem" | "cortexmem" | "cortex" => MemoryBackendKind::CortexMem,
+        "cortex-mem" | "cortex_mem" | "cortexmem" => MemoryBackendKind::CortexMem,
+        "cortex" => MemoryBackendKind::Cortex,
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
@@ -140,6 +151,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::SqliteQdrantHybrid => SQLITE_QDRANT_HYBRID_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::CortexMem => CORTEX_MEM_PROFILE,
+        MemoryBackendKind::Cortex => CORTEX_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,

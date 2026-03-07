@@ -2,6 +2,9 @@ pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
+pub mod cortex_backend;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_config_resolver;
 pub mod decay;
 pub mod embeddings;
 pub mod hybrid;
@@ -25,6 +28,8 @@ pub use backend::{
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
 pub use cortex::CortexMemMemory;
+#[cfg(feature = "memory-cortex")]
+pub use cortex_backend::CortexMemory;
 pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
@@ -65,6 +70,9 @@ where
         MemoryBackendKind::CortexMem => {
             let local = sqlite_builder()?;
             Ok(Box::new(CortexMemMemory::new(workspace_dir, local)))
+        }
+        MemoryBackendKind::Cortex => {
+            anyhow::bail!("memory backend 'cortex' requires full config context, use create_memory_with_storage_and_routes instead")
         }
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
@@ -187,7 +195,12 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key)
+    // Create minimal Config for compatibility
+    let mut full_config = crate::config::Config::default();
+    full_config.memory = config.clone();
+    full_config.workspace_dir = workspace_dir.to_path_buf();
+    full_config.api_key = api_key.map(str::to_string);
+    create_memory_with_storage_and_routes(&full_config, &[], None, workspace_dir, api_key)
 }
 
 /// Factory: create memory with optional storage-provider override.
@@ -197,29 +210,38 @@ pub fn create_memory_with_storage(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+    // Create minimal Config for compatibility
+    let mut full_config = crate::config::Config::default();
+    full_config.memory = config.clone();
+    full_config.workspace_dir = workspace_dir.to_path_buf();
+    full_config.api_key = api_key.map(str::to_string);
+    if let Some(sp) = storage_provider {
+        full_config.storage.provider.config = sp.clone();
+    }
+    create_memory_with_storage_and_routes(&full_config, &[], storage_provider, workspace_dir, api_key)
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
 pub fn create_memory_with_storage_and_routes(
-    config: &MemoryConfig,
+    config: &crate::config::Config,
     embedding_routes: &[EmbeddingRouteConfig],
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
+    let memory_config = &config.memory;
+    let backend_name = effective_memory_backend_name(&memory_config.backend, storage_provider);
     let backend_kind = classify_memory_backend(&backend_name);
-    let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
+    let resolved_embedding = resolve_embedding_config(memory_config, embedding_routes, api_key);
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
-    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
+    if let Err(e) = hygiene::run_if_due(memory_config, workspace_dir) {
         tracing::warn!("memory hygiene skipped: {e}");
     }
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
-    if config.snapshot_enabled
-        && config.snapshot_on_hygiene
+    if memory_config.snapshot_enabled
+        && memory_config.snapshot_on_hygiene
         && matches!(
             backend_kind,
             MemoryBackendKind::Sqlite
@@ -235,7 +257,7 @@ pub fn create_memory_with_storage_and_routes(
 
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
-    if config.auto_hydrate
+    if memory_config.auto_hydrate
         && matches!(
             backend_kind,
             MemoryBackendKind::Sqlite
@@ -256,6 +278,19 @@ pub fn create_memory_with_storage_and_routes(
                 tracing::warn!("memory hydration failed: {e}");
             }
         }
+    }
+
+    // Cortex backend (requires memory-cortex feature)
+    #[cfg(feature = "memory-cortex")]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        return build_cortex_memory(config, memory_config, workspace_dir);
+    }
+
+    #[cfg(not(feature = "memory-cortex"))]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        anyhow::bail!(
+            "memory backend 'cortex' requested but this build was compiled without `memory-cortex`; rebuild with `--features memory-cortex`"
+        );
     }
 
     fn build_sqlite_memory(
@@ -315,6 +350,44 @@ pub fn create_memory_with_storage_and_routes(
     ) -> anyhow::Result<Box<dyn Memory>> {
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
+        );
+    }
+
+    // Cortex backend (requires memory-cortex feature)
+    #[cfg(feature = "memory-cortex")]
+    fn build_cortex_memory(
+        config: &crate::config::Config,
+        memory_config: &MemoryConfig,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<Box<dyn Memory>> {
+        use crate::config::Config;
+        
+        tracing::info!(
+            "🧠 Cortex-Memory backend selected (tenant: {})",
+            memory_config.cortex.tenant_id
+        );
+        
+        let memory_config = memory_config.clone();
+        let workspace_dir = workspace_dir.to_path_buf();
+        let config_clone = config.clone();
+        
+        return tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                CortexMemory::new(&memory_config, workspace_dir, &config_clone)
+                    .await
+                    .map(|m| Box::new(m) as Box<dyn Memory>)
+            })
+        });
+    }
+
+    #[cfg(not(feature = "memory-cortex"))]
+    fn build_cortex_memory(
+        _config: &crate::config::Config,
+        _memory_config: &MemoryConfig,
+        _workspace_dir: &Path,
+    ) -> anyhow::Result<Box<dyn Memory>> {
+        anyhow::bail!(
+            "memory backend 'cortex' requested but this build was compiled without `memory-cortex`; rebuild with `--features memory-cortex`"
         );
     }
 
