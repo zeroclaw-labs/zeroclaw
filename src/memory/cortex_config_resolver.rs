@@ -160,13 +160,23 @@ fn resolve_embedding_from_route(
 }
 
 /// Convert provider name to base URL
+///
+/// Supports:
+/// - custom:URL format (e.g., "custom:http://localhost:11434/v1")
+/// - Known providers: openai, anthropic, ollama, openrouter
+/// - Falls back to OpenAI for unknown providers (documented behavior)
 fn provider_to_base_url(provider: &str) -> String {
     if let Some(custom_url) = provider.strip_prefix("custom:") {
         return custom_url.to_string();
     }
-    
+
     match provider {
         "openai" => "https://api.openai.com/v1".to_string(),
+        "anthropic" => "https://api.anthropic.com/v1".to_string(),
+        "ollama" => "http://localhost:11434/v1".to_string(),
+        "openrouter" => "https://openrouter.ai/api/v1".to_string(),
+        // Fallback to OpenAI for unknown providers
+        // This is intentional for backward compatibility
         _ => "https://api.openai.com/v1".to_string(),
     }
 }
