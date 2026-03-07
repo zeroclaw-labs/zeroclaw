@@ -4252,6 +4252,27 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     "I blocked part of my draft response because it appeared to contain credential material. Please ask me to provide a redacted summary.".to_string()
                 }
             };
+            // Suppress NO_REPLY / HEARTBEAT_OK sentinels that leak from
+            // agent prompt instructions into channel replies.
+            if crate::cron::scheduler::is_no_reply_sentinel(&delivered_response)
+                || crate::daemon::is_heartbeat_ok_sentinel(&delivered_response)
+            {
+                tracing::debug!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Suppressed sentinel reply in channel conversation"
+                );
+                // Cancel any in-flight draft so it doesn't linger in the UI.
+                if let (Some(channel), Some(draft_id)) =
+                    (target_channel.as_ref(), draft_message_id.as_deref())
+                {
+                    if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
+                        tracing::debug!("Failed to cancel draft after sentinel suppression: {err}");
+                    }
+                }
+                return;
+            }
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),

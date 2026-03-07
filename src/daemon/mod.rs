@@ -366,7 +366,7 @@ fn heartbeat_announcement_text(output: &str) -> Option<String> {
     Some(output.to_string())
 }
 
-fn is_heartbeat_ok_sentinel(output: &str) -> bool {
+pub(crate) fn is_heartbeat_ok_sentinel(output: &str) -> bool {
     const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
     output
         .trim()
