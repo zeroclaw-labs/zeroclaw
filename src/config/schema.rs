@@ -114,6 +114,7 @@ pub struct Config {
     #[serde(default)]
     pub provider: ProviderConfig,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(default = "default_temperature")]
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
@@ -2323,6 +2324,7 @@ pub enum NonCliNaturalLanguageApprovalMode {
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
@@ -2415,6 +2417,10 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub non_cli_natural_language_approval_mode_by_channel:
         HashMap<String, NonCliNaturalLanguageApprovalMode>,
+}
+
+fn default_temperature() -> f64 {
+    0.7
 }
 
 fn default_auto_approve() -> Vec<String> {
