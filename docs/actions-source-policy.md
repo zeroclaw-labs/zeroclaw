@@ -16,7 +16,6 @@ Selected allowlist (all actions currently used across CI, Beta Release, and Prom
 | `actions/download-artifact@v4` | release, promote-release | Download build artifacts for packaging |
 | `dtolnay/rust-toolchain@stable` | All workflows | Install Rust toolchain (1.92.0) |
 | `Swatinem/rust-cache@v2` | All workflows | Cargo build/dependency caching |
-| `softprops/action-gh-release@v2` | release, promote-release | Create GitHub Releases |
 | `docker/setup-buildx-action@v3` | release, promote-release | Docker Buildx setup |
 | `docker/login-action@v3` | release, promote-release | GHCR authentication |
 | `docker/build-push-action@v6` | release, promote-release | Multi-platform Docker image build and push |
@@ -26,7 +25,6 @@ Equivalent allowlist patterns:
 - `actions/*`
 - `dtolnay/rust-toolchain@*`
 - `Swatinem/rust-cache@*`
-- `softprops/action-gh-release@*`
 - `docker/*`
 
 ## Workflows
@@ -34,7 +32,7 @@ Equivalent allowlist patterns:
 | Workflow | File | Trigger |
 |----------|------|---------|
 | CI | `.github/workflows/ci.yml` | Pull requests to `master` |
-| Beta Release | `.github/workflows/release.yml` | Push to `master` |
+| Daily Beta Release | `.github/workflows/release.yml` | Daily schedule (08:00 UTC) + manual `workflow_dispatch` |
 | Promote Release | `.github/workflows/promote-release.yml` | Manual `workflow_dispatch` |
 
 ## Change Control
@@ -68,6 +66,11 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
     - Retained: `actions/*`, `dtolnay/rust-toolchain@*`, `softprops/action-gh-release@*`, `docker/*`
 - 2026-03-05: CI build optimization — added mold linker, cargo-nextest, CARGO_INCREMENTAL=0
     - sccache removed due to fragile GHA cache backend causing build failures
+- 2026-03-07: Release pipeline overhaul
+    - Removed: `softprops/action-gh-release@*` (replaced with built-in `gh` CLI)
+    - Beta trigger changed from push-on-master to daily schedule + workflow_dispatch
+    - Added default-branch guard on beta workflow_dispatch
+    - Added build targets: `armv7-unknown-linux-gnueabihf`, `x86_64-apple-darwin` (cross-compiled from macos-14)
 
 ## Rollback
 
