@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -83,6 +83,16 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: NativeImageSource },
+}
+
+#[derive(Debug, Serialize)]
+struct NativeImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +220,7 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -334,10 +344,7 @@ impl AnthropicProvider {
                 _ => {
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: Self::parse_user_content_blocks(&msg.content),
                     });
                 }
             }
@@ -357,6 +364,58 @@ impl AnthropicProvider {
         });
 
         (system_prompt, native_messages)
+    }
+
+    /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
+    fn parse_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
+        let (cleaned_text, image_refs) = crate::multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }];
+        }
+
+        let mut blocks = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed = cleaned_text.trim();
+        if !trimmed.is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: trimmed.to_string(),
+                cache_control: None,
+            });
+        }
+
+        for image_ref in image_refs {
+            if let Some(rest) = image_ref.strip_prefix("data:") {
+                if let Some(semi) = rest.find(';') {
+                    let mime = &rest[..semi];
+                    if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
+                        blocks.push(NativeContentOut::Image {
+                            source: NativeImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: mime.to_string(),
+                                data: b64.to_string(),
+                            },
+                        });
+                        continue;
+                    }
+                }
+            }
+            // Non-data-uri image: include as text reference
+            blocks.push(NativeContentOut::Text {
+                text: format!("[image: {}]", image_ref),
+                cache_control: None,
+            });
+        }
+
+        if blocks.is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            });
+        }
+
+        blocks
     }
 
     fn parse_text_response(response: ChatResponse) -> anyhow::Result<String> {
@@ -510,8 +569,11 @@ impl Provider for AnthropicProvider {
         Ok(Self::parse_native_response(native_response))
     }
 
-    fn supports_native_tools(&self) -> bool {
-        true
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
     }
 
     async fn chat_with_tools(
@@ -1352,5 +1414,117 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn capabilities_includes_vision() {
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let caps = <AnthropicProvider as Provider>::capabilities(&provider);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
+    }
+
+    #[test]
+    fn parse_user_content_blocks_no_images() {
+        let blocks = AnthropicProvider::parse_user_content_blocks("Hello, describe the weather.");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, "Hello, describe the weather.");
+            }
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn parse_user_content_blocks_extracts_image() {
+        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
+        let blocks = AnthropicProvider::parse_user_content_blocks(content);
+        assert_eq!(blocks.len(), 2);
+
+        match &blocks[0] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, "Describe this");
+            }
+            _ => panic!("Expected Text variant for first block"),
+        }
+
+        match &blocks[1] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.data, "abcd");
+            }
+            _ => panic!("Expected Image variant for second block"),
+        }
+    }
+
+    #[test]
+    fn parse_user_content_blocks_multiple_images() {
+        let content = "[IMAGE:data:image/jpeg;base64,img1][IMAGE:data:image/webp;base64,img2]";
+        let blocks = AnthropicProvider::parse_user_content_blocks(content);
+        assert_eq!(blocks.len(), 2);
+
+        match &blocks[0] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.media_type, "image/jpeg");
+                assert_eq!(source.data, "img1");
+            }
+            _ => panic!("Expected Image variant"),
+        }
+
+        match &blocks[1] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.media_type, "image/webp");
+                assert_eq!(source.data, "img2");
+            }
+            _ => panic!("Expected Image variant"),
+        }
+    }
+
+    #[test]
+    fn image_content_serializes_to_anthropic_format() {
+        let content = NativeContentOut::Image {
+            source: NativeImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/jpeg".to_string(),
+                data: "abc123".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&content).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["type"], "image");
+        assert_eq!(parsed["source"]["type"], "base64");
+        assert_eq!(parsed["source"]["media_type"], "image/jpeg");
+        assert_eq!(parsed["source"]["data"], "abc123");
+    }
+
+    #[test]
+    fn convert_messages_user_with_image_produces_multipart() {
+        let messages = vec![ChatMessage::user(
+            "What is in this photo?\n\n[IMAGE:data:image/png;base64,iVBOR]".to_string(),
+        )];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        assert_eq!(native_msgs.len(), 1);
+        assert_eq!(native_msgs[0].role, "user");
+        assert_eq!(native_msgs[0].content.len(), 2);
+
+        match &native_msgs[0].content[0] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, "What is in this photo?");
+            }
+            _ => panic!("Expected Text variant"),
+        }
+
+        match &native_msgs[0].content[1] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.data, "iVBOR");
+            }
+            _ => panic!("Expected Image variant"),
+        }
     }
 }
