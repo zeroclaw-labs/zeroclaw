@@ -707,13 +707,24 @@ MSG
     fi
   fi
 
+  # Build docker run args, handling empty arrays safely with set -u
+  local docker_run_args=(
+    -e HOME=/zeroclaw-data
+    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+    -v "$config_mount"
+    -v "$workspace_mount"
+  )
+
+  # Add namespace/user args only if non-empty (bash set -u safety)
+  if [[ ${#container_run_namespace_args[@]} -gt 0 ]]; then
+    docker_run_args+=("${container_run_namespace_args[@]}")
+  fi
+  if [[ ${#container_run_user_args[@]} -gt 0 ]]; then
+    docker_run_args+=("${container_run_user_args[@]}")
+  fi
+
   "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
-    "${container_run_user_args[@]}" \
-    -e HOME=/zeroclaw-data \
-    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$config_mount" \
-    -v "$workspace_mount" \
+    "${docker_run_args[@]}" \
     "$docker_image" \
     "${onboard_cmd[@]}"
 }
