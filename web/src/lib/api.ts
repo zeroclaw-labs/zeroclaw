@@ -98,12 +98,21 @@ export async function pair(code: string): Promise<{ token: string }> {
 // Public health (no auth required)
 // ---------------------------------------------------------------------------
 
-export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
+export type ServerMode = 'onboard' | 'gateway';
+
+export interface PublicHealth {
+  require_pairing: boolean;
+  paired: boolean;
+  /** "onboard" for the standalone setup server, absent/undefined for gateway. */
+  mode?: ServerMode;
+}
+
+export async function getPublicHealth(): Promise<PublicHealth> {
   const response = await fetch('/health');
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
-  return response.json() as Promise<{ require_pairing: boolean; paired: boolean }>;
+  return response.json() as Promise<PublicHealth>;
 }
 
 // ---------------------------------------------------------------------------

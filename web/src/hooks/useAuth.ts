@@ -14,7 +14,7 @@ import {
   isAuthenticated as checkAuth,
   TOKEN_STORAGE_KEY,
 } from '../lib/auth';
-import { pair as apiPair, getPublicHealth } from '../lib/api';
+import { pair as apiPair, getPublicHealth, type ServerMode } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // Context shape
@@ -27,6 +27,8 @@ export interface AuthState {
   isAuthenticated: boolean;
   /** True while the initial auth check is in progress. */
   loading: boolean;
+  /** Which server we're connected to: "onboard" or "gateway". */
+  serverMode: ServerMode;
   /** Pair with the agent using a pairing code. Stores the token on success. */
   pair: (code: string) => Promise<void>;
   /** Clear the stored token and sign out. */
@@ -44,18 +46,21 @@ export interface AuthProviderProps {
 }
 
 export function AuthProvider({ children }: AuthProviderProps) {
+  const alreadyAuthed = checkAuth();
   const [token, setTokenState] = useState<string | null>(readToken);
-  const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
-  const [loading, setLoading] = useState<boolean>(!checkAuth());
+  const [authenticated, setAuthenticated] = useState<boolean>(alreadyAuthed);
+  const [loading, setLoading] = useState<boolean>(!alreadyAuthed);
+  const [serverMode, setServerMode] = useState<ServerMode>('gateway');
 
-  // On mount: check if server requires pairing at all
+  // On mount: check health to determine server mode and pairing requirement.
+  // If we already have a token, skip the loading gate but still fetch mode.
   useEffect(() => {
-    if (checkAuth()) return; // already have a token, no need to check
     let cancelled = false;
     getPublicHealth()
       .then((health) => {
         if (cancelled) return;
-        if (!health.require_pairing) {
+        if (health.mode === 'onboard') setServerMode('onboard');
+        if (!health.require_pairing || checkAuth()) {
           setAuthenticated(true);
         }
       })
@@ -100,6 +105,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     token,
     isAuthenticated: authenticated,
     loading,
+    serverMode,
     pair,
     logout,
   };

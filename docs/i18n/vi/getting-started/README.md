@@ -13,6 +13,7 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 | Tình huống | Lệnh |
 |----------|---------|
 | Có API key, muốn cài nhanh nhất | `zeroclaw onboard --api-key sk-... --provider openrouter` |
+| Muốn dùng trình hướng dẫn web (mở trong trình duyệt) | `zeroclaw onboard --web` |
 | Muốn được hướng dẫn từng bước | `zeroclaw onboard --interactive` |
 | Đã có config, chỉ cần sửa kênh | `zeroclaw onboard --channels-only` |
 | Dùng xác thực subscription | Xem [Subscription Auth](../../../README.md#subscription-auth-openai-codex--claude-code) |

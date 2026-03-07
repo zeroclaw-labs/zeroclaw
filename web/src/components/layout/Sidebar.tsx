@@ -9,6 +9,7 @@ import {
   Puzzle,
   Brain,
   Smartphone,
+  Wand2,
   Settings,
   DollarSign,
   Activity,
@@ -16,6 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { useAuth } from '@/hooks/useAuth';
 
 const COLLAPSE_BUTTON_DELAY_MS = 1000;
 
@@ -27,6 +29,7 @@ const navItems = [
   { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
   { to: '/memory', icon: Brain, labelKey: 'nav.memory' },
   { to: '/devices', icon: Smartphone, labelKey: 'nav.devices' },
+  { to: '/setup', icon: Wand2, labelKey: 'nav.setup', onboardOnly: true },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
   { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
@@ -46,6 +49,11 @@ export default function Sidebar({
   onClose,
   onToggleCollapse,
 }: SidebarProps) {
+  const { serverMode } = useAuth();
+  const isOnboard = serverMode === 'onboard';
+  const visibleItems = isOnboard
+    ? navItems.filter((i) => i.onboardOnly)
+    : navItems.filter((i) => !i.onboardOnly);
   const [showCollapseButton, setShowCollapseButton] = useState(false);
 
   useEffect(() => {
@@ -115,7 +123,8 @@ export default function Sidebar({
         </div>
 
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
-          {navItems.map(({ to, icon: Icon, labelKey }) => (
+        <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
+          {visibleItems.map(({ to, icon: Icon, labelKey }) => (
             <NavLink
               key={to}
               to={to}

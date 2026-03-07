@@ -485,7 +485,7 @@ fn backend_key_from_choice(choice: usize) -> &'static str {
         .map_or(default_memory_backend_key(), |backend| backend.key)
 }
 
-fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
+pub fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
     let profile = memory_backend_profile(backend);
 
     MemoryConfig {
@@ -1011,7 +1011,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
     ("MiniMax-M2", "MiniMax M2 (legacy)"),
 ];
 
-fn default_model_for_provider(provider: &str) -> String {
+pub fn default_model_for_provider(provider: &str) -> String {
     if provider == "qwen-coding-plan" {
         return "qwen3-coder-plus".into();
     }
@@ -1055,7 +1055,7 @@ fn default_model_for_provider(provider: &str) -> String {
     }
 }
 
-fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     if provider_name == "qwen-coding-plan" {
         return vec![
             (
@@ -6401,7 +6401,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-async fn scaffold_workspace(
+pub async fn scaffold_workspace(
     workspace_dir: &Path,
     ctx: &ProjectContext,
     memory_backend: &str,

@@ -248,7 +248,19 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive or --interactive-ui)
+        /// Launch web-based setup wizard in your browser
+        #[arg(long)]
+        web: bool,
+
+        /// Host address for web setup server (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        web_host: String,
+
+        /// Port for web setup server (default: 42618)
+        #[arg(long, default_value_t = 42618)]
+        web_port: u16,
+
+        /// API key (used in quick mode, ignored with interactive/web onboarding)
         #[arg(long)]
         api_key: Option<String>,
 
@@ -962,6 +974,9 @@ async fn main() -> Result<()> {
         interactive_ui,
         force,
         channels_only,
+        web,
+        web_host,
+        web_port,
         api_key,
         provider,
         model,
@@ -976,6 +991,9 @@ async fn main() -> Result<()> {
         let interactive_ui = *interactive_ui;
         let force = *force;
         let channels_only = *channels_only;
+        let web = *web;
+        let web_host = web_host.clone();
+        let web_port = *web_port;
         let api_key = api_key.clone();
         let provider = provider.clone();
         let model = model.clone();
@@ -1007,6 +1025,24 @@ async fn main() -> Result<()> {
                 "--interactive-ui does not accept --api-key, --provider, --model, --memory, or --no-totp"
             );
         }
+        if web && (interactive || interactive_ui || channels_only) {
+            bail!("--web cannot be combined with --interactive, --interactive-ui, or --channels-only");
+        }
+        if web
+            && (force
+                || api_key.is_some()
+                || provider.is_some()
+                || model.is_some()
+                || memory.is_some()
+                || no_totp
+                || migrate_openclaw
+                || openclaw_source.is_some()
+                || openclaw_config.is_some())
+        {
+            bail!(
+                "--web does not accept quick-setup or migration flags; use only --web, --web-host, --web-port"
+            );
+        }
         if channels_only
             && (api_key.is_some()
                 || provider.is_some()
@@ -1024,6 +1060,13 @@ async fn main() -> Result<()> {
         if channels_only && force {
             bail!("--channels-only does not accept --force");
         }
+
+        // Web-based setup wizard: load config first, then start server
+        if web {
+            let config = Config::load_or_init().await?;
+            return onboard::run_onboard_web(config, &web_host, web_port).await;
+        }
+
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
         } else if interactive_ui {

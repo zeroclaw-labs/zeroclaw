@@ -15,6 +15,7 @@ For first-time setup and quick orientation.
 | Scenario | Command |
 |----------|---------|
 | I have an API key, want fastest setup | `zeroclaw onboard --api-key sk-... --provider openrouter` |
+| I want a web-based setup wizard (opens in browser) | `zeroclaw onboard --web` |
 | I want guided prompts | `zeroclaw onboard --interactive` |
 | Config exists, just fix channels | `zeroclaw onboard --channels-only` |
 | Config exists, I intentionally want full overwrite | `zeroclaw onboard --force` |

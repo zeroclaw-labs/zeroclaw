@@ -36,6 +36,8 @@ Last verified: **March 4, 2026**.
 ### `onboard`
 
 - `zeroclaw onboard`
+- `zeroclaw onboard --web` — web-based setup wizard (opens in browser)
+- `zeroclaw onboard --web --web-host 0.0.0.0 --web-port 8080` — bind to custom address
 - `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --force`

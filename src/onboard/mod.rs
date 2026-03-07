@@ -1,14 +1,18 @@
 pub mod tui;
+pub mod web;
 pub mod wizard;
 
 // Re-exported for CLI and external use
 #[allow(unused_imports)]
 pub use tui::{run_wizard_tui, run_wizard_tui_with_migration};
+pub use web::run_onboard_web;
 #[allow(unused_imports)]
 pub use wizard::{
+    curated_models_for_provider, default_model_for_provider, memory_config_defaults_for_backend,
     run_channels_repair_wizard, run_models_list, run_models_refresh, run_models_refresh_all,
     run_models_set, run_models_status, run_quick_setup, run_quick_setup_with_migration, run_wizard,
-    run_wizard_with_migration, OpenClawOnboardMigrationOptions,
+    run_wizard_with_migration, scaffold_workspace, OpenClawOnboardMigrationOptions,
+    ProjectContext,
 };
 
 #[cfg(test)]

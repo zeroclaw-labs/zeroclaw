@@ -33,6 +33,8 @@ Xác minh lần cuối: **2026-03-04**.
 ### `onboard`
 
 - `zeroclaw onboard`
+- `zeroclaw onboard --web` — trình hướng dẫn cài đặt web (mở trong trình duyệt)
+- `zeroclaw onboard --web --web-host 0.0.0.0 --web-port 8080` — gắn vào địa chỉ tùy chỉnh
 - `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
