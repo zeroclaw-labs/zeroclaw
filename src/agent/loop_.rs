@@ -2799,6 +2799,7 @@ pub async fn run(
             "default".to_string(), // TODO: allow session ID configuration
             Some(config.agent.max_history_messages),
         );
+        // Single message mode: typically starts a fresh context unless we implement session resumption here too.
         conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
         conversation_manager.add_message(ChatMessage::user(&enriched)).await?;
 
@@ -2826,8 +2827,6 @@ pub async fn run(
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
-        println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
@@ -2836,7 +2835,16 @@ pub async fn run(
             "cli".to_string(),
             Some(config.agent.max_history_messages),
         );
-        conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
+
+        // Attempt to resume previous session
+        let resumed = conversation_manager.load_from_memory().await.unwrap_or(false);
+        if resumed {
+            println!("🦀 Resumed previous session.");
+        } else {
+            println!("🦀 ZeroClaw Interactive Mode");
+            println!("Type /help for commands.\n");
+            conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
+        }
 
         loop {
             print!("> ");

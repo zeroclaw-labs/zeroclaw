@@ -78,6 +78,18 @@ impl ConversationManager {
         self.history = history;
     }
 
+    /// Attempt to load history from the memory backend.
+    pub async fn load_from_memory(&mut self) -> Result<bool> {
+        let key = format!("history_{}", self.session_id);
+        if let Some(entry) = self.memory.get(&key).await? {
+            let history: Vec<ChatMessage> = serde_json::from_str(&entry.content)?;
+            self.history = history;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Persist the current history to the memory backend.
     pub async fn checkpoint(&self) -> Result<()> {
         let content = serde_json::to_string(&self.history)?;
