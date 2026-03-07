@@ -10,6 +10,7 @@ const SENSITIVE_EXACT_FILENAMES: &[&str] = &[
     "credentials",
     "credentials.json",
     "auth-profiles.json",
+    "config.toml",
     "id_rsa",
     "id_dsa",
     "id_ecdsa",
@@ -84,6 +85,15 @@ mod tests {
         assert!(is_sensitive_file_path(Path::new(
             "ops/.secrets/runtime.txt"
         )));
+    }
+
+    #[test]
+    fn detects_config_toml_as_sensitive() {
+        assert!(is_sensitive_file_path(Path::new("config.toml")));
+        assert!(is_sensitive_file_path(Path::new(
+            ".zeroclaw/config.toml"
+        )));
+        assert!(is_sensitive_file_path(Path::new("CONFIG.TOML")));
     }
 
     #[test]
