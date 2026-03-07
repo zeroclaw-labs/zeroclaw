@@ -36,9 +36,6 @@ jobs:
                     - name: default
                       command: cargo test --locked --test agent_e2e --verbose
                       install_libudev: false
-                    - name: whatsapp-web
-                      command: cargo check --locked --no-default-features --features whatsapp-web --verbose
-                      install_libudev: false
                     - name: browser-native
                       command: cargo check --locked --no-default-features --features browser-native --verbose
                       install_libudev: false

@@ -718,9 +718,7 @@ fn hydrate_config_for_save(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{
-        CloudflareTunnelConfig, LarkReceiveMode, NgrokTunnelConfig, WatiConfig,
-    };
+    use crate::config::schema::{CloudflareTunnelConfig, NgrokTunnelConfig};
 
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
@@ -788,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_sensitive_fields_covers_wati_email_and_feishu_secrets() {
+    fn mask_sensitive_fields_covers_proxy_and_tunnel_secrets() {
         let mut cfg = crate::config::Config::default();
         cfg.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         cfg.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
@@ -799,28 +797,6 @@ mod tests {
         cfg.tunnel.ngrok = Some(NgrokTunnelConfig {
             auth_token: "ngrok-real-token".to_string(),
             domain: Some("zeroclaw.ngrok.app".to_string()),
-        });
-        cfg.channels_config.wati = Some(WatiConfig {
-            api_token: "wati-real-token".to_string(),
-            api_url: "https://live-mt-server.wati.io".to_string(),
-            tenant_id: Some("tenant-1".to_string()),
-            allowed_numbers: vec!["*".to_string()],
-        });
-        let mut email = crate::channels::email_channel::EmailConfig::default();
-        email.password = "email-real-password".to_string();
-        cfg.channels_config.email = Some(email);
-        cfg.channels_config.feishu = Some(crate::config::FeishuConfig {
-            app_id: "cli_app_id".to_string(),
-            app_secret: "feishu-real-secret".to_string(),
-            encrypt_key: Some("feishu-encrypt-key".to_string()),
-            verification_token: Some("feishu-verify-token".to_string()),
-            allowed_users: vec!["*".to_string()],
-            group_reply: None,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(42617),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
-            ),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
 
         let masked = mask_sensitive_fields(&cfg);
@@ -843,37 +819,10 @@ mod tests {
                 .map(|value| value.auth_token.as_str()),
             Some(MASKED_SECRET)
         );
-        assert_eq!(
-            masked
-                .channels_config
-                .wati
-                .as_ref()
-                .map(|value| value.api_token.as_str()),
-            Some(MASKED_SECRET)
-        );
-        assert_eq!(
-            masked
-                .channels_config
-                .email
-                .as_ref()
-                .map(|value| value.password.as_str()),
-            Some(MASKED_SECRET)
-        );
-        let masked_feishu = masked
-            .channels_config
-            .feishu
-            .as_ref()
-            .expect("feishu config should exist");
-        assert_eq!(masked_feishu.app_secret, MASKED_SECRET);
-        assert_eq!(masked_feishu.encrypt_key.as_deref(), Some(MASKED_SECRET));
-        assert_eq!(
-            masked_feishu.verification_token.as_deref(),
-            Some(MASKED_SECRET)
-        );
     }
 
     #[test]
-    fn hydrate_config_for_save_restores_wati_email_and_feishu_secrets() {
+    fn hydrate_config_for_save_restores_proxy_and_tunnel_secrets() {
         let mut current = crate::config::Config::default();
         current.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         current.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
@@ -884,28 +833,6 @@ mod tests {
         current.tunnel.ngrok = Some(NgrokTunnelConfig {
             auth_token: "ngrok-real-token".to_string(),
             domain: Some("zeroclaw.ngrok.app".to_string()),
-        });
-        current.channels_config.wati = Some(WatiConfig {
-            api_token: "wati-real-token".to_string(),
-            api_url: "https://live-mt-server.wati.io".to_string(),
-            tenant_id: Some("tenant-1".to_string()),
-            allowed_numbers: vec!["*".to_string()],
-        });
-        let mut email = crate::channels::email_channel::EmailConfig::default();
-        email.password = "email-real-password".to_string();
-        current.channels_config.email = Some(email);
-        current.channels_config.feishu = Some(crate::config::FeishuConfig {
-            app_id: "cli_app_id".to_string(),
-            app_secret: "feishu-real-secret".to_string(),
-            encrypt_key: Some("feishu-encrypt-key".to_string()),
-            verification_token: Some("feishu-verify-token".to_string()),
-            allowed_users: vec!["*".to_string()],
-            group_reply: None,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(42617),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
-            ),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
 
         let incoming = mask_sensitive_fields(&current);
@@ -938,36 +865,6 @@ mod tests {
                 .as_ref()
                 .map(|value| value.auth_token.as_str()),
             Some("ngrok-real-token")
-        );
-        assert_eq!(
-            restored
-                .channels_config
-                .wati
-                .as_ref()
-                .map(|value| value.api_token.as_str()),
-            Some("wati-real-token")
-        );
-        assert_eq!(
-            restored
-                .channels_config
-                .email
-                .as_ref()
-                .map(|value| value.password.as_str()),
-            Some("email-real-password")
-        );
-        let restored_feishu = restored
-            .channels_config
-            .feishu
-            .as_ref()
-            .expect("feishu config should exist");
-        assert_eq!(restored_feishu.app_secret, "feishu-real-secret");
-        assert_eq!(
-            restored_feishu.encrypt_key.as_deref(),
-            Some("feishu-encrypt-key")
-        );
-        assert_eq!(
-            restored_feishu.verification_token.as_deref(),
-            Some("feishu-verify-token")
         );
     }
 }

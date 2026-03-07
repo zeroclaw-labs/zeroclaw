@@ -127,7 +127,7 @@ tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
 }
 
-const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "mattermost"];
+const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord"];
 
 const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
 const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;

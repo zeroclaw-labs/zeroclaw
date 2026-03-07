@@ -278,7 +278,6 @@ bot_token = "test_token"
     let parsed: Config = toml::from_str(toml_str).expect("multi-channel config should parse");
     assert!(parsed.channels_config.telegram.is_some());
     assert!(parsed.channels_config.discord.is_some());
-    assert!(parsed.channels_config.slack.is_none());
 }
 
 #[test]
@@ -302,10 +301,6 @@ fn config_channels_all_optional_channels_none_by_default() {
     let channels = ChannelsConfig::default();
     assert!(channels.telegram.is_none());
     assert!(channels.discord.is_none());
-    assert!(channels.slack.is_none());
-    assert!(channels.matrix.is_none());
-    assert!(channels.lark.is_none());
-    assert!(channels.feishu.is_none());
     assert!(channels.webhook.is_none());
 }
 

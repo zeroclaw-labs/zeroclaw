@@ -13,14 +13,6 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
-    "provider.anthropic",
-    "provider.compatible",
-    "provider.copilot",
-    "provider.gemini",
-    "provider.glm",
-    "provider.ollama",
-    "provider.openai",
-    "provider.openrouter",
     "channel.discord",
     "channel.telegram",
     "tool.browser",
