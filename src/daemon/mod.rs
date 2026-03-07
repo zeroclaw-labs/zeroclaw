@@ -153,6 +153,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    {
+        let auth = std::sync::Arc::new(crate::auth::AuthService::from_config(&config));
+        handles.push(auth.spawn_token_keepalive(
+            std::time::Duration::from_secs(crate::auth::TOKEN_KEEPALIVE_INTERVAL_SECS),
+            std::time::Duration::from_secs(crate::auth::TOKEN_KEEPALIVE_REFRESH_SKEW_SECS),
+        ));
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
