@@ -37,10 +37,10 @@ Lane owners are configured in `.github/release/nightly-owner-routing.json`.
 
 Owner routing source: `.github/release/nightly-owner-routing.json`
 
-- `default` -> `@chumyin`
-- `whatsapp-web` -> `@chumyin`
-- `browser-native` -> `@chumyin`
-- `nightly-all-features` -> `@chumyin`
+- `default` -> `@theonlyhennygod`
+- `whatsapp-web` -> `@theonlyhennygod`
+- `browser-native` -> `@theonlyhennygod`
+- `nightly-all-features` -> `@theonlyhennygod`
 
 Escalation thresholds:
 

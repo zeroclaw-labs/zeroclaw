@@ -761,13 +761,13 @@ const copy: Record<Locale, typeof copyEn> = {
 
 const commandLane: Array<{ command: string; hint: Localized }> = [
   {
-    command: "zeroclaw onboard --interactive",
+    command: "curl -fsSL https://zeroclawlabs.ai/install.sh | bash",
     hint: {
-      en: "Generate config and credentials",
-      zh: "生成配置与凭据",
-      es: "Generar configuración y credenciales",
-      pt: "Gerar configuração e credenciais",
-      it: "Genera configurazione e credenziali",
+      en: "Install dependencies, Rust, and launch interactive onboarding",
+      zh: "安装依赖与 Rust，并启动交互式引导",
+      es: "Instalar dependencias, Rust e iniciar onboarding interactivo",
+      pt: "Instalar dependências, Rust e iniciar onboarding interativo",
+      it: "Installa dipendenze, Rust e avvia onboarding interattivo",
     },
   },
   {

@@ -140,7 +140,7 @@ tempfile = "3.14"
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
+nostr-sdk = { version = "0.44", optional = true, default-features = false, features = ["nip04", "nip59"] }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
@@ -222,6 +222,7 @@ default = []
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
+channel-nostr = ["dep:nostr-sdk"]
 memory-postgres = ["dep:postgres", "dep:tokio-postgres-rustls"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]

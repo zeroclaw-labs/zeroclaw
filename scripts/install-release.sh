@@ -142,7 +142,7 @@ fi
 
 echo "==> Starting onboarding"
 if [ -t 0 ] && [ -t 1 ]; then
-  exec "$BIN_PATH" onboard --interactive-ui
+  exec "$BIN_PATH" onboard --interactive
 fi
 
 echo "note: non-interactive shell detected; falling back to quick onboarding mode" >&2

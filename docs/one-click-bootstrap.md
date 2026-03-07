@@ -119,22 +119,24 @@ it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before runn
 ### Quick onboarding (non-interactive)
 
 ```bash
-./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+# Replace <provider> with your choice: openrouter, openai, anthropic, gemini, ollama, etc.
+./install.sh --onboard --api-key "sk-..." --provider <provider>
 ```
 
 Or with environment variables:
 
 ```bash
-ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./bootstrap.sh --onboard
+# Replace <provider> with your choice
+ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="<provider>" ./install.sh --onboard
 ```
 
 ### Interactive onboarding
 
 ```bash
-./bootstrap.sh --interactive-onboard
+./install.sh --interactive-onboard
 ```
 
-This launches the full-screen TUI onboarding flow (`zeroclaw onboard --interactive-ui`).
+This launches the full-screen TUI onboarding flow (`zeroclaw onboard --interactive`) where you can select your provider interactively.
 
 ## Useful flags
 

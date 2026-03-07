@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom';
-import { LogOut, Menu, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { LogOut, Menu } from 'lucide-react';
 import { t, LANGUAGE_BUTTON_LABELS, LANGUAGE_SWITCH_ORDER } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
@@ -21,16 +21,10 @@ const routeTitles: Record<string, string> = {
 const languageSummary = 'English · 简体中文 · 日本語 · Русский · Français · Tiếng Việt · Ελληνικά';
 
 interface HeaderProps {
-  isSidebarCollapsed: boolean;
   onToggleSidebar: () => void;
-  onToggleSidebarCollapse: () => void;
 }
 
-export default function Header({
-  isSidebarCollapsed,
-  onToggleSidebar,
-  onToggleSidebarCollapse,
-}: HeaderProps) {
+export default function Header({ onToggleSidebar }: HeaderProps) {
   const location = useLocation();
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
@@ -64,22 +58,12 @@ export default function Header({
             {pageTitle}
           </h1>
           <p className="hidden text-[10px] uppercase tracking-[0.16em] text-[#7ea5eb] sm:block">
-            Electric dashboard
+            ZeroClaw dashboard
           </p>
         </div>
       </div>
 
       <div className="relative flex w-full items-center justify-end gap-1.5 sm:gap-2 md:w-auto md:gap-3">
-        <button
-          type="button"
-          onClick={onToggleSidebarCollapse}
-          className="hidden items-center gap-1 rounded-lg border border-[#2b4f97] bg-[#091937]/75 px-2.5 py-1.5 text-xs text-[#c4d8ff] transition hover:border-[#4f83ff] hover:text-white md:flex md:text-sm"
-          title={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        >
-          {isSidebarCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
-          <span>{isSidebarCollapsed ? 'Expand' : 'Collapse'}</span>
-        </button>
-
         <button
           type="button"
           onClick={toggleLanguage}

@@ -23,7 +23,7 @@ Usage:
 
 Modes:
   Default mode installs/builds ZeroClaw (requires existing Rust toolchain).
-  No-flag interactive sessions run full-screen TUI onboarding after install.
+  No-flag interactive sessions run guided interactive onboarding after install.
   Guided mode asks setup questions and configures options interactively.
   Optional bootstrap mode can also install system dependencies and Rust.
 
@@ -42,7 +42,7 @@ Options:
   --force-source-build       Disable prebuilt flow and always build from source
   --cargo-features <list>    Extra Cargo features for local source build/install (comma-separated)
   --onboard                  Run onboarding after install
-  --interactive-onboard      Run full-screen TUI onboarding (implies --onboard; default in no-flag interactive sessions)
+  --interactive-onboard      Run guided interactive onboarding (implies --onboard; default in no-flag interactive sessions)
   --api-key <key>            API key for non-interactive onboarding
   --provider <id>            Provider for non-interactive onboarding (default: openrouter)
   --model <id>               Model for non-interactive onboarding (optional)
@@ -257,6 +257,9 @@ detect_config_channel_features() {
   fi
   if grep -Eq '^[[:space:]]*\[channels_config\.matrix\][[:space:]]*$' "$config_path"; then
     features="$(append_csv_feature "$features" "channel-matrix")"
+  fi
+  if grep -Eq '^[[:space:]]*\[channels_config\.nostr\][[:space:]]*$' "$config_path"; then
+    features="$(append_csv_feature "$features" "channel-nostr")"
   fi
 
   echo "$features"
@@ -637,10 +640,10 @@ run_guided_installer() {
 
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
     RUN_ONBOARD=true
-    info "Onboarding mode preselected: full-screen TUI."
+    info "Onboarding mode preselected: guided interactive."
   elif prompt_yes_no "Run onboarding after install?" "yes"; then
     RUN_ONBOARD=true
-    if prompt_yes_no "Use full-screen TUI onboarding?" "yes"; then
+    if prompt_yes_no "Use guided interactive onboarding?" "yes"; then
       INTERACTIVE_ONBOARD=true
     else
       INTERACTIVE_ONBOARD=false
@@ -661,7 +664,7 @@ run_guided_installer() {
       fi
 
       if [[ -z "$API_KEY" ]]; then
-        if ! guided_read api_key_input "API key (hidden, leave empty to switch to TUI onboarding): " true; then
+        if ! guided_read api_key_input "API key (hidden, leave empty to switch to interactive onboarding): " true; then
           echo
           error "guided installer input was interrupted."
           exit 1
@@ -670,7 +673,7 @@ run_guided_installer() {
         if [[ -n "$api_key_input" ]]; then
           API_KEY="$api_key_input"
         else
-          warn "No API key entered. Using TUI onboarding instead."
+          warn "No API key entered. Using interactive onboarding instead."
           INTERACTIVE_ONBOARD=true
         fi
       fi
@@ -1243,8 +1246,8 @@ run_docker_bootstrap() {
   if [[ "$RUN_ONBOARD" == true ]]; then
     local onboard_cmd=()
     if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-      info "Launching TUI onboarding in container"
-      onboard_cmd=(onboard --interactive-ui)
+      info "Launching interactive onboarding in container"
+      onboard_cmd=(onboard --interactive)
     else
       if [[ -z "$API_KEY" ]]; then
         cat <<'MSG'
@@ -1253,7 +1256,7 @@ Use either:
   --api-key "sk-..."
 or:
   ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --docker
-or run TUI onboarding:
+or run interactive onboarding:
   ./zeroclaw_install.sh --docker --interactive-onboard
 MSG
         exit 1
@@ -1718,16 +1721,16 @@ if [[ "$RUN_ONBOARD" == true ]]; then
   fi
 
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Running TUI onboarding"
+    info "Running interactive onboarding"
     if [[ -t 0 && -t 1 ]]; then
-      "$ZEROCLAW_BIN" onboard --interactive-ui
+      "$ZEROCLAW_BIN" onboard --interactive
     elif (: </dev/tty) 2>/dev/null; then
       # `curl ... | bash` leaves stdin as a pipe; hand off terminal control to
-      # the onboarding TUI using the controlling tty.
-      "$ZEROCLAW_BIN" onboard --interactive-ui </dev/tty >/dev/tty 2>/dev/tty
+      # interactive onboarding using the controlling tty.
+      "$ZEROCLAW_BIN" onboard --interactive </dev/tty >/dev/tty 2>/dev/tty
     else
-      error "TUI onboarding requires an interactive terminal."
-      error "Re-run from a terminal: zeroclaw onboard --interactive-ui"
+      error "Interactive onboarding requires an interactive terminal."
+      error "Re-run from a terminal: zeroclaw onboard --interactive"
       exit 1
     fi
   else
@@ -1738,7 +1741,7 @@ Use either:
   --api-key "sk-..."
 or:
   ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --onboard
-or run TUI onboarding:
+or run interactive onboarding:
   ./zeroclaw_install.sh --interactive-onboard
 MSG
       exit 1

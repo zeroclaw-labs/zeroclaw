@@ -102,7 +102,7 @@ Maintain these branch protection rules on `dev` and `main`:
 - Require at least 1 approving review.
 - Require approval after the most recent push.
 - Require CODEOWNERS review for protected paths.
-- For CI/CD-related paths (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs), require CODEOWNERS review with `@chumyin` ownership.
+- For CI/CD-related paths (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs), require CODEOWNERS review with `@theonlyhennygod` ownership.
 - Keep bypass allowances empty by default (use time-boxed break-glass only when absolutely required).
 - Enforce branch protection for admins.
 - Require conversation resolution before merge.

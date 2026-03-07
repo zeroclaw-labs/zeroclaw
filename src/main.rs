@@ -252,7 +252,7 @@ enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Provider name (used in quick mode, default: openrouter)
+        /// Provider name (required in quick mode). Run with --interactive-ui for guided selection.
         #[arg(long)]
         provider: Option<String>,
         /// Model ID override (used in quick mode)

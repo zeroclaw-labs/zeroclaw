@@ -78,13 +78,11 @@ export default function Sidebar({
           <div className="flex items-center gap-3 overflow-hidden">
             {!isCollapsed && (
               <>
-                <div
-                  className="electric-brand-mark h-9 w-9 shrink-0 rounded-xl"
-                  role="img"
-                  aria-label="ZeroClaw"
-                >
-                  <span className="sr-only">ZeroClaw</span>
-                </div>
+                <img
+                  src="/_app/logo.png"
+                  alt="ZeroClaw"
+                  className="h-9 w-9 shrink-0 rounded-xl object-contain"
+                />
                 <span className="text-lg font-semibold tracking-[0.1em] text-white">
                   ZeroClaw
                 </span>

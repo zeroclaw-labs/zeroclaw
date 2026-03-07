@@ -16,7 +16,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: `quality-gate` and `test-and-build` run in parallel (all depend only on `changes` job) to minimize critical path duration
     - Additional behavior: rust-cache is shared across all Rust CI jobs via unified `prefix-key` (`zeroclaw-ci-v1`) and `shared-key` (`${{ runner.os }}-rust`) to reduce redundant compilation
     - Additional behavior: flake detection is integrated into the `test` job via single-retry probe; emits `test-flake-probe` artifact when flake is suspected; optional blocking can be enabled with repository variable `CI_BLOCK_ON_FLAKE_SUSPECTED=true`
-    - Additional behavior: PRs that change CI/CD-governed paths require an explicit approving review from `@chumyin` (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs)
+    - Additional behavior: PRs that change CI/CD-governed paths require an explicit approving review from `@theonlyhennygod` (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs)
     - Additional behavior: PRs that change root license files (`LICENSE-APACHE`, `LICENSE-MIT`) must be authored by `willsarg`
     - Additional behavior: when lint/docs gates fail on PRs, CI posts an actionable feedback comment with failing gate names and local fix commands
     - Merge gate: `CI Required Gate`
