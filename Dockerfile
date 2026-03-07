@@ -42,6 +42,7 @@ RUN rm -rf src benches crates/robot-kit/src crates/zeroclaw-types/src crates/zer
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
+COPY data/ data/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
