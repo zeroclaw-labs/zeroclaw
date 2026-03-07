@@ -58,7 +58,7 @@ Examples:
   ./bootstrap.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/scripts/bootstrap.sh | bash
 
 Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
@@ -905,8 +905,8 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
     fi
 
     TEMP_DIR="$(mktemp -d -t zeroclaw-bootstrap-XXXXXX)"
-    info "No local repository detected; cloning latest main branch"
-    git clone --depth 1 "$REPO_URL" "$TEMP_DIR"
+    info "No local repository detected; cloning latest master branch"
+    git clone --depth 1 --branch master "$REPO_URL" "$TEMP_DIR"
     WORK_DIR="$TEMP_DIR"
     TEMP_CLONE=true
   fi
