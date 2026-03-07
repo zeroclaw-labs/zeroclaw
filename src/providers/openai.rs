@@ -11,6 +11,7 @@ pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens_override: Option<u32>,
+    reasoning_level: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -20,6 +21,8 @@ struct ChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +72,8 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +176,27 @@ impl NativeResponseMessage {
     }
 }
 
+/// Normalize and validate a reasoning level string.
+/// Accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`.
+/// Returns `None` for empty, missing, or invalid values.
+fn normalize_reasoning_level(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" => Some(normalized),
+        _ => {
+            tracing::warn!(
+                reasoning_level = %value,
+                "OpenAI provider: ignoring invalid reasoning level"
+            );
+            None
+        }
+    }
+}
+
 impl OpenAiProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self::with_base_url_and_max_tokens(None, credential, None)
@@ -187,12 +213,22 @@ impl OpenAiProvider {
         credential: Option<&str>,
         max_tokens_override: Option<u32>,
     ) -> Self {
+        Self::with_options(base_url, credential, max_tokens_override, None)
+    }
+
+    pub fn with_options(
+        base_url: Option<&str>,
+        credential: Option<&str>,
+        max_tokens_override: Option<u32>,
+        reasoning_level: Option<&str>,
+    ) -> Self {
         Self {
             base_url: base_url
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            reasoning_level: normalize_reasoning_level(reasoning_level),
         }
     }
 
@@ -353,6 +389,7 @@ impl Provider for OpenAiProvider {
             messages,
             temperature,
             max_tokens: self.max_tokens_override,
+            reasoning_effort: self.reasoning_level.clone(),
         };
 
         let response = self
@@ -395,6 +432,7 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens_override,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            reasoning_effort: self.reasoning_level.clone(),
         };
 
         let response = self
@@ -463,6 +501,7 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens_override,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            reasoning_effort: self.reasoning_level.clone(),
         };
 
         let response = self
@@ -565,11 +604,13 @@ mod tests {
             ],
             temperature: 0.7,
             max_tokens: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("gpt-4o"));
+        assert!(!json.contains("reasoning_effort"));
     }
 
     #[test]
@@ -582,6 +623,7 @@ mod tests {
             }],
             temperature: 0.0,
             max_tokens: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
@@ -870,5 +912,73 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("reasoning_content"));
         assert!(json.contains("thinking..."));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_effort config tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn normalize_reasoning_level_accepts_valid_values() {
+        assert_eq!(normalize_reasoning_level(Some("low")), Some("low".into()));
+        assert_eq!(normalize_reasoning_level(Some("HIGH")), Some("high".into()));
+        assert_eq!(
+            normalize_reasoning_level(Some("medium")),
+            Some("medium".into())
+        );
+        assert_eq!(
+            normalize_reasoning_level(Some("xhigh")),
+            Some("xhigh".into())
+        );
+        assert_eq!(
+            normalize_reasoning_level(Some("minimal")),
+            Some("minimal".into())
+        );
+    }
+
+    #[test]
+    fn normalize_reasoning_level_rejects_invalid() {
+        assert_eq!(normalize_reasoning_level(None), None);
+        assert_eq!(normalize_reasoning_level(Some("")), None);
+        assert_eq!(normalize_reasoning_level(Some("  ")), None);
+        assert_eq!(normalize_reasoning_level(Some("banana")), None);
+    }
+
+    #[test]
+    fn provider_with_reasoning_level_includes_effort_in_request() {
+        let p = OpenAiProvider::with_options(None, Some("k"), None, Some("high"));
+        assert_eq!(p.reasoning_level.as_deref(), Some("high"));
+
+        let req = ChatRequest {
+            model: "o3".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "test".to_string(),
+            }],
+            temperature: 1.0,
+            max_tokens: None,
+            reasoning_effort: p.reasoning_level.clone(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"reasoning_effort\":\"high\""));
+    }
+
+    #[test]
+    fn provider_without_reasoning_level_omits_effort() {
+        let p = OpenAiProvider::new(Some("k"));
+        assert!(p.reasoning_level.is_none());
+
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "test".to_string(),
+            }],
+            temperature: 0.7,
+            max_tokens: None,
+            reasoning_effort: p.reasoning_level.clone(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("reasoning_effort"));
     }
 }

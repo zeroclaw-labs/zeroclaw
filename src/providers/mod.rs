@@ -1215,13 +1215,12 @@ fn create_provider_with_url_and_options(
             openrouter::OpenRouterProvider::new_with_max_tokens(key, options.max_tokens_override),
         )),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(
-            openai::OpenAiProvider::with_base_url_and_max_tokens(
-                api_url,
-                key,
-                options.max_tokens_override,
-            ),
-        )),
+        "openai" => Ok(Box::new(openai::OpenAiProvider::with_options(
+            api_url,
+            key,
+            options.max_tokens_override,
+            options.reasoning_level.as_deref(),
+        ))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
