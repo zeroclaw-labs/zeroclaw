@@ -65,6 +65,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
+use crate::agent::conversation::ConversationManager;
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
 use crate::identity;
@@ -1472,6 +1473,27 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+fn sync_cm_to_cache(ctx: &ChannelRuntimeContext, sender_key: &str, cm: &ConversationManager) {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let turns = histories.entry(sender_key.to_string()).or_default();
+
+    // Export non-system messages to the cache.
+    let non_system: Vec<ChatMessage> = cm
+        .history()
+        .iter()
+        .filter(|m| m.role != "system")
+        .cloned()
+        .collect();
+
+    *turns = non_system;
+    while turns.len() > MAX_CHANNEL_HISTORY {
+        turns.remove(0);
+    }
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1562,17 +1584,7 @@ async fn process_channel_message(
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
-
-    // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
-
-    // Build history from per-sender conversation cache.
+    // ── Build history ──────────────────────────────────────────
     let prior_turns_raw = ctx
         .conversation_histories
         .lock()
@@ -1580,23 +1592,36 @@ async fn process_channel_message(
         .get(&history_key)
         .cloned()
         .unwrap_or_default();
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
-
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
-        }
-    }
+    let had_prior_history = !prior_turns_raw.is_empty();
+    let prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
-    let mut history = vec![ChatMessage::system(system_prompt)];
-    history.extend(prior_turns);
+    let mut cm = ConversationManager::new(
+        ctx.memory.clone(),
+        history_key.clone(),
+        Some(MAX_CHANNEL_HISTORY),
+    );
+    cm.add_message_silent(ChatMessage::system(system_prompt));
+    for turn in prior_turns {
+        cm.add_message_silent(turn);
+    }
+    // Add current user message (un-enriched) to history and cache.
+    cm.add_message_silent(ChatMessage::user(&msg.content));
+    sync_cm_to_cache(ctx.as_ref(), &history_key, &cm);
+
+    // Calculate initial message override for temporary RAG enrichment.
+    let initial_message_override = if !had_prior_history {
+        let memory_context =
+            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        if !memory_context.is_empty() {
+            Some(ChatMessage::user(format!("{memory_context}{}", msg.content)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -1686,7 +1711,7 @@ async fn process_channel_message(
     };
 
     // Record history length before tool loop so we can extract tool context after.
-    let history_len_before_tools = history.len();
+    let history_len_before_tools = cm.history().len();
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -1701,7 +1726,7 @@ async fn process_channel_message(
             Duration::from_secs(timeout_budget_secs),
             run_tool_call_loop(
                 active_provider.as_ref(),
-                &mut history,
+                &mut cm,
                 ctx.tools_registry.as_ref(),
                 ctx.observer.as_ref(),
                 route.provider.as_str(),
@@ -1720,6 +1745,7 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                initial_message_override,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -1854,18 +1880,23 @@ async fn process_channel_message(
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
+            let tool_summary = extract_tool_context_summary(cm.history(), history_len_before_tools);
             let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
                 delivered_response.clone()
             } else {
                 format!("{tool_summary}\n{delivered_response}")
             };
 
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
+            // CM already has the assistant response from run_tool_call_loop,
+            // but if we modified it (hooks/sanitization/summary), we need to update it.
+            if let Some(last) = cm.history_mut().last_mut() {
+                if last.role == "assistant" {
+                    last.content = history_response;
+                }
+            }
+
+            sync_cm_to_cache(ctx.as_ref(), &history_key, &cm);
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -1987,17 +2018,14 @@ async fn process_channel_message(
                     .downcast_ref::<providers::ProviderCapabilityError>()
                     .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && cm.rollback_user_turn(&msg.content).await;
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
                     // inherit this failed request as unfinished context.
-                    append_sender_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        ChatMessage::assistant("[Task failed — not continuing this request]"),
-                    );
+                    cm.add_message(ChatMessage::assistant("[Task failed — not continuing this request]")).await.ok();
                 }
+                sync_cm_to_cache(ctx.as_ref(), &history_key, &cm);
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
@@ -2039,11 +2067,8 @@ async fn process_channel_message(
             );
             // Close the orphan user turn so subsequent messages don't
             // inherit this timed-out request as unfinished context.
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
+            cm.add_message(ChatMessage::assistant("[Task timed out — not continuing this request]")).await.ok();
+            sync_cm_to_cache(ctx.as_ref(), &history_key, &cm);
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
@@ -2987,6 +3012,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        cli_path: config.runtime.cli.cli_path.clone(),
+        cli_timeout_secs: Some(config.runtime.cli.timeout_secs),
+        cli_allowed_tools: config.runtime.cli.allowed_tools.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(

@@ -34,16 +34,16 @@ This document outlines the architectural changes and implementation tasks to enh
 Refactor the dueling agent loops into a single cohesive structure powered by a `ConversationManager`.
 
 #### Acceptance Criteria
-- [ ] `ConversationManager` created and tested in isolation.
-- [ ] `src/agent/loop_.rs` reduced in size by offloading history logic.
-- [ ] `Agent::turn` and `run_tool_call_loop` share the same underlying logic.
+- [x] `ConversationManager` created and tested in isolation.
+- [x] `src/agent/loop_.rs` reduced in size by offloading history logic.
+- [x] `Agent::turn` and `run_tool_call_loop` share the same underlying logic.
 
 #### Atomic Tasks
-- **Task 1.1: Create ConversationManager [2h]**
+- **Task 1.1: Create ConversationManager [2h]** ✅ Completed
     - Objective: Implement `src/agent/conversation.rs` with history trimming and compaction.
     - Context Boundary: `src/agent/conversation.rs`, `src/agent/mod.rs`.
     - Validation: Unit tests for `trim_history` and `auto_compact_history` moved to the new struct.
-- **Task 1.2: Refactor loop_.rs to use ConversationManager [4h]**
+- **Task 1.2: Refactor loop_.rs to use ConversationManager [4h]** ✅ Completed
     - Objective: Replace raw `Vec<ChatMessage>` with `ConversationManager` in `run_tool_call_loop`.
     - Context Boundary: `src/agent/loop_.rs`, `src/agent/conversation.rs`.
     - Validation: Existing integration tests pass with the new abstraction.

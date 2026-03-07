@@ -1,3 +1,8 @@
+use crate::agent::conversation::{
+    build_native_assistant_history, build_native_assistant_history_from_parsed_calls,
+    ConversationManager,
+};
+use crate::agent::dispatcher::ParsedToolCall;
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -141,99 +146,6 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
 
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
-}
-
-/// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return;
-    }
-
-    let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
-}
-
-fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
-    let mut transcript = String::new();
-    for msg in messages {
-        let role = msg.role.to_uppercase();
-        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
-    }
-
-    if transcript.chars().count() > COMPACTION_MAX_SOURCE_CHARS {
-        truncate_with_ellipsis(&transcript, COMPACTION_MAX_SOURCE_CHARS)
-    } else {
-        transcript
-    }
-}
-
-fn apply_compaction_summary(
-    history: &mut Vec<ChatMessage>,
-    start: usize,
-    compact_end: usize,
-    summary: &str,
-) {
-    let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
-    history.splice(start..compact_end, std::iter::once(summary_msg));
-}
-
-async fn auto_compact_history(
-    history: &mut Vec<ChatMessage>,
-    provider: &dyn Provider,
-    model: &str,
-    max_history: usize,
-) -> Result<bool> {
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len().saturating_sub(1)
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return Ok(false);
-    }
-
-    let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
-    let compact_count = non_system_count.saturating_sub(keep_recent);
-    if compact_count == 0 {
-        return Ok(false);
-    }
-
-    let compact_end = start + compact_count;
-    let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
-    let transcript = build_compaction_transcript(&to_compact);
-
-    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
-
-    let summarizer_user = format!(
-        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
-        transcript
-    );
-
-    let summary_raw = provider
-        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
-        .await
-        .unwrap_or_else(|_| {
-            // Fallback to deterministic local truncation when summarization fails.
-            truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
-        });
-
-    let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
-    apply_compaction_summary(history, start, compact_end, &summary);
-
-    Ok(true)
 }
 
 /// Build context preamble by searching memory for relevant entries.
@@ -1669,80 +1581,6 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(
-    text: &str,
-    tool_calls: &[ToolCall],
-    reasoning_content: Option<&str>,
-) -> String {
-    let calls_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
-        })
-        .collect();
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
-
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
-    }
-
-    obj.to_string()
-}
-
-fn build_native_assistant_history_from_parsed_calls(
-    text: &str,
-    tool_calls: &[ParsedToolCall],
-    reasoning_content: Option<&str>,
-) -> Option<String> {
-    let calls_json = tool_calls
-        .iter()
-        .map(|tc| {
-            Some(serde_json::json!({
-                "id": tc.tool_call_id.clone()?,
-                "name": tc.name,
-                "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
-            }))
-        })
-        .collect::<Option<Vec<_>>>()?;
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
-
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
-    }
-
-    Some(obj.to_string())
-}
-
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
     let mut parts = Vec::new();
 
@@ -1762,13 +1600,6 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     }
 
     parts.join("\n")
-}
-
-#[derive(Debug, Clone)]
-struct ParsedToolCall {
-    name: String,
-    arguments: serde_json::Value,
-    tool_call_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1792,7 +1623,7 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
+    conversation_manager: &mut ConversationManager,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     provider_name: &str,
@@ -1804,7 +1635,7 @@ pub(crate) async fn agent_turn(
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
-        history,
+        conversation_manager,
         tools_registry,
         observer,
         provider_name,
@@ -1819,6 +1650,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -1994,7 +1826,7 @@ async fn execute_tools_sequential(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
+    conversation_manager: &mut ConversationManager,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     provider_name: &str,
@@ -2009,6 +1841,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    initial_message_override: Option<ChatMessage>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2033,7 +1866,25 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        let image_marker_count = multimodal::count_image_markers(history);
+        // Use initial_message_override for the very first LLM call if provided.
+        // This allows providing context (like RAG) that shouldn't be persisted.
+        let mut loop_history = if iteration == 0 {
+            if let Some(ref override_msg) = initial_message_override {
+                let mut h = conversation_manager.history().to_vec();
+                if let Some(last) = h.last_mut() {
+                    if last.role == "user" {
+                        *last = override_msg.clone();
+                    }
+                }
+                h
+            } else {
+                conversation_manager.history().to_vec()
+            }
+        } else {
+            conversation_manager.history().to_vec()
+        };
+
+        let image_marker_count = multimodal::count_image_markers(&loop_history);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
@@ -2046,7 +1897,7 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(&mut loop_history, multimodal_config).await?;
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2061,7 +1912,7 @@ pub(crate) async fn run_tool_call_loop(
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
-            messages_count: history.len(),
+            messages_count: loop_history.len(),
         });
         runtime_trace::record_event(
             "llm_request",
@@ -2073,7 +1924,7 @@ pub(crate) async fn run_tool_call_loop(
             None,
             serde_json::json!({
                 "iteration": iteration + 1,
-                "messages_count": history.len(),
+                "messages_count": loop_history.len(),
             }),
         );
 
@@ -2081,7 +1932,7 @@ pub(crate) async fn run_tool_call_loop(
 
         // Fire void hook before LLM call
         if let Some(hooks) = hooks {
-            hooks.fire_llm_input(history, model).await;
+            hooks.fire_llm_input(&mut loop_history, model).await;
         }
 
         // Unified path via Provider::chat so provider-specific native tool logic
@@ -2299,13 +2150,13 @@ pub(crate) async fn run_tool_call_loop(
                         break; // receiver dropped
                     }
                 }
-                if !chunk.is_empty() {
-                    let _ = tx.send(chunk).await;
-                }
+            if !chunk.is_empty() {
+                let _ = tx.send(chunk).await;
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
         }
+        conversation_manager.add_message(ChatMessage::assistant(response_text.clone())).await?;
+        return Ok(display_text);
+    }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
         if !silent && !display_text.is_empty() {
@@ -2568,7 +2419,7 @@ pub(crate) async fn run_tool_call_loop(
         // Native mode: use JSON-structured messages so convert_messages() can
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
-        history.push(ChatMessage::assistant(assistant_history_content));
+        conversation_manager.add_message(ChatMessage::assistant(assistant_history_content)).await?;
         if native_tool_calls.is_empty() {
             let all_results_have_ids = use_native_tools
                 && !individual_results.is_empty()
@@ -2581,10 +2432,10 @@ pub(crate) async fn run_tool_call_loop(
                         "tool_call_id": tool_call_id,
                         "content": result,
                     });
-                    history.push(ChatMessage::tool(tool_msg.to_string()));
+                    conversation_manager.add_message(ChatMessage::tool(tool_msg.to_string())).await?;
                 }
             } else {
-                history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+                conversation_manager.add_message(ChatMessage::user(format!("[Tool results]\n{tool_results}"))).await?;
             }
         } else {
             for (native_call, (_, result)) in
@@ -2594,7 +2445,7 @@ pub(crate) async fn run_tool_call_loop(
                     "tool_call_id": native_call.id,
                     "content": result,
                 });
-                history.push(ChatMessage::tool(tool_msg.to_string()));
+                conversation_manager.add_message(ChatMessage::tool(tool_msg.to_string())).await?;
             }
         }
     }
@@ -2734,6 +2585,9 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        cli_path: config.runtime.cli.cli_path.clone(),
+        cli_timeout_secs: Some(config.runtime.cli.timeout_secs),
+        cli_allowed_tools: config.runtime.cli.allowed_tools.clone(),
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -2940,14 +2794,17 @@ pub async fn run(
             format!("{context}{msg}")
         };
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        let mut conversation_manager = ConversationManager::new(
+            mem.clone(),
+            "default".to_string(), // TODO: allow session ID configuration
+            Some(config.agent.max_history_messages),
+        );
+        conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
+        conversation_manager.add_message(ChatMessage::user(&enriched)).await?;
 
         let response = run_tool_call_loop(
             provider.as_ref(),
-            &mut history,
+            &mut conversation_manager,
             &tools_registry,
             observer.as_ref(),
             provider_name,
@@ -2962,6 +2819,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -2973,7 +2831,12 @@ pub async fn run(
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut conversation_manager = ConversationManager::new(
+            mem.clone(),
+            "cli".to_string(),
+            Some(config.agent.max_history_messages),
+        );
+        conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
 
         loop {
             print!("> ");
@@ -3019,8 +2882,8 @@ pub async fn run(
                         continue;
                     }
 
-                    history.clear();
-                    history.push(ChatMessage::system(&system_prompt));
+                    conversation_manager.history_mut().clear();
+                    conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -3064,11 +2927,11 @@ pub async fn run(
                 format!("{context}{user_input}")
             };
 
-            history.push(ChatMessage::user(&enriched));
+            conversation_manager.add_message(ChatMessage::user(&enriched)).await?;
 
             let response = match run_tool_call_loop(
                 provider.as_ref(),
-                &mut history,
+                &mut conversation_manager,
                 &tools_registry,
                 observer.as_ref(),
                 provider_name,
@@ -3083,6 +2946,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3104,11 +2968,9 @@ pub async fn run(
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
-                &mut history,
+            if let Ok(compacted) = conversation_manager.auto_compact(
                 provider.as_ref(),
                 model_name,
-                config.agent.max_history_messages,
             )
             .await
             {
@@ -3118,7 +2980,7 @@ pub async fn run(
             }
 
             // Hard cap as a safety net.
-            trim_history(&mut history, config.agent.max_history_messages);
+            conversation_manager.trim();
         }
     }
 
@@ -3188,6 +3050,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        cli_path: config.runtime.cli.cli_path.clone(),
+        cli_timeout_secs: Some(config.runtime.cli.timeout_secs),
+        cli_allowed_tools: config.runtime.cli.allowed_tools.clone(),
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
@@ -3295,14 +3160,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         format!("{context}{message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    let mut conversation_manager = ConversationManager::new(
+        mem.clone(),
+        "channel".to_string(), // TODO: allow session ID from channel
+        Some(config.agent.max_history_messages),
+    );
+    conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
+    conversation_manager.add_message(ChatMessage::user(&enriched)).await?;
 
     agent_turn(
         provider.as_ref(),
-        &mut history,
+        &mut conversation_manager,
         &tools_registry,
         observer.as_ref(),
         provider_name,
@@ -3324,6 +3192,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use crate::memory::MemoryEntry;
+
+    struct MockMemory;
+    #[async_trait]
+    impl Memory for MockMemory {
+        fn name(&self) -> &str { "mock" }
+        async fn store(&self, _k: &str, _c: &str, _cat: MemoryCategory, _sid: Option<&str>) -> Result<()> { Ok(()) }
+        async fn recall(&self, _q: &str, _l: usize, _sid: Option<&str>) -> Result<Vec<MemoryEntry>> { Ok(vec![]) }
+        async fn get(&self, _k: &str) -> Result<Option<MemoryEntry>> { Ok(None) }
+        async fn list(&self, _c: Option<&MemoryCategory>, _sid: Option<&str>) -> Result<Vec<MemoryEntry>> { Ok(vec![]) }
+        async fn forget(&self, _k: &str) -> Result<bool> { Ok(true) }
+        async fn count(&self) -> Result<usize> { Ok(0) }
+        async fn health_check(&self) -> bool { true }
+    }
+
+    fn build_cm() -> ConversationManager {
+        ConversationManager::new(Arc::new(MockMemory), "test".into(), None)
+    }
 
     #[test]
     fn test_scrub_credentials() {
@@ -3601,15 +3487,16 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
+        let mut cm = build_cm();
+        cm.history_mut().push(ChatMessage::user(
             "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
+        ));
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
             &provider,
-            &mut history,
+            &mut cm,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -3624,6 +3511,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3641,9 +3529,10 @@ mod tests {
         };
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
-        let mut history = vec![ChatMessage::user(format!(
+        let mut cm = build_cm();
+        cm.history_mut().push(ChatMessage::user(format!(
             "[IMAGE:data:image/png;base64,{oversized_payload}]"
-        ))];
+        )));
 
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
@@ -3655,7 +3544,7 @@ mod tests {
 
         let err = run_tool_call_loop(
             &provider,
-            &mut history,
+            &mut cm,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -3670,6 +3559,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3687,15 +3577,16 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
+        let mut cm = build_cm();
+        cm.history_mut().push(ChatMessage::user(
             "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
+        ));
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
             &provider,
-            &mut history,
+            &mut cm,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -3710,6 +3601,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3813,15 +3705,14 @@ mod tests {
         };
         let approval_mgr = ApprovalManager::from_config(&approval_cfg);
 
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
+        let mut cm = build_cm();
+        cm.history_mut().push(ChatMessage::system("test-system"));
+        cm.history_mut().push(ChatMessage::user("run tool calls"));
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
             &provider,
-            &mut history,
+            &mut cm,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -3836,6 +3727,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3846,7 +3738,7 @@ mod tests {
             "tools should execute successfully"
         );
 
-        let tool_results_message = history
+        let tool_results_message = cm.history()
             .iter()
             .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
             .expect("tool results message should be present");
@@ -3882,15 +3774,14 @@ mod tests {
             Arc::clone(&invocations),
         ))];
 
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
+        let mut cm = build_cm();
+        cm.history_mut().push(ChatMessage::system("test-system"));
+        cm.history_mut().push(ChatMessage::user("run tool calls"));
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
             &provider,
-            &mut history,
+            &mut cm,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -3905,6 +3796,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -3916,7 +3808,7 @@ mod tests {
             "duplicate tool call with same args should not execute twice"
         );
 
-        let tool_results = history
+        let tool_results = cm.history()
             .iter()
             .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
             .expect("prompt-mode tool result payload should be present");
@@ -3938,15 +3830,14 @@ mod tests {
             Arc::clone(&invocations),
         ))];
 
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
+        let mut cm = build_cm();
+        cm.history_mut().push(ChatMessage::system("test-system"));
+        cm.history_mut().push(ChatMessage::user("run tool calls"));
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
             &provider,
-            &mut history,
+            &mut cm,
             &tools_registry,
             &observer,
             "mock-provider",
@@ -3961,6 +3852,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -3968,13 +3860,13 @@ mod tests {
         assert_eq!(result, "done");
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
-            history.iter().any(|msg| {
+            cm.history().iter().any(|msg| {
                 msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_abc\"")
             }),
             "tool result should preserve parsed fallback tool_call_id in native mode"
         );
         assert!(
-            history
+            cm.history()
                 .iter()
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
@@ -4435,70 +4327,6 @@ Tail"#;
     }
 
     #[test]
-    fn trim_history_preserves_system_prompt() {
-        let mut history = vec![ChatMessage::system("system prompt")];
-        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
-            history.push(ChatMessage::user(format!("msg {i}")));
-        }
-        let original_len = history.len();
-        assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
-
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-
-        // System prompt preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "system prompt");
-        // Trimmed to limit
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                                     // Most recent messages preserved
-        let last = &history[history.len() - 1];
-        assert_eq!(
-            last.content,
-            format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19)
-        );
-    }
-
-    #[test]
-    fn trim_history_noop_when_within_limit() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("hello"),
-            ChatMessage::assistant("hi"),
-        ];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history.len(), 3);
-    }
-
-    #[test]
-    fn build_compaction_transcript_formats_roles() {
-        let messages = vec![
-            ChatMessage::user("I like dark mode"),
-            ChatMessage::assistant("Got it"),
-        ];
-        let transcript = build_compaction_transcript(&messages);
-        assert!(transcript.contains("USER: I like dark mode"));
-        assert!(transcript.contains("ASSISTANT: Got it"));
-    }
-
-    #[test]
-    fn apply_compaction_summary_replaces_old_segment() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old 1"),
-            ChatMessage::assistant("old 2"),
-            ChatMessage::user("recent 1"),
-            ChatMessage::assistant("recent 2"),
-        ];
-
-        apply_compaction_summary(&mut history, 1, 3, "- user prefers concise replies");
-
-        assert_eq!(history.len(), 4);
-        assert!(history[1].content.contains("Compaction summary"));
-        assert!(history[2].content.contains("recent 1"));
-        assert!(history[3].content.contains("recent 2"));
-    }
-
-    #[test]
     fn autosave_memory_key_has_prefix_and_uniqueness() {
         let key1 = autosave_memory_key("user_msg");
         let key2 = autosave_memory_key("user_msg");
@@ -4623,42 +4451,6 @@ Done."#;
         let result = parse_tool_call_value(&value);
         assert!(result.is_some());
         assert_eq!(result.unwrap().name, "test");
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Recovery Tests - History Management
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn trim_history_with_no_system_prompt() {
-        // Recovery: History without system prompt should trim correctly
-        let mut history = vec![];
-        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
-            history.push(ChatMessage::user(format!("msg {i}")));
-        }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
-    }
-
-    #[test]
-    fn trim_history_preserves_role_ordering() {
-        // Recovery: After trimming, role ordering should remain consistent
-        let mut history = vec![ChatMessage::system("system")];
-        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
-            history.push(ChatMessage::user(format!("user {i}")));
-            history.push(ChatMessage::assistant(format!("assistant {i}")));
-        }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[history.len() - 1].role, "assistant");
-    }
-
-    #[test]
-    fn trim_history_with_only_system_prompt() {
-        // Recovery: Only system prompt should not be trimmed
-        let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history.len(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -5059,51 +4851,6 @@ Let me check the result."#;
         assert_eq!(result, input, "short values should not be redacted");
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // TG4 (inline): trim_history edge cases
-    // ─────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn trim_history_empty_history() {
-        let mut history: Vec<crate::providers::ChatMessage> = vec![];
-        trim_history(&mut history, 10);
-        assert!(history.is_empty());
-    }
-
-    #[test]
-    fn trim_history_system_only() {
-        let mut history = vec![crate::providers::ChatMessage::system("system prompt")];
-        trim_history(&mut history, 10);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "system");
-    }
-
-    #[test]
-    fn trim_history_exactly_at_limit() {
-        let mut history = vec![
-            crate::providers::ChatMessage::system("system"),
-            crate::providers::ChatMessage::user("msg 1"),
-            crate::providers::ChatMessage::assistant("reply 1"),
-        ];
-        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
-        assert_eq!(history.len(), 3, "should not trim when exactly at limit");
-    }
-
-    #[test]
-    fn trim_history_removes_oldest_non_system() {
-        let mut history = vec![
-            crate::providers::ChatMessage::system("system"),
-            crate::providers::ChatMessage::user("old msg"),
-            crate::providers::ChatMessage::assistant("old reply"),
-            crate::providers::ChatMessage::user("new msg"),
-            crate::providers::ChatMessage::assistant("new reply"),
-        ];
-        trim_history(&mut history, 2);
-        assert_eq!(history.len(), 3); // system + 2 kept
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "new msg");
-    }
-
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
     /// the output must contain ZERO XML protocol artifacts. In the native path
     /// `build_tool_instructions` is never called, so the system prompt alone
@@ -5308,66 +5055,4 @@ Let me check the result."#;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // reasoning_content pass-through tests for history builders
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn build_native_assistant_history_includes_reasoning_content() {
-        let calls = vec![ToolCall {
-            id: "call_1".into(),
-            name: "shell".into(),
-            arguments: "{}".into(),
-        }];
-        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str(), Some("answer"));
-        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
-        assert!(parsed["tool_calls"].is_array());
-    }
-
-    #[test]
-    fn build_native_assistant_history_omits_reasoning_content_when_none() {
-        let calls = vec![ToolCall {
-            id: "call_1".into(),
-            name: "shell".into(),
-            arguments: "{}".into(),
-        }];
-        let result = build_native_assistant_history("answer", &calls, None);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str(), Some("answer"));
-        assert!(parsed.get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn build_native_assistant_history_from_parsed_calls_includes_reasoning_content() {
-        let calls = vec![ParsedToolCall {
-            name: "shell".into(),
-            arguments: serde_json::json!({"command": "pwd"}),
-            tool_call_id: Some("call_2".into()),
-        }];
-        let result = build_native_assistant_history_from_parsed_calls(
-            "answer",
-            &calls,
-            Some("deep thought"),
-        );
-        assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
-        assert_eq!(parsed["content"].as_str(), Some("answer"));
-        assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
-        assert!(parsed["tool_calls"].is_array());
-    }
-
-    #[test]
-    fn build_native_assistant_history_from_parsed_calls_omits_reasoning_content_when_none() {
-        let calls = vec![ParsedToolCall {
-            name: "shell".into(),
-            arguments: serde_json::json!({"command": "pwd"}),
-            tool_call_id: Some("call_2".into()),
-        }];
-        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
-        assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
-        assert_eq!(parsed["content"].as_str(), Some("answer"));
-        assert!(parsed.get("reasoning_content").is_none());
-    }
 }

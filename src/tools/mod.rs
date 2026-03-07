@@ -213,7 +213,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -306,6 +306,7 @@ pub fn all_tools_with_runtime(
         let parent_tools = Arc::new(tool_arcs.clone());
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
+            memory.clone(),
             delegate_fallback_credential,
             security.clone(),
             crate::providers::ProviderRuntimeOptions {
@@ -316,6 +317,9 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                cli_path: None,
+                cli_timeout_secs: None,
+                cli_allowed_tools: None,
             },
         )
         .with_parent_tools(parent_tools)

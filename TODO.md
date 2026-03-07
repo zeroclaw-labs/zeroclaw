@@ -8,7 +8,7 @@
 
 ## High Priority
 - [ ] Fix rate-limit amnesia in agent loop
-- [ ] Refactor loop_.rs into smaller modules
+- [x] Refactor loop_.rs into smaller modules (Task 1.2)
 
 ## Maintenance
 - [ ] Standardize Bazel build targets
