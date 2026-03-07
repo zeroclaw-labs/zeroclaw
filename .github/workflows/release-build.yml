@@ -18,11 +18,12 @@ env:
     GIT_CONFIG_KEY_0: core.hooksPath
     GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
+    ENSURE_RUST_COMPONENTS: "rustfmt clippy"
 
 jobs:
     build-and-test:
         name: Build and Test (Linux x86_64)
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404]
+        runs-on: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
         timeout-minutes: 120
 
         steps:
@@ -47,12 +48,6 @@ jobs:
               shell: bash
               run: ./scripts/ci/ensure_cc.sh
 
-            - name: Ensure cargo component
-              shell: bash
-              env:
-                  ENSURE_CARGO_COMPONENT_STRICT: "true"
-              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
-
             - name: Ensure rustfmt and clippy components
               shell: bash
               run: rustup component add rustfmt clippy --toolchain 1.92.0
@@ -63,6 +58,12 @@ jobs:
                   set -euo pipefail
                   toolchain_bin="$(dirname "$(rustup which --toolchain 1.92.0 cargo)")"
                   echo "$toolchain_bin" >> "$GITHUB_PATH"
+
+            - name: Ensure cargo component
+              shell: bash
+              env:
+                  ENSURE_CARGO_COMPONENT_STRICT: "true"
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
 
             - name: Cache Cargo registry and target
               uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
