@@ -252,6 +252,8 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
+        } else if ct.starts_with("image/") {
+            parts.push(format!("[IMAGE:{url}]"));
         } else {
             tracing::debug!(
                 name,
@@ -1973,6 +1975,41 @@ mod tests {
     }
 
     // process_attachments tests
+
+    #[tokio::test]
+    async fn process_attachments_image_produces_image_marker() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/photo.png",
+            "filename": "photo.png",
+            "content_type": "image/png"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.png]"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_attachments_multiple_images_produce_markers() {
+        let client = reqwest::Client::new();
+        let attachments = vec![
+            serde_json::json!({
+                "url": "https://cdn.discordapp.com/attachments/1/2/a.jpg",
+                "filename": "a.jpg",
+                "content_type": "image/jpeg"
+            }),
+            serde_json::json!({
+                "url": "https://cdn.discordapp.com/attachments/1/2/b.png",
+                "filename": "b.png",
+                "content_type": "image/png"
+            }),
+        ];
+        let result = process_attachments(&attachments, &client).await;
+        assert!(result.contains("[IMAGE:https://cdn.discordapp.com/attachments/1/2/a.jpg]"));
+        assert!(result.contains("[IMAGE:https://cdn.discordapp.com/attachments/1/2/b.png]"));
+    }
 
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
