@@ -203,6 +203,8 @@ struct LarkMessage {
     chat_type: String,
     message_type: String,
     #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
     content: String,
     #[serde(default)]
     mentions: Vec<serde_json::Value>,
@@ -215,6 +217,8 @@ const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(300);
 const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
 /// Fallback tenant token TTL when `expire`/`expires_in` is absent.
 const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
+/// Timeout for quoted-message fetch to avoid blocking inbound handlers.
+const LARK_QUOTED_MESSAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 const LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT: &str =
@@ -462,6 +466,10 @@ impl LarkChannel {
         format!("{}/im/v1/images/{image_key}", self.api_base())
     }
 
+    fn message_get_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}", self.api_base())
+    }
+
     fn resolved_bot_open_id(&self) -> Option<String> {
         self.resolved_bot_open_id
             .read()
@@ -527,6 +535,68 @@ impl LarkChannel {
                 "Lark image download failed: status={status}, body={}",
                 crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
             );
+        }
+    }
+
+    async fn fetch_quoted_message_content(
+        &self,
+        message_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if message_id.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+        let url = self.message_get_url(message_id);
+
+        loop {
+            let response = self
+                .http_client()
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .timeout(LARK_QUOTED_MESSAGE_FETCH_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        anyhow::anyhow!(
+                            "Lark quoted message fetch timed out after {}s: message_id={message_id}",
+                            LARK_QUOTED_MESSAGE_FETCH_TIMEOUT.as_secs()
+                        )
+                    } else {
+                        error.into()
+                    }
+                })?;
+
+            let status = response.status();
+            let body = response.bytes().await?;
+            let parsed = serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap_or(serde_json::Value::Null);
+
+            if should_refresh_lark_tenant_token(status, &parsed) && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !status.is_success() {
+                anyhow::bail!(
+                    "Lark quoted message fetch failed: status={status}, body={}",
+                    crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
+                );
+            }
+
+            let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                anyhow::bail!(
+                    "Lark quoted message fetch returned non-zero code={code}, body={}",
+                    crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
+                );
+            }
+
+            return Ok(extract_quoted_message_from_response(&parsed));
         }
     }
 
@@ -888,7 +958,7 @@ impl LarkChannel {
 
                     // Strip @_user_N placeholders
                     let text = strip_at_placeholders(&text);
-                    let text = text.trim().to_string();
+                    let mut text = text.trim().to_string();
                     if text.is_empty() { continue; }
 
                     // Group-chat: only respond when explicitly @-mentioned
@@ -904,6 +974,25 @@ impl LarkChannel {
                         )
                     {
                         continue;
+                    }
+
+                    if let Some(parent_id) = lark_msg
+                        .parent_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    {
+                        match self.fetch_quoted_message_content(parent_id).await {
+                            Ok(Some(quoted)) => {
+                                text = format_with_quoted_message(&quoted, &text);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(
+                                    "Lark WS: failed to fetch quoted message {parent_id}: {error}"
+                                );
+                            }
+                        }
                     }
 
                     let ack_emoji =
@@ -1348,6 +1437,26 @@ impl LarkChannel {
             return messages;
         }
 
+        let mut text = text;
+        let parent_id = event
+            .pointer("/message/parent_id")
+            .and_then(|pid| pid.as_str())
+            .map(str::trim)
+            .filter(|pid| !pid.is_empty());
+        if let Some(parent_id) = parent_id {
+            match self.fetch_quoted_message_content(parent_id).await {
+                Ok(Some(quoted)) => {
+                    text = format_with_quoted_message(&quoted, &text);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        "Lark webhook: failed to fetch quoted message {parent_id}: {error}"
+                    );
+                }
+            }
+        }
+
         let timestamp = event
             .pointer("/message/create_time")
             .and_then(|t| t.as_str())
@@ -1377,6 +1486,47 @@ impl LarkChannel {
 
         messages
     }
+}
+
+fn parse_quoted_content(message_type: &str, content: &str) -> Option<String> {
+    match message_type {
+        "text" => serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|v| {
+                v.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .filter(|value| !value.is_empty()),
+        "post" => parse_post_content_details(content)
+            .map(|details| details.text)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        _ => None,
+    }
+}
+
+fn extract_quoted_message_from_response(response: &serde_json::Value) -> Option<String> {
+    let item = response
+        .get("data")
+        .and_then(|d| d.get("items"))
+        .and_then(|items| items.as_array())
+        .and_then(|items| items.first());
+    let msg_type = item
+        .and_then(|it| it.get("msg_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let raw_content = item
+        .and_then(|it| it.get("body"))
+        .and_then(|body| body.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    parse_quoted_content(msg_type, raw_content)
+}
+
+fn format_with_quoted_message(quoted: &str, message: &str) -> String {
+    format!("[Replying to: \"{}\"]\n\n{}", quoted.trim(), message)
 }
 
 #[async_trait]
@@ -2767,5 +2917,76 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    #[test]
+    fn lark_parse_quoted_content_extracts_text_payload() {
+        let quoted = parse_quoted_content("text", r#"{"text":"quoted hello"}"#);
+        assert_eq!(quoted.as_deref(), Some("quoted hello"));
+    }
+
+    #[test]
+    fn lark_parse_quoted_content_extracts_post_payload() {
+        let quoted = parse_quoted_content(
+            "post",
+            r#"{"zh_cn":{"title":"","content":[[{"tag":"text","text":"quoted from post"}]]}}"#,
+        );
+        assert_eq!(quoted.as_deref(), Some("quoted from post"));
+    }
+
+    #[test]
+    fn lark_format_with_quoted_message_prefixes_context() {
+        let content = format_with_quoted_message("older message", "new message");
+        assert_eq!(content, "[Replying to: \"older message\"]\n\nnew message");
+    }
+
+    #[test]
+    fn lark_extract_quoted_message_from_response_parses_text_item() {
+        let response = serde_json::json!({
+            "code": 0,
+            "data": {
+                "items": [{
+                    "msg_type": "text",
+                    "body": {
+                        "content": r#"{"text":"quoted hello"}"#
+                    }
+                }]
+            }
+        });
+        let quoted = extract_quoted_message_from_response(&response);
+        assert_eq!(quoted.as_deref(), Some("quoted hello"));
+    }
+
+    #[test]
+    fn lark_extract_quoted_message_from_response_handles_missing_items() {
+        let response = serde_json::json!({
+            "code": 0,
+            "data": {}
+        });
+        let quoted = extract_quoted_message_from_response(&response);
+        assert_eq!(quoted, None);
+    }
+
+    #[test]
+    fn lark_parse_quoted_content_ignores_unsupported_type() {
+        let quoted = parse_quoted_content("file", r#"{"file_key":"abc"}"#);
+        assert_eq!(quoted, None);
+    }
+
+    #[test]
+    fn lark_extract_quoted_message_from_response_ignores_unsupported_type() {
+        let response = serde_json::json!({
+            "code": 0,
+            "data": {
+                "items": [{
+                    "msg_type": "file",
+                    "body": {
+                        "content": r#"{"file_key":"abc"}"#
+                    }
+                }]
+            }
+        });
+        let quoted = extract_quoted_message_from_response(&response);
+        assert_eq!(quoted, None);
     }
 }
