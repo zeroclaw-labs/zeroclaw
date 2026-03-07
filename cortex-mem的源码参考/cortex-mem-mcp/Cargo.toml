@@ -1,0 +1,40 @@
+[package]
+name = "cortex-mem-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server for Cortex-Mem memory management"
+
+[[bin]]
+name = "cortex-mem-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Local dependencies
+cortex-mem-core = { path = "../cortex-mem-core" }
+cortex-mem-tools = { path = "../cortex-mem-tools" }
+cortex-mem-config = { path = "../cortex-mem-config" }
+
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = "0.1"
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# MCP SDK
+rmcp = { version = "0.14", features = ["server", "transport-io"] }
+schemars = { version = "1.0", features = ["derive"] }
+
+# CLI framework  
+clap = { workspace = true }
+
+# Directory utilities
+dirs = "5.0"

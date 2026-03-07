@@ -1,0 +1,15 @@
+[package]
+name = "cortex-mem-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Configuration crate for Cortex Memory system"
+
+[dependencies]
+serde = { workspace = true }
+toml = "0.9"
+directories = "5.0"
+anyhow = { workspace = true }
+thiserror = { workspace = true }

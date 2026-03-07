@@ -1,0 +1,44 @@
+[package]
+name = "cortex-mem-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core memory management engine for Cortex Memory system"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
+rig-core = { workspace = true }
+reqwest = { workspace = true }
+log = "0.4"
+
+# Additional dependencies
+regex = "1.10"
+sha2 = "0.10"
+cortex-mem-config = { path = "../cortex-mem-config" }
+schemars = "0.8"
+
+# Vector search dependencies (mandatory)
+qdrant-client = "1.17"
+dyn-clone = "1.0"
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = "3.10"

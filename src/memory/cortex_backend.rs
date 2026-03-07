@@ -127,15 +127,38 @@ impl Memory for CortexMemory {
         );
 
         // Use MemoryOperations to add message
-        self.operations
+        let message_uri = self.operations
             .add_message(thread_id, role, content)
             .await
             .context("Failed to store memory in Cortex-Memory")?;
 
+        // 🔧 Auto-trigger: Check if we should trigger memory extraction
+        // This mimics the cortex-mem-mcp pattern
+        if let Some(tx) = self.operations.memory_event_tx() {
+            use cortex_mem_core::memory_events::MemoryEvent;
+            
+            let user_id = self.operations.default_user_id().to_string();
+            let agent_id = self.operations.default_agent_id().to_string();
+
+            // Send SessionClosed event to trigger extraction and layer generation
+            let _ = tx.send(MemoryEvent::SessionClosed {
+                session_id: thread_id.to_string(),
+                user_id,
+                agent_id,
+            });
+
+            tracing::info!(
+                "🚀 Triggered SessionClosed event for memory extraction: thread={}, uri={}",
+                thread_id,
+                message_uri
+            );
+        }
+
         tracing::info!(
-            "Cortex stored memory successfully: key={}, thread={}",
+            "Cortex stored memory successfully: key={}, thread={}, uri={}",
             _key,
-            thread_id
+            thread_id,
+            message_uri
         );
 
         Ok(())

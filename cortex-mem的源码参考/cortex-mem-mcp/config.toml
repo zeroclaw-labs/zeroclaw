@@ -1,0 +1,38 @@
+# Main configuration for the memo-rs system
+
+[qdrant]
+url = "http://localhost:6334"
+collection_name = "memo-rs"
+# embedding_dim = 1024 # Optional, will be auto-detected if not specified
+timeout_secs = 30
+
+[llm]
+api_base_url = "https://wanqing-api.corp.kuaishou.com/api/agent/v1/apps"
+api_key = "fs2wzco3o7haz38df1jo4vavnvauxtuz3f0b"
+model_efficient = "app-5f3igd-1754481092760463893"
+temperature = 0.1
+max_tokens = 16384
+
+[server]
+host = "0.0.0.0"
+port = 3000
+cors_origins = ["*"]
+
+[embedding]
+api_base_url = "https://wanqing-api.corp.kuaishou.com/api/gateway/v1/endpoints"
+model_name = "ep-9kf01g-1762237999831608613"
+api_key = "fs2wzco3o7haz38df1jo4vavnvauxtuz3f0b"
+batch_size = 10
+timeout_secs = 30
+
+[memory]
+max_memories = 10000
+similarity_threshold = 0.65
+max_search_results = 50
+enable_deduplication = true
+# memory_ttl_hours = 24 # Optional
+auto_summary_threshold = 32768
+auto_enhance = true
+deduplicate = true
+merge_threshold = 0.75
+search_similarity_threshold = 0.6
