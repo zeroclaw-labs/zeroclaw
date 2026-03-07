@@ -1,0 +1,234 @@
+"""Integration test targets for ZeroClaw."""
+
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# -----------------------------------------------------------------------------
+# Integration Test Targets
+# Each .rs file in tests/ becomes a separate test target
+# Tests depend on zeroclaw_lib and use crates directly from @crates
+# -----------------------------------------------------------------------------
+
+rust_test(
+    name = "agent_e2e",
+    srcs = ["agent_e2e.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:wiremock",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+    proc_macro_deps = [
+        "@crates//:async-trait",
+    ],
+)
+
+rust_test(
+    name = "agent_loop_robustness",
+    srcs = ["agent_loop_robustness.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+    proc_macro_deps = [
+        "@crates//:async-trait",
+    ],
+)
+
+rust_test(
+    name = "channel_routing",
+    srcs = ["channel_routing.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "config_persistence",
+    srcs = ["config_persistence.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "config_schema",
+    srcs = ["config_schema.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "dockerignore_test",
+    srcs = ["dockerignore_test.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "hooks_integration",
+    srcs = ["hooks_integration.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "memory_comparison",
+    srcs = ["memory_comparison.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "memory_restart",
+    srcs = ["memory_restart.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "otel_dependency_feature_regression",
+    srcs = ["otel_dependency_feature_regression.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "provider_resolution",
+    srcs = ["provider_resolution.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "provider_schema",
+    srcs = ["provider_schema.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "reply_target_field_regression",
+    srcs = ["reply_target_field_regression.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "telegram_attachment_fallback",
+    srcs = ["telegram_attachment_fallback.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+rust_test(
+    name = "whatsapp_webhook_security",
+    srcs = ["whatsapp_webhook_security.rs"],
+    data = glob(["fixtures/**"]),
+    deps = [
+        "//:zeroclaw_lib",
+        "@crates//:tokio",
+        "@crates//:serde_json",
+        "@crates//:anyhow",
+    ],
+)
+
+# -----------------------------------------------------------------------------
+# Test Suite (run all integration tests)
+# Usage: bazel test //tests:all
+# -----------------------------------------------------------------------------
+
+test_suite(
+    name = "all",
+    tests = [
+        ":agent_e2e",
+        ":agent_loop_robustness",
+        ":channel_routing",
+        ":config_persistence",
+        ":config_schema",
+        ":dockerignore_test",
+        ":hooks_integration",
+        ":memory_comparison",
+        ":memory_restart",
+        ":otel_dependency_feature_regression",
+        ":provider_resolution",
+        ":provider_schema",
+        ":reply_target_field_regression",
+        ":telegram_attachment_fallback",
+        ":whatsapp_webhook_security",
+    ],
+)

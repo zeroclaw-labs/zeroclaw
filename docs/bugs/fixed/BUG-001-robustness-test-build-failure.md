@@ -1,8 +1,9 @@
 ## 🐛 BUG-001: agent_loop_robustness fails to build [SEVERITY: High]
 
-**Status**: 🐛 Open
+**Status**: ✅ Fixed
 **Discovered**: 2026-03-07 during Agent Stability investigation
-**Impact**: Blocks validation of agent loop stability fixes.
+**Resolved**: 2026-03-07
+**Impact**: Previously blocked validation of agent loop stability fixes. Now resolved.
 
 **Reproduction**:
 1. Run `bazel test //tests:agent_loop_robustness`
