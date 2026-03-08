@@ -51,8 +51,10 @@ pub mod memory_store;
 pub mod model_routing_config;
 pub mod node_tool;
 pub mod pdf_read;
+pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod report_templates;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
@@ -96,6 +98,7 @@ pub use model_routing_config::ModelRoutingConfigTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use pdf_read::PdfReadTool;
+pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -336,6 +339,14 @@ pub fn all_tools_with_runtime(
             root_config.web_search.timeout_secs,
             root_config.config_path.clone(),
             root_config.secrets.encrypt,
+        )));
+    }
+
+    // Project delivery intelligence
+    if root_config.project_intel.enabled {
+        tool_arcs.push(Arc::new(ProjectIntelTool::new(
+            root_config.project_intel.default_language.clone(),
+            root_config.project_intel.risk_sensitivity.clone(),
         )));
     }
 
