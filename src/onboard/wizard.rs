@@ -42,6 +42,8 @@ enum ContainerRuntime {
     Containerd,
     /// Kubernetes (no reliable host alias)
     Kubernetes,
+    /// Unknown container runtime (no reliable host alias)
+    Unknown,
 }
 
 /// Input signals for container runtime detection (used for deterministic testing).
@@ -90,10 +92,15 @@ fn detect_container_runtime_from_inputs(inputs: &ContainerRuntimeInputs) -> Cont
 
     // Check for generic container env var
     if let Some(val) = &inputs.container_env_var {
-        if val.to_lowercase().contains("podman") {
+        let val_lower = val.to_lowercase();
+        if val_lower.contains("podman") {
             return ContainerRuntime::Podman;
         }
-        return ContainerRuntime::Docker;
+        if val_lower.contains("docker") {
+            return ContainerRuntime::Docker;
+        }
+        // Unknown container runtime - require explicit URL input
+        return ContainerRuntime::Unknown;
     }
 
     ContainerRuntime::None
@@ -118,7 +125,9 @@ fn default_local_host() -> Option<&'static str> {
         ContainerRuntime::None => Some("localhost"),
         ContainerRuntime::Docker => Some("host.docker.internal"),
         ContainerRuntime::Podman => Some("host.containers.internal"),
-        ContainerRuntime::Containerd | ContainerRuntime::Kubernetes => None,
+        ContainerRuntime::Containerd | ContainerRuntime::Kubernetes | ContainerRuntime::Unknown => {
+            None
+        }
     }
 }
 
@@ -1534,7 +1543,9 @@ fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
         .is_some_and(|host| {
             // Strip brackets from IPv6 addresses for comparison
             let host_clean = host.trim_start_matches('[').trim_end_matches(']');
-            matches!(
+
+            // Explicit loopback and container host aliases
+            if matches!(
                 host_clean,
                 "localhost"
                     | "127.0.0.1"
@@ -1542,7 +1553,26 @@ fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
                     | "0.0.0.0"
                     | "host.docker.internal"
                     | "host.containers.internal"
-            )
+            ) {
+                return true;
+            }
+
+            // Kubernetes/internal service names: no dots, or ends with internal suffixes
+            // e.g., "ollama", "ollama.default.svc", "ollama.default.svc.cluster.local"
+            if !host_clean.contains('.') {
+                return true; // Simple service name like "ollama"
+            }
+
+            // Common internal/cluster suffixes
+            if host_clean.ends_with(".svc")
+                || host_clean.ends_with(".svc.cluster.local")
+                || host_clean.ends_with(".local")
+                || host_clean.ends_with(".internal")
+            {
+                return true;
+            }
+
+            false
         })
 }
 
@@ -7153,6 +7183,34 @@ mod tests {
     }
 
     #[test]
+    fn ollama_endpoint_is_local_recognizes_k8s_service_names() {
+        // Simple service name (no dots)
+        assert!(ollama_endpoint_is_local("http://ollama:11434"));
+        // Kubernetes DNS names
+        assert!(ollama_endpoint_is_local("http://ollama.default.svc:11434"));
+        assert!(ollama_endpoint_is_local("http://ollama.default.svc.cluster.local:11434"));
+        // .local and .internal suffixes
+        assert!(ollama_endpoint_is_local("http://ollama.local:11434"));
+        assert!(ollama_endpoint_is_local("http://myservice.internal:11434"));
+        // Real remote endpoints should still be detected as remote
+        assert!(!ollama_endpoint_is_local("https://ollama.example.com:11434"));
+        assert!(!ollama_endpoint_is_local("https://api.ollama.ai"));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_unknown_container_env() {
+        // Unknown container env var value should return Unknown, not Docker
+        let inputs = ContainerRuntimeInputs {
+            container_env_var: Some("lxc".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Unknown
+        ));
+    }
+
+    #[test]
     fn detect_container_runtime_from_inputs_detects_kubernetes_env() {
         let inputs = ContainerRuntimeInputs {
             kubernetes_service_host_set: true,
@@ -7237,9 +7295,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_container_runtime_from_inputs_detects_container_env_var() {
+    fn detect_container_runtime_from_inputs_detects_docker_env_var() {
+        // container env var containing "docker" should return Docker
         let inputs = ContainerRuntimeInputs {
-            container_env_var: Some("oci".to_string()),
+            container_env_var: Some("docker".to_string()),
             ..Default::default()
         };
         assert!(matches!(
