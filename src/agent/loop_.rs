@@ -63,8 +63,14 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 characters for context, then redact.
+            // Use char-aware slicing so multibyte UTF-8 input (for example CJK) cannot panic.
+            let prefix: String = val.chars().take(4).collect();
+            let prefix = if prefix.is_empty() {
+                ""
+            } else {
+                prefix.as_str()
+            };
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
@@ -5253,6 +5259,14 @@ Let me check the result."#;
             result, input,
             "non-sensitive text should pass through unchanged"
         );
+    }
+
+    #[test]
+    fn scrub_credentials_handles_multibyte_prefixes_without_panicking() {
+        let input = r#"token="你的WiFi密码超长内容""#;
+        let result = scrub_credentials(input);
+        assert!(result.contains(r#"token="你的Wi*[REDACTED]""#));
+        assert!(!result.contains("Fi密码超长内容"));
     }
 
     #[test]
