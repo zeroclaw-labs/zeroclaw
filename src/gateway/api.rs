@@ -325,6 +325,16 @@ pub async fn handle_api_integrations(
     Json(serde_json::json!({"integrations": integrations})).into_response()
 }
 
+/// GET /api/integrations/settings — backward-compatible integrations settings payload
+pub async fn handle_api_integrations_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    handle_api_integrations(State(state), headers)
+        .await
+        .into_response()
+}
+
 /// POST /api/doctor — run diagnostics
 pub async fn handle_api_doctor(
     State(state): State<AppState>,
