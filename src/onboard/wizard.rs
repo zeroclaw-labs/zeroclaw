@@ -1537,43 +1537,53 @@ fn normalize_ollama_endpoint_url(raw_url: &str) -> String {
 }
 
 fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
-    reqwest::Url::parse(endpoint_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .is_some_and(|host| {
-            // Strip brackets from IPv6 addresses for comparison
-            let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(url) = reqwest::Url::parse(endpoint_url) else {
+        return false;
+    };
 
-            // Explicit loopback and container host aliases
-            if matches!(
-                host_clean,
-                "localhost"
-                    | "127.0.0.1"
-                    | "::1"
-                    | "0.0.0.0"
-                    | "host.docker.internal"
-                    | "host.containers.internal"
-            ) {
-                return true;
-            }
+    let Some(host) = url.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
 
-            // Kubernetes/internal service names: no dots, or ends with internal suffixes
-            // e.g., "ollama", "ollama.default.svc", "ollama.default.svc.cluster.local"
-            if !host_clean.contains('.') {
-                return true; // Simple service name like "ollama"
-            }
+    // Strip brackets from IPv6 addresses for comparison
+    let host_clean = host.trim_start_matches('[').trim_end_matches(']');
 
-            // Common internal/cluster suffixes
-            if host_clean.ends_with(".svc")
-                || host_clean.ends_with(".svc.cluster.local")
-                || host_clean.ends_with(".local")
-                || host_clean.ends_with(".internal")
-            {
-                return true;
-            }
+    // Explicit loopback and container host aliases - always local regardless of scheme
+    if matches!(
+        host_clean,
+        "localhost"
+            | "127.0.0.1"
+            | "::1"
+            | "0.0.0.0"
+            | "host.docker.internal"
+            | "host.containers.internal"
+    ) {
+        return true;
+    }
 
-            false
-        })
+    // For K8s service names, only treat as local if using HTTP (not HTTPS).
+    // Remote cloud endpoints typically use HTTPS, so this avoids misclassifying
+    // a user's explicit "remote Ollama" choice as local.
+    if url.scheme() != "http" {
+        return false;
+    }
+
+    // Kubernetes/internal service names (HTTP only):
+    // e.g., "ollama", "ollama.default.svc", "ollama.default.svc.cluster.local"
+    if !host_clean.contains('.') {
+        return true; // Simple service name like "ollama"
+    }
+
+    // Common internal/cluster suffixes (HTTP only)
+    if host_clean.ends_with(".svc")
+        || host_clean.ends_with(".svc.cluster.local")
+        || host_clean.ends_with(".local")
+        || host_clean.ends_with(".internal")
+    {
+        return true;
+    }
+
+    false
 }
 
 fn ollama_uses_remote_endpoint(provider_api_url: Option<&str>) -> bool {
@@ -7184,17 +7194,22 @@ mod tests {
 
     #[test]
     fn ollama_endpoint_is_local_recognizes_k8s_service_names() {
-        // Simple service name (no dots)
+        // Simple service name (no dots) - HTTP only
         assert!(ollama_endpoint_is_local("http://ollama:11434"));
-        // Kubernetes DNS names
+        // Kubernetes DNS names - HTTP only
         assert!(ollama_endpoint_is_local("http://ollama.default.svc:11434"));
         assert!(ollama_endpoint_is_local("http://ollama.default.svc.cluster.local:11434"));
-        // .local and .internal suffixes
+        // .local and .internal suffixes - HTTP only
         assert!(ollama_endpoint_is_local("http://ollama.local:11434"));
         assert!(ollama_endpoint_is_local("http://myservice.internal:11434"));
         // Real remote endpoints should still be detected as remote
         assert!(!ollama_endpoint_is_local("https://ollama.example.com:11434"));
         assert!(!ollama_endpoint_is_local("https://api.ollama.ai"));
+        // HTTPS with internal-looking names should be treated as remote
+        // (preserves user's explicit "remote Ollama" choice)
+        assert!(!ollama_endpoint_is_local("https://ollama:11434"));
+        assert!(!ollama_endpoint_is_local("https://ollama.internal:11434"));
+        assert!(!ollama_endpoint_is_local("https://proxy.local:11434"));
     }
 
     #[test]
