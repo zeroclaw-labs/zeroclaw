@@ -2235,10 +2235,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         continue;
                     }
                 }
-                // Default: escape HTML entities
+                // Default: escape HTML entities (with passthrough for known safe Telegram tags)
                 let ch = line[i..].chars().next().unwrap();
                 match ch {
-                    '<' => line_out.push_str("&lt;"),
+                    '<' => {
+                        if let Some(tag_len) = Self::try_html_passthrough_len(line, i) {
+                            line_out.push_str(&line[i..i + tag_len]);
+                            i += tag_len;
+                            continue;
+                        }
+                        line_out.push_str("&lt;");
+                    }
                     '>' => line_out.push_str("&gt;"),
                     '&' => line_out.push_str("&amp;"),
                     '"' => line_out.push_str("&quot;"),
@@ -2290,6 +2297,43 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .replace('>', "&gt;")
             .replace('"', "&quot;")
             .replace('\'', "&#39;")
+    }
+
+    /// If `text[pos..]` starts with a known safe Telegram HTML tag (open or close),
+    /// return the byte length of that tag so it can be passed through verbatim.
+    /// Returns `None` if the `<` should be escaped.
+    fn try_html_passthrough_len(text: &str, pos: usize) -> Option<usize> {
+        const SAFE_OPEN: &[&str] = &[
+            "<b>", "<i>", "<u>", "<s>", "<code>", "<pre>", "<strong>", "<em>", "<strike>", "<del>",
+            "<ins>",
+        ];
+        const SAFE_CLOSE: &[&str] = &[
+            "</b>",
+            "</i>",
+            "</u>",
+            "</s>",
+            "</code>",
+            "</pre>",
+            "</strong>",
+            "</em>",
+            "</strike>",
+            "</del>",
+            "</ins>",
+            "</a>",
+        ];
+        let tail = &text[pos..];
+        for tag in SAFE_OPEN.iter().chain(SAFE_CLOSE.iter()) {
+            if tail.starts_with(tag) {
+                return Some(tag.len());
+            }
+        }
+        // <a href="..."> — match any opening <a ...> tag
+        if tail.starts_with("<a ") {
+            if let Some(end) = tail.find('>') {
+                return Some(end + 1);
+            }
+        }
+        None
     }
 
     async fn send_text_chunks(
@@ -3946,6 +3990,35 @@ mod tests {
         let input = "error sending request for url (https://example.com/bot/getUpdates)";
         let sanitized = TelegramChannel::sanitize_telegram_error(input);
         assert_eq!(sanitized, input);
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_passthrough_llm_bold_tag() {
+        let out = TelegramChannel::markdown_to_telegram_html("<b>bold text</b>");
+        assert_eq!(out, "<b>bold text</b>");
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_passthrough_llm_italic_tag() {
+        let out = TelegramChannel::markdown_to_telegram_html("<i>italic</i>");
+        assert_eq!(out, "<i>italic</i>");
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_passthrough_mixed_md_and_html() {
+        // LLM sends mix of Markdown and HTML tags in same message
+        let out = TelegramChannel::markdown_to_telegram_html("**md bold** and <b>html bold</b>");
+        assert_eq!(out, "<b>md bold</b> and <b>html bold</b>");
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_escapes_unknown_tags() {
+        // Unknown/unsafe tags must still be escaped
+        let out = TelegramChannel::markdown_to_telegram_html("<script>alert(1)</script>");
+        assert!(
+            out.contains("&lt;script&gt;"),
+            "unknown tags must be escaped, got: {out}"
+        );
     }
 
     #[test]
