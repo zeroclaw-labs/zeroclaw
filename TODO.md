@@ -5,6 +5,7 @@
 
 ## Active Feature Plans
 - [x] [Agent Stability and Persistence](docs/tasks/agent-stability-persistence.md)
+- [x] [Advanced Context Management](docs/tasks/advanced-context-management.md)
 
 ## High Priority
 - [x] Fix rate-limit amnesia in agent loop (Epic Complete)
