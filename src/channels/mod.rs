@@ -40,6 +40,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod tts;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -71,6 +72,7 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]

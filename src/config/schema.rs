@@ -381,6 +381,10 @@ pub struct Config {
     #[serde(default)]
     pub transcription: TranscriptionConfig,
 
+    /// Text-to-Speech configuration (`[tts]`).
+    #[serde(default)]
+    pub tts: TtsConfig,
+
     /// Inter-process agent communication (`[agents_ipc]`).
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
@@ -704,6 +708,150 @@ impl Default for TranscriptionConfig {
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+// ── TTS (Text-to-Speech) ─────────────────────────────────────────
+
+fn default_tts_provider() -> String {
+    "openai".into()
+}
+
+fn default_tts_voice() -> String {
+    "alloy".into()
+}
+
+fn default_tts_format() -> String {
+    "mp3".into()
+}
+
+fn default_tts_max_text_length() -> usize {
+    4096
+}
+
+fn default_openai_tts_model() -> String {
+    "tts-1".into()
+}
+
+fn default_openai_tts_speed() -> f64 {
+    1.0
+}
+
+fn default_elevenlabs_model_id() -> String {
+    "eleven_monolingual_v1".into()
+}
+
+fn default_elevenlabs_stability() -> f64 {
+    0.5
+}
+
+fn default_elevenlabs_similarity_boost() -> f64 {
+    0.5
+}
+
+fn default_google_tts_language_code() -> String {
+    "en-US".into()
+}
+
+fn default_edge_tts_binary_path() -> String {
+    "edge-tts".into()
+}
+
+/// Text-to-Speech configuration (`[tts]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TtsConfig {
+    /// Enable TTS synthesis.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default TTS provider (`"openai"`, `"elevenlabs"`, `"google"`, `"edge"`).
+    #[serde(default = "default_tts_provider")]
+    pub default_provider: String,
+    /// Default voice ID passed to the selected provider.
+    #[serde(default = "default_tts_voice")]
+    pub default_voice: String,
+    /// Default audio output format (`"mp3"`, `"opus"`, `"wav"`).
+    #[serde(default = "default_tts_format")]
+    pub default_format: String,
+    /// Maximum input text length in characters (default 4096).
+    #[serde(default = "default_tts_max_text_length")]
+    pub max_text_length: usize,
+    /// OpenAI TTS provider configuration (`[tts.openai]`).
+    #[serde(default)]
+    pub openai: Option<OpenAiTtsConfig>,
+    /// ElevenLabs TTS provider configuration (`[tts.elevenlabs]`).
+    #[serde(default)]
+    pub elevenlabs: Option<ElevenLabsTtsConfig>,
+    /// Google Cloud TTS provider configuration (`[tts.google]`).
+    #[serde(default)]
+    pub google: Option<GoogleTtsConfig>,
+    /// Edge TTS provider configuration (`[tts.edge]`).
+    #[serde(default)]
+    pub edge: Option<EdgeTtsConfig>,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_provider: default_tts_provider(),
+            default_voice: default_tts_voice(),
+            default_format: default_tts_format(),
+            max_text_length: default_tts_max_text_length(),
+            openai: None,
+            elevenlabs: None,
+            google: None,
+            edge: None,
+        }
+    }
+}
+
+/// OpenAI TTS provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiTtsConfig {
+    /// API key for OpenAI TTS. Falls back to `OPENAI_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model name (default `"tts-1"`).
+    #[serde(default = "default_openai_tts_model")]
+    pub model: String,
+    /// Playback speed multiplier (default `1.0`).
+    #[serde(default = "default_openai_tts_speed")]
+    pub speed: f64,
+}
+
+/// ElevenLabs TTS provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ElevenLabsTtsConfig {
+    /// API key for ElevenLabs. Falls back to `ELEVENLABS_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model ID (default `"eleven_monolingual_v1"`).
+    #[serde(default = "default_elevenlabs_model_id")]
+    pub model_id: String,
+    /// Voice stability (0.0-1.0, default `0.5`).
+    #[serde(default = "default_elevenlabs_stability")]
+    pub stability: f64,
+    /// Similarity boost (0.0-1.0, default `0.5`).
+    #[serde(default = "default_elevenlabs_similarity_boost")]
+    pub similarity_boost: f64,
+}
+
+/// Google Cloud TTS provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleTtsConfig {
+    /// API key for Google Cloud TTS. Falls back to `GOOGLE_TTS_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Language code (default `"en-US"`).
+    #[serde(default = "default_google_tts_language_code")]
+    pub language_code: String,
+}
+
+/// Edge TTS provider configuration (free, subprocess-based).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EdgeTtsConfig {
+    /// Path to the `edge-tts` binary (default `"edge-tts"`).
+    #[serde(default = "default_edge_tts_binary_path")]
+    pub binary_path: String,
 }
 
 // ── MCP ─────────────────────────────────────────────────────────
@@ -6584,6 +6732,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -10506,6 +10655,7 @@ ws_url = "ws://127.0.0.1:3002"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -10894,6 +11044,7 @@ denied_tools = ["shell"]
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
