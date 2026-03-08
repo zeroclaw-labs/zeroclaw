@@ -336,6 +336,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]`).
+    #[serde(default)]
+    pub google_workspace: GoogleWorkspaceConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -2395,6 +2399,29 @@ impl Default for WebSearchConfig {
 
 fn default_user_agent() -> String {
     "ZeroClaw/1.0".into()
+}
+
+// ── Google Workspace ─────────────────────────────────────────────
+
+/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleWorkspaceConfig {
+    /// Enable the `google_workspace` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Restrict which Google Workspace services the agent can access.
+    /// Empty means all default services are allowed.
+    #[serde(default)]
+    pub allowed_services: Vec<String>,
+}
+
+impl Default for GoogleWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_services: Vec::new(),
+        }
+    }
 }
 
 // ── Proxy ───────────────────────────────────────────────────────
@@ -6572,6 +6599,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -6741,7 +6769,7 @@ async fn remove_active_workspace_marker(marker_root: &Path) -> Result<()> {
     })?;
 
     if marker_root.exists() {
-        sync_directory(marker_root).await?;
+        sync_directory(marker_root)?;
     }
     Ok(())
 }
@@ -6780,7 +6808,7 @@ async fn write_active_workspace_marker(marker_root: &Path, config_dir: &Path) ->
         );
     }
 
-    sync_directory(marker_root).await?;
+    sync_directory(marker_root)?;
     Ok(())
 }
 
@@ -10496,6 +10524,7 @@ ws_url = "ws://127.0.0.1:3002"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -10884,6 +10913,7 @@ denied_tools = ["shell"]
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
