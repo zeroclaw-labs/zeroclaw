@@ -7,7 +7,7 @@ Cập nhật lần cuối: **2026-02-20**.
 ## Mục tiêu release
 
 - Đảm bảo release có thể dự đoán và lặp lại.
-- Chỉ publish từ code đã có trên `main`.
+- Chỉ publish từ code đã có trên `master`.
 - Xác minh các artifact đa nền tảng trước khi publish.
 - Duy trì nhịp release đều đặn ngay cả khi PR volume cao.
 
@@ -22,6 +22,7 @@ Cập nhật lần cuối: **2026-02-20**.
 Automation release nằm tại:
 
 - `.github/workflows/pub-release.yml`
+- `.github/workflows/pub-homebrew-core.yml` (PR formula Homebrew thủ công, do bot sở hữu)
 
 Các chế độ:
 
@@ -33,24 +34,24 @@ Các guardrail ở chế độ publish:
 
 - Tag phải khớp định dạng semver-like `vX.Y.Z[-suffix]`.
 - Tag phải đã tồn tại trên origin.
-- Commit của tag phải có thể truy vết được từ `origin/main`.
+- Commit của tag phải có thể truy vết được từ `origin/master`.
 - GHCR image tag tương ứng (`ghcr.io/<owner>/<repo>:<tag>`) phải sẵn sàng trước khi GitHub Release publish hoàn tất.
 - Artifact được xác minh trước khi publish.
 
 ## Quy trình maintainer
 
-### 1) Preflight trên `main`
+### 1) Preflight trên `master`
 
-1. Đảm bảo các required check đều xanh trên `main` mới nhất.
+1. Đảm bảo các required check đều xanh trên `master` mới nhất.
 2. Xác nhận không có sự cố ưu tiên cao hoặc regression đã biết nào đang mở.
-3. Xác nhận các workflow installer và Docker đều khoẻ mạnh trên các commit `main` gần đây.
+3. Xác nhận các workflow installer và Docker đều khoẻ mạnh trên các commit `master` gần đây.
 
 ### 2) Chạy verification build (không publish)
 
 Chạy `Pub Release` thủ công:
 
 - `publish_release`: `false`
-- `release_ref`: `main`
+- `release_ref`: `master`
 
 Kết quả mong đợi:
 
@@ -60,7 +61,7 @@ Kết quả mong đợi:
 
 ### 3) Cut release tag
 
-Từ một checkout cục bộ sạch đã sync với `origin/main`:
+Từ một checkout cục bộ sạch đã sync với `origin/master`:
 
 ```bash
 scripts/release/cut_release_tag.sh vX.Y.Z --push
@@ -69,7 +70,7 @@ scripts/release/cut_release_tag.sh vX.Y.Z --push
 Script này đảm bảo:
 
 - working tree sạch
-- `HEAD == origin/main`
+- `HEAD == origin/master`
 - tag không bị trùng lặp
 - định dạng tag semver-like
 
@@ -91,14 +92,34 @@ Kết quả publish mong đợi:
 ### 5) Xác minh sau release
 
 1. Xác minh GitHub Release asset có thể tải xuống.
-2. Xác minh GHCR tag cho phiên bản đã release và `latest`.
+2. Xác minh GHCR tag cho phiên bản đã release (`vX.Y.Z`) và tag SHA commit release (`sha-<12>`).
 3. Xác minh các đường dẫn cài đặt phụ thuộc vào release asset (ví dụ tải xuống binary bootstrap).
+
+### 6) Publish formula Homebrew Core (do bot sở hữu)
+
+Chạy `Pub Homebrew Core` thủ công:
+
+- `release_tag`: `vX.Y.Z`
+- `dry_run`: `true` trước, sau đó `false`
+
+Cài đặt repository bắt buộc cho non-dry-run:
+
+- secret: `HOMEBREW_CORE_BOT_TOKEN` (token từ tài khoản bot chuyên dụng, không phải tài khoản maintainer cá nhân)
+- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (ví dụ `zeroclaw-release-bot/homebrew-core`)
+- variable tùy chọn: `HOMEBREW_CORE_BOT_EMAIL`
+
+Các guardrail workflow:
+
+- release tag phải khớp version `Cargo.toml`
+- URL nguồn và SHA256 của formula được cập nhật từ tagged tarball
+- license formula được chuẩn hóa thành `Apache-2.0 OR MIT`
+- PR được mở từ bot fork vào `Homebrew/homebrew-core:master`
 
 ## Đường dẫn khẩn cấp / khôi phục
 
 Nếu release push tag thất bại sau khi artifact đã được xác minh:
 
-1. Sửa vấn đề workflow hoặc packaging trên `main`.
+1. Sửa vấn đề workflow hoặc packaging trên `master`.
 2. Chạy lại `Pub Release` thủ công ở chế độ publish với:
    - `publish_release=true`
    - `release_tag=<existing tag>`
