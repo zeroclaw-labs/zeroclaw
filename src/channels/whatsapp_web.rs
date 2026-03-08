@@ -288,7 +288,7 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
         use wa_rs_ureq_http::UreqHttpClient;
 
-        let mut retry_count = 0u32;
+        let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         const MAX_RETRIES: u32 = 10;
         const BASE_DELAY_SECS: u64 = 3;
         const MAX_DELAY_SECS: u64 = 300;
@@ -336,6 +336,7 @@ impl Channel for WhatsAppWebChannel {
             let tx_clone = tx.clone();
             let allowed_numbers = self.allowed_numbers.clone();
             let logout_tx_clone = logout_tx.clone();
+            let retry_count_clone = retry_count.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -345,6 +346,7 @@ impl Channel for WhatsAppWebChannel {
                     let tx_inner = tx_clone.clone();
                     let allowed_numbers = allowed_numbers.clone();
                     let logout_tx = logout_tx_clone.clone();
+                    let retry_count = retry_count_clone.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -418,6 +420,7 @@ impl Channel for WhatsAppWebChannel {
                             }
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
+                                retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
                             }
                             Event::LoggedOut(_) => {
                                 tracing::warn!(
@@ -429,10 +432,13 @@ impl Channel for WhatsAppWebChannel {
                                 tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
                             }
                             Event::PairingCode { code, .. } => {
-                                tracing::info!("WhatsApp Web pair code received: {}", code);
+                                tracing::info!("WhatsApp Web pair code received");
                                 tracing::info!(
                                     "Link your phone by entering this code in WhatsApp > Linked Devices"
                                 );
+                                eprintln!();
+                                eprintln!("WhatsApp Web pair code: {code}");
+                                eprintln!();
                             }
                             Event::PairingQrCode { code, .. } => {
                                 tracing::info!(
@@ -452,7 +458,9 @@ impl Channel for WhatsAppWebChannel {
                                             "WhatsApp Web: failed to render pairing QR in terminal: {}",
                                             err
                                         );
-                                        tracing::info!("WhatsApp Web QR payload: {}", code);
+                                        eprintln!();
+                                        eprintln!("WhatsApp Web QR payload: {code}");
+                                        eprintln!();
                                     }
                                 }
                             }
@@ -484,9 +492,9 @@ impl Channel for WhatsAppWebChannel {
             // Store the bot handle for later shutdown
             *self.bot_handle.lock() = Some(bot_handle);
 
-            // Bot started successfully — reset retry counter so transient
-            // disconnects don't accumulate toward the cap.
-            retry_count = 0;
+            // Drop the outer sender so logout_rx.recv() returns Err when the
+            // bot task ends without emitting LoggedOut (e.g. crash/panic).
+            drop(logout_tx);
 
             // Wait for a logout signal or process shutdown.
             let should_reconnect = select! {
@@ -507,8 +515,8 @@ impl Channel for WhatsAppWebChannel {
             }
 
             if should_reconnect {
-                retry_count += 1;
-                if retry_count > MAX_RETRIES {
+                let attempts = retry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if attempts > MAX_RETRIES {
                     anyhow::bail!(
                         "WhatsApp Web: exceeded {} reconnect attempts, giving up",
                         MAX_RETRIES
@@ -528,13 +536,13 @@ impl Channel for WhatsAppWebChannel {
                 }
 
                 let delay = std::cmp::min(
-                    BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(retry_count - 1)),
+                    BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(attempts - 1)),
                     MAX_DELAY_SECS,
                 );
                 tracing::info!(
                     "WhatsApp Web: reconnecting in {}s (attempt {}/{})",
                     delay,
-                    retry_count,
+                    attempts,
                     MAX_RETRIES
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
