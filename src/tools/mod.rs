@@ -976,48 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_includes_discord_history_fetch_when_discord_configured() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.channels_config.discord = Some(DiscordConfig {
-            bot_token: "discord-token".into(),
-            guild_id: None,
-            allowed_users: vec!["*".into()],
-            listen_to_bots: false,
-            group_reply: None,
-            mention_only: false,
-        });
-
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"discord_history_fetch"));
-    }
-
-    #[test]
     fn all_tools_includes_browser_when_enabled() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());

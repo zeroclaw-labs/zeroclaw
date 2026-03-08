@@ -204,7 +204,11 @@ impl OpenAiProvider {
 
     /// Configures the service tier (e.g. "flex") for completion requests.
     pub fn with_service_tier(mut self, tier: Option<String>) -> Self {
-        self.service_tier = tier.filter(|s| !s.trim().is_empty());
+        self.service_tier = tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
         self
     }
 
@@ -620,6 +624,15 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"service_tier\":\"flex\""));
+    }
+
+    #[test]
+    fn provider_builder_trims_service_tier() {
+        let provider1 = OpenAiProvider::new(None).with_service_tier(Some(" flex ".to_string()));
+        assert_eq!(provider1.service_tier.as_deref(), Some("flex"));
+
+        let provider2 = OpenAiProvider::new(None).with_service_tier(Some("   ".to_string()));
+        assert_eq!(provider2.service_tier, None);
     }
 
     #[test]
