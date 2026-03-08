@@ -2448,6 +2448,15 @@ pub(crate) async fn run_tool_call_loop(
                 conversation_manager.add_message(ChatMessage::tool(tool_msg.to_string())).await?;
             }
         }
+
+        // Auto-compaction within the tool loop to keep context bounded during long multi-step tasks.
+        if let Ok(compacted) = conversation_manager.auto_compact(provider, model).await {
+            if compacted {
+                if let Some(ref tx) = on_delta {
+                    let _ = tx.send("🧹 Auto-compaction complete\n".to_string()).await;
+                }
+            }
+        }
     }
 
     runtime_trace::record_event(

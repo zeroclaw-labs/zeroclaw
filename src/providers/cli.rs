@@ -124,6 +124,9 @@ impl CliProvider {
                     .arg("--output-format")
                     .arg("json");
 
+                // Note: We intentionally DO NOT pass a --model flag here
+                // to allow the user's local CLI configuration to determine the default.
+
                 if let Some(ref tools) = self.allowed_tools {
                     if !tools.is_empty() {
                         let tools_arg = tools.join(",");
@@ -132,7 +135,7 @@ impl CliProvider {
                 }
             }
             CliType::OpenCode => {
-                cmd.arg("run").arg("-"); // Use '-' to indicate stdin for some versions of opencode
+                cmd.arg("run").arg("-");
             }
         }
 
@@ -201,40 +204,45 @@ impl CliProvider {
     }
 
     fn parse_claude_output(&self, output: &str) -> anyhow::Result<String> {
-        let parsed: ClaudeResponse = serde_json::from_str(output)
-            .map_err(|e| anyhow::anyhow!("Failed to parse Claude JSON output: {}", e))?;
-
-        if let Some(result) = parsed.result {
-            for block in result.content {
-                let text = match block {
-                    ClaudeContent::Block(block) => block.text,
-                    ClaudeContent::Text(text) => Some(text),
-                };
-                if let Some(text) = text {
-                    return Ok(text);
-                }
-            }
+        let trimmed = output.trim();
+        if !trimmed.starts_with('{') {
+            return Ok(trimmed.to_string());
         }
 
-        anyhow::bail!("No text content found in Claude response")
+        match serde_json::from_str::<ClaudeResponse>(trimmed) {
+            Ok(parsed) => {
+                if let Some(result) = parsed.result {
+                    for block in result.content {
+                        let text = match block {
+                            ClaudeContent::Block(block) => block.text,
+                            ClaudeContent::Text(text) => Some(text),
+                        };
+                        if let Some(text) = text {
+                            return Ok(text);
+                        }
+                    }
+                }
+                anyhow::bail!("No text content found in Claude JSON response")
+            }
+            Err(_) => Ok(trimmed.to_string()),
+        }
     }
 
     fn parse_gemini_output(&self, output: &str) -> anyhow::Result<String> {
-        let parsed: GeminiResponse = serde_json::from_str(output)
-            .map_err(|e| anyhow::anyhow!("Failed to parse Gemini JSON output: {}", e))?;
-
-        if let Some(response) = parsed.response {
-            return Ok(response);
+        let trimmed = output.trim();
+        if !trimmed.starts_with('{') {
+            return Ok(trimmed.to_string());
         }
 
-        if let Some(session_id) = parsed.session_id.or(parsed.session_id_alt) {
-            tracing::warn!(
-                "Gemini response has session_id but no response text: {}",
-                session_id
-            );
+        match serde_json::from_str::<GeminiResponse>(trimmed) {
+            Ok(parsed) => {
+                if let Some(response) = parsed.response {
+                    return Ok(response);
+                }
+                Ok(trimmed.to_string())
+            }
+            Err(_) => Ok(trimmed.to_string()),
         }
-
-        Ok(output.to_string())
     }
 
     fn parse_opencode_output(&self, output: &str) -> anyhow::Result<String> {
