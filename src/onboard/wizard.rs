@@ -42,15 +42,25 @@ enum ContainerRuntime {
     Kubernetes,
 }
 
-/// Detects which container runtime (if any) the process is running inside.
-fn detect_container_runtime() -> ContainerRuntime {
+/// Input signals for container runtime detection (used for deterministic testing).
+#[derive(Default)]
+struct ContainerRuntimeInputs {
+    kubernetes_service_host_set: bool,
+    cgroup_contents: Option<String>,
+    containerenv_exists: bool,
+    dockerenv_exists: bool,
+    container_env_var: Option<String>,
+}
+
+/// Pure helper to detect container runtime from explicit inputs (for testability).
+fn detect_container_runtime_from_inputs(inputs: &ContainerRuntimeInputs) -> ContainerRuntime {
     // Check for Kubernetes first (most specific)
-    if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
+    if inputs.kubernetes_service_host_set {
         return ContainerRuntime::Kubernetes;
     }
 
-    // Check cgroup for container runtime signatures (Linux)
-    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+    // Check cgroup for container runtime signatures
+    if let Some(cgroup) = &inputs.cgroup_contents {
         let cgroup_lower = cgroup.to_lowercase();
         if cgroup_lower.contains("kubepods") {
             return ContainerRuntime::Kubernetes;
@@ -64,28 +74,36 @@ fn detect_container_runtime() -> ContainerRuntime {
     }
 
     // Check for Podman-specific marker
-    if Path::new("/run/.containerenv").exists() {
+    if inputs.containerenv_exists {
         return ContainerRuntime::Podman;
     }
 
     // Check for Docker marker file
-    if Path::new("/.dockerenv").exists() {
+    if inputs.dockerenv_exists {
         return ContainerRuntime::Docker;
     }
 
-    // Check for generic container env var (set by some runtimes)
-    // Note: DOCKER_HOST is NOT checked here - it's set on the HOST to point to a remote daemon
-    if std::env::var("container").is_ok() {
-        // Try to distinguish Podman vs Docker from the value
-        if let Ok(val) = std::env::var("container") {
-            if val.to_lowercase().contains("podman") {
-                return ContainerRuntime::Podman;
-            }
+    // Check for generic container env var
+    if let Some(val) = &inputs.container_env_var {
+        if val.to_lowercase().contains("podman") {
+            return ContainerRuntime::Podman;
         }
         return ContainerRuntime::Docker;
     }
 
     ContainerRuntime::None
+}
+
+/// Detects which container runtime (if any) the process is running inside.
+fn detect_container_runtime() -> ContainerRuntime {
+    let inputs = ContainerRuntimeInputs {
+        kubernetes_service_host_set: std::env::var("KUBERNETES_SERVICE_HOST").is_ok(),
+        cgroup_contents: std::fs::read_to_string("/proc/1/cgroup").ok(),
+        containerenv_exists: Path::new("/run/.containerenv").exists(),
+        dockerenv_exists: Path::new("/.dockerenv").exists(),
+        container_env_var: std::env::var("container").ok(),
+    };
+    detect_container_runtime_from_inputs(&inputs)
 }
 
 /// Returns the appropriate hostname for accessing services on the host machine.
@@ -1463,7 +1481,14 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
 fn fetch_ollama_models(endpoint_override: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let endpoint = match endpoint_override {
-        Some(base) => format!("{}/api/tags", base.trim_end_matches('/')),
+        Some(base) => {
+            let normalized = normalize_ollama_endpoint_url(base);
+            if normalized.is_empty() {
+                default_local_url_or_localhost(11434, "/api/tags")
+            } else {
+                format!("{normalized}/api/tags")
+            }
+        }
         None => default_local_url_or_localhost(11434, "/api/tags"),
     };
     let payload: Value = client
@@ -2407,25 +2432,51 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             key
         } else {
             // Local Ollama: compute container-aware URL and persist it
-            let ollama_url = default_local_url_or_localhost(11434, "");
-            provider_api_url = Some(ollama_url.clone());
-            print_bullet(&format!(
-                "Using local Ollama at {} (no API key needed).",
-                style(&ollama_url).cyan()
-            ));
-            if detect_container_runtime() == ContainerRuntime::Kubernetes {
+            // For runtimes without a known host alias (e.g., Kubernetes), require explicit input
+            if let Some(ollama_url) = default_local_url(11434, "") {
+                provider_api_url = Some(ollama_url.clone());
                 print_bullet(&format!(
-                    "Note: Running in Kubernetes. You may need to configure the Ollama endpoint manually via {}.",
-                    style("OLLAMA_API_URL").yellow()
+                    "Using local Ollama at {} (no API key needed).",
+                    style(&ollama_url).cyan()
                 ));
+                String::new()
+            } else {
+                print_bullet(&format!(
+                    "Running in a container without a known host alias. {} may not resolve to the host.",
+                    style("localhost").yellow()
+                ));
+                let raw_url: String = Input::new()
+                    .with_prompt("  Ollama endpoint URL (e.g., http://<service-name>:11434)")
+                    .interact_text()?;
+
+                let normalized_url = normalize_ollama_endpoint_url(&raw_url);
+                if normalized_url.is_empty() {
+                    anyhow::bail!("Ollama endpoint URL cannot be empty.");
+                }
+                provider_api_url = Some(normalized_url.clone());
+                print_bullet(&format!(
+                    "Using Ollama at {} (no API key needed).",
+                    style(&normalized_url).cyan()
+                ));
+                String::new()
             }
-            String::new()
         }
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
-        let raw_url: String = Input::new()
-            .with_prompt("  llama.cpp server endpoint URL")
-            .default(default_local_url_or_localhost(8080, "/v1"))
-            .interact_text()?;
+        // For Kubernetes, don't provide a misleading localhost default
+        let raw_url: String = if let Some(default_url) = default_local_url(8080, "/v1") {
+            Input::new()
+                .with_prompt("  llama.cpp server endpoint URL")
+                .default(default_url)
+                .interact_text()?
+        } else {
+            print_bullet(&format!(
+                "Running in a container without a known host alias. {} may not resolve to the host.",
+                style("localhost").yellow()
+            ));
+            Input::new()
+                .with_prompt("  llama.cpp server endpoint URL (e.g., http://<service-name>:8080/v1)")
+                .interact_text()?
+        };
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
         if normalized_url.is_empty() {
@@ -2453,10 +2504,21 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         key
     } else if provider_name == "sglang" {
-        let raw_url: String = Input::new()
-            .with_prompt("  SGLang server endpoint URL")
-            .default(default_local_url_or_localhost(30000, "/v1"))
-            .interact_text()?;
+        // For Kubernetes, don't provide a misleading localhost default
+        let raw_url: String = if let Some(default_url) = default_local_url(30000, "/v1") {
+            Input::new()
+                .with_prompt("  SGLang server endpoint URL")
+                .default(default_url)
+                .interact_text()?
+        } else {
+            print_bullet(&format!(
+                "Running in a container without a known host alias. {} may not resolve to the host.",
+                style("localhost").yellow()
+            ));
+            Input::new()
+                .with_prompt("  SGLang server endpoint URL (e.g., http://<service-name>:30000/v1)")
+                .interact_text()?
+        };
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
         if normalized_url.is_empty() {
@@ -2484,10 +2546,21 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         key
     } else if provider_name == "vllm" {
-        let raw_url: String = Input::new()
-            .with_prompt("  vLLM server endpoint URL")
-            .default(default_local_url_or_localhost(8000, "/v1"))
-            .interact_text()?;
+        // For Kubernetes, don't provide a misleading localhost default
+        let raw_url: String = if let Some(default_url) = default_local_url(8000, "/v1") {
+            Input::new()
+                .with_prompt("  vLLM server endpoint URL")
+                .default(default_url)
+                .interact_text()?
+        } else {
+            print_bullet(&format!(
+                "Running in a container without a known host alias. {} may not resolve to the host.",
+                style("localhost").yellow()
+            ));
+            Input::new()
+                .with_prompt("  vLLM server endpoint URL (e.g., http://<service-name>:8000/v1)")
+                .interact_text()?
+        };
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
         if normalized_url.is_empty() {
@@ -2515,10 +2588,21 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         key
     } else if provider_name == "osaurus" {
-        let raw_url: String = Input::new()
-            .with_prompt("  Osaurus server endpoint URL")
-            .default(default_local_url_or_localhost(1337, "/v1"))
-            .interact_text()?;
+        // For Kubernetes, don't provide a misleading localhost default
+        let raw_url: String = if let Some(default_url) = default_local_url(1337, "/v1") {
+            Input::new()
+                .with_prompt("  Osaurus server endpoint URL")
+                .default(default_url)
+                .interact_text()?
+        } else {
+            print_bullet(&format!(
+                "Running in a container without a known host alias. {} may not resolve to the host.",
+                style("localhost").yellow()
+            ));
+            Input::new()
+                .with_prompt("  Osaurus server endpoint URL (e.g., http://<service-name>:1337/v1)")
+                .interact_text()?
+        };
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
         if normalized_url.is_empty() {
@@ -6945,6 +7029,20 @@ mod tests {
     }
 
     #[test]
+    fn normalize_ollama_endpoint_url_prevents_double_api_path() {
+        // Verifies that URLs ending with /api are normalized to prevent
+        // /api/api/tags when appending /api/tags for model fetching
+        let base_with_api = "http://localhost:11434/api";
+        let normalized = normalize_ollama_endpoint_url(base_with_api);
+        assert_eq!(normalized, "http://localhost:11434");
+
+        // Constructing the tags URL should now be correct
+        let tags_url = format!("{normalized}/api/tags");
+        assert_eq!(tags_url, "http://localhost:11434/api/tags");
+        assert!(!tags_url.contains("/api/api/"));
+    }
+
+    #[test]
     fn ollama_uses_remote_endpoint_distinguishes_local_and_remote_urls() {
         assert!(!ollama_uses_remote_endpoint(None));
         assert!(!ollama_uses_remote_endpoint(Some("http://localhost:11434")));
@@ -7012,12 +7110,150 @@ mod tests {
     }
 
     #[test]
-    fn detect_container_runtime_returns_none_outside_container() {
-        // When not in a container, should return None
-        // Note: This test may behave differently if run inside a container
-        let runtime = detect_container_runtime();
-        // We can't assert specific value since test env varies, but ensure it doesn't panic
-        let _ = runtime;
+    fn detect_container_runtime_from_inputs_detects_kubernetes_env() {
+        let inputs = ContainerRuntimeInputs {
+            kubernetes_service_host_set: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_kubernetes_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("12:cpuset:/kubepods/burstable/pod123".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_docker_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("12:cpuset:/docker/abc123".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_containerd_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("0::/system.slice/containerd.service".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_podman_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("0::/user.slice/user-1000.slice/podman-abc123".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_dockerenv_file() {
+        let inputs = ContainerRuntimeInputs {
+            dockerenv_exists: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_podman_containerenv() {
+        let inputs = ContainerRuntimeInputs {
+            containerenv_exists: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_container_env_var() {
+        let inputs = ContainerRuntimeInputs {
+            container_env_var: Some("oci".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_podman_env_var() {
+        let inputs = ContainerRuntimeInputs {
+            container_env_var: Some("podman".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_returns_none_when_no_signals() {
+        let inputs = ContainerRuntimeInputs::default();
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::None
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_kubernetes_takes_priority() {
+        // Kubernetes env var should take precedence over Docker/Podman markers
+        let inputs = ContainerRuntimeInputs {
+            kubernetes_service_host_set: true,
+            dockerenv_exists: true,
+            containerenv_exists: true,
+            cgroup_contents: Some("docker".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_cgroup_kubepods_takes_priority_over_docker() {
+        // kubepods in cgroup should be detected as Kubernetes, not Docker
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("0::/kubepods/burstable/pod123/docker-abc".to_string()),
+            dockerenv_exists: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
     }
 
     #[test]
