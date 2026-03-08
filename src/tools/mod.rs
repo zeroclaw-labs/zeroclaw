@@ -105,6 +105,40 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Network access policy for tools that make HTTP/file requests.
+///
+/// Constructed from `[security]` config fields. Both default to `true` (unrestricted).
+/// Power users can restrict access via config:
+///
+/// ```toml
+/// [security]
+/// allow_local_network = false   # blocks localhost, private IPs, file:// URLs
+/// allow_public_internet = false # blocks all public internet access
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkAccessPolicy {
+    pub allow_local_network: bool,
+    pub allow_public_internet: bool,
+}
+
+impl Default for NetworkAccessPolicy {
+    fn default() -> Self {
+        Self {
+            allow_local_network: true,
+            allow_public_internet: true,
+        }
+    }
+}
+
+impl NetworkAccessPolicy {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            allow_local_network: config.security.allow_local_network,
+            allow_public_internet: config.security.allow_public_internet,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ArcDelegatingTool {
     inner: Arc<dyn Tool>,
@@ -209,6 +243,7 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let net_policy = NetworkAccessPolicy::from_config(root_config);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
@@ -246,6 +281,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
             security.clone(),
             browser_config.allowed_domains.clone(),
+            net_policy,
         )));
         // Add full browser automation tool (pluggable backend)
         tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
@@ -265,6 +301,7 @@ pub fn all_tools_with_runtime(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            net_policy,
         )));
     }
 
@@ -274,6 +311,7 @@ pub fn all_tools_with_runtime(
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
+            net_policy,
         )));
     }
 
@@ -284,6 +322,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
+            net_policy,
         )));
     }
 
