@@ -2481,8 +2481,11 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         if normalized_url.is_empty() {
             anyhow::bail!("Azure OpenAI endpoint URL cannot be empty.");
         }
-        reqwest::Url::parse(&normalized_url)
+        let parsed = reqwest::Url::parse(&normalized_url)
             .context("Azure OpenAI endpoint URL must be a valid URL")?;
+        if parsed.scheme() != "https" {
+            anyhow::bail!("Azure OpenAI endpoint URL must use https://");
+        }
         provider_api_url = Some(normalized_url.clone());
 
         print_bullet(&format!(
