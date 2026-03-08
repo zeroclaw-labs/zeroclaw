@@ -800,6 +800,12 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Request timeout in seconds for the gateway HTTP server.
+    /// Prevents slow-loris attacks while allowing enough time for
+    /// agentic tool-call loops. Default: 300 (5 minutes).
+    #[serde(default = "default_gateway_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 fn default_gateway_port() -> u16 {
@@ -830,6 +836,10 @@ fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
+fn default_gateway_request_timeout_secs() -> u64 {
+    300
+}
+
 fn default_true() -> bool {
     true
 }
@@ -848,6 +858,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            request_timeout_secs: default_gateway_request_timeout_secs(),
         }
     }
 }
@@ -6002,6 +6013,7 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            request_timeout_secs: 120,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -6014,6 +6026,7 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(parsed.request_timeout_secs, 120);
     }
 
     #[test]
