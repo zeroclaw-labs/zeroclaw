@@ -6818,10 +6818,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
         );
     }
 
-    #[cfg(unix)]
     sync_directory(&default_config_dir).await?;
-    #[cfg(not(unix))]
-    sync_directory(&default_config_dir)?;
     Ok(())
 }
 
@@ -9749,10 +9746,7 @@ impl Config {
                 })?;
         }
 
-        #[cfg(unix)]
         sync_directory(parent_dir).await?;
-        #[cfg(not(unix))]
-        sync_directory(parent_dir)?;
 
         if had_existing_config {
             let _ = fs::remove_file(&backup_path).await;
@@ -9774,7 +9768,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(path: &Path) -> Result<()> {
+async fn sync_directory(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
@@ -10830,10 +10824,7 @@ denied_tools = ["shell"]
         ));
         fs::create_dir_all(&dir).await.unwrap();
 
-        #[cfg(unix)]
         sync_directory(&dir).await.unwrap();
-        #[cfg(not(unix))]
-        sync_directory(&dir).unwrap();
 
         let _ = fs::remove_dir_all(&dir).await;
     }
