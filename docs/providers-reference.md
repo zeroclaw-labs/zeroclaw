@@ -74,7 +74,7 @@ credential is not reused for fallback providers.
 ### Azure OpenAI Notes
 
 - Provider ID: `azure-openai` (alias: `azure_openai`)
-- Requires configuration of api_url; model name represents the deployment name
+- Requires configuration of api_url(outside model_providers) or base_url(inside model_providers); model name represents the deployment name
 - Authentication: `AZURE_OPENAI_API_KEY` environment variable
 - Uses Azure OpenAI API endpoint format: `{api_url}/openai/deployments/{model}/chat/completions`
 - Uses `api-key` header instead of `Authorization: Bearer` for authentication
