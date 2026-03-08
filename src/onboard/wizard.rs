@@ -659,6 +659,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
         "llama.cpp" => "llamacpp",
+        "azure_openai" => "azure-openai",
         _ => provider_name,
     }
 }
@@ -690,6 +691,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
+        "azure-openai" => "gpt-4o".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
         "venice" => "zai-org-glm-5".into(),
@@ -762,6 +764,25 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "claude-haiku-4-5-20251001".to_string(),
                 "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
+            ),
+        ],
+        "azure-openai" => vec![
+            (
+                "gpt-4o".to_string(),
+                "gpt-4o deployment (common default — must match your Azure deployment name)"
+                    .to_string(),
+            ),
+            (
+                "gpt-4o-mini".to_string(),
+                "gpt-4o-mini deployment (faster, cheaper)".to_string(),
+            ),
+            (
+                "o3-mini".to_string(),
+                "o3-mini deployment (reasoning)".to_string(),
+            ),
+            (
+                "gpt-4-turbo".to_string(),
+                "gpt-4-turbo deployment".to_string(),
             ),
         ],
         "openai" => vec![
@@ -2136,6 +2157,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("anthropic", "Anthropic — Claude Sonnet & Opus (direct)"),
             ("openai", "OpenAI — GPT-4o, o1, GPT-5 (direct)"),
             (
+                "azure-openai",
+                "Azure OpenAI — GPT-5, GPT-4o via your Azure endpoint",
+            ),
+            (
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
             ),
@@ -2431,6 +2456,65 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if canonical_provider_name(provider_name) == "azure-openai" {
+        println!();
+        println!("  {}", style("Azure OpenAI Setup").white().bold());
+        print_bullet("Azure OpenAI uses your own resource endpoint, not a shared API URL.");
+        print_bullet(
+            "Find your endpoint in the Azure Portal under your OpenAI resource > Keys and Endpoint.",
+        );
+        println!();
+
+        let raw_url: String = Input::new()
+            .with_prompt("  Azure OpenAI endpoint URL (e.g. https://my-resource.openai.azure.com)")
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("Azure OpenAI endpoint URL cannot be empty.");
+        }
+        reqwest::Url::parse(&normalized_url)
+            .context("Azure OpenAI endpoint URL must be a valid URL")?;
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Endpoint set to: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet(
+            "The model name you select next must match your Azure deployment name exactly.",
+        );
+        println!();
+
+        if std::env::var("AZURE_OPENAI_API_KEY").is_ok() {
+            print_bullet(&format!(
+                "{} AZURE_OPENAI_API_KEY environment variable detected!",
+                style("✓").green().bold()
+            ));
+            String::new()
+        } else {
+            print_bullet(&format!(
+                "Get your API key from: {}",
+                style("https://portal.azure.com → Azure OpenAI → Keys and Endpoint")
+                    .cyan()
+                    .underlined()
+            ));
+            println!();
+
+            let key: String = Input::new()
+                .with_prompt("  Paste your Azure OpenAI API key (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.is_empty() {
+                print_bullet(&format!(
+                    "Skipped. Set {} or edit config.toml later.",
+                    style("AZURE_OPENAI_API_KEY").yellow()
+                ));
+            }
+
+            key
+        }
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -2852,6 +2936,7 @@ fn provider_env_var(name: &str) -> &'static str {
     match canonical_provider_name(name) {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
+        "azure-openai" => "AZURE_OPENAI_API_KEY",
         "openai-codex" | "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
@@ -7196,5 +7281,43 @@ mod tests {
             port: None,
         });
         assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
+    fn canonical_provider_name_normalizes_azure_openai_underscore_alias() {
+        assert_eq!(canonical_provider_name("azure_openai"), "azure-openai");
+        assert_eq!(canonical_provider_name("azure-openai"), "azure-openai");
+    }
+
+    #[test]
+    fn curated_models_for_azure_openai_include_common_deployment_names() {
+        let ids: Vec<String> = curated_models_for_provider("azure-openai")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"gpt-4o-mini".to_string()));
+        assert!(ids.contains(&"o3-mini".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_azure_openai_alias_matches_canonical() {
+        assert_eq!(
+            curated_models_for_provider("azure-openai"),
+            curated_models_for_provider("azure_openai")
+        );
+    }
+
+    #[test]
+    fn default_model_for_azure_openai_is_gpt4o() {
+        assert_eq!(default_model_for_provider("azure-openai"), "gpt-4o");
+        assert_eq!(default_model_for_provider("azure_openai"), "gpt-4o");
+    }
+
+    #[test]
+    fn provider_env_var_for_azure_openai_is_correct() {
+        assert_eq!(provider_env_var("azure-openai"), "AZURE_OPENAI_API_KEY");
+        assert_eq!(provider_env_var("azure_openai"), "AZURE_OPENAI_API_KEY");
     }
 }
