@@ -222,6 +222,16 @@ impl KnowledgeGraph {
             );
         }
 
+        // Reject tags containing commas since comma is the separator in storage.
+        for tag in tags {
+            if tag.contains(',') {
+                anyhow::bail!(
+                    "tag '{}' contains a comma, which is used as the tag separator",
+                    tag
+                );
+            }
+        }
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let tags_str = tags.join(",");
@@ -394,7 +404,7 @@ impl KnowledgeGraph {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
 
-        for _ in 0..=depth {
+        for _ in 0..depth {
             if frontier.is_empty() {
                 break;
             }

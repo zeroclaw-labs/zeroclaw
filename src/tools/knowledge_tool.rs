@@ -181,9 +181,23 @@ impl KnowledgeTool {
             .and_then(|f| f.get("node_type"))
             .and_then(|v| v.as_str());
 
+        let filter_project = args
+            .get("filters")
+            .and_then(|f| f.get("project"))
+            .and_then(|v| v.as_str());
+
+        // Parse the node_type filter once so it applies in all code paths.
+        let parsed_filter_type = filter_type.and_then(|ft| NodeType::parse(ft).ok());
+
         let results = if query.is_empty() && !filter_tags.is_empty() {
-            // Tag-only search.
-            let nodes = self.graph.query_by_tags(&filter_tags)?;
+            // Tag-only search -- apply node_type and project filters consistently.
+            let mut nodes = self.graph.query_by_tags(&filter_tags)?;
+            if let Some(ref nt) = parsed_filter_type {
+                nodes.retain(|n| &n.node_type == nt);
+            }
+            if let Some(proj) = filter_project {
+                nodes.retain(|n| n.source_project.as_deref() == Some(proj));
+            }
             nodes
                 .into_iter()
                 .map(|node| json!({ "id": node.id, "type": node.node_type, "title": node.title, "score": 1.0 }))
@@ -192,10 +206,12 @@ impl KnowledgeTool {
             let mut search_results = self.graph.query_by_similarity(query, 20)?;
 
             // Post-filter by type if specified.
-            if let Some(ft) = filter_type {
-                if let Ok(nt) = NodeType::parse(ft) {
-                    search_results.retain(|r| r.node.node_type == nt);
-                }
+            if let Some(ref nt) = parsed_filter_type {
+                search_results.retain(|r| &r.node.node_type == nt);
+            }
+            // Post-filter by project if specified.
+            if let Some(proj) = filter_project {
+                search_results.retain(|r| r.node.source_project.as_deref() == Some(proj));
             }
             // Post-filter by tags if specified.
             if !filter_tags.is_empty() {
