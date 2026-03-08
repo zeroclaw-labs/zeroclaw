@@ -112,8 +112,8 @@ impl SkillToolHandler {
                 .cloned()
                 .unwrap_or_else(|| format!("Parameter: {}", placeholder));
 
-            // Infer type from description or use String as default
-            let param_type = Self::infer_parameter_type(&description);
+            // Infer type from name + description (name takes priority)
+            let param_type = Self::infer_parameter_type(&placeholder, &description);
 
             // Infer required from description hints
             let is_optional = {
@@ -151,26 +151,64 @@ impl SkillToolHandler {
         placeholders
     }
 
-    /// Infer parameter type from description text
-    fn infer_parameter_type(description: &str) -> ParameterType {
+    /// Parameter names that are always String regardless of description content.
+    /// Prevents false positives when a description accidentally contains integer/boolean
+    /// keywords (e.g. "Account to use, sets the limit count" → must stay String).
+    const ALWAYS_STRING_NAMES: &'static [&'static str] = &[
+        "account",
+        "username",
+        "name",
+        "contact_name",
+        "query",
+        "text",
+        "session",
+        "mode",
+        "folder_name",
+        "folder",
+        "filter",
+        "channel_filter",
+        "sender",
+        "key",
+        "token",
+        "path",
+        "dir",
+        "url",
+    ];
+
+    /// Infer parameter type from parameter name and description text.
+    /// Name takes priority: known string-identity names are always String even if
+    /// the description accidentally contains integer/boolean keywords.
+    fn infer_parameter_type(name: &str, description: &str) -> ParameterType {
+        // Name-based override: certain param names are always String
+        if Self::ALWAYS_STRING_NAMES.contains(&name) {
+            return ParameterType::String;
+        }
+
         let desc_lower = description.to_lowercase();
 
-        // Check for integer indicators
-        if desc_lower.contains("number")
-            || desc_lower.contains("count")
-            || desc_lower.contains("limit")
-            || desc_lower.contains("maximum")
-            || desc_lower.contains("minimum")
+        // Check for integer indicators using whole-word matching to avoid false
+        // positives like "account" containing "count", "disable" containing "able", etc.
+        let has_word = |word: &str| -> bool {
+            desc_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == word)
+        };
+
+        if has_word("number")
+            || has_word("count")
+            || has_word("limit")
+            || has_word("maximum")
+            || has_word("minimum")
         {
             return ParameterType::Integer;
         }
 
         // Check for boolean indicators
-        if desc_lower.contains("enable")
-            || desc_lower.contains("disable")
-            || desc_lower.contains("true")
-            || desc_lower.contains("false")
-            || desc_lower.contains("flag")
+        if has_word("enable")
+            || has_word("disable")
+            || has_word("true")
+            || has_word("false")
+            || has_word("flag")
         {
             return ParameterType::Boolean;
         }
@@ -385,9 +423,25 @@ impl Tool for SkillToolHandler {
             });
         }
 
-        let command = self
-            .render_command(&args)
-            .context("Failed to render skill tool command")?;
+        let command = match self.render_command(&args) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    skill = %self.skill_name,
+                    tool = %self.tool_def.name,
+                    args = %args,
+                    error = %e,
+                    "Skill tool render failed — returning soft error to LLM"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "Invalid tool arguments: {e}. Please retry with corrected parameters."
+                    ),
+                    success: false,
+                    error: None,
+                });
+            }
+        };
 
         if let Err(e) = self.security.validate_command_execution(&command, false) {
             tracing::warn!(
@@ -452,10 +506,15 @@ impl Tool for SkillToolHandler {
             );
         }
 
+        // When the command fails but produced stdout (e.g. JSON error from Python
+        // script that exits non-zero), include that output so the LLM can see the
+        // actual error reason and retry with corrected parameters.
         Ok(ToolResult {
             success,
             output: if success {
                 scrubbed_stdout
+            } else if !scrubbed_stdout.trim().is_empty() {
+                format!("{}\n---\nstderr: {}", scrubbed_stdout, scrubbed_stderr)
             } else {
                 format!("Command failed:\n{}", scrubbed_stderr)
             },
@@ -485,11 +544,11 @@ mod tests {
     #[test]
     fn infer_integer_type() {
         assert_eq!(
-            SkillToolHandler::infer_parameter_type("Maximum number of items"),
+            SkillToolHandler::infer_parameter_type("size", "Maximum number of items"),
             ParameterType::Integer
         );
         assert_eq!(
-            SkillToolHandler::infer_parameter_type("Limit the count"),
+            SkillToolHandler::infer_parameter_type("items", "Limit the count"),
             ParameterType::Integer
         );
     }
@@ -497,7 +556,7 @@ mod tests {
     #[test]
     fn infer_boolean_type() {
         assert_eq!(
-            SkillToolHandler::infer_parameter_type("Enable verbose mode"),
+            SkillToolHandler::infer_parameter_type("verbose", "Enable verbose mode"),
             ParameterType::Boolean
         );
     }
@@ -505,9 +564,34 @@ mod tests {
     #[test]
     fn infer_string_type_default() {
         assert_eq!(
-            SkillToolHandler::infer_parameter_type("User name or email"),
+            SkillToolHandler::infer_parameter_type("email", "User name or email"),
             ParameterType::String
         );
+    }
+
+    #[test]
+    fn infer_string_not_integer_for_known_string_param_names() {
+        // "account" must be String even if description accidentally contains integer keywords
+        let tricky = "Account to use, sets the limit count";
+        assert_eq!(
+            SkillToolHandler::infer_parameter_type("account", tricky),
+            ParameterType::String
+        );
+        // same for other common string-identity param names
+        for name in &[
+            "username",
+            "query",
+            "session",
+            "mode",
+            "folder_name",
+            "contact_name",
+        ] {
+            assert_eq!(
+                SkillToolHandler::infer_parameter_type(name, "Maximum number of things"),
+                ParameterType::String,
+                "param '{name}' should always be String"
+            );
+        }
     }
 
     #[test]
@@ -819,6 +903,52 @@ mod tests {
         assert!(
             !by_name["limit"].required,
             "limit with default should be optional"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_fail_returns_soft_error_not_err() {
+        let tool_def = SkillTool {
+            name: "telegram_search_global".to_string(),
+            description: "Search Telegram globally".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 script.py --query {query} --date-from {date_from}".to_string(),
+            args: [
+                ("query".to_string(), "Search query".to_string()),
+                ("date_from".to_string(), "Start date (optional)".to_string()),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+        };
+
+        let security = Arc::new(SecurityPolicy::default());
+        let handler =
+            SkillToolHandler::new("zeroclaw_skill".to_string(), tool_def, security).unwrap();
+
+        // LLM sends an Array instead of a String for date_from — must not propagate Err
+        let args = serde_json::json!({
+            "query": "x",
+            "date_from": [1, 2, 3]
+        });
+
+        let result = handler.execute(args).await;
+        assert!(
+            result.is_ok(),
+            "execute must return Ok, not Err on render fail"
+        );
+        let tool_result = result.unwrap();
+        assert!(
+            !tool_result.success,
+            "ToolResult.success must be false for render error"
+        );
+        assert!(
+            tool_result
+                .output
+                .to_lowercase()
+                .contains("invalid tool arguments"),
+            "output must explain the argument error, got: {}",
+            tool_result.output
         );
     }
 }
