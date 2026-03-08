@@ -100,6 +100,14 @@ impl BackpressureController {
             return Ok(());
         }
 
+        // Guard: zero max_queue_depth means shed all non-critical requests immediately.
+        if self.config.max_queue_depth == 0 {
+            return Err(LoadShed {
+                queue_depth: depth,
+                priority,
+            });
+        }
+
         // Hard cap: reject everything non-critical at max.
         if depth >= self.config.max_queue_depth {
             return Err(LoadShed {
@@ -238,5 +246,17 @@ mod tests {
         assert!(ctrl.admit(Priority::Low).is_err());
         assert!(ctrl.admit(Priority::Normal).is_err());
         assert!(ctrl.admit(Priority::High).is_err());
+    }
+
+    #[test]
+    fn zero_max_queue_depth_sheds_non_critical() {
+        let ctrl = make_controller(0);
+        // All non-critical should be shed immediately (no division by zero).
+        assert!(ctrl.admit(Priority::Background).is_err());
+        assert!(ctrl.admit(Priority::Low).is_err());
+        assert!(ctrl.admit(Priority::Normal).is_err());
+        assert!(ctrl.admit(Priority::High).is_err());
+        // Critical still admitted.
+        assert!(ctrl.admit(Priority::Critical).is_ok());
     }
 }
