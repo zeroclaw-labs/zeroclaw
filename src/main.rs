@@ -781,31 +781,7 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-            autonomy_level,
-            max_actions_per_hour,
-            max_tool_iterations,
-            max_history_messages,
-            compact_context,
-            memory_backend,
         } => {
-            if let Some(level) = autonomy_level {
-                config.autonomy.level = level;
-            }
-            if let Some(n) = max_actions_per_hour {
-                config.autonomy.max_actions_per_hour = n;
-            }
-            if let Some(n) = max_tool_iterations {
-                config.agent.max_tool_iterations = n;
-            }
-            if let Some(n) = max_history_messages {
-                config.agent.max_history_messages = n;
-            }
-            if compact_context {
-                config.agent.compact_context = true;
-            }
-            if let Some(ref backend) = memory_backend {
-                config.memory.backend = backend.clone();
-            }
             Box::pin(agent::run(
                 config,
                 message,
