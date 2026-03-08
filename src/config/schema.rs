@@ -2787,7 +2787,9 @@ pub struct DiscordConfig {
     #[serde(default)]
     pub listen_to_bots: bool,
     /// When true, only respond to messages that @-mention the bot.
-    /// Other messages in the guild are silently ignored.
+    /// Guild (server) messages without a bot mention are silently ignored.
+    /// Direct messages (DMs) are always processed regardless of this flag —
+    /// they are inherently private and implicitly addressed to the bot.
     #[serde(default)]
     pub mention_only: bool,
 }
