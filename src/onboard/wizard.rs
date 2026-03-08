@@ -88,7 +88,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     );
     println!();
 
-    print_step(1, 9, "Workspace Setup");
+    print_step(1, 10, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
@@ -97,29 +97,33 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         }
     }
 
-    print_step(2, 9, "AI Provider & API Key");
+    print_step(2, 10, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
-    print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 10, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 9, "Tunnel (Expose to Internet)");
+    print_step(4, 10, "Transcription (Voice-to-Text)");
+    let transcription_config = setup_transcription()?;
+
+    print_step(5, 10, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 9, "Tool Mode & Security");
+    print_step(6, 10, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 9, "Hardware (Physical World)");
+    print_step(7, 10, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(7, 9, "Memory Configuration");
+    print_step(8, 10, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(8, 9, "Project Context (Personalize Your Agent)");
+    print_step(9, 10, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(9, 9, "Workspace Files");
+    print_step(10, 10, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx).await?;
+
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -168,7 +172,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hooks: crate::config::HooksConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
-        transcription: crate::config::TranscriptionConfig::default(),
+        transcription: transcription_config,
+
     };
 
     println!(
@@ -2901,7 +2906,7 @@ fn provider_supports_device_flow(provider_name: &str) -> bool {
     )
 }
 
-// ── Step 5: Tool Mode & Security ────────────────────────────────
+// ── Step 6: Tool Mode & Security ────────────────────────────────
 
 fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
@@ -2991,7 +2996,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     Ok((composio_config, secrets_config))
 }
 
-// ── Step 6: Hardware (Physical World) ───────────────────────────
+// ── Step 7: Hardware (Physical World) ───────────────────────────
 
 fn setup_hardware() -> Result<HardwareConfig> {
     print_bullet("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).");
@@ -3179,7 +3184,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
     Ok(hw_config)
 }
 
-// ── Step 6: Project Context ─────────────────────────────────────
+// ── Step 9: Project Context ─────────────────────────────────────
 
 fn setup_project_context() -> Result<ProjectContext> {
     print_bullet("Let's personalize your agent. You can always update these later.");
@@ -3277,7 +3282,7 @@ fn setup_project_context() -> Result<ProjectContext> {
     })
 }
 
-// ── Step 6: Memory Configuration ───────────────────────────────
+// ── Step 8: Memory Configuration ───────────────────────────────
 
 fn setup_memory() -> Result<MemoryConfig> {
     print_bullet("Choose how ZeroClaw stores and searches memories.");
@@ -3611,13 +3616,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     );
                 }
 
+                let voice_messages = Confirm::new()
+                    .with_prompt("  Enable voice message transcription (requires `ffmpeg` installed)?")
+                    .default(false)
+                    .interact()?;
+
+                if voice_messages {
+                    println!("  {} ZeroClaw uses `whisper-rs` and `ffmpeg` to parse voice notes.", style("ℹ").cyan());
+                    println!("     It will download a small model (~75MB) automatically the first time.");
+                    println!("     Please ensure `ffmpeg` is installed on this machine and available in PATH.");
+                }
+
                 config.telegram = Some(TelegramConfig {
                     bot_token: token,
                     allowed_users,
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
-                    mention_only: false,
+                    mention_only: true, // Defaulting to mention_only for new group setups is safer
+                    allow_group_mentions: true,
+                    voice_messages,
+                    whisper_model: None,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -5053,7 +5072,92 @@ fn setup_channels() -> Result<ChannelsConfig> {
     Ok(config)
 }
 
-// ── Step 4: Tunnel ──────────────────────────────────────────────
+// ── Step 4: Transcription ───────────────────────────────────────
+
+fn setup_transcription() -> Result<crate::config::TranscriptionConfig> {
+    use crate::config::schema::{TranscriptionConfig, TranscriptionProvider};
+
+    println!();
+    println!(
+        "  {} {}",
+        style("Transcription Setup").white().bold(),
+        style("— convert voice messages to text").dim()
+    );
+    print_bullet("ZeroClaw can transcribe voice notes from Telegram and other channels.");
+    println!();
+
+    let enabled = Confirm::new()
+        .with_prompt("  Enable voice transcription?")
+        .default(false)
+        .interact()?;
+
+    if !enabled {
+        println!("  {} Transcription: {}", style("✓").green().bold(), style("disabled").dim());
+        return Ok(TranscriptionConfig::default());
+    }
+
+    let providers = vec![
+        "Groq (Cloud) — fastest, requires GROQ_API_KEY",
+        "Local (Whisper-RS) — private, runs on your CPU, requires ffmpeg",
+    ];
+
+    let provider_idx = Select::new()
+        .with_prompt("  Select transcription provider")
+        .items(&providers)
+        .default(0)
+        .interact()?;
+
+    let provider = if provider_idx == 0 {
+        TranscriptionProvider::Groq
+    } else {
+        TranscriptionProvider::Local
+    };
+
+    let mut config = TranscriptionConfig {
+        enabled: true,
+        provider,
+        ..TranscriptionConfig::default()
+    };
+
+    if provider == TranscriptionProvider::Local {
+        println!();
+        println!("  {} ZeroClaw will use `whisper-rs` and `ffmpeg` for local transcription.", style("ℹ").cyan());
+        println!("     It will download a small model (~75MB) automatically on first use.");
+        println!("     Please ensure `ffmpeg` is installed and available in your PATH.");
+
+        let custom_model = Confirm::new()
+            .with_prompt("  Use a custom Whisper model path? (No = auto-download tiny)")
+            .default(false)
+            .interact()?;
+
+        if custom_model {
+            let path: String = Input::new()
+                .with_prompt("  Path to GGML model file (.bin)")
+                .interact_text()?;
+            if !path.trim().is_empty() {
+                let trimmed = path.trim();
+                let model_path = std::path::Path::new(trimmed);
+                if !model_path.is_file() {
+                    bail!("Whisper model file not found: {}", model_path.display());
+                }
+                config.whisper_model_path = Some(trimmed.to_string());
+            }
+        }
+    } else {
+        println!();
+        print_bullet("Ensure GROQ_API_KEY is set in your environment.");
+    }
+
+    println!(
+        "  {} Transcription: {}",
+        style("✓").green().bold(),
+        style(if provider == TranscriptionProvider::Groq { "Groq" } else { "Local (Whisper-RS)" }).green()
+    );
+
+    Ok(config)
+}
+
+// ── Step 5: Tunnel ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
 fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
@@ -5208,7 +5312,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
     Ok(config)
 }
 
-// ── Step 6: Scaffold workspace files ─────────────────────────────
+// ── Step 10: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
 async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
@@ -7192,6 +7296,7 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });

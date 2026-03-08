@@ -360,18 +360,36 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq).
+/// Supported transcription providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub enum TranscriptionProvider {
+    /// Whisper API via Groq (Cloud).
+    #[default]
+    #[serde(rename = "groq")]
+    Groq,
+    /// Local transcription via whisper-rs (CPU/Metal).
+    #[serde(rename = "local")]
+    Local,
+}
+
+/// Voice transcription configuration (Whisper API via Groq or Local).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Whisper API endpoint URL.
+    /// Transcription provider selection.
+    #[serde(default)]
+    pub provider: TranscriptionProvider,
+    /// Whisper API endpoint URL (Groq only).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name.
+    /// Whisper model name (Groq or local filename hint).
     #[serde(default = "default_transcription_model")]
     pub model: String,
+    /// Path to a local GGML model file (Local only).
+    #[serde(default)]
+    pub whisper_model_path: Option<String>,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
@@ -384,8 +402,10 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: TranscriptionProvider::default(),
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
+            whisper_model_path: None,
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
@@ -2761,6 +2781,16 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Parse and transcribe voice messages.
+    /// Enabling this allows Telegram-specific voice note handling.
+    /// If global `[transcription].provider` is "local", it uses `whisper_model` or fallback.
+    #[serde(default)]
+    pub voice_messages: bool,
+    /// Optional path to a local whisper model (.bin) for this channel.
+    /// If set, this overrides the global `transcription.whisper_model_path`.
+    /// Only used when `transcription.provider` is "local".
+    #[serde(default)]
+    pub whisper_model: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -3218,6 +3248,9 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -4121,7 +4154,8 @@ impl Config {
             // Restrict permissions on newly created config file (may contain API keys)
             #[cfg(unix)]
             {
-                use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+                use std::fs::Permissions;
+                use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
@@ -4792,7 +4826,8 @@ impl Config {
 
         #[cfg(unix)]
         {
-            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
             if let Err(err) =
                 fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
             {
@@ -5119,6 +5154,8 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    voice_messages: false,
+                    whisper_model: None,
                 }),
                 discord: None,
                 slack: None,
@@ -5488,8 +5525,10 @@ tool_dispatcher = "xml"
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
-            interrupt_on_new_message: true,
+            interrupt_on_new_message: false,
             mention_only: false,
+            voice_messages: false,
+            whisper_model: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -5497,7 +5536,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.allowed_users.len(), 2);
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
-        assert!(parsed.interrupt_on_new_message);
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -7335,7 +7374,7 @@ default_model = "legacy-model"
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
+            verification_token: None,
             allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: false,
