@@ -223,8 +223,8 @@ pub fn create_memory_with_storage_and_routes(
     // Cortex backend (requires memory-cortex feature)
     #[cfg(feature = "memory-cortex")]
     if matches!(backend_kind, MemoryBackendKind::Cortex) {
-        tracing::info!(
-            "🧠 Cortex-Memory backend selected (tenant: {})",
+        tracing::debug!(
+            "Cortex-Memory backend selected (tenant: {})",
             config.cortex.tenant_id
         );
 

@@ -41,12 +41,8 @@ impl CortexMemory {
         // Resolve configuration (auto-derive from zeroclaw settings)
         let config = resolve_cortex_config(zeroclaw_config, memory_config, &workspace_dir)?;
         
-        tracing::info!(
-            "🧠 Initializing Cortex-Memory:\n\
-             ├─ LLM: {} @ {}\n\
-             ├─ Embedding: {} ({} dims) @ {}\n\
-             ├─ Qdrant: {} / {}\n\
-             └─ Tenant: {}",
+        tracing::debug!(
+            "Cortex-Memory initializing: LLM={} @ {}, Embedding={} ({} dims) @ {}, Qdrant={}/{}, tenant={}",
             config.llm_model,
             config.llm_api_base_url,
             config.embedding_model,
@@ -118,12 +114,11 @@ impl Memory for CortexMemory {
             MemoryCategory::Custom(_) => "user",
         };
 
-        tracing::info!(
-            "Cortex storing memory: key={}, thread={}, role={}, category={:?}, content_len={}",
+        tracing::debug!(
+            "Cortex storing memory: key={}, thread={}, role={}, content_len={}",
             _key,
             thread_id,
             role,
-            category,
             content.len()
         );
 
@@ -148,15 +143,15 @@ impl Memory for CortexMemory {
                 agent_id,
             });
 
-            tracing::info!(
-                "🚀 Triggered SessionClosed event for memory extraction: thread={}, uri={}",
+            tracing::debug!(
+                "Triggered SessionClosed event for memory extraction: thread={}, uri={}",
                 thread_id,
                 message_uri
             );
         }
 
-        tracing::info!(
-            "Cortex stored memory successfully: key={}, thread={}, uri={}",
+        tracing::debug!(
+            "Cortex stored memory: key={}, thread={}, uri={}",
             _key,
             thread_id,
             message_uri

@@ -92,7 +92,7 @@ fn resolve_llm_config(
     zeroclaw_config: &Config,
     cortex_config: &CortexMemConfig,
 ) -> Result<(String, String, String)> {
-    tracing::info!(
+    tracing::debug!(
         "Resolving LLM config: api_url={:?}, default_provider={:?}, default_model={:?}",
         zeroclaw_config.api_url,
         zeroclaw_config.default_provider,
@@ -107,7 +107,7 @@ fn resolve_llm_config(
     let llm_api_base_url = zeroclaw_config.api_url.clone()
         .unwrap_or_else(|| {
             let derived = derive_provider_base_url(zeroclaw_config.default_provider.as_deref());
-            tracing::info!(
+            tracing::debug!(
                 "LLM API base URL derived from provider {:?}: {}",
                 zeroclaw_config.default_provider,
                 derived
@@ -134,7 +134,7 @@ fn resolve_embedding_config(
     memory_config: &MemoryConfig,
     cortex_config: &CortexMemConfig,
 ) -> Result<(String, String, String, usize)> {
-    tracing::info!(
+    tracing::debug!(
         "Resolving embedding config: provider={}, model={}",
         memory_config.embedding_provider,
         memory_config.embedding_model
@@ -150,7 +150,7 @@ fn resolve_embedding_config(
     let embedding_model = memory_config.embedding_model.clone();
     let embedding_dimensions = memory_config.embedding_dimensions;
 
-    tracing::info!(
+    tracing::debug!(
         "Embedding API base URL resolved to: {}",
         embedding_api_base_url
     );
