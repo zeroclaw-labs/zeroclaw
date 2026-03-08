@@ -5334,6 +5334,11 @@ impl Config {
                     "resilience.circuit_breaker_failure_threshold must be >= 1 when circuit breaker is enabled"
                 );
             }
+            if self.resilience.circuit_breaker_recovery_timeout_secs == 0 {
+                anyhow::bail!(
+                    "resilience.circuit_breaker_recovery_timeout_secs must be >= 1 when circuit breaker is enabled (0 would skip the open state entirely)"
+                );
+            }
         }
         if self.resilience.rate_limit_enabled {
             if self.resilience.requests_per_minute == 0 && self.resilience.burst == 0 {

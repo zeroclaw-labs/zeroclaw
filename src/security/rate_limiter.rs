@@ -75,12 +75,18 @@ pub struct TokenBucketRateLimiter {
 
 impl TokenBucketRateLimiter {
     /// Create a new rate limiter with the given configuration.
+    /// Create a new rate limiter with the given configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.window` is zero — a zero-length refill window would
+    /// silently fail open (infinite refill rate).
     pub fn new(config: RateLimiterConfig) -> Self {
-        let refill_rate = if config.window.as_secs_f64() > 0.0 {
-            config.requests_per_window as f64 / config.window.as_secs_f64()
-        } else {
-            f64::MAX
-        };
+        assert!(
+            !config.window.is_zero(),
+            "RateLimiterConfig.window must be non-zero (zero window fails open)"
+        );
+        let refill_rate = config.requests_per_window as f64 / config.window.as_secs_f64();
         let capacity = (config.requests_per_window + config.burst) as f64;
         Self {
             config,
@@ -247,5 +253,17 @@ mod tests {
         });
 
         assert!(limiter.check("user_a").is_err());
+    }
+
+
+    #[test]
+    #[should_panic(expected = "window must be non-zero")]
+    fn zero_window_panics() {
+        let _limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            requests_per_window: 10,
+            burst: 5,
+            window: Duration::ZERO,
+            max_keys: 100,
+        });
     }
 }
