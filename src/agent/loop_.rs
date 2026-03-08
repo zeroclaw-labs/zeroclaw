@@ -3028,7 +3028,12 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        let sid = session_id.as_deref();
+        // Normalize session_id: trim whitespace, treat empty/whitespace-only as None.
+        let sid: Option<&str> = session_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s as &str);
 
         // When a session ID is provided, load that session's recent conversation history
         // before auto-saving so the current message is not included.
@@ -3039,6 +3044,12 @@ pub async fn run(
             String::new()
         };
 
+        // Inject memory + hardware RAG context into user message.
+        // Auto-save happens after build_context so the current message is not
+        // recalled into its own prompt.
+        let mem_context =
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+
         // Auto-save user message to memory, scoped to session when provided.
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
@@ -3046,10 +3057,6 @@ pub async fn run(
                 .store(&user_key, &msg, MemoryCategory::Conversation, sid)
                 .await;
         }
-
-        // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
