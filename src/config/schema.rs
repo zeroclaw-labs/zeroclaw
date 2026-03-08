@@ -151,6 +151,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
+    "transcription.mistral",
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
@@ -668,27 +669,50 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Voice transcription configuration (Groq Whisper default; also supports Mistral Voxtral endpoints).
+///
+/// # Defaults
+///
+/// - `enabled`: `false` — transcription is opt-in.
+/// - `api_url`: `https://api.groq.com/openai/v1/audio/transcriptions`
+/// - `model`: `whisper-large-v3-turbo`
+///
+/// # Compatibility
+///
+/// Additive and backward-compatible for existing Groq configurations.
+/// New providers may differ in supported models, encoding, or rate limits.
+///
+/// # Migration / Rollback
+///
+/// To switch to Mistral: set `api_url` to the Mistral endpoint, `model`
+/// to e.g. `voxtral-mini-latest`, and provide `api_key` or `MISTRAL_API_KEY`.
+/// To revert: restore `api_url`/`model` to the Groq defaults above (or
+/// remove the keys to use serde defaults).
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
+    /// Default: `false`.
     #[serde(default)]
     pub enabled: bool,
     /// API key used for transcription requests.
     ///
-    /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
+    /// If unset, runtime falls back to `MISTRAL_API_KEY` (for Mistral
+    /// endpoints) or `GROQ_API_KEY` (all others).
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Whisper API endpoint URL.
+    /// Transcription API endpoint URL.
+    /// Default: `https://api.groq.com/openai/v1/audio/transcriptions`.
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name.
+    /// Whisper or Voxtral model name (e.g. `whisper-large-v3-turbo`, `voxtral-mini-latest`).
+    /// Default: `whisper-large-v3-turbo`.
     #[serde(default = "default_transcription_model")]
     pub model: String,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
+    /// Default: `120`.
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
 }
@@ -703,6 +727,26 @@ impl Default for TranscriptionConfig {
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
+    }
+}
+
+impl std::fmt::Debug for TranscriptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranscriptionConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "api_key",
+                &if self.api_key.is_some() {
+                    Some("<redacted>")
+                } else {
+                    None::<&str>
+                },
+            )
+            .field("api_url", &"<redacted>")
+            .field("model", &self.model)
+            .field("language", &self.language)
+            .field("max_duration_secs", &self.max_duration_secs)
+            .finish()
     }
 }
 
@@ -7771,6 +7815,11 @@ impl Config {
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.transcription.api_key,
+                "config.transcription.api_key",
+            )?;
             decrypt_vec_secrets(
                 &store,
                 &mut config.reliability.api_keys,
@@ -9636,6 +9685,11 @@ impl Config {
             &mut config_to_save.storage.provider.config.db_url,
             "config.storage.provider.config.db_url",
         )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
         encrypt_vec_secrets(
             &store,
             &mut config_to_save.reliability.api_keys,
@@ -10978,6 +11032,8 @@ denied_tools = ["shell"]
             },
         );
 
+        config.transcription.api_key = Some("transcription-credential".into());
+
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(config.config_path.clone())
@@ -11106,6 +11162,15 @@ denied_tools = ["shell"]
         assert_eq!(
             store.decrypt(&telegram_token).unwrap(),
             "telegram-credential"
+        );
+
+        let transcription_key = stored.transcription.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            transcription_key
+        ));
+        assert_eq!(
+            store.decrypt(transcription_key).unwrap(),
+            "transcription-credential"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
