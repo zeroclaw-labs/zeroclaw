@@ -34,10 +34,12 @@ use tokio::fs;
 enum ContainerRuntime {
     /// Not running in a container
     None,
-    /// Docker or containerd
+    /// Docker
     Docker,
     /// Podman
     Podman,
+    /// containerd (no reliable host alias)
+    Containerd,
     /// Kubernetes (no reliable host alias)
     Kubernetes,
 }
@@ -68,7 +70,10 @@ fn detect_container_runtime_from_inputs(inputs: &ContainerRuntimeInputs) -> Cont
         if cgroup_lower.contains("podman") {
             return ContainerRuntime::Podman;
         }
-        if cgroup_lower.contains("docker") || cgroup_lower.contains("containerd") {
+        if cgroup_lower.contains("containerd") {
+            return ContainerRuntime::Containerd;
+        }
+        if cgroup_lower.contains("docker") {
             return ContainerRuntime::Docker;
         }
     }
@@ -107,13 +112,13 @@ fn detect_container_runtime() -> ContainerRuntime {
 }
 
 /// Returns the appropriate hostname for accessing services on the host machine.
-/// Returns `None` for Kubernetes (no reliable alias - user must configure manually).
+/// Returns `None` for runtimes without a reliable host alias (user must configure manually).
 fn default_local_host() -> Option<&'static str> {
     match detect_container_runtime() {
         ContainerRuntime::None => Some("localhost"),
         ContainerRuntime::Docker => Some("host.docker.internal"),
         ContainerRuntime::Podman => Some("host.containers.internal"),
-        ContainerRuntime::Kubernetes => None, // No universal alias for K8s
+        ContainerRuntime::Containerd | ContainerRuntime::Kubernetes => None,
     }
 }
 
@@ -1484,12 +1489,20 @@ fn fetch_ollama_models(endpoint_override: Option<&str>) -> Result<Vec<String>> {
         Some(base) => {
             let normalized = normalize_ollama_endpoint_url(base);
             if normalized.is_empty() {
-                default_local_url_or_localhost(11434, "/api/tags")
+                default_local_url(11434, "/api/tags").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Ollama endpoint URL is required (no safe default for this container runtime)"
+                    )
+                })?
             } else {
                 format!("{normalized}/api/tags")
             }
         }
-        None => default_local_url_or_localhost(11434, "/api/tags"),
+        None => default_local_url(11434, "/api/tags").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Ollama endpoint URL is required (no safe default for this container runtime)"
+            )
+        })?,
     };
     let payload: Value = client
         .get(&endpoint)
@@ -2453,6 +2466,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 if normalized_url.is_empty() {
                     anyhow::bail!("Ollama endpoint URL cannot be empty.");
                 }
+                // Validate URL format
+                let parsed = reqwest::Url::parse(&normalized_url)
+                    .context("Ollama endpoint URL must be a valid URL (e.g., http://service:11434)")?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("Ollama endpoint URL must use http:// or https://");
+                }
                 provider_api_url = Some(normalized_url.clone());
                 print_bullet(&format!(
                     "Using Ollama at {} (no API key needed).",
@@ -2481,6 +2500,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
         if normalized_url.is_empty() {
             anyhow::bail!("llama.cpp endpoint URL cannot be empty.");
+        }
+        // Validate URL format
+        let parsed = reqwest::Url::parse(&normalized_url)
+            .context("llama.cpp endpoint URL must be a valid URL (e.g., http://service:8080/v1)")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("llama.cpp endpoint URL must use http:// or https://");
         }
         provider_api_url = Some(normalized_url.clone());
 
@@ -2524,6 +2549,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         if normalized_url.is_empty() {
             anyhow::bail!("SGLang endpoint URL cannot be empty.");
         }
+        // Validate URL format
+        let parsed = reqwest::Url::parse(&normalized_url)
+            .context("SGLang endpoint URL must be a valid URL (e.g., http://service:30000/v1)")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("SGLang endpoint URL must use http:// or https://");
+        }
         provider_api_url = Some(normalized_url.clone());
 
         print_bullet(&format!(
@@ -2566,6 +2597,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         if normalized_url.is_empty() {
             anyhow::bail!("vLLM endpoint URL cannot be empty.");
         }
+        // Validate URL format
+        let parsed = reqwest::Url::parse(&normalized_url)
+            .context("vLLM endpoint URL must be a valid URL (e.g., http://service:8000/v1)")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("vLLM endpoint URL must use http:// or https://");
+        }
         provider_api_url = Some(normalized_url.clone());
 
         print_bullet(&format!(
@@ -2607,6 +2644,12 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
         if normalized_url.is_empty() {
             anyhow::bail!("Osaurus endpoint URL cannot be empty.");
+        }
+        // Validate URL format
+        let parsed = reqwest::Url::parse(&normalized_url)
+            .context("Osaurus endpoint URL must be a valid URL (e.g., http://service:1337/v1)")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("Osaurus endpoint URL must use http:// or https://");
         }
         provider_api_url = Some(normalized_url.clone());
 
@@ -7153,7 +7196,7 @@ mod tests {
         };
         assert!(matches!(
             detect_container_runtime_from_inputs(&inputs),
-            ContainerRuntime::Docker
+            ContainerRuntime::Containerd
         ));
     }
 
