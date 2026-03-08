@@ -457,8 +457,9 @@ Voir [Référence de Configuration](docs/config-reference.md#memory) pour toutes
 
 | Fournisseur       | Statut      | Clé API             | Modèles Exemple                                      |
 | ----------------- | ----------- | ------------------- | ---------------------------------------------------- |
-| **Anthropic**     | ✅ Stable   | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` |
-| **OpenAI**        | ✅ Stable   | `OPENAI_API_KEY`    | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`             |
+| **Anthropic**     | ✅ Stable   | `ANTHROPIC_API_KEY`       | `claude-sonnet-4-20250514`, `claude-opus-4-20250514`                       |
+| **OpenAI**        | ✅ Stable   | `OPENAI_API_KEY`          | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`                                   |
+| **Azure OpenAI**  | ✅ Stable   | `AZURE_OPENAI_API_KEY`    | Via `default_provider = "azure-openai"` et `api_url = "https://..."` |
 | **Google Gemini** | ✅ Stable   | `GOOGLE_API_KEY`    | `gemini-2.0-flash-exp`, `gemini-exp-1206`            |
 | **Ollama**        | ✅ Stable   | N/A (local)         | `llama3.3`, `qwen2.5`, `phi4`                        |
 | **Cerebras**      | ✅ Stable   | `CEREBRAS_API_KEY`  | `llama-3.3-70b`                                      |
@@ -466,9 +467,9 @@ Voir [Référence de Configuration](docs/config-reference.md#memory) pour toutes
 | **Mistral**       | 🚧 Planifié | `MISTRAL_API_KEY`   | TBD                                                  |
 | **Cohere**        | 🚧 Planifié | `COHERE_API_KEY`    | TBD                                                  |
 
-### Endpoints Personnalisés
+### Endpoints Personnalisés (compatibles OpenAI)
 
-ZeroClaw prend en charge les endpoints compatibles OpenAI :
+ZeroClaw prend en charge les endpoints génériques compatibles OpenAI (LiteLLM, vLLM, OpenRouter, etc.) :
 
 ```toml
 [providers.custom]
@@ -479,6 +480,8 @@ model = "your-model-name"
 ```
 
 Exemple : utilisez [LiteLLM](https://github.com/BerriAI/litellm) comme proxy pour accéder à n'importe quel LLM via l'interface OpenAI.
+
+> **Azure OpenAI** dispose d'un provider dédié (`azure-openai`) et utilise `api_url` au lieu de `base_url` — ne pas utiliser `[providers.custom]` pour Azure OpenAI.
 
 Voir [Référence des Fournisseurs](docs/providers-reference.md) pour les détails de configuration complets.
 
