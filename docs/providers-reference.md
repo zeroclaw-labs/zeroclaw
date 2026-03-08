@@ -88,7 +88,7 @@ Configuration example:
 ```toml
 [model_providers.my_azure_openai]
 name = "azure-openai"
-api_url = "https://your-resource.openai.azure.com"
+base_url = "https://your-resource.openai.azure.com"
 
 # Then set your provider and model (deployment name):
 default_provider = "my_azure_openai"
