@@ -16,7 +16,6 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod browser;
-pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -52,7 +51,6 @@ pub mod traits;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
-pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -230,13 +228,10 @@ pub fn all_tools_with_runtime(
         )),
     ];
 
+    let chromium_manager = Arc::new(crate::browser::ChromiumManager::new());
+
     if browser_config.enabled {
-        // Add legacy browser_open tool for simple URL opening
-        tool_arcs.push(Arc::new(BrowserOpenTool::new(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-        )));
-        // Add full browser automation tool (pluggable backend)
+        // Add full browser automation tool (unified CDP + launcher)
         tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
@@ -254,6 +249,7 @@ pub fn all_tools_with_runtime(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            chromium_manager,
         )));
     }
 
@@ -385,7 +381,7 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"browser"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
@@ -426,7 +422,7 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));

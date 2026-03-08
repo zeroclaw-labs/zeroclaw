@@ -8,7 +8,7 @@
 - [x] [Advanced Context Management](docs/tasks/advanced-context-management.md)
 - [x] [CLI Provider Interface](docs/tasks/cli-provider-interface.md)
 - [ ] [Distributed Node Registry](docs/tasks/distributed-node-registry.md)
-- [ ] [Unified Browser Integration](docs/tasks/unified-browser-integration.md)
+- [x] [Unified Browser Integration](docs/tasks/unified-browser-integration.md)
 - [ ] [Autonomous Skill Creation](docs/tasks/autonomous-skill-creation.md)
 
 ## High Priority

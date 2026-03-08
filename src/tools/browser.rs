@@ -67,6 +67,7 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    chromium_manager: Arc<crate::browser::ChromiumManager>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -75,6 +76,7 @@ pub struct BrowserTool {
 enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
+    Chromiumoxide,
     ComputerUse,
     Auto,
 }
@@ -83,6 +85,7 @@ enum BrowserBackendKind {
 enum ResolvedBackend {
     AgentBrowser,
     RustNative,
+    Chromiumoxide,
     ComputerUse,
 }
 
@@ -92,10 +95,11 @@ impl BrowserBackendKind {
         match key.as_str() {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
+            "chromiumoxide" | "cdp" => Ok(Self::Chromiumoxide),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'chromiumoxide', 'computer_use', or 'auto'"
             ),
         }
     }
@@ -104,6 +108,7 @@ impl BrowserBackendKind {
         match self {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
+            Self::Chromiumoxide => "chromiumoxide",
             Self::ComputerUse => "computer_use",
             Self::Auto => "auto",
         }
@@ -186,6 +191,8 @@ pub enum BrowserAction {
     IsVisible { selector: String },
     /// Close browser
     Close,
+    /// Launch browser on desktop (launcher mode)
+    Launch { url: String },
     /// Find element by semantic locator
     Find {
         by: String, // role, text, label, placeholder, testid
@@ -201,6 +208,7 @@ impl BrowserTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         session_name: Option<String>,
+        chromium_manager: Arc<crate::browser::ChromiumManager>,
     ) -> Self {
         Self::new_with_backend(
             security,
@@ -211,6 +219,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            chromium_manager,
         )
     }
 
@@ -224,6 +233,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        chromium_manager: Arc<crate::browser::ChromiumManager>,
     ) -> Self {
         Self {
             security,
@@ -234,6 +244,7 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            chromium_manager,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -352,6 +363,7 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::RustNative)
             }
+            BrowserBackendKind::Chromiumoxide => Ok(ResolvedBackend::Chromiumoxide),
             BrowserBackendKind::ComputerUse => {
                 if !self.computer_use_available()? {
                     anyhow::bail!(
@@ -361,40 +373,134 @@ impl BrowserTool {
                 Ok(ResolvedBackend::ComputerUse)
             }
             BrowserBackendKind::Auto => {
-                if Self::rust_native_compiled() && self.rust_native_available() {
-                    return Ok(ResolvedBackend::RustNative);
-                }
-                if Self::is_agent_browser_available().await {
-                    return Ok(ResolvedBackend::AgentBrowser);
-                }
-
-                let computer_use_err = match self.computer_use_available() {
-                    Ok(true) => return Ok(ResolvedBackend::ComputerUse),
-                    Ok(false) => None,
-                    Err(err) => Some(err.to_string()),
-                };
-
-                if Self::rust_native_compiled() {
-                    if let Some(err) = computer_use_err {
-                        anyhow::bail!(
-                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
-                        );
-                    }
-                    anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
-                    )
-                }
-
-                if let Some(err) = computer_use_err {
-                    anyhow::bail!(
-                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
-                    );
-                }
-
-                anyhow::bail!(
-                    "browser.backend='auto' needs agent-browser CLI, browser-native, or computer-use sidecar"
-                )
+                // Prefer Chromiumoxide (CDP) as the most robust native option
+                return Ok(ResolvedBackend::Chromiumoxide);
             }
+        }
+    }
+
+    async fn execute_chromiumoxide_action(
+        &self,
+        action: BrowserAction,
+    ) -> anyhow::Result<ToolResult> {
+        let page = self
+            .chromium_manager
+            .get_page(self.native_headless, self.native_chrome_path.as_deref())
+            .await?;
+
+        match action {
+            BrowserAction::Open { url } => {
+                self.validate_url(&url)?;
+                crate::browser::navigate(&page, &url).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Navigated to {}", url),
+                    error: None,
+                })
+            }
+            BrowserAction::Snapshot {
+                interactive_only,
+                compact,
+                depth,
+            } => {
+                let data = crate::browser::snapshot(&page, interactive_only, compact, depth).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&data)?,
+                    error: None,
+                })
+            }
+            BrowserAction::Click { selector } => {
+                crate::browser::click(&page, &selector).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Clicked element: {}", selector),
+                    error: None,
+                })
+            }
+            BrowserAction::Fill { selector, value } => {
+                crate::browser::type_text(&page, &selector, &value).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Filled {} into {}", value, selector),
+                    error: None,
+                })
+            }
+            BrowserAction::Type { selector, text } => {
+                crate::browser::type_text(&page, &selector, &text).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Typed text into {}", selector),
+                    error: None,
+                })
+            }
+            BrowserAction::GetText { selector } => {
+                let element = page.find_element(selector.as_str()).await?;
+                let text = element.inner_text().await?.unwrap_or_default();
+                Ok(ToolResult {
+                    success: true,
+                    output: text,
+                    error: None,
+                })
+            }
+            BrowserAction::GetTitle => {
+                let title = page.title().await?.unwrap_or_default();
+                Ok(ToolResult {
+                    success: true,
+                    output: title,
+                    error: None,
+                })
+            }
+            BrowserAction::GetUrl => {
+                let url = page.url().await?.unwrap_or_default();
+                Ok(ToolResult {
+                    success: true,
+                    output: url.to_string(),
+                    error: None,
+                })
+            }
+            BrowserAction::Screenshot { .. } => {
+                let bytes = crate::browser::screenshot(&page).await?;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("[IMAGE:data:image/png;base64,{b64}]"),
+                    error: None,
+                })
+            }
+            BrowserAction::Close => {
+                self.chromium_manager.close().await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: "Browser closed".into(),
+                    error: None,
+                })
+            }
+            BrowserAction::Launch { url } => {
+                self.validate_url(&url)?;
+                crate::browser::open_in_brave(&url).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Launched Brave Browser at {}", url),
+                    error: None,
+                })
+            }
+            _ => anyhow::bail!("Action not yet implemented for chromiumoxide backend"),
+        }
+    }
+
+    async fn execute_action(
+        &self,
+        action: BrowserAction,
+        backend: ResolvedBackend,
+    ) -> anyhow::Result<ToolResult> {
+        match backend {
+            ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
+            ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::Chromiumoxide => self.execute_chromiumoxide_action(action).await,
+            ResolvedBackend::ComputerUse => anyhow::bail!(
+                "Internal error: computer_use backend must be handled before BrowserAction parsing"
+            ),
         }
     }
 
@@ -1868,6 +1974,13 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             })
         }
         "close" => Ok(BrowserAction::Close),
+        "launch" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'url' for launch action"))?;
+            Ok(BrowserAction::Launch { url: url.into() })
+        }
         "find" => {
             let by = args
                 .get("by")
