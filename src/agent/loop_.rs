@@ -255,7 +255,9 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
-                if memory::is_assistant_autosave_key(&entry.key) {
+                if memory::is_assistant_autosave_key(&entry.key)
+                    || entry.key.starts_with("assistant_msg_")
+                {
                     continue;
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
@@ -289,10 +291,10 @@ async fn load_recent_conversation(
     else {
         return String::new();
     };
-    // list() returns newest-first; filter to user_msg_* keys, take N, then reverse for chronological
+    // list() returns newest-first; include both user and assistant turns, take N, reverse for chronological
     let mut recent: Vec<_> = entries
         .into_iter()
-        .filter(|e| e.key.starts_with("user_msg_"))
+        .filter(|e| e.key.starts_with("user_msg_") || e.key.starts_with("assistant_msg_"))
         .take(max_messages)
         .collect();
     if recent.is_empty() {
@@ -301,7 +303,12 @@ async fn load_recent_conversation(
     recent.reverse();
     let mut context = String::from("[Conversation history]\n");
     for entry in &recent {
-        let _ = writeln!(context, "- [{}] {}", entry.timestamp, entry.content);
+        let role = if entry.key.starts_with("assistant_msg_") {
+            "assistant"
+        } else {
+            "user"
+        };
+        let _ = writeln!(context, "- [{}] {role}: {}", entry.timestamp, entry.content);
     }
     context.push('\n');
     context
@@ -3096,6 +3103,22 @@ pub async fn run(
         .await?;
         final_output = response.clone();
         println!("{response}");
+
+        // Persist the assistant reply so the next --session-id invocation can replay it.
+        if let Some(sid) = sid {
+            if config.memory.auto_save && !response.is_empty() {
+                let assistant_key = autosave_memory_key("assistant_msg");
+                let _ = mem
+                    .store(
+                        &assistant_key,
+                        &response,
+                        MemoryCategory::Conversation,
+                        Some(sid),
+                    )
+                    .await;
+            }
+        }
+
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
