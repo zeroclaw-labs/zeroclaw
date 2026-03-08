@@ -15,6 +15,7 @@ use axum::{
         ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
     },
+    http::{header, HeaderMap},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -29,6 +30,7 @@ pub struct WsQuery {
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Auth via query param (browser WebSocket limitation)
@@ -43,8 +45,30 @@ pub async fn handle_ws_chat(
         }
     }
 
+    let requested_subprotocols = parse_requested_subprotocols(&headers);
+    let ws = if requested_subprotocols.is_empty() {
+        ws
+    } else {
+        ws.protocols(requested_subprotocols)
+    };
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
         .into_response()
+}
+
+fn parse_requested_subprotocols(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -162,6 +186,174 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     "message": sanitized,
                 }));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gateway::{GatewayRateLimiter, IdempotencyStore};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::providers::Provider;
+    use crate::security::pairing::PairingGuard;
+    use async_trait::async_trait;
+    use axum::routing::get;
+    use axum::Router;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[tokio::test]
+    async fn ws_handshake_echoes_requested_subprotocol() {
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(test_state());
+        let (addr, server_task) = spawn_test_server(app).await;
+
+        let mut request = format!("ws://{addr}/ws/chat")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            "agent-chat, json".parse().unwrap(),
+        );
+
+        let (socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok()),
+            Some("agent-chat")
+        );
+        drop(socket);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_omits_subprotocol_when_not_requested() {
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(test_state());
+        let (addr, server_task) = spawn_test_server(app).await;
+
+        let request = format!("ws://{addr}/ws/chat")
+            .into_client_request()
+            .unwrap();
+        let (socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        assert!(response
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .is_none());
+        drop(socket);
+        server_task.abort();
+    }
+
+    async fn spawn_test_server(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, task)
+    }
+
+    fn test_state() -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        }
+    }
+
+    struct MockMemory;
+
+    #[async_trait]
+    impl Memory for MockMemory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct MockProvider;
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
         }
     }
 }
