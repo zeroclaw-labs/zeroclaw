@@ -6,11 +6,11 @@
 ## Active Feature Plans
 - [x] [Agent Stability and Persistence](docs/tasks/agent-stability-persistence.md)
 - [x] [Advanced Context Management](docs/tasks/advanced-context-management.md)
+- [x] [CLI Provider Interface](docs/tasks/cli-provider-interface.md)
+- [ ] [Distributed Node Registry](docs/tasks/distributed-node-registry.md)
+- [ ] [Unified Browser Integration](docs/tasks/unified-browser-integration.md)
+- [ ] [Autonomous Skill Creation](docs/tasks/autonomous-skill-creation.md)
 
 ## High Priority
-- [x] Fix rate-limit amnesia in agent loop (Epic Complete)
-- [x] Refactor loop_.rs into smaller modules (Task 1.2)
-
-## Maintenance
-- [ ] Standardize Bazel build targets
-- [ ] Improve CI/CD for cross-compilation
+- [ ] Implement WebSocket Node Registry for remote execution
+- [ ] Add Playwright-based browser tool
