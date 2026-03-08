@@ -27,6 +27,15 @@ pub struct ReportTemplate {
     pub format: ReportFormat,
 }
 
+/// Escape a string for safe inclusion in HTML output.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 impl ReportTemplate {
     /// Render the template by substituting `{{key}}` placeholders with values.
     pub fn render(&self, vars: &HashMap<String, String>) -> String {
@@ -39,6 +48,8 @@ impl ReportTemplate {
                     out.push_str(&format!("## {heading}\n\n{body}\n\n"));
                 }
                 ReportFormat::Html => {
+                    let heading = escape_html(&heading);
+                    let body = escape_html(&body);
                     out.push_str(&format!("<h2>{heading}</h2>\n<p>{body}</p>\n"));
                 }
             }

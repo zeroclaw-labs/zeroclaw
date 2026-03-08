@@ -5295,13 +5295,32 @@ impl Config {
             validate_mcp_config(&self.mcp)?;
         }
 
+        // Project intelligence
+        if self.project_intel.enabled {
+            let lang = &self.project_intel.default_language;
+            if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
+                anyhow::bail!(
+                    "project_intel.default_language must be one of: en, de, fr, it (got '{lang}')"
+                );
+            }
+            let sens = &self.project_intel.risk_sensitivity;
+            if !["low", "medium", "high"].contains(&sens.as_str()) {
+                anyhow::bail!(
+                    "project_intel.risk_sensitivity must be one of: low, medium, high (got '{sens}')"
+                );
+            }
+            if let Some(ref tpl_dir) = self.project_intel.templates_dir {
+                let path = std::path::Path::new(tpl_dir);
+                if !path.exists() {
+                    anyhow::bail!(
+                        "project_intel.templates_dir path does not exist: {tpl_dir}"
+                    );
+                }
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
 
         Ok(())
     }
