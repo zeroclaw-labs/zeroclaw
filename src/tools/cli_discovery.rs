@@ -104,6 +104,21 @@ const KNOWN_CLIS: &[KnownCli] = &[
         version_args: &["--version"],
         category: CliCategory::Language,
     },
+    KnownCli {
+        name: "claude",
+        version_args: &["--version"],
+        category: CliCategory::Language,
+    },
+    KnownCli {
+        name: "gemini",
+        version_args: &["--version"],
+        category: CliCategory::Language,
+    },
+    KnownCli {
+        name: "kilo",
+        version_args: &["--version"],
+        category: CliCategory::Language,
+    },
 ];
 
 /// Discover available CLI tools on the system.
