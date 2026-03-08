@@ -5281,8 +5281,13 @@ impl Config {
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
         // Knowledge graph
-        if self.knowledge.enabled && self.knowledge.max_nodes == 0 {
-            anyhow::bail!("knowledge.max_nodes must be greater than 0");
+        if self.knowledge.enabled {
+            if self.knowledge.max_nodes == 0 {
+                anyhow::bail!("knowledge.max_nodes must be greater than 0");
+            }
+            if self.knowledge.db_path.trim().is_empty() {
+                anyhow::bail!("knowledge.db_path must not be empty");
+            }
         }
 
         // Proxy (delegate to existing validation)
