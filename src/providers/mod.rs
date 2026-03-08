@@ -19,11 +19,14 @@
 pub mod anthropic;
 pub mod backoff;
 pub mod bedrock;
+pub mod claude_code;
 pub mod compatible;
 pub mod copilot;
 pub mod cursor;
 pub mod gemini;
+pub mod gemini_cli;
 pub mod health;
+pub mod kilocli;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -1466,6 +1469,9 @@ fn create_provider_with_url_and_options(
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "cursor" => Ok(Box::new(cursor::CursorProvider::new())),
+        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
+        "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
+        "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
             let (base_url, lm_studio_key) = resolve_lmstudio_connection(api_url, key);
             Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -2146,6 +2152,24 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "cursor",
             display_name: "Cursor (headless CLI)",
             aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "claude-code",
+            display_name: "Claude Code (CLI)",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "gemini-cli",
+            display_name: "Gemini CLI",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "kilocli",
+            display_name: "KiloCLI",
+            aliases: &["kilo"],
             local: true,
         },
         ProviderInfo {
@@ -2926,6 +2950,22 @@ mod tests {
     }
 
     #[test]
+    fn factory_claude_code() {
+        assert!(create_provider("claude-code", None).is_ok());
+    }
+
+    #[test]
+    fn factory_gemini_cli() {
+        assert!(create_provider("gemini-cli", None).is_ok());
+    }
+
+    #[test]
+    fn factory_kilocli() {
+        assert!(create_provider("kilocli", None).is_ok());
+        assert!(create_provider("kilo", None).is_ok());
+    }
+
+    #[test]
     fn factory_nvidia() {
         assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
         assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
@@ -3348,6 +3388,9 @@ providers = ["demo-plugin-provider"]
             "replicate",
             "copilot",
             "cursor",
+            "claude-code",
+            "gemini-cli",
+            "kilocli",
             "nvidia",
             "astrai",
             "ovhcloud",
