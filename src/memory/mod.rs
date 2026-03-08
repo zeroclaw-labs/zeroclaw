@@ -1,6 +1,12 @@
+#![allow(unused_imports)]
+
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_backend;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_config_resolver;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
@@ -26,6 +32,8 @@ pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
+#[cfg(feature = "memory-cortex")]
+pub use cortex_backend::CortexMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
@@ -57,6 +65,9 @@ where
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        MemoryBackendKind::Cortex => {
+            anyhow::bail!("memory backend 'cortex' requires feature flag, rebuild with --features memory-cortex")
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
@@ -203,6 +214,51 @@ pub fn create_memory_with_storage_and_routes(
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
         tracing::warn!("memory hygiene skipped: {e}");
+    }
+
+    // Cortex backend (requires memory-cortex feature)
+    #[cfg(feature = "memory-cortex")]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        tracing::info!(
+            "🧠 Cortex-Memory backend selected (tenant: {})",
+            config.cortex.tenant_id
+        );
+
+        let memory_config = config.clone();
+        let workspace_dir = workspace_dir.to_path_buf();
+        
+        // Build a minimal config context for Cortex-Memory initialization
+        // api_key priority: embedding route key > cortex override > passed api_key parameter
+        let api_key = embedding_routes
+            .iter()
+            .find(|r| r.hint == config.embedding_model.strip_prefix("hint:").unwrap_or(""))
+            .and_then(|r| r.api_key.clone())
+            .or_else(|| config.cortex.embedding_api_key_override.clone())
+            .or_else(|| api_key.map(|s| s.to_string()));
+        
+        let config_clone = crate::config::Config {
+            memory: config.clone(),
+            embedding_routes: embedding_routes.to_vec(),
+            storage: crate::config::StorageConfig::default(),
+            workspace_dir: workspace_dir.clone(),
+            api_key,
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
+            ..crate::config::Config::default()
+        };
+
+        return tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::memory::CortexMemory::new(&memory_config, workspace_dir, &config_clone)
+                    .await
+                    .map(|m| Box::new(m) as Box<dyn Memory>)
+            })
+        });
+    }
+
+    #[cfg(not(feature = "memory-cortex"))]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        anyhow::bail!("memory backend 'cortex' requires feature flag, rebuild with --features memory-cortex")
     }
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
