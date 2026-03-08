@@ -93,6 +93,7 @@ RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
 # Use consistent workspace path
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
+ENV LANG=C.UTF-8
 # Defaults for local dev (Ollama) - matches config.template.toml
 ENV PROVIDER="ollama"
 ENV ZEROCLAW_MODEL="llama3.2"
@@ -116,6 +117,7 @@ COPY --from=builder /zeroclaw-data /zeroclaw-data
 # Environment setup
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
+ENV LANG=C.UTF-8
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden
 #ENV PROVIDER=
