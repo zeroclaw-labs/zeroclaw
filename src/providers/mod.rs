@@ -811,6 +811,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
 
     let provider_env_candidates: Vec<&str> = match name {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        "azure-openai" | "azure_openai" => vec!["AZURE_OPENAI_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
         "ollama" => vec!["OLLAMA_API_KEY"],
