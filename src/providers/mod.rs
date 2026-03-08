@@ -745,6 +745,7 @@ pub struct ProviderRuntimeOptions {
     pub custom_provider_auth_header: Option<String>,
     pub max_tokens_override: Option<u32>,
     pub model_support_vision: Option<bool>,
+    pub service_tier: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -761,6 +762,7 @@ impl Default for ProviderRuntimeOptions {
             custom_provider_auth_header: None,
             max_tokens_override: None,
             model_support_vision: None,
+            service_tier: None,
         }
     }
 }

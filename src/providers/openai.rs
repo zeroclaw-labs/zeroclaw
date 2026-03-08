@@ -11,6 +11,7 @@ pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens_override: Option<u32>,
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -20,6 +21,8 @@ struct ChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +72,8 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,7 +198,18 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            service_tier: None,
         }
+    }
+
+    /// Configures the service tier (e.g. "flex") for completion requests.
+    pub fn with_service_tier(mut self, tier: Option<String>) -> Self {
+        self.service_tier = tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        self
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -353,6 +369,7 @@ impl Provider for OpenAiProvider {
             messages,
             temperature,
             max_tokens: self.max_tokens_override,
+            service_tier: self.service_tier.clone(),
         };
 
         let response = self
@@ -395,6 +412,7 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens_override,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            service_tier: self.service_tier.clone(),
         };
 
         let response = self
@@ -463,6 +481,7 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens_override,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            service_tier: self.service_tier.clone(),
         };
 
         let response = self
@@ -565,6 +584,7 @@ mod tests {
             ],
             temperature: 0.7,
             max_tokens: None,
+            service_tier: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -582,10 +602,37 @@ mod tests {
             }],
             temperature: 0.0,
             max_tokens: None,
+            service_tier: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
         assert!(json.contains("\"temperature\":0.0"));
+        assert!(!json.contains("service_tier"));
+    }
+
+    #[test]
+    fn request_serializes_with_service_tier() {
+        let req = ChatRequest {
+            model: "o3-mini".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            temperature: 0.0,
+            max_tokens: None,
+            service_tier: Some("flex".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"service_tier\":\"flex\""));
+    }
+
+    #[test]
+    fn provider_builder_trims_service_tier() {
+        let provider1 = OpenAiProvider::new(None).with_service_tier(Some(" flex ".to_string()));
+        assert_eq!(provider1.service_tier.as_deref(), Some("flex"));
+
+        let provider2 = OpenAiProvider::new(None).with_service_tier(Some("   ".to_string()));
+        assert_eq!(provider2.service_tier, None);
     }
 
     #[test]

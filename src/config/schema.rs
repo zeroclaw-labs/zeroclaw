@@ -438,6 +438,9 @@ pub struct ModelProviderConfig {
 /// Provider behavior overrides (`[provider]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ProviderConfig {
+    /// Optional service tier for OpenAI requests (e.g., "flex" or "default").
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Optional reasoning level override for providers that support explicit levels
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]

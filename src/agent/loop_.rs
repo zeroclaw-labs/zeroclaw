@@ -2736,6 +2736,7 @@ pub async fn run(
         custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
+        service_tier: None,
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3442,6 +3443,7 @@ pub async fn process_message_with_session(
         custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
+        service_tier: None,
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
